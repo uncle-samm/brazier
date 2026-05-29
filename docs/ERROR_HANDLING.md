@@ -42,12 +42,13 @@ View rendering is wrapped in `rescue`. On crash: error logged, `ServerError` sen
 Match on `Result` in update. For effects that can fail, dispatch error messages back:
 
 ```gleam
-fn update(model, msg) {
+fn update(model, local, server, msg) {
   case msg {
-    Save -> case validate(model) {
-      Ok(_) -> Model(..model, saved: True)
-      Error(reason) -> Model(..model, error: Some(reason))
-    }
+    Save ->
+      case validate(model) {
+        Ok(_) -> #(Model(..model, saved: True), local, server)
+        Error(reason) -> #(Model(..model, error: Some(reason)), local, server)
+      }
   }
 }
 ```

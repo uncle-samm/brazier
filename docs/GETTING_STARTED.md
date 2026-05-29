@@ -369,13 +369,22 @@ beacon.app(init, beacon.no_local, init_server, update, view)
 |> beacon.ws_init(auth.init_from_session(
   store,
   auth_config,
-  fn(_req) { #(init(), init_server()) },
+  fn(_req) {
+    let #(model, _effect) = init()
+    #(model, Nil, init_server())
+  },
   fn(req, sess, user_id) {
-    #(init_authenticated(req.path, sess, user_id), init_server())
+    #(init_authenticated(req.path, sess, user_id), Nil, init_server())
   },
 ))
 |> beacon.start(8080)
 ```
+
+Both branches must return the full combined state `#(Model, Local, Server)` —
+here `#(Model, Nil, Server)` because the app uses `beacon.no_local`. `init()`
+returns `#(Model, effect.Effect(Msg))`, so destructure it and drop the init
+effect; `ws_init` does not carry one. `init_authenticated` returns a bare
+`Model`.
 
 `beacon.ws_init` is the raw hook underneath this helper. When set, it replaces
 both `init` and `init_server` and returns the full combined state

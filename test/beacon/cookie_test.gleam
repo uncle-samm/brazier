@@ -68,6 +68,43 @@ pub fn get_cookie_no_header_test() {
   |> should.equal(Error(Nil))
 }
 
+// Regression: an attacker-supplied cookie whose name merely *contains* the
+// real cookie name must never shadow it. The previous FFI did a substring
+// match on the raw header, so `evil_beacon_session=attacker` could be read as
+// the `beacon_session` cookie. Exact per-name matching closes that hole.
+pub fn get_cookie_ignores_prefixed_shadow_name_test() {
+  let req =
+    request.new()
+    |> request.set_method(http.Get)
+    |> request.set_header(
+      "cookie",
+      "evil_beacon_session=attacker; beacon_session=real",
+    )
+  cookie.get(req, "beacon_session")
+  |> should.equal(Ok("real"))
+}
+
+pub fn get_cookie_ignores_suffixed_shadow_name_test() {
+  let req =
+    request.new()
+    |> request.set_method(http.Get)
+    |> request.set_header(
+      "cookie",
+      "beacon_session=real; beacon_session_evil=attacker",
+    )
+  cookie.get(req, "beacon_session")
+  |> should.equal(Ok("real"))
+}
+
+pub fn get_cookie_no_exact_match_with_only_shadow_name_test() {
+  let req =
+    request.new()
+    |> request.set_method(http.Get)
+    |> request.set_header("cookie", "evil_beacon_session=attacker")
+  cookie.get(req, "beacon_session")
+  |> should.equal(Error(Nil))
+}
+
 pub fn set_cookie_default_test() {
   let resp =
     response.new(200)

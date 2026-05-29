@@ -119,6 +119,58 @@ pub fn perform_tracked_returns_spawned_effect_process_test() {
   list.each(pids, fn(pid) { process.kill(pid) })
 }
 
+// Regression: the per-runtime timer cap must self-heal as timers die. An
+// earlier implementation used a monotonic counter that only ever incremented,
+// so once 10 timers had been created no further timer could start — even after
+// the originals exited. Live-pid tracking prunes dead timers, freeing slots.
+//
+// Effects run synchronously in the calling process and the timer registry is
+// per-process (Erlang process dictionary), and eunit runs each test in its own
+// process, so this test starts with an empty registry.
+pub fn every_self_heals_after_timers_die_test() {
+  // Fill every available slot (max_timers = 10). Long interval so the fillers
+  // never tick during the test — we only care that they occupy slots.
+  let filler_pids =
+    list.repeat(Nil, 10)
+    |> list.flat_map(fn(_i) {
+      effect.perform_tracked(
+        effect.every(60_000, fn() { 0 }),
+        fn(_) { Nil },
+        fn(_, _, _) { Nil },
+      )
+    })
+  let assert True = list.length(filler_pids) == 10
+
+  // At the cap, an additional timer is rejected and must never tick.
+  let blocked_subject = process.new_subject()
+  let blocked_pids =
+    effect.perform_tracked(
+      effect.every(50, fn() { 1 }),
+      fn(n) { process.send(blocked_subject, n) },
+      fn(_, _, _) { Nil },
+    )
+  let assert Error(Nil) = process.receive(blocked_subject, 150)
+
+  // Kill the fillers and let the scheduler mark them dead.
+  list.each(filler_pids, process.kill)
+  process.sleep(20)
+
+  // A new timer must now start: dead timers are pruned, freeing slots. Under
+  // the old monotonic counter this stayed blocked forever and never ticked.
+  let healed_subject = process.new_subject()
+  let healed_pids =
+    effect.perform_tracked(
+      effect.every(50, fn() { 1 }),
+      fn(n) { process.send(healed_subject, n) },
+      fn(_, _, _) { Nil },
+    )
+  let assert Ok(1) = process.receive(healed_subject, 300)
+
+  // Clean up spawned timers.
+  list.each(blocked_pids, process.kill)
+  list.each(healed_pids, process.kill)
+}
+
 pub fn keyed_effect_dispatches_through_keyed_channel_test() {
   let subject = process.new_subject()
   let eff =

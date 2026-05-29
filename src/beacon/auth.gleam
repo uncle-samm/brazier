@@ -304,7 +304,13 @@ pub fn authenticated(
       Ok(sess) -> {
         case current_user(sess) {
           Ok(user_id) -> handler(req, sess, user_id)
-          Error(Nil) -> unauthorized_response()
+          Error(Nil) -> {
+            log.warning(
+              "beacon.auth",
+              "Auth rejected: " <> error_to_string(MissingUser),
+            )
+            unauthorized_response()
+          }
         }
       }
       Error(err) -> {
@@ -337,8 +343,20 @@ pub fn csrf_authenticated(
       Ok(sess) -> {
         case validate_csrf(req, sess, config), current_user(sess) {
           Ok(Nil), Ok(user_id) -> handler(req, sess, user_id)
-          Error(err), _ -> forbidden_response(error_to_string(err))
-          _, Error(Nil) -> unauthorized_response()
+          Error(err), _ -> {
+            log.warning(
+              "beacon.auth",
+              "CSRF rejected: " <> error_to_string(err),
+            )
+            forbidden_response(error_to_string(err))
+          }
+          _, Error(Nil) -> {
+            log.warning(
+              "beacon.auth",
+              "Auth rejected: " <> error_to_string(MissingUser),
+            )
+            unauthorized_response()
+          }
         }
       }
       Error(err) -> {
@@ -459,13 +477,31 @@ pub fn require_auth(store: session.SessionStore) -> middleware.Middleware {
           Some(sess) -> {
             case current_user(sess) {
               Ok(_user_id) -> next(req)
-              Error(Nil) -> unauthorized_response()
+              Error(Nil) -> {
+                log.warning(
+                  "beacon.auth",
+                  "Auth rejected: " <> error_to_string(MissingUser),
+                )
+                unauthorized_response()
+              }
             }
           }
-          None -> unauthorized_response()
+          None -> {
+            log.warning(
+              "beacon.auth",
+              "Auth rejected: " <> error_to_string(InvalidSession),
+            )
+            unauthorized_response()
+          }
         }
       }
-      None -> unauthorized_response()
+      None -> {
+        log.warning(
+          "beacon.auth",
+          "Auth rejected: " <> error_to_string(MissingSessionCookie),
+        )
+        unauthorized_response()
+      }
     }
   }
 }
@@ -490,13 +526,31 @@ pub fn csrf_protection(store: session.SessionStore) -> middleware.Middleware {
               Some(sess) -> {
                 case session.get_value(sess, "csrf_token") {
                   Some(stored_token) if stored_token == token -> next(req)
-                  _ -> forbidden_response("Invalid CSRF token")
+                  _ -> {
+                    log.warning(
+                      "beacon.auth",
+                      "CSRF rejected: " <> error_to_string(InvalidCsrfToken),
+                    )
+                    forbidden_response("Invalid CSRF token")
+                  }
                 }
               }
-              None -> forbidden_response("Invalid session")
+              None -> {
+                log.warning(
+                  "beacon.auth",
+                  "CSRF rejected: " <> error_to_string(InvalidSession),
+                )
+                forbidden_response("Invalid session")
+              }
             }
           }
-          _, _ -> forbidden_response("Missing CSRF token")
+          _, _ -> {
+            log.warning(
+              "beacon.auth",
+              "CSRF rejected: " <> error_to_string(MissingCsrfToken),
+            )
+            forbidden_response("Missing CSRF token")
+          }
         }
       }
     }

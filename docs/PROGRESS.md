@@ -10,7 +10,7 @@
 **Active Milestone:** None
 **Last Completed:** 116 — Review Hardening (CSRF, Timers, Auth, Cookies, Docs)
 **Build Status:** GREEN (zero errors, zero warnings)
-**Test Status:** GREEN (760 tests passed, 0 failures)
+**Test Status:** GREEN (764 tests passed, 0 failures)
 **Linter:** PASSING (zero violations)
 
 ### Milestone 116: Review Hardening (CSRF, Timers, Auth, Cookies, Docs)
@@ -38,6 +38,29 @@
       Shared/Server/Local wording), GETTING_STARTED.md + `beacon.hard_redirect`
       doc comment (redirects flow through `on_update`, not `update`)
 - [x] Run final `gleam build`, `gleam test`, and `gleam run -m beacon/lint`
+
+**Follow-up hardening (post-review cross-check):**
+- [x] Complete the auth-logging fix: the first pass only logged the two outer
+      `session_from_request` error branches. Every 401/403 rejection now logs a
+      `log.warning("beacon.auth", …)` with the specific `SessionError` reason —
+      all 9 paths across `authenticated` (missing-user), `csrf_authenticated`
+      (bad CSRF + missing-user), `require_auth` (missing-user, invalid-session,
+      missing-cookie), and `csrf_protection` (invalid-token, invalid-session,
+      missing-token). "Log everything" means every rejection decision, not just
+      the convenient ones.
+- [x] Add a cookie-shadowing regression test (`cookie_test`): exact-name match
+      must ignore `evil_beacon_session=…` when asked for `beacon_session`
+      (prefix shadow, suffix shadow, and shadow-only-no-real-cookie cases)
+- [x] Add a timer self-healing regression test (`effect_test`): fill all 10
+      slots, confirm an 11th is rejected (never ticks), kill the fillers, then
+      confirm a new `every` ticks again — fails under the old monotonic counter,
+      passes with live-pid pruning
+- [x] Fix two more stale doc samples missed in the first pass:
+      ERROR_HANDLING.md (`update` was 2-arg returning a bare `Model`; now the
+      4-arg `fn(model, local, server, msg)` returning `#(model, local, server)`)
+      and GETTING_STARTED.md `ws_init`/`init_from_session` (was the wrong-shape
+      `#(init(), init_server())`; now destructures `init()`'s
+      `#(Model, Effect)` and returns the full `#(Model, Nil, Server)`)
 
 **Notes:**
 - The timer counter could not be fixed with a `decrement` call: the counter
