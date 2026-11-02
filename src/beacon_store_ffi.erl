@@ -1,32 +1,11 @@
 -module(beacon_store_ffi).
--export([new_list_store/1, append/3, get_all/2, delete_key/2]).
+-export([append/3, get_all/2, delete_key/2]).
 
-%% SECURITY: Atom creation constraint.
-%% Store names come from developer code at compile time, not from runtime user input.
-%% The validate_atom_name/1 guard restricts names to alphanumeric/underscore/hyphen
-%% (max 255 bytes), which bounds the atom table impact. Each distinct store name
-%% creates exactly one atom. If runtime-controlled names are ever needed, switch
-%% to binary_to_existing_atom or use an ETS-backed registry instead.
-
-new_list_store(Name) ->
-    case validate_atom_name(Name) of
-        ok ->
-            AtomName = binary_to_atom(<<"beacon_ls_", Name/binary>>, utf8),
-            ets:new(AtomName, [bag, public, named_table, {read_concurrency, true}]);
-        {error, Reason} ->
-            error(Reason)
-    end.
-
-%% Validate that a name is safe for atom conversion.
-%% Max 255 bytes, alphanumeric + underscore + hyphen only (no spaces, no special chars).
-%% This prevents atom table exhaustion from arbitrary user-controlled input.
-validate_atom_name(Name) when byte_size(Name) > 255 ->
-    {error, <<"Name too long (max 255 bytes)">>};
-validate_atom_name(Name) ->
-    case re:run(Name, <<"^[a-zA-Z0-9_-]+$">>) of
-        {match, _} -> ok;
-        nomatch -> {error, <<"Invalid name: must be alphanumeric, underscore, or hyphen">>}
-    end.
+%% List stores are `duplicate_bag` ETS tables created (idempotently, under a
+%% long-lived owner) by beacon_ets_ffi:ensure_table/2. A duplicate_bag keeps
+%% every inserted {Key, Value} -- two identical chat messages are two
+%% messages. (A plain `bag` would silently drop the second one.) Values for a
+%% key are returned in insertion order.
 
 append(Store, Key, Value) ->
     ets:insert(Store, {Key, Value}),

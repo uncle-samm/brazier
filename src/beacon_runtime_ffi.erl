@@ -124,7 +124,7 @@ try_load_substate_encoder(Name) ->
                     FnName = binary_to_atom(<<"encode_substate_", Name/binary>>, utf8),
                     case erlang:function_exported(beacon_codec, FnName, 1) of
                         true ->
-                            {ok, fun(Model) -> erlang:apply(beacon_codec, FnName, [Model]) end};
+                            {ok, erlang:make_fun(beacon_codec, FnName, 1)};
                         false ->
                             {error, nil}
                     end;

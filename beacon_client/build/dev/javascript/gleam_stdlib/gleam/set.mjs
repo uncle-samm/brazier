@@ -56,6 +56,25 @@ export function is_empty(set) {
 }
 
 /**
+ * Inserts a member into the set.
+ *
+ * This function runs in logarithmic time.
+ *
+ * ## Examples
+ *
+ * ```gleam
+ * assert new()
+ *   |> insert(1)
+ *   |> insert(2)
+ *   |> size
+ *   == 2
+ * ```
+ */
+export function insert(set, member) {
+  return new Set($dict.insert(set.dict, member, token));
+}
+
+/**
  * Checks whether a set contains a given member.
  *
  * This function runs in logarithmic time.
@@ -122,6 +141,33 @@ export function to_list(set) {
 }
 
 /**
+ * Creates a new set of the members in a given list.
+ *
+ * This function runs in loglinear time.
+ *
+ * ## Examples
+ *
+ * ```gleam
+ * import gleam/int
+ * import gleam/list
+ *
+ * assert [1, 1, 2, 4, 3, 2]
+ *   |> from_list
+ *   |> to_list
+ *   |> list.sort(by: int.compare)
+ *   == [1, 2, 3, 4]
+ * ```
+ */
+export function from_list(members) {
+  let dict = $list.fold(
+    members,
+    $dict.new$(),
+    (m, k) => { return $dict.insert(m, k, token); },
+  );
+  return new Set(dict);
+}
+
+/**
  * Combines all entries into a single value by calling a given function on each
  * one.
  *
@@ -160,6 +206,27 @@ export function fold(set, initial, reducer) {
  */
 export function filter(set, predicate) {
   return new Set($dict.filter(set.dict, (m, _) => { return predicate(m); }));
+}
+
+/**
+ * Creates a new set from a given set with the result of applying the given
+ * function to each member.
+ *
+ * ## Examples
+ *
+ * ```gleam
+ * assert from_list([1, 2, 3, 4])
+ *   |> map(with: fn(x) { x * 2 })
+ *   |> to_list
+ *   == [2, 4, 6, 8]
+ * ```
+ */
+export function map(set, fun) {
+  return fold(
+    set,
+    new$(),
+    (acc, member) => { return insert(acc, fun(member)); },
+  );
 }
 
 /**
@@ -208,6 +275,25 @@ function order(first, second) {
 }
 
 /**
+ * Creates a new set that contains all members of both given sets.
+ *
+ * This function runs in loglinear time.
+ *
+ * ## Examples
+ *
+ * ```gleam
+ * assert union(from_list([1, 2]), from_list([2, 3])) |> to_list
+ *   == [1, 2, 3]
+ * ```
+ */
+export function union(first, second) {
+  let $ = order(first, second);
+  let larger = $[0];
+  let smaller = $[1];
+  return fold(smaller, larger, insert);
+}
+
+/**
  * Creates a new set that contains members that are present in both given sets.
  *
  * This function runs in loglinear time.
@@ -221,10 +307,8 @@ function order(first, second) {
  */
 export function intersection(first, second) {
   let $ = order(first, second);
-  let larger;
-  let smaller;
-  larger = $[0];
-  smaller = $[1];
+  let larger = $[0];
+  let smaller = $[1];
   return take(larger, to_list(smaller));
 }
 
@@ -278,6 +362,22 @@ export function is_disjoint(first, second) {
 }
 
 /**
+ * Creates a new set that contains members that are present in either set, but
+ * not both.
+ *
+ * ## Examples
+ *
+ * ```gleam
+ * assert symmetric_difference(from_list([1, 2, 3]), from_list([3, 4]))
+ *   |> to_list
+ *   == [1, 2, 4]
+ * ```
+ */
+export function symmetric_difference(first, second) {
+  return difference(union(first, second), intersection(first, second));
+}
+
+/**
  * Calls a function for each member in a set, discarding the return
  * value.
  *
@@ -306,108 +406,4 @@ export function each(set, fun) {
       return nil;
     },
   );
-}
-
-/**
- * Inserts a member into the set.
- *
- * This function runs in logarithmic time.
- *
- * ## Examples
- *
- * ```gleam
- * assert new()
- *   |> insert(1)
- *   |> insert(2)
- *   |> size
- *   == 2
- * ```
- */
-export function insert(set, member) {
-  return new Set($dict.insert(set.dict, member, token));
-}
-
-/**
- * Creates a new set of the members in a given list.
- *
- * This function runs in loglinear time.
- *
- * ## Examples
- *
- * ```gleam
- * import gleam/int
- * import gleam/list
- *
- * assert [1, 1, 2, 4, 3, 2]
- *   |> from_list
- *   |> to_list
- *   |> list.sort(by: int.compare)
- *   == [1, 2, 3, 4]
- * ```
- */
-export function from_list(members) {
-  let dict = $list.fold(
-    members,
-    $dict.new$(),
-    (m, k) => { return $dict.insert(m, k, token); },
-  );
-  return new Set(dict);
-}
-
-/**
- * Creates a new set from a given set with the result of applying the given
- * function to each member.
- *
- * ## Examples
- *
- * ```gleam
- * assert from_list([1, 2, 3, 4])
- *   |> map(with: fn(x) { x * 2 })
- *   |> to_list
- *   == [2, 4, 6, 8]
- * ```
- */
-export function map(set, fun) {
-  return fold(
-    set,
-    new$(),
-    (acc, member) => { return insert(acc, fun(member)); },
-  );
-}
-
-/**
- * Creates a new set that contains all members of both given sets.
- *
- * This function runs in loglinear time.
- *
- * ## Examples
- *
- * ```gleam
- * assert union(from_list([1, 2]), from_list([2, 3])) |> to_list
- *   == [1, 2, 3]
- * ```
- */
-export function union(first, second) {
-  let $ = order(first, second);
-  let larger;
-  let smaller;
-  larger = $[0];
-  smaller = $[1];
-  return fold(smaller, larger, insert);
-}
-
-/**
- * Creates a new set that contains members that are present in either set, but
- * not both.
- *
- * ## Examples
- *
- * ```gleam
- * assert symmetric_difference(from_list([1, 2, 3]), from_list([3, 4]))
- *   |> to_list
- *   == [1, 2, 4]
- * ```
- */
-export function symmetric_difference(first, second) {
-  return difference(union(first, second), intersection(first, second));
 }

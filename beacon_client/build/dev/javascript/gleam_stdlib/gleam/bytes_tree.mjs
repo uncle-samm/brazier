@@ -1,6 +1,6 @@
 import {
-  toList,
   Empty as $Empty,
+  List$Empty$const as $List$Empty$const,
   prepend as listPrepend,
   CustomType as $CustomType,
 } from "../gleam.mjs";
@@ -30,31 +30,6 @@ class Many extends $CustomType {
 }
 
 /**
- * Appends a bytes tree onto the end of another.
- *
- * Runs in constant time.
- */
-export function append_tree(first, second) {
-  if (second instanceof Bytes) {
-    return new Many(toList([first, second]));
-  } else if (second instanceof Text) {
-    return new Many(toList([first, second]));
-  } else {
-    let trees = second[0];
-    return new Many(listPrepend(first, trees));
-  }
-}
-
-/**
- * Prepends a bytes tree onto the start of another.
- *
- * Runs in constant time.
- */
-export function prepend_tree(second, first) {
-  return append_tree(first, second);
-}
-
-/**
  * Joins a list of bytes trees into a single one.
  *
  * Runs in constant time.
@@ -68,7 +43,65 @@ export function concat(trees) {
  * trees together.
  */
 export function new$() {
-  return concat(toList([]));
+  return concat($List$Empty$const);
+}
+
+function wrap_list(bits) {
+  return new Bytes(bits);
+}
+
+/**
+ * Creates a new bytes tree from a bit array.
+ *
+ * Runs in constant time.
+ */
+export function from_bit_array(bits) {
+  let _pipe = bits;
+  let _pipe$1 = $bit_array.pad_to_bytes(_pipe);
+  return wrap_list(_pipe$1);
+}
+
+/**
+ * Appends a bytes tree onto the end of another.
+ *
+ * Runs in constant time.
+ */
+export function append_tree(first, second) {
+  if (second instanceof Bytes) {
+    return new Many(listPrepend(first, listPrepend(second, $List$Empty$const)));
+  } else if (second instanceof Text) {
+    return new Many(listPrepend(first, listPrepend(second, $List$Empty$const)));
+  } else {
+    let trees = second[0];
+    return new Many(listPrepend(first, trees));
+  }
+}
+
+/**
+ * Prepends a bit array to the start of a bytes tree.
+ *
+ * Runs in constant time.
+ */
+export function prepend(second, first) {
+  return append_tree(from_bit_array(first), second);
+}
+
+/**
+ * Appends a bit array to the end of a bytes tree.
+ *
+ * Runs in constant time.
+ */
+export function append(first, second) {
+  return append_tree(first, from_bit_array(second));
+}
+
+/**
+ * Prepends a bytes tree onto the start of another.
+ *
+ * Runs in constant time.
+ */
+export function prepend_tree(second, first) {
+  return append_tree(first, second);
 }
 
 /**
@@ -102,49 +135,6 @@ export function append_string(first, second) {
 }
 
 /**
- * Creates a new bytes tree from a string tree.
- *
- * Runs in constant time when running on Erlang.
- * Runs in linear time otherwise.
- */
-export function from_string_tree(tree) {
-  return new Text(tree);
-}
-
-function wrap_list(bits) {
-  return new Bytes(bits);
-}
-
-/**
- * Creates a new bytes tree from a bit array.
- *
- * Runs in constant time.
- */
-export function from_bit_array(bits) {
-  let _pipe = bits;
-  let _pipe$1 = $bit_array.pad_to_bytes(_pipe);
-  return wrap_list(_pipe$1);
-}
-
-/**
- * Prepends a bit array to the start of a bytes tree.
- *
- * Runs in constant time.
- */
-export function prepend(second, first) {
-  return append_tree(from_bit_array(first), second);
-}
-
-/**
- * Appends a bit array to the end of a bytes tree.
- *
- * Runs in constant time.
- */
-export function append(first, second) {
-  return append_tree(first, from_bit_array(second));
-}
-
-/**
  * Joins a list of bit arrays into a single bytes tree.
  *
  * Runs in constant time.
@@ -153,6 +143,16 @@ export function concat_bit_arrays(bits) {
   let _pipe = bits;
   let _pipe$1 = $list.map(_pipe, from_bit_array);
   return concat(_pipe$1);
+}
+
+/**
+ * Creates a new bytes tree from a string tree.
+ *
+ * Runs in constant time when running on Erlang.
+ * Runs in linear time otherwise.
+ */
+export function from_string_tree(tree) {
+  return new Text(tree);
 }
 
 function to_list(loop$stack, loop$acc) {
@@ -203,8 +203,11 @@ function to_list(loop$stack, loop$acc) {
  * virtual machine and is highly optimised.
  */
 export function to_bit_array(tree) {
-  let _pipe = toList([toList([tree])]);
-  let _pipe$1 = to_list(_pipe, toList([]));
+  let _pipe = listPrepend(
+    listPrepend(tree, $List$Empty$const),
+    $List$Empty$const,
+  );
+  let _pipe$1 = to_list(_pipe, $List$Empty$const);
   let _pipe$2 = $list.reverse(_pipe$1);
   return $bit_array.concat(_pipe$2);
 }
@@ -215,8 +218,11 @@ export function to_bit_array(tree) {
  * Runs in linear time.
  */
 export function byte_size(tree) {
-  let _pipe = toList([toList([tree])]);
-  let _pipe$1 = to_list(_pipe, toList([]));
+  let _pipe = listPrepend(
+    listPrepend(tree, $List$Empty$const),
+    $List$Empty$const,
+  );
+  let _pipe$1 = to_list(_pipe, $List$Empty$const);
   return $list.fold(
     _pipe$1,
     0,

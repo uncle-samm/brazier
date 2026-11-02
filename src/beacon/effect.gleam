@@ -4,9 +4,23 @@
 ///
 /// Reference: Lustre's effect.gleam — same pattern (opaque type, from/none/batch),
 /// but Beacon's is simpler: only synchronous effects with dispatch callback.
+///
+/// ## Process lifecycle
+///
+/// `background`, `after` and `every` run in separate BEAM processes that are
+/// OWNED by the process performing the effect (the runtime actor). Owned
+/// processes monitor their owner and exit when it exits for any reason, so a
+/// runtime that stops or crashes never leaves timers or workers behind.
+///
+/// Keyed spawned effects are single-flight per key: performing a keyed
+/// spawned effect kills the process previously started under the same key
+/// (so re-keying an `every` timer replaces it instead of leaking it and
+/// consuming a timer slot), and `cancel` kills it as well.
+import beacon/log
 import gleam/erlang/process
 import gleam/int
 import gleam/list
+import gleam/option.{type Option, None, Some}
 
 /// An effect is a list of callbacks that will be executed by the runtime.
 /// Each callback receives a `dispatch` function to send messages back to
@@ -15,11 +29,16 @@ pub opaque type Effect(msg) {
   Effect(callbacks: List(Callback(msg)))
 }
 
+/// Spawned callbacks return `None` when the process was deliberately not
+/// started (timer cap reached, invalid interval) — never a placeholder pid.
 type Callback(msg) {
   SimpleCallback(run: fn(fn(msg) -> Nil) -> Nil)
   KeyedCallback(key: String, run: fn(fn(msg) -> Nil) -> Nil)
-  SpawnedCallback(run: fn(fn(msg) -> Nil) -> process.Pid)
-  KeyedSpawnedCallback(key: String, run: fn(fn(msg) -> Nil) -> process.Pid)
+  SpawnedCallback(run: fn(fn(msg) -> Nil) -> Option(process.Pid))
+  KeyedSpawnedCallback(
+    key: String,
+    run: fn(fn(msg) -> Nil) -> Option(process.Pid),
+  )
   CancelKeyCallback(key: String)
 }
 
@@ -110,14 +129,20 @@ pub fn map(effect: Effect(a), f: fn(a) -> b) -> Effect(b) {
 }
 
 /// Execute all callbacks in the effect with the given dispatch function.
-/// Called by the runtime — not by user code.
+/// Called by the runtime — not by user code. Spawned processes are still
+/// owned by (and die with) the calling process.
 pub fn perform(
   effect: Effect(msg),
   dispatch: fn(msg) -> Nil,
   dispatch_keyed: fn(String, Int, msg) -> Nil,
 ) -> Nil {
-  let _ = perform_tracked(effect, dispatch, dispatch_keyed)
-  Nil
+  let pids = perform_tracked(effect, dispatch, dispatch_keyed)
+  log.debug(
+    "beacon.effect",
+    "Performed effect; spawned "
+      <> int.to_string(list.length(pids))
+      <> " owned processes",
+  )
 }
 
 /// Execute callbacks and return framework-owned spawned process IDs.
@@ -138,17 +163,54 @@ pub fn perform_tracked(
         run(fn(message) { dispatch_keyed(key, generation, message) })
         pids
       }
-      SpawnedCallback(run) -> [run(dispatch), ..pids]
+      SpawnedCallback(run) ->
+        case run(dispatch) {
+          Some(pid) -> [pid, ..pids]
+          None -> pids
+        }
       KeyedSpawnedCallback(key, run) -> {
         let generation = register_key_generation(key)
-        [run(fn(message) { dispatch_keyed(key, generation, message) }), ..pids]
+        // Stop the previous process for this key BEFORE starting the new one
+        // so a re-keyed timer frees its slot before the cap is checked.
+        stop_keyed_process(key, "re-keyed")
+        case run(fn(message) { dispatch_keyed(key, generation, message) }) {
+          Some(pid) -> {
+            track_keyed_process(key, pid)
+            [pid, ..pids]
+          }
+          None -> pids
+        }
       }
       CancelKeyCallback(key) -> {
         cancel_key_generation(key)
+        stop_keyed_process(key, "cancelled")
         pids
       }
     }
   })
+}
+
+fn stop_keyed_process(key: String, reason: String) -> Nil {
+  case take_keyed_process(key) {
+    Some(pid) ->
+      case stop_process(pid) {
+        True ->
+          log.debug(
+            "beacon.effect",
+            "Stopped keyed effect process for key "
+              <> key
+              <> " ("
+              <> reason
+              <> ")",
+          )
+        False ->
+          log.debug(
+            "beacon.effect",
+            "Keyed effect process for key " <> key <> " had already exited",
+          )
+      }
+    None -> Nil
+  }
 }
 
 /// Create a background effect that runs in a separate BEAM process.
@@ -167,7 +229,9 @@ pub fn perform_tracked(
 pub fn background(callback: fn(fn(msg) -> Nil) -> Nil) -> Effect(msg) {
   Effect(callbacks: [
     SpawnedCallback(run: fn(dispatch) {
-      process.spawn_unlinked(fn() { callback(dispatch) })
+      let pid = spawn_owned(fn() { callback(dispatch) })
+      log.debug("beacon.effect", "Started owned background effect process")
+      Some(pid)
     }),
   ])
 }
@@ -177,10 +241,16 @@ pub fn background(callback: fn(fn(msg) -> Nil) -> Nil) -> Effect(msg) {
 const max_timers = 10
 
 /// Create a periodic timer effect. Dispatches `make_msg()` every `interval_ms`.
-/// The timer runs in a separate BEAM process and continues until the runtime shuts down.
-/// Capped at 10 concurrent timers per runtime — additional timers are rejected with a warning.
+/// The timer runs in a separate BEAM process owned by the runtime and stops
+/// when the runtime stops or crashes.
+/// Capped at 10 concurrent timers per runtime — additional timers are
+/// rejected with a warning. An `interval_ms` below 1 is rejected with an
+/// error log (it would be a busy loop).
 ///
-/// Note: each call creates a NEW timer. Guard against duplicate calls in update.
+/// Each un-keyed call creates a NEW timer. To replace a timer instead of
+/// adding one, key it: `effect.keyed("clock", effect.every(1000, Tick))` —
+/// performing it again stops the previous "clock" timer first, and
+/// `effect.cancel` (via `effect.cancellable`) stops it outright.
 ///
 /// Reference: Phoenix LiveView `Process.send_after` in `handle_info`.
 ///
@@ -192,19 +262,38 @@ const max_timers = 10
 pub fn every(interval_ms: Int, make_msg: fn() -> msg) -> Effect(msg) {
   Effect(callbacks: [
     SpawnedCallback(run: fn(dispatch) {
-      let current = live_timer_count()
-      case current >= max_timers {
+      case interval_ms < 1 {
         True -> {
-          log_timer_limit_warning(current)
-          process.spawn_unlinked(fn() { Nil })
+          log.error(
+            "beacon.effect",
+            "effect.every rejected: interval_ms must be >= 1, got "
+              <> int.to_string(interval_ms),
+          )
+          None
         }
         False -> {
-          let pid =
-            process.spawn_unlinked(fn() {
-              timer_loop(interval_ms, make_msg, dispatch)
-            })
-          register_timer(pid)
-          pid
+          let current = live_timer_count()
+          case current >= max_timers {
+            True -> {
+              log_timer_limit_warning(current, max_timers)
+              None
+            }
+            False -> {
+              let pid = start_interval(interval_ms, make_msg, dispatch)
+              register_timer(pid)
+              log.debug(
+                "beacon.effect",
+                "Started interval timer ("
+                  <> int.to_string(interval_ms)
+                  <> "ms, "
+                  <> int.to_string(current + 1)
+                  <> "/"
+                  <> int.to_string(max_timers)
+                  <> " timers)",
+              )
+              Some(pid)
+            }
+          }
         }
       }
     }),
@@ -224,7 +313,39 @@ fn register_timer(pid: process.Pid) -> Nil
 
 /// Log a warning when the timer limit is reached.
 @external(erlang, "beacon_effect_ffi", "log_timer_limit_warning")
-fn log_timer_limit_warning(current: Int) -> Nil
+fn log_timer_limit_warning(current: Int, max: Int) -> Nil
+
+/// Spawn a process owned by the caller: it is killed when the caller exits.
+@external(erlang, "beacon_effect_ffi", "spawn_owned")
+fn spawn_owned(work: fn() -> Nil) -> process.Pid
+
+/// Start an owned periodic timer (send_after re-armed per tick).
+@external(erlang, "beacon_effect_ffi", "start_interval")
+fn start_interval(
+  interval_ms: Int,
+  make_msg: fn() -> msg,
+  dispatch: fn(msg) -> Nil,
+) -> process.Pid
+
+/// Start an owned one-shot timer.
+@external(erlang, "beacon_effect_ffi", "start_after")
+fn start_after(
+  delay_ms: Int,
+  make_msg: fn() -> msg,
+  dispatch: fn(msg) -> Nil,
+) -> process.Pid
+
+/// Remove and return the process currently tracked for a key.
+@external(erlang, "beacon_effect_ffi", "take_keyed_process")
+fn take_keyed_process(key: String) -> Option(process.Pid)
+
+/// Track the live process for a key.
+@external(erlang, "beacon_effect_ffi", "track_keyed_process")
+fn track_keyed_process(key: String, pid: process.Pid) -> Nil
+
+/// Kill a process and free its timer slot. Returns whether it was alive.
+@external(erlang, "beacon_effect_ffi", "stop_process")
+fn stop_process(pid: process.Pid) -> Bool
 
 @external(erlang, "beacon_effect_ffi", "unique_integer")
 fn unique_integer() -> Int
@@ -238,17 +359,9 @@ fn cancel_key_generation(key: String) -> Nil
 @external(erlang, "beacon_effect_ffi", "is_current_key_generation")
 pub fn is_current_key_generation(key: String, generation: Int) -> Bool
 
-fn timer_loop(
-  interval_ms: Int,
-  make_msg: fn() -> msg,
-  dispatch: fn(msg) -> Nil,
-) -> Nil {
-  process.sleep(interval_ms)
-  dispatch(make_msg())
-  timer_loop(interval_ms, make_msg, dispatch)
-}
-
 /// Create a single delayed effect. Dispatches `make_msg()` once after `delay_ms`.
+/// The timer is owned by the runtime and is cancelled if the runtime stops
+/// first. A negative `delay_ms` is rejected with an error log.
 ///
 /// Example:
 /// ```gleam
@@ -257,10 +370,23 @@ fn timer_loop(
 pub fn after(delay_ms: Int, make_msg: fn() -> msg) -> Effect(msg) {
   Effect(callbacks: [
     SpawnedCallback(run: fn(dispatch) {
-      process.spawn_unlinked(fn() {
-        process.sleep(delay_ms)
-        dispatch(make_msg())
-      })
+      case delay_ms < 0 {
+        True -> {
+          log.error(
+            "beacon.effect",
+            "effect.after rejected: delay_ms must be >= 0, got "
+              <> int.to_string(delay_ms),
+          )
+          None
+        }
+        False -> {
+          log.debug(
+            "beacon.effect",
+            "Started delayed effect (" <> int.to_string(delay_ms) <> "ms)",
+          )
+          Some(start_after(delay_ms, make_msg, dispatch))
+        }
+      }
     }),
   ])
 }

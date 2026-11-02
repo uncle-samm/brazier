@@ -2,11 +2,11 @@ import { Ok, Error, Empty as $Empty, remainderInt, divideInt } from "../gleam.mj
 import * as $float from "../gleam/float.mjs";
 import * as $order from "../gleam/order.mjs";
 import {
+  identity as to_float,
   parse_int as parse,
   int_from_base_string as do_base_parse,
   to_string,
   int_to_base_string as do_to_base_string,
-  identity as to_float,
   bitwise_and,
   bitwise_not,
   bitwise_or,
@@ -47,6 +47,57 @@ export function absolute_value(x) {
   } else {
     return x * -1;
   }
+}
+
+/**
+ * Returns the result of the base being raised to the power of the
+ * exponent, as a `Float`.
+ *
+ * ## Examples
+ *
+ * ```gleam
+ * assert power(2, -1.0) == Ok(0.5)
+ * ```
+ *
+ * ```gleam
+ * assert power(2, 2.0) == Ok(4.0)
+ * ```
+ *
+ * ```gleam
+ * assert power(8, 1.5) == Ok(22.627416997969522)
+ * ```
+ *
+ * ```gleam
+ * assert 4 |> power(of: 2.0) == Ok(16.0)
+ * ```
+ *
+ * ```gleam
+ * assert power(-1, 0.5) == Error(Nil)
+ * ```
+ */
+export function power(base, exponent) {
+  let _pipe = base;
+  let _pipe$1 = to_float(_pipe);
+  return $float.power(_pipe$1, exponent);
+}
+
+/**
+ * Returns the square root of the input as a `Float`.
+ *
+ * ## Examples
+ *
+ * ```gleam
+ * assert square_root(4) == Ok(2.0)
+ * ```
+ *
+ * ```gleam
+ * assert square_root(-16) == Error(Nil)
+ * ```
+ */
+export function square_root(x) {
+  let _pipe = x;
+  let _pipe$1 = to_float(_pipe);
+  return $float.square_root(_pipe$1);
 }
 
 /**
@@ -173,84 +224,20 @@ export function to_base36(x) {
 }
 
 /**
- * Returns the result of the base being raised to the power of the
- * exponent, as a `Float`.
+ * Compares two ints, returning the larger of the two.
  *
  * ## Examples
  *
  * ```gleam
- * assert power(2, -1.0) == Ok(0.5)
- * ```
- *
- * ```gleam
- * assert power(2, 2.0) == Ok(4.0)
- * ```
- *
- * ```gleam
- * assert power(8, 1.5) == Ok(22.627416997969522)
- * ```
- *
- * ```gleam
- * assert 4 |> power(of: 2.0) == Ok(16.0)
- * ```
- *
- * ```gleam
- * assert power(-1, 0.5) == Error(Nil)
+ * assert max(2, 3) == 3
  * ```
  */
-export function power(base, exponent) {
-  let _pipe = base;
-  let _pipe$1 = to_float(_pipe);
-  return $float.power(_pipe$1, exponent);
-}
-
-/**
- * Returns the square root of the input as a `Float`.
- *
- * ## Examples
- *
- * ```gleam
- * assert square_root(4) == Ok(2.0)
- * ```
- *
- * ```gleam
- * assert square_root(-16) == Error(Nil)
- * ```
- */
-export function square_root(x) {
-  let _pipe = x;
-  let _pipe$1 = to_float(_pipe);
-  return $float.square_root(_pipe$1);
-}
-
-/**
- * Compares two ints, returning an order.
- *
- * ## Examples
- *
- * ```gleam
- * assert compare(2, 3) == Lt
- * ```
- *
- * ```gleam
- * assert compare(4, 3) == Gt
- * ```
- *
- * ```gleam
- * assert compare(3, 3) == Eq
- * ```
- */
-export function compare(a, b) {
-  let $ = a === b;
+export function max(a, b) {
+  let $ = a > b;
   if ($) {
-    return new $order.Eq();
+    return a;
   } else {
-    let $1 = a < b;
-    if ($1) {
-      return new $order.Lt();
-    } else {
-      return new $order.Gt();
-    }
+    return b;
   }
 }
 
@@ -265,24 +252,6 @@ export function compare(a, b) {
  */
 export function min(a, b) {
   let $ = a < b;
-  if ($) {
-    return a;
-  } else {
-    return b;
-  }
-}
-
-/**
- * Compares two ints, returning the larger of the two.
- *
- * ## Examples
- *
- * ```gleam
- * assert max(2, 3) == 3
- * ```
- */
-export function max(a, b) {
-  let $ = a > b;
   if ($) {
     return a;
   } else {
@@ -317,6 +286,37 @@ export function clamp(x, min_bound, max_bound) {
     let _pipe = x;
     let _pipe$1 = min(_pipe, max_bound);
     return max(_pipe$1, min_bound);
+  }
+}
+
+/**
+ * Compares two ints, returning an order.
+ *
+ * ## Examples
+ *
+ * ```gleam
+ * assert compare(2, 3) == Lt
+ * ```
+ *
+ * ```gleam
+ * assert compare(4, 3) == Gt
+ * ```
+ *
+ * ```gleam
+ * assert compare(3, 3) == Eq
+ * ```
+ */
+export function compare(a, b) {
+  let $ = a === b;
+  if ($) {
+    return $order.Order$Eq$const;
+  } else {
+    let $1 = a < b;
+    if ($1) {
+      return $order.Order$Lt$const;
+    } else {
+      return $order.Order$Gt$const;
+    }
   }
 }
 

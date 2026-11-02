@@ -1,10 +1,14 @@
-import { toList, CustomType as $CustomType, isEqual } from "../gleam.mjs";
+import {
+  List$Empty$const as $List$Empty$const,
+  CustomType as $CustomType,
+  isEqual,
+} from "../gleam.mjs";
 import * as $list from "../gleam/list.mjs";
 import {
-  add as append_tree,
   concat as from_strings,
-  concat,
   identity as from_string,
+  add as append_tree,
+  concat,
   identity as to_string,
   length as byte_size,
   lowercase,
@@ -28,22 +32,14 @@ export {
 };
 
 class All extends $CustomType {}
-
-/**
- * Prepends some `StringTree` onto the start of another.
- *
- * Runs in constant time.
- */
-export function prepend_tree(tree, prefix) {
-  return append_tree(prefix, tree);
-}
+const Direction$All$const = new All();
 
 /**
  * Create an empty `StringTree`. Useful as the start of a pipe chaining many
  * trees together.
  */
 export function new$() {
-  return from_strings(toList([]));
+  return from_strings($List$Empty$const);
 }
 
 /**
@@ -62,6 +58,15 @@ export function prepend(tree, prefix) {
  */
 export function append(tree, second) {
   return append_tree(tree, from_string(second));
+}
+
+/**
+ * Prepends some `StringTree` onto the start of another.
+ *
+ * Runs in constant time.
+ */
+export function prepend_tree(tree, prefix) {
+  return append_tree(prefix, tree);
 }
 
 /**
