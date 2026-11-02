@@ -1,41 +1,22 @@
 -module(beacon_connection_tracker_ffi).
--export([init/0, increment/0, decrement/0, count/0]).
+%% Connection-slot API used by the transport handler code.
+%%
+%% Slots are owned by the listener's connection owner (beacon_http_conns),
+%% which takes a slot when it starts a handler process and releases it when
+%% that process exits for any reason. These functions only operate on the
+%% calling handler's own slot:
+%%   decrement/0 releases the caller's slot early (idempotent) and returns
+%%               the listener's remaining live connection count.
+%%   count/0     returns the listener's live connection count.
+%% Both crash loudly when called outside a connection handler process.
+-export([init/0, decrement/0, count/0]).
 
-%% Initialize the ETS table for tracking global connection count.
-%% Safe to call multiple times — only creates the table on first call.
+%% Kept for API compatibility: there is no global table to create any more.
 init() ->
-    case ets:info(beacon_conn_tracker) of
-        undefined ->
-            try
-                ets:new(beacon_conn_tracker, [set, public, named_table]),
-                ets:insert(beacon_conn_tracker, {count, 0})
-            catch
-                error:badarg ->
-                    %% Another process created the table between our check and create.
-                    %% This is fine — the table exists now.
-                    ok
-            end,
-            nil;
-        _ ->
-            nil
-    end.
+    nil.
 
-%% Atomically increment the global connection count. Returns the new value.
-increment() ->
-    init(),
-    ets:update_counter(beacon_conn_tracker, count, 1).
-
-%% Atomically decrement the global connection count. Returns the new value.
-%% Clamps to 0 to prevent negative counts from bugs.
 decrement() ->
-    init(),
-    New = ets:update_counter(beacon_conn_tracker, count, {2, -1, 0, 0}),
-    New.
+    beacon_http_conns:release_self().
 
-%% Read the current connection count.
 count() ->
-    init(),
-    case ets:lookup(beacon_conn_tracker, count) of
-        [{count, N}] -> N;
-        _ -> 0
-    end.
+    beacon_http_conns:count_self().

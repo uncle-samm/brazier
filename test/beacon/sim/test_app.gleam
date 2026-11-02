@@ -1,5 +1,6 @@
 /// Test application configurations for simulation testing.
-/// Each function starts a real Beacon app on a given port.
+/// Each function starts a real Beacon app on an OS-assigned port (port 0);
+/// read the bound port from the returned `App.port`.
 import beacon/application
 import beacon/effect
 import beacon/element
@@ -18,12 +19,10 @@ pub type CounterMsg {
   CounterInc
 }
 
-pub fn start_counter_app(
-  port: Int,
-) -> Result(application.App, error.BeaconError) {
+pub fn start_counter_app() -> Result(application.App, error.BeaconError) {
   let config =
     application.AppConfig(
-      port: port,
+      port: 0,
       init: fn() { #(CounterModel(count: 0), effect.none()) },
       update: fn(model: CounterModel, _msg) {
         #(CounterModel(count: model.count + 1), effect.none())
@@ -73,12 +72,11 @@ pub type TickerMsg {
 }
 
 pub fn start_ticker_app(
-  port: Int,
   interval_ms: Int,
 ) -> Result(application.App, error.BeaconError) {
   let config =
     application.AppConfig(
-      port: port,
+      port: 0,
       init: fn() {
         #(TickerModel(tick: 0), effect.every(interval_ms, fn() { Tick }))
       },
@@ -116,16 +114,3 @@ pub fn start_ticker_app(
     )
   application.start_advanced(config)
 }
-
-/// Generate a unique port in the 20000-48999 range for parallel test execution.
-/// The range stays below 49152 so it never collides with ports the OS hands
-/// out for outgoing connections (the macOS/IANA ephemeral range is 49152-65535).
-pub fn unique_port() -> Int {
-  20_000 + { abs(erlang_unique_pos()) % 29_000 }
-}
-
-@external(erlang, "erlang", "abs")
-fn abs(n: Int) -> Int
-
-@external(erlang, "erlang", "unique_integer")
-fn erlang_unique_pos() -> Int

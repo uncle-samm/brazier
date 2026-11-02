@@ -22,6 +22,7 @@ import gleam/bytes_tree
 import gleam/dynamic.{type Dynamic}
 import gleam/dynamic/decode
 import gleam/erlang/process
+import gleam/http
 import gleam/http/request.{type Request}
 import gleam/http/response
 import gleam/int
@@ -139,6 +140,33 @@ pub type SecurityLimits {
     max_http_header_bytes: Int,
     /// Timeout for request line/header reads before upgrade, in milliseconds. Default: 5000.
     pre_upgrade_timeout_ms: Int,
+    // HTTP limits
+    /// Maximum concurrent connections from one peer IP. Peers listed in
+    /// `trusted_proxies` are exempt (they multiplex many clients). Default: 256.
+    max_connections_per_ip: Int,
+    /// Maximum request-line length in bytes; longer lines get 414. Default: 8192.
+    max_request_line_bytes: Int,
+    /// Maximum declared request body size in bytes; larger Content-Length
+    /// gets 413 before the handler runs. Default: 8388608 (8MB).
+    max_body_bytes: Int,
+    /// Maximum wait for each chunk of request body, in milliseconds. Default: 30000.
+    body_read_timeout_ms: Int,
+    /// Absolute deadline for reading a request body, in milliseconds from
+    /// the moment its head was parsed (the head itself is bounded by
+    /// `pre_upgrade_timeout_ms`). Default: 60000.
+    request_timeout_ms: Int,
+    /// How long an idle keep-alive connection waits for the next request,
+    /// in milliseconds. Default: 15000.
+    keepalive_idle_timeout_ms: Int,
+    /// Maximum requests served on one keep-alive connection. Default: 1000.
+    max_keepalive_requests: Int,
+    /// Maximum time a blocked socket send may take before the connection
+    /// is closed, in milliseconds. Default: 30000.
+    send_timeout_ms: Int,
+    /// Reverse proxies (IP addresses or CIDRs) whose X-Forwarded-For and
+    /// Forwarded headers are believed. Empty means the socket peer address
+    /// is always the client address. Default: [].
+    trusted_proxies: List(String),
   )
 }
 
@@ -151,6 +179,16 @@ pub fn default_security_limits() -> SecurityLimits {
     max_http_headers: 100,
     max_http_header_bytes: 65_536,
     pre_upgrade_timeout_ms: 5000,
+    // HTTP limits
+    max_connections_per_ip: 256,
+    max_request_line_bytes: 8192,
+    max_body_bytes: 8_388_608,
+    body_read_timeout_ms: 30_000,
+    request_timeout_ms: 60_000,
+    keepalive_idle_timeout_ms: 15_000,
+    max_keepalive_requests: 1000,
+    send_timeout_ms: 30_000,
+    trusted_proxies: [],
   )
 }
 
@@ -249,9 +287,6 @@ fn erlang_unique_integer() -> Int
 
 @external(erlang, "beacon_connection_tracker_ffi", "init")
 pub fn connection_tracker_init() -> Nil
-
-@external(erlang, "beacon_connection_tracker_ffi", "increment")
-fn connection_tracker_increment() -> Int
 
 @external(erlang, "beacon_connection_tracker_ffi", "decrement")
 fn connection_tracker_decrement() -> Int
@@ -1151,89 +1186,303 @@ fn route_framework_request(
 
 // --- Per-Connection Handler ---
 
-/// Handle a single TCP connection: read HTTP request, route to WS or HTTP handler.
+/// Unread request body bytes the server discards itself so a keep-alive
+/// connection can be reused (cowboy uses the same idea). A larger unread
+/// body closes the connection instead.
+const max_discard_body_bytes = 65_536
+
+/// Methods answered for `OPTIONS *`.
+const allowed_methods_header = "GET, HEAD, POST, PUT, DELETE, OPTIONS, PATCH"
+
+/// Serve one TCP connection: HTTP/1.1 requests in a keep-alive loop until
+/// the connection closes or is upgraded to a WebSocket.
 /// Middleware runs on ALL requests, including /ws, before routing.
-fn per_connection_handler(socket: Socket, config: TransportConfig) -> Nil {
-  let conn_count = connection_tracker_increment()
-  case conn_count > config.security_limits.max_connections {
-    True -> {
+///
+/// The connection slot is owned by the listener's connection owner, which
+/// releases it when this process exits, so there is no manual bookkeeping
+/// on the HTTP path.
+fn per_connection_handler(
+  socket: Socket,
+  config: TransportConfig,
+  handler: fn(Request(Connection)) -> response.Response(ResponseBody),
+) -> Nil {
+  log.debug("beacon.transport", "Connection handler started")
+  serve_requests(socket, config, handler, 0)
+}
+
+fn serve_requests(
+  socket: Socket,
+  config: TransportConfig,
+  handler: fn(Request(Connection)) -> response.Response(ResponseBody),
+  served: Int,
+) -> Nil {
+  let limits = config.security_limits
+  let head_limits =
+    transport_http.HeadLimits(
+      max_headers: limits.max_http_headers,
+      max_header_bytes: limits.max_http_header_bytes,
+      max_request_line_bytes: limits.max_request_line_bytes,
+    )
+  // The first request must arrive promptly after accept (slowloris guard);
+  // later ones may wait for the keep-alive idle timeout, but once a request
+  // line arrived its headers must follow within the pre-upgrade timeout.
+  let timing = case served {
+    0 ->
+      transport_http.HeadTiming(
+        request_line_timeout_ms: limits.pre_upgrade_timeout_ms,
+        header_deadline: transport_http.SharedWithRequestLine,
+      )
+    _ ->
+      transport_http.HeadTiming(
+        request_line_timeout_ms: limits.keepalive_idle_timeout_ms,
+        header_deadline: transport_http.AfterRequestLine(
+          limits.pre_upgrade_timeout_ms,
+        ),
+      )
+  }
+  case transport_http.read_request_head(socket, head_limits, timing) {
+    Error(err) ->
+      case transport_http.get_head_error_status(err) {
+        None -> {
+          log.debug(
+            "beacon.transport",
+            "Closing connection after "
+              <> int.to_string(served)
+              <> " requests: "
+              <> transport_http.get_head_error_message(err),
+          )
+          server.close(socket)
+        }
+        Some(status) ->
+          transport_http.write_error(
+            socket,
+            status,
+            transport_http.get_head_error_message(err),
+          )
+      }
+    Ok(#(req, version)) ->
+      case transport_http.check_framing(req, version, limits.max_body_bytes) {
+        Error(transport_http.FramingError(status: status, reason: reason)) ->
+          transport_http.write_error(socket, status, reason)
+        Ok(framing) ->
+          case request.path_segments(req) {
+            ["ws"] -> serve_ws_request(socket, req, framing, config)
+            _ ->
+              serve_http_request(
+                socket,
+                req,
+                version,
+                framing,
+                config,
+                handler,
+                served,
+              )
+          }
+      }
+  }
+}
+
+/// Route a /ws request: middleware, then the WebSocket upgrade. The
+/// connection never returns to the HTTP loop afterwards.
+fn serve_ws_request(
+  socket: Socket,
+  req: Request(Connection),
+  framing: transport_http.BodyFraming,
+  config: TransportConfig,
+) -> Nil {
+  case framing.content_length, transport_http.get_buffered_byte_count(socket) {
+    0, 0 ->
+      case check_middleware(req, config.middlewares) {
+        Ok(Nil) -> handle_ws_request(socket, req, config)
+        Error(resp) -> {
+          case transport_http.write_response(socket, resp) {
+            Ok(Nil) -> Nil
+            Error(reason) ->
+              log.error(
+                "beacon.transport",
+                "Failed to write middleware rejection: " <> reason,
+              )
+          }
+          transport_http.close_gracefully(socket)
+        }
+      }
+    0, buffered -> {
+      // RFC 6455 4.1: the client must wait for the handshake response
+      // before sending frames. The frame reader starts from the socket, so
+      // bytes already buffered here would be silently lost.
       log.warning(
         "beacon.transport",
-        "Global connection limit reached ("
-          <> int.to_string(conn_count)
-          <> "/"
-          <> int.to_string(config.security_limits.max_connections)
-          <> ") — rejecting pre-upgrade connection",
+        "Rejecting WebSocket upgrade: client sent "
+          <> int.to_string(buffered)
+          <> " bytes before the handshake completed",
       )
-      let _ = connection_tracker_decrement()
-      transport_http.write_error(socket, 503, "Too many connections")
+      transport_http.write_error(
+        socket,
+        400,
+        "Data received before the WebSocket handshake completed",
+      )
     }
-    False -> {
-      log.debug(
+    length, _ -> {
+      // Body bytes after an upgrade request would be parsed as WebSocket
+      // frames; refuse instead.
+      log.warning(
         "beacon.transport",
-        "Global connections after accept: " <> int.to_string(conn_count),
+        "Rejecting WebSocket upgrade request with a "
+          <> int.to_string(length)
+          <> " byte body",
       )
-      case
-        transport_http.read_request_with_limits(
-          socket,
-          config.security_limits.max_http_headers,
-          config.security_limits.max_http_header_bytes,
-          config.security_limits.pre_upgrade_timeout_ms,
-        )
-      {
-        Ok(req) -> {
-          case request.path_segments(req) {
-            ["ws"] -> {
-              case check_middleware(req, config.middlewares) {
-                Ok(Nil) -> handle_ws_request(socket, req, config)
-                Error(resp) -> {
-                  case transport_http.write_response(socket, resp) {
-                    Ok(Nil) -> Nil
-                    Error(reason) ->
-                      log.error(
-                        "beacon.transport",
-                        "Failed to write middleware rejection: " <> reason,
-                      )
-                  }
-                  server.close(socket)
-                  let _ = connection_tracker_decrement()
-                  Nil
-                }
-              }
-            }
-            _ -> {
-              let handler = create_handler(config)
-              let resp = handler(req)
-              case transport_http.write_response(socket, resp) {
-                Ok(Nil) -> Nil
-                Error(reason) ->
-                  log.error(
-                    "beacon.transport",
-                    "Failed to write response: " <> reason,
-                  )
-              }
-              server.close(socket)
-              let _ = connection_tracker_decrement()
-              Nil
-            }
-          }
-        }
+      transport_http.write_error(
+        socket,
+        400,
+        "WebSocket upgrade requests must not have a body",
+      )
+    }
+  }
+}
+
+fn serve_http_request(
+  socket: Socket,
+  req: Request(Connection),
+  version: transport_http.HttpVersion,
+  framing: transport_http.BodyFraming,
+  config: TransportConfig,
+  handler: fn(Request(Connection)) -> response.Response(ResponseBody),
+  served: Int,
+) -> Nil {
+  let limits = config.security_limits
+  let deadline = transport_http.get_monotonic_ms() + limits.request_timeout_ms
+  transport_http.begin_body(
+    socket,
+    framing,
+    limits.body_read_timeout_ms,
+    deadline,
+  )
+  let request_handler = case req.method, req.path {
+    http.Options, "*" -> asterisk_options_response
+    _, _ -> handler
+  }
+  let result = transport_http.run_handler(request_handler, req)
+  // A 100-continue client is still waiting for permission to send an unread
+  // body; reading it ourselves would invite it, so close instead.
+  let discard_limit = case framing.expect_continue {
+    True -> 0
+    False -> max_discard_body_bytes
+  }
+  let body = transport_http.finish_body(socket, discard_limit)
+  case result {
+    Error(_) -> {
+      // run_handler already logged the crash with its stacktrace.
+      let resp =
+        transport_http.create_error_response(500, "Internal Server Error")
+      case write_response_for(socket, req, version, resp, False) {
+        Ok(Nil) -> Nil
+        Error(reason) ->
+          log.warning(
+            "beacon.transport",
+            "Failed to write 500 after handler crash: " <> reason,
+          )
+      }
+      transport_http.close_gracefully(socket)
+    }
+    Ok(resp) -> {
+      let served = served + 1
+      let keep_alive =
+        decide_keep_alive(req, version, resp, body, served, limits)
+      case write_response_for(socket, req, version, resp, keep_alive) {
         Error(reason) -> {
           log.error(
             "beacon.transport",
-            "Failed to read HTTP request: " <> reason,
+            "Failed to write response, closing connection: " <> reason,
           )
           server.close(socket)
-          let _ = connection_tracker_decrement()
-          Nil
         }
+        Ok(Nil) ->
+          case keep_alive {
+            True -> serve_requests(socket, config, handler, served)
+            False -> transport_http.close_gracefully(socket)
+          }
       }
     }
   }
 }
 
+fn write_response_for(
+  socket: Socket,
+  req: Request(Connection),
+  version: transport_http.HttpVersion,
+  resp: response.Response(ResponseBody),
+  keep_alive: Bool,
+) -> Result(Nil, String) {
+  transport_http.write_framed_response(
+    socket,
+    resp,
+    transport_http.ResponseFraming(
+      version: version,
+      head_request: req.method == http.Head,
+      keep_alive: keep_alive,
+    ),
+  )
+}
+
+/// Whether the connection can serve another request after this one.
+fn decide_keep_alive(
+  req: Request(Connection),
+  version: transport_http.HttpVersion,
+  resp: response.Response(ResponseBody),
+  body: transport_http.BodyOutcome,
+  served: Int,
+  limits: SecurityLimits,
+) -> Bool {
+  case
+    transport_http.is_keep_alive_requested(req, version),
+    transport_http.is_close_requested_by_response(resp),
+    body,
+    served >= limits.max_keepalive_requests
+  {
+    False, _, _, _ -> False
+    _, True, _, _ -> False
+    _, _, transport_http.BodyUnread(remaining), _ -> {
+      log.info(
+        "beacon.transport",
+        "Closing connection: handler left "
+          <> int.to_string(remaining)
+          <> " request body bytes unread",
+      )
+      False
+    }
+    _, _, transport_http.BodyFailed, _ -> {
+      log.info(
+        "beacon.transport",
+        "Closing connection after a failed request body read",
+      )
+      False
+    }
+    _, _, transport_http.BodyConsumed, True -> {
+      log.info(
+        "beacon.transport",
+        "Closing connection after "
+          <> int.to_string(served)
+          <> " requests (max_keepalive_requests)",
+      )
+      False
+    }
+    True, False, transport_http.BodyConsumed, False -> True
+  }
+}
+
+/// `OPTIONS *` (RFC 9110 9.3.7) asks about the server as a whole.
+fn asterisk_options_response(
+  _req: Request(Connection),
+) -> response.Response(ResponseBody) {
+  log.debug("beacon.transport", "Answering OPTIONS *")
+  response.new(204)
+  |> response.set_header("allow", allowed_methods_header)
+  |> response.set_body(Bytes(bytes_tree.new()))
+}
+
 /// Run middleware on a request and check if it short-circuits.
 /// Returns Ok(Nil) if middleware passes through, Error(resp) if it rejects.
+/// A crashing middleware rejects the request with 500.
 fn check_middleware(
   req: Request(Connection),
   middlewares: List(middleware.Middleware),
@@ -1247,10 +1496,17 @@ fn check_middleware(
         |> response.set_body(Bytes(bytes_tree.new()))
       }
       let piped = middleware.pipeline(mws, marker)
-      let result = piped(req)
-      case result.status {
-        101 -> Ok(Nil)
-        _ -> Error(result)
+      case transport_http.run_handler(piped, req) {
+        Ok(result) ->
+          case result.status {
+            101 -> Ok(Nil)
+            _ -> Error(result)
+          }
+        Error(_) ->
+          Error(transport_http.create_error_response(
+            500,
+            "Internal Server Error",
+          ))
       }
     }
   }
@@ -1406,11 +1662,47 @@ fn gzip_compress(data: BitArray) -> BitArray
 /// Default number of acceptor processes.
 const default_acceptor_count = 10
 
+/// Default listen backlog.
+const default_backlog = 1024
+
+/// The listener options implied by a transport configuration.
+pub fn to_listener_options(config: TransportConfig) -> server.ListenerOptions {
+  let limits = config.security_limits
+  server.ListenerOptions(
+    port: config.port,
+    acceptors: default_acceptor_count,
+    backlog: default_backlog,
+    max_connections: limits.max_connections,
+    max_connections_per_ip: limits.max_connections_per_ip,
+    trusted_proxies: limits.trusted_proxies,
+    send_timeout_ms: limits.send_timeout_ms,
+  )
+}
+
 /// Start the transport layer — binds to the given port and begins
-/// accepting connections. Returns the server process Pid for monitoring.
+/// accepting connections. Returns the listener supervisor's Pid.
+/// Use `start_listener` to also learn the bound port (for port 0).
 pub fn start(
   config: TransportConfig,
 ) -> Result(process.Pid, error.BeaconError) {
+  case start_listener(config) {
+    Ok(listener) -> {
+      log.debug(
+        "beacon.transport",
+        "Transport started on port " <> int.to_string(server.get_port(listener)),
+      )
+      Ok(server.get_supervisor(listener))
+    }
+    Error(err) -> Error(err)
+  }
+}
+
+/// Start the transport layer and return the running listener, which
+/// reports the bound port (`server.get_port`) and live connection counts.
+/// The listener supervisor is linked to the caller.
+pub fn start_listener(
+  config: TransportConfig,
+) -> Result(server.Listener, error.BeaconError) {
   log.info(
     "beacon.transport",
     "Starting on port " <> int.to_string(config.port),
@@ -1425,28 +1717,82 @@ pub fn start(
       )
     Some(_) -> Nil
   }
-
-  let handler_fn = fn(socket: Socket) { per_connection_handler(socket, config) }
-
-  case server.start(config.port, handler_fn, default_acceptor_count) {
-    Ok(pid) -> {
-      log.info(
-        "beacon.transport",
-        "Listening on port " <> int.to_string(config.port),
-      )
-      Ok(pid)
+  case validate_security_limits(config.security_limits) {
+    Error(reason) ->
+      Error(error.ConfigError(reason: "Invalid security limits: " <> reason))
+    Ok(Nil) -> {
+      // Built once: middleware and routing closures are shared by every
+      // connection instead of being rebuilt per request.
+      let handler = create_handler(config)
+      let handler_fn = fn(socket: Socket) {
+        per_connection_handler(socket, config, handler)
+      }
+      case server.start(to_listener_options(config), handler_fn) {
+        Ok(listener) -> {
+          log.info(
+            "beacon.transport",
+            "Listening on port " <> int.to_string(server.get_port(listener)),
+          )
+          Ok(listener)
+        }
+        Error(reason) -> {
+          log.error(
+            "beacon.transport",
+            "Failed to start on port "
+              <> int.to_string(config.port)
+              <> ": "
+              <> reason,
+          )
+          Error(error.TransportError(
+            reason: "Failed to bind to port "
+            <> int.to_string(config.port)
+            <> ": "
+            <> reason,
+          ))
+        }
+      }
     }
-    Error(reason) -> {
-      log.error(
-        "beacon.transport",
-        "Failed to start on port "
-          <> int.to_string(config.port)
-          <> ": "
-          <> reason,
-      )
-      Error(error.TransportError(
-        reason: "Failed to bind to port " <> int.to_string(config.port),
-      ))
+  }
+}
+
+/// Reject limits that would disable a protection or make the server
+/// unusable (zero or negative sizes, counts and timeouts).
+pub fn validate_security_limits(limits: SecurityLimits) -> Result(Nil, String) {
+  let positive = [
+    #("max_message_bytes", limits.max_message_bytes),
+    #("max_events_per_second", limits.max_events_per_second),
+    #("max_connections", limits.max_connections),
+    #("max_http_headers", limits.max_http_headers),
+    #("max_http_header_bytes", limits.max_http_header_bytes),
+    #("pre_upgrade_timeout_ms", limits.pre_upgrade_timeout_ms),
+    #("max_connections_per_ip", limits.max_connections_per_ip),
+    #("max_request_line_bytes", limits.max_request_line_bytes),
+    #("body_read_timeout_ms", limits.body_read_timeout_ms),
+    #("request_timeout_ms", limits.request_timeout_ms),
+    #("keepalive_idle_timeout_ms", limits.keepalive_idle_timeout_ms),
+    #("max_keepalive_requests", limits.max_keepalive_requests),
+    #("send_timeout_ms", limits.send_timeout_ms),
+  ]
+  let invalid =
+    positive
+    |> list.filter(fn(check) { check.1 < 1 })
+    |> list.map(fn(check) { check.0 <> "=" <> int.to_string(check.1) })
+  let invalid = case limits.max_body_bytes < 0 {
+    True -> [
+      "max_body_bytes=" <> int.to_string(limits.max_body_bytes),
+      ..invalid
+    ]
+    False -> invalid
+  }
+  case invalid {
+    [] -> {
+      log.debug("beacon.transport", "Security limits validated")
+      Ok(Nil)
+    }
+    _ -> {
+      let reason = "must be positive: " <> string.join(invalid, ", ")
+      log.error("beacon.transport", "Invalid security limits, " <> reason)
+      Error(reason)
     }
   }
 }

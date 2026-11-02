@@ -3,8 +3,8 @@ import beacon/stress
 import gleam/erlang/process
 
 pub fn stress_real_websocket_connections_test() {
-  let port = test_app.unique_port()
-  let assert Ok(_app) = test_app.start_counter_app(port)
+  let assert Ok(app) = test_app.start_counter_app()
+  let port = app.port
   process.sleep(200)
 
   let config =
@@ -24,8 +24,8 @@ pub fn stress_real_websocket_connections_test() {
 }
 
 pub fn stress_real_websocket_processes_cleaned_up_test() {
-  let port = test_app.unique_port()
-  let assert Ok(_app) = test_app.start_counter_app(port)
+  let assert Ok(app) = test_app.start_counter_app()
+  let port = app.port
   process.sleep(200)
 
   let config =
@@ -45,8 +45,8 @@ pub fn stress_real_websocket_processes_cleaned_up_test() {
 }
 
 pub fn stress_concurrent_websocket_events_test() {
-  let port = test_app.unique_port()
-  let assert Ok(_app) = test_app.start_counter_app(port)
+  let assert Ok(app) = test_app.start_counter_app()
+  let port = app.port
   process.sleep(200)
 
   let config =
