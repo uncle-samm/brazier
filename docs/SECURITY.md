@@ -165,6 +165,39 @@ the first. A sibling subdomain can plant such a cookie ("cookie tossing"); a
 `__Host-` name prevents that, because the browser accepts it only from the
 exact host, with `Secure` and `Path=/`.
 
+## File Uploads
+
+`beacon/upload` trusts nothing the client sends in a multipart request:
+
+- **Bounded reading.** `upload.read_multipart(req, config)` refuses a
+  non-multipart Content-Type (415) before touching the body, and a declared
+  Content-Length above `max_request_bytes` (413, default 11 MB) before reading
+  a byte. It then reads exactly that many bytes; chunked bodies are refused by
+  the server, so a request never buffers more than the cap. Each file is then
+  held to `max_size` (default 10 MB).
+- **Content sniffing.** A file's type comes from its leading bytes: PNG, JPEG,
+  GIF, WebP and PDF are recognised. The sniffed type must be in
+  `allowed_types` *and* match the declared Content-Type (case and parameters
+  ignored). Bytes that match no signature (HTML, SVG, scripts, text) are
+  refused, whatever they claim to be. `validate_config` refuses an allow-list
+  naming a type that cannot be sniffed.
+- **Strict parsing.** A missing close delimiter, a part without a `form-data`
+  Content-Disposition or name, duplicate part headers, a non-UTF-8 field and an
+  invalid boundary are all errors; a single bad file fails the whole form.
+- **Storage.** `upload.save(file, dir)` names the file `<32 random hex>.<ext>`,
+  with the extension taken from the content, and creates it exclusively
+  (`O_EXCL`), so an existing file or planted symlink is never overwritten. The
+  client's filename is kept only as `original_filename`: reduced to its last
+  path segment, without control characters, at most 255 characters.
+- **Serving.** `upload.serve(dir, stored_name, download_name)` accepts only a
+  name `save` produced, reads only regular files, takes the Content-Type from
+  the stored extension and always answers with `Content-Disposition:
+  attachment` (RFC 6266, with an RFC 8187 `filename*`),
+  `X-Content-Type-Options: nosniff` and `Content-Security-Policy: default-src
+  'none'; sandbox`, so a stored file is never rendered inline.
+
+`upload.error_status` maps each error to 400, 413, 415 or 500.
+
 ## Timer Cap
 
 The effect system caps periodic timers at 10 per runtime process (`effect.every`). Attempts to create additional timers are rejected with a warning log. This prevents runaway timer creation from buggy update handlers.

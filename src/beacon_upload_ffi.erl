@@ -1,31 +1,72 @@
 -module(beacon_upload_ffi).
--export([write_file/2, binary_split/2, binary_split_once/2, trim_trailing_crlf/1]).
+-export([random_token/0, write_new_file/2, read_regular_file/1,
+         binary_split/2, binary_split_once/2]).
 
-write_file(Path, Data) ->
+%% 128 random bits as 32 lower-case hex digits: a stored upload's name.
+random_token() ->
+    binary:encode_hex(crypto:strong_rand_bytes(16), lowercase).
+
+%% Create Path exclusively (O_EXCL: an existing file or symlink is never
+%% opened, so nothing is overwritten), as Plug.Upload does. A failed write
+%% removes the partial file.
+write_new_file(Path, Data) ->
     case validate_path(Path) of
-        ok ->
-            case file:write_file(Path, Data) of
-                ok -> {ok, nil};
-                {error, Reason} ->
-                    logger:error("File write failed: path=~s reason=~p", [Path, Reason]),
-                    {error, list_to_binary(io_lib:format("write failed: ~p", [Reason]))}
-            end;
         {error, Msg} ->
-            logger:error("Path traversal attempt blocked: path=~s reason=~s", [Path, Msg]),
-            {error, list_to_binary(Msg)}
+            logger:error("Upload path traversal blocked: path=~ts reason=~ts",
+                         [Path, Msg]),
+            {error, list_to_binary(Msg)};
+        ok ->
+            case file:open(Path, [write, exclusive, raw, binary]) of
+                {error, Reason} ->
+                    logger:error("Upload create failed: path=~ts reason=~p",
+                                 [Path, Reason]),
+                    {error, reason(Reason)};
+                {ok, Fd} ->
+                    Written = file:write(Fd, Data),
+                    Closed = file:close(Fd),
+                    case {Written, Closed} of
+                        {ok, ok} -> {ok, nil};
+                        _ ->
+                            logger:error("Upload write failed: path=~ts write=~p close=~p",
+                                         [Path, Written, Closed]),
+                            case file:delete(Path) of
+                                ok -> ok;
+                                {error, DeleteReason} ->
+                                    logger:error("Cannot remove partial upload: path=~ts reason=~p",
+                                                 [Path, DeleteReason])
+                            end,
+                            {error, <<"write failed">>}
+                    end
+            end
+    end.
+
+%% Read Path only if it is a regular file (not a symlink, directory or
+%% device).
+read_regular_file(Path) ->
+    case validate_path(Path) of
+        {error, Msg} -> {error, list_to_binary(Msg)};
+        ok ->
+            case file:read_link_info(Path) of
+                {ok, Info} when element(3, Info) =:= regular ->
+                    case file:read_file(Path) of
+                        {ok, Data} -> {ok, Data};
+                        {error, Reason} -> {error, reason(Reason)}
+                    end;
+                {ok, Info} ->
+                    {error, list_to_binary(io_lib:format("not a regular file (~p)",
+                                                         [element(3, Info)]))};
+                {error, Reason} -> {error, reason(Reason)}
+            end
     end.
 
 validate_path(Path) when is_binary(Path) ->
-    validate_path(binary_to_list(Path));
-validate_path(Path) when is_list(Path) ->
-    %% Split path into components and check each one for ".."
-    Components = filename:split(Path),
-    case lists:member("..", Components) of
-        true ->
-            {error, "path traversal (..) is not allowed"};
-        false ->
-            ok
+    case lists:member(<<"..">>, filename:split(Path)) of
+        true -> {error, "path traversal (..) is not allowed"};
+        false -> ok
     end.
+
+reason(Reason) ->
+    unicode:characters_to_binary(io_lib:format("~p", [Reason])).
 
 %% Split binary data on a separator, returning list of parts.
 binary_split(Data, Separator) ->
@@ -36,16 +77,4 @@ binary_split_once(Data, Separator) ->
     case binary:split(Data, Separator) of
         [Before, After] -> {ok, {Before, After}};
         _ -> {error, nil}
-    end.
-
-%% Trim trailing \r\n from binary data.
-trim_trailing_crlf(Data) ->
-    Size = byte_size(Data),
-    case Size >= 2 of
-        true ->
-            case binary:part(Data, Size - 2, 2) of
-                <<"\r\n">> -> binary:part(Data, 0, Size - 2);
-                _ -> Data
-            end;
-        false -> Data
     end.
