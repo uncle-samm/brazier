@@ -30,7 +30,7 @@
     lookup_int/2,
     lookup_string/2,
     %% Catalogue emitters.
-    http_request_span/4,
+    http_request_span/3,
     http_connection/3,
     ws_upgrade_span/2,
     ws_close/7,
@@ -183,14 +183,17 @@ lookup_string(Map, Key) ->
 
 %% --- Catalogue emitters (literal atoms only) ---
 
-%% [beacon, http, request] span. Run returns {Result, Status, ReqBytes, RespBytes}.
-http_request_span(Method, Route, ConnectionId, Run) ->
-    Meta = #{method => Method, route => Route, connection_id => ConnectionId},
+%% [beacon, http, request] span. The route is only known once the handler
+%% has routed the request, so Run returns it:
+%% {Result, Route, Status, ReqBytes, RespBytes}. Start (and exception)
+%% metadata is method and connection_id; stop adds route and status.
+http_request_span(Method, ConnectionId, Run) ->
+    Meta = #{method => Method, connection_id => ConnectionId},
     telemetry:span([?PREFIX, http, request], Meta, fun() ->
-        {Result, Status, ReqBytes, RespBytes} = Run(),
+        {Result, Route, Status, ReqBytes, RespBytes} = Run(),
         {Result,
          #{req_body_bytes => ReqBytes, resp_body_bytes => RespBytes},
-         Meta#{status => Status}}
+         Meta#{route => Route, status => Status}}
     end).
 
 %% [beacon, http, connection, accepted | rejected | closed]

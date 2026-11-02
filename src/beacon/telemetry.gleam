@@ -209,15 +209,16 @@ pub type ReplicaState {
 }
 
 /// `[beacon, http, request]` span. `run` returns the result with the
-/// response status and the request and response body sizes in bytes.
-/// `route` is the matched pattern, never the raw path.
+/// matched route, the response status and the request and response body
+/// sizes in bytes. The route is only known after routing, so it is on the
+/// stop event (with `status`), not on start or exception. `route` is the
+/// matched pattern, never the raw path.
 @external(erlang, "beacon_telemetry_ffi", "http_request_span")
 @internal
 pub fn http_request_span(
   method: String,
-  route: String,
   connection_id: String,
-  run: fn() -> #(a, Int, Int, Int),
+  run: fn() -> #(a, String, Int, Int, Int),
 ) -> a
 
 /// `[beacon, http, connection, accepted | rejected | closed]`.

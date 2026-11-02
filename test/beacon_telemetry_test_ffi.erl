@@ -1,5 +1,12 @@
 -module(beacon_telemetry_test_ffi).
--export([rescue/1, handler_ids/1, bench_no_handler_emit/1, print_to_user/1]).
+-export([rescue/1, handler_ids/1, bench_no_handler_emit/1, print_to_user/1,
+         exit_abnormally/1]).
+
+%% Exit Pid with an abnormal reason (not normal, shutdown or kill), as an
+%% unexpected crash of a connection process would.
+exit_abnormally(Pid) ->
+    true = exit(Pid, {beacon_test, abnormal_exit}),
+    nil.
 
 %% eunit captures a test's standard output; the user process is the
 %% terminal, so benchmark results appear in the test run's output.
