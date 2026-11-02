@@ -83,14 +83,15 @@ pub fn secure_headers_sets_x_content_type_test() {
   // Verify ALL headers set by secure_headers()
   let assert Ok("nosniff") = response.get_header(resp, "x-content-type-options")
   let assert Ok("SAMEORIGIN") = response.get_header(resp, "x-frame-options")
-  let assert Ok("1; mode=block") = response.get_header(resp, "x-xss-protection")
+  let assert Ok("0") = response.get_header(resp, "x-xss-protection")
   let assert Ok("strict-origin-when-cross-origin") =
     response.get_header(resp, "referrer-policy")
   let assert Ok("camera=(), microphone=(), geolocation=()") =
     response.get_header(resp, "permissions-policy")
-  let assert Ok(
-    "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https://avatars.githubusercontent.com; connect-src 'self' ws: wss:",
-  ) = response.get_header(resp, "content-security-policy")
+  let assert Ok(csp) = response.get_header(resp, "content-security-policy")
+  let assert True = csp == middleware.default_csp
+  let assert True = string.contains(csp, "frame-ancestors 'self'")
+  let assert True = string.contains(csp, "object-src 'none'")
 }
 
 pub fn secure_headers_with_custom_csp_test() {
@@ -247,7 +248,7 @@ pub fn context_overwrite_test() {
 // --- Rate limit middleware test ---
 
 pub fn rate_limit_middleware_allows_test() {
-  let limiter =
+  let assert Ok(limiter) =
     beacon_rate_limit.new(
       "mw_allow_" <> unique_id(),
       beacon_rate_limit.RateLimitConfig(max_requests: 10, window_seconds: 60),
@@ -257,13 +258,13 @@ pub fn rate_limit_middleware_allows_test() {
     |> response.set_body(Bytes(bytes_tree.from_string("ok")))
   }
   let piped = middleware.pipeline([middleware.rate_limit(limiter)], handler)
-  let req = make_request("GET", "/")
+  let req = make_socket_request("GET", "/", [], loopback_socket())
   let resp = piped(req)
   let assert 200 = resp.status
 }
 
 pub fn rate_limit_middleware_blocks_test() {
-  let limiter =
+  let assert Ok(limiter) =
     beacon_rate_limit.new(
       "mw_block_" <> unique_id(),
       beacon_rate_limit.RateLimitConfig(max_requests: 1, window_seconds: 60),
@@ -273,7 +274,7 @@ pub fn rate_limit_middleware_blocks_test() {
     |> response.set_body(Bytes(bytes_tree.from_string("ok")))
   }
   let piped = middleware.pipeline([middleware.rate_limit(limiter)], handler)
-  let req = make_request("GET", "/")
+  let req = make_socket_request("GET", "/", [], loopback_socket())
   // First request passes
   let assert 200 = { piped(req) }.status
   // Second request blocked
@@ -286,6 +287,17 @@ fn unique_id() -> String {
 
 @external(erlang, "beacon_test_ffi", "unique_ref")
 fn do_unique_id() -> String
+
+@external(erlang, "beacon_client_ip_test_ffi", "loopback_socket")
+fn loopback_socket() -> server.Socket
+
+@external(erlang, "beacon_client_ip_test_ffi", "make_request")
+fn make_socket_request(
+  method: String,
+  path: String,
+  headers: List(#(String, String)),
+  socket: server.Socket,
+) -> request.Request(Connection)
 
 import beacon/rate_limit as beacon_rate_limit
 import gleam/http

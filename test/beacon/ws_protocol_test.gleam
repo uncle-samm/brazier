@@ -572,8 +572,14 @@ pub fn cross_port_origin_gets_403_test() {
   raw_close(socket)
 }
 
-pub fn invalid_forwarded_proto_gets_403_test() {
-  let server = start_server(test_limits(), None)
+/// The test client connects from 127.0.0.1; trusting that address makes it
+/// act as a reverse proxy.
+fn behind_proxy_limits() -> transport.SecurityLimits {
+  transport.SecurityLimits(..test_limits(), trusted_proxies: ["127.0.0.1"])
+}
+
+pub fn invalid_forwarded_proto_from_trusted_proxy_gets_403_test() {
+  let server = start_server(behind_proxy_limits(), None)
   let headers =
     with_header(upgrade_headers(server.port), "X-Forwarded-Proto", "gopher")
   let #(socket, head) = raw_upgrade(server.port, headers)
@@ -581,13 +587,64 @@ pub fn invalid_forwarded_proto_gets_403_test() {
   raw_close(socket)
 }
 
-pub fn forwarded_https_matches_https_origin_test() {
-  let server = start_server(test_limits(), None)
+pub fn forwarded_https_from_trusted_proxy_matches_https_origin_test() {
+  let server = start_server(behind_proxy_limits(), None)
   let headers =
     upgrade_headers(server.port)
     |> with_header("X-Forwarded-Proto", "https")
     |> with_header("Origin", "https://" <> host_header(server.port))
   let probe = open_with(server, headers)
+  raw_close(probe.socket)
+}
+
+/// Regression: X-Forwarded-Proto was believed from any client, so a direct
+/// attacker could claim https and pass an https Origin check.
+pub fn forwarded_https_from_untrusted_peer_is_ignored_test() {
+  let server = start_server(test_limits(), None)
+  let headers =
+    upgrade_headers(server.port)
+    |> with_header("X-Forwarded-Proto", "https")
+    |> with_header("Origin", "https://" <> host_header(server.port))
+  let #(socket, head) = raw_upgrade(server.port, headers)
+  let assert "403" = status_of(head)
+  raw_close(socket)
+}
+
+/// An untrusted client's X-Forwarded-Proto is not read at all, so even a
+/// malformed one does not affect the (plain http) upgrade.
+pub fn invalid_forwarded_proto_from_untrusted_peer_is_ignored_test() {
+  let server = start_server(test_limits(), None)
+  let headers =
+    with_header(upgrade_headers(server.port), "X-Forwarded-Proto", "gopher")
+  let probe = open_with(server, headers)
+  raw_close(probe.socket)
+}
+
+/// Behind a trusted proxy the per-IP cap counts the forwarded client, not
+/// the proxy, so one proxy does not share a single slot bucket.
+pub fn per_ip_slot_uses_forwarded_client_behind_trusted_proxy_test() {
+  let server = start_server(behind_proxy_limits(), None)
+  let headers =
+    with_header(upgrade_headers(server.port), "X-Forwarded-For", "203.0.113.7")
+  let probe = open_with(server, headers)
+  let port = int.to_string(server.port)
+  let assert 1 = ws.get_ip_slot_count(port <> "|203.0.113.7")
+  let assert 0 = ws.get_ip_slot_count(port <> "|" <> host)
+  raw_close(probe.socket)
+  let assert True =
+    wait_until(fn() { ws.get_ip_slot_count(port <> "|203.0.113.7") == 0 }, 2000)
+}
+
+/// Regression: a direct client could pick its own per-IP bucket by sending
+/// X-Forwarded-For. Without trusted proxies the header is ignored.
+pub fn per_ip_slot_ignores_spoofed_forwarded_for_test() {
+  let server = start_server(test_limits(), None)
+  let headers =
+    with_header(upgrade_headers(server.port), "X-Forwarded-For", "198.51.100.9")
+  let probe = open_with(server, headers)
+  let port = int.to_string(server.port)
+  let assert 1 = ws.get_ip_slot_count(port <> "|" <> host)
+  let assert 0 = ws.get_ip_slot_count(port <> "|198.51.100.9")
   raw_close(probe.socket)
 }
 

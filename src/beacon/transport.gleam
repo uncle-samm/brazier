@@ -7,10 +7,12 @@
 ///
 /// Reference: LiveView channel protocol, RFC 6455.
 import beacon/error
+import beacon/ip
 import beacon/log
 import beacon/middleware
 import beacon/ssr
 import beacon/static
+import beacon/transport/client
 import beacon/transport/http as transport_http
 import beacon/transport/server.{
   type Connection, type ResponseBody, type Socket, Bytes,
@@ -314,6 +316,13 @@ pub fn validate_security_limits(limits: SecurityLimits) -> Result(Nil, String) {
         }
       }),
     )
+    // HTTP limits: a typo in the proxy list must never silently change who
+    // is trusted.
+    use _ <- result.try(
+      ip.parse_trusted_proxies(limits.trusted_proxies)
+      |> result.map(fn(_) { Nil })
+      |> result.map_error(fn(reason) { "trusted_proxies: " <> reason }),
+    )
     list.try_each(limits.ws_allowed_origins, fn(origin) {
       case parse_origin(origin) {
         Ok(Origin(has_path: False, ..)) -> Ok(Nil)
@@ -337,6 +346,25 @@ pub fn validate_security_limits(limits: SecurityLimits) -> Result(Nil, String) {
     }
     Error(reason) -> {
       log.error("beacon.transport", "Invalid security limits: " <> reason)
+      Error(reason)
+    }
+  }
+}
+
+/// The parsed `trusted_proxies` of validated limits.
+/// `validate_security_limits` (run when the listener starts) has already
+/// rejected any unparsable entry, so an error here means the limits were
+/// built without validation; it is logged and the caller must refuse.
+pub fn trusted_proxies(
+  limits: SecurityLimits,
+) -> Result(ip.TrustedProxies, String) {
+  case ip.parse_trusted_proxies(limits.trusted_proxies) {
+    Ok(parsed) -> Ok(parsed)
+    Error(reason) -> {
+      log.error(
+        "beacon.transport",
+        "trusted_proxies is invalid (limits were not validated): " <> reason,
+      )
       Error(reason)
     }
   }
@@ -1633,23 +1661,26 @@ fn parse_port(text: String) -> Result(Int, String) {
   }
 }
 
-/// The scheme the client used to reach us: the first X-Forwarded-Proto
-/// token when a proxy set one, otherwise plain http (Beacon itself does not
-/// terminate TLS).
-fn request_scheme(req: Request(Connection)) -> Result(String, String) {
-  case request.get_header(req, "x-forwarded-proto") {
-    Error(Nil) -> Ok("http")
-    Ok(value) -> {
-      let first = case string.split(value, ",") {
-        [token, ..] -> string.lowercase(string.trim(token))
-        [] -> ""
-      }
-      case first {
-        "http" | "https" -> Ok(first)
-        _ -> Error("invalid X-Forwarded-Proto \"" <> value <> "\"")
-      }
-    }
-  }
+/// The scheme the client used to reach us. X-Forwarded-Proto is honoured
+/// only from a trusted proxy (`beacon/transport/client`); otherwise plain
+/// http (Beacon itself does not terminate TLS).
+fn request_scheme(
+  req: Request(Connection),
+  limits: SecurityLimits,
+) -> Result(String, String) {
+  use trusted <- result.try(trusted_proxies(limits))
+  client.scheme(req, trusted)
+}
+
+/// The client address for an upgrade: the socket peer, or the forwarded
+/// client when the peer is a trusted proxy (same rule as the HTTP side).
+fn ws_client_ip(
+  socket: Socket,
+  req: Request(Connection),
+  limits: SecurityLimits,
+) -> Result(String, String) {
+  use trusted <- result.try(trusted_proxies(limits))
+  client.ip_for_socket(socket, req.headers, trusted)
 }
 
 /// Check that the Origin header matches the server's own origin (scheme,
@@ -1674,7 +1705,7 @@ fn check_origin(
         Ok(h) -> h
         Error(Nil) -> ""
       }
-      case request_scheme(req) {
+      case request_scheme(req, limits) {
         Error(reason) -> {
           log.warning("beacon.transport", "Origin check failed: " <> reason)
           Error(reason)
@@ -1779,7 +1810,7 @@ fn handle_ws_request(
 ) -> Nil {
   let conn_id = generate_connection_id()
   let limits = config.security_limits
-  case validate_security_limits(limits), ws.peer_ip(socket) {
+  case validate_security_limits(limits), ws_client_ip(socket, req, limits) {
     Error(reason), _ ->
       reject_ws_request(
         socket,

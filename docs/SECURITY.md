@@ -45,7 +45,18 @@ On every WebSocket upgrade, the transport checks the `Origin` header against the
 
 **Per-connection (server-side, transport layer):** Each WebSocket connection tracks events per 1-second sliding window. When `max_events_per_second` (default 50) is exceeded, the server sends a `ServerError("Rate limited")` message and drops the event. Heartbeats are exempt from rate limiting.
 
-**HTTP middleware:** The `middleware.rate_limit(limiter)` middleware returns HTTP 429 when a client exceeds the configured request rate. It identifies clients by `X-Forwarded-For` header or request host.
+**HTTP middleware:** The `middleware.rate_limit(limiter)` middleware returns HTTP 429 (with `Retry-After` set to the window length) when a client exceeds the configured request rate. It keys on the socket peer address and ignores `X-Forwarded-For` / `Forwarded`, so a client cannot get a fresh budget by inventing addresses. Behind a reverse proxy use `middleware.rate_limit_behind_proxies(limiter, trusted)` (see Trusted Proxies). A request whose peer address cannot be read gets 400.
+
+The limiter (`beacon/rate_limit`) is a fixed-window counter in an ETS table owned by a dedicated process, linked to and monitoring its creator. Memory is bounded: expired windows are swept every window, and the table holds at most `max_keys` clients (default `rate_limit.default_max_keys`, 100,000; set it with `rate_limit.new_with_max_keys`). At the cap, new clients are refused (fail closed) while known clients keep their budget, and every sweep logs an error with the number of refusals. If the limiter process is gone, every check is refused and logged.
+
+## Trusted Proxies
+
+`SecurityLimits.trusted_proxies` lists the reverse proxies (addresses or CIDRs such as `"10.0.0.0/8"`, `"fd00::/8"`) whose forwarding headers Beacon believes. It is validated at startup; an invalid entry refuses to start. `beacon/transport/client` is the single resolver used by the HTTP rate limiter, the per-IP WebSocket cap and the WebSocket Origin check:
+
+- **Client IP:** the socket peer, unless the peer is a trusted proxy. Then it is the right-most `Forwarded` (preferred) or `X-Forwarded-For` hop that is not itself a trusted proxy (RFC 7239 section 7.4; the Plug `RemoteIp` / Rails `remote_ip` rule). A client can prepend hops but cannot forge the ones its proxies append. A malformed hop stops the walk at the last trusted address and is logged.
+- **Scheme:** `http` (Beacon does not terminate TLS), unless a trusted proxy sends `X-Forwarded-Proto`, which must then be `http` or `https`; anything else, or several of the header, rejects the request. From an untrusted peer the header is ignored, so a direct client cannot claim `https` to pass an `https://` Origin check.
+
+With the default empty list, no forwarding header is ever honoured. Use the same list for `middleware.rate_limit_behind_proxies` via `ip.parse_trusted_proxies` (or `transport.trusted_proxies(limits)`).
 
 ## Message Size Limits
 
@@ -79,10 +90,16 @@ The `middleware.secure_headers()` middleware (included by default in all apps) s
 
 - `X-Content-Type-Options: nosniff`
 - `X-Frame-Options: SAMEORIGIN`
-- `X-XSS-Protection: 1; mode=block`
+- `X-XSS-Protection: 0` (the legacy XSS auditor is itself exploitable; OWASP recommends disabling it and relying on CSP)
 - `Referrer-Policy: strict-origin-when-cross-origin`
 - `Permissions-Policy: camera=(), microphone=(), geolocation=()`
-- `Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' ws: wss:`
+- `Content-Security-Policy:` `middleware.default_csp`, which is `default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https://avatars.githubusercontent.com; connect-src 'self' ws: wss:; frame-ancestors 'self'; object-src 'none'; base-uri 'self'`. `frame-ancestors 'self'` is the CSP form of `X-Frame-Options: SAMEORIGIN`.
+
+HSTS is opt-in because Beacon does not terminate TLS: add `middleware.hsts(31_536_000, True)` (it returns a `Result`; a negative max-age is an error) when the app is served over HTTPS behind a TLS proxy.
+
+## Route Scoping
+
+`middleware.only`, `middleware.at` and `middleware.except` compare paths segment by segment, the way the routers read them, not as raw string prefixes. `only("/admin", mw)` covers `/admin` and `/admin/users` but not `/administrator`. A path is read both with empty segments dropped (page routing) and with dot segments resolved (API routing): `only` and `at` apply when either reading matches, and `except` skips the middleware only when both readings are under the prefix. So `//admin` still gets `only("/admin", auth)`, and `/public/../admin` still gets `except("/public", auth)`.
 
 ## Session Tokens
 
