@@ -28,6 +28,19 @@ pub type Timeout {
 @external(erlang, "beacon_peer_ffi", "with_cluster")
 pub fn with_cluster(count: Int, prefix: String, run: fn(List(Peer)) -> a) -> a
 
+/// `with_cluster` with extra command-line arguments for every peer.
+@external(erlang, "beacon_peer_ffi", "with_cluster_args")
+pub fn with_cluster_args(
+  count: Int,
+  prefix: String,
+  args: List(String),
+  run: fn(List(Peer)) -> a,
+) -> a
+
+/// `add_peer` with extra command-line arguments for the new peer.
+@external(erlang, "beacon_peer_ffi", "add_peer_args")
+pub fn add_peer_args(existing: Peer, prefix: String, args: List(String)) -> Peer
+
 /// Start one more, unconnected, peer owned by the same cluster as
 /// `existing`. Use `connect` to join it.
 @external(erlang, "beacon_peer_ffi", "add_peer")
@@ -84,6 +97,10 @@ pub fn partition(a: Peer, b: Peer) -> Nil
 /// Undo `partition` and reconnect `a` and `b`.
 @external(erlang, "beacon_peer_ffi", "heal")
 pub fn heal(a: Peer, b: Peer) -> Nil
+
+/// Undo `partition` without connecting `a` and `b`.
+@external(erlang, "beacon_peer_ffi", "restore")
+pub fn restore(a: Peer, b: Peer) -> Nil
 
 /// Connect peer `a` to peer `b`.
 @external(erlang, "beacon_peer_ffi", "connect")

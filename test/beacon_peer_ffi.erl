@@ -13,8 +13,8 @@
 %% process, so the peers are stopped even when a test fails or is killed.
 %% with_cluster/3 also stops them in an `after` clause on the normal path.
 
--export([with_cluster/3, rpc/3, crash/1, stop/1, partition/2, heal/2,
-         connect/2, node_of/1, pause/1, alive/1, add_peer/2]).
+-export([with_cluster/3, with_cluster_args/4, rpc/3, crash/1, stop/1, partition/2,
+         heal/2, restore/2, connect/2, node_of/1, pause/1, alive/1, add_peer/2, add_peer_args/3]).
 
 -define(START_TIMEOUT_MS, 30000).
 -define(STOP_TIMEOUT_MS, 10000).
@@ -22,11 +22,16 @@
 %% Start Count connected peers, run Fun(Peers), always stop the peers.
 %% Peers is a list of {peer, ControlPid, Node, Keeper}.
 with_cluster(Count, Prefix, Fun) ->
+    with_cluster_args(Count, Prefix, [], Fun).
+
+%% with_cluster/3 with extra command-line arguments for every peer (for
+%% example TLS distribution flags).
+with_cluster_args(Count, Prefix, ExtraArgs, Fun) ->
     Owner = self(),
     Cookie = random_cookie(),
     Keeper = spawn(fun() -> keeper_init(Owner, Cookie) end),
     try
-        Peers = [start_peer(Keeper, Prefix) || _ <- lists:seq(1, Count)],
+        Peers = [start_peer(Keeper, Prefix, ExtraArgs) || _ <- lists:seq(1, Count)],
         ok = mesh(Peers),
         Fun(Peers)
     after
@@ -35,12 +40,15 @@ with_cluster(Count, Prefix, Fun) ->
 
 %% Start one more peer in the cluster that Existing belongs to (it is not
 %% connected to anything yet; use connect/2).
-add_peer({peer, _, _, Keeper}, Prefix) ->
-    start_peer(Keeper, Prefix).
+add_peer(Existing, Prefix) ->
+    add_peer_args(Existing, Prefix, []).
 
-start_peer(Keeper, Prefix) ->
+add_peer_args({peer, _, _, Keeper}, Prefix, ExtraArgs) ->
+    start_peer(Keeper, Prefix, ExtraArgs).
+
+start_peer(Keeper, Prefix, ExtraArgs) ->
     Ref = erlang:monitor(process, Keeper),
-    Keeper ! {start_peer, self(), Ref, Prefix},
+    Keeper ! {start_peer, self(), Ref, Prefix, ExtraArgs},
     receive
         {Ref, {ok, Pid, Node}} ->
             erlang:demonitor(Ref, [flush]),
@@ -118,11 +126,17 @@ partition(A, B) ->
 
 %% Undo partition/2: restore each side's cookie for the other and connect.
 heal(A, B) ->
+    restore(A, B),
+    {ok, nil} = connect(A, B),
+    nil.
+
+%% Undo partition/2 without connecting: A and B can connect again, and
+%% whatever reconnects them (a cluster manager) is under test.
+restore(A, B) ->
     NodeA = node_of(A),
     NodeB = node_of(B),
     {ok, true} = rpc(A, fun() -> erlang:set_cookie(NodeB, erlang:get_cookie()) end, 5000),
     {ok, true} = rpc(B, fun() -> erlang:set_cookie(NodeA, erlang:get_cookie()) end, 5000),
-    {ok, nil} = connect(A, B),
     nil.
 
 pause(Ms) ->
@@ -137,8 +151,8 @@ keeper_init(Owner, Cookie) ->
 
 keeper_loop(Owner, OwnerRef, Cookie, Peers) ->
     receive
-        {start_peer, From, Ref, Prefix} ->
-            case start_node(Cookie, Prefix) of
+        {start_peer, From, Ref, Prefix, ExtraArgs} ->
+            case start_node(Cookie, Prefix, ExtraArgs) of
                 {ok, Pid, Node} ->
                     From ! {Ref, {ok, Pid, Node}},
                     keeper_loop(Owner, OwnerRef, Cookie, [Pid | Peers]);
@@ -155,7 +169,7 @@ keeper_loop(Owner, OwnerRef, Cookie, Peers) ->
             keeper_loop(Owner, OwnerRef, Cookie, lists:delete(Pid, Peers))
     end.
 
-start_node(Cookie, Prefix) ->
+start_node(Cookie, Prefix, ExtraArgs) ->
     %% Every non-OTP code path of the runner (the Gleam build directories),
     %% made absolute so the peer resolves them whatever its cwd.
     Root = code:root_dir(),
@@ -163,8 +177,8 @@ start_node(Cookie, Prefix) ->
                                     string:prefix(filename:absname(P), Root) =:= nomatch,
                                     P =/= "."],
     Args = ["-setcookie", atom_to_list(Cookie),
-            "-kernel", "logger_level", "none",
-            "-pa" | Paths],
+            "-kernel", "logger_level", "none"
+            | [unicode:characters_to_list(A) || A <- ExtraArgs]] ++ ["-pa" | Paths],
     try peer:start_link(#{name => peer:random_name(unicode:characters_to_list(Prefix)),
                           connection => standard_io,
                           args => Args,
@@ -215,6 +229,7 @@ stop_keeper(Keeper) ->
         erlang:error(peer_stop_timeout)
     end.
 
+%% 44 bytes: long enough for cluster.start's production cookie check.
 random_cookie() ->
-    list_to_atom("beacon_test_" ++ integer_to_list(erlang:unique_integer([positive]))
-                 ++ "_" ++ integer_to_list(rand:uniform(1000000000))).
+    Hex = binary:encode_hex(crypto:strong_rand_bytes(16), lowercase),
+    binary_to_atom(<<"beacon_test_", Hex/binary>>).

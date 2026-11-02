@@ -8,7 +8,9 @@
          report/1, fail/1,
          worker_queue_len/1, suspend_worker/1, resume_worker/1,
          remote_worker_nodes/1, count_events/1, counted_events/0,
-         registered/1, alive/1, kill/1, wait_down/2, record_event/4]).
+         registered/1, alive/1, kill/1, wait_down/2, record_event/4,
+         record_events/1, recorded_events/0, record_named_event/4, putenv/2,
+         dist_protocol/1, dist_optfile/1]).
 
 -define(EVENTS, beacon_test_counted_events).
 
@@ -174,6 +176,79 @@ counted_events() ->
 record_event(_Name, Measurements, _Metadata, nil) ->
     true = ets:insert(?EVENTS, {erlang:unique_integer([monotonic]), Measurements}),
     ok.
+
+%% --- Telemetry recording with metadata ---
+
+-define(NAMED, beacon_test_named_events).
+
+%% Record every event in EventNames (each a list of binaries) emitted on
+%% this node: its dotted name and its node and reason metadata.
+record_events(EventNames) ->
+    Parent = self(),
+    Ref = make_ref(),
+    spawn(fun() ->
+        ?NAMED = ets:new(?NAMED, [ordered_set, public, named_table]),
+        Parent ! {Ref, ready},
+        receive stop -> ok end
+    end),
+    receive {Ref, ready} -> ok after 5000 -> erlang:error(recorder_table_not_ready) end,
+    Names = [[binary_to_atom(S, utf8) || S <- Name] || Name <- EventNames],
+    ok = telemetry:attach_many(<<"beacon-test-named-events">>, Names,
+                               fun ?MODULE:record_named_event/4, nil),
+    nil.
+
+record_named_event(Name, _Measurements, Metadata, nil) ->
+    Dotted = iolist_to_binary(lists:join(<<".">>, [atom_to_binary(A) || A <- Name])),
+    true = ets:insert(?NAMED, {erlang:unique_integer([monotonic]), Dotted,
+                               maps:get(node, Metadata, <<>>),
+                               maps:get(reason, Metadata, <<>>)}),
+    ok.
+
+%% Recorded events, oldest first, as {event, Name, Node, Reason}.
+recorded_events() ->
+    [{event, Name, Node, Reason} || {_, Name, Node, Reason} <- ets:tab2list(?NAMED)].
+
+putenv(Name, Value) ->
+    true = os:putenv(unicode:characters_to_list(Name), unicode:characters_to_list(Value)),
+    nil.
+
+%% The distribution carrier of the connection to Node (tcp, tls, ...), or
+%% {error, nil} when not connected.
+dist_protocol(Node) ->
+    case net_kernel:node_info(Node) of
+        {ok, Info} ->
+            case proplists:get_value(address, Info) of
+                {net_address, _, _, Protocol, _} -> {ok, atom_to_binary(Protocol)};
+                Other -> erlang:error({unexpected_node_address, Other})
+            end;
+        {error, _} ->
+            {error, nil}
+    end.
+
+%% --- TLS distribution ---
+
+-define(FIXTURES, "test/fixtures/dist_tls").
+-define(OPTFILE_DIR, "build/test/dist_tls").
+
+%% Write an -ssl_dist_optfile for a test node and return its absolute path.
+%% Cert is the fixture name of the node's certificate ("node", "rogue") or
+%% "none" for a node without one. Every node trusts only the cluster CA and
+%% requires a peer certificate. Server name checking is off: the fixtures
+%% cannot name the host that runs the tests (production keeps it on).
+dist_optfile(Cert) ->
+    Fixture = fun(F) -> filename:absname(filename:join(?FIXTURES, F)) end,
+    Own = case Cert of
+              <<"none">> -> [];
+              Name -> [{certfile, Fixture(binary_to_list(Name) ++ ".pem")},
+                       {keyfile, Fixture(binary_to_list(Name) ++ ".key")}]
+          end,
+    Trust = [{cacertfile, Fixture("ca.pem")}, {verify, verify_peer}],
+    Terms = [{server, Own ++ Trust ++ [{fail_if_no_peer_cert, true}]},
+             {client, Own ++ Trust ++ [{server_name_indication, disable}]}],
+    Path = filename:absname(filename:join(?OPTFILE_DIR, binary_to_list(Cert) ++ ".conf")),
+    ok = filelib:ensure_dir(Path),
+    ok = file:write_file(Path, io_lib:format("~p.~n", [Terms])),
+    unicode:characters_to_binary(Path).
 
 %% --- Processes ---
 
