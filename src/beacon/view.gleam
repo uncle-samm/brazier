@@ -9,7 +9,7 @@
 /// Architecture doc section 9 (Build-Time Template Analysis).
 import beacon/element.{
   type Attr, type Node, ElementNode, EventAttr, HtmlAttr, KeyedNode, MemoNode,
-  NoneNode, RawHtml, TextNode,
+  NoAttr, NoneNode, RawHtml, TextNode,
 }
 import beacon/template/rendered.{type Rendered}
 import gleam/int
@@ -158,12 +158,18 @@ fn render_children(
 fn render_attrs(state: RenderState, attrs: List(Attr)) -> RenderState {
   list.fold(attrs, state, fn(acc, attr) {
     case attr {
+      NoAttr -> acc
       HtmlAttr(name, value) ->
-        // Attribute VALUE is dynamic — name is static
-        acc
-        |> append_static(" " <> name <> "=\"")
-        |> add_dynamic(escape_attr(value))
-        |> append_static("\"")
+        // Attribute VALUE is dynamic — name is static. A URL value the
+        // policy refuses drops the whole attribute.
+        case element.checked_value(name, value) {
+          Error(Nil) -> acc
+          Ok(value) ->
+            acc
+            |> append_static(" " <> name <> "=\"")
+            |> add_dynamic(escape_attr(value))
+            |> append_static("\"")
+        }
       EventAttr(event_name, handler_id, debounce_ms) -> {
         // Event handlers are static — they don't change between renders
         let with_event =

@@ -1,6 +1,9 @@
 import beacon
 import beacon/element
+import beacon/html
 import beacon/island
+import beacon/log_capture
+import gleam/list
 
 pub fn text_to_string_test() {
   let node = element.text("hello world")
@@ -222,6 +225,82 @@ pub fn raw_html_to_json_test() {
   let result = element.to_json_string(node)
   let assert True = str_contains(result, "\"raw\"")
   let assert True = str_contains(result, "<b>test</b>")
+}
+
+// --- URL policy (docs/design/API_REDESIGN.md section 5, item 9) ---
+
+pub fn attr_drops_javascript_href_and_logs_warning_test() {
+  let #(attribute, logs) =
+    log_capture.capture(fn() { element.attr("href", "JaVaScRiPt:alert(1)") })
+  let assert element.NoAttr = attribute
+  let assert True =
+    log_capture.has(logs, level: "warning", containing: [
+      "beacon.element", "href", "JaVaScRiPt:alert(1)", "javascript",
+    ])
+}
+
+pub fn html_href_and_src_go_through_policy_test() {
+  let assert element.NoAttr = html.href(" java\tscript:alert(1)")
+  let assert element.NoAttr = html.src_("data:text/html,<script>x</script>")
+  let assert element.NoAttr = html.href("data:image/png;base64,AAAA")
+  let assert element.HtmlAttr("src", "data:image/png;base64,AAAA") =
+    html.src_("data:image/png;base64,AAAA")
+  let assert element.HtmlAttr("href", "/home") = html.href("/home")
+  let assert element.HtmlAttr("href", "mailto:a@example.com") =
+    html.href("mailto:a@example.com")
+}
+
+pub fn attr_escape_hatch_covers_every_url_attribute_test() {
+  let assert True =
+    list.all(
+      ["href", "src", "action", "formaction", "poster", "cite", "xlink:href"],
+      fn(name) { element.attr(name, "vbscript:x") == element.NoAttr },
+    )
+  let assert element.NoAttr = element.attr("FormAction", "javascript:x")
+  let assert element.HtmlAttr("title", "javascript:x") =
+    element.attr("title", "javascript:x")
+}
+
+pub fn blocked_attr_is_dropped_from_html_test() {
+  let node =
+    html.a([element.attr("href", "javascript:alert(1)"), html.class("x")], [
+      element.text("go"),
+    ])
+  let assert "<a class=\"x\">go</a>" = element.to_string(node)
+}
+
+pub fn to_string_rechecks_directly_built_attr_test() {
+  let node =
+    element.el("a", [element.HtmlAttr("href", "javascript:alert(1)")], [
+      element.text("go"),
+    ])
+  let #(html_string, logs) =
+    log_capture.capture(fn() { element.to_string(node) })
+  let assert "<a>go</a>" = html_string
+  let assert True =
+    log_capture.has(logs, level: "warning", containing: ["href", "javascript"])
+}
+
+pub fn to_json_rechecks_directly_built_attr_test() {
+  let node = element.el("img", [element.HtmlAttr("src", "vbscript:x")], [])
+  let assert "{\"t\":\"el\",\"tag\":\"img\",\"a\":[],\"ch\":[]}" =
+    element.to_json_string(node)
+}
+
+pub fn allowed_urls_render_test() {
+  let node =
+    html.a([html.href("https://example.com/?a=1&b=2")], [element.text("x")])
+  let assert "<a href=\"https://example.com/?a=1&amp;b=2\">x</a>" =
+    element.to_string(node)
+  let img = html.img([html.src_("data:image/webp;base64,UklGR")])
+  let assert "<img src=\"data:image/webp;base64,UklGR\">" =
+    element.to_string(img)
+}
+
+pub fn safe_url_does_not_log_test() {
+  let #(_attribute, logs) =
+    log_capture.capture(fn() { element.attr("href", "/safe") })
+  let assert False = log_capture.has(logs, level: "warning", containing: [])
 }
 
 // --- Helpers ---

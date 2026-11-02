@@ -7,10 +7,13 @@
 /// and Beacon handles the diffing.
 ///
 /// Reference: Lustre vdom/vnode.gleam, Elm's Html type.
+import beacon/internal/url
+import beacon/log
 import gleam/int
 import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
+import gleam/result
 import gleam/string
 import gleam/string_tree.{type StringTree}
 
@@ -53,6 +56,9 @@ pub type Attr {
   /// An event handler like on_click. The value is the event name
   /// that gets sent back to the server.
   EventAttr(event_name: String, handler_id: String, debounce_ms: Option(Int))
+  /// An attribute that renders nothing. `attr` returns it for a URL
+  /// attribute whose value the URL policy refuses (see `beacon/internal/url`).
+  NoAttr
 }
 
 /// Convert a Node tree to an HTML string for SSR.
@@ -125,7 +131,10 @@ pub fn to_json(node: Node(msg)) -> json.Json {
       json.object([
         #("t", json.string("el")),
         #("tag", json.string(tag)),
-        #("a", json.array(attributes, attr_to_json)),
+        #(
+          "a",
+          json.preprocessed_array(list.filter_map(attributes, attr_to_json)),
+        ),
         #("ch", json.array(children, to_json)),
       ])
   }
@@ -185,9 +194,38 @@ pub fn keyed(key: String, child: Node(msg)) -> Node(msg) {
 }
 
 /// Create an HTML attribute (key-value pair).
+///
+/// For a URL attribute (`href`, `src`, `action`, `formaction`, `poster`,
+/// `cite`, `xlink:href`) the value must pass the URL policy in
+/// `beacon/internal/url`. A refused value is dropped: the result is `NoAttr`
+/// and a warning names the attribute and a truncated value.
 pub fn attr(name: String, value: String) -> Attr {
   let assert True = is_valid_attribute_name(name)
-  HtmlAttr(name: name, value: value)
+  case checked_value(name, value) {
+    Ok(value) -> HtmlAttr(name: name, value: value)
+    Error(Nil) -> NoAttr
+  }
+}
+
+/// Apply the URL policy to an attribute value about to be built or
+/// rendered. A refused value is logged as a warning and returned as
+/// `Error(Nil)`; the caller drops the attribute.
+pub fn checked_value(name: String, value: String) -> Result(String, Nil) {
+  case url.check(name, value) {
+    Ok(value) -> Ok(value)
+    Error(blocked) -> {
+      log.warning(
+        "beacon.element",
+        "Dropped attribute "
+          <> name
+          <> "=\""
+          <> url.truncate_for_log(value)
+          <> "\": "
+          <> url.describe(blocked),
+      )
+      Error(Nil)
+    }
+  }
 }
 
 /// Return True when a custom HTML attribute name is safe to render.
@@ -264,43 +302,55 @@ fn has_attr(attributes: List(Attr), name: String) -> Bool {
   list.any(attributes, fn(attr) {
     case attr {
       HtmlAttr(attr_name, _) -> attr_name == name
-      EventAttr(_, _, _) -> False
+      EventAttr(_, _, _) | NoAttr -> False
     }
   })
 }
 
-fn attr_to_json(attribute: Attr) -> json.Json {
+fn attr_to_json(attribute: Attr) -> Result(json.Json, Nil) {
   case attribute {
-    HtmlAttr(name, value) ->
+    NoAttr -> Error(Nil)
+    HtmlAttr(name, value) -> {
+      use value <- result.map(checked_value(name, value))
       json.object([
         #("t", json.string("attr")),
         #("n", json.string(name)),
         #("v", json.string(value)),
       ])
+    }
     EventAttr(event_name, handler_id, debounce_ms) ->
-      json.object([
-        #("t", json.string("event")),
-        #("n", json.string(event_name)),
-        #("h", json.string(handler_id)),
-        #("d", case debounce_ms {
-          Some(delay) -> json.int(delay)
-          None -> json.null()
-        }),
-      ])
+      Ok(
+        json.object([
+          #("t", json.string("event")),
+          #("n", json.string(event_name)),
+          #("h", json.string(handler_id)),
+          #("d", case debounce_ms {
+            Some(delay) -> json.int(delay)
+            None -> json.null()
+          }),
+        ]),
+      )
   }
 }
 
 fn render_attributes(tree: StringTree, attributes: List(Attr)) -> StringTree {
   list.fold(attributes, tree, fn(acc, attribute) {
     case attribute {
+      NoAttr -> acc
       HtmlAttr(name, value) -> {
         let assert True = is_valid_attribute_name(name)
-        acc
-        |> string_tree.append(" ")
-        |> string_tree.append(name)
-        |> string_tree.append("=\"")
-        |> string_tree.append(escape_attr(value))
-        |> string_tree.append("\"")
+        // Checked again here: an `HtmlAttr` built directly, not through
+        // `attr`, has not been through the URL policy.
+        case checked_value(name, value) {
+          Error(Nil) -> acc
+          Ok(value) ->
+            acc
+            |> string_tree.append(" ")
+            |> string_tree.append(name)
+            |> string_tree.append("=\"")
+            |> string_tree.append(escape_attr(value))
+            |> string_tree.append("\"")
+        }
       }
       EventAttr(event_name, handler_id, debounce_ms) -> {
         let assert True = is_valid_event_name(event_name)

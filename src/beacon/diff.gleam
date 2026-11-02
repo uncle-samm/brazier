@@ -6,7 +6,7 @@
 /// LiveView's positional diff format for the wire protocol.
 import beacon/element.{
   type Attr, type Node, ElementNode, EventAttr, HtmlAttr, KeyedNode, MemoNode,
-  NoneNode, RawHtml, TextNode,
+  NoAttr, NoneNode, RawHtml, TextNode,
 }
 import gleam/json
 import gleam/list
@@ -184,6 +184,7 @@ fn find_removed_attrs(
           HtmlAttr(name, _) -> Ok(RemoveAttribute(path: path, name: name))
           EventAttr(event_name, _, _) ->
             Ok(RemoveEvent(path: path, event_name: event_name))
+          NoAttr -> Error(Nil)
         }
     }
   })
@@ -200,8 +201,13 @@ fn find_added_or_changed_attrs(
       True -> Error(Nil)
       False ->
         case new_attr {
+          NoAttr -> Error(Nil)
           HtmlAttr(name, value) ->
-            Ok(SetAttribute(path: path, name: name, value: value))
+            case element.checked_value(name, value) {
+              Ok(value) ->
+                Ok(SetAttribute(path: path, name: name, value: value))
+              Error(Nil) -> Ok(RemoveAttribute(path: path, name: name))
+            }
           EventAttr(event_name, handler_id, _) -> {
             Ok(SetEvent(
               path: path,
