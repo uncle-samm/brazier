@@ -4,6 +4,7 @@ import gleam/bit_array
 import gleam/dynamic/decode
 import gleam/json
 import gleam/list
+import gleam/option
 import gleam/string
 
 // --- ServerMessage encoding tests ---
@@ -318,34 +319,55 @@ pub fn encode_decode_roundtrip_consistency_test() {
 // --- WebSocket frame edge cases ---
 
 pub fn ws_decode_incomplete_frame_test() {
-  let assert Error(_) =
-    ws.decode_frame(<<129:size(8), 5:size(8), 0:size(8), 0:size(8)>>)
+  let assert Ok(ws.Incomplete) =
+    ws.decode_next(
+      <<129:size(8), 133:size(8), 0:size(8), 0:size(8)>>,
+      ws.create_reassembly(),
+      65_536,
+    )
 }
 
 pub fn ws_decode_rejects_unmasked_client_frame_test() {
-  let assert Error("protocol_violation_unmasked") =
-    ws.decode_frame(<<129:size(8), 2:size(8), "hi":utf8>>)
+  let assert Error(ws.BadFrame(ws.UnmaskedFrame) as error) =
+    ws.decode_next(
+      <<129:size(8), 2:size(8), "hi":utf8>>,
+      ws.create_reassembly(),
+      65_536,
+    )
+  let assert 1002 = ws.get_protocol_close_code(error)
 }
 
 pub fn ws_decode_text_ping_pong_close_and_unknown_opcode_test() {
-  let assert Ok(#(ws.TextFrame("hi"), <<>>)) =
-    ws.decode_frame(masked_ws_frame(1, <<"hi":utf8>>))
-  let assert Ok(#(ws.CloseFrame, <<>>)) =
-    ws.decode_frame(masked_ws_frame(8, <<>>))
-  let assert Ok(#(ws.PingFrame(ping), <<>>)) =
-    ws.decode_frame(masked_ws_frame(9, <<"p":utf8>>))
+  let fresh = ws.create_reassembly()
+  let assert Ok(ws.Complete(ws.TextMessage("hi"), <<>>, _)) =
+    ws.decode_next(masked_ws_frame(1, <<"hi":utf8>>), fresh, 65_536)
+  let assert Ok(ws.Complete(
+    ws.CloseMessage(code: option.None, reason: ""),
+    <<>>,
+    _,
+  )) = ws.decode_next(masked_ws_frame(8, <<>>), fresh, 65_536)
+  let assert Ok(ws.Complete(ws.PingMessage(ping), <<>>, _)) =
+    ws.decode_next(masked_ws_frame(9, <<"p":utf8>>), fresh, 65_536)
   let assert Ok("p") = bit_array.to_string(ping)
-  let assert Ok(#(ws.PongFrame(pong), <<>>)) =
-    ws.decode_frame(masked_ws_frame(10, <<"q":utf8>>))
+  let assert Ok(ws.Complete(ws.PongMessage(pong), <<>>, _)) =
+    ws.decode_next(masked_ws_frame(10, <<"q":utf8>>), fresh, 65_536)
   let assert Ok("q") = bit_array.to_string(pong)
-  let assert Ok(#(ws.BinaryFrame(binary), <<>>)) =
-    ws.decode_frame(masked_ws_frame(3, <<1, 2, 3>>))
+  let assert Ok(ws.Complete(ws.BinaryMessage(binary), <<>>, _)) =
+    ws.decode_next(masked_ws_frame(2, <<1, 2, 3>>), fresh, 65_536)
   let assert 3 = bit_array.byte_size(binary)
+  // Opcode 3 is reserved: protocol error, not a binary frame.
+  let assert Error(ws.BadFrame(ws.UnknownOpcode(3))) =
+    ws.decode_next(masked_ws_frame(3, <<1, 2, 3>>), fresh, 65_536)
 }
 
-pub fn ws_decode_invalid_utf8_text_closes_frame_test() {
-  let assert Ok(#(ws.CloseFrame, <<>>)) =
-    ws.decode_frame(masked_ws_frame(1, <<255, 254>>))
+pub fn ws_decode_invalid_utf8_text_is_1007_test() {
+  let assert Error(ws.InvalidUtf8 as error) =
+    ws.decode_next(
+      masked_ws_frame(1, <<255, 254>>),
+      ws.create_reassembly(),
+      65_536,
+    )
+  let assert 1007 = ws.get_protocol_close_code(error)
 }
 
 @external(erlang, "beacon_test_ffi", "masked_ws_frame")

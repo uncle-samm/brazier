@@ -7,10 +7,12 @@ import beacon/middleware
 import beacon/session
 import beacon/transport/server.{type Connection, type ResponseBody, Bytes}
 import gleam/bytes_tree
+import gleam/dict
 import gleam/http
 import gleam/http/request.{type Request}
 import gleam/http/response.{type Response}
 import gleam/json as json_builder
+import gleam/list
 import gleam/option.{type Option, None, Some}
 
 pub const default_session_cookie_name = "beacon_session"
@@ -83,12 +85,28 @@ pub fn dev_session_config() -> SessionConfig {
   )
 }
 
-/// Log in a user — creates a session and stores the user ID.
+/// Log in a user — creates a fresh session and stores the user ID.
+///
+/// Always issues a NEW session id. If the request already carried a session
+/// (anonymous or another user's), use `login_rotating` so the old id is
+/// deleted and cannot be replayed (session fixation).
 pub fn login(store: session.SessionStore, user_id: String) -> session.Session {
-  let sess = session.create(store)
-  let sess = session.set(store, sess, user_id_key, user_id)
+  let sess =
+    session.create_with_data(store, dict.from_list([#(user_id_key, user_id)]))
   log.info("beacon.auth", "User logged in")
   sess
+}
+
+/// Log in a user, deleting the previous session id (if any).
+///
+/// Live WebSockets bound to the old session are told to close.
+pub fn login_rotating(
+  store: session.SessionStore,
+  old_session_id: Option(String),
+  user_id: String,
+) -> session.Session {
+  delete_previous_session(store, old_session_id)
+  login(store, user_id)
 }
 
 /// Create a login session and session-bound CSRF token.
@@ -96,10 +114,83 @@ pub fn create_login(
   store: session.SessionStore,
   user_id: String,
 ) -> LoginSession {
-  let sess = login(store, user_id)
+  create_login_rotating(store, None, user_id)
+}
+
+/// Create a login session and CSRF token, deleting the previous session id.
+pub fn create_login_rotating(
+  store: session.SessionStore,
+  old_session_id: Option(String),
+  user_id: String,
+) -> LoginSession {
+  delete_previous_session(store, old_session_id)
   let csrf_token = session.generate_id()
-  let sess = session.set(store, sess, csrf_token_key, csrf_token)
+  let sess =
+    session.create_with_data(
+      store,
+      dict.from_list([#(user_id_key, user_id), #(csrf_token_key, csrf_token)]),
+    )
+  log.info("beacon.auth", "User logged in")
   LoginSession(session: sess, csrf_token: csrf_token)
+}
+
+fn delete_previous_session(
+  store: session.SessionStore,
+  old_session_id: Option(String),
+) -> Nil {
+  case old_session_id {
+    Some(old_id) -> {
+      log.info("beacon.auth", "Login replacing previous session")
+      session.delete(store, old_id)
+    }
+    None -> Nil
+  }
+}
+
+/// Change privileges (role, permissions, impersonation) on a live session.
+///
+/// Rotates the session id, applies `updates` to the new session, and issues a
+/// new CSRF token. The old id is deleted and every WebSocket bound to it is
+/// closed. The caller MUST send the returned session's cookie
+/// (`with_session_cookie`) and CSRF token to the client.
+pub fn change_privileges(
+  store: session.SessionStore,
+  session_id: String,
+  updates: List(#(String, String)),
+) -> Result(LoginSession, SessionError) {
+  case session.rotate(store, session_id) {
+    Error(err) -> {
+      log.warning(
+        "beacon.auth",
+        "Privilege change rejected: " <> session.store_error_to_string(err),
+      )
+      Error(InvalidSession)
+    }
+    Ok(rotated) -> {
+      let csrf_token = session.generate_id()
+      let result =
+        session.update(store, rotated.id, fn(data) {
+          list.fold(updates, data, fn(acc, pair) {
+            dict.insert(acc, pair.0, pair.1)
+          })
+          |> dict.insert(csrf_token_key, csrf_token)
+        })
+      case result {
+        Ok(sess) -> {
+          log.info("beacon.auth", "Session privileges changed (id rotated)")
+          Ok(LoginSession(session: sess, csrf_token: csrf_token))
+        }
+        Error(err) -> {
+          log.error(
+            "beacon.auth",
+            "Privilege update failed after rotation: "
+              <> session.store_error_to_string(err),
+          )
+          Error(InvalidSession)
+        }
+      }
+    }
+  }
 }
 
 /// Attach the configured HttpOnly session cookie to a response.
@@ -160,6 +251,30 @@ pub fn login_json_response(
   )
 }
 
+/// Like `login_json_response`, but deletes the previous session id first.
+pub fn login_json_response_rotating(
+  store: session.SessionStore,
+  old_session_id: Option(String),
+  user_id: String,
+  config: SessionConfig,
+) -> LoginResult {
+  let login = create_login_rotating(store, old_session_id, user_id)
+  let resp =
+    api.json_value(
+      200,
+      json_builder.object([
+        #("ok", json_builder.bool(True)),
+        #("csrf", json_builder.string(login.csrf_token)),
+      ]),
+    )
+    |> with_session_cookie(login.session, config)
+  LoginResult(
+    session: login.session,
+    csrf_token: login.csrf_token,
+    response: resp,
+  )
+}
+
 /// Log out — destroys the session.
 pub fn logout(store: session.SessionStore, session_id: String) -> Nil {
   session.delete(store, session_id)
@@ -186,20 +301,35 @@ pub fn current_user(sess: session.Session) -> Result(String, Nil) {
   }
 }
 
+/// Read the raw session id from the configured cookie.
+///
+/// Does NOT validate the session against a store; use `session_from_request`
+/// for that. Intended for binding other credentials (e.g. the WebSocket join
+/// token) to the session via `session.binding_fingerprint`.
+pub fn session_id_from_request(
+  req: Request(body),
+  config: SessionConfig,
+) -> Result(String, SessionError) {
+  case session.id_from_request(req, config.cookie_name) {
+    Ok(id) -> Ok(id)
+    Error(Nil) -> Error(MissingSessionCookie)
+  }
+}
+
 /// Get the current session from a request cookie.
 pub fn session_from_request(
   req: Request(body),
   store: session.SessionStore,
   config: SessionConfig,
 ) -> Result(session.Session, SessionError) {
-  case cookie.get(req, config.cookie_name) {
+  case session_id_from_request(req, config) {
     Ok(session_id) -> {
       case session.get(store, session_id) {
         Some(sess) -> Ok(sess)
         None -> Error(InvalidSession)
       }
     }
-    Error(Nil) -> Error(MissingSessionCookie)
+    Error(err) -> Error(err)
   }
 }
 
@@ -229,8 +359,11 @@ pub fn validate_csrf(
   case request.get_header(req, config.csrf_header) {
     Ok(token) -> {
       case session.get_value(sess, csrf_token_key) {
-        Some(expected) if token == expected -> Ok(Nil)
-        Some(_) -> Error(InvalidCsrfToken)
+        Some(expected) ->
+          case session.secure_compare(token, expected) {
+            True -> Ok(Nil)
+            False -> Error(InvalidCsrfToken)
+          }
         None -> Error(MissingCsrfToken)
       }
     }
@@ -239,14 +372,35 @@ pub fn validate_csrf(
 }
 
 /// WebSocket auth function that accepts only requests with a valid session user.
+///
+/// The transport runs `ws_auth` inside the WebSocket handler process, both
+/// before the upgrade and periodically afterwards. On success this binds that
+/// process to the session, so logout, rotation, or expiry of the session
+/// closes the live socket immediately (see `session.bind_current_process`).
 pub fn ws_session_auth(
   store: session.SessionStore,
   config: SessionConfig,
 ) -> fn(Request(Connection)) -> Result(Nil, String) {
   fn(req: Request(Connection)) {
-    case current_user_from_request(req, store, config) {
-      Ok(_) -> Ok(Nil)
-      Error(err) -> Error(error_to_string(err))
+    case session_from_request(req, store, config) {
+      Ok(sess) ->
+        case current_user(sess) {
+          Ok(_user_id) -> {
+            session.bind_current_process(store, sess.id)
+            Ok(Nil)
+          }
+          Error(Nil) -> {
+            log.warning(
+              "beacon.auth",
+              "WS auth rejected: " <> error_to_string(MissingUser),
+            )
+            Error(error_to_string(MissingUser))
+          }
+        }
+      Error(err) -> {
+        log.warning("beacon.auth", "WS auth rejected: " <> error_to_string(err))
+        Error(error_to_string(err))
+      }
     }
   }
 }
@@ -390,7 +544,11 @@ pub fn login_route(
 ) -> api.Route {
   api.post(path, fn(req) {
     case authenticate(req) {
-      Ok(user_id) -> login_json_response(store, user_id, config).response
+      Ok(user_id) -> {
+        let old_id =
+          option.from_result(session.id_from_request(req, config.cookie_name))
+        login_json_response_rotating(store, old_id, user_id, config).response
+      }
       Error(reason) -> {
         log.warning("beacon.auth", "Login route rejected request")
         api.text(401, reason)
@@ -464,42 +622,24 @@ pub fn error_to_string(err: SessionError) -> String {
 
 /// Auth middleware — rejects unauthenticated requests with 401.
 /// Checks for a session cookie and validates it against the store.
+/// Uses `default_session_config()`; see `require_auth_with_config`.
 pub fn require_auth(store: session.SessionStore) -> middleware.Middleware {
+  require_auth_with_config(store, default_session_config())
+}
+
+/// Auth middleware using the configured cookie name.
+pub fn require_auth_with_config(
+  store: session.SessionStore,
+  config: SessionConfig,
+) -> middleware.Middleware {
   fn(
     req: Request(Connection),
     next: fn(Request(Connection)) -> Response(ResponseBody),
   ) -> Response(ResponseBody) {
-    let session_id =
-      option.from_result(cookie.get(req, default_session_cookie_name))
-    case session_id {
-      Some(id) -> {
-        case session.get(store, id) {
-          Some(sess) -> {
-            case current_user(sess) {
-              Ok(_user_id) -> next(req)
-              Error(Nil) -> {
-                log.warning(
-                  "beacon.auth",
-                  "Auth rejected: " <> error_to_string(MissingUser),
-                )
-                unauthorized_response()
-              }
-            }
-          }
-          None -> {
-            log.warning(
-              "beacon.auth",
-              "Auth rejected: " <> error_to_string(InvalidSession),
-            )
-            unauthorized_response()
-          }
-        }
-      }
-      None -> {
-        log.warning(
-          "beacon.auth",
-          "Auth rejected: " <> error_to_string(MissingSessionCookie),
-        )
+    case current_user_from_request(req, store, config) {
+      Ok(_user_id) -> next(req)
+      Error(err) -> {
+        log.warning("beacon.auth", "Auth rejected: " <> error_to_string(err))
         unauthorized_response()
       }
     }
@@ -508,7 +648,17 @@ pub fn require_auth(store: session.SessionStore) -> middleware.Middleware {
 
 /// CSRF middleware — validates CSRF token on state-changing requests.
 /// Allows GET, HEAD, OPTIONS. Requires valid token on POST, PUT, DELETE, PATCH.
+/// Uses `default_session_config()`; see `csrf_protection_with_config`.
 pub fn csrf_protection(store: session.SessionStore) -> middleware.Middleware {
+  csrf_protection_with_config(store, default_session_config())
+}
+
+/// CSRF middleware using the configured cookie and header names.
+/// Tokens are compared in constant time.
+pub fn csrf_protection_with_config(
+  store: session.SessionStore,
+  config: SessionConfig,
+) -> middleware.Middleware {
   fn(
     req: Request(Connection),
     next: fn(Request(Connection)) -> Response(ResponseBody),
@@ -516,44 +666,38 @@ pub fn csrf_protection(store: session.SessionStore) -> middleware.Middleware {
     case req.method {
       http.Get | http.Head | http.Options -> next(req)
       _ -> {
-        // For state-changing requests, validate CSRF token
-        let csrf_header = request.get_header(req, "x-csrf-token")
-        let session_id =
-          option.from_result(cookie.get(req, default_session_cookie_name))
-        case csrf_header, session_id {
-          Ok(token), Some(sid) -> {
-            case session.get(store, sid) {
-              Some(sess) -> {
-                case session.get_value(sess, "csrf_token") {
-                  Some(stored_token) if stored_token == token -> next(req)
-                  _ -> {
-                    log.warning(
-                      "beacon.auth",
-                      "CSRF rejected: " <> error_to_string(InvalidCsrfToken),
-                    )
-                    forbidden_response("Invalid CSRF token")
-                  }
-                }
-              }
-              None -> {
+        case session_from_request(req, store, config) {
+          Ok(sess) ->
+            case validate_csrf(req, sess, config) {
+              Ok(Nil) -> next(req)
+              Error(err) -> {
                 log.warning(
                   "beacon.auth",
-                  "CSRF rejected: " <> error_to_string(InvalidSession),
+                  "CSRF rejected: " <> error_to_string(err),
                 )
-                forbidden_response("Invalid session")
+                forbidden_response(csrf_rejection_text(err))
               }
             }
-          }
-          _, _ -> {
+          Error(err) -> {
             log.warning(
               "beacon.auth",
-              "CSRF rejected: " <> error_to_string(MissingCsrfToken),
+              "CSRF rejected: " <> error_to_string(err),
             )
-            forbidden_response("Missing CSRF token")
+            forbidden_response(csrf_rejection_text(err))
           }
         }
       }
     }
+  }
+}
+
+fn csrf_rejection_text(err: SessionError) -> String {
+  case err {
+    MissingCsrfToken -> "Missing CSRF token"
+    InvalidCsrfToken -> "Invalid CSRF token"
+    MissingSessionCookie -> "Missing CSRF token"
+    InvalidSession -> "Invalid session"
+    MissingUser -> "Invalid session"
   }
 }
 

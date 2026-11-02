@@ -15,6 +15,7 @@ import beacon/transport/http as transport_http
 import beacon/transport/server.{type Connection, type ResponseBody, Bytes}
 import gleam/bit_array
 import gleam/bytes_tree
+import gleam/dict
 import gleam/erlang/process
 import gleam/http
 import gleam/http/request.{type Request}
@@ -316,10 +317,15 @@ fn handle_login(
           let sess = session.create(store)
           let csrf_token =
             form.generate_session_csrf(csrf_store, sess.id, csrf_secret)
-          let sess = session.set(store, sess, "user_id", username)
-          let sess = session.set(store, sess, "role", "admin")
-          let sess = session.set(store, sess, "csrf_token", csrf_token)
-          let _sess = session.set(store, sess, "display_name", "Ada Lovelace")
+          let assert Ok(sess) =
+            session.update(store, sess.id, fn(data) {
+              data
+              |> dict.insert("user_id", username)
+              |> dict.insert("role", "admin")
+              |> dict.insert("csrf_token", csrf_token)
+              |> dict.insert("display_name", "Ada Lovelace")
+            })
+            as "session was created on the line above and cannot have expired"
           json_response(200, "{\"ok\":true,\"csrf\":\"" <> csrf_token <> "\"}")
           |> cookie.set("beacon_session", sess.id, dev_cookie_options())
         }
@@ -365,11 +371,11 @@ fn handle_profile(
           case csrf, field(fields, "display_name") {
             Ok(token), Ok(display_name) ->
               case token == expected {
-                True -> {
-                  let _sess =
-                    session.set(store, sess, "display_name", display_name)
-                  json_response(200, "{\"ok\":true}")
-                }
+                True ->
+                  case session.set(store, sess, "display_name", display_name) {
+                    Ok(_sess) -> json_response(200, "{\"ok\":true}")
+                    Error(_err) -> text_response(401, "Session expired")
+                  }
                 False -> text_response(403, "Invalid CSRF token")
               }
             _, _ -> text_response(403, "Invalid CSRF token")

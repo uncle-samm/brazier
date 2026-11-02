@@ -5,9 +5,24 @@
     read_http_request/1, read_http_request_with_limits/4, read_body/2,
     ws_accept_key/1,
     ws_encode_text_frame/1, ws_encode_close_frame/0,
-    ws_decode_frame/1,
     classify_tcp_message/1,
     start_acceptor_pool/3
+]).
+%% Strict RFC 6455 frame layer and WebSocket connection helpers.
+-export([
+    ws_parse_frame/2,
+    ws_encode_frame/2,
+    ws_encode_close/2,
+    ws_is_valid_utf8/1,
+    ws_decode_key/1,
+    ws_set_send_timeout/2,
+    ws_peer_ip/1,
+    ws_acquire_ip_slot/2,
+    ws_release_ip_slot/1,
+    ws_ip_slot_count/1,
+    ws_now_ms/0,
+    ws_classify_message/1,
+    ws_mailbox_len/0
 ]).
 
 %% --- TCP Operations ---
@@ -179,36 +194,195 @@ ws_encode_text_frame(Text) when is_binary(Text) ->
 ws_encode_close_frame() ->
     <<1:1, 0:3, 8:4, 0:1, 0:7>>.
 
-%% Decode a WebSocket frame from raw bytes.
-%% Client frames are always masked (RFC 6455 Section 5.1).
-%% Returns: {ok, {Opcode, UnmaskedPayload, RemainingData}} | {error, <<"incomplete">>}
-ws_decode_frame(Data) ->
+%% --- Strict RFC 6455 frame parser ---
+%% Parses ONE client frame from the front of Data.
+%%
+%% Returns the Erlang shape of the Gleam type ws.ParseOutcome:
+%%   {parsed, Fin :: boolean(), Opcode, UnmaskedPayload, Rest}
+%%   need_more
+%%   {parse_failed, FrameError}
+%% where FrameError is the Erlang shape of ws.FrameError:
+%%   reserved_bits_set | {unknown_opcode, Op} | fragmented_control_frame
+%%   | {control_frame_too_large, Len} | unmasked_frame | non_minimal_length
+%%   | {frame_too_large, Len}
+%%
+%% Checks run on the 2..14 byte header BEFORE the payload is buffered, so a
+%% peer declaring a 2^62 byte frame is rejected immediately instead of making
+%% the server buffer up to the limit (cowboy/cowlib do the same).
+%% Reference: RFC 6455 §5.2, §5.5; cowlib cow_ws:parse_header/3.
+ws_parse_frame(Data, MaxPayload) when is_binary(Data), is_integer(MaxPayload), MaxPayload >= 0 ->
     case Data of
-        %% 7-bit length (< 126), masked
-        <<_Fin:1, _Rsv:3, Opcode:4, 1:1, Len:7, Mask:4/binary, Rest/binary>>
-          when Len < 126, byte_size(Rest) >= Len ->
-            <<Payload:Len/binary, Remaining/binary>> = Rest,
-            Unmasked = unmask(Payload, Mask),
-            {ok, {Opcode, Unmasked, Remaining}};
-        %% 16-bit length (126), masked
-        <<_Fin:1, _Rsv:3, Opcode:4, 1:1, 126:7, Len:16, Mask:4/binary, Rest/binary>>
-          when byte_size(Rest) >= Len ->
-            <<Payload:Len/binary, Remaining/binary>> = Rest,
-            Unmasked = unmask(Payload, Mask),
-            {ok, {Opcode, Unmasked, Remaining}};
-        %% 64-bit length (127), masked
-        <<_Fin:1, _Rsv:3, Opcode:4, 1:1, 127:7, Len:64, Mask:4/binary, Rest/binary>>
-          when byte_size(Rest) >= Len ->
-            <<Payload:Len/binary, Remaining/binary>> = Rest,
-            Unmasked = unmask(Payload, Mask),
-            {ok, {Opcode, Unmasked, Remaining}};
-        %% Unmasked frame from client — protocol violation
-        <<_Fin:1, _Rsv:3, _Opcode:4, 0:1, _Len:7, _/binary>> when byte_size(Data) >= 2 ->
-            {error, <<"protocol_violation_unmasked">>};
-        %% Incomplete frame
+        <<Fin:1, Rsv:3, Op:4, Mask:1, Len7:7, Rest/binary>> ->
+            parse_header(Fin, Rsv, Op, Mask, Len7, Rest, MaxPayload);
         _ ->
-            {error, <<"incomplete">>}
+            need_more
     end.
+
+parse_header(_Fin, Rsv, _Op, _Mask, _Len7, _Rest, _Max) when Rsv =/= 0 ->
+    %% No extensions are negotiated, so every RSV bit must be zero (§5.2).
+    {parse_failed, reserved_bits_set};
+parse_header(_Fin, _Rsv, Op, _Mask, _Len7, _Rest, _Max)
+  when Op =/= 0, Op =/= 1, Op =/= 2, Op =/= 8, Op =/= 9, Op =/= 10 ->
+    {parse_failed, {unknown_opcode, Op}};
+parse_header(0, _Rsv, Op, _Mask, _Len7, _Rest, _Max) when Op >= 8 ->
+    %% Control frames MUST NOT be fragmented (§5.5).
+    {parse_failed, fragmented_control_frame};
+parse_header(_Fin, _Rsv, Op, _Mask, Len7, _Rest, _Max) when Op >= 8, Len7 > 125 ->
+    %% Control frames MUST have a payload length of 125 bytes or less (§5.5).
+    {parse_failed, {control_frame_too_large, Len7}};
+parse_header(_Fin, _Rsv, _Op, 0, _Len7, _Rest, _Max) ->
+    %% A server MUST close the connection on an unmasked client frame (§5.1).
+    {parse_failed, unmasked_frame};
+parse_header(Fin, _Rsv, Op, 1, Len7, Rest, Max) when Len7 < 126 ->
+    parse_payload(Fin, Op, Len7, Rest, Max);
+parse_header(Fin, _Rsv, Op, 1, 126, Rest, Max) ->
+    case Rest of
+        <<Len:16, _/binary>> when Len < 126 ->
+            {parse_failed, non_minimal_length};
+        <<Len:16, Rest2/binary>> ->
+            parse_payload(Fin, Op, Len, Rest2, Max);
+        _ ->
+            need_more
+    end;
+parse_header(Fin, _Rsv, Op, 1, 127, Rest, Max) ->
+    case Rest of
+        <<1:1, _:63, _/binary>> ->
+            %% The most significant bit of a 64-bit length MUST be 0 (§5.2).
+            {parse_failed, {frame_too_large, 16#7FFFFFFFFFFFFFFF}};
+        <<Len:64, _/binary>> when Len < 65536 ->
+            {parse_failed, non_minimal_length};
+        <<Len:64, Rest2/binary>> ->
+            parse_payload(Fin, Op, Len, Rest2, Max);
+        _ ->
+            need_more
+    end.
+
+parse_payload(_Fin, _Op, Len, _Rest, Max) when Len > Max ->
+    {parse_failed, {frame_too_large, Len}};
+parse_payload(Fin, Op, Len, Rest, _Max) ->
+    case Rest of
+        <<MaskKey:4/binary, Payload:Len/binary, Remaining/binary>> ->
+            {parsed, Fin =:= 1, Op, unmask(Payload, MaskKey), Remaining};
+        _ ->
+            need_more
+    end.
+
+%% Encode one unfragmented server frame (FIN set, unmasked, RSV 0).
+%% Server frames MUST NOT be masked (§5.1).
+ws_encode_frame(Opcode, Payload) when is_integer(Opcode), is_binary(Payload) ->
+    Len = byte_size(Payload),
+    if
+        Len < 126 ->
+            <<1:1, 0:3, Opcode:4, 0:1, Len:7, Payload/binary>>;
+        Len < 65536 ->
+            <<1:1, 0:3, Opcode:4, 0:1, 126:7, Len:16, Payload/binary>>;
+        true ->
+            <<1:1, 0:3, Opcode:4, 0:1, 127:7, Len:64, Payload/binary>>
+    end.
+
+%% Encode a close frame carrying a status code and reason (§5.5.1).
+%% The caller guarantees byte_size(Reason) =< 123 so the payload fits a
+%% control frame; this is asserted here so a violation crashes loudly.
+ws_encode_close(Code, Reason) when is_integer(Code), Code >= 1000, Code =< 4999,
+                                   is_binary(Reason), byte_size(Reason) =< 123 ->
+    ws_encode_frame(8, <<Code:16, Reason/binary>>).
+
+%% True when the binary is entirely well-formed UTF-8 (§8.1).
+ws_is_valid_utf8(Bin) when is_binary(Bin) ->
+    case unicode:characters_to_binary(Bin, utf8, utf8) of
+        Bin -> true;
+        _ -> false
+    end.
+
+%% Decode a Sec-WebSocket-Key. Returns {ok, Raw} or {error, nil}.
+ws_decode_key(Key) when is_binary(Key) ->
+    try base64:decode(Key) of
+        Raw -> {ok, Raw}
+    catch
+        error:_ -> {error, nil}
+    end.
+
+%% Bound how long a send may block on a slow reader. With send_timeout_close
+%% the socket is closed by the VM when the timeout fires, so a stuck peer can
+%% never pin the handler process or grow the kernel send queue forever.
+%% Reference: cowboy/ranch send_timeout + send_timeout_close.
+ws_set_send_timeout(Socket, TimeoutMs) when is_integer(TimeoutMs), TimeoutMs > 0 ->
+    case inet:setopts(Socket, [{send_timeout, TimeoutMs}, {send_timeout_close, true}]) of
+        ok -> {ok, nil};
+        {error, Reason} -> {error, format_reason(Reason)}
+    end.
+
+%% The peer IP address as text, used for per-IP connection accounting.
+ws_peer_ip(Socket) ->
+    case inet:peername(Socket) of
+        {ok, {Addr, _Port}} -> {ok, list_to_binary(inet:ntoa(Addr))};
+        {error, Reason} -> {error, format_reason(Reason)}
+    end.
+
+%% --- Per-IP WebSocket slots ---
+%% The calling process joins the pg group {beacon_ws_ip, SlotKey}, where
+%% SlotKey identifies a listener and a peer IP. pg removes a member
+%% automatically when it exits, so a crashed handler can never leak a slot.
+%% Join-then-count is race free: two concurrent joins may both see the other
+%% and both be rejected, but the cap can never be exceeded.
+-define(WS_PG_SCOPE, beacon_ws_pg).
+
+ensure_ws_pg() ->
+    case pg:start(?WS_PG_SCOPE) of
+        {ok, _Pid} -> ok;
+        {error, {already_started, _Pid}} -> ok
+    end.
+
+%% Returns {ok, Count} when the slot was taken, {error, Count} when the cap
+%% would be exceeded (the caller has already been removed from the group).
+ws_acquire_ip_slot(SlotKey, Max) when is_binary(SlotKey), is_integer(Max), Max > 0 ->
+    ensure_ws_pg(),
+    Group = {beacon_ws_ip, SlotKey},
+    ok = pg:join(?WS_PG_SCOPE, Group, self()),
+    Count = length(pg:get_local_members(?WS_PG_SCOPE, Group)),
+    case Count > Max of
+        true ->
+            ok = pg:leave(?WS_PG_SCOPE, Group, self()),
+            {error, Count - 1};
+        false ->
+            {ok, Count}
+    end.
+
+%% Release the calling process's slot. Idempotent: returns true when a slot
+%% was held, false when it had already been released.
+ws_release_ip_slot(SlotKey) when is_binary(SlotKey) ->
+    ensure_ws_pg(),
+    case pg:leave(?WS_PG_SCOPE, {beacon_ws_ip, SlotKey}, self()) of
+        ok -> true;
+        not_joined -> false
+    end.
+
+ws_ip_slot_count(SlotKey) when is_binary(SlotKey) ->
+    ensure_ws_pg(),
+    length(pg:get_local_members(?WS_PG_SCOPE, {beacon_ws_ip, SlotKey})).
+
+%% Monotonic clock in milliseconds (liveness bookkeeping).
+ws_now_ms() ->
+    erlang:monotonic_time(millisecond).
+
+%% Classify a raw (non-Subject) message received by a WebSocket handler.
+%% Returns the Erlang shape of the Gleam type ws.SocketEvent.
+ws_classify_message({tcp, _Socket, Data}) ->
+    {socket_data, Data};
+ws_classify_message({tcp_closed, _Socket}) ->
+    socket_closed;
+ws_classify_message({tcp_error, _Socket, Reason}) ->
+    {socket_error, format_reason(Reason)};
+ws_classify_message({beacon_session_revoked, SessionId, Reason})
+  when is_binary(SessionId), is_binary(Reason) ->
+    {session_revoked, SessionId, Reason};
+ws_classify_message(Other) ->
+    {unexpected_message, list_to_binary(io_lib:format("~0P", [Other, 8]))}.
+
+%% Number of messages waiting in the calling process's mailbox.
+ws_mailbox_len() ->
+    {message_queue_len, Len} = erlang:process_info(self(), message_queue_len),
+    Len.
 
 %% Unmask payload using XOR with 4-byte mask key.
 %% Uses crypto:exor for efficiency.

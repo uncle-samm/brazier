@@ -9,7 +9,6 @@
 import beacon/error
 import beacon/log
 import beacon/middleware
-import beacon/pubsub
 import beacon/ssr
 import beacon/static
 import beacon/transport/http as transport_http
@@ -28,6 +27,7 @@ import gleam/int
 import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
+import gleam/result
 import gleam/string
 import simplifile
 
@@ -125,11 +125,17 @@ pub type InternalMessage {
 
 /// Configurable security limits for the transport layer.
 /// All fields have sensible defaults via `default_security_limits()`.
+/// `validate_security_limits` rejects nonsensical values; the WebSocket
+/// upgrade path refuses to run with invalid limits.
 pub type SecurityLimits {
   SecurityLimits(
     /// Maximum WebSocket message size in bytes. Default: 65536 (64KB).
+    /// Bounds both a single frame (checked from the frame header, before the
+    /// payload is buffered) and a reassembled fragmented message. Exceeding
+    /// it closes the connection with 1009.
     max_message_bytes: Int,
     /// Maximum events per second per connection. Default: 50.
+    /// Every event inside an `event_batch` counts individually.
     max_events_per_second: Int,
     /// Maximum concurrent HTTP/WebSocket connections globally. Default: 10000.
     max_connections: Int,
@@ -139,6 +145,42 @@ pub type SecurityLimits {
     max_http_header_bytes: Int,
     /// Timeout for request line/header reads before upgrade, in milliseconds. Default: 5000.
     pre_upgrade_timeout_ms: Int,
+    // WebSocket limits
+    /// Maximum concurrent WebSocket connections per peer IP (per listener).
+    /// Upgrades beyond it get 429. Default: 100. Behind a reverse proxy every
+    /// client shares the proxy's address — raise this or enforce it upstream.
+    max_ws_connections_per_ip: Int,
+    /// Interval between server pings, in milliseconds. Default: 30000.
+    ws_ping_interval_ms: Int,
+    /// Time a client has to answer a ping before the connection is closed
+    /// (1000, "pong timeout"), in milliseconds. Default: 20000.
+    ws_pong_timeout_ms: Int,
+    /// Close the connection (1000, "idle timeout") when no application
+    /// message — including the client heartbeat, sent every 30s — arrives for
+    /// this long, in milliseconds. Default: 90000.
+    ws_idle_timeout_ms: Int,
+    /// A socket send that cannot complete within this many milliseconds
+    /// fails and the socket is closed (slow reader protection). Default: 15000.
+    ws_send_timeout_ms: Int,
+    /// Maximum messages queued for the connection process. When the runtime
+    /// produces faster than the client reads, the connection closes with 1013.
+    /// Default: 1000.
+    ws_max_outbound_queue: Int,
+    /// Interval for re-running `ws_auth` on a live connection, in
+    /// milliseconds. A failed re-check closes with 4401. Default: 60000.
+    ws_auth_recheck_interval_ms: Int,
+    /// Undecodable messages tolerated per connection before it is closed
+    /// with 1008. Default: 10.
+    ws_max_decode_errors: Int,
+    /// Rate limit violations tolerated within one rate window before the
+    /// connection is closed with 1008. Each rejected message is one
+    /// violation, so the default tolerates a burst of roughly three times
+    /// `max_events_per_second` in one window. Default: 100.
+    ws_max_rate_violations: Int,
+    /// Extra origins (e.g. "https://app.example.com") allowed to open
+    /// WebSockets in addition to the request's own scheme/host/port.
+    /// Default: [].
+    ws_allowed_origins: List(String),
   )
 }
 
@@ -151,7 +193,117 @@ pub fn default_security_limits() -> SecurityLimits {
     max_http_headers: 100,
     max_http_header_bytes: 65_536,
     pre_upgrade_timeout_ms: 5000,
+    max_ws_connections_per_ip: 100,
+    ws_ping_interval_ms: 30_000,
+    ws_pong_timeout_ms: 20_000,
+    ws_idle_timeout_ms: 90_000,
+    ws_send_timeout_ms: 15_000,
+    ws_max_outbound_queue: 1000,
+    ws_auth_recheck_interval_ms: 60_000,
+    ws_max_decode_errors: 10,
+    ws_max_rate_violations: 100,
+    ws_allowed_origins: [],
   )
+}
+
+/// Largest delay `erlang:send_after/3` accepts (2^32 - 1 ms).
+const max_timer_ms = 4_294_967_295
+
+/// Validate security limits. Every count, size and interval must be
+/// positive (the two abuse thresholds may be 0, meaning "first offence
+/// closes"), timer intervals must fit `erlang:send_after/3`, and every
+/// allowed origin must be a bare `scheme://host[:port]` origin.
+pub fn validate_security_limits(limits: SecurityLimits) -> Result(Nil, String) {
+  let positive = [
+    #("max_message_bytes", limits.max_message_bytes),
+    #("max_events_per_second", limits.max_events_per_second),
+    #("max_connections", limits.max_connections),
+    #("max_http_headers", limits.max_http_headers),
+    #("max_http_header_bytes", limits.max_http_header_bytes),
+    #("pre_upgrade_timeout_ms", limits.pre_upgrade_timeout_ms),
+    #("max_ws_connections_per_ip", limits.max_ws_connections_per_ip),
+    #("ws_send_timeout_ms", limits.ws_send_timeout_ms),
+    #("ws_max_outbound_queue", limits.ws_max_outbound_queue),
+  ]
+  let timers = [
+    #("ws_ping_interval_ms", limits.ws_ping_interval_ms),
+    #("ws_pong_timeout_ms", limits.ws_pong_timeout_ms),
+    #("ws_idle_timeout_ms", limits.ws_idle_timeout_ms),
+    #("ws_auth_recheck_interval_ms", limits.ws_auth_recheck_interval_ms),
+  ]
+  let non_negative = [
+    #("ws_max_decode_errors", limits.ws_max_decode_errors),
+    #("ws_max_rate_violations", limits.ws_max_rate_violations),
+  ]
+  let outcome = {
+    use _ <- result.try(
+      list.try_each(positive, fn(field) {
+        case field.1 > 0 {
+          True -> Ok(Nil)
+          False -> Error(field.0 <> " must be > 0")
+        }
+      }),
+    )
+    use _ <- result.try(
+      list.try_each(timers, fn(field) {
+        case field.1 > 0 && field.1 <= max_timer_ms {
+          True -> Ok(Nil)
+          False ->
+            Error(
+              field.0
+              <> " must be in 1.."
+              <> int.to_string(max_timer_ms)
+              <> "ms",
+            )
+        }
+      }),
+    )
+    use _ <- result.try(
+      list.try_each(non_negative, fn(field) {
+        case field.1 >= 0 {
+          True -> Ok(Nil)
+          False -> Error(field.0 <> " must be >= 0")
+        }
+      }),
+    )
+    list.try_each(limits.ws_allowed_origins, fn(origin) {
+      case parse_origin(origin) {
+        Ok(Origin(has_path: False, ..)) -> Ok(Nil)
+        Ok(Origin(has_path: True, ..)) ->
+          Error(
+            "ws_allowed_origins entry must not contain a path: \""
+            <> origin
+            <> "\"",
+          )
+        Error(reason) ->
+          Error(
+            "invalid ws_allowed_origins entry \"" <> origin <> "\": " <> reason,
+          )
+      }
+    })
+  }
+  case outcome {
+    Ok(Nil) -> {
+      log.debug("beacon.transport", "Security limits valid")
+      Ok(Nil)
+    }
+    Error(reason) -> {
+      log.error("beacon.transport", "Invalid security limits: " <> reason)
+      Error(reason)
+    }
+  }
+}
+
+/// Timer events a WebSocket connection process schedules for itself.
+pub type WsTimer {
+  /// Send the next server ping.
+  PingTick
+  /// Deadline for the pong answering ping `seq`.
+  PongDeadline(seq: Int)
+  /// Check whether the connection has been idle too long.
+  IdleCheck
+  /// Re-run `ws_auth` against the original upgrade request.
+  AuthRecheck
 }
 
 /// State held by each WebSocket connection process.
@@ -167,16 +319,46 @@ pub type ConnectionState {
     on_close: fn(ConnectionId) -> Nil,
     /// Rate limiting: count of events in current 1-second window.
     event_count: Int,
-    /// Rate limiting: start of current window (monotonic native time units).
+    /// Rate limiting: start of current window (monotonic milliseconds).
     rate_window_start: Int,
     /// Security limits for this connection (copied from TransportConfig at init).
     security_limits: SecurityLimits,
     /// Heartbeat rate limiting: count in current 1-second window.
     heartbeat_count: Int,
-    /// Heartbeat rate limiting: start of current window (monotonic native time units).
+    /// Heartbeat rate limiting: start of current window (monotonic milliseconds).
     heartbeat_window_start: Int,
-    /// WebSocket frame buffer for partial frame reassembly.
+    /// Receive buffer holding at most one partial frame between reads.
     buffer: BitArray,
+    /// Fragmented message reassembly state.
+    reassembly: ws.Reassembly,
+    /// Peer IP address, for logs.
+    peer_ip: String,
+    /// Per-IP slot this connection holds (released on cleanup).
+    slot_key: String,
+    /// The original upgrade request (for periodic `ws_auth` re-checks).
+    request: Request(Connection),
+    /// The configured `ws_auth`, re-run every `ws_auth_recheck_interval_ms`.
+    ws_auth: Option(fn(Request(Connection)) -> Result(Nil, String)),
+    /// Monotonic ms of the last application message from the client.
+    last_activity_ms: Int,
+    /// Sequence number of the last ping sent.
+    ping_seq: Int,
+    /// Sequence number of the ping awaiting a pong, if any.
+    pending_ping: Option(Int),
+    /// Undecodable messages received so far.
+    decode_errors: Int,
+    /// Rate limit violations in the current rate window.
+    rate_violations: Int,
+    /// Subject the connection's own timers deliver to.
+    timer_subject: process.Subject(WsTimer),
+    /// Next server ping.
+    ping_timer: Option(process.Timer),
+    /// Deadline for the outstanding pong.
+    pong_timer: Option(process.Timer),
+    /// Next idle check.
+    idle_timer: Option(process.Timer),
+    /// Next `ws_auth` re-check (only when `ws_auth` is configured).
+    auth_timer: Option(process.Timer),
   )
 }
 
@@ -406,67 +588,113 @@ fn client_message_type(msg: ClientMessage) -> String {
   }
 }
 
+/// Connection context for log lines: connection id and peer address.
+fn ctx(state: ConnectionState) -> String {
+  state.id <> " (peer " <> state.peer_ip <> ")"
+}
+
 /// Send a ServerMessage over a WebSocket connection.
-/// Logs errors but does not crash — the connection may have closed.
-fn send_ws_message(state: ConnectionState, msg: ServerMessage) -> Nil {
+/// A failed send means the connection is dead (the socket is closed by the
+/// VM on send timeout); callers must stop the connection on Error.
+fn send_ws_message(
+  state: ConnectionState,
+  msg: ServerMessage,
+) -> Result(Nil, String) {
   let encoded = encode_server_message(msg)
-  case server.send_text_frame(state.socket, encoded) {
+  case server.send_bytes(state.socket, ws.encode_text(encoded)) {
     Ok(Nil) -> {
       log.debug("beacon.transport", "Sent message to " <> state.id)
-      Nil
+      Ok(Nil)
     }
-    Error(_reason) -> {
-      log.error(
+    Error(reason) -> {
+      log.warning(
         "beacon.transport",
-        "Failed to send message to " <> state.id <> ": send_text_frame failed",
+        "Failed to send message to " <> ctx(state) <> ": " <> reason,
       )
-      Nil
+      Error(reason)
     }
   }
 }
 
-/// One second in native time units (nanoseconds on most BEAM VMs).
-/// Used for rate limiting window calculations.
-const one_second_native = 1_000_000_000
+/// Send a message; a failed send stops the connection.
+fn send_or_stop(state: ConnectionState, msg: ServerMessage) -> Next {
+  case send_ws_message(state, msg) {
+    Ok(Nil) -> Continue(state)
+    Error(reason) -> Stop(state, NoCloseFrame, "send failed: " <> reason)
+  }
+}
 
-/// Maximum heartbeats per second. Heartbeats beyond this are rejected and logged
-/// (no ack sent) to prevent heartbeat flooding.
+/// Send a pre-encoded frame (ping, pong); a failed send stops the connection.
+fn send_frame_or_stop(
+  state: ConnectionState,
+  frame: BitArray,
+  what: String,
+) -> Next {
+  case server.send_bytes(state.socket, frame) {
+    Ok(Nil) -> {
+      log.debug("beacon.transport", "Sent " <> what <> " to " <> state.id)
+      Continue(state)
+    }
+    Error(reason) -> {
+      log.warning(
+        "beacon.transport",
+        "Failed to send " <> what <> " to " <> ctx(state) <> ": " <> reason,
+      )
+      Stop(state, NoCloseFrame, what <> " send failed: " <> reason)
+    }
+  }
+}
+
+/// Length of one rate limiting window, in milliseconds.
+const rate_window_ms = 1000
+
+/// Maximum heartbeats per second. Heartbeats beyond this are not acked and
+/// count as a rate limit violation.
 const max_heartbeats_per_second = 2
 
 /// Maximum number of events in a single batch message.
 /// Prevents clients from sending unbounded arrays that consume server memory.
 const max_batch_size = 100
 
-/// Check per-connection rate limit: max 50 events per 1-second window.
-/// Returns the updated state and whether the event was rate limited.
-fn check_rate_limit(state: ConnectionState) -> #(ConnectionState, Bool) {
-  let now = erlang_monotonic_time()
-  // If more than 1 second has passed, reset the window
-  let #(count, window_start) = case
-    now - state.rate_window_start > one_second_native
-  {
-    True -> #(0, now)
-    False -> #(state.event_count, state.rate_window_start)
-  }
-  let new_count = count + 1
-  let new_state =
-    ConnectionState(
-      ..state,
-      event_count: new_count,
-      rate_window_start: window_start,
-    )
+/// Check the per-connection event rate limit for `cost` events (a batch
+/// costs one per event). Returns the updated state and whether the events
+/// were rejected. Rejected events do not consume budget. Starting a new
+/// window also forgives earlier rate violations.
+fn check_rate_limit(
+  state: ConnectionState,
+  cost: Int,
+) -> #(ConnectionState, Bool) {
+  let assert True = cost >= 1 as "every message costs at least one event"
+  let state = roll_rate_window(state)
+  let new_count = state.event_count + cost
   case new_count > state.security_limits.max_events_per_second {
-    True -> #(new_state, True)
-    False -> #(new_state, False)
+    True -> #(state, True)
+    False -> #(ConnectionState(..state, event_count: new_count), False)
+  }
+}
+
+/// Start a new rate window if the current one has elapsed, resetting the
+/// event budget and forgiving earlier violations.
+fn roll_rate_window(state: ConnectionState) -> ConnectionState {
+  let now = ws.get_now_ms()
+  case now - state.rate_window_start >= rate_window_ms {
+    True ->
+      ConnectionState(
+        ..state,
+        event_count: 0,
+        rate_window_start: now,
+        rate_violations: 0,
+      )
+    False -> state
   }
 }
 
 /// Check heartbeat rate limit: max 2 per second.
 /// Returns the updated state and whether the heartbeat was rate limited.
 fn check_heartbeat_rate(state: ConnectionState) -> #(ConnectionState, Bool) {
-  let now = erlang_monotonic_time()
+  let now = ws.get_now_ms()
   let #(count, window_start) = case
-    now - state.heartbeat_window_start > one_second_native
+    now - state.heartbeat_window_start >= rate_window_ms
   {
     True -> #(0, now)
     False -> #(state.heartbeat_count, state.heartbeat_window_start)
@@ -478,234 +706,663 @@ fn check_heartbeat_rate(state: ConnectionState) -> #(ConnectionState, Bool) {
       heartbeat_count: new_count,
       heartbeat_window_start: window_start,
     )
-  case new_count > max_heartbeats_per_second {
-    True -> #(new_state, True)
-    False -> #(new_state, False)
-  }
+  #(new_state, new_count > max_heartbeats_per_second)
 }
 
-/// Handle an incoming WebSocket text frame.
-/// Rejects oversized messages, then decodes and dispatches.
-/// Returns the updated connection state.
-fn handle_ws_text(state: ConnectionState, text: String) -> ConnectionState {
-  let size = string.byte_size(text)
-  case size > state.security_limits.max_message_bytes {
+/// Record one rate limit violation. Too many within a window closes the
+/// connection with 1008; otherwise `reply` (if any) is sent as an error.
+fn record_rate_violation(
+  state: ConnectionState,
+  description: String,
+  reply: Option(String),
+) -> Next {
+  // Roll the window here too, so violations that are not events (heartbeat
+  // floods, oversized batches) are also forgiven once a window passes.
+  let state = roll_rate_window(state)
+  let violations = state.rate_violations + 1
+  let state = ConnectionState(..state, rate_violations: violations)
+  let max = state.security_limits.ws_max_rate_violations
+  case violations > max {
     True -> {
       log.warning(
         "beacon.transport",
-        "Oversized message from "
-          <> state.id
-          <> " ("
-          <> int.to_string(size)
-          <> " bytes) — rejected",
+        "Closing abusive connection "
+          <> ctx(state)
+          <> ": "
+          <> int.to_string(violations)
+          <> " rate limit violations (max "
+          <> int.to_string(max)
+          <> "), last: "
+          <> description,
       )
-      send_ws_message(state, ServerError(reason: "Message too large"))
-      state
+      Stop(
+        state,
+        SendClose(ws.close_policy_violation, "rate limit exceeded"),
+        "rate limit violations exceeded",
+      )
     }
-    False -> handle_ws_text_decode(state, text)
+    False -> {
+      log.warning(
+        "beacon.transport",
+        "Rate limit violation from "
+          <> ctx(state)
+          <> " ("
+          <> int.to_string(violations)
+          <> "/"
+          <> int.to_string(max)
+          <> "): "
+          <> description,
+      )
+      case reply {
+        Some(reason) -> send_or_stop(state, ServerError(reason: reason))
+        None -> Continue(state)
+      }
+    }
   }
 }
 
-/// Decode and dispatch a validated text message.
-/// Applies per-connection rate limiting to non-heartbeat messages.
-fn handle_ws_text_decode(
-  state: ConnectionState,
-  text: String,
-) -> ConnectionState {
+/// Record one undecodable message. The raw text is never logged or echoed
+/// (it may carry user data); only its size is.
+fn record_decode_error(state: ConnectionState, size: Int) -> Next {
+  let errors = state.decode_errors + 1
+  let state = ConnectionState(..state, decode_errors: errors)
+  let max = state.security_limits.ws_max_decode_errors
+  log.warning(
+    "beacon.transport",
+    "Undecodable message from "
+      <> ctx(state)
+      <> " ("
+      <> int.to_string(size)
+      <> " bytes, "
+      <> int.to_string(errors)
+      <> "/"
+      <> int.to_string(max)
+      <> ")",
+  )
+  case errors > max {
+    True -> {
+      log.warning(
+        "beacon.transport",
+        "Closing connection "
+          <> ctx(state)
+          <> " after repeated invalid messages",
+      )
+      Stop(
+        state,
+        SendClose(ws.close_policy_violation, "too many invalid messages"),
+        "decode errors exceeded",
+      )
+    }
+    False -> send_or_stop(state, ServerError(reason: "Invalid message"))
+  }
+}
+
+/// Handle a complete text message. Size is already bounded by the frame
+/// layer (`max_message_bytes`). Any text message counts as activity.
+fn handle_ws_text(state: ConnectionState, text: String) -> Next {
+  let state = ConnectionState(..state, last_activity_ms: ws.get_now_ms())
+  handle_ws_text_decode(state, text)
+}
+
+/// Decode and dispatch a text message, applying heartbeat and event rate
+/// limits (each event of a batch counts) and decode error accounting.
+fn handle_ws_text_decode(state: ConnectionState, text: String) -> Next {
   case decode_client_message(text) {
     Ok(ClientHeartbeat) -> {
-      // Rate-limit heartbeats: max 2 per second to prevent flooding
       let #(new_state, hb_limited) = check_heartbeat_rate(state)
       case hb_limited {
-        True -> {
-          log.debug(
-            "beacon.transport",
-            "Heartbeat rate limited for " <> state.id,
-          )
-          new_state
-        }
+        True -> record_rate_violation(new_state, "heartbeat flood", None)
         False -> {
           log.debug("beacon.transport", "Heartbeat from " <> state.id)
-          send_ws_message(new_state, ServerHeartbeatAck)
-          new_state
+          send_or_stop(new_state, ServerHeartbeatAck)
         }
       }
     }
     Ok(ClientEventBatch(events) as msg) -> {
-      // Reject oversized batches before any further processing
       let batch_len = list.length(events)
       case batch_len > max_batch_size {
-        True -> {
-          log.warning(
-            "beacon.transport",
-            "Batch too large from "
-              <> state.id
-              <> " ("
+        True ->
+          record_rate_violation(
+            state,
+            "batch of "
               <> int.to_string(batch_len)
-              <> " events, max "
+              <> " events (max "
               <> int.to_string(max_batch_size)
               <> ")",
+            Some("Batch too large"),
           )
-          send_ws_message(state, ServerError(reason: "Batch too large"))
-          state
-        }
-        False -> {
-          // Check rate limit before dispatching
-          let #(new_state, rate_limited) = check_rate_limit(state)
-          case rate_limited {
-            True -> {
-              log.warning(
-                "beacon.transport",
-                "Rate limited connection "
-                  <> state.id
-                  <> " ("
-                  <> int.to_string(new_state.event_count)
-                  <> " events/sec)",
-              )
-              send_ws_message(new_state, ServerError(reason: "Rate limited"))
-              new_state
-            }
-            False -> {
-              log.debug(
-                "beacon.transport",
-                "Event from "
-                  <> new_state.id
-                  <> ": "
-                  <> client_message_type(msg),
-              )
-              new_state.on_event(new_state.id, msg)
-              new_state
-            }
-          }
-        }
+        False -> dispatch_rate_limited(state, msg, int.max(batch_len, 1))
       }
     }
-    Ok(msg) -> {
-      // Check rate limit before dispatching
-      let #(new_state, rate_limited) = check_rate_limit(state)
-      case rate_limited {
-        True -> {
-          log.warning(
-            "beacon.transport",
-            "Rate limited connection "
-              <> state.id
-              <> " ("
-              <> int.to_string(new_state.event_count)
-              <> " events/sec)",
-          )
-          send_ws_message(new_state, ServerError(reason: "Rate limited"))
-          new_state
-        }
-        False -> {
-          log.debug(
-            "beacon.transport",
-            "Event from " <> new_state.id <> ": " <> client_message_type(msg),
-          )
-          new_state.on_event(new_state.id, msg)
-          new_state
-        }
-      }
-    }
-    Error(err) -> {
-      let err_str = error.to_string(err)
-      log.warning(
+    Ok(msg) -> dispatch_rate_limited(state, msg, 1)
+    Error(_codec_error) -> record_decode_error(state, string.byte_size(text))
+  }
+}
+
+/// Dispatch a decoded message if the rate limit allows `cost` more events.
+fn dispatch_rate_limited(
+  state: ConnectionState,
+  msg: ClientMessage,
+  cost: Int,
+) -> Next {
+  let #(new_state, rate_limited) = check_rate_limit(state, cost)
+  case rate_limited {
+    True ->
+      record_rate_violation(
+        new_state,
+        "rate limited "
+          <> client_message_type(msg)
+          <> " ("
+          <> int.to_string(cost)
+          <> " events, "
+          <> int.to_string(new_state.event_count)
+          <> " already this second)",
+        Some("Rate limited"),
+      )
+    False -> {
+      log.debug(
         "beacon.transport",
-        "Decode error from " <> state.id <> ": " <> err_str,
+        "Event from " <> new_state.id <> ": " <> client_message_type(msg),
       )
-      send_ws_message(
-        state,
-        ServerError(reason: "Invalid message: " <> err_str),
-      )
-      state
+      new_state.on_event(new_state.id, msg)
+      Continue(new_state)
     }
   }
 }
 
-// --- Frame Processing ---
+// --- Connection loop ---
 
-/// Result of processing buffered WebSocket frames.
-type FrameResult {
-  /// Continue — state updated, remaining buffer returned.
-  FrameContinue(ConnectionState, BitArray)
-  /// Close frame received — connection should be closed.
-  FrameClose(ConnectionState)
-  /// Protocol violation — close immediately instead of buffering forever.
-  FrameProtocolError(ConnectionState, String)
+/// Everything the connection process can receive.
+type LoopEvent {
+  FromRuntime(InternalMessage)
+  FromTimer(WsTimer)
+  FromSocket(ws.SocketEvent)
 }
 
-/// Process all complete frames in the buffer.
-/// Loops until no more complete frames can be decoded.
-fn process_frames(state: ConnectionState, buffer: BitArray) -> FrameResult {
-  case ws.decode_frame(buffer) {
-    Ok(#(ws.TextFrame(text), rest)) -> {
-      let new_state = handle_ws_text(state, text)
-      process_frames(new_state, rest)
-    }
-    Ok(#(ws.BinaryFrame(_), rest)) -> {
+/// Outcome of handling one event.
+type Next {
+  Continue(ConnectionState)
+  /// Stop the connection: send `action`, close the socket, clean up.
+  /// `reason` is for the log.
+  Stop(state: ConnectionState, action: CloseAction, reason: String)
+}
+
+/// What to put on the wire before closing the socket.
+type CloseAction {
+  /// Send a close frame with this code and short reason.
+  SendClose(code: Int, reason: String)
+  /// Answer a peer close by echoing its code (empty close when it had none).
+  EchoClose(code: Option(Int))
+  /// The socket is already dead (peer closed, send failed): send nothing.
+  NoCloseFrame
+}
+
+/// Short, constant close reason for a protocol error (sent to the peer).
+fn protocol_close_reason(error: ws.ProtocolError) -> String {
+  case ws.get_protocol_close_code(error) {
+    1009 -> "message too big"
+    1007 -> "invalid utf-8"
+    _ -> "protocol error"
+  }
+}
+
+/// Decode and handle every complete frame in `buffer`.
+fn process_frames(state: ConnectionState, buffer: BitArray) -> Next {
+  case
+    ws.decode_next(
+      buffer,
+      state.reassembly,
+      state.security_limits.max_message_bytes,
+    )
+  {
+    Error(error) -> {
       log.warning(
         "beacon.transport",
-        "Unexpected binary frame from " <> state.id,
+        "WebSocket protocol error from "
+          <> ctx(state)
+          <> ": "
+          <> ws.get_protocol_error_reason(error),
       )
-      process_frames(state, rest)
+      Stop(
+        state,
+        SendClose(
+          ws.get_protocol_close_code(error),
+          protocol_close_reason(error),
+        ),
+        "protocol error: " <> ws.get_protocol_error_reason(error),
+      )
     }
-    Ok(#(ws.CloseFrame, _rest)) -> {
-      log.info("beacon.transport", "Close frame from " <> state.id)
-      FrameClose(state)
-    }
-    Ok(#(ws.PingFrame(_data), rest)) -> {
-      // Pong is same as ping payload — but for simplicity, skip pong response
-      // WebSocket keepalive is handled by our heartbeat protocol instead
-      process_frames(state, rest)
-    }
-    Ok(#(ws.PongFrame(_), rest)) -> {
-      // Ignore pong frames
-      process_frames(state, rest)
-    }
-    Error("incomplete") -> {
-      // Incomplete frame — keep buffer for next read
-      FrameContinue(state, buffer)
-    }
-    Error(reason) -> {
+    Ok(ws.Incomplete) -> Continue(ConnectionState(..state, buffer: buffer))
+    Ok(ws.Fragment(rest: rest, reassembly: reassembly)) ->
+      process_frames(ConnectionState(..state, reassembly: reassembly), rest)
+    Ok(ws.Complete(message: message, rest: rest, reassembly: reassembly)) ->
+      case
+        handle_ws_message(
+          ConnectionState(..state, reassembly: reassembly),
+          message,
+        )
+      {
+        Continue(new_state) -> process_frames(new_state, rest)
+        stop -> stop
+      }
+  }
+}
+
+/// Handle one complete, validated WebSocket message.
+fn handle_ws_message(state: ConnectionState, message: ws.Message) -> Next {
+  case message {
+    ws.TextMessage(text) -> handle_ws_text(state, text)
+    ws.BinaryMessage(data) -> {
       log.warning(
         "beacon.transport",
-        "WebSocket protocol error from " <> state.id <> ": " <> reason,
+        "Binary message from "
+          <> ctx(state)
+          <> " ("
+          <> int.to_string(bit_array.byte_size(data))
+          <> " bytes) — Beacon only accepts text",
       )
-      FrameProtocolError(state, reason)
+      Stop(
+        state,
+        SendClose(ws.close_unsupported_data, "binary messages not supported"),
+        "binary message",
+      )
     }
+    ws.CloseMessage(code: code, reason: _) -> {
+      let code_text = case code {
+        Some(c) -> int.to_string(c)
+        None -> "none"
+      }
+      log.info(
+        "beacon.transport",
+        "Close frame from " <> ctx(state) <> " (code " <> code_text <> ")",
+      )
+      Stop(state, EchoClose(code), "peer sent close")
+    }
+    ws.PingMessage(payload) ->
+      send_frame_or_stop(state, ws.encode_pong(payload), "pong")
+    ws.PongMessage(payload) -> handle_pong(state, payload)
+  }
+}
+
+fn ping_payload(seq: Int) -> BitArray {
+  <<int.to_string(seq):utf8>>
+}
+
+/// A pong carrying the outstanding ping's payload clears the deadline.
+/// Unsolicited pongs are allowed (RFC 6455 §5.5.3) and ignored.
+fn handle_pong(state: ConnectionState, payload: BitArray) -> Next {
+  case state.pending_ping {
+    Some(seq) ->
+      case payload == ping_payload(seq) {
+        True -> {
+          cancel_timer(state.pong_timer)
+          log.debug("beacon.transport", "Pong from " <> state.id)
+          Continue(
+            ConnectionState(..state, pending_ping: None, pong_timer: None),
+          )
+        }
+        False -> {
+          log.debug(
+            "beacon.transport",
+            "Pong with stale payload from " <> state.id,
+          )
+          Continue(state)
+        }
+      }
+    None -> {
+      log.debug("beacon.transport", "Unsolicited pong from " <> state.id)
+      Continue(state)
+    }
+  }
+}
+
+fn cancel_timer(timer: Option(process.Timer)) -> Nil {
+  case timer {
+    Some(t) ->
+      case process.cancel_timer(t) {
+        process.Cancelled(_) -> Nil
+        // Already fired; the message (if still queued) is discarded with
+        // the process, or ignored by its sequence/state guard.
+        process.TimerNotFound -> Nil
+      }
+    None -> Nil
+  }
+}
+
+/// Handle a timer the connection scheduled for itself.
+fn handle_timer(state: ConnectionState, timer: WsTimer) -> Next {
+  case timer {
+    PingTick -> send_ping(state)
+    PongDeadline(seq) ->
+      case state.pending_ping == Some(seq) {
+        True -> {
+          log.warning(
+            "beacon.transport",
+            "No pong from "
+              <> ctx(state)
+              <> " within "
+              <> int.to_string(state.security_limits.ws_pong_timeout_ms)
+              <> "ms",
+          )
+          Stop(
+            state,
+            SendClose(ws.close_normal, "pong timeout"),
+            "pong timeout",
+          )
+        }
+        False -> Continue(state)
+      }
+    IdleCheck -> check_idle(state)
+    AuthRecheck -> recheck_auth(state)
+  }
+}
+
+/// Send the next ping unless one is still outstanding (its deadline is
+/// already armed), and reschedule.
+fn send_ping(state: ConnectionState) -> Next {
+  let limits = state.security_limits
+  let ping_timer =
+    Some(process.send_after(
+      state.timer_subject,
+      limits.ws_ping_interval_ms,
+      PingTick,
+    ))
+  let state = ConnectionState(..state, ping_timer: ping_timer)
+  case state.pending_ping {
+    Some(_) -> Continue(state)
+    None -> {
+      let seq = state.ping_seq + 1
+      case
+        send_frame_or_stop(state, ws.encode_ping(ping_payload(seq)), "ping")
+      {
+        Continue(sent_state) ->
+          Continue(
+            ConnectionState(
+              ..sent_state,
+              ping_seq: seq,
+              pending_ping: Some(seq),
+              pong_timer: Some(process.send_after(
+                state.timer_subject,
+                limits.ws_pong_timeout_ms,
+                PongDeadline(seq),
+              )),
+            ),
+          )
+        stop -> stop
+      }
+    }
+  }
+}
+
+/// Close the connection when no application message arrived within the
+/// idle timeout; otherwise re-arm for the remaining time.
+fn check_idle(state: ConnectionState) -> Next {
+  let timeout = state.security_limits.ws_idle_timeout_ms
+  let idle_for = ws.get_now_ms() - state.last_activity_ms
+  case idle_for >= timeout {
+    True -> {
+      log.info(
+        "beacon.transport",
+        "Connection "
+          <> ctx(state)
+          <> " idle for "
+          <> int.to_string(idle_for)
+          <> "ms",
+      )
+      Stop(state, SendClose(ws.close_normal, "idle timeout"), "idle timeout")
+    }
+    False ->
+      Continue(
+        ConnectionState(
+          ..state,
+          idle_timer: Some(process.send_after(
+            state.timer_subject,
+            timeout - idle_for,
+            IdleCheck,
+          )),
+        ),
+      )
+  }
+}
+
+/// Re-run `ws_auth` against the original upgrade request. A session that
+/// was logged out, rotated or expired since the upgrade closes with 4401.
+fn recheck_auth(state: ConnectionState) -> Next {
+  case state.ws_auth {
+    None -> {
+      log.error(
+        "beacon.transport",
+        "Auth re-check fired without ws_auth for " <> ctx(state),
+      )
+      Stop(
+        state,
+        SendClose(ws.close_internal_error, "internal error"),
+        "auth re-check without ws_auth",
+      )
+    }
+    Some(auth_fn) ->
+      case auth_fn(state.request) {
+        Ok(Nil) -> {
+          log.debug("beacon.transport", "Auth re-check passed for " <> state.id)
+          Continue(
+            ConnectionState(
+              ..state,
+              auth_timer: Some(process.send_after(
+                state.timer_subject,
+                state.security_limits.ws_auth_recheck_interval_ms,
+                AuthRecheck,
+              )),
+            ),
+          )
+        }
+        Error(reason) -> {
+          log.warning(
+            "beacon.transport",
+            "Auth re-check failed for " <> ctx(state) <> ": " <> reason,
+          )
+          Stop(
+            state,
+            SendClose(ws.close_auth_revoked, "authentication expired"),
+            "auth re-check failed",
+          )
+        }
+      }
+  }
+}
+
+/// Handle a raw socket-level (or session revocation) event.
+fn handle_socket_event(state: ConnectionState, event: ws.SocketEvent) -> Next {
+  case event {
+    ws.SocketData(data) -> {
+      let buffer = bit_array.append(state.buffer, data)
+      case process_frames(ConnectionState(..state, buffer: <<>>), buffer) {
+        Continue(new_state) -> {
+          server.set_active_once(new_state.socket)
+          Continue(new_state)
+        }
+        stop -> stop
+      }
+    }
+    ws.SocketClosed -> Stop(state, NoCloseFrame, "peer closed TCP connection")
+    ws.SocketError(reason) -> {
+      log.warning(
+        "beacon.transport",
+        "TCP error for " <> ctx(state) <> ": " <> reason,
+      )
+      Stop(state, NoCloseFrame, "TCP error: " <> reason)
+    }
+    ws.SessionRevoked(session_id: _, reason: reason) -> {
+      log.warning(
+        "beacon.transport",
+        "Session behind " <> ctx(state) <> " was " <> reason,
+      )
+      Stop(
+        state,
+        SendClose(ws.close_auth_revoked, "session revoked"),
+        "session " <> reason,
+      )
+    }
+    ws.UnexpectedMessage(description) -> {
+      log.error(
+        "beacon.transport",
+        "Unexpected message in connection "
+          <> ctx(state)
+          <> ": "
+          <> string.slice(description, 0, 200),
+      )
+      Stop(
+        state,
+        SendClose(ws.close_internal_error, "internal error"),
+        "unexpected process message",
+      )
+    }
+  }
+}
+
+/// Handle a message from the runtime. A mailbox deeper than
+/// `ws_max_outbound_queue` means the client cannot keep up: close with 1013
+/// rather than buffer without bound.
+fn handle_runtime_message(
+  state: ConnectionState,
+  message: InternalMessage,
+) -> Next {
+  let queued = ws.get_mailbox_len()
+  let max = state.security_limits.ws_max_outbound_queue
+  case queued > max {
+    True -> {
+      log.warning(
+        "beacon.transport",
+        "Outbound queue for "
+          <> ctx(state)
+          <> " has "
+          <> int.to_string(queued)
+          <> " messages (max "
+          <> int.to_string(max)
+          <> ")",
+      )
+      Stop(
+        state,
+        SendClose(ws.close_try_again_later, "server overloaded"),
+        "outbound queue full",
+      )
+    }
+    False ->
+      case message {
+        SendMount(payload) -> send_or_stop(state, ServerMount(payload: payload))
+        SendError(reason) -> send_or_stop(state, ServerError(reason: reason))
+        SendModelSync(model_json, version, ack_clock) ->
+          send_or_stop(
+            state,
+            ServerModelSync(
+              model_json: model_json,
+              version: version,
+              ack_clock: ack_clock,
+            ),
+          )
+        SendPatch(ops_json, version, ack_clock) ->
+          send_or_stop(
+            state,
+            ServerPatch(
+              ops_json: ops_json,
+              version: version,
+              ack_clock: ack_clock,
+            ),
+          )
+        SendNavigate(path) -> send_or_stop(state, ServerNavigate(path: path))
+        SendHardNavigate(path) ->
+          send_or_stop(state, ServerHardNavigate(path: path))
+        CloseForBackpressure(reason) -> {
+          log.warning(
+            "beacon.transport",
+            "Closing slow connection " <> ctx(state) <> ": " <> reason,
+          )
+          case send_ws_message(state, ServerError(reason: reason)) {
+            Ok(Nil) ->
+              Stop(
+                state,
+                SendClose(ws.close_try_again_later, "backpressure"),
+                "backpressure: " <> reason,
+              )
+            Error(send_reason) ->
+              Stop(state, NoCloseFrame, "send failed: " <> send_reason)
+          }
+        }
+        ReceivedTcpData(data) -> handle_socket_event(state, ws.SocketData(data))
+        TcpConnectionClosed -> handle_socket_event(state, ws.SocketClosed)
+        TcpConnectionError(reason) ->
+          handle_socket_event(state, ws.SocketError(reason))
+      }
   }
 }
 
 // --- WebSocket Connection Lifecycle ---
 
-/// Cleanup a WebSocket connection: decrement tracker, unsub PubSub, call on_close.
+/// Release everything the connection holds: timers, the per-IP slot, the
+/// global connection count, and the runtime (via `on_close`).
 fn cleanup_connection(state: ConnectionState) -> Nil {
-  log.info("beacon.transport", "Connection closed (cleanup): " <> state.id)
+  log.info("beacon.transport", "Connection closed (cleanup): " <> ctx(state))
+  cancel_timer(state.ping_timer)
+  cancel_timer(state.pong_timer)
+  cancel_timer(state.idle_timer)
+  cancel_timer(state.auth_timer)
+  ws.release_ip_slot(state.slot_key)
   let conn_count = connection_tracker_decrement()
   log.debug(
     "beacon.transport",
     "Global connections after close: " <> int.to_string(conn_count),
   )
-  pubsub.unsubscribe("beacon:patches:" <> state.id)
   state.on_close(state.id)
 }
 
+/// Put the close action on the wire, close the socket, clean up.
+fn stop_connection(
+  state: ConnectionState,
+  action: CloseAction,
+  reason: String,
+) -> Nil {
+  log.info(
+    "beacon.transport",
+    "Closing WebSocket " <> ctx(state) <> ": " <> reason,
+  )
+  let frame = case action {
+    SendClose(code: code, reason: close_reason) ->
+      Some(ws.encode_close(code, close_reason))
+    EchoClose(code: Some(code)) -> Some(ws.encode_close(code, ""))
+    EchoClose(code: None) -> Some(ws.encode_empty_close())
+    NoCloseFrame -> None
+  }
+  case frame {
+    Some(bytes) ->
+      case server.send_bytes(state.socket, bytes) {
+        Ok(Nil) -> Nil
+        Error(send_reason) ->
+          log.warning(
+            "beacon.transport",
+            "Failed to send close frame to "
+              <> ctx(state)
+              <> ": "
+              <> send_reason,
+          )
+      }
+    None -> Nil
+  }
+  server.close(state.socket)
+  cleanup_connection(state)
+}
+
 /// WebSocket receive loop — runs in the handler process.
-/// Receives TCP data and internal messages via a selector.
-/// This function never returns normally — it exits when the connection closes.
+/// Receives runtime messages, its own timers and socket events.
+/// Returns only after the connection has been closed and cleaned up.
 fn ws_loop(
   state: ConnectionState,
   subject: process.Subject(InternalMessage),
 ) -> Nil {
   let selector =
     process.new_selector()
-    |> process.select(subject)
-    |> process.select_other(fn(raw: Dynamic) -> InternalMessage {
-      case server.classify_tcp_message(raw) {
-        Ok(server.TcpData(data)) -> ReceivedTcpData(data)
-        Ok(server.TcpClosed) -> TcpConnectionClosed
-        Ok(server.TcpError(reason)) -> TcpConnectionError(reason)
-        Error(Nil) -> TcpConnectionError("Unknown message received")
-      }
+    |> process.select_map(subject, FromRuntime)
+    |> process.select_map(state.timer_subject, FromTimer)
+    |> process.select_other(fn(raw: Dynamic) {
+      FromSocket(ws.decode_socket_event(raw))
     })
   ws_loop_inner(state, selector)
 }
@@ -713,166 +1370,46 @@ fn ws_loop(
 /// Inner loop with cached selector.
 fn ws_loop_inner(
   state: ConnectionState,
-  selector: process.Selector(InternalMessage),
+  selector: process.Selector(LoopEvent),
 ) -> Nil {
-  let msg = process.selector_receive_forever(selector)
-  case msg {
-    ReceivedTcpData(data) -> {
-      let buffer = bit_array.append(state.buffer, data)
-      case
-        bit_array.byte_size(buffer) > state.security_limits.max_message_bytes
-      {
-        True -> {
-          log.warning(
-            "beacon.transport",
-            "Buffered WebSocket data exceeded limit for "
-              <> state.id
-              <> " ("
-              <> int.to_string(bit_array.byte_size(buffer))
-              <> " bytes)",
-          )
-          send_ws_message(state, ServerError(reason: "Message too large"))
-          server.close(state.socket)
-          cleanup_connection(state)
-        }
-        False -> {
-          case process_frames(state, buffer) {
-            FrameContinue(new_state, new_buffer) -> {
-              server.set_active_once(new_state.socket)
-              ws_loop_inner(
-                ConnectionState(..new_state, buffer: new_buffer),
-                selector,
-              )
-            }
-            FrameClose(close_state) -> {
-              case server.send_close_frame(close_state.socket) {
-                Ok(Nil) -> Nil
-                Error(reason) ->
-                  log.warning(
-                    "beacon.transport",
-                    "Failed to send close frame to "
-                      <> close_state.id
-                      <> ": "
-                      <> reason,
-                  )
-              }
-              server.close(close_state.socket)
-              cleanup_connection(close_state)
-            }
-            FrameProtocolError(error_state, reason) -> {
-              case server.send_close_frame(error_state.socket) {
-                Ok(Nil) -> Nil
-                Error(send_reason) ->
-                  log.warning(
-                    "beacon.transport",
-                    "Failed to send close frame after protocol error for "
-                      <> error_state.id
-                      <> ": "
-                      <> send_reason,
-                  )
-              }
-              log.warning(
-                "beacon.transport",
-                "Closing connection "
-                  <> error_state.id
-                  <> " after WebSocket protocol error: "
-                  <> reason,
-              )
-              server.close(error_state.socket)
-              cleanup_connection(error_state)
-            }
-          }
-        }
-      }
-    }
-    TcpConnectionClosed -> {
-      cleanup_connection(state)
-    }
-    TcpConnectionError(reason) -> {
-      log.error(
-        "beacon.transport",
-        "TCP error for " <> state.id <> ": " <> reason,
-      )
-      server.close(state.socket)
-      cleanup_connection(state)
-    }
-    SendMount(payload) -> {
-      send_ws_message(state, ServerMount(payload: payload))
-      ws_loop_inner(state, selector)
-    }
-    SendError(reason) -> {
-      send_ws_message(state, ServerError(reason: reason))
-      ws_loop_inner(state, selector)
-    }
-    SendModelSync(model_json, version, ack_clock) -> {
-      send_ws_message(
-        state,
-        ServerModelSync(
-          model_json: model_json,
-          version: version,
-          ack_clock: ack_clock,
-        ),
-      )
-      ws_loop_inner(state, selector)
-    }
-    SendPatch(ops_json, version, ack_clock) -> {
-      send_ws_message(
-        state,
-        ServerPatch(ops_json: ops_json, version: version, ack_clock: ack_clock),
-      )
-      ws_loop_inner(state, selector)
-    }
-    SendNavigate(path) -> {
-      send_ws_message(state, ServerNavigate(path: path))
-      ws_loop_inner(state, selector)
-    }
-    SendHardNavigate(path) -> {
-      send_ws_message(state, ServerHardNavigate(path: path))
-      ws_loop_inner(state, selector)
-    }
-    CloseForBackpressure(reason) -> {
-      log.warning(
-        "beacon.transport",
-        "Closing slow connection " <> state.id <> ": " <> reason,
-      )
-      send_ws_message(state, ServerError(reason: reason))
-      case server.send_close_frame(state.socket) {
-        Ok(Nil) -> Nil
-        Error(send_reason) ->
-          log.warning(
-            "beacon.transport",
-            "Failed to send close frame to slow connection "
-              <> state.id
-              <> ": "
-              <> send_reason,
-          )
-      }
-      server.close(state.socket)
-      cleanup_connection(state)
-    }
+  let next = case process.selector_receive_forever(selector) {
+    FromSocket(event) -> handle_socket_event(state, event)
+    FromTimer(timer) -> handle_timer(state, timer)
+    FromRuntime(message) -> handle_runtime_message(state, message)
+  }
+  case next {
+    Continue(new_state) -> ws_loop_inner(new_state, selector)
+    Stop(state: final_state, action: action, reason: reason) ->
+      stop_connection(final_state, action, reason)
   }
 }
 
+/// Identity of an admitted connection, carried from admission to startup.
+type Admission {
+  Admission(conn_id: ConnectionId, peer_ip: String, slot_key: String)
+}
+
 /// Start a WebSocket connection on an already-upgraded socket.
-/// Creates the connection state, sets up runtime, and enters the frame loop.
-/// This function runs in the handler process and never returns.
-/// The HTTP request is passed through so ws_init can read cookies/headers.
+/// Starts the runtime, arms liveness timers, and enters the frame loop.
+/// Runs in the handler process and returns when the connection ends.
 fn start_ws_connection(
   socket: Socket,
   config: TransportConfig,
   req: Request(Connection),
+  admission: Admission,
 ) -> Nil {
-  let conn_id = generate_connection_id()
-  log.info("beacon.transport", "New connection: " <> conn_id)
+  let conn_id = admission.conn_id
+  log.info(
+    "beacon.transport",
+    "New connection: " <> conn_id <> " (peer " <> admission.peer_ip <> ")",
+  )
 
   let subject = process.new_subject()
 
   // Use runtime_factory if available (per-connection runtimes)
   // Otherwise use shared callbacks
   let handlers = case config.runtime_factory {
-    Some(factory) -> {
-      factory(conn_id, subject, req)
-    }
+    Some(factory) -> factory(conn_id, subject, req)
     None -> {
       config.on_connect(conn_id, subject)
       Ok(#(config.on_event, config.on_disconnect))
@@ -881,6 +1418,18 @@ fn start_ws_connection(
 
   case handlers {
     Ok(#(conn_on_event, conn_on_close)) -> {
+      let limits = config.security_limits
+      let timer_subject = process.new_subject()
+      let now = ws.get_now_ms()
+      let auth_timer = case config.ws_auth {
+        Some(_) ->
+          Some(process.send_after(
+            timer_subject,
+            limits.ws_auth_recheck_interval_ms,
+            AuthRecheck,
+          ))
+        None -> None
+      }
       let state =
         ConnectionState(
           id: conn_id,
@@ -888,19 +1437,40 @@ fn start_ws_connection(
           on_event: conn_on_event,
           on_close: conn_on_close,
           event_count: 0,
-          rate_window_start: 0,
-          security_limits: config.security_limits,
+          rate_window_start: now,
+          security_limits: limits,
           heartbeat_count: 0,
-          heartbeat_window_start: 0,
+          heartbeat_window_start: now,
           buffer: <<>>,
+          reassembly: ws.create_reassembly(),
+          peer_ip: admission.peer_ip,
+          slot_key: admission.slot_key,
+          request: req,
+          ws_auth: config.ws_auth,
+          last_activity_ms: now,
+          ping_seq: 0,
+          pending_ping: None,
+          decode_errors: 0,
+          rate_violations: 0,
+          timer_subject: timer_subject,
+          ping_timer: Some(process.send_after(
+            timer_subject,
+            limits.ws_ping_interval_ms,
+            PingTick,
+          )),
+          pong_timer: None,
+          idle_timer: Some(process.send_after(
+            timer_subject,
+            limits.ws_idle_timeout_ms,
+            IdleCheck,
+          )),
+          auth_timer: auth_timer,
         )
-
-      pubsub.subscribe("beacon:patches:" <> conn_id)
 
       // Start receiving TCP data
       server.set_active_once(socket)
 
-      // Enter the receive loop — never returns
+      // Enter the receive loop — returns after close and cleanup
       ws_loop(state, subject)
     }
     Error(reason) -> {
@@ -908,10 +1478,17 @@ fn start_ws_connection(
         "beacon.transport",
         "Closing WebSocket after runtime startup failure for "
           <> conn_id
-          <> ": "
+          <> " (peer "
+          <> admission.peer_ip
+          <> "): "
           <> reason,
       )
-      case server.send_close_frame(socket) {
+      case
+        server.send_bytes(
+          socket,
+          ws.encode_close(ws.close_internal_error, "startup failure"),
+        )
+      {
         Ok(Nil) -> Nil
         Error(send_reason) ->
           log.warning(
@@ -923,6 +1500,7 @@ fn start_ws_connection(
           )
       }
       server.close(socket)
+      ws.release_ip_slot(admission.slot_key)
       let conn_count = connection_tracker_decrement()
       log.debug(
         "beacon.transport",
@@ -935,11 +1513,109 @@ fn start_ws_connection(
 
 // --- WebSocket Upgrade Validation ---
 
-/// Check that the Origin header matches the server's host.
+/// A parsed web origin (RFC 6454): scheme, host and effective port.
+type Origin {
+  Origin(scheme: String, host: String, port: Int, has_path: Bool)
+}
+
+fn default_port(scheme: String) -> Result(Int, String) {
+  case scheme {
+    "http" -> Ok(80)
+    "https" -> Ok(443)
+    other -> Error("unsupported scheme \"" <> other <> "\"")
+  }
+}
+
+/// Parse an Origin header value: `scheme://host[:port]`. A trailing path is
+/// tolerated (some legacy clients send one) but recorded. `null`, userinfo
+/// and anything outside http/https are rejected.
+fn parse_origin(value: String) -> Result(Origin, String) {
+  case string.split_once(string.trim(value), "://") {
+    Error(Nil) -> Error("origin has no scheme")
+    Ok(#(raw_scheme, rest)) -> {
+      let scheme = string.lowercase(raw_scheme)
+      use port <- result.try(default_port(scheme))
+      let #(authority, has_path) = case string.split_once(rest, "/") {
+        Ok(#(authority, _path)) -> #(authority, True)
+        Error(Nil) -> #(rest, False)
+      }
+      use #(host, port) <- result.try(parse_authority(authority, port))
+      Ok(Origin(scheme: scheme, host: host, port: port, has_path: has_path))
+    }
+  }
+}
+
+/// Parse `host[:port]` (IPv6 hosts in brackets). Host is lowercased.
+fn parse_authority(
+  authority: String,
+  default: Int,
+) -> Result(#(String, Int), String) {
+  let forbidden = ["@", "?", "#", " ", "\\", "\t"]
+  case list.any(forbidden, fn(c) { string.contains(authority, c) }) {
+    True -> Error("invalid characters in host")
+    False ->
+      case authority {
+        "" -> Error("empty host")
+        "[" <> ipv6_rest ->
+          case string.split_once(ipv6_rest, "]") {
+            Ok(#("", _)) -> Error("empty IPv6 host")
+            Ok(#(address, "")) ->
+              Ok(#("[" <> string.lowercase(address) <> "]", default))
+            Ok(#(address, ":" <> port_text)) -> {
+              use port <- result.try(parse_port(port_text))
+              Ok(#("[" <> string.lowercase(address) <> "]", port))
+            }
+            _ -> Error("malformed IPv6 host")
+          }
+        _ ->
+          case string.split(authority, ":") {
+            [""] | ["", _] -> Error("empty host")
+            [host] -> Ok(#(string.lowercase(host), default))
+            [host, port_text] -> {
+              use port <- result.try(parse_port(port_text))
+              Ok(#(string.lowercase(host), port))
+            }
+            _ -> Error("malformed host")
+          }
+      }
+  }
+}
+
+fn parse_port(text: String) -> Result(Int, String) {
+  case int.parse(text) {
+    Ok(port) if port >= 1 && port <= 65_535 -> Ok(port)
+    _ -> Error("invalid port \"" <> text <> "\"")
+  }
+}
+
+/// The scheme the client used to reach us: the first X-Forwarded-Proto
+/// token when a proxy set one, otherwise plain http (Beacon itself does not
+/// terminate TLS).
+fn request_scheme(req: Request(Connection)) -> Result(String, String) {
+  case request.get_header(req, "x-forwarded-proto") {
+    Error(Nil) -> Ok("http")
+    Ok(value) -> {
+      let first = case string.split(value, ",") {
+        [token, ..] -> string.lowercase(string.trim(token))
+        [] -> ""
+      }
+      case first {
+        "http" | "https" -> Ok(first)
+        _ -> Error("invalid X-Forwarded-Proto \"" <> value <> "\"")
+      }
+    }
+  }
+}
+
+/// Check that the Origin header matches the server's own origin (scheme,
+/// host and port) or an entry of `ws_allowed_origins`.
 /// This prevents cross-site WebSocket hijacking (CSWSH).
 ///
 /// SECURITY: Origin validation is the primary CSRF defense for WebSocket connections.
-fn check_origin(req: Request(Connection)) -> Result(Nil, String) {
+fn check_origin(
+  req: Request(Connection),
+  limits: SecurityLimits,
+) -> Result(Nil, String) {
   case request.get_header(req, "origin") {
     Error(Nil) -> {
       log.warning(
@@ -951,115 +1627,330 @@ fn check_origin(req: Request(Connection)) -> Result(Nil, String) {
     Ok(origin) -> {
       let request_host = case request.get_header(req, "host") {
         Ok(h) -> h
-        Error(Nil) -> {
-          log.warning(
-            "beacon.transport",
-            "Missing Host header for origin check",
-          )
-          ""
-        }
+        Error(Nil) -> ""
       }
-      origin_allowed_for_host(origin, request_host)
+      case request_scheme(req) {
+        Error(reason) -> {
+          log.warning("beacon.transport", "Origin check failed: " <> reason)
+          Error(reason)
+        }
+        Ok(scheme) ->
+          origin_allowed(
+            origin,
+            scheme,
+            request_host,
+            limits.ws_allowed_origins,
+          )
+      }
     }
   }
 }
 
-/// Validate that an Origin header value belongs to the request Host.
-/// Empty origins, empty hosts, protocol-relative URLs, and mismatches reject.
+/// Validate an Origin header against the request's own origin
+/// (`request_scheme` + Host header, default ports applied) and an explicit
+/// allow-list of origins. Scheme, host and port must all match.
+pub fn origin_allowed(
+  origin: String,
+  request_scheme: String,
+  request_host: String,
+  allowed_origins: List(String),
+) -> Result(Nil, String) {
+  let decision = {
+    use parsed <- result.try(
+      parse_origin(origin)
+      |> result.map_error(fn(reason) { "invalid Origin: " <> reason }),
+    )
+    let same = Origin(..parsed, has_path: False)
+    let allow_listed =
+      list.any(allowed_origins, fn(allowed) {
+        case parse_origin(allowed) {
+          Ok(entry) -> Origin(..entry, has_path: False) == same
+          Error(_) -> False
+        }
+      })
+    case allow_listed {
+      True -> Ok(Nil)
+      False -> {
+        use port <- result.try(default_port(string.lowercase(request_scheme)))
+        use #(host, port) <- result.try(
+          parse_authority(string.trim(request_host), port)
+          |> result.map_error(fn(reason) { "invalid Host: " <> reason }),
+        )
+        let own =
+          Origin(
+            scheme: string.lowercase(request_scheme),
+            host: host,
+            port: port,
+            has_path: False,
+          )
+        case own == same {
+          True -> Ok(Nil)
+          False -> Error("Origin mismatch")
+        }
+      }
+    }
+  }
+  case decision {
+    Ok(Nil) -> {
+      log.debug("beacon.transport", "Origin allowed: " <> origin)
+      Ok(Nil)
+    }
+    Error(reason) -> {
+      log.warning(
+        "beacon.transport",
+        "Origin rejected ("
+          <> reason
+          <> "): origin="
+          <> origin
+          <> " scheme="
+          <> request_scheme
+          <> " host="
+          <> request_host,
+      )
+      Error(reason)
+    }
+  }
+}
+
+/// Validate that an Origin header value belongs to the request Host over
+/// plain http. Empty origins, empty hosts, scheme-less values and
+/// scheme/host/port mismatches reject.
 pub fn origin_allowed_for_host(
   origin: String,
   request_host: String,
 ) -> Result(Nil, String) {
-  let origin_host = extract_host_from_origin(origin)
-  case origin_host != "" && request_host != "" && origin_host == request_host {
-    True -> Ok(Nil)
-    False -> {
-      log.warning(
-        "beacon.transport",
-        "Origin mismatch: origin=" <> origin <> " host=" <> request_host,
-      )
-      Error("Origin mismatch")
-    }
-  }
-}
-
-/// Extract the host portion from an origin URL.
-fn extract_host_from_origin(origin: String) -> String {
-  let without_protocol = case string.split(origin, "://") {
-    [_, rest] -> rest
-    _ -> origin
-  }
-  case string.split(without_protocol, "/") {
-    [host, ..] -> host
-    _ -> without_protocol
-  }
+  log.debug("beacon.transport", "Checking origin against host " <> request_host)
+  origin_allowed(origin, "http", request_host, [])
 }
 
 /// Handle a WebSocket upgrade request on a raw socket.
-/// Validates connection limit, origin, auth, then performs the upgrade handshake.
+/// Admission order: limits sanity, global cap, per-IP cap, origin, auth,
+/// then RFC 6455 handshake validation. Every rejection is logged with the
+/// connection id and peer address and releases what was acquired.
 fn handle_ws_request(
   socket: Socket,
   req: Request(Connection),
   config: TransportConfig,
 ) -> Nil {
-  // Check global connection limit
-  let current_count = connection_tracker_count()
-  case current_count > config.security_limits.max_connections {
-    True -> {
+  let conn_id = generate_connection_id()
+  let limits = config.security_limits
+  case validate_security_limits(limits), ws.peer_ip(socket) {
+    Error(reason), _ ->
+      reject_ws_request(
+        socket,
+        conn_id,
+        "unknown",
+        None,
+        500,
+        "Server misconfigured",
+        "invalid security limits: " <> reason,
+      )
+    Ok(Nil), Error(reason) -> {
+      // The peer is already gone: nobody to answer.
       log.warning(
         "beacon.transport",
-        "Global connection limit reached ("
+        "WebSocket upgrade " <> conn_id <> " dropped: " <> reason,
+      )
+      server.close(socket)
+      let _count = connection_tracker_decrement()
+      Nil
+    }
+    Ok(Nil), Ok(peer_ip) ->
+      admit_ws_request(socket, req, config, conn_id, peer_ip)
+  }
+}
+
+fn admit_ws_request(
+  socket: Socket,
+  req: Request(Connection),
+  config: TransportConfig,
+  conn_id: ConnectionId,
+  peer_ip: String,
+) -> Nil {
+  let limits = config.security_limits
+  let current_count = connection_tracker_count()
+  case current_count > limits.max_connections {
+    True ->
+      reject_ws_request(
+        socket,
+        conn_id,
+        peer_ip,
+        None,
+        503,
+        "Too many connections",
+        "global connection limit reached ("
           <> int.to_string(current_count)
           <> "/"
-          <> int.to_string(config.security_limits.max_connections)
-          <> ") — rejecting new connection",
+          <> int.to_string(limits.max_connections)
+          <> ")",
       )
-      let _ = connection_tracker_decrement()
-      transport_http.write_error(socket, 503, "Too many connections")
-    }
     False -> {
-      // Check origin — prevents cross-site WebSocket hijacking
-      case check_origin(req) {
-        Error(reason) -> {
-          reject_ws_request(socket, 403, "Forbidden: " <> reason)
-        }
-        Ok(Nil) -> {
-          // Check WebSocket auth if configured
-          let auth_ok = case config.ws_auth {
-            Some(auth_fn) -> auth_fn(req)
-            None -> Ok(Nil)
-          }
-          case auth_ok {
-            Error(reason) -> {
-              log.warning("beacon.transport", "WS auth rejected: " <> reason)
-              reject_ws_request(socket, 401, "Unauthorized: " <> reason)
-            }
-            Ok(Nil) -> {
-              // Perform the WebSocket upgrade handshake
-              case ws.upgrade(socket, req) {
-                Ok(Nil) -> {
-                  // Upgrade succeeded — enter the WS frame loop
-                  start_ws_connection(socket, config, req)
-                }
-                Error(reason) -> {
-                  log.error(
-                    "beacon.transport",
-                    "WebSocket upgrade failed: " <> reason,
-                  )
-                  let _ = connection_tracker_decrement()
-                  server.close(socket)
-                }
-              }
-            }
-          }
-        }
+      let slot_key = int.to_string(config.port) <> "|" <> peer_ip
+      case ws.acquire_ip_slot(slot_key, limits.max_ws_connections_per_ip) {
+        Error(count) ->
+          reject_ws_request(
+            socket,
+            conn_id,
+            peer_ip,
+            None,
+            429,
+            "Too many connections from this address",
+            "per-IP WebSocket limit reached (" <> int.to_string(count) <> ")",
+          )
+        Ok(_count) ->
+          authorize_ws_request(
+            socket,
+            req,
+            config,
+            Admission(conn_id: conn_id, peer_ip: peer_ip, slot_key: slot_key),
+          )
       }
     }
   }
 }
 
-fn reject_ws_request(socket: Socket, status: Int, body: String) -> Nil {
-  let _ = connection_tracker_decrement()
+fn authorize_ws_request(
+  socket: Socket,
+  req: Request(Connection),
+  config: TransportConfig,
+  admission: Admission,
+) -> Nil {
+  let reject = fn(status, body, reason) {
+    reject_ws_request(
+      socket,
+      admission.conn_id,
+      admission.peer_ip,
+      Some(admission.slot_key),
+      status,
+      body,
+      reason,
+    )
+  }
+  case check_origin(req, config.security_limits) {
+    Error(reason) -> reject(403, "Forbidden: " <> reason, "origin: " <> reason)
+    Ok(Nil) -> {
+      let auth_ok = case config.ws_auth {
+        Some(auth_fn) -> auth_fn(req)
+        None -> Ok(Nil)
+      }
+      case auth_ok {
+        Error(reason) ->
+          reject(401, "Unauthorized: " <> reason, "ws_auth: " <> reason)
+        Ok(Nil) ->
+          case ws.validate_upgrade(req) {
+            Error(error) -> {
+              let description = ws.get_upgrade_error_reason(error)
+              case ws.get_upgrade_error_status(error) {
+                426 ->
+                  reject_unsupported_version(socket, admission, description)
+                status ->
+                  reject(status, description, "handshake: " <> description)
+              }
+            }
+            Ok(client_key) ->
+              upgrade_ws_request(socket, req, config, admission, client_key)
+          }
+      }
+    }
+  }
+}
+
+fn upgrade_ws_request(
+  socket: Socket,
+  req: Request(Connection),
+  config: TransportConfig,
+  admission: Admission,
+  client_key: String,
+) -> Nil {
+  let upgraded = {
+    use _ <- result.try(ws.set_send_timeout(
+      socket,
+      config.security_limits.ws_send_timeout_ms,
+    ))
+    ws.send_upgrade_response(socket, client_key)
+  }
+  case upgraded {
+    Ok(Nil) -> start_ws_connection(socket, config, req, admission)
+    Error(reason) -> {
+      log.warning(
+        "beacon.transport",
+        "WebSocket upgrade failed for "
+          <> admission.conn_id
+          <> " (peer "
+          <> admission.peer_ip
+          <> "): "
+          <> reason,
+      )
+      server.close(socket)
+      ws.release_ip_slot(admission.slot_key)
+      let _count = connection_tracker_decrement()
+      Nil
+    }
+  }
+}
+
+/// 426 Upgrade Required must advertise the supported version (§4.4).
+fn reject_unsupported_version(
+  socket: Socket,
+  admission: Admission,
+  description: String,
+) -> Nil {
+  log.warning(
+    "beacon.transport",
+    "WebSocket upgrade rejected for "
+      <> admission.conn_id
+      <> " (peer "
+      <> admission.peer_ip
+      <> ") status 426: "
+      <> description,
+  )
+  ws.release_ip_slot(admission.slot_key)
+  let _count = connection_tracker_decrement()
+  let resp =
+    response.new(426)
+    |> response.set_header("sec-websocket-version", "13")
+    |> response.set_body(Bytes(bytes_tree.from_string(description)))
+  case transport_http.write_response(socket, resp) {
+    Ok(Nil) -> Nil
+    Error(reason) ->
+      log.warning(
+        "beacon.transport",
+        "Failed to write 426 response for "
+          <> admission.conn_id
+          <> ": "
+          <> reason,
+      )
+  }
+  server.close(socket)
+}
+
+/// Reject an upgrade: log with context, release the per-IP slot (if one
+/// was taken) and the global count, answer with an HTTP error and close.
+fn reject_ws_request(
+  socket: Socket,
+  conn_id: ConnectionId,
+  peer_ip: String,
+  slot_key: Option(String),
+  status: Int,
+  body: String,
+  reason: String,
+) -> Nil {
+  log.warning(
+    "beacon.transport",
+    "WebSocket upgrade rejected for "
+      <> conn_id
+      <> " (peer "
+      <> peer_ip
+      <> ") status "
+      <> int.to_string(status)
+      <> ": "
+      <> reason,
+  )
+  case slot_key {
+    Some(key) -> ws.release_ip_slot(key)
+    None -> Nil
+  }
+  let _count = connection_tracker_decrement()
   transport_http.write_error(socket, status, body)
 }
 
