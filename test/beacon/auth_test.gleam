@@ -15,7 +15,7 @@ import gleeunit/should
 
 pub fn login_creates_session_test() {
   let store = session.new_store("auth_login")
-  let sess = auth.login(store, "user123")
+  let assert Ok(sess) = auth.login(store, "user123")
   // Session should exist with user_id
   let assert Some(found) = session.get(store, sess.id)
   let assert Ok("user123") = auth.current_user(found)
@@ -23,8 +23,8 @@ pub fn login_creates_session_test() {
 
 pub fn logout_destroys_session_test() {
   let store = session.new_store("auth_logout")
-  let sess = auth.login(store, "user456")
-  auth.logout(store, sess.id)
+  let assert Ok(sess) = auth.login(store, "user456")
+  let assert Ok(Nil) = auth.logout(store, sess.id)
   // Session should be gone
   let assert option.None = session.get(store, sess.id)
 }
@@ -38,7 +38,7 @@ pub fn current_user_no_user_test() {
 
 pub fn current_user_with_user_test() {
   let store = session.new_store("auth_withuser")
-  let sess = auth.login(store, "admin")
+  let assert Ok(sess) = auth.login(store, "admin")
   let assert Ok("admin") = auth.current_user(sess)
 }
 
@@ -65,7 +65,7 @@ pub fn login_response_sets_session_cookie_and_csrf_test() {
 pub fn create_login_then_with_session_cookie_supports_custom_response_test() {
   let store = session.new_store("auth_create_login")
   let config = auth.dev_session_config()
-  let login = auth.create_login(store, "custom-user")
+  let assert Ok(login) = auth.create_login(store, "custom-user")
 
   let assert Ok(resp) =
     api_json("{\"csrf\":\"" <> login.csrf_token <> "\"}")
@@ -109,11 +109,11 @@ pub fn login_with_invalid_cookie_config_creates_no_session_test() {
       ),
     )
   let before = session.count(store)
-  let assert Error(cookie.InvalidName(_)) =
+  let assert Error(auth.CookieRejected(cookie.InvalidName(_))) =
     auth.login_response(store, "u", empty_response(), bad_name)
-  let assert Error(cookie.InvalidName(_)) =
+  let assert Error(auth.CookieRejected(cookie.InvalidName(_))) =
     auth.login_json_response(store, "u", bad_name)
-  let assert Error(cookie.InsecureSameSiteNone(_)) =
+  let assert Error(auth.CookieRejected(cookie.InsecureSameSiteNone(_))) =
     auth.login_json_response_rotating(store, option.None, "u", insecure_none)
   should.equal(session.count(store), before)
 }

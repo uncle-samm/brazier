@@ -1022,7 +1022,7 @@ pub fn expired_session_gets_401_test() {
         sweep_interval_ms: 60_000,
       ),
     )
-  let sess = auth.login(store, "user-1")
+  let assert Ok(sess) = auth.login(store, "user-1")
   process.sleep(80)
   let server = session_auth_server(store)
   let #(socket, head) =
@@ -1033,18 +1033,18 @@ pub fn expired_session_gets_401_test() {
 
 pub fn logout_closes_live_socket_4401_test() {
   let store = session.new_store("ws2_ws_logout")
-  let sess = auth.login(store, "user-1")
+  let assert Ok(sess) = auth.login(store, "user-1")
   let server = session_auth_server(store)
   let probe = open_with(server, cookie_headers(server.port, sess.id))
   let assert True =
     wait_until(fn() { session.bound_process_count(store, sess.id) == 1 }, 1000)
-  auth.logout(store, sess.id)
+  let assert Ok(Nil) = auth.logout(store, sess.id)
   assert_closed_with(probe, server, 4401)
 }
 
 pub fn old_session_id_is_unusable_after_login_rotation_test() {
   let store = session.new_store("ws2_ws_rotation")
-  let anonymous = auth.login(store, "guest")
+  let assert Ok(anonymous) = auth.login(store, "guest")
   let server = session_auth_server(store)
   let probe = open_with(server, cookie_headers(server.port, anonymous.id))
   let assert True =
@@ -1052,7 +1052,8 @@ pub fn old_session_id_is_unusable_after_login_rotation_test() {
       fn() { session.bound_process_count(store, anonymous.id) == 1 },
       1000,
     )
-  let fresh = auth.login_rotating(store, Some(anonymous.id), "user-1")
+  let assert Ok(fresh) =
+    auth.login_rotating(store, Some(anonymous.id), "user-1")
   // The socket bound to the old id is closed...
   assert_closed_with(probe, server, 4401)
   // ...the old id cannot open a new one...
@@ -1069,7 +1070,7 @@ pub fn failed_auth_recheck_closes_4401_test() {
   // ws_auth that does not bind the process: only the periodic re-check can
   // notice the session is gone.
   let store = session.new_store("ws2_ws_recheck")
-  let sess = auth.login(store, "user-1")
+  let assert Ok(sess) = auth.login(store, "user-1")
   let check = fn(req: Request(Connection)) {
     case session.id_from_request(req, auth.default_session_cookie_name) {
       Ok(id) ->

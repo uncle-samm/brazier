@@ -1,5 +1,16 @@
 /// Auth helpers — login, logout, session-bound authentication.
 /// Works with the session store and middleware context.
+///
+/// Every helper uses the session functions that return errors
+/// (`session.try_create_with_data`, `session.try_delete`, `session.fetch`,
+/// `session.rotate`), so an External backend failure never crashes a
+/// request:
+/// - a missing, deleted or expired session is `InvalidSession`;
+/// - a backend failure (or a write that lost every compare-and-swap race)
+///   is `SessionStoreUnavailable`, logged as an error with its reason.
+///   Request wrappers and middleware answer it with 503, WebSocket auth
+///   rejects the socket, and `init_from_session` renders the guest state
+///   (fail closed: an unverifiable session is never trusted).
 import beacon/api
 import beacon/cookie
 import beacon/log
@@ -41,6 +52,15 @@ pub type LoginSession {
   LoginSession(session: session.Session, csrf_token: String)
 }
 
+/// Why a helper that builds a login or logout response failed.
+pub type ResponseError {
+  /// The session cookie config is invalid; no session was created.
+  CookieRejected(cookie.CookieError)
+  /// The session store failed. Login: no session was created. Logout: the
+  /// session may still exist, but its live sockets were told to close.
+  StoreFailed(session.SessionStoreError)
+}
+
 /// Result returned after creating a login response.
 pub type LoginResult {
   LoginResult(
@@ -57,6 +77,9 @@ pub type SessionError {
   MissingUser
   MissingCsrfToken
   InvalidCsrfToken
+  /// The session store could not answer (an External backend failed). The
+  /// reason is logged; it is not part of any client-facing text.
+  SessionStoreUnavailable(reason: String)
 }
 
 /// Secure production defaults: HttpOnly, Secure, SameSite=Lax.
@@ -91,22 +114,35 @@ pub fn dev_session_config() -> SessionConfig {
 /// Always issues a NEW session id. If the request already carried a session
 /// (anonymous or another user's), use `login_rotating` so the old id is
 /// deleted and cannot be replayed (session fixation).
-pub fn login(store: session.SessionStore, user_id: String) -> session.Session {
-  let sess =
-    session.create_with_data(store, dict.from_list([#(user_id_key, user_id)]))
+pub fn login(
+  store: session.SessionStore,
+  user_id: String,
+) -> Result(session.Session, SessionError) {
+  use sess <- result.map(
+    session.try_create_with_data(
+      store,
+      dict.from_list([#(user_id_key, user_id)]),
+    )
+    |> result.map_error(store_failure(_, "login")),
+  )
   log.info("beacon.auth", "User logged in")
   sess
 }
 
 /// Log in a user, deleting the previous session id (if any).
 ///
-/// Live WebSockets bound to the old session are told to close.
+/// Live WebSockets bound to the old session are told to close. When the old
+/// session cannot be deleted no new one is created: logging in must never
+/// leave a replayable previous id behind.
 pub fn login_rotating(
   store: session.SessionStore,
   old_session_id: Option(String),
   user_id: String,
-) -> session.Session {
-  delete_previous_session(store, old_session_id)
+) -> Result(session.Session, SessionError) {
+  use Nil <- result.try(
+    delete_previous_session(store, old_session_id)
+    |> result.map_error(store_failure(_, "login")),
+  )
   login(store, user_id)
 }
 
@@ -114,23 +150,33 @@ pub fn login_rotating(
 pub fn create_login(
   store: session.SessionStore,
   user_id: String,
-) -> LoginSession {
+) -> Result(LoginSession, SessionError) {
   create_login_rotating(store, None, user_id)
 }
 
 /// Create a login session and CSRF token, deleting the previous session id.
+/// As with `login_rotating`, a failed delete creates nothing.
 pub fn create_login_rotating(
   store: session.SessionStore,
   old_session_id: Option(String),
   user_id: String,
-) -> LoginSession {
-  delete_previous_session(store, old_session_id)
+) -> Result(LoginSession, SessionError) {
+  start_login(store, old_session_id, user_id)
+  |> result.map_error(store_failure(_, "login"))
+}
+
+/// Delete the previous session (if any), then create the new one.
+fn start_login(
+  store: session.SessionStore,
+  old_session_id: Option(String),
+  user_id: String,
+) -> Result(LoginSession, session.SessionStoreError) {
+  use Nil <- result.try(delete_previous_session(store, old_session_id))
   let csrf_token = session.generate_id()
-  let sess =
-    session.create_with_data(
-      store,
-      dict.from_list([#(user_id_key, user_id), #(csrf_token_key, csrf_token)]),
-    )
+  use sess <- result.map(session.try_create_with_data(
+    store,
+    dict.from_list([#(user_id_key, user_id), #(csrf_token_key, csrf_token)]),
+  ))
   log.info("beacon.auth", "User logged in")
   LoginSession(session: sess, csrf_token: csrf_token)
 }
@@ -138,13 +184,35 @@ pub fn create_login_rotating(
 fn delete_previous_session(
   store: session.SessionStore,
   old_session_id: Option(String),
-) -> Nil {
+) -> Result(Nil, session.SessionStoreError) {
   case old_session_id {
     Some(old_id) -> {
       log.info("beacon.auth", "Login replacing previous session")
-      session.delete(store, old_id)
+      session.try_delete(store, old_id)
     }
-    None -> Nil
+    None -> Ok(Nil)
+  }
+}
+
+/// Map a session store error to the auth error a caller sees. A session
+/// that is gone is `InvalidSession`; anything else means the store could
+/// not answer, which is logged as an error with the operation.
+fn store_failure(
+  err: session.SessionStoreError,
+  operation: String,
+) -> SessionError {
+  case err {
+    session.SessionNotFound | session.SessionExpired -> InvalidSession
+    session.SessionContention
+    | session.SessionBackendFailed(_)
+    | session.InvalidBackend(_) -> {
+      let reason = session.store_error_to_string(err)
+      log.error(
+        "beacon.auth",
+        "Session store unavailable during " <> operation <> ": " <> reason,
+      )
+      SessionStoreUnavailable(reason)
+    }
   }
 }
 
@@ -165,7 +233,7 @@ pub fn change_privileges(
         "beacon.auth",
         "Privilege change rejected: " <> session.store_error_to_string(err),
       )
-      Error(InvalidSession)
+      Error(store_failure(err, "privilege change"))
     }
     Ok(rotated) -> {
       let csrf_token = session.generate_id()
@@ -187,7 +255,7 @@ pub fn change_privileges(
             "Privilege update failed after rotation: "
               <> session.store_error_to_string(err),
           )
-          Error(InvalidSession)
+          Error(store_failure(err, "privilege change"))
         }
       }
     }
@@ -207,9 +275,7 @@ pub fn with_session_cookie(
 
 /// Refuse a session config whose cookie cannot be set, before a session is
 /// created for it (so a bad config never leaves an orphan session).
-fn check_session_cookie(
-  config: SessionConfig,
-) -> Result(Nil, cookie.CookieError) {
+fn check_session_cookie(config: SessionConfig) -> Result(Nil, ResponseError) {
   case cookie.validate_options(config.cookie_name, config.cookie_options) {
     Ok(Nil) -> Ok(Nil)
     Error(error) -> {
@@ -217,7 +283,49 @@ fn check_session_cookie(
         "beacon.auth",
         "Invalid session cookie config: " <> cookie.error_to_string(error),
       )
-      Error(error)
+      Error(CookieRejected(error))
+    }
+  }
+}
+
+/// Create the login session for a response helper.
+fn response_login(
+  store: session.SessionStore,
+  old_session_id: Option(String),
+  user_id: String,
+) -> Result(LoginSession, ResponseError) {
+  start_login(store, old_session_id, user_id)
+  |> result.map_error(fn(err) {
+    log.error(
+      "beacon.auth",
+      "Login failed, session store unavailable: "
+        <> session.store_error_to_string(err),
+    )
+    StoreFailed(err)
+  })
+}
+
+/// Attach the session cookie for a response helper. The cookie config was
+/// validated before the session was created, so this fails only if
+/// `cookie.validate_options` and `cookie.set` disagree.
+fn response_cookie(
+  resp: Response(ResponseBody),
+  login: LoginSession,
+  config: SessionConfig,
+) -> Result(LoginResult, ResponseError) {
+  case with_session_cookie(resp, login.session, config) {
+    Ok(resp) ->
+      Ok(LoginResult(
+        session: login.session,
+        csrf_token: login.csrf_token,
+        response: resp,
+      ))
+    Error(error) -> {
+      log.error(
+        "beacon.auth",
+        "Session cookie rejected after login: " <> cookie.error_to_string(error),
+      )
+      Error(CookieRejected(error))
     }
   }
 }
@@ -232,15 +340,10 @@ pub fn login_response(
   user_id: String,
   resp: Response(ResponseBody),
   config: SessionConfig,
-) -> Result(LoginResult, cookie.CookieError) {
+) -> Result(LoginResult, ResponseError) {
   use Nil <- result.try(check_session_cookie(config))
-  let login = create_login(store, user_id)
-  use resp <- result.map(with_session_cookie(resp, login.session, config))
-  LoginResult(
-    session: login.session,
-    csrf_token: login.csrf_token,
-    response: resp,
-  )
+  use login <- result.try(response_login(store, None, user_id))
+  response_cookie(resp, login, config)
 }
 
 /// Log in a user and return a standard JSON response.
@@ -251,24 +354,8 @@ pub fn login_json_response(
   store: session.SessionStore,
   user_id: String,
   config: SessionConfig,
-) -> Result(LoginResult, cookie.CookieError) {
-  use Nil <- result.try(check_session_cookie(config))
-  let login = create_login(store, user_id)
-  use resp <- result.map(
-    api.json_value(
-      200,
-      json_builder.object([
-        #("ok", json_builder.bool(True)),
-        #("csrf", json_builder.string(login.csrf_token)),
-      ]),
-    )
-    |> with_session_cookie(login.session, config),
-  )
-  LoginResult(
-    session: login.session,
-    csrf_token: login.csrf_token,
-    response: resp,
-  )
+) -> Result(LoginResult, ResponseError) {
+  login_json_response_rotating(store, None, user_id, config)
 }
 
 /// Like `login_json_response`, but deletes the previous session id first.
@@ -277,44 +364,67 @@ pub fn login_json_response_rotating(
   old_session_id: Option(String),
   user_id: String,
   config: SessionConfig,
-) -> Result(LoginResult, cookie.CookieError) {
+) -> Result(LoginResult, ResponseError) {
   use Nil <- result.try(check_session_cookie(config))
-  let login = create_login_rotating(store, old_session_id, user_id)
-  use resp <- result.map(
-    api.json_value(
-      200,
-      json_builder.object([
-        #("ok", json_builder.bool(True)),
-        #("csrf", json_builder.string(login.csrf_token)),
-      ]),
-    )
-    |> with_session_cookie(login.session, config),
+  use login <- result.try(response_login(store, old_session_id, user_id))
+  api.json_value(
+    200,
+    json_builder.object([
+      #("ok", json_builder.bool(True)),
+      #("csrf", json_builder.string(login.csrf_token)),
+    ]),
   )
-  LoginResult(
-    session: login.session,
-    csrf_token: login.csrf_token,
-    response: resp,
-  )
+  |> response_cookie(login, config)
 }
 
-/// Log out — destroys the session.
-pub fn logout(store: session.SessionStore, session_id: String) -> Nil {
-  session.delete(store, session_id)
+/// Log out — destroys the session. Its live sockets are told to close even
+/// when the store fails (see `session.try_delete`); the error is returned.
+pub fn logout(
+  store: session.SessionStore,
+  session_id: String,
+) -> Result(Nil, SessionError) {
+  use Nil <- result.map(
+    session.try_delete(store, session_id)
+    |> result.map_error(store_failure(_, "logout")),
+  )
   log.info("beacon.auth", "Session logged out")
 }
 
 /// Destroy the session and attach a matching cookie deletion header.
 /// The session is destroyed even when the cookie config is invalid (the
-/// error is still returned).
+/// error is still returned). When the store fails no response is built:
+/// clearing the cookie would tell the user they are logged out while the
+/// session may still exist.
 pub fn logout_response(
   store: session.SessionStore,
   sess: session.Session,
   resp: Response(ResponseBody),
   config: SessionConfig,
-) -> Result(Response(ResponseBody), cookie.CookieError) {
-  logout(store, sess.id)
+) -> Result(Response(ResponseBody), ResponseError) {
+  use Nil <- result.try(case session.try_delete(store, sess.id) {
+    Ok(Nil) -> {
+      log.info("beacon.auth", "Session logged out")
+      Ok(Nil)
+    }
+    Error(err) -> {
+      log.error(
+        "beacon.auth",
+        "Logout failed, session store unavailable: "
+          <> session.store_error_to_string(err),
+      )
+      Error(StoreFailed(err))
+    }
+  })
   resp
   |> cookie.delete_with_options(config.cookie_name, config.cookie_options)
+  |> result.map_error(fn(error) {
+    log.error(
+      "beacon.auth",
+      "Logout could not clear the session cookie: "
+        <> cookie.error_to_string(error),
+    )
+    CookieRejected(error)
+  })
 }
 
 /// Get the current user ID from a session.
@@ -346,15 +456,9 @@ pub fn session_from_request(
   store: session.SessionStore,
   config: SessionConfig,
 ) -> Result(session.Session, SessionError) {
-  case session_id_from_request(req, config) {
-    Ok(session_id) -> {
-      case session.get(store, session_id) {
-        Some(sess) -> Ok(sess)
-        None -> Error(InvalidSession)
-      }
-    }
-    Error(err) -> Error(err)
-  }
+  use session_id <- result.try(session_id_from_request(req, config))
+  session.fetch(store, session_id)
+  |> result.map_error(store_failure(_, "session lookup"))
 }
 
 /// Get the current user ID from a request cookie.
@@ -421,6 +525,8 @@ pub fn ws_session_auth(
             Error(error_to_string(MissingUser))
           }
         }
+      // Already logged as an error by store_failure.
+      Error(SessionStoreUnavailable(_) as err) -> Error(error_to_string(err))
       Error(err) -> {
         log.warning("beacon.auth", "WS auth rejected: " <> error_to_string(err))
         Error(error_to_string(err))
@@ -459,6 +565,17 @@ pub fn init_from_session(
         }
       }
       Error(MissingSessionCookie) -> guest_init(req)
+      Error(SessionStoreUnavailable(reason)) -> {
+        // Fail closed: a session that cannot be verified is never trusted,
+        // and init has no error channel, so the guest state is rendered.
+        log.error(
+          "beacon.auth",
+          "Rendering the guest state: the session store is unavailable ("
+            <> reason
+            <> ")",
+        )
+        guest_init(req)
+      }
       Error(err) -> {
         log.warning(
           "beacon.auth",
@@ -491,10 +608,7 @@ pub fn authenticated(
           }
         }
       }
-      Error(err) -> {
-        log.warning("beacon.auth", "Auth rejected: " <> error_to_string(err))
-        unauthorized_response()
-      }
+      Error(err) -> rejection_response(err)
     }
   }
 }
@@ -537,10 +651,7 @@ pub fn csrf_authenticated(
           }
         }
       }
-      Error(err) -> {
-        log.warning("beacon.auth", "Auth rejected: " <> error_to_string(err))
-        unauthorized_response()
-      }
+      Error(err) -> rejection_response(err)
     }
   }
 }
@@ -573,14 +684,9 @@ pub fn login_route(
           option.from_result(session.id_from_request(req, config.cookie_name))
         case login_json_response_rotating(store, old_id, user_id, config) {
           Ok(login) -> login.response
-          Error(error) -> {
-            log.error(
-              "beacon.auth",
-              "Login route cannot set the session cookie: "
-                <> cookie.error_to_string(error),
-            )
-            api.text(500, "Internal Server Error")
-          }
+          // Both failures were logged where they happened.
+          Error(StoreFailed(_)) -> unavailable_response()
+          Error(CookieRejected(_)) -> api.text(500, "Internal Server Error")
         }
       }
       Error(reason) -> {
@@ -624,14 +730,9 @@ pub fn logout_route(
         )
       case logout_response(store, sess, ok, config) {
         Ok(resp) -> resp
-        Error(error) -> {
-          log.error(
-            "beacon.auth",
-            "Logout could not clear the session cookie: "
-              <> cookie.error_to_string(error),
-          )
-          api.text(500, "Internal Server Error")
-        }
+        // Both failures were logged where they happened.
+        Error(StoreFailed(_)) -> unavailable_response()
+        Error(CookieRejected(_)) -> api.text(500, "Internal Server Error")
       }
     }),
   )
@@ -658,6 +759,17 @@ pub fn error_to_string(err: SessionError) -> String {
     MissingUser -> "missing user"
     MissingCsrfToken -> "missing CSRF token"
     InvalidCsrfToken -> "invalid CSRF token"
+    SessionStoreUnavailable(_) -> "session store unavailable"
+  }
+}
+
+/// Convert a login or logout response error into a text reason.
+pub fn response_error_to_string(err: ResponseError) -> String {
+  case err {
+    CookieRejected(error) ->
+      "session cookie rejected: " <> cookie.error_to_string(error)
+    StoreFailed(error) ->
+      "session store unavailable: " <> session.store_error_to_string(error)
   }
 }
 
@@ -679,10 +791,7 @@ pub fn require_auth_with_config(
   ) -> Response(ResponseBody) {
     case current_user_from_request(req, store, config) {
       Ok(_user_id) -> next(req)
-      Error(err) -> {
-        log.warning("beacon.auth", "Auth rejected: " <> error_to_string(err))
-        unauthorized_response()
-      }
+      Error(err) -> rejection_response(err)
     }
   }
 }
@@ -719,6 +828,8 @@ pub fn csrf_protection_with_config(
                 forbidden_response(csrf_rejection_text(err))
               }
             }
+          // Already logged as an error by store_failure.
+          Error(SessionStoreUnavailable(_)) -> unavailable_response()
           Error(err) -> {
             log.warning(
               "beacon.auth",
@@ -739,7 +850,27 @@ fn csrf_rejection_text(err: SessionError) -> String {
     MissingSessionCookie -> "Missing CSRF token"
     InvalidSession -> "Invalid session"
     MissingUser -> "Invalid session"
+    SessionStoreUnavailable(_) -> "Session store unavailable"
   }
+}
+
+/// The response for a request whose session could not be accepted: 503
+/// when the store could not answer (already logged as an error), 401
+/// otherwise.
+fn rejection_response(err: SessionError) -> Response(ResponseBody) {
+  case err {
+    SessionStoreUnavailable(_) -> unavailable_response()
+    _ -> {
+      log.warning("beacon.auth", "Auth rejected: " <> error_to_string(err))
+      unauthorized_response()
+    }
+  }
+}
+
+fn unavailable_response() -> Response(ResponseBody) {
+  response.new(503)
+  |> response.set_header("retry-after", "1")
+  |> response.set_body(Bytes(bytes_tree.from_string("Service Unavailable")))
 }
 
 fn unauthorized_response() -> Response(ResponseBody) {

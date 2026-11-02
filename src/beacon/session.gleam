@@ -789,10 +789,10 @@ pub fn count(store: SessionStore) -> Int {
 }
 
 /// `create`, `create_with_data`, `get`, `delete` and `count` predate
-/// External backends and have no error channel; `beacon/auth` builds on
-/// them. A backend failure there crashes the calling (request) process
-/// after logging, as a raising Plug.Session store does; the `try_` and
-/// `fetch` variants return the error instead.
+/// External backends and have no error channel. A backend failure there
+/// crashes the calling (request) process after logging, as a raising
+/// Plug.Session store does; the `try_` and `fetch` variants return the
+/// error instead. `beacon/auth` uses only those error-returning variants.
 fn or_crash(
   outcome: Result(a, SessionStoreError),
   store: SessionStore,
