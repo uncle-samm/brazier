@@ -1134,53 +1134,91 @@ fn try_api_handler(
 }
 
 /// Route a request through framework handlers: beacon_client.js, health, static, SSR.
+/// Paths are matched exactly (no segment normalisation), and framework
+/// assets answer only GET and HEAD.
 fn route_framework_request(
   config: TransportConfig,
   req: Request(Connection),
 ) -> response.Response(ResponseBody) {
-  case request.path_segments(req) {
-    ["beacon_client.js"] -> serve_client_js(req)
-    ["health"] -> {
+  case req.path {
+    "/health" ->
       response.new(200)
       |> response.set_header("content-type", "application/json")
       |> response.set_body(Bytes(bytes_tree.from_string("{\"status\":\"ok\"}")))
-    }
-    _ -> {
-      let path = req.path
-      case
-        string.starts_with(path, "/beacon_client_")
-        && string.ends_with(path, ".js")
-      {
-        True -> {
-          let name = string.drop_start(path, 1)
-          serve_hashed_client_js(name, req)
-        }
-        False -> {
-          case config.static_config {
-            Some(static_cfg) -> {
-              let if_none_match = case
-                request.get_header(req, "if-none-match")
-              {
-                Ok(val) -> val
-                Error(Nil) -> ""
-              }
-              case
-                static.serve_with_etag_check(
-                  static_cfg,
-                  req.path,
-                  if_none_match,
-                )
-              {
-                Ok(resp) -> resp
-                Error(Nil) ->
-                  serve_page_or_ssr(config.page_html, config.ssr_factory, req)
-              }
-            }
-            None -> serve_page_or_ssr(config.page_html, config.ssr_factory, req)
-          }
-        }
+    "/beacon_client.js" ->
+      when_readable_method(req, fn() { serve_client_js(req) })
+    "/beacon_client_" <> _ -> {
+      let name = string.drop_start(req.path, 1)
+      // Only exact build output names are read from the assets directory;
+      // anything else is an ordinary path.
+      case static.is_client_bundle_name(name) {
+        True ->
+          when_readable_method(req, fn() { serve_hashed_client_js(name, req) })
+        False -> route_static_or_page(config, req)
       }
     }
+    _ -> route_static_or_page(config, req)
+  }
+}
+
+/// Serve a static file when the path is under the static prefix, else the page.
+fn route_static_or_page(
+  config: TransportConfig,
+  req: Request(Connection),
+) -> response.Response(ResponseBody) {
+  let page = fn() {
+    serve_page_or_ssr(config.page_html, config.ssr_factory, req)
+  }
+  case config.static_config {
+    None -> page()
+    Some(static_cfg) ->
+      case static.matches_prefix(static_cfg, req.path) {
+        False -> page()
+        True ->
+          when_readable_method(req, fn() {
+            case
+              static.serve_with_etag_check(
+                static_cfg,
+                req.path,
+                header_or_empty(req, "if-none-match"),
+              )
+            {
+              Ok(resp) -> resp
+              Error(Nil) -> page()
+            }
+          })
+      }
+  }
+}
+
+/// Run `serve` for GET and HEAD; any other method gets 405 (RFC 9110 §15.5.6).
+fn when_readable_method(
+  req: Request(Connection),
+  serve: fn() -> response.Response(ResponseBody),
+) -> response.Response(ResponseBody) {
+  case req.method {
+    http.Get | http.Head -> serve()
+    method -> {
+      log.debug(
+        "beacon.transport",
+        "405 for "
+          <> http.method_to_string(method)
+          <> " on framework asset "
+          <> req.path,
+      )
+      response.new(405)
+      |> response.set_header("allow", "GET, HEAD")
+      |> response.set_header("content-type", "text/plain; charset=utf-8")
+      |> response.set_body(Bytes(bytes_tree.from_string("Method Not Allowed")))
+    }
+  }
+}
+
+/// A request header value, or "" when absent.
+fn header_or_empty(req: Request(Connection), name: String) -> String {
+  case request.get_header(req, name) {
+    Ok(value) -> value
+    Error(Nil) -> ""
   }
 }
 
@@ -1529,133 +1567,187 @@ fn serve_page_or_ssr(
       case page_html {
         option.Some(rendered) -> ssr.to_response(rendered)
         option.None ->
-          response.new(200)
-          |> response.set_header("content-type", "text/html; charset=utf-8")
-          |> response.set_body(
-            Bytes(bytes_tree.from_string(default_page_html())),
-          )
+          case default_page_html() {
+            Ok(html) ->
+              response.new(200)
+              |> response.set_header("content-type", "text/html; charset=utf-8")
+              |> response.set_body(Bytes(bytes_tree.from_string(html)))
+            Error(reason) -> client_js_unavailable(reason)
+          }
       }
   }
 }
 
-/// Default page when no SSR is configured.
-fn default_page_html() -> String {
-  "<!DOCTYPE html>"
-  <> "<html><head><meta charset=\"utf-8\"><title>Beacon</title>"
-  <> "</head><body>"
-  <> "<div id=\"beacon-app\"></div>"
-  <> "<script src=\"/"
-  <> get_client_js_filename()
-  <> "\" data-beacon-auto></script>"
-  <> "</body></html>"
+/// Default page when no SSR is configured. Fails when the client bundle
+/// has not been built: a page whose script cannot load is not served.
+fn default_page_html() -> Result(String, String) {
+  case get_client_js_filename(ssr.client_assets_dir()) {
+    Error(reason) -> Error(reason)
+    Ok(filename) ->
+      Ok(
+        "<!DOCTYPE html>"
+        <> "<html><head><meta charset=\"utf-8\"><title>Beacon</title>"
+        <> "</head><body>"
+        <> "<div id=\"beacon-app\"></div>"
+        <> "<script src=\"/"
+        <> filename
+        <> "\" data-beacon-auto></script>"
+        <> "</body></html>",
+      )
+  }
 }
 
-fn get_client_js_filename() -> String {
-  let manifest_path = ssr.client_assets_dir() <> "/beacon_client.manifest"
+/// The bundle file named by `beacon_client.manifest` in `assets_dir`. The
+/// name must be exact build output (`static.is_client_bundle_name`), so a
+/// damaged manifest can never point the server at another file.
+fn get_client_js_filename(assets_dir: String) -> Result(String, String) {
+  let manifest_path = assets_dir <> "/beacon_client.manifest"
   case simplifile.read(manifest_path) {
-    Ok(name) -> string.trim(name)
+    Ok(contents) -> {
+      let name = string.trim(contents)
+      case static.is_client_bundle_name(name) {
+        True -> Ok(name)
+        False -> {
+          let reason =
+            "beacon_client.manifest at "
+            <> manifest_path
+            <> " names an invalid bundle "
+            <> string.inspect(name)
+            <> " — rebuild with `gleam run -m beacon/build`"
+          log.error("beacon.transport", reason)
+          Error(reason)
+        }
+      }
+    }
     Error(err) -> {
-      log.error(
-        "beacon.transport",
-        "FATAL: No beacon_client.manifest found at "
-          <> manifest_path
-          <> ": "
-          <> string.inspect(err)
-          <> " — the client JS was not built. Run `gleam run -m beacon/build` first.",
-      )
-      "MISSING_CLIENT_JS_RUN_BEACON_BUILD"
+      let reason =
+        "No beacon_client.manifest at "
+        <> manifest_path
+        <> ": "
+        <> string.inspect(err)
+        <> " — the client JS was not built. Run `gleam run -m beacon/build` first."
+      log.error("beacon.transport", reason)
+      Error(reason)
     }
   }
 }
 
+/// 500 for a missing or invalid client bundle (a deployment error).
+fn client_js_unavailable(reason: String) -> response.Response(ResponseBody) {
+  log.error("beacon.transport", "Client JS unavailable: " <> reason)
+  response.new(500)
+  |> response.set_header("content-type", "text/plain; charset=utf-8")
+  |> response.set_body(
+    Bytes(bytes_tree.from_string(
+      "Client JS not built. Run `gleam run -m beacon/build` first.",
+    )),
+  )
+}
+
+/// `/beacon_client.js`: the current bundle under a stable URL, so it must be
+/// revalidated on every use (`no-cache` plus an ETag).
 fn serve_client_js(
   req: Request(Connection),
 ) -> response.Response(ResponseBody) {
   let assets_dir = ssr.client_assets_dir()
-  let manifest_path = assets_dir <> "/beacon_client.manifest"
-  case simplifile.read(manifest_path) {
-    Ok(name) -> serve_js_file(assets_dir <> "/" <> string.trim(name), req)
-    Error(err) -> {
-      log.error(
-        "beacon.transport",
-        "FATAL: No beacon_client.manifest: "
-          <> string.inspect(err)
-          <> " — client JS not built. Run `gleam run -m beacon/build`.",
-      )
-      response.new(500)
-      |> response.set_body(
-        Bytes(bytes_tree.from_string(
-          "Client JS not built. Run `gleam run -m beacon/build` first.",
-        )),
-      )
-    }
+  case get_client_js_filename(assets_dir) {
+    Ok(name) ->
+      case serve_js_file(assets_dir <> "/" <> name, "no-cache", req) {
+        Ok(resp) -> resp
+        // The manifest names a bundle that does not exist: broken build.
+        Error(Nil) ->
+          client_js_unavailable(
+            "beacon_client.manifest names " <> name <> " but it does not exist",
+          )
+      }
+    Error(reason) -> client_js_unavailable(reason)
   }
 }
 
+/// `/beacon_client_<hash>.js`: content-addressed, cached forever. A name that
+/// no longer exists (a page from before a deploy) is a 404.
 fn serve_hashed_client_js(
   name: String,
   req: Request(Connection),
 ) -> response.Response(ResponseBody) {
-  serve_js_file(ssr.client_assets_dir() <> "/" <> name, req)
-}
-
-fn serve_js_file(
-  path: String,
-  req: Request(Connection),
-) -> response.Response(ResponseBody) {
-  case simplifile.read(path) {
-    Ok(contents) -> {
-      let base_response =
-        response.new(200)
-        |> response.set_header(
-          "content-type",
-          "application/javascript; charset=utf-8",
-        )
-        |> response.set_header(
-          "cache-control",
-          "public, max-age=31536000, immutable",
-        )
-        |> response.set_header("vary", "accept-encoding")
-      let accepts_gzip = case request.get_header(req, "accept-encoding") {
-        Ok(header) -> string.contains(string.lowercase(header), "gzip")
-        Error(Nil) -> False
-      }
-      case accepts_gzip {
-        True ->
-          base_response
-          |> response.set_header("content-encoding", "gzip")
-          |> response.set_body(
-            Bytes(
-              bytes_tree.from_bit_array(
-                gzip_compress(bit_array.from_string(contents)),
-              ),
-            ),
-          )
-        False ->
-          base_response
-          |> response.set_body(Bytes(bytes_tree.from_string(contents)))
-      }
-    }
-    Error(err) -> {
-      log.error(
+  case
+    serve_js_file(
+      ssr.client_assets_dir() <> "/" <> name,
+      static.immutable_cache_control(),
+      req,
+    )
+  {
+    Ok(resp) -> resp
+    Error(Nil) -> {
+      log.warning(
         "beacon.transport",
-        "Client JS not found: "
-          <> string.inspect(err)
-          <> " — run `gleam run -m beacon/build` to compile client JS",
+        "Unknown client bundle requested: " <> name,
       )
-      response.new(500)
-      |> response.set_header("content-type", "text/plain")
-      |> response.set_body(
-        Bytes(bytes_tree.from_string(
-          "// beacon.js not found. Run: gleam run -m beacon/build\n",
-        )),
-      )
+      response.new(404)
+      |> response.set_header("content-type", "text/plain; charset=utf-8")
+      |> response.set_header("cache-control", "no-store")
+      |> response.set_body(Bytes(bytes_tree.from_string("Not Found")))
     }
   }
 }
 
-@external(erlang, "zlib", "gzip")
-fn gzip_compress(data: BitArray) -> BitArray
+/// Serve a client bundle from the asset cache (raw and gzip bodies are built
+/// once per file version). Content negotiation picks gzip when the client
+/// accepts it; each encoding has its own strong ETag. Error(Nil) when the
+/// file does not exist.
+fn serve_js_file(
+  path: String,
+  cache_control: String,
+  req: Request(Connection),
+) -> Result(response.Response(ResponseBody), Nil) {
+  case static.load_client_asset(path) {
+    Ok(asset) -> {
+      let use_gzip =
+        static.accepts_gzip(header_or_empty(req, "accept-encoding"))
+      let #(body, etag) = case use_gzip {
+        True -> #(asset.gzip, gzip_etag(asset.etag))
+        False -> #(asset.raw, asset.etag)
+      }
+      let base =
+        response.new(200)
+        |> response.set_header("cache-control", cache_control)
+        |> response.set_header("etag", etag)
+        |> response.set_header("vary", "accept-encoding")
+        |> response.set_header("x-content-type-options", "nosniff")
+      case static.etag_matches(header_or_empty(req, "if-none-match"), etag) {
+        True -> {
+          log.debug("beacon.transport", "304 for client JS " <> path)
+          Ok(
+            response.Response(..base, status: 304)
+            |> response.set_body(Bytes(bytes_tree.new())),
+          )
+        }
+        False -> {
+          let base =
+            base
+            |> response.set_header(
+              "content-type",
+              "application/javascript; charset=utf-8",
+            )
+          let base = case use_gzip {
+            True -> response.set_header(base, "content-encoding", "gzip")
+            False -> base
+          }
+          Ok(response.set_body(base, Bytes(bytes_tree.from_bit_array(body))))
+        }
+      }
+    }
+    Error(static.AssetNotFound) -> Error(Nil)
+    Error(static.AssetReadFailed(reason)) ->
+      Ok(client_js_unavailable("cannot read " <> path <> ": " <> reason))
+  }
+}
+
+/// The ETag of the gzip representation: the identity ETag with a `-gzip`
+/// suffix inside the quotes (strong validators must differ per encoding).
+fn gzip_etag(etag: String) -> String {
+  string.drop_end(etag, 1) <> "-gzip\""
+}
 
 // --- Server Start ---
 
@@ -1717,10 +1809,16 @@ pub fn start_listener(
       )
     Some(_) -> Nil
   }
-  case validate_security_limits(config.security_limits) {
-    Error(reason) ->
+  let static_check = case config.static_config {
+    Some(static_cfg) -> static.validate_config(static_cfg)
+    None -> Ok(Nil)
+  }
+  case validate_security_limits(config.security_limits), static_check {
+    Error(reason), _ ->
       Error(error.ConfigError(reason: "Invalid security limits: " <> reason))
-    Ok(Nil) -> {
+    _, Error(reason) ->
+      Error(error.ConfigError(reason: "Invalid static config: " <> reason))
+    Ok(Nil), Ok(Nil) -> {
       // Built once: middleware and routing closures are shared by every
       // connection instead of being rebuilt per request.
       let handler = create_handler(config)
