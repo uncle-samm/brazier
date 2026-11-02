@@ -50,11 +50,23 @@ pub fn main() {
 
 ## Security Limits
 
+Start from the defaults and override what you need; the limits are
+validated at startup and an invalid value refuses to start. The full list is
+in [SECURITY.md](SECURITY.md#securitylimits).
+
 ```gleam
 beacon.security_limits(transport.SecurityLimits(
-  max_message_bytes: 65_536, max_events_per_second: 100, max_connections: 20_000,
+  ..transport.default_security_limits(),
+  max_connections: 20_000,
+  max_events_per_second: 100,
+  // Behind a reverse proxy: believe its X-Forwarded-For / Forwarded headers.
+  trusted_proxies: ["10.0.0.0/8"],
 ))
 ```
+
+Behind a reverse proxy, every client shares the proxy's address. Trusted
+proxies are exempt from `max_connections_per_ip`; raise
+`max_ws_connections_per_ip` or enforce per-client caps at the proxy.
 
 ## Health Check
 

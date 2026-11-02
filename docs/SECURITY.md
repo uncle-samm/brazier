@@ -4,20 +4,78 @@ Beacon includes built-in security protections across the transport, middleware, 
 
 ## SecurityLimits
 
-The `SecurityLimits` type in `beacon/transport` controls connection-level protections:
+The `SecurityLimits` type in `beacon/transport` controls connection-level
+protections. `transport.validate_security_limits` checks it when the listener
+starts; an invalid value (a non-positive size or interval, a timer too large
+for `erlang:send_after/3`, a malformed trusted proxy or allowed origin)
+refuses to start.
 
 ```gleam
 pub type SecurityLimits {
   SecurityLimits(
-    max_message_bytes: Int,        // Default: 65536 (64KB)
-    max_events_per_second: Int,    // Default: 50
-    max_connections: Int,          // Default: 10000
-    max_http_headers: Int,         // Default: 100
-    max_http_header_bytes: Int,    // Default: 65536
-    pre_upgrade_timeout_ms: Int,   // Default: 5000
+    max_message_bytes: Int,           // 65536: one WS frame or reassembled message
+    max_events_per_second: Int,       // 50 per WS connection
+    max_connections: Int,             // 10000 HTTP + WS connections, global
+    max_http_headers: Int,            // 100
+    max_http_header_bytes: Int,       // 65536
+    pre_upgrade_timeout_ms: Int,      // 5000: deadline for request line + headers
+    // HTTP limits
+    max_connections_per_ip: Int,      // 256 (trusted proxies exempt)
+    max_request_line_bytes: Int,      // 8192, longer gets 414
+    max_body_bytes: Int,              // 8388608, larger Content-Length gets 413
+    body_read_timeout_ms: Int,        // 30000 per body chunk
+    request_timeout_ms: Int,          // 60000 total for the body
+    keepalive_idle_timeout_ms: Int,   // 15000 between keep-alive requests
+    max_keepalive_requests: Int,      // 1000 per connection
+    send_timeout_ms: Int,             // 30000 per blocked socket send
+    trusted_proxies: List(String),    // [] (see Trusted Proxies)
+    // WebSocket limits
+    max_ws_connections_per_ip: Int,   // 100
+    ws_ping_interval_ms: Int,         // 30000
+    ws_pong_timeout_ms: Int,          // 20000
+    ws_idle_timeout_ms: Int,          // 90000
+    ws_send_timeout_ms: Int,          // 15000
+    ws_max_outbound_queue: Int,       // 1000
+    ws_auth_recheck_interval_ms: Int, // 60000
+    ws_max_decode_errors: Int,        // 10
+    ws_max_rate_violations: Int,      // 100
+    ws_allowed_origins: List(String), // []
   )
 }
 ```
+
+## HTTP Server Hardening
+
+The HTTP/1.1 server (`beacon/transport/server`, `beacon/transport/http`)
+follows the cowboy/ranch and Plug conventions:
+
+- **Request line:** origin-form and absolute-form (the path is taken from an
+  absolute URI) are accepted; `*` only for `OPTIONS`; authority-form and
+  anything malformed get 400, an unknown method 501, a version other than
+  HTTP/1.0 or 1.1 505, and a request line over `max_request_line_bytes` 414.
+- **Headers:** more than `max_http_headers` or `max_http_header_bytes` gets
+  431; an invalid header line 400; HTTP/1.1 without exactly one `Host` 400.
+- **Smuggling:** `Content-Length` together with `Transfer-Encoding`, a
+  duplicate or non-numeric `Content-Length` get 400; chunked bodies get 501.
+- **Slow clients:** the request head must arrive within
+  `pre_upgrade_timeout_ms` (otherwise 408), each body chunk within
+  `body_read_timeout_ms` and the whole body within `request_timeout_ms`; an
+  idle keep-alive connection is closed after `keepalive_idle_timeout_ms`.
+- **Keep-alive:** `Connection: close` from either side and HTTP/1.0 without
+  `keep-alive` close the connection after the response, which then carries
+  `Connection: close`. `HEAD` responses keep `Content-Length` with no body.
+  An unread small body is discarded so the connection can be reused; a large
+  one closes it.
+- **Connections:** a supervised tracker owns the connection slots; a slot is
+  released when its process exits for any reason. Connections over
+  `max_connections` or `max_connections_per_ip` get 503 and are closed.
+- **Supervision:** acceptors run under an OTP supervisor and are restarted
+  (and logged) when they crash; a crashing handler gets 500 and closes only
+  its own connection.
+
+A seeded raw-socket fuzz test (`test/beacon/http_fuzz_test.gleam`) sends
+mutated and random requests and checks that the server never crashes, hangs,
+leaks a connection slot or loses an acceptor.
 
 Override defaults via the builder:
 
