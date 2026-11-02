@@ -34,6 +34,9 @@
 -define(SCOPE, beacon_pubsub_pg).
 -define(CONFIG_KEY, {beacon_pubsub, config}).
 -define(MAX_TOPIC_BYTES, 255).
+%% Bound on stop/0: the supervisor's own shutdown of its children is
+%% bounded by their shutdown timeouts, so this is only reached on a hang.
+-define(STOP_TIMEOUT_MS, 15000).
 
 max_topic_bytes() -> ?MAX_TOPIC_BYTES.
 
@@ -109,10 +112,21 @@ stop() ->
             {error, not_started};
         Pid ->
             logger:info("[beacon.pubsub] Stopping PubSub"),
-            Ref = erlang:monitor(process, Pid),
-            exit(Pid, shutdown),
-            receive
-                {'DOWN', Ref, process, Pid, _Reason} -> {ok, nil}
+            %% proc_lib:stop/3 rather than exit/2: a supervisor ignores a
+            %% shutdown signal from any process but its parent, and stop/0
+            %% may run in any process.
+            try proc_lib:stop(Pid, shutdown, ?STOP_TIMEOUT_MS) of
+                ok ->
+                    logger:info("[beacon.pubsub] PubSub stopped"),
+                    {ok, nil}
+            catch
+                exit:noproc ->
+                    %% It stopped between whereis/1 and the stop request.
+                    logger:warning("[beacon.pubsub] PubSub was already stopping"),
+                    {error, not_started};
+                exit:Reason ->
+                    logger:error("[beacon.pubsub] PubSub did not stop: ~p", [Reason]),
+                    {error, {stop_failed, format(Reason)}}
             end
     end.
 

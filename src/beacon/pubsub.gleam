@@ -57,6 +57,8 @@ pub type PubSubError {
   InvalidConfig(String)
   /// The PubSub supervisor did not start.
   StartFailed(String)
+  /// The PubSub supervisor did not shut down within the stop deadline.
+  StopFailed(String)
 }
 
 /// PubSub configuration. Use `default_config` and the setters.
@@ -225,8 +227,10 @@ pub fn supervised(
   )
 }
 
-/// Stop PubSub on this node. Every subscriber is linked to its partition,
-/// so subscribers stop too.
+/// Stop PubSub on this node (any process may call it). Every subscriber is
+/// linked to its partition, so subscribers stop too. Use it for PubSub
+/// started with `start` or `start_with`; under `supervised`, stop the
+/// parent supervisor instead, or it restarts PubSub.
 pub fn stop() -> Result(Nil, PubSubError) {
   stop_ffi()
 }
@@ -331,6 +335,7 @@ pub fn describe(error: PubSubError) -> String {
       "too many subscriptions (limit " <> int.to_string(limit) <> ")"
     InvalidConfig(reason) -> "invalid PubSub config: " <> reason
     StartFailed(reason) -> "PubSub failed to start: " <> reason
+    StopFailed(reason) -> "PubSub failed to stop: " <> reason
   }
 }
 
