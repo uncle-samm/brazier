@@ -532,7 +532,7 @@ fn compile_module(path: String, source: String) -> Result(Nil, String) {
       list.each(analyzer.state_diagnostics(analysis), fn(line) {
         log.info("beacon.build", line)
       })
-      list.each(analyzer.client_contract_report(source, analysis), fn(line) {
+      list.each(analyzer.client_contract_report(analysis), fn(line) {
         log.info("beacon.build", line)
       })
       log.info("beacon.build", analyzer.client_contract_summary(analysis))

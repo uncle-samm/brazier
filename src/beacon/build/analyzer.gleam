@@ -1,26 +1,36 @@
 /// Glance-based code analyzer for the build tool.
-/// Parses user source code and classifies Msg variants.
-/// Also validates purity and extracts pure code for JS compilation.
+///
+/// Parses user source code, resolves the types of every field that crosses
+/// the wire, and classifies Msg variants. Also validates purity and extracts
+/// pure code for JS compilation.
+import beacon/build/field_type.{type FieldType, type TypeDef}
+import beacon/build/source_location
 import beacon/log
 import glance
+import gleam/dict.{type Dict}
 import gleam/int
 import gleam/list
 import gleam/option
+import gleam/result
+import gleam/set.{type Set}
 import gleam/string
 
-/// A field in a Model or Local type.
+/// A field in a Model or Local type, or an argument of a Msg variant.
 pub type TypeField {
   TypeField(
-    /// The field name (e.g., "count").
+    /// The field name (e.g., "count"). Unlabelled Msg arguments are `argN`.
     name: String,
-    /// The field type name (e.g., "Int", "String", "Bool", "List").
+    /// The outer type name as written (e.g., "Int", "List"). Descriptive only;
+    /// code generation uses `field_type`.
     type_name: String,
-    /// For generic types like List(Stroke), the inner type name.
+    /// For generic types like List(Stroke), the inner type name. Descriptive only.
     inner_type: String,
     /// Module qualifier for the type (e.g., "auth" for auth.AuthState). Empty = local.
     module: String,
     /// Module qualifier for the inner type (e.g., "card" for List(card.Card)). Empty = local.
     inner_module: String,
+    /// The resolved type, with imports and aliases applied.
+    field_type: FieldType,
   )
 }
 
@@ -72,8 +82,10 @@ pub type ComputedField {
   ComputedField(
     /// The function name (e.g., "subtotal", "total").
     name: String,
-    /// The return type name (e.g., "Int", "String", "Float", "Bool").
+    /// The return type name as written (e.g., "Int"). Empty when unannotated.
     return_type: String,
+    /// The resolved return type. Unannotated functions are unsupported.
+    field_type: FieldType,
   )
 }
 
@@ -150,6 +162,12 @@ pub type Analysis {
     imported_modules: List(ImportedModule),
     /// Imported module Msg types used by routed/component apps.
     external_msg_types: List(MsgTypeInfo),
+    /// Every custom type and type alias in the analyzed modules, keyed by
+    /// #(canonical module alias, type name). The app module's alias is "".
+    type_defs: Dict(#(String, String), TypeDef),
+    /// Server-only modules the app module imports. They are stripped from
+    /// the client bundle.
+    skipped_client_imports: List(String),
   )
 }
 
@@ -178,250 +196,19 @@ pub type MsgImpact {
   ModelAndLocal
 }
 
-/// Analyze a Gleam source string.
-/// Returns the Msg variants with model-impact classification.
+/// An imported module parsed once, with the scope its type names resolve in.
+type External {
+  External(
+    alias: String,
+    module_path: String,
+    module: glance.Module,
+    scope: field_type.Scope,
+  )
+}
+
+/// Analyze a single Gleam source string.
 pub fn analyze(source: String) -> Result(Analysis, String) {
-  case glance.module(source) {
-    Ok(module) -> {
-      // Find Msg type
-      let msg_type = find_custom_type(module, "Msg")
-      // Find update function (try "update" first, then "make_update")
-      let has_direct_init = case find_function(module, "init") {
-        Ok(_) -> True
-        Error(_) -> False
-      }
-      let has_direct_update = case find_function(module, "update") {
-        Ok(_) -> True
-        Error(_) -> False
-      }
-      let has_direct_view = case find_function(module, "view") {
-        Ok(_) -> True
-        Error(_) -> False
-      }
-      let update_fn = case find_function(module, "update") {
-        Ok(f) -> Ok(f)
-        Error(_) -> find_function(module, "make_update")
-      }
-      // Check for Local type
-      let #(has_local, local_fields) = case find_custom_type(module, "Local") {
-        Ok(local_type) -> #(True, extract_fields(local_type))
-        Error(_) -> #(False, [])
-      }
-
-      // Check for Server type (private server-side state)
-      let #(has_server, server_module_alias, server_type_name, server_fields) = case
-        find_custom_type(module, "Server")
-      {
-        Ok(server_type) -> #(True, "", "Server", extract_fields(server_type))
-        Error(_) -> #(False, "", "Server", [])
-      }
-
-      // Extract Model fields for JSON codec generation
-      let #(has_model, model_fields) = case find_custom_type(module, "Model") {
-        Ok(model_type) -> #(True, extract_fields(model_type))
-        Error(_) -> {
-          log.debug(
-            "beacon.analyzer",
-            "No Model type found — this module may not be an app component",
-          )
-          #(False, [])
-        }
-      }
-
-      // Extract ALL custom types for nested decoder generation
-      let custom_types =
-        list.filter_map(module.custom_types, fn(def) {
-          let name = def.definition.name
-          // Skip Model, Local, Msg, Server — we handle those specially
-          case
-            name == "Model"
-            || name == "Local"
-            || name == "Msg"
-            || name == "Server"
-          {
-            True -> Error(Nil)
-            False -> {
-              let fields = extract_fields(def.definition)
-              case fields {
-                [] -> Error(Nil)
-                _ -> Ok(CustomTypeInfo(name: name, fields: fields, module: ""))
-              }
-            }
-          }
-        })
-
-      // Extract enum types (multiple variants, no fields — e.g., Column { Todo; Doing; Done })
-      let enum_types =
-        list.filter_map(module.custom_types, fn(def) {
-          let ct = def.definition
-          // Skip Model, Local, Msg
-          case ct.name == "Model" || ct.name == "Local" || ct.name == "Msg" {
-            True -> Error(Nil)
-            False -> {
-              // An enum type has multiple variants, ALL with zero fields
-              let all_fieldless =
-                list.all(ct.variants, fn(v) { list.is_empty(v.fields) })
-              case all_fieldless && list.length(ct.variants) >= 2 {
-                True -> {
-                  let variant_names = list.map(ct.variants, fn(v) { v.name })
-                  Ok(EnumTypeInfo(
-                    name: ct.name,
-                    variants: variant_names,
-                    module: "",
-                  ))
-                }
-                False -> Error(Nil)
-              }
-            }
-          }
-        })
-
-      // Detect substates: Model fields whose types are custom record types.
-      // These are tracked independently for efficient per-substate diffing.
-      let substates =
-        list.filter_map(model_fields, fn(f) {
-          case f.type_name {
-            "List" ->
-              case
-                list.find(custom_types, fn(ct) {
-                  ct.name == f.inner_type && ct.module == f.inner_module
-                })
-              {
-                Ok(_) ->
-                  Ok(SubstateInfo(
-                    field_name: f.name,
-                    type_name: f.inner_type,
-                    is_list: True,
-                    module: f.inner_module,
-                  ))
-                Error(_) -> Error(Nil)
-              }
-            _ ->
-              case
-                list.find(custom_types, fn(ct) {
-                  ct.name == f.type_name && ct.module == f.module
-                })
-              {
-                Ok(_) ->
-                  Ok(SubstateInfo(
-                    field_name: f.name,
-                    type_name: f.type_name,
-                    is_list: False,
-                    module: f.module,
-                  ))
-                Error(_) -> Error(Nil)
-              }
-          }
-        })
-
-      // Detect computed fields — pub fn that takes exactly 1 param of type Model
-      // and returns a known type. Excludes view (returns Node), update (takes 2+ params),
-      // init (takes 0 params), and server_only_functions.
-      let computed_excluded = [
-        "view",
-        "init",
-        "init_local",
-        "init_server",
-        "update",
-        "start",
-        "main",
-        "on_update",
-        "make_update",
-        "make_init",
-        "make_on_update",
-      ]
-      let computed_fields =
-        list.filter_map(module.functions, fn(def) {
-          let func = def.definition
-          // Must be public
-          case func.publicity {
-            glance.Public -> {
-              // Must not be in excluded list
-              case list.contains(computed_excluded, func.name) {
-                True -> Error(Nil)
-                False -> {
-                  // Must take exactly 1 parameter of type Model
-                  case func.parameters {
-                    [
-                      glance.FunctionParameter(
-                        type_: option.Some(glance.NamedType(name: "Model", ..)),
-                        ..,
-                      ),
-                    ] -> {
-                      // Extract return type — must not be Node (that's view)
-                      let return_type = case func.return {
-                        option.Some(glance.NamedType(name: name, ..)) ->
-                          case name {
-                            // Node return = view-like, not computed
-                            "Node" -> Error(Nil)
-                            _ -> Ok(name)
-                          }
-                        _ -> Ok("String")
-                      }
-                      case return_type {
-                        Ok(rt) ->
-                          Ok(ComputedField(name: func.name, return_type: rt))
-                        Error(Nil) -> Error(Nil)
-                      }
-                    }
-                    _ -> Error(Nil)
-                  }
-                }
-              }
-            }
-            _ -> Error(Nil)
-          }
-        })
-
-      // Classify Msg variants if both Msg type and update function are present.
-      // When either is missing (multi-file apps where Msg/update are in separate files),
-      // succeed with empty msg_variants — the codec only needs Model fields.
-      let variants = case msg_type, update_fn {
-        Ok(msg), Ok(func) -> classify_variants(msg, func, has_local)
-        _, _ -> {
-          log.debug(
-            "beacon.analyzer",
-            "No Msg type or update function in this file — codec-only analysis",
-          )
-          []
-        }
-      }
-      let client_variants = case find_custom_type(module, "ClientMsg") {
-        Ok(client_msg) -> variants_from_msg_type(client_msg)
-        Error(_) -> []
-      }
-      Ok(
-        Analysis(
-          has_model: has_model,
-          model_module: "",
-          model_type_name: "Model",
-          msg_variants: variants,
-          msg_module: "",
-          msg_type_name: "Msg",
-          client_msg_variants: client_variants,
-          has_local: has_local,
-          local_module: "",
-          local_type_name: "Local",
-          local_fields: local_fields,
-          has_server: has_server,
-          server_module: server_module_alias,
-          server_type_name: server_type_name,
-          server_fields: server_fields,
-          model_fields: model_fields,
-          has_direct_init: has_direct_init,
-          has_direct_update: has_direct_update,
-          has_direct_view: has_direct_view,
-          custom_types: custom_types,
-          enum_types: enum_types,
-          substates: substates,
-          computed_fields: computed_fields,
-          imported_modules: [],
-          external_msg_types: [],
-        ),
-      )
-    }
-    Error(_) -> Error("Failed to parse source")
-  }
+  analyze_path("app module", source, [])
 }
 
 /// Analyze a multi-file app: main source + external module sources.
@@ -429,393 +216,810 @@ pub fn analyze(source: String) -> Result(Analysis, String) {
 /// - alias is the module qualifier (e.g., "auth" for `import domains/auth`)
 /// - module_path is the import path (e.g., "domains/auth")
 /// - source_text is the file contents
-/// Extracts types from external modules and merges them into the analysis.
 pub fn analyze_multi(
   source: String,
   external_sources: List(#(String, String, String)),
 ) -> Result(Analysis, String) {
-  case analyze(source) {
-    Error(reason) -> Error(reason)
-    Ok(analysis) -> {
-      // Parse each external source and extract types tagged with the module alias
-      let #(ext_custom_types, ext_enum_types, imported_modules, ext_msg_types) =
-        list.fold(external_sources, #([], [], [], []), fn(acc, ext) {
-          let #(alias, module_path, ext_source) = ext
-          case glance.module(ext_source) {
-            Error(_) -> acc
-            Ok(ext_module) -> {
-              let #(cts, ets, ims, msgs) = acc
-              let im = ImportedModule(module_path: module_path, alias: alias)
-              let ext_cts =
-                list.filter_map(ext_module.custom_types, fn(def) {
-                  let ct = def.definition
-                  // Skip non-public and server/message boundary types.
-                  case ct.publicity {
-                    glance.Public
-                      if ct.name != "Msg"
-                      && ct.name != "ClientMsg"
-                      && ct.name != "Server"
-                    -> {
-                      let fields =
-                        extract_fields(ct)
-                        |> qualify_external_fields(alias)
-                      case fields {
-                        [] -> Error(Nil)
-                        _ ->
-                          Ok(CustomTypeInfo(
-                            name: ct.name,
-                            fields: fields,
-                            module: alias,
-                          ))
-                      }
-                    }
-                    _ -> Error(Nil)
-                  }
-                })
-              let ext_ets =
-                list.filter_map(ext_module.custom_types, fn(def) {
-                  let ct = def.definition
-                  case ct.publicity {
-                    glance.Public
-                      if ct.name != "Msg"
-                      && ct.name != "ClientMsg"
-                      && ct.name != "Server"
-                    -> {
-                      let all_fieldless =
-                        list.all(ct.variants, fn(v) { list.is_empty(v.fields) })
-                      case all_fieldless && list.length(ct.variants) >= 2 {
-                        True -> {
-                          let variant_names =
-                            list.map(ct.variants, fn(v) { v.name })
-                          Ok(EnumTypeInfo(
-                            name: ct.name,
-                            variants: variant_names,
-                            module: alias,
-                          ))
-                        }
-                        False -> Error(Nil)
-                      }
-                    }
-                    _ -> Error(Nil)
-                  }
-                })
-              let ext_msgs = case find_custom_type(ext_module, "Msg") {
-                Ok(msg_type) -> {
-                  let update_fn = case find_function(ext_module, "update") {
-                    Ok(func) -> Ok(func)
-                    Error(_) -> find_function(ext_module, "make_update")
-                  }
-                  let variants = case
-                    find_custom_type(ext_module, "ClientMsg")
-                  {
-                    Ok(client_msg) -> variants_from_msg_type(client_msg)
-                    Error(_) ->
-                      case analysis.client_msg_variants {
-                        [_, ..] -> analysis.client_msg_variants
-                        [] ->
-                          case update_fn {
-                            Ok(func) -> classify_variants(msg_type, func, False)
-                            Error(_) -> variants_from_msg_type(msg_type)
-                          }
-                      }
-                  }
-                  [MsgTypeInfo(module: alias, variants: variants)]
-                }
-                Error(_) -> []
-              }
-              #(
-                list.append(cts, ext_cts),
-                list.append(ets, ext_ets),
-                [im, ..ims],
-                list.append(msgs, ext_msgs),
-              )
-            }
-          }
-        })
+  analyze_path("app module", source, external_sources)
+}
 
-      // Merge external types into analysis
-      let all_custom_types =
-        list.append(analysis.custom_types, ext_custom_types)
-      let all_enum_types = list.append(analysis.enum_types, ext_enum_types)
-
-      let #(has_model, model_module_alias, model_type_name, model_fields) = case
-        analysis.has_model
-      {
-        True -> #(
-          True,
-          analysis.model_module,
-          analysis.model_type_name,
-          analysis.model_fields,
-        )
-        False -> {
-          let ext_model =
-            list.find_map(external_sources, fn(ext) {
-              let #(alias, _module_path, ext_source) = ext
-              case glance.module(ext_source) {
-                Error(_) -> Error(Nil)
-                Ok(ext_module) -> {
-                  case
-                    list.find(ext_module.custom_types, fn(def) {
-                      def.definition.name == "Model"
-                      && def.definition.publicity == glance.Public
-                    })
-                  {
-                    Ok(def) ->
-                      Ok(#(
-                        alias,
-                        def.definition.name,
-                        extract_fields(def.definition)
-                          |> qualify_external_fields(alias),
-                      ))
-                    Error(Nil) -> Error(Nil)
-                  }
-                }
-              }
-            })
-          case ext_model {
-            Ok(#(alias, type_name, fields)) -> {
-              log.info(
-                "beacon.analyzer",
-                "Found Model type in external module: " <> alias,
-              )
-              #(True, alias, type_name, fields)
-            }
-            Error(Nil) -> #(False, "", "Model", [])
-          }
-        }
-      }
-
-      let #(msg_variants, msg_module_alias, msg_type_name, client_msg_variants) = case
-        analysis.msg_variants
-      {
-        [_, ..] -> #(
-          analysis.msg_variants,
-          analysis.msg_module,
-          analysis.msg_type_name,
-          analysis.client_msg_variants,
-        )
-        [] -> {
-          let ext_msg =
-            list.find_map(external_sources, fn(ext) {
-              let #(alias, _module_path, ext_source) = ext
-              case glance.module(ext_source) {
-                Error(_) -> Error(Nil)
-                Ok(ext_module) -> {
-                  case find_custom_type(ext_module, "Msg") {
-                    Ok(msg_type) -> {
-                      let update_fn = case find_function(ext_module, "update") {
-                        Ok(func) -> Ok(func)
-                        Error(_) -> find_function(ext_module, "make_update")
-                      }
-                      let variants = case
-                        find_custom_type(ext_module, "ClientMsg")
-                      {
-                        Ok(client_msg) -> variants_from_msg_type(client_msg)
-                        Error(_) ->
-                          case analysis.client_msg_variants {
-                            [_, ..] -> analysis.client_msg_variants
-                            [] ->
-                              case update_fn {
-                                Ok(func) ->
-                                  classify_variants(
-                                    msg_type,
-                                    func,
-                                    analysis.has_local,
-                                  )
-                                Error(_) -> variants_from_msg_type(msg_type)
-                              }
-                          }
-                      }
-                      let client_variants = case
-                        find_custom_type(ext_module, "ClientMsg")
-                      {
-                        Ok(client_msg) -> variants_from_msg_type(client_msg)
-                        Error(_) -> analysis.client_msg_variants
-                      }
-                      Ok(#(alias, msg_type.name, variants, client_variants))
-                    }
-                    Error(_) -> Error(Nil)
-                  }
-                }
-              }
-            })
-          case ext_msg {
-            Ok(#(alias, type_name, variants, client_variants)) -> {
-              log.info(
-                "beacon.analyzer",
-                "Found Msg type in external module: " <> alias,
-              )
-              #(variants, alias, type_name, client_variants)
-            }
-            Error(Nil) -> #([], "", "Msg", [])
-          }
-        }
-      }
-
-      // Re-detect substates with the full type set (including external types)
-      let substates =
-        list.filter_map(model_fields, fn(f) {
-          case f.type_name {
-            "List" ->
-              case
-                list.find(all_custom_types, fn(ct) {
-                  ct.name == f.inner_type && ct.module == f.inner_module
-                })
-              {
-                Ok(_) ->
-                  Ok(SubstateInfo(
-                    field_name: f.name,
-                    type_name: f.inner_type,
-                    is_list: True,
-                    module: f.inner_module,
-                  ))
-                Error(_) -> Error(Nil)
-              }
-            _ ->
-              case
-                list.find(all_custom_types, fn(ct) {
-                  ct.name == f.type_name && ct.module == f.module
-                })
-              {
-                Ok(_) ->
-                  Ok(SubstateInfo(
-                    field_name: f.name,
-                    type_name: f.type_name,
-                    is_list: False,
-                    module: f.module,
-                  ))
-                Error(_) -> Error(Nil)
-              }
-          }
-        })
-
-      // Check external sources for Server type (multi-file apps may have it in a separate module)
-      let #(has_server, server_module_alias, server_type_name, server_fields) = case
-        analysis.has_server
-      {
-        True -> #(
-          True,
-          analysis.server_module,
-          analysis.server_type_name,
-          analysis.server_fields,
-        )
-        False -> {
-          // Search external modules for a type named "Server" or "ServerState"
-          let ext_server =
-            list.find_map(external_sources, fn(ext) {
-              let #(alias, _module_path, ext_source) = ext
-              case glance.module(ext_source) {
-                Error(_) -> Error(Nil)
-                Ok(ext_module) -> {
-                  // Look for Server or ServerState type
-                  let server_type =
-                    list.find(ext_module.custom_types, fn(def) {
-                      let name = def.definition.name
-                      { name == "Server" || name == "ServerState" }
-                      && def.definition.publicity == glance.Public
-                    })
-                  case server_type {
-                    Ok(def) ->
-                      Ok(#(
-                        alias,
-                        def.definition.name,
-                        extract_fields(def.definition),
-                      ))
-                    Error(Nil) -> Error(Nil)
-                  }
-                }
-              }
-            })
-          case ext_server {
-            Ok(#(srv_alias, srv_type_name, fields)) -> {
-              log.info(
-                "beacon.analyzer",
-                "Found "
-                  <> srv_type_name
-                  <> " type in external module: "
-                  <> srv_alias,
-              )
-              #(True, srv_alias, srv_type_name, fields)
-            }
-            Error(Nil) -> #(False, "", "Server", [])
-          }
-        }
-      }
-
-      // Check external sources for Local type (multi-file apps may keep Local
-      // in a separate client-visible module).
-      let #(has_local, local_module_alias, local_type_name, local_fields) = case
-        analysis.has_local
-      {
-        True -> #(
-          True,
-          analysis.local_module,
-          analysis.local_type_name,
-          analysis.local_fields,
-        )
-        False -> {
-          let ext_local =
-            list.find_map(external_sources, fn(ext) {
-              let #(alias, _module_path, ext_source) = ext
-              case glance.module(ext_source) {
-                Error(_) -> Error(Nil)
-                Ok(ext_module) -> {
-                  case
-                    list.find(ext_module.custom_types, fn(def) {
-                      def.definition.name == "Local"
-                      && def.definition.publicity == glance.Public
-                    })
-                  {
-                    Ok(def) ->
-                      Ok(#(
-                        alias,
-                        def.definition.name,
-                        extract_fields(def.definition)
-                          |> qualify_external_fields(alias),
-                      ))
-                    Error(Nil) -> Error(Nil)
-                  }
-                }
-              }
-            })
-          case ext_local {
-            Ok(#(alias, type_name, fields)) -> #(True, alias, type_name, fields)
-            Error(Nil) -> #(False, "", "Local", [])
-          }
-        }
-      }
-
-      let external_msg_types = case msg_module_alias {
-        "" -> ext_msg_types
-        alias -> list.filter(ext_msg_types, fn(info) { info.module != alias })
-      }
-
-      Ok(
-        Analysis(
-          ..analysis,
-          has_model: has_model,
-          model_module: model_module_alias,
-          model_type_name: model_type_name,
-          msg_variants: msg_variants,
-          msg_module: msg_module_alias,
-          msg_type_name: msg_type_name,
-          client_msg_variants: client_msg_variants,
-          has_local: has_local,
-          local_module: local_module_alias,
-          local_type_name: local_type_name,
-          local_fields: local_fields,
-          has_server: has_server,
-          server_module: server_module_alias,
-          server_type_name: server_type_name,
-          server_fields: server_fields,
-          model_fields: model_fields,
-          custom_types: all_custom_types,
-          enum_types: all_enum_types,
-          substates: substates,
-          imported_modules: imported_modules,
-          external_msg_types: external_msg_types,
-        ),
+/// Analyze an app module read from `path`, plus its imported app modules.
+/// `path` is used only in parse error messages.
+pub fn analyze_path(
+  path: String,
+  source: String,
+  external_sources: List(#(String, String, String)),
+) -> Result(Analysis, String) {
+  use module <- result.try(parse(path, source))
+  let external_sources = unique_by_path(external_sources)
+  use canonical <- result.try(
+    external_sources
+    |> list.map(fn(ext) { #(ext.0, ext.1) })
+    |> field_type.canonical_aliases,
+  )
+  use externals <- result.try(
+    list.try_map(external_sources, fn(ext) {
+      let #(alias, module_path, ext_source) = ext
+      use ext_module <- result.map(parse(module_path <> ".gleam", ext_source))
+      External(
+        alias:,
+        module_path:,
+        module: ext_module,
+        scope: field_type.scope(ext_module, alias, canonical),
       )
+    }),
+  )
+  let analysis =
+    analyze_primary(module, field_type.scope(module, "", canonical))
+  let analysis = case externals {
+    [] -> analysis
+    _ -> merge_externals(analysis, externals)
+  }
+  Ok(finish(analysis))
+}
+
+fn parse(path: String, source: String) -> Result(glance.Module, String) {
+  glance.module(source)
+  |> result.map_error(fn(err) {
+    let message = source_location.describe_parse_error(path, source, err)
+    log.error("beacon.build.analyzer", "Cannot parse " <> message)
+    "Cannot parse " <> message
+  })
+}
+
+fn unique_by_path(
+  sources: List(#(String, String, String)),
+) -> List(#(String, String, String)) {
+  let #(_seen, kept) =
+    list.fold(sources, #(set.new(), []), fn(acc, ext) {
+      let #(seen, kept) = acc
+      case set.contains(seen, ext.1) {
+        True -> acc
+        False -> #(set.insert(seen, ext.1), [ext, ..kept])
+      }
+    })
+  list.reverse(kept)
+}
+
+const computed_excluded = [
+  "view", "init", "init_local", "init_server", "update", "start", "main",
+  "on_update", "make_update", "make_init", "make_on_update",
+]
+
+fn analyze_primary(module: glance.Module, scope: field_type.Scope) -> Analysis {
+  let msg_type = find_custom_type(module, "Msg")
+  let has_direct_init = result.is_ok(find_function(module, "init"))
+  let has_direct_update = result.is_ok(find_function(module, "update"))
+  let has_direct_view = result.is_ok(find_function(module, "view"))
+  let update_fn = find_update_function(module)
+
+  let #(has_local, local_fields) = case find_custom_type(module, "Local") {
+    Ok(local_type) -> #(True, extract_fields(scope, local_type))
+    Error(_) -> #(False, [])
+  }
+  let #(has_server, server_fields) = case find_custom_type(module, "Server") {
+    Ok(server_type) -> #(True, extract_fields(scope, server_type))
+    Error(_) -> #(False, [])
+  }
+  let #(has_model, model_fields) = case find_custom_type(module, "Model") {
+    Ok(model_type) -> #(True, extract_fields(scope, model_type))
+    Error(_) -> {
+      log.debug(
+        "beacon.build.analyzer",
+        "No Model type found — this module may not be an app component",
+      )
+      #(False, [])
+    }
+  }
+
+  let custom_types =
+    list.filter_map(module.custom_types, fn(def) {
+      let name = def.definition.name
+      case list.contains(["Model", "Local", "Msg", "Server"], name) {
+        True -> Error(Nil)
+        False ->
+          case extract_fields(scope, def.definition) {
+            [] -> Error(Nil)
+            fields -> Ok(CustomTypeInfo(name:, fields:, module: ""))
+          }
+      }
+    })
+  let enum_types =
+    list.filter_map(module.custom_types, fn(def) {
+      case list.contains(["Model", "Local", "Msg"], def.definition.name) {
+        True -> Error(Nil)
+        False -> enum_info(def.definition, "")
+      }
+    })
+
+  let computed_fields =
+    list.filter_map(module.functions, fn(def) { computed_field(scope, def) })
+
+  let variants = case msg_type, update_fn {
+    Ok(msg), Ok(func) -> classify_variants(scope, msg, func, has_local)
+    _, _ -> {
+      log.debug(
+        "beacon.build.analyzer",
+        "No Msg type or update function in this file — codec-only analysis",
+      )
+      []
+    }
+  }
+  let client_variants = case find_custom_type(module, "ClientMsg") {
+    Ok(client_msg) -> variants_from_msg_type(scope, client_msg)
+    Error(_) -> []
+  }
+  Analysis(
+    has_model:,
+    model_module: "",
+    model_type_name: "Model",
+    msg_variants: variants,
+    msg_module: "",
+    msg_type_name: "Msg",
+    client_msg_variants: client_variants,
+    has_local:,
+    local_module: "",
+    local_type_name: "Local",
+    local_fields:,
+    has_server:,
+    server_module: "",
+    server_type_name: "Server",
+    server_fields:,
+    model_fields:,
+    has_direct_init:,
+    has_direct_update:,
+    has_direct_view:,
+    custom_types:,
+    enum_types:,
+    substates: [],
+    computed_fields:,
+    imported_modules: [],
+    external_msg_types: [],
+    type_defs: module_type_defs(module, scope),
+    skipped_client_imports: skipped_client_imports(module),
+  )
+}
+
+fn find_update_function(
+  module: glance.Module,
+) -> Result(glance.Function, String) {
+  case find_function(module, "update") {
+    Ok(func) -> Ok(func)
+    Error(_) -> find_function(module, "make_update")
+  }
+}
+
+fn enum_info(
+  custom_type: glance.CustomType,
+  module_alias: String,
+) -> Result(EnumTypeInfo, Nil) {
+  let all_fieldless =
+    list.all(custom_type.variants, fn(v) { list.is_empty(v.fields) })
+  case all_fieldless && list.length(custom_type.variants) >= 2 {
+    True ->
+      Ok(EnumTypeInfo(
+        name: custom_type.name,
+        variants: list.map(custom_type.variants, fn(v) { v.name }),
+        module: module_alias,
+      ))
+    False -> Error(Nil)
+  }
+}
+
+/// A computed field is a public function taking exactly one `Model` argument
+/// that does not return a `Node`. Its return type must be annotated so the
+/// codec knows how to encode it.
+fn computed_field(
+  scope: field_type.Scope,
+  def: glance.Definition(glance.Function),
+) -> Result(ComputedField, Nil) {
+  let func = def.definition
+  let is_candidate =
+    func.publicity == glance.Public
+    && !list.contains(computed_excluded, func.name)
+  case is_candidate, func.parameters, func.return {
+    False, _, _ -> Error(Nil)
+    True,
+      [
+        glance.FunctionParameter(
+          type_: option.Some(glance.NamedType(name: "Model", ..)),
+          ..,
+        ),
+      ],
+      option.Some(glance.NamedType(name: "Node", ..))
+    -> Error(Nil)
+    True,
+      [
+        glance.FunctionParameter(
+          type_: option.Some(glance.NamedType(name: "Model", ..)),
+          ..,
+        ),
+      ],
+      option.Some(return_type)
+    ->
+      Ok(ComputedField(
+        name: func.name,
+        return_type: written_type_name(return_type),
+        field_type: field_type.resolve(scope, return_type),
+      ))
+    True,
+      [
+        glance.FunctionParameter(
+          type_: option.Some(glance.NamedType(name: "Model", ..)),
+          ..,
+        ),
+      ],
+      option.None
+    ->
+      Ok(ComputedField(
+        name: func.name,
+        return_type: "",
+        field_type: field_type.UnsupportedType(
+          "computed field `"
+          <> func.name
+          <> "` has no return annotation; add `-> Type` so its value can be encoded",
+        ),
+      ))
+    True, _, _ -> Error(Nil)
+  }
+}
+
+fn written_type_name(type_: glance.Type) -> String {
+  case type_ {
+    glance.NamedType(name:, ..) -> name
+    glance.TupleType(elements:, ..) -> tuple_type_name(elements)
+    glance.FunctionType(..) -> "fn"
+    glance.VariableType(name:, ..) -> name
+    glance.HoleType(name:, ..) -> name
+  }
+}
+
+fn module_type_defs(
+  module: glance.Module,
+  scope: field_type.Scope,
+) -> Dict(#(String, String), TypeDef) {
+  let customs =
+    list.map(module.custom_types, fn(def) {
+      #(
+        #(scope.current, def.definition.name),
+        field_type.custom_type_def(scope, def.definition),
+      )
+    })
+  let aliases =
+    list.map(module.type_aliases, fn(def) {
+      #(
+        #(scope.current, def.definition.name),
+        field_type.type_alias_def(scope, def.definition),
+      )
+    })
+  dict.from_list(list.append(customs, aliases))
+}
+
+/// Fold imported app modules into the primary module's analysis: their types,
+/// their nested Msg types, and Model/Msg/Server/Local when the primary module
+/// does not define them itself.
+fn merge_externals(analysis: Analysis, externals: List(External)) -> Analysis {
+  let boundary_types = ["Msg", "ClientMsg", "Server"]
+  let ext_custom_types =
+    list.flat_map(externals, fn(ext) {
+      list.filter_map(ext.module.custom_types, fn(def) {
+        let ct = def.definition
+        case
+          ct.publicity == glance.Public
+          && !list.contains(boundary_types, ct.name)
+        {
+          False -> Error(Nil)
+          True ->
+            case
+              extract_fields(ext.scope, ct)
+              |> qualify_external_fields(ext.alias)
+            {
+              [] -> Error(Nil)
+              fields ->
+                Ok(CustomTypeInfo(name: ct.name, fields:, module: ext.alias))
+            }
+        }
+      })
+    })
+  let ext_enum_types =
+    list.flat_map(externals, fn(ext) {
+      list.filter_map(ext.module.custom_types, fn(def) {
+        let ct = def.definition
+        case
+          ct.publicity == glance.Public
+          && !list.contains(boundary_types, ct.name)
+        {
+          False -> Error(Nil)
+          True -> enum_info(ct, ext.alias)
+        }
+      })
+    })
+  let ext_msg_types =
+    list.filter_map(externals, fn(ext) {
+      case find_custom_type(ext.module, "Msg") {
+        Ok(_) ->
+          Ok(MsgTypeInfo(
+            module: ext.alias,
+            variants: external_msg_variants(ext, False),
+          ))
+        Error(_) -> Error(Nil)
+      }
+    })
+  let imported_modules =
+    list.map(externals, fn(ext) {
+      ImportedModule(module_path: ext.module_path, alias: ext.alias)
+    })
+    |> list.reverse
+  let type_defs =
+    list.fold(externals, analysis.type_defs, fn(acc, ext) {
+      dict.merge(acc, module_type_defs(ext.module, ext.scope))
+    })
+
+  let #(has_model, model_module, model_type_name, model_fields) = case
+    analysis.has_model
+  {
+    True -> #(
+      True,
+      analysis.model_module,
+      analysis.model_type_name,
+      analysis.model_fields,
+    )
+    False ->
+      case find_external_type(externals, ["Model"]) {
+        Ok(#(ext, ct)) -> {
+          log.info(
+            "beacon.build.analyzer",
+            "Found Model type in external module: " <> ext.alias,
+          )
+          #(
+            True,
+            ext.alias,
+            ct.name,
+            extract_fields(ext.scope, ct) |> qualify_external_fields(ext.alias),
+          )
+        }
+        Error(Nil) -> #(False, "", "Model", [])
+      }
+  }
+
+  let #(msg_variants, msg_module, msg_type_name, client_msg_variants) = case
+    analysis.msg_variants
+  {
+    [_, ..] -> #(
+      analysis.msg_variants,
+      analysis.msg_module,
+      analysis.msg_type_name,
+      analysis.client_msg_variants,
+    )
+    [] ->
+      case
+        list.find(externals, fn(ext) {
+          result.is_ok(find_custom_type(ext.module, "Msg"))
+        })
+      {
+        Ok(ext) -> {
+          log.info(
+            "beacon.build.analyzer",
+            "Found Msg type in external module: " <> ext.alias,
+          )
+          // The app module's ClientMsg allowlist, when it has one, applies to
+          // the Msg type it imports: only those variants are generated.
+          let #(variants, client_variants) = case
+            find_custom_type(ext.module, "ClientMsg"),
+            analysis.client_msg_variants
+          {
+            Ok(client_msg), _ -> {
+              let allowed = variants_from_msg_type(ext.scope, client_msg)
+              #(allowed, allowed)
+            }
+            Error(_), [_, ..] as allowed -> #(allowed, allowed)
+            Error(_), [] -> #(
+              external_msg_variants(ext, analysis.has_local),
+              [],
+            )
+          }
+          #(variants, ext.alias, "Msg", client_variants)
+        }
+        Error(Nil) -> #([], "", "Msg", [])
+      }
+  }
+
+  let #(has_server, server_module, server_type_name, server_fields) = case
+    analysis.has_server
+  {
+    True -> #(
+      True,
+      analysis.server_module,
+      analysis.server_type_name,
+      analysis.server_fields,
+    )
+    False ->
+      case find_external_type(externals, ["Server", "ServerState"]) {
+        Ok(#(ext, ct)) -> {
+          log.info(
+            "beacon.build.analyzer",
+            "Found " <> ct.name <> " type in external module: " <> ext.alias,
+          )
+          #(
+            True,
+            ext.alias,
+            ct.name,
+            extract_fields(ext.scope, ct) |> qualify_external_fields(ext.alias),
+          )
+        }
+        Error(Nil) -> #(False, "", "Server", [])
+      }
+  }
+
+  let #(has_local, local_module, local_type_name, local_fields) = case
+    analysis.has_local
+  {
+    True -> #(
+      True,
+      analysis.local_module,
+      analysis.local_type_name,
+      analysis.local_fields,
+    )
+    False ->
+      case find_external_type(externals, ["Local"]) {
+        Ok(#(ext, ct)) -> #(
+          True,
+          ext.alias,
+          ct.name,
+          extract_fields(ext.scope, ct) |> qualify_external_fields(ext.alias),
+        )
+        Error(Nil) -> #(False, "", "Local", [])
+      }
+  }
+
+  let external_msg_types = case msg_module {
+    "" -> ext_msg_types
+    alias -> list.filter(ext_msg_types, fn(info) { info.module != alias })
+  }
+
+  Analysis(
+    ..analysis,
+    has_model:,
+    model_module:,
+    model_type_name:,
+    msg_variants:,
+    msg_module:,
+    msg_type_name:,
+    client_msg_variants:,
+    has_local:,
+    local_module:,
+    local_type_name:,
+    local_fields:,
+    has_server:,
+    server_module:,
+    server_type_name:,
+    server_fields:,
+    model_fields:,
+    custom_types: list.append(analysis.custom_types, ext_custom_types),
+    enum_types: list.append(analysis.enum_types, ext_enum_types),
+    imported_modules:,
+    external_msg_types:,
+    type_defs:,
+  )
+}
+
+/// The variants of an imported module's Msg type: its own `ClientMsg`
+/// allowlist when it has one, otherwise every Msg variant, classified
+/// against the module's update function when it has one.
+fn external_msg_variants(ext: External, has_local: Bool) -> List(MsgVariant) {
+  case find_custom_type(ext.module, "ClientMsg") {
+    Ok(client_msg) -> variants_from_msg_type(ext.scope, client_msg)
+    Error(_) ->
+      case find_custom_type(ext.module, "Msg") {
+        Error(_) -> []
+        Ok(msg_type) ->
+          case find_update_function(ext.module) {
+            Ok(func) -> classify_variants(ext.scope, msg_type, func, has_local)
+            Error(_) -> variants_from_msg_type(ext.scope, msg_type)
+          }
+      }
+  }
+}
+
+/// The first public custom type named one of `names` in any imported module.
+fn find_external_type(
+  externals: List(External),
+  names: List(String),
+) -> Result(#(External, glance.CustomType), Nil) {
+  list.find_map(externals, fn(ext) {
+    list.find_map(ext.module.custom_types, fn(def) {
+      case
+        list.contains(names, def.definition.name)
+        && def.definition.publicity == glance.Public
+      {
+        True -> Ok(#(ext, def.definition))
+        False -> Error(Nil)
+      }
+    })
+  })
+}
+
+/// Expand type aliases everywhere and derive substates from resolved types.
+fn finish(analysis: Analysis) -> Analysis {
+  let aliases =
+    dict.fold(analysis.type_defs, dict.new(), fn(acc, key, def) {
+      case def {
+        field_type.AliasDef(target) -> dict.insert(acc, key, target)
+        _ -> acc
+      }
+    })
+  let expand = fn(type_) { field_type.expand_aliases(type_, aliases) }
+  let expand_fields = fn(fields: List(TypeField)) {
+    list.map(fields, fn(f) { TypeField(..f, field_type: expand(f.field_type)) })
+  }
+  let expand_variants = fn(variants: List(MsgVariant)) {
+    list.map(variants, fn(v) {
+      MsgVariant(..v, fields: expand_fields(v.fields))
+    })
+  }
+  let type_defs =
+    dict.map_values(analysis.type_defs, fn(_key, def) {
+      case def {
+        field_type.RecordDef(constructor:, fields:) ->
+          field_type.RecordDef(
+            constructor:,
+            fields: list.map(fields, fn(f) { #(f.0, expand(f.1)) }),
+          )
+        field_type.AliasDef(target) -> field_type.AliasDef(expand(target))
+        field_type.EnumDef(..) | field_type.UnsupportedDef(..) -> def
+      }
+    })
+  let model_fields = expand_fields(analysis.model_fields)
+  Analysis(
+    ..analysis,
+    model_fields:,
+    local_fields: expand_fields(analysis.local_fields),
+    server_fields: expand_fields(analysis.server_fields),
+    msg_variants: expand_variants(analysis.msg_variants),
+    client_msg_variants: expand_variants(analysis.client_msg_variants),
+    external_msg_types: list.map(analysis.external_msg_types, fn(info) {
+      MsgTypeInfo(..info, variants: expand_variants(info.variants))
+    }),
+    computed_fields: list.map(analysis.computed_fields, fn(c) {
+      ComputedField(..c, field_type: expand(c.field_type))
+    }),
+    type_defs:,
+    substates: list.filter_map(model_fields, fn(f) { substate(type_defs, f) }),
+  )
+}
+
+/// A Model field is a substate when it holds a record (or a list of records)
+/// with at least one field.
+fn substate(
+  type_defs: Dict(#(String, String), TypeDef),
+  field: TypeField,
+) -> Result(SubstateInfo, Nil) {
+  let #(target, is_list) = case field.field_type {
+    field_type.ListType(inner) -> #(inner, True)
+    other -> #(other, False)
+  }
+  case target {
+    field_type.NamedType(module:, name:) ->
+      case dict.get(type_defs, #(module, name)) {
+        Ok(field_type.RecordDef(fields: [_, ..], ..)) ->
+          Ok(SubstateInfo(
+            field_name: field.name,
+            type_name: name,
+            is_list:,
+            module:,
+          ))
+        _ -> Error(Nil)
+      }
+    _ -> Error(Nil)
+  }
+}
+
+// ===== Codec type validation =====
+
+/// The Msg variants the browser may send: the `ClientMsg` allowlist when the
+/// app defines one, otherwise every Msg variant.
+pub fn client_event_variants(analysis: Analysis) -> List(MsgVariant) {
+  case analysis.client_msg_variants {
+    [] -> analysis.msg_variants
+    variants -> variants
+  }
+}
+
+/// Check that every type the generated codecs must encode or decode is
+/// supported: Model and Local fields, browser-sent Msg variants, nested Msg
+/// types and computed fields. Every problem is reported, each naming the
+/// field and the type.
+pub fn validate_codec_types(analysis: Analysis) -> Result(Nil, String) {
+  let nested_msg_modules =
+    list.map(analysis.external_msg_types, fn(info) { info.module })
+  let checker = Checker(type_defs: analysis.type_defs, nested_msg_modules:)
+  let model_errors = case analysis.has_model {
+    False -> []
+    True ->
+      root_errors(
+        checker,
+        analysis.model_module,
+        analysis.model_type_name,
+        analysis.model_fields,
+      )
+  }
+  let local_errors = case analysis.has_local {
+    False -> []
+    True ->
+      root_errors(
+        checker,
+        analysis.local_module,
+        analysis.local_type_name,
+        analysis.local_fields,
+      )
+  }
+  let msg_label =
+    field_type.qualified_name(analysis.msg_module, analysis.msg_type_name)
+  let msg_errors =
+    variant_errors(checker, msg_label, client_event_variants(analysis))
+  let nested_errors =
+    list.flat_map(analysis.external_msg_types, fn(info) {
+      variant_errors(checker, info.module <> ".Msg", info.variants)
+    })
+  let computed_errors =
+    list.flat_map(analysis.computed_fields, fn(c) {
+      check_type(
+        checker,
+        "computed field `" <> c.name <> "`",
+        c.field_type,
+        set.new(),
+      )
+    })
+  case
+    list.flatten([
+      model_errors,
+      local_errors,
+      msg_errors,
+      nested_errors,
+      computed_errors,
+    ])
+    |> list.unique
+  {
+    [] -> Ok(Nil)
+    errors -> {
+      let message =
+        "Generated codecs cannot handle these types:\n  - "
+        <> string.join(errors, "\n  - ")
+      log.error("beacon.build.analyzer", message)
+      Error(message)
+    }
+  }
+}
+
+type Checker {
+  Checker(
+    type_defs: Dict(#(String, String), TypeDef),
+    nested_msg_modules: List(String),
+  )
+}
+
+fn root_errors(
+  checker: Checker,
+  module: String,
+  name: String,
+  fields: List(TypeField),
+) -> List(String) {
+  let label = field_type.qualified_name(module, name)
+  case dict.get(checker.type_defs, #(module, name)) {
+    Ok(field_type.RecordDef(..)) ->
+      list.flat_map(fields, fn(f) {
+        check_type(
+          checker,
+          label <> "." <> f.name,
+          f.field_type,
+          set.from_list([#(module, name)]),
+        )
+      })
+    Ok(field_type.UnsupportedDef(reason)) -> [label <> ": " <> reason]
+    Ok(field_type.EnumDef(..)) | Ok(field_type.AliasDef(..)) -> [
+      label <> ": must be a record with a single constructor",
+    ]
+    Error(Nil) -> [label <> ": type definition not found"]
+  }
+}
+
+fn variant_errors(
+  checker: Checker,
+  msg_label: String,
+  variants: List(MsgVariant),
+) -> List(String) {
+  list.flat_map(variants, fn(variant) {
+    list.flat_map(variant.fields, fn(f) {
+      let context = msg_label <> "." <> variant.name <> "." <> f.name
+      case f.field_type {
+        // A nested Msg is carried as an argument of a parent Msg variant.
+        field_type.NamedType(module:, name: "Msg") ->
+          case list.contains(checker.nested_msg_modules, module) {
+            True -> []
+            False -> check_type(checker, context, f.field_type, set.new())
+          }
+        other -> check_type(checker, context, other, set.new())
+      }
+    })
+  })
+}
+
+fn check_type(
+  checker: Checker,
+  context: String,
+  type_: FieldType,
+  visiting: Set(#(String, String)),
+) -> List(String) {
+  let problem = fn(reason) {
+    [
+      context
+      <> ": "
+      <> reason
+      <> " (type "
+      <> field_type.describe(type_)
+      <> ")",
+    ]
+  }
+  case type_ {
+    field_type.IntType
+    | field_type.FloatType
+    | field_type.BoolType
+    | field_type.StringType -> []
+    field_type.OptionType(inner) | field_type.ListType(inner) ->
+      check_type(checker, context, inner, visiting)
+    field_type.DictType(key:, value:) -> {
+      let key_errors = case key {
+        field_type.StringType | field_type.IntType -> []
+        _ ->
+          problem(
+            "Dict keys must be String or Int, found `"
+            <> field_type.describe(key)
+            <> "`",
+          )
+      }
+      list.append(key_errors, check_type(checker, context, value, visiting))
+    }
+    field_type.TupleType(elements) ->
+      list.flat_map(elements, check_type(checker, context, _, visiting))
+    field_type.UnsupportedType(reason) -> [context <> ": " <> reason]
+    field_type.NamedType(module:, name:) -> {
+      let key = #(module, name)
+      let label = field_type.qualified_name(module, name)
+      case set.contains(visiting, key), dict.get(checker.type_defs, key) {
+        True, _ ->
+          problem(
+            "recursive type `"
+            <> label
+            <> "` cannot be encoded; generated codecs need a finite shape",
+          )
+        False, Error(Nil) ->
+          problem("type `" <> label <> "` is not defined in an analyzed module")
+        False, Ok(field_type.RecordDef(fields:, ..)) ->
+          list.flat_map(fields, fn(f) {
+            check_type(
+              checker,
+              context <> " → " <> label <> "." <> f.0,
+              f.1,
+              set.insert(visiting, key),
+            )
+          })
+        False, Ok(field_type.EnumDef(variants)) -> {
+          let wire_names = list.map(variants, field_type.enum_wire_name)
+          case list.length(list.unique(wire_names)) == list.length(wire_names) {
+            True -> []
+            False ->
+              problem(
+                "enum `"
+                <> label
+                <> "` has variants that differ only by case; they would encode to the same JSON string",
+              )
+          }
+        }
+        // Aliases are expanded by `finish`, so one surviving here is a bug.
+        False, Ok(field_type.AliasDef(..)) ->
+          problem("type alias `" <> label <> "` was not expanded")
+        False, Ok(field_type.UnsupportedDef(reason)) -> problem(reason)
+      }
     }
   }
 }
@@ -887,51 +1091,55 @@ fn find_function(
   }
 }
 
-/// Extract labelled fields from a custom type's first variant.
-fn extract_fields(custom_type: glance.CustomType) -> List(TypeField) {
+/// Extract labelled fields from a custom type's first variant. Whether the
+/// type is a valid record is checked by `validate_codec_types` through its
+/// `TypeDef`.
+fn extract_fields(
+  scope: field_type.Scope,
+  custom_type: glance.CustomType,
+) -> List(TypeField) {
   case custom_type.variants {
     [variant, ..] ->
       list.filter_map(variant.fields, fn(field) {
         case field {
-          glance.LabelledVariantField(item: field_type, label: name) -> {
-            let #(type_name, inner, mod_val, inner_mod_val) =
-              type_parts(field_type, name)
-            Ok(TypeField(
-              name: name,
-              type_name: type_name,
-              inner_type: inner,
-              module: mod_val,
-              inner_module: inner_mod_val,
-            ))
-          }
-          _ -> Error(Nil)
+          glance.LabelledVariantField(item:, label:) ->
+            Ok(type_field(scope, label, item))
+          glance.UnlabelledVariantField(..) -> Error(Nil)
         }
       })
-    _ -> []
+    [] -> []
   }
 }
 
-fn extract_variant_fields(variant: glance.Variant) -> List(TypeField) {
-  variant.fields
-  |> list.index_map(fn(field, idx) {
-    let name = case field {
-      glance.LabelledVariantField(label: label, ..) -> label
-      glance.UnlabelledVariantField(..) -> "arg" <> int.to_string(idx)
+fn extract_variant_fields(
+  scope: field_type.Scope,
+  variant: glance.Variant,
+) -> List(TypeField) {
+  list.index_map(variant.fields, fn(field, idx) {
+    case field {
+      glance.LabelledVariantField(item:, label:) ->
+        type_field(scope, label, item)
+      glance.UnlabelledVariantField(item:) ->
+        type_field(scope, "arg" <> int.to_string(idx), item)
     }
-    let field_type = case field {
-      glance.LabelledVariantField(item: item, ..) -> item
-      glance.UnlabelledVariantField(item: item) -> item
-    }
-    let #(type_name, inner, mod_val, inner_mod_val) =
-      type_parts(field_type, name)
-    TypeField(
-      name: name,
-      type_name: type_name,
-      inner_type: inner,
-      module: mod_val,
-      inner_module: inner_mod_val,
-    )
   })
+}
+
+fn type_field(
+  scope: field_type.Scope,
+  name: String,
+  annotation: glance.Type,
+) -> TypeField {
+  let #(type_name, inner_type, module, inner_module) =
+    type_parts(annotation, name)
+  TypeField(
+    name:,
+    type_name:,
+    inner_type:,
+    module:,
+    inner_module:,
+    field_type: field_type.resolve(scope, annotation),
+  )
 }
 
 fn type_parts(
@@ -1008,6 +1216,7 @@ fn module_name_or_empty(
 /// A variant affects the model if its case arm returns a modified model
 /// (not just returning the input model unchanged).
 fn classify_variants(
+  scope: field_type.Scope,
   msg_type: glance.CustomType,
   update_fn: glance.Function,
   has_local: Bool,
@@ -1071,18 +1280,21 @@ fn classify_variants(
     }
     MsgVariant(
       name: name,
-      fields: extract_variant_fields(variant),
+      fields: extract_variant_fields(scope, variant),
       affects_model: affects_model,
       affects_local: affects_local,
     )
   })
 }
 
-fn variants_from_msg_type(msg_type: glance.CustomType) -> List(MsgVariant) {
+fn variants_from_msg_type(
+  scope: field_type.Scope,
+  msg_type: glance.CustomType,
+) -> List(MsgVariant) {
   list.map(msg_type.variants, fn(variant) {
     MsgVariant(
       name: variant.name,
-      fields: extract_variant_fields(variant),
+      fields: extract_variant_fields(scope, variant),
       affects_model: True,
       affects_local: False,
     )
@@ -1262,14 +1474,10 @@ pub fn state_diagnostics(analysis: Analysis) -> List(String) {
 /// which state is client-visible, which imports were stripped from the client
 /// bundle, which codecs were generated, and why each message is LOCAL, MODEL,
 /// or MODEL+LOCAL.
-pub fn client_contract_report(
-  source: String,
-  analysis: Analysis,
-) -> List(String) {
-  let skipped_imports = skipped_client_imports(source)
-  let skipped_line = case skipped_imports {
+pub fn client_contract_report(analysis: Analysis) -> List(String) {
+  let skipped_line = case analysis.skipped_client_imports {
     [] -> "Skipped client imports: none"
-    _ -> "Skipped client imports: " <> string.join(skipped_imports, ", ")
+    skipped -> "Skipped client imports: " <> string.join(skipped, ", ")
   }
 
   let codec_names =
@@ -1351,18 +1559,14 @@ pub fn client_contract_summary(analysis: Analysis) -> String {
   <> ", generated=encode_model/decode_model/decode_event/encode_msg/render_model"
 }
 
-fn skipped_client_imports(source: String) -> List(String) {
-  case glance.module(source) {
-    Error(_) -> ["<parse failed>"]
-    Ok(module) ->
-      list.filter_map(module.imports, fn(def) {
-        let import_ = def.definition
-        case is_server_only_import(import_.module) {
-          True -> Ok(import_.module)
-          False -> Error(Nil)
-        }
-      })
-  }
+fn skipped_client_imports(module: glance.Module) -> List(String) {
+  list.filter_map(module.imports, fn(def) {
+    let import_ = def.definition
+    case is_server_only_import(import_.module) {
+      True -> Ok(import_.module)
+      False -> Error(Nil)
+    }
+  })
 }
 
 fn qualified_type_label(module_name: String, type_name: String) -> String {
@@ -1491,15 +1695,10 @@ pub type PurityError {
 ///
 /// Returns Ok(Nil) if the module is pure, or Error with a clear message.
 pub fn validate_purity(source: String) -> Result(Nil, String) {
-  case glance.module(source) {
-    Error(_) -> Error("Failed to parse source for purity validation")
-    Ok(module) -> {
-      let errors = find_purity_errors(module)
-      case errors {
-        [] -> Ok(Nil)
-        _ -> Error(format_purity_errors(errors))
-      }
-    }
+  use module <- result.try(parse("app module", source))
+  case find_purity_errors(module) {
+    [] -> Ok(Nil)
+    errors -> Error(format_purity_errors(errors))
   }
 }
 
@@ -1509,35 +1708,31 @@ pub fn validate_purity(source: String) -> Result(Nil, String) {
 /// stores, PubSub, HTTP, env reads, FFI, process APIs, and random values belongs
 /// in `on_update`.
 pub fn validate_client_update_purity(source: String) -> Result(Nil, String) {
-  case client_update_purity_errors(source) {
+  use module <- result.try(parse("app module", source))
+  case client_update_purity_errors(module) {
     [] -> Ok(Nil)
     errors -> Error(format_purity_errors(errors))
   }
 }
 
 /// Return client-visible update purity violations without formatting.
-pub fn client_update_purity_errors(source: String) -> List(PurityError) {
-  case glance.module(source) {
-    Error(_) -> [UpdateSideEffect("failed to parse source for update purity")]
-    Ok(module) -> {
-      let aliases = side_effect_import_aliases(module)
-      let external_names = erlang_external_function_names(module)
-      let update_errors = case find_function(module, "update") {
-        Ok(func) ->
-          function_body_side_effects(func.body, aliases, external_names)
-        Error(_) -> []
-      }
-      let factory_errors =
-        list.filter_map(module.functions, fn(def) {
-          let func = def.definition
-          case func.name == "make_update" && !list.is_empty(func.parameters) {
-            True -> Ok(CapturedUpdateFactory(function_name: "make_update"))
-            False -> Error(Nil)
-          }
-        })
-      list.append(update_errors, factory_errors)
-    }
+pub fn client_update_purity_errors(module: glance.Module) -> List(PurityError) {
+  let aliases = side_effect_import_aliases(module)
+  let external_names = erlang_external_function_names(module)
+  let update_errors = case find_function(module, "update") {
+    Ok(func) -> function_body_side_effects(func.body, aliases, external_names)
+    // An app without a direct `update` has no client-visible update to check.
+    Error(_) -> []
   }
+  let factory_errors =
+    list.filter_map(module.functions, fn(def) {
+      let func = def.definition
+      case func.name == "make_update" && !list.is_empty(func.parameters) {
+        True -> Ok(CapturedUpdateFactory(function_name: "make_update"))
+        False -> Error(Nil)
+      }
+    })
+  list.append(update_errors, factory_errors)
 }
 
 /// Walk the AST and collect all purity violations.
@@ -1879,20 +2074,16 @@ const server_only_functions = [
 
 /// Return True when a source module contains server-only declarations that
 /// require client extraction before the module can be copied into a JS build.
-pub fn has_server_boundary(source: String) -> Bool {
-  case glance.module(source) {
-    Error(_) -> True
-    Ok(module) -> {
-      list.any(module.custom_types, fn(def) { def.definition.name == "Server" })
-      || list.any(module.functions, fn(def) {
-        def.definition.name == "init_server"
-        || def.definition.name == "update_server"
-      })
-      || list.any(module.constants, fn(def) {
-        string.starts_with(def.definition.name, "server_")
-      })
-    }
-  }
+pub fn has_server_boundary(source: String) -> Result(Bool, String) {
+  use module <- result.map(parse("app module", source))
+  list.any(module.custom_types, fn(def) { def.definition.name == "Server" })
+  || list.any(module.functions, fn(def) {
+    def.definition.name == "init_server"
+    || def.definition.name == "update_server"
+  })
+  || list.any(module.constants, fn(def) {
+    string.starts_with(def.definition.name, "server_")
+  })
 }
 
 /// Names of functions that MUST be extracted even if they reference server code.
@@ -1923,8 +2114,8 @@ fn extract_client_source_with_update(
   source: String,
   include_update: Bool,
 ) -> Result(String, String) {
-  case glance.module(source) {
-    Error(_) -> Error("Failed to parse source for extraction")
+  case parse("client module", source) {
+    Error(reason) -> Error(reason)
     Ok(module) -> {
       let source_bytes = string_to_bytes(source)
 

@@ -165,7 +165,7 @@ pub fn lint_source(file_path: String, source: String) -> List(Violation) {
       let degraded_path_violations =
         check_no_degraded_path_phrases(file_path, source)
       let update_contract_violations =
-        check_client_update_contract(file_path, source)
+        check_client_update_contract(file_path, source, module)
       let deprecated_route_violations =
         check_deprecated_route_api(file_path, source)
       list.append(
@@ -401,6 +401,7 @@ fn check_deprecated_route_api(
 fn check_client_update_contract(
   file_path: String,
   source: String,
+  module: glance.Module,
 ) -> List(Violation) {
   let is_app_code =
     string.starts_with(file_path, "examples/")
@@ -409,7 +410,7 @@ fn check_client_update_contract(
   case is_app_code || string.contains(source, "pub type Msg") {
     False -> []
     True -> {
-      analyzer.client_update_purity_errors(source)
+      analyzer.client_update_purity_errors(module)
       |> list.map(fn(err) {
         Violation(
           file: file_path,
