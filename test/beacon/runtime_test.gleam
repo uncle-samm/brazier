@@ -315,7 +315,12 @@ pub fn runtime_sends_model_sync_on_event_test() {
     subject,
     runtime.ClientConnected(conn_id: "test_conn_3", subject: transport_subject),
   )
-  process.sleep(20)
+  process.send(
+    subject,
+    runtime.ClientJoined(conn_id: "test_conn_3", token: "", path: "/"),
+  )
+  let assert Ok(transport.SendModelSync(..)) =
+    process.receive(transport_subject, 500)
 
   // Send an event
   process.send(
@@ -402,7 +407,12 @@ pub fn runtime_handles_unknown_event_test() {
     subject,
     runtime.ClientConnected(conn_id: "test_conn_5", subject: transport_subject),
   )
-  process.sleep(20)
+  process.send(
+    subject,
+    runtime.ClientJoined(conn_id: "test_conn_5", token: "", path: "/"),
+  )
+  let assert Ok(transport.SendModelSync(..)) =
+    process.receive(transport_subject, 500)
 
   // Send unknown event — should produce a SendError
   process.send(
@@ -419,16 +429,23 @@ pub fn runtime_handles_unknown_event_test() {
   )
   process.sleep(50)
 
-  // Check that the transport received a SendError for the unknown handler
+  // Check that the transport received a SendError for the unknown handler,
+  // followed by an ack-only patch at the unchanged revision.
   let msgs = drain_messages(transport_subject, [])
   let has_error =
     list.any(msgs, fn(m) {
       case m {
-        transport.SendError(reason: _) -> True
+        transport.SendError(reason: reason) ->
+          string.contains(reason, "Unknown handler")
         _ -> False
       }
     })
   let assert True = has_error
+  let assert True =
+    list.contains(
+      msgs,
+      transport.SendPatch(ops_json: "[]", version: 0, ack_clock: 1),
+    )
 }
 
 pub fn runtime_effect_dispatches_message_test() {
@@ -681,7 +698,12 @@ pub fn client_request_sync_sends_model_sync_without_mount_test() {
     subject,
     runtime.ClientConnected(conn_id: "sync_conn", subject: transport_subject),
   )
-  process.sleep(20)
+  process.send(
+    subject,
+    runtime.ClientJoined(conn_id: "sync_conn", token: "", path: "/"),
+  )
+  let assert Ok(transport.SendModelSync(..)) =
+    process.receive(transport_subject, 500)
   process.send(subject, runtime.ClientSyncRequested(conn_id: "sync_conn"))
   process.sleep(50)
 
@@ -705,124 +727,211 @@ pub fn client_request_sync_sends_model_sync_without_mount_test() {
   let assert False = has_mount
 }
 
-pub fn state_recovery_from_token_test() {
-  // Create a runtime with serialize/deserialize
-  let config =
-    runtime.RuntimeConfig(
-      init: counter_init,
-      update: counter_update,
-      view: counter_view,
-      decode_event: option.Some(counter_decode_event),
-      serialize_model: option.Some(fn(m: CounterModel) {
-        int.to_string(m.count)
-      }),
-      deserialize_model: option.Some(fn(s: String) {
-        case int.parse(s) {
-          Ok(n) -> Ok(CounterModel(count: n))
-          Error(Nil) -> Error("invalid count")
-        }
-      }),
-      route_patterns: [],
-      on_route_change: option.None,
-      on_route_leave: option.None,
-      dynamic_subscriptions: option.None,
-      on_notify: option.None,
-      on_notification: option.None,
-      init_from_request: option.None,
-      secret_key: "",
-      dev_mode: False,
-    )
-  let assert Ok(subject) = runtime.start(config)
+fn recovery_config(
+  secret_key: String,
+) -> runtime.RuntimeConfig(CounterModel, CounterMsg) {
+  runtime.RuntimeConfig(
+    ..counter_config(),
+    serialize_model: option.Some(fn(m: CounterModel) { int.to_string(m.count) }),
+    deserialize_model: option.Some(fn(s: String) {
+      case int.parse(s) {
+        Ok(n) -> Ok(CounterModel(count: n))
+        Error(Nil) -> Error("invalid count")
+      }
+    }),
+    secret_key: secret_key,
+  )
+}
+
+/// Connect and join one connection, returning the first message it gets.
+fn join_and_receive(
+  subject: process.Subject(runtime.RuntimeMessage(msg)),
+  conn_id: String,
+  token: String,
+) -> #(process.Subject(transport.InternalMessage), transport.InternalMessage) {
   let transport_subject = process.new_subject()
+  process.send(
+    subject,
+    runtime.ClientConnected(conn_id: conn_id, subject: transport_subject),
+  )
+  process.send(
+    subject,
+    runtime.ClientJoined(conn_id: conn_id, token: token, path: "/"),
+  )
+  let assert Ok(first) = process.receive(transport_subject, 1000)
+  #(transport_subject, first)
+}
 
-  // Connect
-  process.send(
-    subject,
-    runtime.ClientConnected(
-      conn_id: "recovery_conn",
-      subject: transport_subject,
-    ),
-  )
-  process.sleep(20)
+const recovery_secret = "runtime-test-secret-key-0123456789"
 
-  // Increment the counter 3 times
-  process.send(
-    subject,
-    runtime.ClientEventReceived(
-      conn_id: "recovery_conn",
-      event_name: "click",
-      handler_id: "increment",
-      event_data: "{}",
-      target_path: "0",
-      clock: 1,
-      ops: "",
-    ),
-  )
-  process.send(
-    subject,
-    runtime.ClientEventReceived(
-      conn_id: "recovery_conn",
-      event_name: "click",
-      handler_id: "increment",
-      event_data: "{}",
-      target_path: "0",
-      clock: 2,
-      ops: "",
-    ),
-  )
-  process.send(
-    subject,
-    runtime.ClientEventReceived(
-      conn_id: "recovery_conn",
-      event_name: "click",
-      handler_id: "increment",
-      event_data: "{}",
-      target_path: "0",
-      clock: 3,
-      ops: "",
-    ),
-  )
-  process.sleep(50)
+pub fn state_recovery_rejects_token_signed_with_other_secret_test() {
+  let assert Ok(subject) = runtime.start(recovery_config(recovery_secret))
+  let token =
+    runtime.create_state_token(
+      CounterModel(count: 3),
+      fn(m: CounterModel) { int.to_string(m.count) },
+      "some-other-secret-key-0123456789",
+    )
+  let #(_, first) = join_and_receive(subject, "forged_conn", token)
+  let assert transport.SendModelSync(model_json: "0", version: 0, ack_clock: 0) =
+    first
+}
 
-  // Now create a token with the current model state (count=3)
+pub fn state_recovery_rejects_tampered_token_test() {
+  let assert Ok(subject) = runtime.start(recovery_config(recovery_secret))
+  let token =
+    runtime.create_state_token(
+      CounterModel(count: 3),
+      fn(m: CounterModel) { int.to_string(m.count) },
+      recovery_secret,
+    )
+  let tampered = token <> "x"
+  let #(_, first) = join_and_receive(subject, "tampered_conn", tampered)
+  let assert transport.SendModelSync(model_json: "0", ..) = first
+}
+
+pub fn state_recovery_ignores_token_when_secret_empty_test() {
+  let assert Ok(subject) = runtime.start(recovery_config(""))
   let token =
     runtime.create_state_token(
       CounterModel(count: 3),
       fn(m: CounterModel) { int.to_string(m.count) },
       "",
     )
+  let #(_, first) = join_and_receive(subject, "empty_secret_conn", token)
+  let assert transport.SendModelSync(model_json: "0", ..) = first
+}
 
-  // Simulate reconnection: new connection joins with the token
-  let transport_subject2 = process.new_subject()
+pub fn state_recovery_rejects_session_bound_token_without_session_test() {
+  let assert Ok(subject) = runtime.start(recovery_config(recovery_secret))
+  let token =
+    ssr.sign_join_token(
+      recovery_secret,
+      ssr.fingerprint_session_id("session-a"),
+      option.Some("3"),
+      ssr_now(),
+    )
+  let #(_, first) = join_and_receive(subject, "unbound_conn", token)
+  let assert transport.SendModelSync(model_json: "0", ..) = first
+}
+
+pub fn state_recovery_rejects_token_for_other_session_test() {
+  let assert Ok(subject) = runtime.start(recovery_config(recovery_secret))
+  let token =
+    ssr.sign_join_token(
+      recovery_secret,
+      ssr.fingerprint_session_id("session-a"),
+      option.Some("3"),
+      ssr_now(),
+    )
+  let transport_subject = process.new_subject()
   process.send(
     subject,
     runtime.ClientConnected(
-      conn_id: "recovery_conn_2",
-      subject: transport_subject2,
+      conn_id: "other_session",
+      subject: transport_subject,
     ),
   )
-  process.sleep(20)
-
-  // Join with the token containing count=3
   process.send(
     subject,
-    runtime.ClientJoined(conn_id: "recovery_conn_2", token: token, path: "/"),
+    runtime.ClientJoinedWithSession(
+      conn_id: "other_session",
+      token: token,
+      path: "/",
+      session_fingerprint: ssr.fingerprint_session_id("session-b"),
+    ),
   )
-  process.sleep(50)
-
-  // The model sync should contain "3" (recovered state), not "0" (init state).
-  let selector =
-    process.new_selector()
-    |> process.select(transport_subject2)
-  let assert Ok(sync_msg) = process.selector_receive(selector, 1000)
-  case sync_msg {
-    transport.SendModelSync(model_json: json, ..) -> {
-      let assert "3" = json
-    }
-    transport.SendMount(..) -> panic as "Join must not send SendMount"
-    _ -> panic as "Expected SendModelSync message"
-  }
+  let assert Ok(transport.SendModelSync(model_json: "0", ..)) =
+    process.receive(transport_subject, 1000)
 }
+
+pub fn state_recovery_rejects_expired_token_test() {
+  let assert Ok(subject) = runtime.start(recovery_config(recovery_secret))
+  // Issued two days ago: past the join token lifetime.
+  let token =
+    ssr.sign_join_token(
+      recovery_secret,
+      "",
+      option.Some("3"),
+      ssr_now() - 172_800,
+    )
+  let #(_, first) = join_and_receive(subject, "expired_conn", token)
+  let assert transport.SendModelSync(model_json: "0", ..) = first
+}
+
+pub fn state_recovery_rejects_model_the_deserializer_refuses_test() {
+  let assert Ok(subject) = runtime.start(recovery_config(recovery_secret))
+  let token =
+    ssr.sign_join_token(
+      recovery_secret,
+      "",
+      option.Some("not-a-number"),
+      ssr_now(),
+    )
+  let #(_, first) = join_and_receive(subject, "bad_model_conn", token)
+  let assert transport.SendModelSync(model_json: "0", ..) = first
+}
+
+pub fn state_recovery_only_applies_to_first_join_test() {
+  // A second connection joining a live runtime must not replace the model
+  // the first connection is already looking at.
+  let assert Ok(subject) = runtime.start(recovery_config(recovery_secret))
+  let #(_, first) = join_and_receive(subject, "first_conn", "")
+  let assert transport.SendModelSync(model_json: "0", ..) = first
+  let token =
+    runtime.create_state_token(
+      CounterModel(count: 3),
+      fn(m: CounterModel) { int.to_string(m.count) },
+      recovery_secret,
+    )
+  let #(_, second) = join_and_receive(subject, "second_conn", token)
+  let assert transport.SendModelSync(model_json: "0", ..) = second
+}
+
+pub fn state_recovery_from_token_test() {
+  let assert Ok(subject) = runtime.start(recovery_config(recovery_secret))
+  let token =
+    runtime.create_state_token(
+      CounterModel(count: 3),
+      fn(m: CounterModel) { int.to_string(m.count) },
+      recovery_secret,
+    )
+  // The model sync carries the recovered state (3), not the init state (0).
+  let #(_, first) = join_and_receive(subject, "recovery_conn", token)
+  let assert transport.SendModelSync(model_json: "3", version: 0, ack_clock: 0) =
+    first
+}
+
+pub fn state_recovery_from_session_bound_token_test() {
+  let assert Ok(subject) = runtime.start(recovery_config(recovery_secret))
+  let fingerprint = ssr.fingerprint_session_id("session-a")
+  let token =
+    ssr.sign_join_token(
+      recovery_secret,
+      fingerprint,
+      option.Some("7"),
+      ssr_now(),
+    )
+  let transport_subject = process.new_subject()
+  process.send(
+    subject,
+    runtime.ClientConnected(conn_id: "bound_conn", subject: transport_subject),
+  )
+  process.send(
+    subject,
+    runtime.ClientJoinedWithSession(
+      conn_id: "bound_conn",
+      token: token,
+      path: "/",
+      session_fingerprint: fingerprint,
+    ),
+  )
+  let assert Ok(transport.SendModelSync(model_json: "7", ..)) =
+    process.receive(transport_subject, 1000)
+}
+
+@external(erlang, "beacon_ssr_ffi", "system_time_seconds")
+fn ssr_now() -> Int
 
 pub fn model_sync_sent_after_event_test() {
   // Runtime with serialize_model should send model_sync after events

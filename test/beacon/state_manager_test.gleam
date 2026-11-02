@@ -63,6 +63,19 @@ pub fn ets_start_test() {
   let _manager = state_manager.start_ets("beacon_test_ets_" <> unique_id())
 }
 
+pub fn ets_start_twice_reuses_table_test() {
+  let name = "beacon_test_ets_twice_" <> unique_id()
+  let first = state_manager.start_ets(name)
+  state_manager.ets_put(first, "s1", 7)
+  let second = state_manager.start_ets(name)
+  let assert Ok(7) = state_manager.ets_get(second, "s1")
+}
+
+pub fn try_start_ets_invalid_name_is_typed_error_test() {
+  let assert Error(state_manager.InvalidTableName(_, _)) =
+    state_manager.try_start_ets("not valid")
+}
+
 pub fn ets_put_and_get_test() {
   let manager = state_manager.start_ets("beacon_test_ets_pg_" <> unique_id())
   state_manager.ets_put(manager, "s1", 42)
