@@ -3,9 +3,11 @@ import beacon
 import beacon/api
 import beacon/auth
 import beacon/effect
+import beacon/log
 import beacon/route
 import beacon/session
 import beacon/transport/server.{type Connection, type ResponseBody}
+import gleam/dict
 import gleam/http/request.{type Request}
 import gleam/http/response
 import gleam/int
@@ -143,24 +145,36 @@ fn handle_login(
       case api.form_field(fields, "csrf"), api.form_field(fields, "username") {
         Ok(csrf), Ok(username) if csrf == app.login_csrf_token -> {
           let safe_user = normalize_user(username)
-          let login = auth.create_login(store, safe_user)
-          let sess = login.session
-          let sess = session.set(store, sess, "role", role_for_user(safe_user))
-          let _sess =
-            session.set(
-              store,
-              sess,
-              "display_name",
-              display_name_for_user(safe_user),
-            )
-          api.json_value(
-            200,
-            json.object([
-              #("ok", json.bool(True)),
-              #("csrf", json.string(login.csrf_token)),
-            ]),
-          )
-          |> auth.with_session_cookie(sess, config)
+          // Rotate: any session id the browser already had is deleted so it
+          // cannot be fixed by an attacker and replayed after login.
+          let old_id =
+            option.from_result(session.id_from_request(req, config.cookie_name))
+          let login = auth.create_login_rotating(store, old_id, safe_user)
+          let result =
+            session.update(store, login.session.id, fn(data) {
+              data
+              |> dict.insert("role", role_for_user(safe_user))
+              |> dict.insert("display_name", display_name_for_user(safe_user))
+            })
+          case result {
+            Ok(sess) ->
+              api.json_value(
+                200,
+                json.object([
+                  #("ok", json.bool(True)),
+                  #("csrf", json.string(login.csrf_token)),
+                ]),
+              )
+              |> auth.with_session_cookie(sess, config)
+            Error(err) -> {
+              log.error(
+                "auth_workspace",
+                "Login profile write failed: "
+                  <> session.store_error_to_string(err),
+              )
+              api.text(500, "Login failed")
+            }
+          }
         }
         _, _ -> api.text(403, "Invalid login CSRF token")
       }
@@ -194,10 +208,18 @@ fn handle_profile(
     Error(reason) -> api.text(400, reason)
     Ok(fields) -> {
       case api.form_field(fields, "display_name") {
-        Ok(display_name) -> {
-          let _sess = session.set(store, sess, "display_name", display_name)
-          api.json_value(200, json.object([#("ok", json.bool(True))]))
-        }
+        Ok(display_name) ->
+          case session.set(store, sess, "display_name", display_name) {
+            Ok(_sess) ->
+              api.json_value(200, json.object([#("ok", json.bool(True))]))
+            Error(err) -> {
+              log.warning(
+                "auth_workspace",
+                "Profile write rejected: " <> session.store_error_to_string(err),
+              )
+              api.text(401, "Session expired")
+            }
+          }
         Error(reason) -> api.text(400, reason)
       }
     }
@@ -234,7 +256,11 @@ fn init_from_request(
   )
 }
 
-fn session_value(sess: session.Session, key: String, default: String) -> String {
+fn session_value(
+  sess: session.Session,
+  key: String,
+  default: String,
+) -> String {
   case session.get_value(sess, key) {
     Some(value) -> value
     None -> default

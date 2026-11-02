@@ -6,6 +6,7 @@ import beacon/sim/pool
 import beacon/sim/report
 import beacon/sim/scenario
 import beacon/sim/test_app
+import beacon/transport
 import gleam/erlang/process
 import gleam/string
 
@@ -183,7 +184,16 @@ pub fn sim_malformed_frames_test() {
 
 pub fn sim_flood_single_connection_test() {
   let port = test_app.unique_port()
-  let assert Ok(_app) = test_app.start_counter_app(port)
+  // A flood well past max_events_per_second must be rate limited without
+  // crashing the connection. Under the default limits a sustained flood is
+  // treated as abuse and closed with 1008 (covered in ws_protocol_test), so
+  // this test tolerates every violation to exercise the limiter itself.
+  let limits =
+    transport.SecurityLimits(
+      ..test_app.sim_security_limits(),
+      ws_max_rate_violations: 1_000_000,
+    )
+  let assert Ok(_app) = test_app.start_counter_app_with_limits(port, limits)
   process.sleep(200)
 
   let mt = metrics.new()
