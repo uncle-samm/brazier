@@ -8,7 +8,8 @@
 //// - A handler that crashes is detached by `telemetry`, which then emits
 ////   `[telemetry, handler, failure]`. Beacon logs that event at error
 ////   level. The process that emitted the event is never affected.
-//// - With no handler attached, an emit costs one ETS lookup.
+//// - With no handler attached, an emit costs one `persistent_term` read
+////   and one ETS lookup.
 //// - Metadata never carries session ids, tokens, cookies, event payloads,
 ////   models, query strings or remote IPs.
 ////
