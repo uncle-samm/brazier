@@ -1,5 +1,5 @@
 -module(beacon_csrf_ffi).
--export([new_store/1, put_token/3, get_token/2, delete_token/2]).
+-export([new_store/1, put_token/3, consume_token/3]).
 
 %% SECURITY: Atom creation constraint.
 %% CSRF store names come from developer code at compile time, not from runtime
@@ -30,12 +30,22 @@ put_token(Store, Key, Value) ->
     ets:insert(Store, {Key, Value}),
     nil.
 
-get_token(Store, Key) ->
+%% Check Token against the stored token for Key in constant time
+%% (crypto:hash_equals), then delete exactly that row. select_delete matches
+%% the stored value, so if a concurrent request consumed it (or a new token
+%% replaced it) between the lookup and the delete, nothing is deleted and
+%% this request fails: a token is accepted at most once.
+consume_token(Store, Key, Token) ->
     case ets:lookup(Store, Key) of
-        [{_, Value}] -> {ok, Value};
-        [] -> {error, nil}
+        [] -> {error, <<"no token issued or already used">>};
+        [{_, Stored}] ->
+            case byte_size(Stored) =:= byte_size(Token)
+                 andalso crypto:hash_equals(Stored, Token) of
+                false -> {error, <<"token mismatch">>};
+                true ->
+                    case ets:select_delete(Store, [{{Key, Stored}, [], [true]}]) of
+                        1 -> {ok, nil};
+                        0 -> {error, <<"token already used">>}
+                    end
+            end
     end.
-
-delete_token(Store, Key) ->
-    ets:delete(Store, Key),
-    nil.
