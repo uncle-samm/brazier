@@ -1,0 +1,289 @@
+import beacon/effect
+import beacon/error
+import beacon/internal/context
+import beacon/log_capture
+import beacon/router
+import beacon/runtime
+import beacon/transport
+import gleam/erlang/process
+import gleam/list
+import gleam/option
+import gleam/string
+import gleam/uri
+
+// --- segments / query ---
+
+fn parse(raw: String) -> uri.Uri {
+  let assert Ok(parsed) = uri.parse(raw)
+  parsed
+}
+
+pub fn segments_decodes_and_drops_empty_segments_test() {
+  let assert ["users", "Jürgen"] = router.segments(parse("/users/J%C3%BCrgen/"))
+  let assert [] = router.segments(parse("/"))
+  let assert ["a", "b"] = router.segments(parse("/a//b///"))
+}
+
+pub fn segments_drops_dot_segments_test() {
+  let assert ["b"] = router.segments(parse("/a/../b/."))
+}
+
+pub fn segments_keep_encoded_slash_inside_one_segment_test() {
+  // `%2F` decodes after splitting, so it stays inside its segment.
+  let assert ["files", "a/b"] = router.segments(parse("/files/a%2Fb"))
+}
+
+pub fn query_decodes_in_order_test() {
+  let assert [#("q", "a b"), #("page", "2")] =
+    router.query(parse("/search?q=a%20b&page=2"))
+  let assert [] = router.query(parse("/search"))
+}
+
+pub fn query_keeps_repeated_keys_test() {
+  let assert [#("t", "1"), #("t", "2")] = router.query(parse("/?t=1&t=2"))
+}
+
+pub fn is_local_path_test() {
+  let assert True = router.is_local_path("/")
+  let assert True = router.is_local_path("/users/7?tab=posts")
+  let assert False = router.is_local_path("//evil.example/x")
+  let assert False = router.is_local_path("https://evil.example/")
+  let assert False = router.is_local_path("javascript:alert(1)")
+  let assert False = router.is_local_path("")
+  let assert False = router.is_local_path("users")
+}
+
+// --- navigation effects outside a client event ---
+
+fn perform(eff: effect.Effect(Nil)) -> Nil {
+  effect.perform(eff, fn(_msg) { Nil }, fn(_key, _generation, _msg) { Nil })
+}
+
+pub fn non_local_push_logs_error_test() {
+  let #(Nil, logs) =
+    log_capture.capture(fn() { perform(router.push("https://evil.example/")) })
+  let assert True =
+    log_capture.has(logs, level: "error", containing: [
+      "router.push", "same-origin", "evil.example",
+    ])
+}
+
+pub fn non_local_replace_and_redirect_log_errors_test() {
+  let #(Nil, logs) =
+    log_capture.capture(fn() {
+      perform(router.replace("//evil.example"))
+      perform(router.redirect("javascript:x"))
+    })
+  let assert True =
+    log_capture.has(logs, level: "error", containing: ["router.replace"])
+  let assert True =
+    log_capture.has(logs, level: "error", containing: ["router.redirect"])
+}
+
+pub fn push_without_connection_logs_warning_test() {
+  let #(Nil, logs) = log_capture.capture(fn() { perform(router.push("/x")) })
+  let assert True =
+    log_capture.has(logs, level: "warning", containing: [
+      "router.push to /x", "no connection",
+    ])
+}
+
+// --- navigation effects from a client event, through the runtime ---
+
+type Model {
+  Model
+}
+
+type Msg {
+  Go(kind: String, path: String)
+}
+
+fn nav_config() -> runtime.RuntimeConfig(Model, Msg) {
+  runtime.RuntimeConfig(
+    init: fn(_ctx) { #(Model, effect.none()) },
+    update: fn(model: Model, msg: Msg) {
+      let Go(kind:, path:) = msg
+      let eff = case kind {
+        "push" -> router.push(path)
+        "replace" -> router.replace(path)
+        _ -> router.redirect(path)
+      }
+      #(model, eff)
+    },
+    encode_model: fn(_model) { "{}" },
+    // The handler id carries the navigation: "push:/x".
+    decode_event: fn(_name, handler_id, _data, _path) {
+      case string.split_once(handler_id, ":") {
+        Ok(#(kind, path)) -> Ok(Go(kind:, path:))
+        Error(Nil) ->
+          Error(error.RuntimeError(reason: "bad handler id " <> handler_id))
+      }
+    },
+    restore_model: option.None,
+    route: option.None,
+    dynamic_subscriptions: option.None,
+    on_notify: option.None,
+    on_notification: option.None,
+    secret_key: "",
+  )
+}
+
+fn ctx() -> context.Context {
+  context.new(
+    uri: uri.Uri(..uri.empty, path: "/"),
+    cookies: [],
+    is_connected: True,
+    session_id: Error(Nil),
+  )
+}
+
+fn joined(
+  conn_id: String,
+) -> #(
+  process.Subject(runtime.RuntimeMessage(Msg)),
+  process.Subject(transport.InternalMessage),
+) {
+  let assert Ok(subject) = runtime.start(nav_config(), ctx())
+  let transport_subject = process.new_subject()
+  process.send(
+    subject,
+    runtime.ClientConnected(conn_id: conn_id, subject: transport_subject),
+  )
+  process.send(
+    subject,
+    runtime.ClientJoined(conn_id: conn_id, token: "", path: "/"),
+  )
+  let assert Ok(transport.SendModelSync(..)) =
+    process.receive(transport_subject, 1000)
+  #(subject, transport_subject)
+}
+
+fn click(
+  subject: process.Subject(runtime.RuntimeMessage(Msg)),
+  conn_id: String,
+  handler_id: String,
+) -> Nil {
+  process.send(
+    subject,
+    runtime.ClientEventReceived(
+      conn_id: conn_id,
+      event_name: "click",
+      handler_id: handler_id,
+      event_data: "{}",
+      target_path: "0",
+      clock: 1,
+      ops: "",
+    ),
+  )
+}
+
+pub fn push_from_event_navigates_that_connection_test() {
+  let #(subject, transport_subject) = joined("nav_push")
+  click(subject, "nav_push", "push:/users/7?tab=posts")
+  let assert Ok(transport.SendNavigate(path: "/users/7?tab=posts")) =
+    process.receive(transport_subject, 1000)
+}
+
+pub fn replace_from_event_sends_replace_navigate_test() {
+  let #(subject, transport_subject) = joined("nav_replace")
+  click(subject, "nav_replace", "replace:/settings")
+  let assert Ok(transport.SendReplaceNavigate(path: "/settings")) =
+    process.receive(transport_subject, 1000)
+}
+
+pub fn redirect_from_event_sends_hard_navigate_test() {
+  let #(subject, transport_subject) = joined("nav_redirect")
+  click(subject, "nav_redirect", "redirect:/login")
+  let assert Ok(transport.SendHardNavigate(path: "/login")) =
+    process.receive(transport_subject, 1000)
+}
+
+pub fn non_local_push_from_event_sends_nothing_test() {
+  let #(subject, transport_subject) = joined("nav_evil")
+  click(subject, "nav_evil", "push://evil.example/x")
+  assert_no_navigation(transport_subject)
+}
+
+pub fn push_from_event_navigates_only_that_connection_test() {
+  let #(subject, first) = joined("nav_a")
+  let second = connect(subject, "nav_b")
+  click(subject, "nav_a", "push:/first")
+  let assert Ok(transport.SendNavigate(path: "/first")) =
+    process.receive(first, 1000)
+  assert_no_navigation(second)
+}
+
+pub fn push_outside_event_navigates_every_connection_test() {
+  // An effect's dispatched message (an async continuation, a timer) runs
+  // outside any client event: its navigation follows the shared model to
+  // every connection of the session, not just the last event's.
+  let #(subject, first) = joined("nav_c")
+  let second = connect(subject, "nav_d")
+  click(subject, "nav_c", "push:/first")
+  let assert Ok(transport.SendNavigate(path: "/first")) =
+    process.receive(first, 1000)
+  process.send(
+    subject,
+    runtime.EffectDispatched(message: Go(kind: "push", path: "/second")),
+  )
+  let assert Ok(transport.SendNavigate(path: "/second")) =
+    receive_navigation(first)
+  let assert Ok(transport.SendNavigate(path: "/second")) =
+    receive_navigation(second)
+}
+
+/// Connect and join one more connection to a running session.
+fn connect(
+  subject: process.Subject(runtime.RuntimeMessage(Msg)),
+  conn_id: String,
+) -> process.Subject(transport.InternalMessage) {
+  let transport_subject = process.new_subject()
+  process.send(
+    subject,
+    runtime.ClientConnected(conn_id: conn_id, subject: transport_subject),
+  )
+  process.send(
+    subject,
+    runtime.ClientJoined(conn_id: conn_id, token: "", path: "/"),
+  )
+  let assert Ok(transport.SendModelSync(..)) =
+    process.receive(transport_subject, 1000)
+  transport_subject
+}
+
+/// The next message that is not a patch or sync (event acks).
+fn receive_navigation(
+  transport_subject: process.Subject(transport.InternalMessage),
+) -> Result(transport.InternalMessage, Nil) {
+  case process.receive(transport_subject, 1000) {
+    Ok(transport.SendPatch(..)) | Ok(transport.SendModelSync(..)) ->
+      receive_navigation(transport_subject)
+    other -> other
+  }
+}
+
+/// Drain what the connection receives for 200ms (event acks are patches)
+/// and assert none of it navigates.
+fn assert_no_navigation(
+  transport_subject: process.Subject(transport.InternalMessage),
+) -> Nil {
+  let assert [] =
+    drain(transport_subject, [])
+    |> list.filter(fn(message) {
+      case message {
+        transport.SendPatch(..) | transport.SendModelSync(..) -> False
+        _ -> True
+      }
+    })
+  Nil
+}
+
+fn drain(
+  transport_subject: process.Subject(transport.InternalMessage),
+  acc: List(transport.InternalMessage),
+) -> List(transport.InternalMessage) {
+  case process.receive(transport_subject, 200) {
+    Ok(message) -> drain(transport_subject, [message, ..acc])
+    Error(Nil) -> list.reverse(acc)
+  }
+}

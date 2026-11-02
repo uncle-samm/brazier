@@ -16,8 +16,9 @@ import beacon/effect.{type Effect}
 import beacon/log
 import beacon/transport
 import gleam/erlang/process.{type Subject}
+import gleam/int
 import gleam/list
-import gleam/option.{type Option, None, Some}
+import gleam/option.{None, Some}
 import gleam/string
 import gleam/uri.{type Uri}
 
@@ -94,26 +95,36 @@ fn navigation_effect(
             <> string.inspect(path),
         )
       True ->
-        case get_navigation_target() {
-          Some(subject) -> {
-            log.debug("beacon.routing", "router." <> kind <> " to " <> path)
-            process.send(subject, message)
-          }
-          None ->
+        case get_navigation_targets() {
+          [] ->
             log.warning(
               "beacon.routing",
               "router."
                 <> kind
                 <> " to "
                 <> path
-                <> " has no connection to navigate (effect not run from a client event)",
+                <> " has no connection to navigate (effect not run by a session runtime, or the session has no connection)",
             )
+          targets -> {
+            log.debug(
+              "beacon.routing",
+              "router."
+                <> kind
+                <> " to "
+                <> path
+                <> " on "
+                <> int.to_string(list.length(targets))
+                <> " connection(s)",
+            )
+            list.each(targets, fn(subject) { process.send(subject, message) })
+          }
         }
     }
   })
 }
 
-/// The connection whose event is being handled (stored by the runtime
-/// before it runs effects).
-@external(erlang, "beacon_runtime_ffi", "get_redirect_target")
-fn get_navigation_target() -> Option(Subject(transport.InternalMessage))
+/// The connections to navigate: the one whose event is being handled, or
+/// every connection of the session for effects run outside a client event.
+/// Stored by the runtime before it runs effects; `[]` elsewhere.
+@external(erlang, "beacon_runtime_ffi", "get_navigation_targets")
+fn get_navigation_targets() -> List(Subject(transport.InternalMessage))

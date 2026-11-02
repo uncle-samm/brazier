@@ -1,23 +1,26 @@
 -module(beacon_runtime_ffi).
 -export([
-    store_redirect_target/1, get_redirect_target/0,
+    store_navigation_targets/1, get_navigation_targets/0,
     try_load_codec_encoder/0, try_load_codec_decoder/0,
     try_load_codec_event_decoder/0,
     message_queue_len/1
 ]).
 
-%% Store the navigation target (the connection whose event is being
-%% handled) in the runtime's process dictionary while effects run.
-store_redirect_target(Subject) ->
-    erlang:put(beacon_redirect_target, Subject),
+%% Store the connections that `beacon/router` navigation effects should
+%% navigate in the runtime's process dictionary, before the runtime runs
+%% effects. Overwritten on every effect run, so a stale target never leaks.
+store_navigation_targets(Subjects) when is_list(Subjects) ->
+    erlang:put(beacon_navigation_targets, Subjects),
     nil.
 
-%% Get the navigation target from the process dictionary.
-get_redirect_target() ->
-    case erlang:get(beacon_redirect_target) of
-        undefined -> none;
-        Subject -> {some, Subject}
+%% The stored navigation targets; [] in a process that never stored any
+%% (an effect run outside the runtime, or a spawned effect process).
+get_navigation_targets() ->
+    case erlang:get(beacon_navigation_targets) of
+        undefined -> [];
+        Subjects when is_list(Subjects) -> Subjects
     end.
+
 
 %% The generated beacon_codec:encode_model/1, or {error, nil} when the codec
 %% has not been generated.

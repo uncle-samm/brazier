@@ -1425,7 +1425,33 @@ fn run_effects(
   run_effects_with_context(effects, self, None, dict.new())
 }
 
-/// Execute effects with connection context for targeted sends (redirects).
+/// The connections a `router` navigation effect run now should navigate:
+/// the connection whose event is being handled, or, for effects run outside
+/// a client event (an effect's dispatched message, a notification), every
+/// connection of this session, since they all render the same model.
+fn navigation_targets(
+  conn_id: Option(transport.ConnectionId),
+  connections: Dict(transport.ConnectionId, Subject(transport.InternalMessage)),
+) -> List(Subject(transport.InternalMessage)) {
+  case conn_id {
+    Some(cid) ->
+      case dict.get(connections, cid) {
+        Ok(subject) -> [subject]
+        Error(Nil) -> {
+          log.warning(
+            "beacon.runtime",
+            "Connection "
+              <> cid
+              <> " left before its event's effects ran; navigation effects have no target",
+          )
+          []
+        }
+      }
+    None -> dict.values(connections)
+  }
+}
+
+/// Execute effects with connection context for targeted sends (navigation).
 fn run_effects_with_context(
   effects: Effect(msg),
   self: Subject(RuntimeMessage(msg)),
@@ -1436,28 +1462,7 @@ fn run_effects_with_context(
     True -> []
     False -> {
       log.debug("beacon.runtime", "Executing effects")
-      // Store connection context so redirect can target the right client
-      case conn_id {
-        Some(cid) -> {
-          case dict.get(connections, cid) {
-            Ok(subject) -> store_redirect_target(subject)
-            Error(Nil) -> {
-              log.debug(
-                "beacon.runtime",
-                "Connection " <> cid <> " not found for redirect target storage",
-              )
-              Nil
-            }
-          }
-        }
-        None -> {
-          log.debug(
-            "beacon.runtime",
-            "No connection context for effects (broadcast or init)",
-          )
-          Nil
-        }
-      }
+      store_navigation_targets(navigation_targets(conn_id, connections))
       let dispatch = fn(msg) {
         process.send(self, EffectDispatched(message: msg))
       }
@@ -2104,15 +2109,12 @@ fn receive_with_commands(
   timeout: Int,
 ) -> ListenerReceiveResult
 
-@external(erlang, "beacon_runtime_ffi", "store_redirect_target")
-fn store_redirect_target(
-  subject: process.Subject(transport.InternalMessage),
+/// Record, in the runtime's process dictionary, the connections that
+/// `router` navigation effects run from this process should navigate.
+@external(erlang, "beacon_runtime_ffi", "store_navigation_targets")
+fn store_navigation_targets(
+  subjects: List(process.Subject(transport.InternalMessage)),
 ) -> Nil
-
-@external(erlang, "beacon_runtime_ffi", "get_redirect_target")
-pub fn get_redirect_target() -> option.Option(
-  process.Subject(transport.InternalMessage),
-)
 
 /// Create a signed join token carrying the serialized model, not bound to
 /// any browser session. Prefer `ssr.join_token_for` for request-bound pages.
