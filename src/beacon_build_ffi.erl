@@ -1,7 +1,5 @@
 -module(beacon_build_ffi).
--export([string_to_bytes/1, bytes_to_string/1,
-         run_program/3, absolute_path/1, content_hash/1,
-         exit_failure/1]).
+-export([run_program/3, absolute_path/1, content_hash/1, exit_failure/1]).
 
 %% Run a program without invoking a shell. This prevents build-time command
 %% injection through project paths or path dependencies.
@@ -63,12 +61,3 @@ exit_failure(Reason) ->
 content_hash(Contents) when is_binary(Contents) ->
     Hex = binary:encode_hex(crypto:hash(sha256, Contents), lowercase),
     binary:part(Hex, 0, 16).
-
-%% Convert a binary string to a list of byte values.
-%% Used by the AST extractor to slice source text by byte offsets.
-string_to_bytes(Bin) when is_binary(Bin) ->
-    binary_to_list(Bin).
-
-%% Convert a list of byte values back to a binary string.
-bytes_to_string(Bytes) when is_list(Bytes) ->
-    list_to_binary(Bytes).

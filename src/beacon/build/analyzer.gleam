@@ -8,6 +8,7 @@ import beacon/build/field_type.{type FieldType, type TypeDef}
 import beacon/build/source_location
 import beacon/log
 import glance
+import gleam/bit_array
 import gleam/dict.{type Dict}
 import gleam/int
 import gleam/list
@@ -2271,7 +2272,7 @@ fn extract_client_source_with_update(
   case parse("client module", source) {
     Error(reason) -> Error(reason)
     Ok(module) -> {
-      let source_bytes = string_to_bytes(source)
+      let source_bytes = bit_array.from_string(source)
 
       // Collect all type definitions (Model, Local, Msg, custom types)
       // Exclude Server/ServerState types — private server-side state is never
@@ -2563,20 +2564,14 @@ fn function_references_server_code(func_text: String) -> Bool {
   || string.contains(func_text, "sleep(")
 }
 
-/// Slice a portion of the source using byte offsets from a Span.
-fn slice_source(source_bytes: List(Int), span: glance.Span) -> String {
+/// The source text of a definition. glance spans are byte offsets.
+fn slice_source(source_bytes: BitArray, span: glance.Span) -> String {
   let glance.Span(start: start, end: end) = span
-  source_bytes
-  |> list.drop(start)
-  |> list.take(end - start)
-  |> bytes_to_string()
+  // Invariant: glance parsed exactly these bytes, so its spans lie inside
+  // them and start and end on token boundaries, which are UTF-8 boundaries.
+  let assert Ok(text) =
+    bit_array.slice(source_bytes, start, end - start)
+    |> result.try(bit_array.to_string)
+    as "glance span is not a UTF-8 slice of the parsed source"
+  text
 }
-
-/// Convert a string to a list of byte values.
-/// We need this because Glance Span uses byte offsets, not character offsets.
-@external(erlang, "beacon_build_ffi", "string_to_bytes")
-fn string_to_bytes(s: String) -> List(Int)
-
-/// Convert a list of byte values back to a string.
-@external(erlang, "beacon_build_ffi", "bytes_to_string")
-fn bytes_to_string(bytes: List(Int)) -> String
