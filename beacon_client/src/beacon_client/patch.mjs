@@ -14,6 +14,12 @@
 // Every malformed op, unknown op, invalid pointer or missing target THROWS.
 // Nothing is skipped silently: the caller logs the error and requests a full
 // model sync from the server.
+//
+// The "Wire sync policy" section at the end holds the pure decision rules the
+// browser runtime (beacon_client_ffi.mjs) applies to server messages, close
+// codes and outbound pacing. It lives here because the build bundles only this
+// module, handler.gleam and beacon_client_ffi.mjs, and the rules must be
+// testable without a DOM (beacon_client/test/sync_vectors.mjs).
 
 // Keys that must never be set via patch operations to prevent prototype pollution.
 const UNSAFE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
@@ -365,4 +371,243 @@ function containsUnsafeKey(value) {
     if (UNSAFE_KEYS.has(key) || containsUnsafeKey(value[key])) return true;
   }
   return false;
+}
+
+// === Wire sync policy ===
+//
+// Versioning rule (mirrors the runtime module docs in src/beacon/runtime.gleam):
+// the server keeps ONE revision per runtime. It bumps only when the
+// client-visible model JSON changes and is broadcast. A patch carries the
+// revision it produces, so it applies only on top of revision - 1. A
+// model_sync carries the current revision and replaces the cached model. An
+// empty patch ("[]") is an ack: it carries the current revision and only
+// advances ack_clock. Navigation and joins never bump the revision.
+
+/** Server default for SecurityLimits.max_events_per_second. */
+export const SERVER_MAX_EVENTS_PER_SECOND = 50;
+/** Server limit on events in one event_batch (transport max_batch_size). */
+export const SERVER_MAX_BATCH_SIZE = 100;
+/**
+ * Client send budget per window. Below the server limit so network jitter,
+ * which can compress the arrival times of messages paced on the client, can
+ * not push a server window over SERVER_MAX_EVENTS_PER_SECOND.
+ */
+export const CLIENT_SEND_BUDGET = 40;
+export const CLIENT_SEND_WINDOW_MS = 1000;
+/** Server limit is 2 heartbeats per second; keep at most one per 500ms. */
+export const HEARTBEAT_MIN_INTERVAL_MS = 500;
+export const RECONNECT_BASE_MS = 1000;
+export const RECONNECT_MAX_MS = 30000;
+export const RECONNECT_JITTER_MS = 1000;
+/** Close code for a revoked session or expired authentication. */
+export const CLOSE_AUTH_REVOKED = 4401;
+
+function isRevision(value) {
+  return Number.isSafeInteger(value) && value >= 0;
+}
+
+/**
+ * Decide what to do with a model_sync.
+ * state = { version, synced } where synced is false until the first
+ * model_sync of the current connection has been applied.
+ * Returns "invalid" | "stale" | "apply".
+ */
+export function classifyModelSync(state, version) {
+  if (!isRevision(version)) return "invalid";
+  if (state.synced && version < state.version) return "stale";
+  return "apply";
+}
+
+/**
+ * Decide what to do with a patch carrying `opsCount` ops at `version`.
+ * Returns "invalid" | "gap" | "stale" | "ack" | "apply".
+ *   gap   - the patch does not build on the cached revision: request a resync
+ *   stale - already covered by the cached revision: ignore
+ *   ack   - empty patch at the cached revision: advance ack_clock only
+ *   apply - patch builds exactly on the cached revision
+ */
+export function classifyPatch(state, version, opsCount) {
+  if (!isRevision(version) || !Number.isSafeInteger(opsCount) || opsCount < 0) {
+    return "invalid";
+  }
+  if (!state.synced) return "gap";
+  if (opsCount === 0) {
+    if (version === state.version) return "ack";
+    return version < state.version ? "stale" : "gap";
+  }
+  if (version === state.version + 1) return "apply";
+  return version <= state.version ? "stale" : "gap";
+}
+
+/** "stop" for 4401 (do not reconnect with this session), else "reconnect". */
+export function closeAction(code) {
+  return code === CLOSE_AUTH_REVOKED ? "stop" : "reconnect";
+}
+
+/** Exponential backoff with jitter. `random01` is in [0, 1). */
+export function reconnectDelayMs(attempts, random01) {
+  if (!Number.isSafeInteger(attempts) || attempts < 0) {
+    throw new Error("reconnectDelayMs: attempts must be a non-negative integer, got " + attempts);
+  }
+  if (typeof random01 !== "number" || !(random01 >= 0 && random01 < 1)) {
+    throw new Error("reconnectDelayMs: random01 must be in [0, 1), got " + random01);
+  }
+  const base = Math.min(RECONNECT_BASE_MS * Math.pow(2, Math.min(attempts, 30)), RECONNECT_MAX_MS);
+  return base + Math.floor(random01 * RECONNECT_JITTER_MS);
+}
+
+/** True when a heartbeat may be sent at `now` given the previous one at `lastAt`. */
+export function heartbeatAllowed(lastAt, now) {
+  return lastAt === null || now - lastAt >= HEARTBEAT_MIN_INTERVAL_MS;
+}
+
+/** Cost of an outbound message as the server rate limiter counts it. */
+export function messageCost(msg) {
+  if (msg.type === "heartbeat") return 0;
+  if (msg.type === "event_batch") return Math.max(msg.events.length, 1);
+  return 1;
+}
+
+/**
+ * Split an event_batch into batches the server can accept: each at most
+ * `maxPerBatch` events, order preserved. An empty batch is returned as is.
+ */
+export function splitEventBatch(msg, maxPerBatch) {
+  if (msg.type !== "event_batch" || !Array.isArray(msg.events)) {
+    throw new Error("splitEventBatch: expected an event_batch with an events array");
+  }
+  if (!Number.isSafeInteger(maxPerBatch) || maxPerBatch < 1 || maxPerBatch > SERVER_MAX_BATCH_SIZE) {
+    throw new Error("splitEventBatch: maxPerBatch must be in 1.." + SERVER_MAX_BATCH_SIZE + ", got " + maxPerBatch);
+  }
+  if (msg.events.length <= maxPerBatch) return [msg];
+  const batches = [];
+  for (let i = 0; i < msg.events.length; i += maxPerBatch) {
+    batches.push({ ...msg, events: msg.events.slice(i, i + maxPerBatch) });
+  }
+  return batches;
+}
+
+/**
+ * Sliding-window send budget: at most `limit` cost units in any `windowMs`.
+ * Time must be monotonic (performance.now()); a clock that moves backwards
+ * is an invariant violation and throws.
+ */
+export class SendBudget {
+  constructor(limit, windowMs) {
+    if (!Number.isSafeInteger(limit) || limit < 1) throw new Error("SendBudget: limit must be >= 1");
+    if (!(windowMs > 0)) throw new Error("SendBudget: windowMs must be > 0");
+    this.limit = limit;
+    this.windowMs = windowMs;
+    this.entries = [];
+    this.used = 0;
+    this.lastNow = -Infinity;
+  }
+
+  prune(now) {
+    if (now < this.lastNow) {
+      throw new Error("SendBudget: clock moved backwards (" + now + " < " + this.lastNow + ")");
+    }
+    this.lastNow = now;
+    while (this.entries.length > 0 && now - this.entries[0].at >= this.windowMs) {
+      this.used -= this.entries.shift().cost;
+    }
+  }
+
+  assertCost(cost) {
+    if (!Number.isSafeInteger(cost) || cost < 1 || cost > this.limit) {
+      throw new Error("SendBudget: cost must be in 1.." + this.limit + ", got " + cost);
+    }
+  }
+
+  /** Take `cost` units at `now` if they fit. */
+  tryTake(now, cost) {
+    this.assertCost(cost);
+    this.prune(now);
+    if (this.used + cost > this.limit) return false;
+    this.entries.push({ at: now, cost });
+    this.used += cost;
+    return true;
+  }
+
+  /** Milliseconds until `cost` units fit (0 when they fit now). */
+  msUntilAvailable(now, cost) {
+    this.assertCost(cost);
+    this.prune(now);
+    let used = this.used;
+    for (let i = 0; used + cost > this.limit; i++) {
+      used -= this.entries[i].cost;
+      if (used + cost <= this.limit) return Math.max(this.entries[i].at + this.windowMs - now, 1);
+    }
+    return 0;
+  }
+}
+
+/**
+ * Outbound queue paced by a SendBudget. Nothing is dropped silently: push
+ * returns false when the queue is full so the caller can log and resync.
+ * Items are { msg, cost, priority }. Priority items (request_sync) go ahead
+ * of every non-priority item, after earlier priority items.
+ */
+export class PacedQueue {
+  constructor(budget, maxQueued) {
+    if (!Number.isSafeInteger(maxQueued) || maxQueued < 1) throw new Error("PacedQueue: maxQueued must be >= 1");
+    this.budget = budget;
+    this.maxQueued = maxQueued;
+    this.items = [];
+  }
+
+  get length() {
+    return this.items.length;
+  }
+
+  /** Replace the budget, e.g. for a new connection with a fresh server window. */
+  setBudget(budget) {
+    for (const item of this.items) budget.assertCost(item.cost);
+    this.budget = budget;
+  }
+
+  push(msg, cost, priority) {
+    this.budget.assertCost(cost);
+    if (this.items.length >= this.maxQueued) return false;
+    const item = { msg, cost, priority: priority === true };
+    if (item.priority) {
+      let at = 0;
+      while (at < this.items.length && this.items[at].priority) at++;
+      this.items.splice(at, 0, item);
+    } else {
+      this.items.push(item);
+    }
+    return true;
+  }
+
+  /** Remove every item for which `pred(msg)` is true; returns how many. */
+  removeWhere(pred) {
+    const before = this.items.length;
+    this.items = this.items.filter((item) => !pred(item.msg));
+    return before - this.items.length;
+  }
+
+  /**
+   * Send queued items in order while `canSend(msg)` holds and the budget
+   * allows. `sendFn(msg)` returns true when the message was written; false
+   * keeps it at the head. Returns { sent, waitMs } where waitMs > 0 means the
+   * head is waiting for budget and the caller should pump again after it.
+   */
+  pump(now, canSend, sendFn) {
+    let sent = 0;
+    while (this.items.length > 0) {
+      const head = this.items[0];
+      if (!canSend(head.msg)) return { sent, waitMs: 0 };
+      if (!this.budget.tryTake(now, head.cost)) {
+        return { sent, waitMs: this.budget.msUntilAvailable(now, head.cost) };
+      }
+      if (!sendFn(head.msg)) {
+        // The spent budget is not refunded: pacing stays conservative.
+        return { sent, waitMs: 0 };
+      }
+      this.items.shift();
+      sent++;
+    }
+    return { sent, waitMs: 0 };
+  }
 }

@@ -14,6 +14,7 @@ import beacon/runtime
 import beacon/transport
 import gleam/erlang/process.{type Subject}
 import gleam/int
+import gleam/json
 import gleam/list
 import gleam/option.{None, Some}
 import gleam/pair
@@ -659,4 +660,172 @@ pub fn snapshot_diff_without_usable_cache_is_resync_test() {
     runtime.encode_snapshot(model_json, other_codecs, Model(0, "", ""))
   let assert runtime.Resync = runtime.diff_snapshot(sub, other)
   let assert runtime.Unchanged = runtime.diff_snapshot(full, full)
+}
+
+// --- client replay of server frames (server and client versioning agree) ---
+
+@external(erlang, "beacon_patch_test_ffi", "run_node")
+fn run_node(script: String, arg: String) -> Result(String, String)
+
+@external(erlang, "beacon_patch_test_ffi", "write_file")
+fn write_file(path: String, contents: String) -> Result(Nil, String)
+
+@external(erlang, "beacon_patch_test_ffi", "scratch_path")
+fn scratch_path(name: String) -> String
+
+/// Wire JSON of a state message, exactly as the transport sends it.
+fn wire(message: transport.InternalMessage) -> String {
+  case message {
+    transport.SendModelSync(model_json:, version:, ack_clock:) ->
+      transport.encode_server_message(transport.ServerModelSync(
+        model_json:,
+        version:,
+        ack_clock:,
+      ))
+    transport.SendPatch(ops_json:, version:, ack_clock:) ->
+      transport.encode_server_message(transport.ServerPatch(
+        ops_json:,
+        version:,
+        ack_clock:,
+      ))
+    other -> panic as { "not a state message: " <> string.inspect(other) }
+  }
+}
+
+/// Drive one session through every revision rule and record, in order, the
+/// state frames connection "a" receives. Returns the frames plus the final
+/// barrier model_sync (model JSON and revision), which is not in the frames.
+fn record_session() -> #(List(String), String, Int) {
+  let proof = process.new_subject()
+  let assert Ok(rt) = runtime.start(route_config(proof))
+  let a = join(rt, "a", "/")
+  let assert Ok("/") = process.receive(proof, 1000)
+  let f0 = next(a)
+  let assert transport.SendModelSync(version: 0, ..) = f0
+  let b = join(rt, "b", "/")
+  let assert transport.SendModelSync(version: 0, ..) = next(b)
+
+  // Own change, own unchanged event (ack), another connection's change.
+  event(rt, "a", "inc", 1)
+  let f1 = next(a)
+  let assert transport.SendPatch(version: 1, ack_clock: 1, ..) = f1
+  let assert transport.SendPatch(version: 1, ..) = next(b)
+  event(rt, "a", "noop", 2)
+  let f2 = next(a)
+  let assert transport.SendPatch(ops_json: "[]", version: 1, ack_clock: 2) = f2
+  event(rt, "b", "inc", 1)
+  let f3 = next(a)
+  let assert transport.SendPatch(version: 2, ack_clock: 2, ..) = f3
+  let assert transport.SendPatch(version: 2, ..) = next(b)
+
+  // Navigation that changes the model, then one that does not.
+  process.send(rt, runtime.ClientNavigated(conn_id: "a", path: "/a"))
+  let assert Ok("/a") = process.receive(proof, 1000)
+  let f4 = next(a)
+  let assert transport.SendPatch(version: 3, ..) = f4
+  let assert transport.SendPatch(version: 3, ..) = next(b)
+  process.send(rt, runtime.ClientNavigated(conn_id: "a", path: "/a"))
+  let assert Ok("/a") = process.receive(proof, 1000)
+
+  // A failing event: error (not a state frame), then an ack.
+  event(rt, "a", "bogus", 3)
+  let assert transport.SendError(..) = next(a)
+  let f5 = next(a)
+  let assert transport.SendPatch(ops_json: "[]", version: 3, ack_clock: 3) = f5
+
+  // Rejoin: full resync at the current revision.
+  process.send(rt, runtime.ClientJoined(conn_id: "a", token: "", path: "/a"))
+  let f6 = next(a)
+  let assert transport.SendModelSync(version: 3, ack_clock: 3, ..) = f6
+
+  // A join on another route changes the model for everyone already joined.
+  let c = join(rt, "c", "/")
+  let assert Ok("/") = process.receive(proof, 1000)
+  let assert transport.SendModelSync(version: 4, ..) = next(c)
+  let f7 = next(a)
+  let assert transport.SendPatch(version: 4, ..) = f7
+
+  // A batch with a change and an unchanged event: one revision.
+  process.send(
+    rt,
+    runtime.ClientEventBatchReceived(conn_id: "a", events: [
+      #("click", "inc", "{}", "0", 4, ""),
+      #("click", "noop", "{}", "0", 5, ""),
+      #("click", "inc", "{}", "0", 6, ""),
+    ]),
+  )
+  let f8 = next(a)
+  let assert transport.SendPatch(version: 5, ack_clock: 6, ..) = f8
+
+  let assert transport.SendModelSync(model_json: final_json, version: 5, ..) =
+    barrier(rt, "a", a)
+  let frames = list.map([f0, f1, f2, f3, f4, f5, f6, f7, f8], wire)
+  #(frames, final_json, 5)
+}
+
+fn replay_on_client(
+  name: String,
+  frames: List(String),
+  final_json: String,
+  final_version: Int,
+) -> Result(String, String) {
+  let contents =
+    json.object([
+      #("messages", json.array(frames, json.string)),
+      #("final_model", json.string(final_json)),
+      #("final_version", json.int(final_version)),
+    ])
+    |> json.to_string
+  let path = scratch_path(name)
+  let assert Ok(Nil) = write_file(path, contents)
+  run_node("beacon_client/test/sync_vectors.mjs", path)
+}
+
+pub fn client_replay_detects_a_missing_patch_test() {
+  let #(frames, final_json, final_version) = record_session()
+  // Drop the first patch (revision 1): the next patch is a gap.
+  let assert [f0, _f1, ..rest] = frames
+  let assert Error(output) =
+    replay_on_client("sync_gap.json", [f0, ..rest], final_json, final_version)
+  let assert True = string.contains(output, "verdict gap")
+}
+
+pub fn client_replay_detects_a_duplicated_patch_test() {
+  let #(frames, final_json, final_version) = record_session()
+  let assert [f0, f1, ..rest] = frames
+  let assert Error(output) =
+    replay_on_client(
+      "sync_dup.json",
+      [f0, f1, f1, ..rest],
+      final_json,
+      final_version,
+    )
+  let assert True = string.contains(output, "verdict stale")
+}
+
+pub fn client_replay_detects_a_wrong_final_model_test() {
+  let #(frames, _final_json, final_version) = record_session()
+  let assert Error(output) =
+    replay_on_client(
+      "sync_final.json",
+      frames,
+      "{\"count\":-1,\"blob\":\"\",\"path\":\"/\"}",
+      final_version,
+    )
+  let assert True = string.contains(output, "final model_sync")
+}
+
+pub fn client_replay_of_server_frames_matches_final_sync_test() {
+  let #(frames, final_json, final_version) = record_session()
+  let assert Ok(output) =
+    replay_on_client("sync_ok.json", frames, final_json, final_version)
+  let assert True = string.contains(output, "9 replayed frames")
+}
+
+/// The browser runtime itself (close codes, backoff, heartbeats, outbound
+/// pacing, server errors, revision handling) driven by a fake socket and
+/// clock. The harness exits non-zero on any failed scenario.
+pub fn client_runtime_behaviour_harness_test() {
+  let assert Ok(output) = run_node("beacon_client/test/ffi_harness.mjs", "")
+  let assert True = string.contains(output, "ffi harness ok: 11 scenarios")
 }
