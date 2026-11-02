@@ -2528,10 +2528,10 @@ fn serve_page_or_ssr(
   req: Request(Connection),
 ) -> response.Response(ResponseBody) {
   case ssr_factory {
-    option.Some(factory) -> page_response(factory(req, req.path))
+    option.Some(factory) -> page_response(factory(req, req.path), req)
     option.None ->
       case page_html {
-        option.Some(rendered) -> page_response(rendered)
+        option.Some(rendered) -> page_response(rendered, req)
         option.None ->
           case default_page_html() {
             Ok(html) ->
@@ -2598,15 +2598,23 @@ fn get_client_js_filename(assets_dir: String) -> Result(String, String) {
   }
 }
 
-/// The SSR page response. A session cookie that cannot be set is a server
-/// bug: answer 500 rather than a page without its session.
-fn page_response(page: ssr.RenderedPage) -> response.Response(ResponseBody) {
-  case ssr.to_response(page) {
+/// The SSR page response. Its join token is bound to the request's
+/// session cookie (`ssr.to_response_for_request`), so a token lifted from
+/// one browser session does not join under another. A join cookie that
+/// cannot be set is a server bug: answer 500 rather than a page without it.
+fn page_response(
+  page: ssr.RenderedPage,
+  req: Request(Connection),
+) -> response.Response(ResponseBody) {
+  case ssr.to_response_for_request(page, req) {
     Ok(resp) -> resp
     Error(error) -> {
       log.error(
         "beacon.transport",
-        "Cannot set the SSR session cookie: " <> cookie.error_to_string(error),
+        "Cannot set the SSR join cookie for "
+          <> req.path
+          <> ": "
+          <> cookie.error_to_string(error),
       )
       response.new(500)
       |> response.set_header("content-type", "text/plain; charset=utf-8")
