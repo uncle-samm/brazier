@@ -10,7 +10,6 @@
 /// 6. Every file must be readable and parse; failures are violations
 ///
 /// Reference: CLAUDE.md engineering principles, TigerBeetle approach.
-import beacon/build/analyzer
 import beacon/build/source_location
 import beacon/log
 import glance
@@ -164,8 +163,6 @@ pub fn lint_source(file_path: String, source: String) -> List(Violation) {
         check_no_discarded_results(file_path, source, module)
       let degraded_path_violations =
         check_no_degraded_path_phrases(file_path, source)
-      let update_contract_violations =
-        check_client_update_contract(file_path, source, module)
       let deprecated_route_violations =
         check_deprecated_route_api(file_path, source)
       list.append(
@@ -173,10 +170,7 @@ pub fn lint_source(file_path: String, source: String) -> List(Violation) {
           list.append(todo_violations, logging_violations),
           degraded_path_violations,
         ),
-        list.append(
-          list.append(update_contract_violations, deprecated_route_violations),
-          discard_violations,
-        ),
+        list.append(deprecated_route_violations, discard_violations),
       )
     }
     Error(err) -> {
@@ -394,49 +388,6 @@ fn check_deprecated_route_api(
         }
       })
     }
-  }
-}
-
-/// Check app/example code for client-visible update hazards.
-fn check_client_update_contract(
-  file_path: String,
-  source: String,
-  module: glance.Module,
-) -> List(Violation) {
-  let is_app_code =
-    string.starts_with(file_path, "examples/")
-    || string.contains(file_path, "/examples/")
-    || string.starts_with(file_path, "src/beacon/examples/")
-  case is_app_code || string.contains(source, "pub type Msg") {
-    False -> []
-    True -> {
-      analyzer.client_update_purity_errors(module)
-      |> list.map(fn(err) {
-        Violation(
-          file: file_path,
-          location: "module",
-          rule: "client-update-purity",
-          message: client_update_error_message(err),
-        )
-      })
-    }
-  }
-}
-
-fn client_update_error_message(err: analyzer.PurityError) -> String {
-  case err {
-    analyzer.UpdateSideEffect(call) ->
-      "Client-visible update calls `" <> call <> "`; move this to on_update."
-    analyzer.CapturedUpdateFactory(name) ->
-      "Client-visible "
-      <> name
-      <> "(...) captures server state; use pure update plus on_update."
-    analyzer.ServerImport(module_path) ->
-      "Client-visible module imports server-only `" <> module_path <> "`."
-    analyzer.ErlangExternal(function_name) ->
-      "Client-visible function `"
-      <> function_name
-      <> "` uses Erlang FFI; move this to on_update."
   }
 }
 

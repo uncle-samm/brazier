@@ -11,8 +11,8 @@
 ///
 /// 1. Finds the app module (see `beacon/build/discovery`) and the user
 ///    modules it uses (`beacon/build/sources`).
-/// 2. Analyzes them (`beacon/build/analyzer`) and checks the app has a shape
-///    the generated code supports (`beacon/build/shape`).
+/// 2. Analyzes them (`beacon/build/analyzer`): the app constructor call, the
+///    code that reaches the browser, and the Model and Msg codecs.
 /// 3. Writes `build/beacon_contract.json` (`beacon/build/contract`).
 /// 4. Generates `src/beacon_codec.gleam` (`beacon/build/server_codec`) and
 ///    compiles the project with `gleam build`.
@@ -31,11 +31,11 @@ import beacon/build/files
 import beacon/build/program
 import beacon/build/project_toml
 import beacon/build/server_codec
-import beacon/build/shape
 import beacon/build/sources
 import beacon/log
 import gleam/list
 import gleam/result
+import gleam/set
 import gleam/string
 
 /// What to build.
@@ -115,17 +115,11 @@ pub fn build(project: String, target: Target) -> Result(Built, String) {
     "Building " <> app.path <> " (" <> app.module_path <> ")",
   )
   use analysis <- result.try(analyze(src_dir, app))
-  use client <- result.try(shape.check(analysis, app.source))
-  use Nil <- result.try(contract.write(
-    project,
-    app.path,
-    app.module_path,
-    analysis,
-  ))
-  use codec_path <- result.try(write_codec(project, src_dir, app, analysis))
+  use Nil <- result.try(contract.write(project, app.path, analysis))
+  use codec_path <- result.try(write_codec(project, src_dir, analysis))
   use Nil <- result.try(compile(project, config.name, codec_path))
   use bundle <- result.try(
-    client_bundle.build(project, src_dir, beacon_root, app, analysis, client)
+    client_bundle.build(project, src_dir, beacon_root, app, analysis)
     |> result.try_recover(fn(reason) { remove_manifest(project, reason) }),
   )
   Ok(Built(app:, codec_path:, bundle:))
@@ -155,26 +149,24 @@ fn find_app(
 fn analyze(src_dir: String, app: AppModule) -> Result(Analysis, String) {
   use externals <- result.try(sources.app_externals(src_dir, app))
   use analysis <- result.try(
-    analyzer.analyze_multi(app.source, externals)
+    analyzer.analyze(app.module_path, [
+      #(app.module_path, app.source),
+      ..externals
+    ])
     |> result.map_error(fn(reason) {
       "Analysis of " <> app.path <> " failed: " <> reason
     }),
   )
-  list.each(analyzer.state_diagnostics(analysis), log.info("beacon.build", _))
-  list.each(analyzer.client_contract_report(analysis), log.info(
+  log.info(
     "beacon.build",
-    _,
-  ))
-  log.info("beacon.build", analyzer.client_contract_summary(analysis))
-  list.each(analysis.msg_variants, fn(variant) {
-    log.info(
-      "beacon.build",
-      "  "
-        <> variant.name
-        <> " -> "
-        <> analyzer.msg_impact_label(analyzer.msg_impact(variant)),
-    )
-  })
+    "Analyzed "
+      <> app.module_path
+      <> ": "
+      <> string.inspect(list.length(analysis.client))
+      <> " client modules, "
+      <> string.inspect(set.size(analysis.codecs.allowed))
+      <> " client-built constructors",
+  )
   Ok(analysis)
 }
 
@@ -185,10 +177,9 @@ fn analyze(src_dir: String, app: AppModule) -> Result(Analysis, String) {
 fn write_codec(
   project: String,
   src_dir: String,
-  app: AppModule,
   analysis: Analysis,
 ) -> Result(String, String) {
-  use codec <- result.try(server_codec.generate(analysis, app.module_path))
+  use codec <- result.try(server_codec.generate(analysis))
   let staged = files.join(project, "build/beacon_codegen/" <> codec_file)
   use Nil <- result.try(files.write(staged, codec))
   use _output <- result.try(

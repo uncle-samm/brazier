@@ -267,49 +267,6 @@ pub fn note() -> String {
   let assert "no-degraded-path-phrases" = v.rule
 }
 
-pub fn update_side_effect_in_example_is_violation_test() {
-  let source =
-    "
-import beacon/store
-
-pub type Model { Model(count: Int) }
-pub type Msg { Save }
-pub fn update(model: Model, msg: Msg) -> Model {
-  case msg {
-    Save -> {
-      store.put(store.new(\"bad\"), \"count\", model.count)
-      model
-    }
-  }
-}
-pub fn view(model: Model) { model }
-"
-  let violations = lint.lint_source("examples/bad/src/bad.gleam", source)
-  let assert 2 = list.length(violations)
-  let assert Ok(v) =
-    list.find(violations, fn(v) { str_contains(v.message, "store.put") })
-  let assert "client-update-purity" = v.rule
-  let assert True = str_contains(v.message, "move this to on_update")
-}
-
-pub fn captured_make_update_in_example_is_violation_test() {
-  let source =
-    "
-pub type Model { Model(count: Int) }
-pub type Msg { Inc }
-pub fn make_update(shared: Int) -> fn(Model, Msg) -> Model {
-  fn(model: Model, msg: Msg) {
-    case msg { Inc -> Model(count: model.count + shared) }
-  }
-}
-pub fn view(model: Model) { model }
-"
-  let violations = lint.lint_source("examples/bad/src/bad.gleam", source)
-  let assert [v] = violations
-  let assert "client-update-purity" = v.rule
-  let assert True = str_contains(v.message, "make_update")
-}
-
 pub fn low_level_route_api_in_example_is_violation_test() {
   let source =
     "

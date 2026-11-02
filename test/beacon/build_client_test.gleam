@@ -1,12 +1,11 @@
-/// Tests for the client-side build pieces: the generated `beacon` and
-/// `beacon/log` shims, app module discovery, and bundle publishing.
+/// Tests for the client-side build pieces: the generated `beacon/log` shim,
+/// app module discovery, and bundle publishing.
 import beacon/build/client_bundle
 import beacon/build/client_shim
 import beacon/build/discovery
 import glance
 import gleam/dict
 import gleam/list
-import gleam/option.{Some}
 import gleam/set
 import gleam/string
 import simplifile
@@ -49,52 +48,6 @@ fn parse_file(path: String) -> glance.Module {
   module
 }
 
-// --- client beacon shim ------------------------------------------------------
-
-pub fn shim_has_every_public_view_helper_test() {
-  // Independently of client_shim's own filter: every public function of the
-  // server `beacon` module whose return type is Attr or Node.
-  let server = parse_file("src/beacon.gleam")
-  let view_helpers =
-    server.functions
-    |> list.filter(fn(def) {
-      def.definition.publicity == glance.Public
-      && case def.definition.return {
-        Some(glance.NamedType(name: "Attr", ..))
-        | Some(glance.NamedType(name: "Node", ..)) -> True
-        _ -> False
-      }
-    })
-    |> list.map(fn(def) {
-      #(def.definition.name, list.length(def.definition.parameters))
-    })
-  let assert Ok(shim_source) = client_shim.beacon_module(".")
-  let assert Ok(shim) = glance.module(shim_source)
-  let shim_functions = public_functions(shim)
-  let missing =
-    list.filter(view_helpers, fn(helper) {
-      dict.get(shim_functions, helper.0) != Ok(helper.1)
-    })
-  let assert [] = missing
-  // The helpers the hand-written shim used to miss are present.
-  let assert Ok(1) = dict.get(shim_functions, "on_focus")
-  let assert Ok(1) = dict.get(shim_functions, "on_blur")
-  let assert Ok(2) = dict.get(shim_functions, "on_input_debounced")
-  // The shim adds nothing the server module does not have.
-  let assert True =
-    list.length(view_helpers) == dict.size(shim_functions)
-    && list.length(view_helpers) >= 18
-}
-
-pub fn shim_defines_node_alias_test() {
-  let assert Ok(shim_source) = client_shim.beacon_module(".")
-  let assert Ok(shim) = glance.module(shim_source)
-  let assert True =
-    list.any(shim.type_aliases, fn(def) {
-      def.definition.name == "Node" && def.definition.publicity == glance.Public
-    })
-}
-
 pub fn log_shim_matches_server_log_api_test() {
   let server = public_functions(parse_file("src/beacon/log.gleam"))
   let assert Ok(shim) = glance.module(client_shim.log_module)
@@ -108,68 +61,9 @@ pub fn log_shim_matches_server_log_api_test() {
   let assert True = dict.size(expected) == 4
 }
 
-pub fn shim_rejects_helper_using_other_module_test() {
-  let source =
-    "import beacon/element.{type Attr}
-import gleam/int
-
-pub fn bad_count(n: Int) -> Attr {
-  element.attr(\"data-count\", int.to_string(n))
-}
-"
-  let assert Error(reason) = client_shim.helpers("fake/beacon.gleam", source)
-  let assert True = string.contains(reason, "`beacon.bad_count`")
-  let assert True = string.contains(reason, "fake/beacon.gleam")
-  let assert True = string.contains(reason, "it uses int.")
-}
-
-pub fn shim_rejects_helper_using_unknown_function_test() {
-  let source =
-    "import beacon/element.{type Attr}
-
-pub fn bad_secret() -> Attr {
-  element.attr(\"data-secret\", read_secret())
-}
-
-fn read_secret() -> String {
-  \"x\"
-}
-"
-  let assert Error(reason) = client_shim.helpers("fake/beacon.gleam", source)
-  let assert True = string.contains(reason, "`beacon.bad_secret`")
-  let assert True = string.contains(reason, "read_secret")
-}
-
-pub fn shim_allows_helpers_calling_helpers_test() {
-  let source =
-    "import beacon/element.{type Attr}
-
-/// Doc comments are kept out of the copied source.
-pub fn first(name: String) -> Attr {
-  let value = string.lowercase(name)
-  element.attr(\"data-first\", value)
-}
-
-pub fn second() -> Attr {
-  first(\"X\")
-}
-
-pub fn not_a_helper() -> Int {
-  1
-}
-"
-  let assert Ok([first, second]) =
-    client_shim.helpers("fake/beacon.gleam", source)
-  let assert client_shim.Helper(name: "first", arity: 1, source: first_source) =
-    first
-  let assert True = string.starts_with(first_source, "pub fn first(")
-  let assert True = string.ends_with(first_source, "}")
-  let assert client_shim.Helper(name: "second", arity: 0, ..) = second
-}
-
 // --- discovery ---------------------------------------------------------------
 
-/// A module that defines a complete app. It only needs to parse.
+/// The parts of an app module other than `main`. It only needs to parse.
 const app_body =
   "
 pub type Model {
@@ -178,6 +72,10 @@ pub type Model {
 
 pub type Msg {
   Increment
+}
+
+pub fn init(_ctx) {
+  Model(0)
 }
 
 pub fn update(model, _msg) {
@@ -193,7 +91,7 @@ pub fn discovery_aliased_import_test() {
   let dir = fresh_dir("aliased")
   write(
     dir,
-    "a_helper_app.gleam",
+    "a_helper.gleam",
     "import beacon as b\n" <> app_body <> "pub fn other() { b.title }\n",
   )
   write(
@@ -201,7 +99,7 @@ pub fn discovery_aliased_import_test() {
     "main_app.gleam",
     "import beacon as b\n"
       <> app_body
-      <> "pub fn main() { b.app(1, 2, 3, update, view) |> b.start(8080) }\n",
+      <> "pub fn main() { b.simple(init, update, view) |> b.start(8080) }\n",
   )
   let assert Ok(app) = discovery.find(dir)
   let assert True = app.path == dir <> "/main_app.gleam"
@@ -214,26 +112,51 @@ pub fn discovery_unqualified_import_test() {
   write(
     dir,
     "web/app.gleam",
-    "import beacon.{app}\n"
+    "import beacon.{application}\n"
       <> app_body
-      <> "pub fn main() { app(1, 2, 3, update, view) }\n",
+      <> "pub fn main() { application(init:, update:, view:) }\n",
   )
   let assert Ok(app) = discovery.find(dir)
   let assert "web/app" = app.module_path
 }
 
-pub fn discovery_unqualified_alias_import_test() {
-  let dir = fresh_dir("unqualified_alias")
-  write(dir, "other.gleam", app_body)
+pub fn discovery_follows_main_into_helpers_test() {
+  let dir = fresh_dir("helper_call")
   write(
     dir,
     "app.gleam",
-    "import beacon.{start as serve}\n"
+    "import beacon.{full_application as full}\n"
       <> app_body
-      <> "pub fn main() { serve(1, 8080) }\n",
+      <> "fn build() { full(init, update, Nil, Nil, view) }\npub fn main() { build() }\n",
   )
   let assert Ok(app) = discovery.find(dir)
   let assert "app" = app.module_path
+}
+
+pub fn discovery_ignores_calls_main_does_not_reach_test() {
+  let dir = fresh_dir("unreached_call")
+  write(
+    dir,
+    "app.gleam",
+    "import beacon\n"
+      <> app_body
+      <> "pub fn app() { beacon.simple(init, update, view) }\npub fn main() { Nil }\n",
+  )
+  let assert Error(reason) = discovery.find(dir)
+  let assert True = string.contains(reason, "No app module found in " <> dir)
+}
+
+pub fn discovery_ignores_private_main_test() {
+  let dir = fresh_dir("private_main")
+  write(
+    dir,
+    "app.gleam",
+    "import beacon\n"
+      <> app_body
+      <> "fn main() { beacon.simple(init, update, view) }\n",
+  )
+  let assert Error(reason) = discovery.find(dir)
+  let assert True = string.contains(reason, "No app module found")
 }
 
 pub fn discovery_ignores_entrypoint_in_comments_and_strings_test() {
@@ -241,73 +164,54 @@ pub fn discovery_ignores_entrypoint_in_comments_and_strings_test() {
   write(
     dir,
     "a.gleam",
-    "import beacon\n// beacon.start(8080)\n"
+    "import beacon\n// pub fn main() { beacon.simple(init, update, view) }\n"
       <> app_body
-      <> "pub const doc = \"beacon.app(init) |> beacon.start(8080)\"\n",
+      <> "pub const doc = \"beacon.simple(init, update, view)\"\npub fn main() { doc }\n",
   )
-  write(dir, "b.gleam", app_body)
+  let assert Error(reason) = discovery.find(dir)
+  let assert True = string.contains(reason, "No app module found in " <> dir)
+}
+
+pub fn discovery_ignores_other_modules_named_beacon_test() {
+  // `simple` from a module other than `beacon` is not an app constructor.
+  let dir = fresh_dir("other_simple")
+  write(
+    dir,
+    "app.gleam",
+    "import beacon_extra\n"
+      <> app_body
+      <> "pub fn main() { beacon_extra.simple(init, update, view) }\n",
+  )
+  let assert Error(_) = discovery.find(dir)
+}
+
+pub fn discovery_several_apps_is_an_error_test() {
+  let dir = fresh_dir("several")
+  let main =
+    "import beacon\n"
+    <> app_body
+    <> "pub fn main() { beacon.simple(init, update, view) }\n"
+  write(dir, "a.gleam", main)
+  write(dir, "b.gleam", main)
   let assert Error(reason) = discovery.find(dir)
   let assert True = string.contains(reason, "Several modules")
   let assert True = string.contains(reason, dir <> "/a.gleam")
   let assert True = string.contains(reason, dir <> "/b.gleam")
 }
 
-pub fn discovery_ignores_definitions_in_comments_test() {
-  let dir = fresh_dir("comment_definitions")
-  write(
-    dir,
-    "notes.gleam",
-    "// pub type Model { Model }
-// pub type Msg { Msg }
-// pub fn update(model, msg) { model }
-// pub fn view(model) { model }
-pub const doc = \"pub type Model pub type Msg pub fn update pub fn view\"
-",
-  )
-  let assert Error(reason) = discovery.find(dir)
-  let assert True = string.contains(reason, "No app module found in " <> dir)
-  write(dir, "app.gleam", app_body)
-  let assert Ok(app) = discovery.find(dir)
-  let assert "app" = app.module_path
-}
-
 pub fn discovery_skips_codec_and_framework_modules_test() {
   let dir = fresh_dir("skips")
-  write(dir, "beacon_codec.gleam", app_body)
-  write(dir, "beacon/vendored.gleam", app_body)
-  write(dir, "beacon.gleam", app_body)
-  write(dir, "beacon_extra/app.gleam", app_body)
+  let main =
+    "import beacon\n"
+    <> app_body
+    <> "pub fn main() { beacon.simple(init, update, view) }\n"
+  write(dir, "beacon_codec.gleam", main)
+  write(dir, "beacon/vendored.gleam", main)
+  write(dir, "beacon.gleam", main)
+  write(dir, "beacon_extra/app.gleam", main)
   let assert Ok(app) = discovery.find(dir)
   // beacon_extra is not Beacon's package; only `beacon` and `beacon/*` are.
   let assert "beacon_extra/app" = app.module_path
-}
-
-pub fn discovery_requires_update_or_make_update_test() {
-  let dir = fresh_dir("no_update")
-  write(
-    dir,
-    "app.gleam",
-    "pub type Model { Model }\npub type Msg { Msg }\npub fn view(m) { m }\n",
-  )
-  let assert Error(reason) = discovery.find(dir)
-  let assert True = string.contains(reason, "No app module found")
-  write(
-    dir,
-    "app.gleam",
-    "pub type Model { Model }\npub type Msg { Msg }\npub fn view(m) { m }\npub fn make_update(x) { x }\n",
-  )
-  let assert Ok(_) = discovery.find(dir)
-}
-
-pub fn discovery_private_types_do_not_count_test() {
-  let dir = fresh_dir("private")
-  write(
-    dir,
-    "app.gleam",
-    "type Model { Model }\npub type Msg { Msg }\npub fn view(m) { m }\npub fn update(m, _) { m }\n",
-  )
-  let assert Error(reason) = discovery.find(dir)
-  let assert True = string.contains(reason, "No app module found")
 }
 
 pub fn discovery_unparsable_module_is_an_error_test() {

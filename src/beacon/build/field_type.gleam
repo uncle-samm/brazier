@@ -5,7 +5,7 @@
 /// imported unqualified, `c` may be an alias for `app/card`, and `Cards` may be
 /// a type alias. A `Scope` holds what one source file's imports and
 /// definitions say, and `resolve` turns an annotation into a `FieldType` whose
-/// named types carry the canonical module alias the generated code imports.
+/// named types carry the path of the module that defines them.
 ///
 /// Anything the codecs cannot encode becomes `UnsupportedType` with a reason,
 /// so the analyzer can fail the build naming the type and field.
@@ -28,8 +28,8 @@ pub type FieldType {
   ListType(inner: FieldType)
   DictType(key: FieldType, value: FieldType)
   TupleType(elements: List(FieldType))
-  /// A user-defined type. `module` is the canonical alias used by generated
-  /// code; the empty string means the primary app module.
+  /// A user-defined type. `module` is the path of the module that defines
+  /// it, such as `app/card`.
   NamedType(module: String, name: String)
   /// A type the codecs cannot handle, with the reason.
   UnsupportedType(reason: String)
@@ -42,7 +42,7 @@ pub const max_tuple_size = 8
 /// What one source file's imports and definitions say about type names.
 pub type Scope {
   Scope(
-    /// Canonical alias for types defined in this file ("" for the app module).
+    /// Path of this file's module.
     current: String,
     /// Module alias as written in this file -> module path.
     aliases: Dict(String, String),
@@ -50,16 +50,17 @@ pub type Scope {
     unqualified: Dict(String, #(String, String)),
     /// Names of custom types defined in this file.
     local_types: Set(String),
-    /// Module path -> canonical alias used by generated code.
-    canonical: Dict(String, String),
+    /// Paths of the user modules the build analyzes. A type from any other
+    /// module (a dependency) cannot be encoded.
+    known: Set(String),
   )
 }
 
-/// Build the scope for a parsed module.
+/// Build the scope for a parsed module whose path is `current`.
 pub fn scope(
   module: glance.Module,
   current: String,
-  canonical: Dict(String, String),
+  known: Set(String),
 ) -> Scope {
   let #(aliases, unqualified) =
     list.fold(module.imports, #(dict.new(), dict.new()), fn(acc, def) {
@@ -85,7 +86,7 @@ pub fn scope(
         set.insert(acc, def.definition.name)
       })
     }
-  Scope(current:, aliases:, unqualified:, local_types:, canonical:)
+  Scope(current:, aliases:, unqualified:, local_types:, known:)
 }
 
 /// The name an import is referenced by: its `as` alias or its last segment.
@@ -201,9 +202,9 @@ fn resolve_from_module(
     "gleam/dict", "Dict", [key, value] ->
       DictType(resolve(scope, key), resolve(scope, value))
     _, _, _ ->
-      case dict.get(scope.canonical, path) {
-        Ok(alias) -> user_type(alias, name, parameters)
-        Error(Nil) ->
+      case set.contains(scope.known, path) {
+        True -> user_type(path, name, parameters)
+        False ->
           UnsupportedType(
             "`"
             <> name
@@ -237,6 +238,10 @@ pub type TypeDef {
   RecordDef(constructor: String, fields: List(#(String, FieldType)))
   /// Several variants without fields. Encoded as the lowercased variant name.
   EnumDef(variants: List(String))
+  /// Variants that carry fields, or one variant with unlabelled fields.
+  /// Encoded as `{"tag": "Variant", "arg0": .., "arg1": ..}`, the fields by
+  /// position whether or not they are labelled.
+  UnionDef(variants: List(#(String, List(FieldType))))
   /// A type alias, replaced by its target before code generation.
   AliasDef(target: FieldType)
   /// A type the codecs cannot handle, with the reason.
@@ -268,22 +273,17 @@ pub fn custom_type_def(
         <> name
         <> "` is private; make it `pub` so generated codecs can use it",
       )
-    glance.CustomType(variants: [variant], ..) ->
-      record_def(scope, name, variant)
+    glance.CustomType(variants: [variant], ..) -> record_def(scope, variant)
     glance.CustomType(variants: [_, _, ..] as variants, ..) if all_fieldless ->
       EnumDef(list.map(variants, fn(variant) { variant.name }))
     glance.CustomType(variants: [], ..) ->
       UnsupportedDef("type `" <> name <> "` has no constructors")
-    glance.CustomType(..) ->
-      UnsupportedDef(
-        "type `"
-        <> name
-        <> "` has several variants that carry fields; generated codecs support records (one variant) and enums (variants without fields)",
-      )
+    glance.CustomType(variants:, ..) -> union_def(scope, variants)
   }
 }
 
-fn record_def(scope: Scope, name: String, variant: glance.Variant) -> TypeDef {
+/// A record when every field is labelled, otherwise a one-variant union.
+fn record_def(scope: Scope, variant: glance.Variant) -> TypeDef {
   let fields =
     list.try_map(variant.fields, fn(field) {
       case field {
@@ -294,13 +294,28 @@ fn record_def(scope: Scope, name: String, variant: glance.Variant) -> TypeDef {
     })
   case fields {
     Ok(fields) -> RecordDef(constructor: variant.name, fields:)
-    Error(Nil) ->
-      UnsupportedDef(
-        "record `"
-        <> name
-        <> "` has unlabelled fields; label every field so it can be encoded as a JSON object",
-      )
+    Error(Nil) -> union_def(scope, [variant])
   }
+}
+
+fn union_def(scope: Scope, variants: List(glance.Variant)) -> TypeDef {
+  UnionDef(
+    list.map(variants, fn(variant) {
+      #(variant.name, list.map(variant.fields, variant_field_type(scope, _)))
+    }),
+  )
+}
+
+fn variant_field_type(scope: Scope, field: glance.VariantField) -> FieldType {
+  case field {
+    glance.LabelledVariantField(item:, ..) -> resolve(scope, item)
+    glance.UnlabelledVariantField(item:) -> resolve(scope, item)
+  }
+}
+
+/// The JSON key of a union variant's field at `index`.
+pub fn union_arg_key(index: Int) -> String {
+  "arg" <> int.to_string(index)
 }
 
 /// Classify a type alias defined in the module `scope` describes.
@@ -385,12 +400,9 @@ pub fn describe(type_: FieldType) -> String {
   }
 }
 
-/// `module.Name`, or `Name` for the app module.
+/// `module/path.Name`, for messages.
 pub fn qualified_name(module: String, name: String) -> String {
-  case module {
-    "" -> name
-    _ -> module <> "." <> name
-  }
+  module <> "." <> name
 }
 
 /// Every named type referenced anywhere inside a field type, in order.
@@ -404,34 +416,15 @@ pub fn named_types(type_: FieldType) -> List(#(String, String)) {
   }
 }
 
-/// Build the canonical module path -> alias map, failing when two different
-/// modules would be imported under the same alias in generated code.
-pub fn canonical_aliases(
-  modules: List(#(String, String)),
-) -> Result(Dict(String, String), String) {
-  list.try_fold(modules, #(dict.new(), dict.new()), fn(acc, entry) {
-    let #(by_path, by_alias) = acc
-    let #(alias, path) = entry
-    case dict.get(by_alias, alias), dict.get(by_path, path) {
-      Ok(other_path), _ if other_path != path ->
-        Error(
-          "Modules `"
-          <> other_path
-          <> "` and `"
-          <> path
-          <> "` are both referred to as `"
-          <> alias
-          <> "`. Give one of them a different alias with `import "
-          <> path
-          <> " as <name>` so generated code can import both.",
-        )
-      _, Ok(_) -> Ok(acc)
-      _, Error(Nil) ->
-        Ok(#(
-          dict.insert(by_path, path, alias),
-          dict.insert(by_alias, alias, path),
-        ))
-    }
-  })
-  |> result.map(fn(acc) { acc.0 })
+/// The reason of the first `UnsupportedType` inside a field type, if any.
+/// Named types are not followed; their definitions are checked on their own.
+pub fn unsupported_reason(type_: FieldType) -> Result(String, Nil) {
+  case type_ {
+    UnsupportedType(reason) -> Ok(reason)
+    OptionType(inner) | ListType(inner) -> unsupported_reason(inner)
+    DictType(key, value) ->
+      result.lazy_or(unsupported_reason(key), fn() { unsupported_reason(value) })
+    TupleType(elements) -> list.find_map(elements, unsupported_reason)
+    IntType | FloatType | BoolType | StringType | NamedType(..) -> Error(Nil)
+  }
 }
