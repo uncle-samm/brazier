@@ -4,7 +4,7 @@ Status: accepted design (Milestone 117, WS7). Decisions in section 9 are recorde
 
 A few things I could not read, so the design rests on assumptions:
 - I did not read `docs/COMPONENTS.md`, `HTML_ELEMENTS.md`, `STATE_MANAGEMENT.md`, `EFFECTS.md`, `ROUTING.md` or the Lustre/LiveView sources. The patterns below follow their published APIs from memory.
-- `docs/FILE_BASED_ROUTING.md` does not exist, and no file-based route generator exists in `src/`. Only `docs/ROUTING.md` does.
+- The routing-convention doc linked from CLAUDE.md does not exist, and no route generator exists in `src/`. Only `docs/ROUTING.md` does.
 
 ## 1. Two findings that shape the design
 

@@ -1986,42 +1986,52 @@ fn start_pubsub_listener(
 ) -> Subject(ListenerCommand) {
   // Use a subject on the CALLER to receive the listener's command subject
   let reply_subject = process.new_subject()
-  let _ =
-    process.spawn_unlinked(fn() {
-      // Monitor before linking: if the runtime is already gone the monitor
-      // delivers DOWN (noproc) and the loop exits on its first receive.
-      let owner_monitor = process.monitor(runtime_pid)
-      let _ = process.link(runtime_pid)
-      // Create the command subject HERE — inside the spawned process —
-      // so it's owned by this process and receives messages correctly.
-      let command_subject = process.new_subject()
+  // The listener sends its command subject back on `reply_subject`; its Pid
+  // is not needed.
+  process.spawn_unlinked(fn() {
+    // Monitor before linking: if the runtime is already gone the monitor
+    // delivers DOWN (noproc) and the loop exits on its first receive.
+    let owner_monitor = process.monitor(runtime_pid)
+    case process.link(runtime_pid) {
+      True -> Nil
+      // The runtime already exited; the monitor above delivers DOWN and
+      // the loop stops on its first receive.
+      False ->
+        log.debug(
+          "beacon.runtime",
+          "PubSub listener: runtime already exited before link",
+        )
+    }
+    // Create the command subject HERE — inside the spawned process —
+    // so it's owned by this process and receives messages correctly.
+    let command_subject = process.new_subject()
 
-      log.info("beacon.subscription", "Listener process spawned")
-      // Subscribe to the initial topics BEFORE replying, so that once
-      // `start` returns no broadcast to an initial topic can be missed.
-      let topics = list.unique(topics)
-      list.each(topics, fn(t) {
-        log.info("beacon.subscription", "Subscribing to: " <> t)
-        pubsub.subscribe(t)
-      })
-      process.send(reply_subject, command_subject)
-      log.info(
-        "beacon.subscription",
-        "Listener started with "
-          <> int.to_string(list.length(topics))
-          <> " initial topics",
-      )
-      listener_loop(
-        Listener(
-          runtime_subject: runtime_subject,
-          command_subject: command_subject,
-          owner_monitor: owner_monitor,
-          on_notify: on_notify,
-          on_notification: on_notification,
-        ),
-        topics,
-      )
+    log.info("beacon.subscription", "Listener process spawned")
+    // Subscribe to the initial topics BEFORE replying, so that once
+    // `start` returns no broadcast to an initial topic can be missed.
+    let topics = list.unique(topics)
+    list.each(topics, fn(t) {
+      log.info("beacon.subscription", "Subscribing to: " <> t)
+      pubsub.subscribe(t)
     })
+    process.send(reply_subject, command_subject)
+    log.info(
+      "beacon.subscription",
+      "Listener started with "
+        <> int.to_string(list.length(topics))
+        <> " initial topics",
+    )
+    listener_loop(
+      Listener(
+        runtime_subject: runtime_subject,
+        command_subject: command_subject,
+        owner_monitor: owner_monitor,
+        on_notify: on_notify,
+        on_notification: on_notification,
+      ),
+      topics,
+    )
+  })
   // INVARIANT: The listener process was just spawned and MUST send its
   // command_subject back immediately. If this times out (5s), the listener
   // failed to start — a fatal configuration error. Crash is intentional:

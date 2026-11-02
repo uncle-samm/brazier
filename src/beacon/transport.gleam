@@ -516,6 +516,18 @@ fn connection_tracker_decrement() -> Int
 @external(erlang, "beacon_connection_tracker_ffi", "count")
 fn connection_tracker_count() -> Int
 
+/// Release the calling handler's connection slot early and log what is left.
+fn release_connection_slot(context: String) -> Nil {
+  let remaining = connection_tracker_decrement()
+  log.debug(
+    "beacon.transport",
+    "Released connection slot ("
+      <> context
+      <> "); live connections: "
+      <> int.to_string(remaining),
+  )
+}
+
 /// Encode a ServerMessage to JSON string for sending over the wire.
 pub fn encode_server_message(msg: ServerMessage) -> String {
   case msg {
@@ -1830,8 +1842,7 @@ fn handle_ws_request(
         "WebSocket upgrade " <> conn_id <> " dropped: " <> reason,
       )
       server.close(socket)
-      let _count = connection_tracker_decrement()
-      Nil
+      release_connection_slot("peer gone before upgrade")
     }
     Ok(Nil), Ok(peer_ip) ->
       admit_ws_request(socket, req, config, conn_id, peer_ip)
@@ -1994,8 +2005,7 @@ fn upgrade_ws_request(
       )
       server.close(socket)
       ws.release_ip_slot(admission.slot_key)
-      let _count = connection_tracker_decrement()
-      Nil
+      release_connection_slot("upgrade write failed")
     }
   }
 }
@@ -2016,7 +2026,7 @@ fn reject_unsupported_version(
       <> description,
   )
   ws.release_ip_slot(admission.slot_key)
-  let _count = connection_tracker_decrement()
+  release_connection_slot("unsupported WebSocket version")
   let resp =
     response.new(426)
     |> response.set_header("sec-websocket-version", "13")
@@ -2061,7 +2071,7 @@ fn reject_ws_request(
     Some(key) -> ws.release_ip_slot(key)
     None -> Nil
   }
-  let _count = connection_tracker_decrement()
+  release_connection_slot("WebSocket request rejected")
   transport_http.write_error(socket, status, body)
 }
 

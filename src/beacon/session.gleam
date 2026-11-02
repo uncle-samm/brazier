@@ -125,11 +125,12 @@ pub fn new_store_with_config(
   let table = session_ets_new(name)
   let store =
     SessionStore(table: table, table_name: table_name(table), config: config)
-  let _sweeper =
-    start_sweeper(process.self(), config.sweep_interval_ms, fn() {
-      sweep_expired(store)
-      Nil
-    })
+  // The sweeper monitors the owner (this process) and exits when it dies, so
+  // its Pid does not need to be kept.
+  start_sweeper(process.self(), config.sweep_interval_ms, fn() {
+    sweep_expired(store)
+    Nil
+  })
   log.info(
     "beacon.session",
     "Created session store "

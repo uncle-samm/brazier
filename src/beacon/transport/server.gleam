@@ -271,8 +271,20 @@ pub fn stop(listener: Listener) -> Nil {
     "Stopping listener on port " <> int.to_string(listener.port),
   )
   ffi_stop_supervisor(listener.supervisor)
-  let _ = ffi_conns_forget_port(listener.conns)
-  Nil
+  case ffi_conns_forget_port(listener.conns) {
+    True ->
+      log.debug(
+        "beacon.server",
+        "Forgot bound port " <> int.to_string(listener.port),
+      )
+    False ->
+      log.warning(
+        "beacon.server",
+        "No remembered bound port for listener on port "
+          <> int.to_string(listener.port)
+          <> " (stopped twice?)",
+      )
+  }
 }
 
 /// The port the listener is bound to (the OS-assigned one for port 0).

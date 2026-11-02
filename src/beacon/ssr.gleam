@@ -258,6 +258,9 @@ fn render_view_html(config: SsrConfig(model, msg), model: model) -> String {
       element.to_string(view_tree)
     }
   }
+  // SSR only pops the render stack here; the client re-registers handlers on
+  // hydration. WS7 deletes beacon/handler.
+  // lint:allow-discard the SSR handler registry is not needed after render
   let _view_registry = handler.finish_render()
   view_html
 }

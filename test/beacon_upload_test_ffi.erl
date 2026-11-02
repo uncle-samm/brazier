@@ -9,7 +9,10 @@ fresh_dir() ->
         false -> "/tmp";
         Tmp -> Tmp
     end,
-    Name = "beacon_upload_test_" ++ integer_to_list(erlang:unique_integer([positive])),
+    %% unique_integer restarts on every VM boot, so a directory left behind by
+    %% an earlier run could collide; random bytes make the name unique.
+    Suffix = binary_to_list(binary:encode_hex(crypto:strong_rand_bytes(8), lowercase)),
+    Name = "beacon_upload_test_" ++ Suffix,
     Dir = unicode:characters_to_binary(filename:join(Base, Name)),
     ok = file:make_dir(Dir),
     Dir.

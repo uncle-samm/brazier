@@ -149,24 +149,25 @@ fn spawn_connections(
     True -> Nil
     False -> {
       let i = index
-      let _ =
-        process.spawn(fn() {
-          let result =
-            open_ws_and_exercise(host, port, hold_ms, events_per_connection)
-          case result {
-            Ok(Nil) -> process.send(subject, True)
-            Error(reason) -> {
-              log.warning(
-                "beacon.stress",
-                "Connection "
-                  <> int.to_string(i)
-                  <> " failed during stress run: "
-                  <> reason,
-              )
-              process.send(subject, False)
-            }
+      // The worker reports success or failure on `subject`; its Pid is not
+      // needed.
+      process.spawn(fn() {
+        let result =
+          open_ws_and_exercise(host, port, hold_ms, events_per_connection)
+        case result {
+          Ok(Nil) -> process.send(subject, True)
+          Error(reason) -> {
+            log.warning(
+              "beacon.stress",
+              "Connection "
+                <> int.to_string(i)
+                <> " failed during stress run: "
+                <> reason,
+            )
+            process.send(subject, False)
           }
-        })
+        }
+      })
       spawn_connections(
         remaining - 1,
         host,
