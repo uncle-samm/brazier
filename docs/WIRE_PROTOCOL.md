@@ -27,7 +27,9 @@ server-visible event sends its own `event`.
 {"type": "event_batch", "events": [{"name": "click", ...}]}
 ```
 
-**heartbeat** -- Keep-alive, sent every 30s.
+**heartbeat** -- Keep-alive, sent every 30s. The browser client never sends
+two within 500ms, writes it straight to the socket and never queues it, so a
+reconnect does not release a burst of heartbeats.
 ```json
 {"type": "heartbeat"}
 ```
@@ -54,16 +56,23 @@ SSR; live join replies with `model_sync`, and later updates use `model_sync` or
 {"type": "mount", "payload": "<div>...</div>"}
 ```
 
-**model_sync** -- Full authoritative model state. Sent on join and whenever the
-server must replace the client's cached model JSON.
+**model_sync** -- Full authoritative model state. Sent on join, on rejoin, in
+answer to `request_sync`, and whenever the server must replace the client's
+cached model JSON. `version` is the current revision (see Versioning).
 ```json
 {"type": "model_sync", "model": "{\"count\":1}", "version": 1, "ack_clock": 1}
 ```
 
-**patch** -- Incremental server-computed JSON Patch ops. Sent after events when
-model changes and the server can describe the change compactly.
+**patch** -- Incremental server-computed RFC 6902 JSON Patch ops against the
+client-visible model JSON. `version` is the revision the patch produces.
 ```json
 {"type": "patch", "ops": "[{\"op\":\"replace\",\"path\":\"/count\",\"value\":2}]", "version": 2, "ack_clock": 2}
+```
+A patch with `"ops": "[]"` is an **ack**: the server processed the
+connection's events up to `ack_clock` without changing the client-visible
+model. Its `version` is the current revision, not a new one.
+```json
+{"type": "patch", "ops": "[]", "version": 2, "ack_clock": 3}
 ```
 
 **heartbeat_ack** -- Acknowledges heartbeat.
@@ -95,9 +104,78 @@ this triggers a real HTTP request — use when the browser needs to receive HTTP
 {"type": "reload"}
 ```
 
+## Versioning
+
+The runtime keeps one `revision` per session (the `version` field on the wire).
+
+- It is bumped only when the client-visible model JSON changes, and every such
+  change is broadcast to all joined connections as a patch carrying the new
+  revision (or as a `model_sync` at the new revision when the server has no
+  cached model to diff against). Changes from any source count: an event from any connection, an
+  effect, a store or PubSub update, a timer, a navigation or a join that
+  changes the model.
+- Navigation and joins never bump the revision by themselves. A navigation
+  that leaves the model unchanged sends nothing.
+- `model_sync` carries the current revision. A patch carries the revision it
+  produces, which is always the previous revision plus one.
+- An event that leaves the model unchanged (or fails) is answered with an ack
+  patch (`"ops": "[]"`) at the current revision. A failed event sends its
+  `error` first.
+
+Client rules, which the generated browser client follows:
+
+| Frame | Condition | Action |
+|-------|-----------|--------|
+| `model_sync` | `version` not a non-negative integer | Treat as a failed sync |
+| `model_sync` | older than the cached revision | Ignore |
+| `model_sync` | otherwise | Replace the cached model |
+| `patch` | no synced model yet | Gap: `request_sync` |
+| `patch` with ops | `version` = cached + 1 | Apply |
+| `patch` with ops | `version` <= cached | Ignore (stale) |
+| `patch` with ops | `version` > cached + 1 | Gap: `request_sync` |
+| `patch` `[]` | `version` = cached | Ack |
+| `patch` `[]` | `version` < cached | Ignore (stale) |
+| `patch` `[]` | `version` > cached | Gap: `request_sync` |
+
+A patch that fails to parse, apply or decode, or a server frame that is not
+JSON, drops the cached model and sends `request_sync`. Only one
+`request_sync` is in flight at a time; any `model_sync` answers it. A
+`model_sync` that cannot be decoded is retried with `request_sync` up to 3
+times in a row. After that the client logs an error and stops requesting
+syncs on that connection (a reload recovers). A new connection starts over.
+
 ## Event Clocking
 
-Each `event` has a monotonic `clock`. The server echoes it back as `ack_clock` on `model_sync` and `patch`, letting the client discard stale responses.
+Each `event` has a monotonic `clock`. The server keeps the highest clock it has
+processed per connection and echoes it back as `ack_clock` on `model_sync` and
+`patch`, so the client knows which of its optimistic events the server state
+already includes. A frame whose `ack_clock` is behind the client's pending
+model event is held until the server catches up.
+
+## Client Connection Behaviour
+
+The generated browser client handles close codes, reconnects and sending as
+follows.
+
+- **4401**: stop reconnecting, log an error and reload the page so the user
+  gets a fresh session or the login page.
+- **Any other close** (including 1008, 1009 and 1013): reconnect after
+  `min(1s * 2^attempts, 30s)` plus up to 1s of random jitter. `attempts`
+  resets only after a `model_sync` is applied, so a server that accepts and
+  immediately drops sockets is still retried with backoff.
+- **Outbound pacing**: every message except `heartbeat` passes through one
+  queue paced at 40 messages per sliding 1s window (an `event_batch` costs one
+  per event, as on the server), below the server's 50 per second. The queue
+  holds 200 messages. `request_sync` goes ahead of queued events. Events wait
+  until the first `model_sync` (or `mount`) on a connection. A full queue is
+  logged as an error and, once the queue drains, followed by `request_sync`.
+  Nothing is dropped silently.
+- **Batches**: an `event_batch` with more than 40 events is split into
+  batches of at most 40, sent in order.
+- **`Rate limited` and `Batch too large`** errors are logged and followed by
+  `request_sync`, since the rejected message may have carried state the
+  client already applied optimistically. Other `error` reasons are logged.
+- Unknown server message types are logged as errors.
 
 ## Reconnection Flow
 
