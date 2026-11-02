@@ -29,8 +29,9 @@ get_env_int(Name) ->
     case os:getenv(binary_to_list(Name)) of
         false -> {error, <<"env_var_not_set">>};
         Value ->
-            case catch list_to_integer(Value) of
-                N when is_integer(N) -> {ok, N};
-                _ -> {error, <<"not_an_integer">>}
+            try list_to_integer(Value) of
+                N -> {ok, N}
+            catch
+                error:badarg -> {error, <<"not_an_integer">>}
             end
     end.

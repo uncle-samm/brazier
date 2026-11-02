@@ -117,9 +117,11 @@ pub fn start_ticker_app(
   application.start_advanced(config)
 }
 
-/// Generate a unique port in the 20000-50000 range for parallel test execution.
+/// Generate a unique port in the 20000-48999 range for parallel test execution.
+/// The range stays below 49152 so it never collides with ports the OS hands
+/// out for outgoing connections (the macOS/IANA ephemeral range is 49152-65535).
 pub fn unique_port() -> Int {
-  20_000 + { abs(erlang_unique_pos()) % 30_000 }
+  20_000 + { abs(erlang_unique_pos()) % 29_000 }
 }
 
 @external(erlang, "erlang", "abs")
