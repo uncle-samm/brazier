@@ -252,9 +252,11 @@ runtime_render_span(Route, Event, ConnectionId, Run) ->
 runtime_stop(Uptime, Reason) ->
     telemetry:execute([?PREFIX, runtime, stop], #{uptime => Uptime}, #{reason => Reason}).
 
-%% [beacon, effect, run] span.
-effect_run_span(Kind, Run) ->
-    Meta = #{kind => Kind},
+%% [beacon, effect, run] span. The label is `effect`, not `kind`: telemetry
+%% writes the exception class to `kind` on the exception event, which would
+%% overwrite it.
+effect_run_span(Effect, Run) ->
+    Meta = #{effect => Effect},
     telemetry:span([?PREFIX, effect, run], Meta, fun() -> {Run(), Meta} end).
 
 %% [beacon, effect, timer, rejected]

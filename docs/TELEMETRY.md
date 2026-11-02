@@ -126,7 +126,7 @@ measurements: `system_time` and `monotonic_time` on start, `duration` and
 | `[beacon, runtime, mount \| handle_event \| navigate]` S | none | `route`, `event`, `connection_id` | not yet |
 | `[beacon, runtime, render]` S | `patch_bytes` (stop) | `route`, `event`, `connection_id` | not yet |
 | `[beacon, runtime, stop]` | `uptime` | `reason` | not yet |
-| `[beacon, effect, run]` S | none | `kind` | not yet |
+| `[beacon, effect, run]` S | none | `effect` | not yet |
 | `[beacon, effect, timer, rejected]` | none | `limit` | not yet |
 | `[beacon, store, write]` | `count` | `store`, `op`, `mode` | yes |
 | `[beacon, store, sync]` S | `entries`, `bytes` (stop) | `store`, `peer` | not yet (replicated stores) |

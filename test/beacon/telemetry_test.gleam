@@ -261,7 +261,7 @@ fn documented() -> List(Documented) {
       [],
     ),
     Plain(["runtime", "stop"], ["uptime"], ["reason"]),
-    Span(["effect", "run"], ["kind"], [], []),
+    Span(["effect", "run"], ["effect"], [], []),
     Plain(["effect", "timer", "rejected"], [], ["limit"]),
     Plain(["store", "write"], ["count"], ["store", "op", "mode"]),
     Span(["store", "sync"], ["store", "peer"], ["entries", "bytes"], []),

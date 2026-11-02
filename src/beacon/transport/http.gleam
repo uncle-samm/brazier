@@ -604,6 +604,18 @@ pub const max_route_tag_bytes = 255
 /// programming error and crashes the request (answered with 500).
 pub fn tag_route(pattern: String) -> Nil {
   let size = string.byte_size(pattern)
+  case size > 0 && size <= max_route_tag_bytes {
+    True -> log.debug("beacon.http", "Request matched route " <> pattern)
+    False ->
+      log.error(
+        "beacon.http",
+        "tag_route called with a "
+          <> int.to_string(size)
+          <> "-byte route pattern (allowed 1 to "
+          <> int.to_string(max_route_tag_bytes)
+          <> ")",
+      )
+  }
   let assert True = size > 0 && size <= max_route_tag_bytes
     as "tag_route: a route pattern is 1 to 255 bytes"
   ffi_route_tag(pattern)

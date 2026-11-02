@@ -31,10 +31,21 @@
 /// or late. A timestamp further in the future than the tolerance means a
 /// broken clock: the session is treated as expired and an error is logged.
 ///
+/// Telemetry: `[beacon, session, created | revoked | expired | contention]`
+/// with `count` 1 and a bounded `reason`, emitted only after the backend
+/// confirmed the change:
+/// - `created`: `"create"` or `"rotate"` (the fresh id of a rotation).
+/// - `revoked`: `"deleted"` (logout) or `"rotated"` (the old id).
+/// - `expired`: `"absolute_ttl"`, `"idle_ttl"` or `"clock_skew"` when a
+///   lookup finds the row past its lifetime, `"sweep"` from the sweeper.
+/// - `contention`: `"update"` when a write loses every compare-and-swap
+///   attempt, `"rotate"` when the row changed during a rotation.
+///
 /// Reference: OWASP Session Management Cheat Sheet; Phoenix
 /// `live_socket_id` disconnect broadcasts; Plug.Session stores.
 import beacon/cookie
 import beacon/log
+import beacon/telemetry
 import gleam/bit_array
 import gleam/dict.{type Dict}
 import gleam/erlang/atom
@@ -353,6 +364,15 @@ pub fn try_create_with_data(
   store: SessionStore,
   data: Dict(String, String),
 ) -> Result(Session, SessionStoreError) {
+  create_row(store, data, "create")
+}
+
+/// Insert a fresh row; `reason` labels the `created` event.
+fn create_row(
+  store: SessionStore,
+  data: Dict(String, String),
+  reason: String,
+) -> Result(Session, SessionStoreError) {
   let id = generate_id()
   let session = Session(id: id, data: data)
   let now = now_ms()
@@ -369,6 +389,7 @@ pub fn try_create_with_data(
   // session to another, so crash loudly.
   let assert True = inserted as "session id collision: the RNG is broken"
   log.debug(module_name, "Created session in " <> store.name)
+  telemetry.session_event(telemetry.Created, reason)
   Ok(session)
 }
 
@@ -432,8 +453,8 @@ fn lookup_live(
     Some(row) ->
       case liveness(store, now_ms(), row) {
         Live -> Ok(row)
-        Ended -> {
-          use Nil <- result.try(expire_row(store, id, row.version))
+        Ended(reason) -> {
+          use Nil <- result.try(expire_row(store, id, row.version, reason))
           Error(SessionExpired)
         }
       }
@@ -442,7 +463,8 @@ fn lookup_live(
 
 type Liveness {
   Live
-  Ended
+  /// `reason` is the `expired` event's label.
+  Ended(reason: String)
 }
 
 /// Whether a row is within its lifetimes. A timestamp further in the
@@ -461,15 +483,16 @@ fn liveness(store: SessionStore, now: Int, row: StoredSession) -> Liveness {
           <> int.to_string(clock_skew_tolerance_ms)
           <> " ms): a node clock is wrong; treating the session as expired",
       )
-      Ended
+      Ended("clock_skew")
     }
     False ->
       case
-        now - row.created_at_ms >= store.config.absolute_ttl_ms
-        || now - row.last_seen_ms >= store.config.idle_ttl_ms
+        now - row.created_at_ms >= store.config.absolute_ttl_ms,
+        now - row.last_seen_ms >= store.config.idle_ttl_ms
       {
-        True -> Ended
-        False -> Live
+        True, _ -> Ended("absolute_ttl")
+        False, True -> Ended("idle_ttl")
+        False, False -> Live
       }
   }
 }
@@ -479,11 +502,16 @@ fn expire_row(
   store: SessionStore,
   id: String,
   version: Int,
+  reason: String,
 ) -> Result(Nil, SessionStoreError) {
   use deleted <- result.try(backend_delete_version(store, id, version))
   case deleted {
     True -> {
-      log.info(module_name, "Session expired in " <> store.name)
+      log.info(
+        module_name,
+        "Session expired (" <> reason <> ") in " <> store.name,
+      )
+      telemetry.session_event(telemetry.Expired, reason)
       revoke_bound(store, id, Expired)
     }
     False ->
@@ -532,7 +560,7 @@ pub fn update(
         module_name,
         "Refusing to write expired session in " <> store.name,
       )
-    Error(SessionContention) ->
+    Error(SessionContention) -> {
       log.error(
         module_name,
         "Session write lost "
@@ -540,6 +568,8 @@ pub fn update(
           <> " compare-and-swap races in "
           <> store.name,
       )
+      telemetry.session_event(telemetry.Contention, "update")
+    }
     // Already logged where the backend failed.
     Error(SessionBackendFailed(_)) | Error(InvalidBackend(_)) -> Nil
   }
@@ -608,7 +638,10 @@ pub fn try_delete(
 ) -> Result(Nil, SessionStoreError) {
   let deleted = backend_delete(store, id)
   case deleted {
-    Ok(Nil) -> log.info(module_name, "Deleted session in " <> store.name)
+    Ok(Nil) -> {
+      log.info(module_name, "Deleted session in " <> store.name)
+      telemetry.session_event(telemetry.Revoked, "deleted")
+    }
     Error(_) ->
       log.error(
         module_name,
@@ -654,13 +687,15 @@ pub fn rotate(
             module_name,
             "Session changed during rotation in " <> store.name,
           )
+          telemetry.session_event(telemetry.Contention, "rotate")
           Error(SessionContention)
         }
         True -> {
           // The old id is gone from here on, so its sockets are told even
           // when creating the new one fails.
+          telemetry.session_event(telemetry.Revoked, "rotated")
           revoke_bound(store, old_id, Rotated)
-          use fresh <- result.try(try_create_with_data(store, old.session.data))
+          use fresh <- result.try(create_row(store, old.session.data, "rotate"))
           log.info(module_name, "Rotated session in " <> store.name)
           Ok(fresh)
         }
@@ -710,6 +745,7 @@ fn sweep_batches(
       use deleted <- result.map(backend_delete_version(store, id, version))
       case deleted {
         True -> {
+          telemetry.session_event(telemetry.Expired, "sweep")
           revoke_bound(store, id, Expired)
           count + 1
         }

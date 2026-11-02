@@ -290,7 +290,7 @@ pub fn runtime_stop(uptime: Int, reason: String) -> Nil
 /// `[beacon, effect, run]` span.
 @external(erlang, "beacon_telemetry_ffi", "effect_run_span")
 @internal
-pub fn effect_run_span(kind: String, run: fn() -> a) -> a
+pub fn effect_run_span(effect: String, run: fn() -> a) -> a
 
 /// `[beacon, effect, timer, rejected]`.
 @external(erlang, "beacon_telemetry_ffi", "effect_timer_rejected")
