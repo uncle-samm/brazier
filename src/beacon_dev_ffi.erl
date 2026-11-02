@@ -153,14 +153,13 @@ start_app(ModuleName) ->
 
 %% Notify connected browsers to reload via PubSub.
 notify_browser_reload() ->
-    try pg:get_members(beacon_pg, <<"beacon:reload">>) of
-        Pids ->
+    case beacon_pubsub_ffi:local_subscribers(<<"beacon:reload">>) of
+        {ok, Pids} ->
             [Pid ! {beacon_reload} || Pid <- Pids],
-            {ok, nil}
-    catch
-        Class:Reason ->
-            logger:warning("[beacon.dev] notify_browser_reload failed: ~p:~p", [Class, Reason]),
-            {error, format("~p:~p", [Class, Reason])}
+            {ok, nil};
+        {error, Reason} ->
+            logger:warning("[beacon.dev] notify_browser_reload failed: ~p", [Reason]),
+            {error, format("~p", [Reason])}
     end.
 
 %% True when fswatch (macOS) or inotifywait (Linux) is installed.

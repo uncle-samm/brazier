@@ -30,3 +30,7 @@ secrets/
 test_cdp*.py
 test_cdp*.sh
 !test_all_cdp.py
+
+# TLS distribution test fixtures: test-only keys (see regenerate.sh there)
+!test/fixtures/dist_tls/*.pem
+!test/fixtures/dist_tls/*.key
