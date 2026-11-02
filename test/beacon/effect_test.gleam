@@ -93,11 +93,17 @@ pub fn background_is_not_none_test() {
 pub fn every_dispatches_periodically_test() {
   let subject = process.new_subject()
   let eff = effect.every(50, fn() { 1 })
-  perform(eff, fn(n) { process.send(subject, n) })
+  let pids =
+    effect.perform_tracked(eff, fn(n) { process.send(subject, n) }, fn(_, _, _) {
+      Nil
+    })
   // Should receive at least 3 ticks in 200ms
   let assert Ok(1) = process.receive(subject, 200)
   let assert Ok(1) = process.receive(subject, 200)
   let assert Ok(1) = process.receive(subject, 200)
+  // Tests in a module share one eunit process (and so one timer registry):
+  // stop the timer so it does not occupy a slot in later tests.
+  list.each(pids, process.kill)
 }
 
 pub fn after_dispatches_once_test() {
@@ -125,8 +131,9 @@ pub fn perform_tracked_returns_spawned_effect_process_test() {
 // the originals exited. Live-pid tracking prunes dead timers, freeing slots.
 //
 // Effects run synchronously in the calling process and the timer registry is
-// per-process (Erlang process dictionary), and eunit runs each test in its own
-// process, so this test starts with an empty registry.
+// per-process (Erlang process dictionary). eunit runs a module's tests in one
+// process, so every test in this module must stop the timers it starts; this
+// test then starts with an empty registry.
 pub fn every_self_heals_after_timers_die_test() {
   // Fill every available slot (max_timers = 10). Long interval so the fillers
   // never tick during the test — we only care that they occupy slots.

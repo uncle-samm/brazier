@@ -278,6 +278,7 @@ pub fn start(
               let listener =
                 start_pubsub_listener(
                   subject,
+                  started.pid,
                   config.on_notify,
                   config.on_notification,
                   initial_topics,
@@ -1742,15 +1743,36 @@ type ListenerReceiveResult {
   CommandReceived(command: ListenerCommand)
   /// A PubSub notification was received on a topic.
   NotificationReceived(topic: String, payload: Dynamic)
+  /// The owning runtime exited (DOWN from the listener's monitor).
+  OwnerExited(reason: String)
   /// Timeout — no message within the window.
   ReceiveTimeout
+}
+
+/// Immutable context of a PubSub listener process.
+type Listener(msg) {
+  Listener(
+    runtime_subject: Subject(RuntimeMessage(msg)),
+    command_subject: Subject(ListenerCommand),
+    /// Monitor on the owning runtime — the listener exits when it fires.
+    owner_monitor: process.Monitor,
+    on_notify: Option(fn(String) -> msg),
+    on_notification: Option(fn(Notification) -> msg),
+  )
 }
 
 /// Start the PubSub listener — spawns a process that handles
 /// dynamic subscription commands and forwards notifications.
 /// Returns a Subject for sending commands to the listener.
+///
+/// Lifecycle: the listener is bound to the RUNTIME, not to the caller. It
+/// links to the runtime (so a crashing listener crashes the runtime loudly
+/// instead of silently dropping notifications, and an abnormal runtime exit
+/// kills the listener) and monitors it (so a normal runtime exit, which a
+/// link does not propagate, also stops the listener and unsubscribes).
 fn start_pubsub_listener(
   runtime_subject: Subject(RuntimeMessage(msg)),
+  runtime_pid: Pid,
   on_notify: Option(fn(String) -> msg),
   on_notification: Option(fn(Notification) -> msg),
   topics: List(String),
@@ -1758,18 +1780,24 @@ fn start_pubsub_listener(
   // Use a subject on the CALLER to receive the listener's command subject
   let reply_subject = process.new_subject()
   let _ =
-    process.spawn(fn() {
+    process.spawn_unlinked(fn() {
+      // Monitor before linking: if the runtime is already gone the monitor
+      // delivers DOWN (noproc) and the loop exits on its first receive.
+      let owner_monitor = process.monitor(runtime_pid)
+      let _ = process.link(runtime_pid)
       // Create the command subject HERE — inside the spawned process —
       // so it's owned by this process and receives messages correctly.
       let command_subject = process.new_subject()
-      // Send it back to the caller
-      process.send(reply_subject, command_subject)
 
       log.info("beacon.subscription", "Listener process spawned")
+      // Subscribe to the initial topics BEFORE replying, so that once
+      // `start` returns no broadcast to an initial topic can be missed.
+      let topics = list.unique(topics)
       list.each(topics, fn(t) {
         log.info("beacon.subscription", "Subscribing to: " <> t)
         pubsub.subscribe(t)
       })
+      process.send(reply_subject, command_subject)
       log.info(
         "beacon.subscription",
         "Listener started with "
@@ -1777,10 +1805,13 @@ fn start_pubsub_listener(
           <> " initial topics",
       )
       listener_loop(
-        runtime_subject,
-        command_subject,
-        on_notify,
-        on_notification,
+        Listener(
+          runtime_subject: runtime_subject,
+          command_subject: command_subject,
+          owner_monitor: owner_monitor,
+          on_notify: on_notify,
+          on_notification: on_notification,
+        ),
         topics,
       )
     })
@@ -1793,89 +1824,94 @@ fn start_pubsub_listener(
 }
 
 /// Listener receive loop — handles commands and PubSub notifications.
-fn listener_loop(
-  runtime_subject: Subject(RuntimeMessage(msg)),
-  command_subject: Subject(ListenerCommand),
-  on_notify: Option(fn(String) -> msg),
-  on_notification: Option(fn(Notification) -> msg),
-  subscriptions: List(String),
-) -> Nil {
-  case receive_with_commands(command_subject, 60_000) {
-    CommandReceived(SubscribeTo(topic)) -> {
-      pubsub.subscribe(topic)
-      log.debug("beacon.subscription", "Subscribed to: " <> topic)
-      listener_loop(
-        runtime_subject,
-        command_subject,
-        on_notify,
-        on_notification,
-        case list.contains(subscriptions, topic) {
-          True -> subscriptions
-          False -> [topic, ..subscriptions]
-        },
-      )
-    }
-    CommandReceived(UnsubscribeFrom(topic)) -> {
-      pubsub.unsubscribe(topic)
-      log.debug("beacon.subscription", "Unsubscribed from: " <> topic)
-      listener_loop(
-        runtime_subject,
-        command_subject,
-        on_notify,
-        on_notification,
-        list.filter(subscriptions, fn(existing) { existing != topic }),
-      )
-    }
+fn listener_loop(listener: Listener(msg), subscriptions: List(String)) -> Nil {
+  case
+    receive_with_commands(
+      listener.command_subject,
+      listener.owner_monitor,
+      60_000,
+    )
+  {
+    CommandReceived(SubscribeTo(topic)) ->
+      // pg allows a process to join a group more than once (and then
+      // delivers every broadcast once per membership), so joining is
+      // guarded by the listener's own subscription set.
+      case list.contains(subscriptions, topic) {
+        True -> {
+          log.debug("beacon.subscription", "Already subscribed to: " <> topic)
+          listener_loop(listener, subscriptions)
+        }
+        False -> {
+          pubsub.subscribe(topic)
+          log.debug("beacon.subscription", "Subscribed to: " <> topic)
+          listener_loop(listener, [topic, ..subscriptions])
+        }
+      }
+    CommandReceived(UnsubscribeFrom(topic)) ->
+      case list.contains(subscriptions, topic) {
+        True -> {
+          pubsub.unsubscribe(topic)
+          log.debug("beacon.subscription", "Unsubscribed from: " <> topic)
+          listener_loop(
+            listener,
+            list.filter(subscriptions, fn(existing) { existing != topic }),
+          )
+        }
+        False -> {
+          log.debug(
+            "beacon.subscription",
+            "Ignoring unsubscribe from non-subscribed topic: " <> topic,
+          )
+          listener_loop(listener, subscriptions)
+        }
+      }
     CommandReceived(ShutdownListener) -> {
       log.info("beacon.subscription", "Listener shutting down")
-      list.each(subscriptions, fn(topic) {
-        log.debug("beacon.subscription", "Unsubscribing on shutdown: " <> topic)
-        pubsub.unsubscribe(topic)
-      })
-      Nil
+      unsubscribe_all(subscriptions)
+    }
+    OwnerExited(reason) -> {
+      log.info(
+        "beacon.subscription",
+        "Owning runtime exited (" <> reason <> "); listener stopping",
+      )
+      unsubscribe_all(subscriptions)
     }
     NotificationReceived(topic, payload) -> {
-      case on_notify {
+      case listener.on_notify {
         Some(handler) ->
           process.send(
-            runtime_subject,
+            listener.runtime_subject,
             EffectDispatched(message: handler(topic)),
           )
         None -> Nil
       }
-      case on_notification {
+      case listener.on_notification {
         Some(handler) ->
           process.send(
-            runtime_subject,
+            listener.runtime_subject,
             EffectDispatched(
               message: handler(Notification(topic: topic, payload: payload)),
             ),
           )
         None -> Nil
       }
-      listener_loop(
-        runtime_subject,
-        command_subject,
-        on_notify,
-        on_notification,
-        subscriptions,
-      )
+      listener_loop(listener, subscriptions)
     }
-    ReceiveTimeout -> {
-      listener_loop(
-        runtime_subject,
-        command_subject,
-        on_notify,
-        on_notification,
-        subscriptions,
-      )
-    }
+    ReceiveTimeout -> listener_loop(listener, subscriptions)
   }
+}
+
+fn unsubscribe_all(subscriptions: List(String)) -> Nil {
+  list.each(subscriptions, fn(topic) {
+    log.debug("beacon.subscription", "Unsubscribing on shutdown: " <> topic)
+    pubsub.unsubscribe(topic)
+  })
 }
 
 @external(erlang, "beacon_subscription_ffi", "receive_with_commands")
 fn receive_with_commands(
   subject: Subject(ListenerCommand),
+  owner_monitor: process.Monitor,
   timeout: Int,
 ) -> ListenerReceiveResult
 
