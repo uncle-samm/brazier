@@ -145,11 +145,114 @@ pub fn handle() { Nil }
   let assert [] = violations
 }
 
-pub fn invalid_source_no_crash_test() {
-  let source = "this is not valid gleam @@@"
+pub fn invalid_source_is_parse_error_violation_test() {
+  let source = "pub fn ok() { 1 }\nthis is not valid gleam @@@"
   let violations = lint.lint_source("bad.gleam", source)
-  // Should not crash, just return empty
-  let assert [] = violations
+  let assert [v] = violations
+  let assert "parse-error" = v.rule
+  // The message names the file, the line:column and the offending token.
+  let assert True = str_contains(v.message, "bad.gleam:2:1")
+  let assert True = str_contains(v.message, "\"this\"")
+}
+
+pub fn unreadable_file_is_violation_test() {
+  let violations = lint.lint_file("test/fixtures/does_not_exist.gleam")
+  let assert [v] = violations
+  let assert "unreadable-path" = v.rule
+}
+
+pub fn discarded_value_in_src_is_violation_test() {
+  let source =
+    "
+pub fn save() {
+  let _ = write()
+  Nil
+}
+"
+  let violations = lint.lint_source("src/beacon/other.gleam", source)
+  let assert [v] = violations
+  let assert "no-discarded-result" = v.rule
+  let assert "3:3" = v.location
+  let assert True = str_contains(v.message, "save")
+}
+
+pub fn named_discard_in_nested_block_is_violation_test() {
+  let source =
+    "
+pub fn save() {
+  case True {
+    True -> {
+      let _ignored = write()
+      Nil
+    }
+    False -> Nil
+  }
+}
+"
+  let violations = lint.lint_source("src/beacon/other.gleam", source)
+  let assert [v] = violations
+  let assert "no-discarded-result" = v.rule
+}
+
+pub fn discard_with_reasoned_opt_out_passes_test() {
+  let source =
+    "
+pub fn save() {
+  // lint:allow-discard the returned count is informational only
+  let _ = decrement()
+  Nil
+}
+"
+  let assert [] = lint.lint_source("src/beacon/other.gleam", source)
+}
+
+pub fn discard_opt_out_without_reason_is_violation_test() {
+  let source =
+    "
+pub fn save() {
+  // lint:allow-discard
+  let _ = decrement()
+  Nil
+}
+"
+  let assert [v] = lint.lint_source("src/beacon/other.gleam", source)
+  let assert "no-discarded-result" = v.rule
+  let assert True = str_contains(v.message, "must give a reason")
+}
+
+pub fn discard_opt_out_must_be_directly_above_test() {
+  let source =
+    "
+pub fn save() {
+  // lint:allow-discard the returned count is informational only
+
+  let _ = decrement()
+  Nil
+}
+"
+  let assert [_] = lint.lint_source("src/beacon/other.gleam", source)
+}
+
+pub fn discard_outside_src_is_not_checked_test() {
+  let source =
+    "
+pub fn save() {
+  let _ = write()
+  Nil
+}
+"
+  let assert [] = lint.lint_source("test/beacon/other_test.gleam", source)
+}
+
+pub fn let_assert_discard_is_not_flagged_test() {
+  let source =
+    "
+pub fn save() {
+  let assert Ok(_) = write()
+  Nil
+}
+"
+  let assert [] = lint.lint_source("src/beacon/other.gleam", source)
 }
 
 pub fn removed_router_api_phrase_is_violation_test() {
