@@ -19,7 +19,25 @@ pub type CounterMsg {
   CounterInc
 }
 
+/// Security limits for simulation apps. Every simulated client connects from
+/// localhost, so the per-IP caps are raised above the largest pool
+/// (1000 connections) the sim tests open.
+pub fn sim_security_limits() -> transport.SecurityLimits {
+  transport.SecurityLimits(
+    ..transport.default_security_limits(),
+    max_connections_per_ip: 10_000,
+    max_ws_connections_per_ip: 10_000,
+  )
+}
+
 pub fn start_counter_app() -> Result(application.App, error.BeaconError) {
+  start_counter_app_with_limits(sim_security_limits())
+}
+
+/// Counter app with explicit security limits (for abuse-policy tests).
+pub fn start_counter_app_with_limits(
+  limits: transport.SecurityLimits,
+) -> Result(application.App, error.BeaconError) {
   let config =
     application.AppConfig(
       port: 0,
@@ -51,7 +69,7 @@ pub fn start_counter_app() -> Result(application.App, error.BeaconError) {
       dynamic_subscriptions: option.None,
       on_notify: option.None,
       on_notification: option.None,
-      security_limits: transport.default_security_limits(),
+      security_limits: limits,
       head_html: option.None,
       api_handler: option.None,
       ws_auth: option.None,
@@ -105,7 +123,7 @@ pub fn start_ticker_app(
       dynamic_subscriptions: option.None,
       on_notify: option.None,
       on_notification: option.None,
-      security_limits: transport.default_security_limits(),
+      security_limits: sim_security_limits(),
       head_html: option.None,
       api_handler: option.None,
       ws_auth: option.None,

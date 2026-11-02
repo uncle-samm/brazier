@@ -91,6 +91,12 @@ pub fn set_active_once(socket: Socket) -> Nil
 @external(erlang, "beacon_ip_ffi", "peer_ip")
 pub fn get_peer_ip(socket: Socket) -> Result(String, String)
 
+/// The local port a connected socket was accepted on. Equals the
+/// listener's bound port, which differs from the configured port when the
+/// listener was started on port 0.
+@external(erlang, "beacon_ip_ffi", "local_port")
+pub fn get_local_port(socket: Socket) -> Result(Int, String)
+
 // --- WebSocket Operations ---
 
 /// Encode text as a WebSocket text frame (server→client, unmasked).

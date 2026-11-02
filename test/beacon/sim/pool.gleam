@@ -9,6 +9,7 @@ import beacon/sim/scenario.{
 }
 import gleam/erlang/process
 import gleam/int
+import gleam/json
 import gleam/string
 
 /// Pool configuration.
@@ -324,9 +325,11 @@ fn execute_action(
           let event_msg =
             "{\"type\":\"event\",\"name\":\"click\",\"handler_id\":\""
             <> handler_id
-            <> "\",\"data\":\""
-            <> data
-            <> "\",\"target_path\":\"0\",\"clock\":1}"
+            <> "\",\"data\":"
+            // `data` is itself JSON: encode it as a JSON string so the
+            // quotes inside it are escaped and the message stays valid.
+            <> json.to_string(json.string(data))
+            <> ",\"target_path\":\"0\",\"clock\":1}"
           let msg_bytes = string.byte_size(event_msg)
           case ws_send(s, event_msg) {
             Ok(_) -> {

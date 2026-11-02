@@ -5,7 +5,8 @@
 %% is dual-stack.
 -export([
     parse_cidrs/1, cidrs_match/2, parse_ip/1, ip_to_string/1,
-    peer_ip/1, peer_ip_tuple/1, normalize/1, parse_ip_tuple_result/1
+    peer_ip/1, peer_ip_tuple/1, normalize/1, parse_ip_tuple_result/1,
+    local_port/1
 ]).
 
 %% Parse a list of CIDR or single-address strings.
@@ -124,4 +125,18 @@ peer_ip_tuple(Socket) ->
     catch
         Class:Err ->
             {error, list_to_binary(io_lib:format("peername raised ~p:~p", [Class, Err]))}
+    end.
+
+%% Local (listening) port of a connected socket. Used to scope per-listener
+%% state such as per-IP WebSocket slots when the listener bound port 0.
+local_port(Socket) ->
+    try inet:sockname(Socket) of
+        {ok, {_Ip, Port}} when is_integer(Port) -> {ok, Port};
+        {ok, Other} ->
+            {error, list_to_binary(io_lib:format("unsupported local address: ~p", [Other]))};
+        {error, Reason} ->
+            {error, list_to_binary(io_lib:format("sockname failed: ~p", [Reason]))}
+    catch
+        Class:Err ->
+            {error, list_to_binary(io_lib:format("sockname raised ~p:~p", [Class, Err]))}
     end.
