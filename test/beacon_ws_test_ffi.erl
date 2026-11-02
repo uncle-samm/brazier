@@ -16,8 +16,25 @@
     process_count/0,
     recv_buffer_small_connect/2,
     run_parallel/2,
-    monotonic_us/0
+    monotonic_us/0,
+    all_processes/0,
+    suspend/1,
+    resume/1,
+    blocked_in_accept/1
 ]).
+
+%% True when Pid is an idle acceptor waiting in gen_tcp:accept (the server
+%% spawns a replacement acceptor for every accepted connection).
+blocked_in_accept(Pid) ->
+    case erlang:process_info(Pid, current_stacktrace) of
+        {current_stacktrace, Frames} ->
+            lists:any(fun({M, F, _, _}) ->
+                              (M =:= prim_inet orelse M =:= inet_tcp
+                               orelse M =:= inet6_tcp orelse M =:= gen_tcp)
+                                  andalso (F =:= accept orelse F =:= accept0)
+                      end, Frames);
+        undefined -> false
+    end.
 
 %% Wait for a session revocation message in the calling process.
 receive_revoked(TimeoutMs) ->
@@ -213,3 +230,18 @@ run_parallel(N, Fun) ->
 
 format(Reason) when is_atom(Reason) -> atom_to_binary(Reason, utf8);
 format(Reason) -> list_to_binary(io_lib:format("~p", [Reason])).
+
+%% Every live process on the node.
+all_processes() ->
+    erlang:processes().
+
+%% Suspend / resume a process (to build up its mailbox deterministically).
+suspend(Pid) ->
+    case erlang:suspend_process(Pid) of
+        true -> {ok, nil};
+        false -> {error, nil}
+    end.
+
+resume(Pid) ->
+    true = erlang:resume_process(Pid),
+    {ok, nil}.
