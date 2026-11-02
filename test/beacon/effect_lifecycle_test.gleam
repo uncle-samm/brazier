@@ -21,6 +21,11 @@ fn effect_guardian(worker: Pid) -> Result(Pid, Nil)
 @external(erlang, "beacon_effect_test_ffi", "pg_members")
 fn pg_members(topic: String) -> List(Pid)
 
+/// Wait on pg's group monitor until the topic is empty; returns the
+/// members still present at the deadline.
+@external(erlang, "beacon_effect_test_ffi", "await_pg_empty")
+fn await_pg_empty(topic: String, timeout_ms: Int) -> List(Pid)
+
 const down_timeout_ms = 2000
 
 /// Wait until every pid has exited, asserting via monitors. Fails the test
@@ -338,7 +343,7 @@ pub fn runtime_kill_reaps_all_owned_processes_test() {
   let #(_subject, runtime_pid, owned) = start_lifecycle_runtime(topic)
   process.kill(runtime_pid)
   assert_all_down([runtime_pid, ..owned])
-  let assert [] = pg_members(topic)
+  let assert [] = await_pg_empty(topic, down_timeout_ms)
 }
 
 pub fn runtime_crash_reaps_all_owned_processes_test() {
@@ -346,7 +351,7 @@ pub fn runtime_crash_reaps_all_owned_processes_test() {
   let #(_subject, runtime_pid, owned) = start_lifecycle_runtime(topic)
   process.send_abnormal_exit(runtime_pid, "simulated runtime crash")
   assert_all_down([runtime_pid, ..owned])
-  let assert [] = pg_members(topic)
+  let assert [] = await_pg_empty(topic, down_timeout_ms)
 }
 
 pub fn runtime_shutdown_reaps_all_owned_processes_test() {
@@ -354,7 +359,7 @@ pub fn runtime_shutdown_reaps_all_owned_processes_test() {
   let #(subject, runtime_pid, owned) = start_lifecycle_runtime(topic)
   process.send(subject, runtime.Shutdown)
   assert_all_down([runtime_pid, ..owned])
-  let assert [] = pg_members(topic)
+  let assert [] = await_pg_empty(topic, down_timeout_ms)
 }
 
 pub fn listener_crash_is_loud_and_takes_runtime_down_test() {
