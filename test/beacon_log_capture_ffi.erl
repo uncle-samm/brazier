@@ -1,53 +1,41 @@
-%% Captures the log events the calling process emits while a function runs.
-%%
-%% The test runner sets the primary logger level to `none`. `capture/1`
-%% raises it to `all` for the duration of the call, installs a handler that
-%% forwards only events logged by the calling process, and restores the
-%% previous level and removes the handler afterwards, even when the function
-%% crashes. Handlers run in the logging process, so every event is in the
-%% mailbox by the time the function returns.
 -module(beacon_log_capture_ffi).
+%% Capture logger output produced while a function runs, for tests that
+%% assert a warning or error was logged. The test runner sets the primary
+%% level to `none`; capture raises it for the duration of the call and
+%% restores it afterwards, even when the function crashes.
 -export([capture/1, log/2]).
 
 capture(Fun) ->
-    Id = list_to_atom(
-        "beacon_log_capture_" ++ integer_to_list(erlang:unique_integer([positive]))
-    ),
+    Id = list_to_atom("beacon_log_capture_" ++ integer_to_list(erlang:unique_integer([positive]))),
     #{level := PreviousLevel} = logger:get_primary_config(),
-    ok = logger:add_handler(Id, ?MODULE, #{
-        level => all,
-        filter_default => log,
-        filters => [],
-        config => #{target => self()}
-    }),
+    ok = logger:add_handler(Id, ?MODULE, #{level => all, config => #{pid => self(), id => Id}}),
     ok = logger:set_primary_config(level, all),
-    Result =
-        try
-            Fun()
-        after
-            ok = logger:set_primary_config(level, PreviousLevel),
-            ok = logger:remove_handler(Id)
-        end,
-    {Result, drain(Id, [])}.
-
-%% logger handler callback.
-log(#{level := Level, msg := Msg, meta := Meta}, #{id := Id, config := #{target := Target}}) ->
-    case maps:get(pid, Meta, undefined) of
-        Target -> Target ! {beacon_captured_log, Id, atom_to_binary(Level), format(Msg)};
-        _ -> ok
+    Result = try
+        Fun()
+    after
+        ok = logger:set_primary_config(level, PreviousLevel),
+        ok = logger:remove_handler(Id)
     end,
+    {Result, collect(Id, [])}.
+
+%% Logger handler callback: runs in the logging process.
+log(#{level := Level, msg := Msg, meta := Meta}, #{config := #{pid := Pid, id := Id}}) ->
+    Pid ! {beacon_captured_log, Id, {atom_to_binary(Level, utf8), format(Msg, Meta)}},
     ok.
 
-drain(Id, Acc) ->
+collect(Id, Acc) ->
     receive
-        {beacon_captured_log, Id, Level, Text} -> drain(Id, [{Level, Text} | Acc])
+        {beacon_captured_log, Id, Entry} -> collect(Id, [Entry | Acc])
     after 0 ->
         lists:reverse(Acc)
     end.
 
-format({string, Chardata}) ->
-    unicode:characters_to_binary(Chardata);
-format({report, Report}) ->
+format({string, String}, _Meta) ->
+    unicode:characters_to_binary(String);
+format({report, Report}, #{report_cb := Callback}) when is_function(Callback, 1) ->
+    {Format, Args} = Callback(Report),
+    unicode:characters_to_binary(io_lib:format(Format, Args));
+format({report, Report}, _Meta) ->
     unicode:characters_to_binary(io_lib:format("~p", [Report]));
-format({Format, Args}) ->
+format({Format, Args}, _Meta) ->
     unicode:characters_to_binary(io_lib:format(Format, Args)).

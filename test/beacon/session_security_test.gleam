@@ -95,7 +95,7 @@ pub fn sweep_removes_expired_sessions_test() {
   should.equal(session.count(store), 2)
   sleep_ms(80)
   let live = session.create(store)
-  should.equal(session.sweep_expired(store), 2)
+  should.equal(session.sweep_expired(store), Ok(2))
   should.equal(session.count(store), 1)
   let assert Some(_) = session.get(store, live.id)
 }

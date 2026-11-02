@@ -1,5 +1,10 @@
 /// Shared state store — provides ETS-backed storage without user FFI.
 /// Stores auto-broadcast via PubSub when data changes.
+///
+/// Stores are node-local: each node has its own table, and change
+/// notifications use `pubsub.local_broadcast`, so they reach only watchers
+/// on the node whose table changed. (A cluster-wide notification would make
+/// every other node re-read its own, unchanged table.)
 /// To react to changes, return `store.topic(s)` / `store.list_topic(s)` from
 /// `beacon.subscriptions` and handle it in `beacon.on_notify`.
 ///
@@ -14,7 +19,9 @@
 import beacon/log
 import beacon/pubsub
 import beacon/state_manager
+import beacon/telemetry
 import gleam/list
+import gleam/string
 
 /// Why a store could not be created. Names must be 1-255 bytes of
 /// `[A-Za-z0-9_-]` once prefixed (they become ETS table atoms).
@@ -90,14 +97,16 @@ pub fn get(store: Store(value), key: String) -> Result(value, Nil) {
 pub fn put(store: Store(value), key: String, value: value) -> Nil {
   log.debug("beacon.store", "put: " <> key)
   state_manager.ets_put(store.manager, key, value)
-  pubsub.broadcast(store.topic, Nil)
+  wrote(store.topic, "put", 1)
+  notify(store.topic)
 }
 
 /// Delete a value by key. Auto-broadcasts to watchers.
 pub fn delete(store: Store(value), key: String) -> Nil {
   log.debug("beacon.store", "delete: " <> key)
   state_manager.ets_delete(store.manager, key)
-  pubsub.broadcast(store.topic, Nil)
+  wrote(store.topic, "delete", 1)
+  notify(store.topic)
 }
 
 /// Count total entries.
@@ -144,7 +153,8 @@ pub fn new_list(name: String) -> ListStore(value) {
 pub fn append(store: ListStore(value), key: String, value: value) -> Nil {
   log.debug("beacon.store", "append")
   list_store_append_ffi(store.table, key, value)
-  pubsub.broadcast(store.topic, Nil)
+  wrote(store.topic, "append", 1)
+  notify(store.topic)
 }
 
 /// Append multiple values at once. Only broadcasts ONCE after all inserts.
@@ -156,7 +166,8 @@ pub fn append_many(
 ) -> Nil {
   log.debug("beacon.store", "append_many")
   list.each(values, fn(v) { list_store_append_ffi(store.table, key, v) })
-  pubsub.broadcast(store.topic, Nil)
+  wrote(store.topic, "append", list.length(values))
+  notify(store.topic)
 }
 
 /// Append a value and broadcast to both the store topic AND a per-key topic.
@@ -169,9 +180,11 @@ pub fn append_notify(
   topic_prefix: String,
 ) -> Nil {
   log.debug("beacon.store", "append_notify")
+  let key_topic = checked_key_topic(topic_prefix, key)
   list_store_append_ffi(store.table, key, value)
-  pubsub.broadcast(store.topic, Nil)
-  pubsub.broadcast(topic_prefix <> key, Nil)
+  wrote(store.topic, "append", 1)
+  notify(store.topic)
+  notify(key_topic)
 }
 
 /// Get all values for a key.
@@ -184,7 +197,8 @@ pub fn get_all(store: ListStore(value), key: String) -> List(value) {
 pub fn delete_all(store: ListStore(value), key: String) -> Nil {
   log.debug("beacon.store", "delete_all")
   list_store_delete_ffi(store.table, key)
-  pubsub.broadcast(store.topic, Nil)
+  wrote(store.topic, "delete_all", 1)
+  notify(store.topic)
 }
 
 /// Delete all values for a key and broadcast to a per-key topic.
@@ -194,14 +208,68 @@ pub fn delete_all_notify(
   topic_prefix: String,
 ) -> Nil {
   log.debug("beacon.store", "delete_all_notify")
+  let key_topic = checked_key_topic(topic_prefix, key)
   list_store_delete_ffi(store.table, key)
-  pubsub.broadcast(store.topic, Nil)
-  pubsub.broadcast(topic_prefix <> key, Nil)
+  wrote(store.topic, "delete_all", 1)
+  notify(store.topic)
+  notify(key_topic)
 }
 
 /// Get the PubSub topic for this list store (return it from `beacon.subscriptions`).
 pub fn list_topic(store: ListStore(value)) -> String {
   store.topic
+}
+
+// === Notifications ===
+
+/// Tell this node's watchers of `topic` that the store changed.
+fn notify(topic: String) -> Nil {
+  let outcome = pubsub.local_broadcast(topic, Nil)
+  case outcome {
+    Ok(Nil) -> Nil
+    Error(reason) ->
+      log.error(
+        "beacon.store",
+        "Change notification on "
+          <> topic
+          <> " failed: "
+          <> pubsub.describe(reason),
+      )
+  }
+  // INVARIANT: the write has happened; a watcher that is never told would
+  // show stale data forever, so a failed notification crashes the writer.
+  let assert Ok(Nil) = outcome
+  Nil
+}
+
+/// The per-key topic `prefix <> key`, checked BEFORE the write so an
+/// invalid topic never leaves a written but unannounced change.
+fn checked_key_topic(prefix: String, key: String) -> String {
+  let key_topic = prefix <> key
+  let outcome = pubsub.validate_topic(key_topic)
+  case outcome {
+    Ok(Nil) -> Nil
+    Error(reason) ->
+      log.error(
+        "beacon.store",
+        "Refusing a write with an invalid per-key topic: "
+          <> pubsub.describe(reason),
+      )
+  }
+  // INVARIANT: the Nil-returning write API cannot report the error, and
+  // the topic prefix and key come from the application: crash loudly.
+  let assert Ok(Nil) = outcome
+  key_topic
+}
+
+/// `[beacon, store, write]` for a node-local store.
+fn wrote(topic: String, op: String, count: Int) -> Nil {
+  telemetry.store_write(count, store_name(topic), op, "local")
+}
+
+/// Every store topic is `"store:" <> name` (see `try_new`/`try_new_list`).
+fn store_name(topic: String) -> String {
+  string.drop_start(topic, 6)
 }
 
 // === Internal FFI ===

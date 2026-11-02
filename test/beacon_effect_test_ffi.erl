@@ -16,30 +16,28 @@ effect_guardian(Worker) ->
             {error, nil}
     end.
 
-%% Members of a Beacon PubSub topic (pg group in the beacon_pg scope).
+%% Local subscribers of a Beacon PubSub topic.
 pg_members(Topic) ->
-    pg:get_members(beacon_pg, Topic).
+    {ok, Pids} = beacon_pubsub_ffi:local_subscribers(Topic),
+    Pids.
 
-%% Wait until a topic has no members. pg removes a dead member when its own
-%% DOWN message is processed, which can trail the DOWN the test receives, so
-%% this waits on pg's group monitor (explicit leave notifications) instead of
-%% polling. Returns the members still present at the deadline ([] on success).
+%% Wait until a topic has no local subscribers. The registry partition
+%% removes a dead subscriber when it handles the subscriber's 'EXIT', which
+%% can trail the DOWN the test receives, so this polls the registry until
+%% the deadline. Returns the subscribers still present at the deadline
+%% ([] on success).
 await_pg_empty(Topic, TimeoutMs) ->
-    {Ref, Members} = pg:monitor(beacon_pg, Topic),
-    Deadline = erlang:monotonic_time(millisecond) + TimeoutMs,
-    Result = await_pg_leaves(Ref, Topic, Members, Deadline),
-    ok = pg:demonitor(beacon_pg, Ref),
-    Result.
+    await_pg_empty_until(Topic, erlang:monotonic_time(millisecond) + TimeoutMs).
 
-await_pg_leaves(_Ref, _Topic, [], _Deadline) ->
-    [];
-await_pg_leaves(Ref, Topic, Members, Deadline) ->
-    Remaining = max(0, Deadline - erlang:monotonic_time(millisecond)),
-    receive
-        {Ref, leave, Topic, Left} ->
-            await_pg_leaves(Ref, Topic, Members -- Left, Deadline);
-        {Ref, join, Topic, Joined} ->
-            await_pg_leaves(Ref, Topic, Members ++ Joined, Deadline)
-    after Remaining ->
-        Members
+await_pg_empty_until(Topic, Deadline) ->
+    case pg_members(Topic) of
+        [] ->
+            [];
+        Members ->
+            case erlang:monotonic_time(millisecond) >= Deadline of
+                true ->
+                    Members;
+                false ->
+                    receive after 5 -> await_pg_empty_until(Topic, Deadline) end
+            end
     end.

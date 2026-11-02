@@ -29,5 +29,5 @@ pub fn has(
   })
 }
 
-@external(erlang, "beacon_log_capture_ffi", "capture")
+@external(erlang, "beacon_own_log_capture_ffi", "capture")
 fn do_capture(fun: fn() -> a) -> #(a, List(#(String, String)))

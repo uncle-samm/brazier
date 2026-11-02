@@ -7,23 +7,28 @@
     session_ets_touch/3,
     session_ets_delete/2,
     session_ets_delete_if_version/3,
-    session_ets_expired_ids/3,
+    session_ets_expired_ids/4,
     session_ets_size/1,
     table_name/1,
     now_ms/0,
     generate_session_id/0,
     binding_fingerprint/1,
     constant_time_equal/2,
+    ensure_registry/0,
     bind_process/3,
     bound_process_count/2,
     notify_revoked/3,
-    start_sweeper/3
+    notify_revoked_local/3,
+    local_bound_sessions/1,
+    start_maintenance/4
 ]).
 
 %% Session rows are stored as:
 %%   {Id, Version, CreatedAtMs, LastSeenMs, Session}
 %% where Session is the Gleam `Session(id, data)` record and all times are
-%% erlang:monotonic_time(millisecond). Version increases on every data write
+%% erlang:system_time(millisecond), so rows written by different nodes (or
+%% read back from an External backend) compare. beacon/session allows
+%% clock_skew_tolerance_ms of difference between node clocks. Version increases on every data write
 %% so updates can be applied with an atomic compare-and-swap (select_replace).
 %%
 %% SECURITY: Atom creation constraint.
@@ -60,7 +65,7 @@ table_name(Table) ->
     atom_to_binary(ets:info(Table, name), utf8).
 
 now_ms() ->
-    erlang:monotonic_time(millisecond).
+    erlang:system_time(millisecond).
 
 %% Insert a brand new row. Returns false if the id already exists (a 256-bit
 %% random collision), so the caller can crash loudly instead of overwriting.
@@ -96,13 +101,19 @@ session_ets_delete(Table, Id) ->
 session_ets_delete_if_version(Table, Id, Version) ->
     ets:select_delete(Table, [{{Id, Version, '_', '_', '_'}, [], [true]}]) =:= 1.
 
-%% Ids (with their versions) whose absolute or idle deadline has passed.
-session_ets_expired_ids(Table, AbsoluteCutoffMs, IdleCutoffMs) ->
-    ets:select(Table, [{
+%% Up to Limit ids (with their versions) whose absolute or idle deadline has
+%% passed (`=<` matches the `>=` lifetime check in beacon/session).
+session_ets_expired_ids(Table, AbsoluteCutoffMs, IdleCutoffMs, Limit)
+        when is_integer(Limit), Limit > 0 ->
+    MatchSpec = [{
         {'$1', '$2', '$3', '$4', '_'},
-        [{'orelse', {'<', '$3', AbsoluteCutoffMs}, {'<', '$4', IdleCutoffMs}}],
+        [{'orelse', {'=<', '$3', AbsoluteCutoffMs}, {'=<', '$4', IdleCutoffMs}}],
         [{{'$1', '$2'}}]
-    }]).
+    }],
+    case ets:select(Table, MatchSpec, Limit) of
+        {Rows, _Continuation} -> Rows;
+        '$end_of_table' -> []
+    end.
 
 session_ets_size(Table) ->
     ets:info(Table, size).
@@ -131,22 +142,33 @@ constant_time_equal(_, _) ->
 
 %% --- Live-connection registry (pg) ---
 %% Processes bound to a session (WebSocket handlers) join the pg group
-%% {beacon_session, TableName, SessionId}. pg removes members automatically
-%% when they exit, so the registry cannot leak dead processes.
+%% {beacon_session, Namespace, SessionId} in the beacon_session_pg scope.
+%% pg removes members when they exit or when their node disconnects, so the
+%% registry cannot leak dead processes. Namespace is the same on every node
+%% for a shared (External) store, so a revocation on one node reaches the
+%% sockets bound on all of them (pg:get_members is cluster-wide).
+%%
+%% The scope process is started unlinked on first use (store creation) so it
+%% outlives short-lived callers; beacon's supervision tree should own it.
 
-ensure_pg() ->
+ensure_registry() ->
     case pg:start(?PG_SCOPE) of
-        {ok, _Pid} -> ok;
-        {error, {already_started, _Pid}} -> ok
+        {ok, _Pid} ->
+            logger:info(#{module => beacon_session_ffi,
+                          msg => <<"Started session registry scope">>,
+                          scope => ?PG_SCOPE}),
+            nil;
+        {error, {already_started, _Pid}} ->
+            nil
     end.
 
-group(TableName, SessionId) ->
-    {beacon_session, TableName, SessionId}.
+group(Namespace, SessionId) ->
+    {beacon_session, Namespace, SessionId}.
 
-%% Idempotently bind Pid to the session. Returns the member count.
-bind_process(TableName, SessionId, Pid) ->
-    ensure_pg(),
-    Group = group(TableName, SessionId),
+%% Idempotently bind Pid to the session. Returns the local member count.
+bind_process(Namespace, SessionId, Pid) ->
+    ensure_registry(),
+    Group = group(Namespace, SessionId),
     Members = pg:get_local_members(?PG_SCOPE, Group),
     case lists:member(Pid, Members) of
         true -> length(Members);
@@ -155,34 +177,96 @@ bind_process(TableName, SessionId, Pid) ->
             length(Members) + 1
     end.
 
-bound_process_count(TableName, SessionId) ->
-    ensure_pg(),
-    length(pg:get_local_members(?PG_SCOPE, group(TableName, SessionId))).
+%% Bound processes on this node only.
+bound_process_count(Namespace, SessionId) ->
+    ensure_registry(),
+    length(pg:get_local_members(?PG_SCOPE, group(Namespace, SessionId))).
 
-%% Send {beacon_session_revoked, SessionId, Reason} to every bound process.
-%% Returns the number of processes notified.
-notify_revoked(TableName, SessionId, Reason) ->
-    ensure_pg(),
-    Members = pg:get_local_members(?PG_SCOPE, group(TableName, SessionId)),
+%% Send {beacon_session_revoked, SessionId, Reason} to every bound process on
+%% every connected node. Returns the number of processes notified.
+notify_revoked(Namespace, SessionId, Reason) ->
+    ensure_registry(),
+    send_revoked(pg:get_members(?PG_SCOPE, group(Namespace, SessionId)),
+                 SessionId, Reason).
+
+%% The same, for processes on this node only (the nodeup re-check).
+notify_revoked_local(Namespace, SessionId, Reason) ->
+    ensure_registry(),
+    send_revoked(pg:get_local_members(?PG_SCOPE, group(Namespace, SessionId)),
+                 SessionId, Reason).
+
+send_revoked(Members, SessionId, Reason) ->
     lists:foreach(fun(Pid) ->
         Pid ! {beacon_session_revoked, SessionId, Reason}
     end, Members),
     length(Members).
 
-%% --- Expiry sweeper ---
-%% An unlinked process that runs SweepFun every IntervalMs and exits when
-%% Owner (the process that owns the ETS table) exits. Unlinked so a sweeper
-%% crash never kills the owner; monitored so it never outlives the table.
-start_sweeper(Owner, IntervalMs, SweepFun) when is_integer(IntervalMs), IntervalMs > 0 ->
+%% Session ids in Namespace with at least one bound process on this node.
+local_bound_sessions(Namespace) ->
+    ensure_registry(),
+    [Id || {beacon_session, Ns, Id} = Group <- pg:which_groups(?PG_SCOPE),
+           Ns =:= Namespace,
+           pg:get_local_members(?PG_SCOPE, Group) =/= []].
+
+%% --- Maintenance process ---
+%% An unlinked process per store that
+%%   - runs SweepFun every IntervalMs (timer via send_after, so other
+%%     messages do not postpone the sweep), and
+%%   - runs RecheckFun(Node) when a node connects (net_kernel:monitor_nodes),
+%%     coalescing nodeups that are already queued into one re-check;
+%% and exits when Owner (the process that created the store) exits.
+%% Unlinked so a crash never kills the owner; monitored so it never outlives
+%% the store. A crash inside either fun is logged and the loop continues:
+%% the funs log their own failures, so a crash here is a bug worth an error
+%% line, but stopping expiry for the life of the store would be worse.
+start_maintenance(Owner, IntervalMs, SweepFun, RecheckFun)
+        when is_integer(IntervalMs), IntervalMs > 0 ->
     spawn(fun() ->
         Ref = erlang:monitor(process, Owner),
-        sweeper_loop(Ref, IntervalMs, SweepFun)
+        ok = net_kernel:monitor_nodes(true),
+        erlang:send_after(IntervalMs, self(), beacon_session_sweep),
+        maintenance_loop(Ref, IntervalMs, SweepFun, RecheckFun)
     end).
 
-sweeper_loop(Ref, IntervalMs, SweepFun) ->
+maintenance_loop(Ref, IntervalMs, SweepFun, RecheckFun) ->
     receive
-        {'DOWN', Ref, process, _, _} -> ok
-    after IntervalMs ->
-        SweepFun(),
-        sweeper_loop(Ref, IntervalMs, SweepFun)
+        {'DOWN', Ref, process, _, Reason} ->
+            logger:debug(#{module => beacon_session_ffi,
+                           msg => <<"Session store owner exited; stopping maintenance">>,
+                           reason => Reason}),
+            ok;
+        beacon_session_sweep ->
+            run_guarded(sweep, fun() -> SweepFun() end),
+            erlang:send_after(IntervalMs, self(), beacon_session_sweep),
+            maintenance_loop(Ref, IntervalMs, SweepFun, RecheckFun);
+        {nodeup, Node} ->
+            Last = drain_nodeups(Node),
+            run_guarded(recheck, fun() -> RecheckFun(Last) end),
+            maintenance_loop(Ref, IntervalMs, SweepFun, RecheckFun);
+        {nodedown, _Node} ->
+            %% pg drops the remote members itself; nothing to do here.
+            maintenance_loop(Ref, IntervalMs, SweepFun, RecheckFun);
+        Other ->
+            logger:warning(#{module => beacon_session_ffi,
+                             msg => <<"Session maintenance got an unexpected message">>,
+                             message => Other}),
+            maintenance_loop(Ref, IntervalMs, SweepFun, RecheckFun)
+    end.
+
+%% Take the nodeups already in the mailbox; one re-check covers them all.
+drain_nodeups(Node) ->
+    receive
+        {nodeup, Next} -> drain_nodeups(Next)
+    after 0 -> Node
+    end.
+
+run_guarded(What, Fun) ->
+    try
+        Fun()
+    catch
+        Class:Reason:Stack ->
+            logger:error(#{module => beacon_session_ffi,
+                           msg => <<"Session maintenance task crashed">>,
+                           task => What, class => Class,
+                           reason => Reason, stacktrace => Stack})
     end.
