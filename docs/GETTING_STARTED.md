@@ -69,7 +69,18 @@ pub fn main() {
 
 ### 4. Run it
 
+During development, run dev mode. It builds the app, starts it, and rebuilds
+whenever a `.gleam` file changes:
+
 ```bash
+gleam run -m beacon/dev
+```
+
+To run without dev mode, build first and then run. `beacon.start` refuses to
+start without the build's output:
+
+```bash
+gleam run -m beacon/build
 gleam run
 ```
 
@@ -500,13 +511,22 @@ docker run -p 8080:8080 -e SECRET_KEY=your-secret my_app
 
 ## Build Tool
 
-Compile user code to JavaScript for client-side execution:
+Generate the server codec and compile your view and update code to JavaScript
+for the browser:
 
 ```bash
 gleam run -m beacon/build
 ```
 
-This creates a content-hashed file like `priv/static/beacon_client_HASH.js` — local events run in the browser with zero server traffic.
+This writes `src/beacon_codec.gleam` and a content-hashed bundle like
+`priv/static/beacon_client_HASH.js`; local events then run in the browser with
+no server traffic. It finds the app module in `src/`; when more than one
+module could be the app, name it with
+`gleam run -m beacon/build -- src/my_app.gleam`. It needs `node` and `npx`. On any failure
+it prints the reason (file and location for parse errors, type and field for
+unsupported Model fields) and exits with status 1. Run it before `gleam run`
+and in every deployment; `beacon.start` never builds. See
+[DEPLOYMENT.md](DEPLOYMENT.md).
 
 ## Development Mode
 
@@ -516,14 +536,19 @@ For a fast feedback loop during development:
 gleam run -m beacon/dev
 ```
 
-This starts your app with file watching and hot module reload:
+Dev mode is the only place Beacon builds automatically:
 
-- Watches `.gleam` files for changes, auto-rebuilds server + client
-- Hot-swaps BEAM modules without restarting — no lost WebSocket connections
-- Notifies connected browsers to reload automatically
-- Uses native file watchers (`fswatch` on macOS, `inotifywait` on Linux) or a polling watcher when native tooling is unavailable
+- Runs the build, then starts the app module's `main`. If the first build
+  fails, dev mode exits with status 1.
+- Watches `src/` for `.gleam` changes with `fswatch` (macOS) or `inotifywait`
+  (Linux), or by polling every 500ms when neither is installed.
+- On each change, rebuilds and hot-loads the changed BEAM modules into the
+  running app, without restarting it.
+- A failed rebuild is logged and the app keeps running the last good build.
+- Connected browsers are not reloaded automatically yet; refresh the page to
+  pick up client-side changes.
 
-For production, use `gleam run` directly — no file watcher, no HMR overhead.
+For production, run `gleam run -m beacon/build` once, then `gleam run`.
 
 ## Server Privacy
 
