@@ -109,9 +109,13 @@ pub fn count(
 
 // --- ETS-Based State Manager ---
 
-/// An ETS-based state manager that persists state in an ETS table.
-/// ETS tables are owned by the process that creates them, so use
-/// a supervisor to ensure the table survives process crashes.
+/// An ETS-based state manager that persists state in a named, public ETS
+/// table.
+///
+/// The table is owned by a long-lived, node-wide owner process rather than
+/// the caller, so it survives the process that created it (a request handler,
+/// a runtime, a test). Creation is idempotent: starting a manager with a name
+/// that already exists returns the same table.
 ///
 /// Note: ETS tables use Erlang terms, so state must be serializable.
 /// The table is `public` so any process can read/write.
@@ -122,12 +126,89 @@ pub type EtsManager {
 /// Opaque reference to an ETS table.
 pub type EtsTable
 
-/// Start an ETS-based state manager.
-/// The table name must be unique across the BEAM node.
-pub fn start_ets(table_name: String) -> EtsManager {
+/// Why an ETS table could not be created or reused.
+pub type EtsError {
+  /// The name is not 1-255 bytes of `[A-Za-z0-9_-]` (names become atoms).
+  InvalidTableName(name: String, reason: String)
+  /// A table with this name already exists with a different type, e.g. a
+  /// `set` where a `duplicate_bag` was requested.
+  TableTypeMismatch(name: String, expected: String, found: String)
+  /// The table owner process could not create the table.
+  TableOwnerUnavailable(name: String, reason: String)
+}
+
+/// The ETS table type to create.
+pub type EtsTableType {
+  /// One value per key.
+  EtsSet
+  /// Any number of values per key, duplicates kept, insertion order kept.
+  EtsDuplicateBag
+}
+
+/// Create (or reuse) a named ETS table of the given type, owned by the
+/// long-lived table owner.
+pub fn ensure_table(
+  table_name: String,
+  table_type: EtsTableType,
+) -> Result(EtsTable, EtsError) {
+  case ets_ensure_table(table_name, table_type) {
+    Ok(table) -> {
+      log.debug("beacon.state_manager", "ETS table ready: " <> table_name)
+      Ok(table)
+    }
+    Error(err) -> {
+      log.error(
+        "beacon.state_manager",
+        "ETS table "
+          <> table_name
+          <> " unavailable: "
+          <> describe_ets_error(err),
+      )
+      Error(err)
+    }
+  }
+}
+
+/// Human-readable description of an `EtsError`, for logs and messages.
+pub fn describe_ets_error(err: EtsError) -> String {
+  case err {
+    InvalidTableName(name:, reason:) ->
+      "invalid table name \"" <> name <> "\": " <> reason
+    TableTypeMismatch(name:, expected:, found:) ->
+      "table \""
+      <> name
+      <> "\" already exists as "
+      <> found
+      <> ", expected "
+      <> expected
+    TableOwnerUnavailable(name:, reason:) ->
+      "table owner could not create \"" <> name <> "\": " <> reason
+  }
+}
+
+/// Start (or reuse) an ETS-based state manager.
+/// Calling this twice with the same name returns the same table.
+pub fn try_start_ets(table_name: String) -> Result(EtsManager, EtsError) {
   log.info("beacon.state_manager", "Starting ETS state manager: " <> table_name)
-  let table = ets_new_table(table_name)
-  EtsManager(table: table)
+  case ensure_table(table_name, EtsSet) {
+    Ok(table) -> Ok(EtsManager(table: table))
+    Error(err) -> Error(err)
+  }
+}
+
+/// Start (or reuse) an ETS-based state manager.
+///
+/// Table names are developer-supplied constants, so an `EtsError` here is a
+/// programming error (an invalid name, or a name already used by a table of
+/// another type). It is logged and then crashes the caller loudly; use
+/// `try_start_ets` to handle it as a value instead.
+pub fn start_ets(table_name: String) -> EtsManager {
+  let result = try_start_ets(table_name)
+  // Invariant: table names are compile-time constants chosen by the
+  // developer; a failure is a bug to surface at startup, already logged by
+  // ensure_table above.
+  let assert Ok(manager) = result as "beacon.state_manager.start_ets failed"
+  manager
 }
 
 /// Store state in the ETS table.
@@ -150,8 +231,11 @@ pub fn ets_count(manager: EtsManager) -> Int {
   ets_ffi_count(manager.table)
 }
 
-@external(erlang, "beacon_ets_ffi", "new_table")
-fn ets_new_table(name: String) -> EtsTable
+@external(erlang, "beacon_ets_ffi", "ensure_table")
+fn ets_ensure_table(
+  name: String,
+  table_type: EtsTableType,
+) -> Result(EtsTable, EtsError)
 
 @external(erlang, "beacon_ets_ffi", "put")
 fn ets_ffi_put(table: EtsTable, key: String, value: state) -> Nil

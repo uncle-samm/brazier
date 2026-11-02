@@ -46,23 +46,61 @@ ETS-backed stores visible to all connections. Auto-broadcasts via PubSub on muta
 
 ```gleam
 import beacon/store
-let s = store.new("settings")       // Create store
+let s = store.new("settings")       // Create (or reuse) the store
 store.put(s, "theme", "dark")       // Set (auto-broadcasts)
 store.get(s, "theme")               // Ok("dark")
 store.delete(s, "theme")            // Remove (auto-broadcasts)
 ```
 
+Creation is **idempotent**: `store.new("settings")` called again -- from any
+process, at any time -- returns a handle to the same data. The backing ETS
+tables are owned by a long-lived Beacon table-owner process, not by the
+caller, so a store created inside a request handler, a runtime or `init`
+survives that process exiting.
+
+Store names are developer-chosen constants: 1-255 bytes of `[A-Za-z0-9_-]`
+(they become ETS table atoms; never derive a name from user input).
+`store.new` / `store.new_list` log and crash loudly on an invalid name; use
+`store.try_new` / `store.try_new_list` to get a typed
+`Result(_, store.StoreError)` instead:
+
+```gleam
+case store.try_new(name) {
+  Ok(s) -> use_store(s)
+  Error(err) -> log.error("app", state_manager.describe_ets_error(err))
+}
+```
+
+A `Store` and a `ListStore` with the same name are separate tables, but they
+share the PubSub topic `"store:" <> name`.
+
 ### List Store
 
-Multiple values per key (ETS bag). Good for chat messages and logs.
+Any number of values per key (ETS `duplicate_bag`). Good for chat messages
+and logs: appending the same value twice stores it twice, and `get_all`
+returns values in insertion order.
 
 ```gleam
 let msgs = store.new_list("messages")
 store.append(msgs, "room1", msg)           // Add value
-store.get_all(msgs, "room1")               // All values for key
+store.get_all(msgs, "room1")               // All values for key, oldest first
 store.append_many(msgs, "room1", [a, b])   // Bulk insert, broadcasts once
 store.delete_all(msgs, "room1")            // Remove all for key
 store.append_notify(msgs, room_id, msg, "room:")  // Also broadcasts to "room:{room_id}"
+```
+
+### Reacting to Store Changes
+
+Mutations broadcast `Nil` on the store's topic. Subscribe to it with
+`beacon.subscriptions` and re-read the store in the handler:
+
+```gleam
+let messages = store.new_list("messages")
+
+beacon.app(init, beacon.no_local, beacon.no_server, update, view)
+|> beacon.subscriptions(fn(_model) { [store.list_topic(messages)] })
+|> beacon.on_notify(fn(_topic) { MessagesChanged })
+|> beacon.start(8080)
 ```
 
 ## PubSub
@@ -107,7 +145,10 @@ The client receives `total` alongside the model fields, but it is never part of 
 
 ## Cross-Route State Sharing
 
-Create a store at module level and reference it from multiple routes. Use `beacon.subscriptions` in each route to react to changes:
+Wrap the store in a function and call it from multiple routes -- because
+creation is idempotent, every call returns the same store. Use
+`beacon.subscriptions` with `store.topic(shared.cart())` in each route to
+react to changes:
 
 ```gleam
 pub fn cart() { store.new("cart") }  // in shared.gleam
