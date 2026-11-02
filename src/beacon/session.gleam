@@ -88,8 +88,12 @@ pub const default_idle_ttl_ms = 7_200_000
 /// Default sweep interval: 60 seconds.
 pub const default_sweep_interval_ms = 60_000
 
-/// Bounded retries for the compare-and-swap loop in `set`.
-const max_cas_attempts = 64
+/// Bounded retries for the compare-and-swap loop in `set`/`update`.
+/// A writer only loses a round when another write to the same session wins
+/// it, so N concurrent writers need at most N attempts each; the bound is
+/// set well above any realistic per-session concurrency (requests plus live
+/// sockets of one user) and the loop yields between attempts.
+const max_cas_attempts = 1024
 
 /// Default store lifetimes (24h absolute, 2h idle, sweep every minute).
 pub fn default_store_config() -> StoreConfig {
@@ -318,7 +322,11 @@ fn update_loop(
               let row = #(id, version + 1, created_at, now, updated)
               case session_ets_cas(store.table, id, version, row) {
                 True -> Ok(updated)
-                False -> update_loop(store, id, transform, attempts_left - 1)
+                False -> {
+                  // Let the winning writer finish before re-reading.
+                  erlang_yield()
+                  update_loop(store, id, transform, attempts_left - 1)
+                }
               }
             }
           }
@@ -522,6 +530,9 @@ pub fn secure_compare(a: String, b: String) -> Bool {
 }
 
 // === FFI ===
+
+@external(erlang, "erlang", "yield")
+fn erlang_yield() -> Bool
 
 @external(erlang, "beacon_session_ffi", "session_ets_new")
 fn session_ets_new(name: String) -> SessionTable
