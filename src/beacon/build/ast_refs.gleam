@@ -22,17 +22,21 @@ pub type Refs {
     qualifiers: Set(String),
     /// Unqualified names: variables, functions, constructors and types.
     names: Set(String),
+    /// Qualified references as #(qualifier, name): `#("list", "map")` for
+    /// `list.map`, `#("option", "Option")` for `option.Option`.
+    qualified: Set(#(String, String)),
   )
 }
 
 pub fn empty() -> Refs {
-  Refs(qualifiers: set.new(), names: set.new())
+  Refs(qualifiers: set.new(), names: set.new(), qualified: set.new())
 }
 
 pub fn merge(a: Refs, b: Refs) -> Refs {
   Refs(
     qualifiers: set.union(a.qualifiers, b.qualifiers),
     names: set.union(a.names, b.names),
+    qualified: set.union(a.qualified, b.qualified),
   )
 }
 
@@ -44,10 +48,18 @@ fn add_name(refs: Refs, value: String) -> Refs {
   Refs(..refs, names: set.insert(refs.names, value))
 }
 
-fn module_qualifier(refs: Refs, module: Option(String)) -> Refs {
+fn add_qualified(refs: Refs, qualifier: String, name: String) -> Refs {
+  Refs(
+    ..add_qualifier(refs, qualifier),
+    qualified: set.insert(refs.qualified, #(qualifier, name)),
+  )
+}
+
+/// A reference to `name`, qualified by `module` when there is one.
+fn reference(refs: Refs, module: Option(String), name: String) -> Refs {
   case module {
-    Some(module) -> add_qualifier(refs, module)
-    None -> refs
+    Some(module) -> add_qualified(refs, module, name)
+    None -> add_name(refs, name)
   }
 }
 
@@ -89,11 +101,7 @@ fn optional_type(refs: Refs, t: Option(glance.Type)) -> Refs {
 pub fn type_(refs: Refs, t: glance.Type) -> Refs {
   case t {
     glance.NamedType(name: type_name, module:, parameters:, ..) -> {
-      let refs = case module {
-        Some(module) -> add_qualifier(refs, module)
-        None -> add_name(refs, type_name)
-      }
-      list.fold(parameters, refs, type_)
+      list.fold(parameters, reference(refs, module, type_name), type_)
     }
     glance.TupleType(elements:, ..) -> list.fold(elements, refs, type_)
     glance.FunctionType(parameters:, return:, ..) ->
@@ -163,10 +171,7 @@ pub fn expression(refs: Refs, expr: glance.Expression) -> Refs {
       list.fold(body, optional_type(refs, return_annotation), statement)
     }
     glance.RecordUpdate(module:, constructor:, record:, fields: updates, ..) -> {
-      let refs = case module {
-        Some(module) -> add_qualifier(refs, module)
-        None -> add_name(refs, constructor)
-      }
+      let refs = reference(refs, module, constructor)
       list.fold(updates, expression(refs, record), fn(refs, update) {
         case update.item {
           Some(item) -> expression(refs, item)
@@ -176,8 +181,11 @@ pub fn expression(refs: Refs, expr: glance.Expression) -> Refs {
       })
     }
     // `alias.name`: the container is a qualifier when it is a bare name.
-    glance.FieldAccess(container: glance.Variable(name: container, ..), ..) ->
-      add_name(add_qualifier(refs, container), container)
+    glance.FieldAccess(
+      container: glance.Variable(name: container, ..),
+      label:,
+      ..,
+    ) -> add_name(add_qualified(refs, container, label), container)
     glance.FieldAccess(container:, ..) -> expression(refs, container)
     glance.Call(function:, arguments:, ..) ->
       fields(expression(refs, function), arguments)
@@ -240,17 +248,17 @@ fn walk_pattern(refs: Refs, pattern: glance.Pattern) -> Refs {
         })
       })
     glance.PatternVariant(module:, constructor:, arguments:, ..) -> {
-      let refs = case module {
-        Some(_) -> module_qualifier(refs, module)
-        None -> add_name(refs, constructor)
-      }
-      list.fold(arguments, refs, fn(refs, argument) {
-        case argument {
-          glance.LabelledField(item:, ..) | glance.UnlabelledField(item:) ->
-            walk_pattern(refs, item)
-          glance.ShorthandField(..) -> refs
-        }
-      })
+      list.fold(
+        arguments,
+        reference(refs, module, constructor),
+        fn(refs, argument) {
+          case argument {
+            glance.LabelledField(item:, ..) | glance.UnlabelledField(item:) ->
+              walk_pattern(refs, item)
+            glance.ShorthandField(..) -> refs
+          }
+        },
+      )
     }
   }
 }

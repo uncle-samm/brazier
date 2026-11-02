@@ -1,8 +1,12 @@
-/// Build system tests — verify codec generation produces correct output.
-/// Tests the build pipeline through the analyzer + codec generation.
+/// Build system tests: command line, source collection and generated
+/// imports, plus analyzer inputs for codec generation.
 import beacon/build
 import beacon/build/analyzer
-import gleam/erlang/process
+import beacon/build/client_entry
+import beacon/build/discovery
+import beacon/build/program
+import beacon/build/server_codec
+import beacon/build/sources
 import gleam/list
 import gleam/string
 import simplifile
@@ -35,48 +39,86 @@ pub fn view(model: Model) { model }
   let assert True = find("rate") == "Float"
 }
 
-pub fn source_root_resolves_nested_app_modules_test() {
-  let assert "src" = build.source_root("src/app/model.gleam")
-  let assert "examples/domains/src" =
-    build.source_root("examples/domains/src/app.gleam")
-  let assert "src" = build.source_root("src/app.gleam")
+// === Command line ===
+
+pub fn parse_args_defaults_to_src_test() {
+  let assert Ok(build.SourceDir("src")) = build.parse_args([])
 }
 
-pub fn source_freshness_detects_newer_nested_app_source_test() {
-  let temp_root = "build/beacon_test_manifest_freshness"
-  let src_root = temp_root <> "/src"
-  let page_path = src_root <> "/pages/home.gleam"
-  let manifest_path = temp_root <> "/priv/static/beacon_client.manifest"
-
-  case simplifile.delete(temp_root) {
-    Ok(Nil) -> Nil
-    Error(_) -> Nil
-  }
-  let assert Ok(Nil) = simplifile.create_directory_all(src_root <> "/pages")
-  let assert Ok(Nil) =
-    simplifile.create_directory_all(temp_root <> "/priv/static")
-  let assert Ok(Nil) =
-    simplifile.write(page_path, "pub fn title() { \"Home\" }")
-  process.sleep(1200)
-  let assert Ok(Nil) = simplifile.write(manifest_path, "beacon_client_old.js")
-  let assert False = build.is_any_source_newer_than(manifest_path, [src_root])
-
-  process.sleep(1200)
-  let assert Ok(Nil) =
-    simplifile.write(page_path, "pub fn title() { \"Home updated\" }")
-  let assert True = build.is_any_source_newer_than(manifest_path, [src_root])
-
-  case simplifile.delete(temp_root) {
-    Ok(Nil) -> Nil
-    Error(_) -> Nil
-  }
+pub fn parse_args_gleam_file_is_the_app_module_test() {
+  let assert Ok(build.AppFile("src/my_app.gleam")) =
+    build.parse_args(["src/my_app.gleam"])
 }
 
-pub fn transitive_client_source_resolution_skips_empty_server_modules_test() {
-  let temp_root = "build/beacon_test_client_transitive"
-  let src_root = temp_root <> "/src"
-  let server_path = src_root <> "/app/server_state.gleam"
-  let manager_path = src_root <> "/agent/manager.gleam"
+pub fn parse_args_other_argument_is_a_source_dir_test() {
+  let assert Ok(build.SourceDir("app/src")) = build.parse_args(["app/src"])
+}
+
+pub fn parse_args_rejects_extra_arguments_test() {
+  let assert Error(reason) = build.parse_args(["src", "extra"])
+  let assert True = string.contains(reason, "src extra")
+  let assert True = string.contains(reason, build.usage)
+}
+
+// === Source collection ===
+
+fn fresh_tree(root: String, files: List(#(String, String))) -> Nil {
+  let assert Ok(Nil) = case simplifile.delete(root) {
+    Ok(Nil) -> Ok(Nil)
+    Error(simplifile.Enoent) -> Ok(Nil)
+    Error(reason) -> Error(reason)
+  }
+  list.each(files, fn(file) {
+    let path = root <> "/" <> file.0
+    let assert Ok(Nil) = simplifile.create_directory_all(parent(path))
+    let assert Ok(Nil) = simplifile.write(path, file.1)
+  })
+}
+
+fn parent(path: String) -> String {
+  let assert Ok(#(_, dir)) = string.split_once(string.reverse(path), "/")
+  string.reverse(dir)
+}
+
+pub fn app_externals_recurses_through_user_modules_test() {
+  let src = "build/beacon_test_app_externals/src"
+  let app_source =
+    "import types/models\npub type Model { Model(status: models.AgentRunStatus) }\n"
+  fresh_tree(src, [
+    #("app.gleam", app_source),
+    #(
+      "types/models.gleam",
+      "import types/enums\npub type AgentRunStatus { AgentRunStatus(type_: enums.AgentType) }\n",
+    ),
+    #("types/enums.gleam", "pub type AgentType { Codex Gemini }\n"),
+  ])
+  let app =
+    discovery.AppModule(
+      path: src <> "/app.gleam",
+      module_path: "app",
+      source: app_source,
+    )
+  let assert Ok(sources) = sources.app_externals(src, app)
+  let assert [#("models", "types/models", _), #("enums", "types/enums", _)] =
+    sources
+}
+
+pub fn app_externals_reports_unparsable_user_module_test() {
+  let src = "build/beacon_test_app_externals_broken/src"
+  let app_source = "import broken\npub type Model { Model(count: Int) }\n"
+  fresh_tree(src, [#("app.gleam", app_source), #("broken.gleam", "pub type {")])
+  let app =
+    discovery.AppModule(
+      path: src <> "/app.gleam",
+      module_path: "app",
+      source: app_source,
+    )
+  let assert Error(reason) = sources.app_externals(src, app)
+  let assert True = string.contains(reason, "broken.gleam")
+}
+
+pub fn client_externals_skip_server_only_modules_test() {
+  let src = "build/beacon_test_client_externals/src"
   let source =
     "import app/server_state.{type ServerState}
 
@@ -93,103 +135,26 @@ pub fn view(model: Model) {
   model
 }
 "
-
-  case simplifile.delete(temp_root) {
-    Ok(Nil) -> Nil
-    Error(_) -> Nil
-  }
-  let assert Ok(Nil) = simplifile.create_directory_all(src_root <> "/app")
-  let assert Ok(Nil) = simplifile.create_directory_all(src_root <> "/agent")
-  let assert Ok(Nil) =
-    simplifile.write(
-      server_path,
-      "import agent/manager
-
-pub type ServerState {
-  ServerState(manager: manager.Manager)
-}
-",
-    )
-  let assert Ok(Nil) =
-    simplifile.write(
-      manager_path,
-      "pub type Manager {
-  Manager(secret: String)
-}
-",
-    )
-
+  fresh_tree(src, [
+    #("app.gleam", source),
+    #(
+      "app/server_state.gleam",
+      "import agent/manager\n\npub type ServerState {\n  ServerState(manager: manager.Manager)\n}\n",
+    ),
+    #(
+      "agent/manager.gleam",
+      "pub type Manager {\n  Manager(secret: String)\n}\n",
+    ),
+  ])
+  let assert Ok(client_source) = analyzer.extract_client_source(source)
   let assert Ok(sources) =
-    build.resolve_transitive_client_external_sources(source, src_root)
+    sources.client_externals(src, src <> "/app.gleam", client_source)
   let module_paths = list.map(sources, fn(source) { source.1 })
   let assert False = list.contains(module_paths, "app/server_state")
   let assert False = list.contains(module_paths, "agent/manager")
-
-  case simplifile.delete(temp_root) {
-    Ok(Nil) -> Nil
-    Error(_) -> Nil
-  }
 }
 
-pub fn source_freshness_treats_missing_manifest_as_stale_test() {
-  let temp_root = "build/beacon_test_missing_manifest_freshness"
-  let src_root = temp_root <> "/src"
-  let manifest_path = temp_root <> "/priv/static/beacon_client.manifest"
-
-  case simplifile.delete(temp_root) {
-    Ok(Nil) -> Nil
-    Error(_) -> Nil
-  }
-  let assert Ok(Nil) = simplifile.create_directory_all(src_root)
-  let assert Ok(Nil) = simplifile.write(src_root <> "/main.gleam", "")
-  let assert True = build.is_any_source_newer_than(manifest_path, [src_root])
-
-  case simplifile.delete(temp_root) {
-    Ok(Nil) -> Nil
-    Error(_) -> Nil
-  }
-}
-
-pub fn resolve_transitive_external_sources_recurses_through_user_modules_test() {
-  let temp_root = "build/beacon_test_transitive_sources"
-  let src_root = temp_root <> "/src"
-  let app_path = src_root <> "/app.gleam"
-  let models_path = src_root <> "/types/models.gleam"
-  let enums_path = src_root <> "/types/enums.gleam"
-
-  case simplifile.delete(temp_root) {
-    Ok(Nil) -> Nil
-    Error(_) -> Nil
-  }
-  let assert Ok(Nil) = simplifile.create_directory_all(src_root <> "/types")
-  let assert Ok(Nil) =
-    simplifile.write(
-      app_path,
-      "import types/models\npub type Model { Model(status: models.AgentRunStatus) }\n",
-    )
-  let assert Ok(Nil) =
-    simplifile.write(
-      models_path,
-      "import types/enums\npub type AgentRunStatus { AgentRunStatus(type_: enums.AgentType) }\n",
-    )
-  let assert Ok(Nil) =
-    simplifile.write(enums_path, "pub type AgentType { Codex Gemini }\n")
-
-  let assert Ok(app_source) = simplifile.read(app_path)
-  let assert Ok(sources) =
-    build.resolve_transitive_external_sources(app_source, src_root)
-  let module_paths = list.map(sources, fn(s) { s.1 })
-  let assert True = list.contains(module_paths, "types/models")
-  let assert True = list.contains(module_paths, "types/enums")
-  let assert False = list.contains(module_paths, "app")
-
-  case simplifile.delete(temp_root) {
-    Ok(Nil) -> Nil
-    Error(_) -> Nil
-  }
-}
-
-pub fn resolve_transitive_framework_sources_recurses_through_beacon_modules_test() {
+pub fn framework_closure_recurses_through_beacon_modules_test() {
   let source =
     "
 import beacon/application
@@ -200,53 +165,19 @@ pub type Msg { Ping }
 pub fn update(model: Model, msg: Msg) -> Model { model }
 pub fn view(model: Model) { model }
 "
-
-  let assert Ok(sources) =
-    build.resolve_transitive_framework_sources([source], ".")
+  let assert Ok(sources) = sources.framework_closure(".", [source])
   let module_paths = list.map(sources, fn(s) { s.1 })
   let assert True = list.contains(module_paths, "beacon/application")
   let assert True = list.contains(module_paths, "beacon/route")
+  // The shimmed modules are generated for the client, never copied.
+  let assert False = list.contains(module_paths, "beacon")
+  let assert False = list.contains(module_paths, "beacon/log")
 }
 
-pub fn generate_external_imports_emits_explicit_aliases_test() {
-  let app_source =
-    "
-import types/models
+// === Generated imports ===
 
-pub type Model { Model(service: models.ThreadService) }
-pub type Msg { Ping }
-pub fn update(model: Model, msg: Msg) -> Model { model }
-pub fn view(model: Model) { model }
-"
-  let models_source =
-    "
-import types/enums
-
-pub type ThreadService {
-  ThreadService(status: enums.AgentRunStatus)
-}
-"
-  let enums_source =
-    "
-pub type AgentRunStatus {
-  Pending
-  Running
-}
-"
-  let assert Ok(analysis) =
-    analyzer.analyze_multi(app_source, [
-      #("models", "types/models", models_source),
-      #("enums", "types/enums", enums_source),
-    ])
-
-  let imports = build.generate_external_imports(analysis, app_source, False)
-  let assert True = string.contains(imports, "import types/models as models")
-  let assert True = string.contains(imports, "import types/enums as enums")
-}
-
-pub fn generate_external_imports_preserves_nested_app_and_type_paths_test() {
-  let app_source =
-    "
+const nested_app_source =
+  "
 import server_state
 import types/models
 
@@ -255,6 +186,8 @@ pub type Msg { Ping }
 pub fn update(model: Model, msg: Msg) -> Model { model }
 pub fn view(model: Model) { model }
 "
+
+fn nested_analysis() -> analyzer.Analysis {
   let server_source =
     "
 import types/enums
@@ -279,22 +212,26 @@ pub type AgentRunStatus {
 }
 "
   let assert Ok(analysis) =
-    analyzer.analyze_multi(app_source, [
+    analyzer.analyze_multi(nested_app_source, [
       #("server_state", "app/server_state", server_source),
       #("models", "types/models", models_source),
       #("enums", "types/enums", enums_source),
     ])
+  analysis
+}
 
-  let imports = build.generate_external_imports(analysis, app_source, False)
-  let assert False =
-    string.contains(imports, "import app/server_state as server_state")
-  let assert True = string.contains(imports, "import types/models as models")
-  let assert True = string.contains(imports, "import types/enums as enums")
+pub fn server_codec_imports_nested_type_modules_test() {
+  let assert Ok(codec) = server_codec.generate(nested_analysis(), "app/main")
+  let assert True = string.contains(codec, "import app/main")
+  let assert True = string.contains(codec, "import types/models")
+  let assert True = string.contains(codec, "import types/enums")
+}
 
-  let server_imports =
-    build.generate_external_imports(analysis, app_source, True)
-  let assert True =
-    string.contains(server_imports, "import app/server_state as server_state")
+pub fn client_entry_imports_nested_type_modules_test() {
+  let assert Ok(entry) = client_entry.generate(nested_analysis(), True)
+  let assert True = string.contains(entry, "import types/models")
+  let assert True = string.contains(entry, "import types/enums")
+  let assert False = string.contains(entry, "server_state")
 }
 
 // Note: Server field exclusion is tested in build_codec_test.gleam
@@ -439,4 +376,38 @@ pub fn view(model: Model, local: Local) { model }
   let assert True = find("Reset")
   // SetInput only modifies local
   let assert False = find("SetInput")
+}
+
+// === External programs ===
+
+pub fn program_run_passes_unicode_arguments_unchanged_test() {
+  let assert Ok(output) =
+    program.run(".", "printf", ["%s", "zoë \" </script> 日本"])
+  let assert "zoë \" </script> 日本" = output
+}
+
+pub fn program_run_nonzero_exit_is_an_error_test() {
+  let assert Error(reason) = program.run(".", "sh", ["-c", "echo boom; exit 3"])
+  let assert True = string.contains(reason, "boom")
+  let assert True = string.contains(reason, "Exit status: 3")
+  let assert True = string.contains(reason, "`sh -c")
+}
+
+pub fn program_run_missing_executable_is_an_error_test() {
+  let assert Error(reason) = program.run(".", "beacon-no-such-program", [])
+  let assert True =
+    string.contains(reason, "Executable not found: beacon-no-such-program")
+}
+
+pub fn program_absolute_path_keeps_unicode_test() {
+  let path = program.absolute_path("build/zoë/日本.gleam")
+  let assert True = string.starts_with(path, "/")
+  let assert True = string.ends_with(path, "/build/zoë/日本.gleam")
+}
+
+pub fn program_content_hash_is_stable_test() {
+  let hash = program.content_hash("bundle")
+  let assert 16 = string.length(hash)
+  let assert True = hash == program.content_hash("bundle")
+  let assert True = hash != program.content_hash("bundle2")
 }

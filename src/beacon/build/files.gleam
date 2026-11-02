@@ -18,6 +18,24 @@ pub fn write(path: String, contents: String) -> Result(Nil, String) {
   |> result.map_error(fn(err) { failure("write", path, err) })
 }
 
+/// Write `contents` to `path` unless the file already holds exactly that.
+/// True when the file was written. Leaving an unchanged file untouched keeps
+/// its modification time, so file watchers and `gleam build` see no change.
+pub fn write_if_changed(
+  path: String,
+  contents: String,
+) -> Result(Bool, String) {
+  use exists <- result.try(is_file(path))
+  use current <- result.try(case exists {
+    True -> read(path) |> result.map(Ok)
+    False -> Ok(Error(Nil))
+  })
+  case current == Ok(contents) {
+    True -> Ok(False)
+    False -> write(path, contents) |> result.map(fn(_: Nil) { True })
+  }
+}
+
 /// Copy the file at `from` to `to`, creating the parent directory of `to`.
 pub fn copy(from: String, to: String) -> Result(Nil, String) {
   use Nil <- result.try(ensure_parent(to))
@@ -84,11 +102,13 @@ pub fn parent(path: String) -> String {
   }
 }
 
-/// Join path segments with `/`, without doubling separators.
+/// Join path segments with `/`, without doubling separators. A base of `.`
+/// (the current directory) is dropped: `join(".", "src")` is `src`.
 pub fn join(base: String, child: String) -> String {
-  case string.ends_with(base, "/") {
-    True -> base <> child
-    False -> base <> "/" <> child
+  case base, string.ends_with(base, "/") {
+    ".", _ -> child
+    _, True -> base <> child
+    _, False -> base <> "/" <> child
   }
 }
 

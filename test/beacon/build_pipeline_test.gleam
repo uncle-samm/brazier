@@ -1,12 +1,49 @@
 /// Build pipeline tests — verify the analysis pipeline works correctly
 /// against real example apps and across rebuild scenarios.
-import beacon/build
-import beacon/build/analyzer
+import beacon/build/analyzer.{type Analysis}
+import beacon/build/discovery
+import beacon/build/shape
+import beacon/build/sources
 import gleam/list
 import gleam/string
 import simplifile
 
 // === Example App Analysis Tests ===
+
+/// Analyze the app module below `src_dir` the way `beacon/build` does: with
+/// every user module it reaches.
+fn analyze_example(src_dir: String) -> #(String, Analysis) {
+  let assert Ok(app) = discovery.find(src_dir)
+  let assert Ok(externals) = sources.app_externals(src_dir, app)
+  let assert Ok(analysis) = analyzer.analyze_multi(app.source, externals)
+  #(app.source, analysis)
+}
+
+/// Every example has an app shape the generated code supports.
+pub fn every_example_passes_analysis_and_shape_check_test() {
+  let assert Ok(examples) = simplifile.read_directory("examples")
+  let checked =
+    examples
+    |> list.sort(string.compare)
+    |> list.filter(fn(name) {
+      simplifile.is_file("examples/" <> name <> "/gleam.toml") == Ok(True)
+    })
+    |> list.map(fn(name) {
+      let #(source, analysis) = analyze_example("examples/" <> name <> "/src")
+      case shape.check(analysis, source) {
+        Ok(_) -> Ok(name)
+        Error(reason) -> Error(#(name, reason))
+      }
+    })
+  let assert [] =
+    list.filter_map(checked, fn(r) {
+      case r {
+        Ok(_) -> Error(Nil)
+        Error(failure) -> Ok(failure)
+      }
+    })
+  let assert True = list.length(checked) > 10
+}
 
 pub fn counter_example_analyzes_correctly_test() {
   let assert Ok(source) = simplifile.read("examples/counter/src/counter.gleam")
@@ -43,7 +80,7 @@ pub fn private_session_example_supports_server_state_bundle_test() {
   let assert False = analysis.has_local
   let assert True =
     list.any(analysis.server_fields, fn(f) { f.name == "signing_key" })
-  let assert Ok(True) = build.can_build_enhanced_bundle(source, analysis)
+  let assert Ok(_) = shape.check(analysis, source)
 }
 
 pub fn auth_workspace_example_supports_server_state_bundle_test() {
@@ -56,7 +93,7 @@ pub fn auth_workspace_example_supports_server_state_bundle_test() {
     list.any(analysis.server_fields, fn(f) { f.name == "private_audit_key" })
   let assert False =
     list.any(analysis.model_fields, fn(f) { f.name == "private_audit_key" })
-  let assert Ok(True) = build.can_build_enhanced_bundle(source, analysis)
+  let assert Ok(_) = shape.check(analysis, source)
 }
 
 pub fn counter_local_analyzes_correctly_test() {
@@ -81,7 +118,7 @@ pub fn local_first_form_analyzes_as_local_model_split_test() {
     list.any(analysis.msg_variants, fn(v) {
       v.name == "SubmitSearch" && v.affects_model
     })
-  let assert Ok(True) = build.can_build_enhanced_bundle(source, analysis)
+  let assert Ok(_) = shape.check(analysis, source)
 }
 
 pub fn routed_workspace_app_supports_client_state_bundle_test() {
@@ -92,12 +129,11 @@ pub fn routed_workspace_app_supports_client_state_bundle_test() {
   let assert False = analysis.has_server
   let assert True =
     list.any(analysis.msg_variants, fn(v) { v.name == "RouteChanged" })
-  let assert Ok(True) = build.can_build_enhanced_bundle(source, analysis)
+  let assert Ok(_) = shape.check(analysis, source)
 }
 
 pub fn routed_example_supports_imported_page_modules_test() {
-  let assert Ok(source) = simplifile.read("examples/routed/src/main.gleam")
-  let assert Ok(analysis) = analyzer.analyze(source)
+  let #(source, analysis) = analyze_example("examples/routed/src")
   let assert False = analysis.has_local
   let assert True = analysis.has_server
   let assert True = list.any(analysis.model_fields, fn(f) { f.name == "path" })
@@ -111,7 +147,7 @@ pub fn routed_example_supports_imported_page_modules_test() {
     })
   let assert True =
     list.any(analysis.msg_variants, fn(v) { v.name == "RouteChanged" })
-  let assert Ok(True) = build.can_build_enhanced_bundle(source, analysis)
+  let assert Ok(_) = shape.check(analysis, source)
 }
 
 pub fn routed_example_route_local_home_model_analyzes_test() {
@@ -179,7 +215,7 @@ pub fn route_server_workspace_route_servers_are_private_test() {
     list.any(analysis.custom_types, fn(ct) {
       ct.module == "settings" && ct.name == "Server"
     })
-  let assert Ok(True) = build.can_build_enhanced_bundle(source, analysis)
+  let assert Ok(_) = shape.check(analysis, source)
 }
 
 pub fn routed_example_uses_explicit_imported_page_modules_test() {
@@ -247,7 +283,7 @@ pub fn domains_multi_file_supports_enhanced_bundle_test() {
       #("auth", "domains/auth", auth_src),
       #("items", "domains/items", items_src),
     ])
-  let assert Ok(True) = build.can_build_enhanced_bundle(app_source, analysis)
+  let assert Ok(_) = shape.check(analysis, app_source)
 }
 
 pub fn effect_app_without_local_supports_client_renderer_test() {
@@ -256,7 +292,7 @@ pub fn effect_app_without_local_supports_client_renderer_test() {
   let assert Ok(analysis) = analyzer.analyze(source)
   let assert False = analysis.has_local
   let assert False = analysis.has_server
-  let assert Ok(True) = build.can_build_enhanced_bundle(source, analysis)
+  let assert Ok(_) = shape.check(analysis, source)
 }
 
 // === Idempotency Tests ===
@@ -384,7 +420,7 @@ pub fn update(model: Model, _local: Nil, _server: Nil, _msg: Msg) -> #(Model, Ni
 pub fn view(model: Model, _local: Nil) { model }
 "
   let assert Ok(analysis) = analyzer.analyze(source)
-  let assert Ok(True) = build.can_build_enhanced_bundle(source, analysis)
+  let assert Ok(_) = shape.check(analysis, source)
 }
 
 pub fn enhanced_bundle_supported_for_server_state_view_test() {
@@ -399,7 +435,7 @@ pub fn update(model: Model, _local: Nil, server: Server, _msg: Msg) -> #(Model, 
 pub fn view(model: Model, _local: Nil) { model }
 "
   let assert Ok(analysis) = analyzer.analyze(source)
-  let assert Ok(True) = build.can_build_enhanced_bundle(source, analysis)
+  let assert Ok(_) = shape.check(analysis, source)
 }
 
 pub fn enhanced_bundle_skipped_for_model_only_multi_file_test() {
@@ -408,5 +444,5 @@ pub fn enhanced_bundle_skipped_for_model_only_multi_file_test() {
 pub type Model { Model(count: Int) }
 "
   let assert Ok(analysis) = analyzer.analyze(source)
-  let assert Ok(False) = build.can_build_enhanced_bundle(source, analysis)
+  let assert Error(_) = shape.check(analysis, source)
 }

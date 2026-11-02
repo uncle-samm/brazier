@@ -11,7 +11,6 @@
 /// }
 /// ```
 import beacon/application
-import beacon/build
 import beacon/effect
 import beacon/element.{type Attr}
 import beacon/error
@@ -724,27 +723,26 @@ pub fn start(
   }
 }
 
-/// Internal: start the app after validation passes.
+/// Internal: start the app after validation passes. The server codec and the
+/// client bundle are build artifacts of `gleam run -m beacon/build` (or
+/// `gleam run -m beacon/dev`); starting without them is an error.
 fn start_validated(
   builder: AppBuilder(model, msg),
   port: Int,
   wrapped_init: fn() -> #(model, effect.Effect(msg)),
   base_update: fn(model, msg) -> #(model, effect.Effect(msg)),
 ) -> Result(Nil, error.BeaconError) {
-  // Auto-build client JS if not already built.
-  case auto_build_client_js() {
+  let checked = case require_client_bundle() {
+    Ok(Nil) -> runtime.verify_generated_contract()
     Error(err) -> Error(err)
-    Ok(Nil) -> {
-      hot_reload_codec()
-      case runtime.verify_generated_contract() {
-        Error(err) -> {
-          log.error("beacon", error.to_string(err))
-          Error(err)
-        }
-        Ok(Nil) ->
-          start_with_verified_contract(builder, port, wrapped_init, base_update)
-      }
+  }
+  case checked {
+    Error(err) -> {
+      log.error("beacon", error.to_string(err))
+      Error(err)
     }
+    Ok(Nil) ->
+      start_with_verified_contract(builder, port, wrapped_init, base_update)
   }
 }
 
@@ -823,96 +821,51 @@ fn list_append(a: List(x), b: List(x)) -> List(x) {
 @external(erlang, "lists", "append")
 fn do_list_append(a: List(x), b: List(x)) -> List(x)
 
-/// Hot-reload the beacon_codec module after auto-build generates it.
-@external(erlang, "beacon_auto_build_ffi", "hot_reload_codec")
-fn hot_reload_codec() -> Nil
+const client_manifest = "priv/static/beacon_client.manifest"
 
-/// Build client JS if not already built or if source changed.
-///
-/// Two modes based on app structure:
-/// 1. Apps with Model/Msg/update/view in one file → builds codec + enhanced bundle (local events work)
-/// 2. Unsupported shapes fail before startup with a structured error.
-///
-/// Both modes generate a codec (beacon_codec.gleam) for server-side model encoding.
-/// A client-state bundle is required for normal Beacon apps.
-fn auto_build_client_js() -> Result(Nil, error.BeaconError) {
-  case client_js_is_fresh() {
-    True -> Ok(Nil)
-    False -> {
-      log.info("beacon", "Building client JS...")
-      case simplifile.is_file("priv/static/beacon_client.manifest") {
-        Ok(False) -> Ok(Nil)
-        Ok(True) -> {
-          case simplifile.delete("priv/static/beacon_client.manifest") {
-            Ok(Nil) -> Ok(Nil)
-            Error(err) ->
-              Error(error.ConfigError(
-                reason: "Failed to delete stale client manifest: "
-                <> string.inspect(err),
-              ))
-          }
-        }
-        Error(err) ->
+const build_hint =
+  "Run `gleam run -m beacon/build` before starting the app, or `gleam run -m beacon/dev` while developing."
+
+/// Check that the client bundle built by `gleam run -m beacon/build` exists:
+/// `priv/static/beacon_client.manifest` must name a bundle in `priv/static`.
+fn require_client_bundle() -> Result(Nil, error.BeaconError) {
+  case simplifile.read(client_manifest) {
+    Error(err) ->
+      Error(error.ConfigError(
+        reason: "No client bundle: cannot read "
+        <> client_manifest
+        <> " ("
+        <> simplifile.describe_error(err)
+        <> "). "
+        <> build_hint,
+      ))
+    Ok(contents) -> {
+      let bundle = "priv/static/" <> string.trim(contents)
+      case string.trim(contents), simplifile.is_file(bundle) {
+        "", _ ->
           Error(error.ConfigError(
-            reason: "Failed to inspect client manifest: " <> string.inspect(err),
+            reason: client_manifest <> " is empty. " <> build_hint,
+          ))
+        _, Ok(True) -> {
+          log.info("beacon", "Client bundle " <> bundle)
+          Ok(Nil)
+        }
+        _, Ok(False) ->
+          Error(error.ConfigError(
+            reason: client_manifest
+            <> " names "
+            <> bundle
+            <> ", which does not exist. "
+            <> build_hint,
+          ))
+        _, Error(err) ->
+          Error(error.ConfigError(
+            reason: "Cannot inspect "
+            <> bundle
+            <> ": "
+            <> simplifile.describe_error(err),
           ))
       }
-      |> result_then(fn(_) {
-        // Analyze once, generate codec + try enhanced bundle separately
-        case build.auto_build() {
-          Error(reason) -> {
-            let err = error.ConfigError(reason: reason)
-            log.error("beacon", error.to_string(err))
-            Error(err)
-          }
-          Ok(Nil) -> {
-            // Compile codec (if generated) + hot-reload
-            let _ = build.run_gleam_build()
-            hot_reload_codec()
-            case simplifile.is_file("priv/static/beacon_client.manifest") {
-              Ok(True) -> Ok(Nil)
-              Ok(False) | Error(_) -> {
-                let err =
-                  error.ConfigError(
-                    reason: "Client-state bundle was not generated. Beacon requires SSR first render plus a generated client renderer/model codec after mount. Move Model, Msg, update, and view into a supported client-visible shape or fix the build/codegen error above.",
-                  )
-                log.error("beacon", error.to_string(err))
-                Error(err)
-              }
-            }
-          }
-        }
-      })
     }
-  }
-}
-
-fn result_then(
-  result: Result(a, error.BeaconError),
-  next: fn(a) -> Result(b, error.BeaconError),
-) -> Result(b, error.BeaconError) {
-  case result {
-    Ok(value) -> next(value)
-    Error(err) -> Error(err)
-  }
-}
-
-/// Check if the client JS bundle is fresh (manifest exists and is newer than source).
-fn client_js_is_fresh() -> Bool {
-  case simplifile.is_file("priv/static/beacon_client.manifest") {
-    Ok(True) -> {
-      // Manifest exists — check app source and Beacon client runtime source.
-      case build.is_any_source_newer_than_manifest(["src", "gleam.toml"]) {
-        True -> {
-          log.info(
-            "beacon",
-            "Client JS source or app source changed — rebuilding",
-          )
-          False
-        }
-        False -> True
-      }
-    }
-    _ -> False
   }
 }

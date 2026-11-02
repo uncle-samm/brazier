@@ -269,7 +269,8 @@ pub fn analyze_path(
   Ok(finish(analysis))
 }
 
-fn parse(path: String, source: String) -> Result(glance.Module, String) {
+/// Parse Gleam source, reporting a failure with its location in `path`.
+pub fn parse(path: String, source: String) -> Result(glance.Module, String) {
   glance.module(source)
   |> result.map_error(fn(err) {
     let message = source_location.describe_parse_error(path, source, err)

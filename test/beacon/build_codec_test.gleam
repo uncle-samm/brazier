@@ -1,7 +1,8 @@
 /// Build codec tests — verify the analysis pipeline produces correct
 /// codec inputs for every app type (standard, server_state, local_state, multi-file).
-import beacon/build
 import beacon/build/analyzer
+import beacon/build/server_codec
+import beacon/build/shape
 import gleam/list
 import gleam/string
 
@@ -338,7 +339,7 @@ pub type ServerState {
     list.any(analysis.msg_variants, fn(v) { v.name == "SetTitle" })
   let assert True = analysis.has_server
   let assert "server_state" = analysis.server_module
-  let assert Ok(True) = build.can_build_enhanced_bundle(app_source, analysis)
+  let assert Ok(_) = shape.check(analysis, app_source)
 }
 
 pub fn multi_file_imported_contract_requires_public_view_test() {
@@ -371,7 +372,7 @@ pub type Msg {
   let assert True = analysis.has_model
   let assert "model" = analysis.model_module
   let assert "msg" = analysis.msg_module
-  let assert Ok(False) = build.can_build_enhanced_bundle(app_source, analysis)
+  let assert Error(_) = shape.check(analysis, app_source)
 }
 
 // === Substate Tests ===
@@ -497,11 +498,10 @@ pub type AgentRunStatus {
       #("enums", "types/enums", enums_source),
     ])
 
-  let imports = build.generate_external_imports(analysis, app_source, True)
-  let assert True =
-    string.contains(imports, "import app/server_state as server_state")
-  let assert True = string.contains(imports, "import types/models as models")
-  let assert True = string.contains(imports, "import types/enums as enums")
+  // The codec imports every module whose types it encodes or decodes.
+  let assert Ok(codec) = server_codec.generate(analysis, "app")
+  let assert True = string.contains(codec, "import types/models")
+  let assert True = string.contains(codec, "import types/enums")
 }
 
 // === Option Type Detection ===
