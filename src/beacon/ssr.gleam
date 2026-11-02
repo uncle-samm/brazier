@@ -215,16 +215,19 @@ fn render_not_found_page(config: SsrConfig(model, msg)) -> RenderedPage {
   )
 }
 
-/// Convert a RenderedPage to an HTTP response.
-pub fn to_response(page: RenderedPage) -> Response(ResponseBody) {
+/// Convert a RenderedPage to an HTTP response. Errors when the session
+/// cookie cannot be set (a token outside the cookie-octet set).
+pub fn to_response(
+  page: RenderedPage,
+) -> Result(Response(ResponseBody), cookie.CookieError) {
   response.new(200)
   |> response.set_header("content-type", "text/html; charset=utf-8")
+  |> response.set_body(Bytes(bytes_tree.from_string(page.html)))
   |> cookie.set(
     session_cookie_name,
     page.session_token,
     session_cookie_options(page.cookie_secure),
   )
-  |> response.set_body(Bytes(bytes_tree.from_string(page.html)))
 }
 
 fn session_cookie_options(secure: Bool) -> cookie.CookieOptions {

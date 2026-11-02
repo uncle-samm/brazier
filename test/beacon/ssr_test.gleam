@@ -1,3 +1,4 @@
+import beacon/cookie
 import beacon/effect
 import beacon/element
 import beacon/route
@@ -209,15 +210,36 @@ pub fn render_page_for_path_unmatched_route_renders_static_not_found_test() {
   let assert False = str_contains(page.html, "Hello, default!")
 }
 
+/// The session token goes into a Set-Cookie header; a token outside the
+/// cookie-octet set is refused instead of being written as an injection.
+pub fn to_response_rejects_a_token_that_is_not_a_cookie_value_test() {
+  let page =
+    ssr.RenderedPage(
+      ..ssr.render_page(test_config()),
+      session_token: "tok; Domain=evil.example",
+    )
+  let assert Error(cookie.InvalidValue(_)) = ssr.to_response(page)
+}
+
+pub fn render_page_session_token_is_a_valid_cookie_value_test() {
+  let page = ssr.render_page(test_config())
+  let assert Ok(Nil) =
+    cookie.validate(
+      ssr.session_cookie_name,
+      page.session_token,
+      cookie.default_options(),
+    )
+}
+
 pub fn to_response_returns_200_test() {
   let page = ssr.render_page(test_config())
-  let resp = ssr.to_response(page)
+  let assert Ok(resp) = ssr.to_response(page)
   let assert 200 = resp.status
 }
 
 pub fn to_response_sets_httponly_session_cookie_test() {
   let page = ssr.render_page(test_config())
-  let resp = ssr.to_response(page)
+  let assert Ok(resp) = ssr.to_response(page)
   let assert Ok(cookie_header) = find_header(resp.headers, "set-cookie")
   let assert True = str_contains(cookie_header, ssr.session_cookie_name <> "=")
   let assert True = str_contains(cookie_header, "HttpOnly")

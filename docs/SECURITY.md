@@ -132,6 +132,39 @@ the same session policy. Use `auth.dev_session_config()` only for localhost
 HTTP development, where the `Secure` cookie attribute would prevent the browser
 from storing the cookie.
 
+The login and logout helpers return `Result(_, cookie.CookieError)`. The
+cookie config is checked before a session is created, so an invalid
+`SessionConfig` never leaves an orphan session; `auth.login_route()` and
+`auth.logout_route()` answer 500 and log the error.
+
+## Cookies
+
+`beacon/cookie` validates every cookie it sets against RFC 6265 and returns a
+`Result`; nothing is stripped or rewritten:
+
+- the name must be an RFC 7230 token;
+- the value must be cookie-octets (optionally wrapped in double quotes): no
+  whitespace, `;`, `,`, `"`, `\` or control bytes, so a value cannot add its own
+  attributes (`abc; Domain=evil.example`) or headers;
+- `Path` must start with `/` and contain no control bytes or `;`;
+- `SameSite` must be exactly `Strict`, `Lax` or `None`, and `None` needs
+  `Secure`;
+- `Max-Age` cannot be negative;
+- `__Secure-` names need `Secure`, and `__Host-` names need `Secure` and
+  `Path=/` (prefixes are matched case-insensitively, as browsers do);
+- name plus value is at most 4096 bytes and the path at most 1024 bytes.
+
+A response carries one `Set-Cookie` per name: setting a name again replaces
+it, and other cookies are kept. `cookie.delete` uses the same attributes as
+`cookie.default_options()` (including `Secure`); use `delete_with_options`
+for a cookie set with other options. Error messages name the cookie but never
+include its value.
+
+When the browser sends two cookies with the same name, `cookie.get` returns
+the first. A sibling subdomain can plant such a cookie ("cookie tossing"); a
+`__Host-` name prevents that, because the browser accepts it only from the
+exact host, with `Secure` and `Path=/`.
+
 ## Timer Cap
 
 The effect system caps periodic timers at 10 per runtime process (`effect.every`). Attempts to create additional timers are rejected with a warning log. This prevents runaway timer creation from buggy update handlers.

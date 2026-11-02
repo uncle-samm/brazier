@@ -6,6 +6,7 @@
 /// instead of Mist. Direct gen_tcp for zero unnecessary abstraction layers.
 ///
 /// Reference: LiveView channel protocol, RFC 6455.
+import beacon/cookie
 import beacon/error
 import beacon/ip
 import beacon/log
@@ -2527,10 +2528,10 @@ fn serve_page_or_ssr(
   req: Request(Connection),
 ) -> response.Response(ResponseBody) {
   case ssr_factory {
-    option.Some(factory) -> ssr.to_response(factory(req, req.path))
+    option.Some(factory) -> page_response(factory(req, req.path))
     option.None ->
       case page_html {
-        option.Some(rendered) -> ssr.to_response(rendered)
+        option.Some(rendered) -> page_response(rendered)
         option.None ->
           case default_page_html() {
             Ok(html) ->
@@ -2593,6 +2594,25 @@ fn get_client_js_filename(assets_dir: String) -> Result(String, String) {
         <> " — the client JS was not built. Run `gleam run -m beacon/build` first."
       log.error("beacon.transport", reason)
       Error(reason)
+    }
+  }
+}
+
+/// The SSR page response. A session cookie that cannot be set is a server
+/// bug: answer 500 rather than a page without its session.
+fn page_response(page: ssr.RenderedPage) -> response.Response(ResponseBody) {
+  case ssr.to_response(page) {
+    Ok(resp) -> resp
+    Error(error) -> {
+      log.error(
+        "beacon.transport",
+        "Cannot set the SSR session cookie: " <> cookie.error_to_string(error),
+      )
+      response.new(500)
+      |> response.set_header("content-type", "text/plain; charset=utf-8")
+      |> response.set_body(
+        Bytes(bytes_tree.from_string("Internal Server Error")),
+      )
     }
   }
 }

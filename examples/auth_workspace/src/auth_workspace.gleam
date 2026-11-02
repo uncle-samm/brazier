@@ -2,6 +2,7 @@ import auth_workspace/app
 import beacon
 import beacon/api
 import beacon/auth
+import beacon/cookie
 import beacon/effect
 import beacon/log
 import beacon/route
@@ -129,10 +130,30 @@ fn api_handler(
     api.post(
       "/api/logout",
       auth.protect_api_with_csrf(store, config, fn(_req, sess, _user_id) {
-        auth.logout_response(store, sess, api.text(200, "Logged out"), config)
+        case
+          auth.logout_response(store, sess, api.text(200, "Logged out"), config)
+        {
+          Ok(resp) -> resp
+          Error(error) -> cookie_failure("Logout", error)
+        }
       }),
     ),
   ])
+}
+
+/// The session cookie config was refused (see `cookie.validate`): log it
+/// and answer 500 rather than send a broken Set-Cookie header.
+fn cookie_failure(
+  action: String,
+  error: cookie.CookieError,
+) -> response.Response(ResponseBody) {
+  log.error(
+    "auth_workspace",
+    action
+      <> " cannot set the session cookie: "
+      <> cookie.error_to_string(error),
+  )
+  api.text(500, "Internal Server Error")
 }
 
 fn handle_login(
@@ -157,15 +178,21 @@ fn handle_login(
               |> dict.insert("display_name", display_name_for_user(safe_user))
             })
           case result {
-            Ok(sess) ->
-              api.json_value(
-                200,
-                json.object([
-                  #("ok", json.bool(True)),
-                  #("csrf", json.string(login.csrf_token)),
-                ]),
-              )
-              |> auth.with_session_cookie(sess, config)
+            Ok(sess) -> {
+              let resp =
+                api.json_value(
+                  200,
+                  json.object([
+                    #("ok", json.bool(True)),
+                    #("csrf", json.string(login.csrf_token)),
+                  ]),
+                )
+                |> auth.with_session_cookie(sess, config)
+              case resp {
+                Ok(resp) -> resp
+                Error(error) -> cookie_failure("Login", error)
+              }
+            }
             Error(err) -> {
               log.error(
                 "auth_workspace",
