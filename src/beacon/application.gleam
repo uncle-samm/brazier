@@ -3,6 +3,7 @@
 /// so that crashes are contained and services restart automatically.
 ///
 /// Reference: Phoenix application structure, Erlang/OTP supervisor pattern.
+import beacon/config as beacon_config
 import beacon/effect.{type Effect}
 import beacon/element.{type Node}
 import beacon/error
@@ -44,7 +45,8 @@ pub type AppConfig(model, msg) {
     decode_event: Option(
       fn(String, String, String, String) -> Result(msg, error.BeaconError),
     ),
-    /// Secret key for session tokens.
+    /// Secret key for session tokens: at least 32 bytes
+    /// (`config.min_secret_key_bytes`), or start fails with a ConfigError.
     secret_key: String,
     /// Application title (used in SSR HTML).
     title: String,
@@ -165,6 +167,16 @@ fn verify_public_application_contract(
 }
 
 fn start_verified(
+  config: AppConfig(model, msg),
+) -> Result(App, error.BeaconError) {
+  // A weak secret makes every signed join token forgeable: refuse to start.
+  case beacon_config.validate_secret_key(config.secret_key) {
+    Error(err) -> Error(err)
+    Ok(_) -> start_with_valid_secret(config)
+  }
+}
+
+fn start_with_valid_secret(
   config: AppConfig(model, msg),
 ) -> Result(App, error.BeaconError) {
   // Start PubSub for distributed broadcasting
@@ -308,6 +320,18 @@ fn start_supervised_with(
   start_fn: fn(AppConfig(model, msg)) -> Result(App, error.BeaconError),
 ) -> Result(App, error.BeaconError) {
   log.configure()
+  // Refuse a weak secret before any process is started, so a failed start
+  // leaves nothing running.
+  case beacon_config.validate_secret_key(config.secret_key) {
+    Error(err) -> Error(err)
+    Ok(_) -> start_supervised_with_valid_secret(config, start_fn)
+  }
+}
+
+fn start_supervised_with_valid_secret(
+  config: AppConfig(model, msg),
+  start_fn: fn(AppConfig(model, msg)) -> Result(App, error.BeaconError),
+) -> Result(App, error.BeaconError) {
   log.info(
     "beacon.application",
     "Starting supervised Beacon application on port "

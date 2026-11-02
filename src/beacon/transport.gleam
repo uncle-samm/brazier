@@ -252,8 +252,9 @@ const max_timer_ms = 4_294_967_295
 
 /// Validate security limits. Every count, size and interval must be
 /// positive (the two abuse thresholds may be 0, meaning "first offence
-/// closes", and `max_body_bytes` may be 0, meaning "no request bodies"), timer intervals must fit `erlang:send_after/3`, and every
-/// allowed origin must be a bare `scheme://host[:port]` origin.
+/// closes", and `max_body_bytes` may be 0, meaning "no request bodies"),
+/// timer intervals must fit `erlang:send_after/3`, and every allowed origin
+/// must be a bare `scheme://host[:port]` origin.
 pub fn validate_security_limits(limits: SecurityLimits) -> Result(Nil, String) {
   let positive = [
     #("max_message_bytes", limits.max_message_bytes),

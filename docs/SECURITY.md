@@ -107,13 +107,33 @@ SSR pages set a signed join/state recovery token in the HttpOnly `beacon_join_to
 
 The cookie is `HttpOnly`, `SameSite=Lax`, path `/`, and has `Max-Age=86400`. JavaScript cannot read it, so XSS cannot directly steal the join token from DOM state.
 
-Auto-generated secret keys are warned about at startup. Set an explicit key for production:
+The secret key must be at least 32 bytes (`config.min_secret_key_bytes`, the
+HMAC-SHA256 output size; RFC 2104 section 3). `application.start`,
+`start_advanced` and `start_supervised` refuse an empty key, a shorter key and
+the formerly built-in dev secret with a `ConfigError` before any process is
+started or port bound. The key is never logged. `config.secret_key()` reads
+`SECRET_KEY` and applies the same check; there is no default.
+
+`beacon.app` generates a random per-process key when none is set, and warns at
+startup: tokens then die on restart and differ between nodes. Set an explicit
+key for production (generate one with `openssl rand -base64 48`):
 
 ```gleam
+let assert Ok(secret) = config.secret_key() as "SECRET_KEY must be set"
 beacon.app(init, beacon.no_local, beacon.no_server, update, view)
-|> beacon.secret_key("your-production-secret")
+|> beacon.secret_key(secret)
 |> beacon.start(8080)
 ```
+
+## CSRF Tokens
+
+`beacon/form` CSRF tokens are 256 random bits from
+`crypto.strong_random_bytes`, hex encoded; they are not derived from the
+secret key, the time or a counter. `form.verify_session_csrf` compares the
+submitted token with `crypto:hash_equals` (constant time) and consumes it with
+an atomic compare-and-delete, so a token is accepted exactly once even when
+several requests race, and a wrong guess does not burn the real token.
+Issuing a new token for a session replaces the old one.
 
 ## Application Session Auth
 
