@@ -1647,7 +1647,9 @@ fn erlang_external_function_names(module: glance.Module) -> List(String) {
   })
 }
 
-fn side_effect_import_aliases(module: glance.Module) -> List(#(String, String)) {
+fn side_effect_import_aliases(
+  module: glance.Module,
+) -> List(#(String, String)) {
   list.filter_map(module.imports, fn(def) {
     let import_ = def.definition
     case is_update_side_effect_module(import_.module) {

@@ -1312,7 +1312,9 @@ fn get_client_js_filename() -> String {
   }
 }
 
-fn serve_client_js(req: Request(Connection)) -> response.Response(ResponseBody) {
+fn serve_client_js(
+  req: Request(Connection),
+) -> response.Response(ResponseBody) {
   let assets_dir = ssr.client_assets_dir()
   let manifest_path = assets_dir <> "/beacon_client.manifest"
   case simplifile.read(manifest_path) {
@@ -1406,7 +1408,9 @@ const default_acceptor_count = 10
 
 /// Start the transport layer — binds to the given port and begins
 /// accepting connections. Returns the server process Pid for monitoring.
-pub fn start(config: TransportConfig) -> Result(process.Pid, error.BeaconError) {
+pub fn start(
+  config: TransportConfig,
+) -> Result(process.Pid, error.BeaconError) {
   log.info(
     "beacon.transport",
     "Starting on port " <> int.to_string(config.port),

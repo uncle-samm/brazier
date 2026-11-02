@@ -978,7 +978,9 @@ fn create_build_directories(dir: String) -> Result(Nil, String) {
   }
 }
 
-fn generated_client_toml(client_sources: List(String)) -> Result(String, String) {
+fn generated_client_toml(
+  client_sources: List(String),
+) -> Result(String, String) {
   let base_deps = [
     "gleam_stdlib = \">= 0.44.0 and < 2.0.0\"",
     "gleam_json = \">= 3.1.0 and < 4.0.0\"",
@@ -1335,7 +1337,10 @@ fn write_client_external_sources(
   }
 }
 
-fn write_module_source_text(path: String, source: String) -> Result(Nil, String) {
+fn write_module_source_text(
+  path: String,
+  source: String,
+) -> Result(Nil, String) {
   let target_dir = case string.split(path, "/") |> list.reverse {
     [_, ..rest] ->
       case list.reverse(rest) {
@@ -2559,7 +2564,10 @@ fn qualify_type_server(
   }
 }
 
-fn server_model_type(module_name: String, analysis: analyzer.Analysis) -> String {
+fn server_model_type(
+  module_name: String,
+  analysis: analyzer.Analysis,
+) -> String {
   qualify_type_server(
     module_name,
     analysis.model_module,
@@ -2571,7 +2579,10 @@ fn server_msg_type(module_name: String, analysis: analyzer.Analysis) -> String {
   qualify_type_server(module_name, analysis.msg_module, analysis.msg_type_name)
 }
 
-fn server_local_type(module_name: String, analysis: analyzer.Analysis) -> String {
+fn server_local_type(
+  module_name: String,
+  analysis: analyzer.Analysis,
+) -> String {
   case analysis.has_local {
     True ->
       qualify_type_server(
@@ -2583,7 +2594,10 @@ fn server_local_type(module_name: String, analysis: analyzer.Analysis) -> String
   }
 }
 
-fn server_constructor_prefix(module_name: String, type_module: String) -> String {
+fn server_constructor_prefix(
+  module_name: String,
+  type_module: String,
+) -> String {
   case type_module {
     "" -> module_name
     mod -> mod
@@ -3705,7 +3719,10 @@ fn server_event_decoder_for_field(
   }
 }
 
-fn default_msg_value(module_name: String, analysis: analyzer.Analysis) -> String {
+fn default_msg_value(
+  module_name: String,
+  analysis: analyzer.Analysis,
+) -> String {
   case find_external_msg_type(analysis, module_name) {
     Ok(info) ->
       case info.variants {

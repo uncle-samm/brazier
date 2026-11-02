@@ -128,7 +128,8 @@ pub fn secure_headers() -> Middleware {
 }
 
 /// Default Content-Security-Policy value.
-const default_csp = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https://avatars.githubusercontent.com; connect-src 'self' ws: wss:"
+const default_csp =
+  "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https://avatars.githubusercontent.com; connect-src 'self' ws: wss:"
 
 /// Security headers middleware with a custom Content-Security-Policy.
 /// Use this when the default CSP is too strict (e.g., external stylesheets,

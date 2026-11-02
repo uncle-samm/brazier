@@ -143,7 +143,10 @@ fn do_render(node: Node(msg), state: RenderState) -> RenderState {
 }
 
 /// Render a list of children.
-fn render_children(state: RenderState, children: List(Node(msg))) -> RenderState {
+fn render_children(
+  state: RenderState,
+  children: List(Node(msg)),
+) -> RenderState {
   list.fold(children, state, fn(acc, child) { do_render(child, acc) })
 }
 

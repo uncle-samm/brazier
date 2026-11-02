@@ -47,7 +47,10 @@ pub fn counter(n_events: Int) -> Scenario {
   )
 }
 
-fn repeat_event_with_response(remaining: Int, acc: List(Action)) -> List(Action) {
+fn repeat_event_with_response(
+  remaining: Int,
+  acc: List(Action),
+) -> List(Action) {
   case remaining {
     0 -> list.reverse(acc)
     _ ->

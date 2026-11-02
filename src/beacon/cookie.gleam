@@ -146,7 +146,11 @@ fn parse_cookie_header(header: String) -> List(#(String, String)) {
 
 /// Build a Set-Cookie header value.
 /// SECURITY: Strips \r and \n from name and value to prevent header injection.
-fn build_set_cookie(name: String, value: String, opts: CookieOptions) -> String {
+fn build_set_cookie(
+  name: String,
+  value: String,
+  opts: CookieOptions,
+) -> String {
   let safe_name = sanitize_cookie_value(name)
   let safe_value = sanitize_cookie_value(value)
   let base = safe_name <> "=" <> safe_value

@@ -483,7 +483,11 @@ fn field(fields: List(#(String, String)), name: String) -> Result(String, Nil) {
   }
 }
 
-fn session_value(sess: session.Session, key: String, default: String) -> String {
+fn session_value(
+  sess: session.Session,
+  key: String,
+  default: String,
+) -> String {
   case session.get_value(sess, key) {
     Some(value) -> value
     None -> default

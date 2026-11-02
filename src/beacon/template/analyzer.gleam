@@ -36,7 +36,9 @@ pub fn analyze_view_source(
 }
 
 /// Find the public `view` function in a module.
-fn find_view_function(module: glance.Module) -> Result(glance.Function, String) {
+fn find_view_function(
+  module: glance.Module,
+) -> Result(glance.Function, String) {
   let view_fns =
     list.filter(module.functions, fn(def) {
       def.definition.publicity == glance.Public && def.definition.name == "view"

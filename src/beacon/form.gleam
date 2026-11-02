@@ -209,7 +209,11 @@ pub fn validate(form: Form, validators: List(fn(Form) -> Form)) -> Form {
 }
 
 /// Render a password input field.
-pub fn password_input(form: Form, name: String, attrs: List(Attr)) -> Node(msg) {
+pub fn password_input(
+  form: Form,
+  name: String,
+  attrs: List(Attr),
+) -> Node(msg) {
   let value = get_value(form, name)
   let base_attrs = [
     element.attr("type", "password"),

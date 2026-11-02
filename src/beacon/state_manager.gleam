@@ -100,7 +100,10 @@ pub fn delete(
 }
 
 /// Get the number of stored sessions.
-pub fn count(manager: Subject(StateManagerMessage(state)), timeout: Int) -> Int {
+pub fn count(
+  manager: Subject(StateManagerMessage(state)),
+  timeout: Int,
+) -> Int {
   actor.call(manager, timeout, Count)
 }
 

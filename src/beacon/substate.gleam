@@ -66,7 +66,10 @@ pub fn start(
 
 /// Get the current state from a substate actor.
 /// This is a synchronous call that blocks until the response is received.
-pub fn get(subject: Subject(SubstateMessage(state, msg)), timeout: Int) -> state {
+pub fn get(
+  subject: Subject(SubstateMessage(state, msg)),
+  timeout: Int,
+) -> state {
   actor.call(subject, timeout, GetState)
 }
 
