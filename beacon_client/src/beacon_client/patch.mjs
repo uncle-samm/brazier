@@ -1,115 +1,139 @@
-// JSON Patch Operations for Beacon State Sync
-// Automatically diffs two model JSON objects and produces minimal patch operations.
-// The developer never sees these ops — they're internal to the framework.
+// JSON Patch Operations for Beacon State Sync.
 //
-// Inspired by RFC 6902 but tailored for Beacon's state-over-the-wire model.
-// Operations: replace, append (detected automatically for arrays).
+// Ops follow RFC 6902 (JSON Patch) with RFC 6901 (JSON Pointer) paths:
+//   add      - add an object member, or insert into an array at an index / "-"
+//   replace  - replace an existing value ("" replaces the whole document)
+//   remove   - remove an existing object member or array element
+//   append   - Beacon extension: concatenate a list onto an existing array
+//
+// This module MUST implement exactly the same semantics as the server mirror
+// in src/beacon_patch_ffi.erl. Both sides are exercised against the same
+// randomly generated vectors (see test/beacon/patch_test.gleam and
+// beacon_client/test/patch_vectors.mjs).
+//
+// Every malformed op, unknown op, invalid pointer or missing target THROWS.
+// Nothing is skipped silently: the caller logs the error and requests a full
+// model sync from the server.
+
+// Keys that must never be set via patch operations to prevent prototype pollution.
+const UNSAFE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+
+/** Error thrown for any patch that cannot be applied exactly. */
+export class PatchError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "PatchError";
+  }
+}
 
 /**
- * Diff two model objects and produce an array of patch operations.
- * The framework calls this automatically — developers never invoke it directly.
- *
- * @param {*} oldModel - The model before update (parsed JSON object)
- * @param {*} newModel - The model after update (parsed JSON object)
- * @returns {Array} - Array of patch operations
+ * Diff two model values and produce an array of patch operations.
+ * Mirrors diff_values/3 in beacon_patch_ffi.erl.
  */
 export function diffModels(oldModel, newModel) {
-  if (oldModel === newModel) return [];
-  if (oldModel === null || oldModel === undefined) {
-    return [{ op: "replace", path: "", value: newModel }];
-  }
-  if (typeof oldModel !== "object" || typeof newModel !== "object") {
-    return [{ op: "replace", path: "", value: newModel }];
-  }
   if (containsUnsafeKey(oldModel) || containsUnsafeKey(newModel)) {
+    if (deepEqual(oldModel, newModel)) return [];
     return [{ op: "replace", path: "", value: newModel }];
   }
-
   const ops = [];
-  diffObject(oldModel, newModel, "", ops);
+  diffValues(oldModel, newModel, "", ops);
   return ops;
 }
 
+function isObject(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function diffValues(oldVal, newVal, path, ops) {
+  if (deepEqual(oldVal, newVal)) return;
+  if (isObject(oldVal) && isObject(newVal)) {
+    diffObject(oldVal, newVal, path, ops);
+  } else if (Array.isArray(oldVal) && Array.isArray(newVal)) {
+    diffArray(oldVal, newVal, path, ops);
+  } else {
+    ops.push({ op: "replace", path, value: newVal });
+  }
+}
+
 function diffObject(oldObj, newObj, basePath, ops) {
-  // Check for removed keys
-  const oldKeys = Object.keys(oldObj);
-  for (let i = 0; i < oldKeys.length; i++) {
-    const key = oldKeys[i];
+  const oldKeys = Object.keys(oldObj).sort(compareKeys);
+  for (const key of oldKeys) {
     if (!Object.prototype.hasOwnProperty.call(newObj, key)) {
-      ops.push({ op: "remove", path: basePath + "/" + escapePathSegment(key) });
+      ops.push({ op: "remove", path: childPath(basePath, key) });
     }
   }
-
-  // Check for added/changed keys
-  const newKeys = Object.keys(newObj);
-  for (let i = 0; i < newKeys.length; i++) {
-    const key = newKeys[i];
-    const path = basePath + "/" + escapePathSegment(key);
-    const oldVal = oldObj[key];
-    const newVal = newObj[key];
-
+  const newKeys = Object.keys(newObj).sort(compareKeys);
+  for (const key of newKeys) {
+    const path = childPath(basePath, key);
     if (!Object.prototype.hasOwnProperty.call(oldObj, key)) {
-      // New key added
-      ops.push({ op: "replace", path, value: newVal });
-    } else if (Array.isArray(oldVal) && Array.isArray(newVal)) {
-      diffArray(oldVal, newVal, path, ops);
-    } else if (
-      typeof oldVal === "object" &&
-      oldVal !== null &&
-      typeof newVal === "object" &&
-      newVal !== null &&
-      !Array.isArray(oldVal)
-    ) {
-      diffObject(oldVal, newVal, path, ops);
-    } else if (!deepEqual(oldVal, newVal)) {
-      ops.push({ op: "replace", path, value: newVal });
+      ops.push({ op: "add", path, value: newObj[key] });
+    } else {
+      diffValues(oldObj[key], newObj[key], path, ops);
     }
   }
 }
 
+// Erlang sorts binary map keys bytewise; compare UTF-8 bytes to match.
+const utf8 = new TextEncoder();
+function compareKeys(a, b) {
+  const ab = utf8.encode(a);
+  const bb = utf8.encode(b);
+  const len = Math.min(ab.length, bb.length);
+  for (let i = 0; i < len; i++) {
+    if (ab[i] !== bb[i]) return ab[i] - bb[i];
+  }
+  return ab.length - bb.length;
+}
+
 function diffArray(oldArr, newArr, path, ops) {
-  // Fast path: identical arrays
-  if (oldArr.length === newArr.length && deepEqual(oldArr, newArr)) return;
-
-  // Check for append: new array starts with all elements of old array + extra at end
-  if (newArr.length > oldArr.length) {
-    let isAppend = true;
-    for (let i = 0; i < oldArr.length; i++) {
-      if (!deepEqual(oldArr[i], newArr[i])) {
-        isAppend = false;
-        break;
+  let prefix = 0;
+  while (
+    prefix < oldArr.length &&
+    prefix < newArr.length &&
+    deepEqual(oldArr[prefix], newArr[prefix])
+  ) {
+    prefix++;
+  }
+  let suffix = 0;
+  while (
+    suffix < oldArr.length - prefix &&
+    suffix < newArr.length - prefix &&
+    deepEqual(oldArr[oldArr.length - 1 - suffix], newArr[newArr.length - 1 - suffix])
+  ) {
+    suffix++;
+  }
+  const oldMidLen = oldArr.length - prefix - suffix;
+  const newMidLen = newArr.length - prefix - suffix;
+  const paired = Math.min(oldMidLen, newMidLen);
+  const local = [];
+  for (let i = 0; i < paired; i++) {
+    const index = prefix + i;
+    diffValues(oldArr[index], newArr[index], childPath(path, index), local);
+  }
+  if (oldMidLen > paired) {
+    for (let index = prefix + oldMidLen - 1; index >= prefix + paired; index--) {
+      local.push({ op: "remove", path: childPath(path, index) });
+    }
+  } else if (newMidLen > paired) {
+    const surplus = newArr.slice(prefix + paired, prefix + newMidLen);
+    if (suffix === 0) {
+      local.push({ op: "append", path, value: surplus });
+    } else {
+      for (let i = 0; i < surplus.length; i++) {
+        local.push({ op: "add", path: childPath(path, prefix + paired + i), value: surplus[i] });
       }
     }
-    if (isAppend) {
-      ops.push({ op: "append", path, value: newArr.slice(oldArr.length) });
-      return;
-    }
   }
-
-  // Check for truncation (prefix match but shorter)
-  if (newArr.length < oldArr.length) {
-    let isPrefix = true;
-    for (let i = 0; i < newArr.length; i++) {
-      if (!deepEqual(oldArr[i], newArr[i])) {
-        isPrefix = false;
-        break;
-      }
-    }
-    if (isPrefix) {
-      // Truncation: replace with shorter array
-      ops.push({ op: "replace", path, value: newArr });
-      return;
-    }
+  if (local.length > newArr.length) {
+    ops.push({ op: "replace", path, value: newArr });
+  } else {
+    for (const op of local) ops.push(op);
   }
-
-  // Not a simple append or truncation — replace the whole array
-  ops.push({ op: "replace", path, value: newArr });
 }
 
 function deepEqual(a, b) {
   if (a === b) return true;
-  if (a === null || b === null || a === undefined || b === undefined)
-    return a === b;
+  if (a === null || b === null || a === undefined || b === undefined) return a === b;
   if (typeof a !== typeof b) return false;
   if (typeof a !== "object") return false;
   if (Array.isArray(a) !== Array.isArray(b)) return false;
@@ -133,22 +157,53 @@ function deepEqual(a, b) {
   return true;
 }
 
-function escapePathSegment(segment) {
+// === RFC 6901 JSON Pointer ===
+
+/** Escape one reference token: "~" -> "~0", then "/" -> "~1". */
+export function escapePathSegment(segment) {
   return String(segment).replace(/~/g, "~0").replace(/\//g, "~1");
 }
 
-/**
- * Apply patch operations to a model object.
- * Returns a new object — the original is not modified.
- *
- * @param {*} model - The current model (parsed JSON object)
- * @param {Array} ops - Array of patch operations
- * @returns {*} - The patched model
- */
-// Keys that must never be set via patch operations to prevent prototype pollution.
-const UNSAFE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+function childPath(base, key) {
+  return base + "/" + escapePathSegment(key);
+}
 
+/**
+ * Parse a JSON pointer into reference tokens.
+ * "" is the whole document; "/" is the single token "" (an empty key).
+ * Throws PatchError for pointers that do not start with "/" or contain a "~"
+ * not followed by 0 or 1.
+ */
+export function parsePath(path) {
+  if (typeof path !== "string") {
+    throw new PatchError("Invalid JSON pointer: pointer must be a string");
+  }
+  if (path === "") return [];
+  if (path[0] !== "/") {
+    throw new PatchError(`Invalid JSON pointer: ${JSON.stringify(path)} must be empty or start with /`);
+  }
+  return path
+    .slice(1)
+    .split("/")
+    .map((segment) => {
+      if (/~(?![01])/.test(segment)) {
+        throw new PatchError(`Invalid JSON pointer: ${JSON.stringify(path)} has ~ not followed by 0 or 1`);
+      }
+      // ~1 must be decoded before ~0 so "~01" decodes to "~1", not "/".
+      return segment.replace(/~1/g, "/").replace(/~0/g, "~");
+    });
+}
+
+// === Apply Engine ===
+
+/**
+ * Apply patch operations to a model. Returns a new value — the input is not
+ * modified. Throws PatchError on any op that cannot be applied exactly.
+ */
 export function applyOps(model, ops) {
+  if (!Array.isArray(ops)) {
+    throw new PatchError("Patch ops must be an array");
+  }
   let result = model;
   for (let i = 0; i < ops.length; i++) {
     result = applyOp(result, ops[i]);
@@ -157,91 +212,141 @@ export function applyOps(model, ops) {
 }
 
 function applyOp(model, op) {
-  const { path, value } = op;
-
-  if (path === "" || path === "/") {
-    // Root-level operation
-    if (op.op === "replace") return value;
-    return model;
+  if (!isObject(op) || typeof op.op !== "string") {
+    throw new PatchError(`Malformed patch op: ${JSON.stringify(op)}`);
   }
-
-  const segments = parsePath(path);
-  assertSafeSegments(segments);
-
-  // Clone the path to the target
-  const result = shallowClonePath(model, segments);
-  let current = result;
-
-  // Navigate to parent of target
-  for (let i = 0; i < segments.length - 1; i++) {
-    current = current[segments[i]];
-  }
-
-  const lastKey = segments[segments.length - 1];
-
+  const tokens = parsePath(op.path);
+  assertSafeSegments(tokens);
   switch (op.op) {
     case "replace":
-      current[lastKey] = value;
-      break;
-    case "append":
-      if (Array.isArray(current[lastKey])) {
-        current[lastKey] = current[lastKey].concat(value);
-      }
-      break;
+      requireValue(op);
+      return updateAt(model, tokens, (parent, token) => replaceIn(parent, token, op.value), op.value);
+    case "add":
+      requireValue(op);
+      return updateAt(model, tokens, (parent, token) => addIn(parent, token, op.value), op.value);
     case "remove":
-      if (Array.isArray(current)) {
-        const idx = parseInt(lastKey, 10);
-        current.splice(idx, 1);
-      } else {
-        delete current[lastKey];
+      if (tokens.length === 0) throw new PatchError("Cannot remove the document root");
+      return updateAt(model, tokens, removeIn, undefined);
+    case "append":
+      if (!Array.isArray(op.value)) {
+        throw new PatchError(`append value must be an array at ${JSON.stringify(op.path)}`);
       }
-      break;
+      if (tokens.length === 0) return appendTo(model, op.value, op.path);
+      return updateAt(
+        model,
+        tokens,
+        (parent, token) => replaceIn(parent, token, appendTo(getIn(parent, token), op.value, op.path)),
+        undefined,
+      );
+    default:
+      throw new PatchError(`Unknown patch op: ${JSON.stringify(op.op)}`);
   }
-
-  return result;
 }
 
-/**
- * Shallow-clone objects along a path so we don't mutate the original.
- * Only clones the objects on the path — siblings are shared references.
- */
-function shallowClonePath(obj, segments) {
-  if (typeof obj !== "object" || obj === null) return obj;
-  const result = Array.isArray(obj) ? [...obj] : { ...obj };
-  let current = result;
-  for (let i = 0; i < segments.length - 1; i++) {
-    const key = segments[i];
-    if (!Object.prototype.hasOwnProperty.call(current, key)) break;
-    const child = current[key];
-    if (typeof child === "object" && child !== null) {
-      current[key] = Array.isArray(child) ? [...child] : { ...child };
-      current = current[key];
-    } else {
-      break;
-    }
+function requireValue(op) {
+  if (!Object.prototype.hasOwnProperty.call(op, "value")) {
+    throw new PatchError(`Patch op ${op.op} at ${JSON.stringify(op.path)} has no value`);
   }
-  // Clone the leaf container too
-  if (segments.length > 0) {
-    const leafKey = segments[segments.length - 1];
-    const leaf = current[leafKey];
-    if (typeof leaf === "object" && leaf !== null && Array.isArray(leaf)) {
-      current[leafKey] = [...leaf];
-    }
-  }
-  return result;
 }
 
-function parsePath(path) {
-  return path
-    .split("/")
-    .filter((s) => s !== "")
-    .map((segment) => segment.replace(/~1/g, "/").replace(/~0/g, "~"));
+// Copy-on-write walk to the parent of the last token.
+function updateAt(node, tokens, fn, rootValue) {
+  if (tokens.length === 0) return rootValue;
+  if (tokens.length === 1) return fn(node, tokens[0]);
+  const [token, ...rest] = tokens;
+  const child = getIn(node, token);
+  return replaceIn(node, token, updateAt(child, rest, fn, rootValue));
+}
+
+function getIn(node, token) {
+  if (Array.isArray(node)) return node[existingIndex(node, token)];
+  if (isObject(node)) {
+    if (!Object.prototype.hasOwnProperty.call(node, token)) {
+      throw new PatchError(`Missing member ${JSON.stringify(token)}`);
+    }
+    return node[token];
+  }
+  throw new PatchError(`Cannot traverse ${JSON.stringify(token)} into a non-container`);
+}
+
+function replaceIn(node, token, value) {
+  if (Array.isArray(node)) {
+    const index = existingIndex(node, token);
+    const copy = node.slice();
+    copy[index] = value;
+    return copy;
+  }
+  if (isObject(node)) {
+    if (!Object.prototype.hasOwnProperty.call(node, token)) {
+      throw new PatchError(`Missing member ${JSON.stringify(token)}`);
+    }
+    return { ...node, [token]: value };
+  }
+  throw new PatchError(`Cannot replace ${JSON.stringify(token)} in a non-container`);
+}
+
+function addIn(node, token, value) {
+  if (Array.isArray(node)) {
+    if (token === "-") return node.concat([value]);
+    const index = parseIndex(token);
+    if (index > node.length) {
+      throw new PatchError(`Array index ${token} out of bounds (length ${node.length})`);
+    }
+    const copy = node.slice();
+    copy.splice(index, 0, value);
+    return copy;
+  }
+  if (isObject(node)) {
+    return { ...node, [token]: value };
+  }
+  throw new PatchError(`Cannot add ${JSON.stringify(token)} to a non-container`);
+}
+
+function removeIn(node, token) {
+  if (Array.isArray(node)) {
+    const index = existingIndex(node, token);
+    const copy = node.slice();
+    copy.splice(index, 1);
+    return copy;
+  }
+  if (isObject(node)) {
+    if (!Object.prototype.hasOwnProperty.call(node, token)) {
+      throw new PatchError(`Missing member ${JSON.stringify(token)}`);
+    }
+    const copy = { ...node };
+    delete copy[token];
+    return copy;
+  }
+  throw new PatchError(`Cannot remove ${JSON.stringify(token)} from a non-container`);
+}
+
+function appendTo(node, items, path) {
+  if (!Array.isArray(node)) {
+    throw new PatchError(`append target ${JSON.stringify(path)} is not an array`);
+  }
+  return node.concat(items);
+}
+
+function existingIndex(arr, token) {
+  const index = parseIndex(token);
+  if (index >= arr.length) {
+    throw new PatchError(`Array index ${token} out of bounds (length ${arr.length})`);
+  }
+  return index;
+}
+
+// RFC 6901 array index: "0" or a decimal without leading zeros.
+function parseIndex(token) {
+  if (!/^(0|[1-9][0-9]*)$/.test(token)) {
+    throw new PatchError(`Invalid array index ${JSON.stringify(token)}`);
+  }
+  return Number(token);
 }
 
 function assertSafeSegments(segments) {
   for (let i = 0; i < segments.length; i++) {
     if (UNSAFE_KEYS.has(segments[i])) {
-      throw new Error(`Unsafe patch path segment: ${segments[i]}`);
+      throw new PatchError(`Unsafe patch path segment: ${segments[i]}`);
     }
   }
 }
