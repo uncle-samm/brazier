@@ -1,13 +1,25 @@
 /// Shared state store — provides ETS-backed storage without user FFI.
 /// Stores auto-broadcast via PubSub when data changes.
-/// Use `beacon.watch(store, fn() -> msg)` to subscribe to changes.
+/// To react to changes, return `store.topic(s)` / `store.list_topic(s)` from
+/// `beacon.subscriptions` and handle it in `beacon.on_notify`.
 ///
 /// - `Store` — key-value (one value per key)
-/// - `ListStore` — bag-type (multiple values per key, like chat messages)
+/// - `ListStore` — duplicate-bag (any number of values per key, duplicates
+///   and insertion order kept, like chat messages)
+///
+/// Creation is idempotent: `new(name)` / `new_list(name)` called again with
+/// the same name (from any process) returns a handle to the same data. The
+/// backing tables are owned by a long-lived owner process, so they outlive
+/// the process that created them.
 import beacon/log
 import beacon/pubsub
 import beacon/state_manager
 import gleam/list
+
+/// Why a store could not be created. Names must be 1-255 bytes of
+/// `[A-Za-z0-9_-]` once prefixed (they become ETS table atoms).
+pub type StoreError =
+  state_manager.EtsError
 
 /// A key-value store backed by ETS.
 /// Auto-broadcasts on put/delete.
@@ -15,10 +27,57 @@ pub type Store(value) {
   Store(manager: state_manager.EtsManager, topic: String)
 }
 
-/// Create a new key-value store.
+/// Create (or reuse) a key-value store, returning a typed error for an
+/// invalid name.
+pub fn try_new(name: String) -> Result(Store(value), StoreError) {
+  log.debug("beacon.store", "Opening store: " <> name)
+  case open_table(name, "beacon_store_", state_manager.EtsSet) {
+    Ok(table) ->
+      Ok(Store(
+        manager: state_manager.EtsManager(table: table),
+        topic: "store:" <> name,
+      ))
+    Error(err) -> Error(err)
+  }
+}
+
+/// Create (or reuse) a key-value store. Calling it again with the same name
+/// returns the same store.
+///
+/// Store names are developer-supplied constants, so a failure (an invalid
+/// name) is a programming error: it is logged and crashes the caller
+/// loudly. Use `try_new` to handle it as a value.
 pub fn new(name: String) -> Store(value) {
-  log.info("beacon.store", "Creating store: " <> name)
-  Store(manager: state_manager.start_ets(name), topic: "store:" <> name)
+  let result = try_new(name)
+  // Invariant: store names are compile-time constants; an invalid one is a
+  // bug to surface at startup (already logged by state_manager.ensure_table).
+  let assert Ok(store) = result as "beacon.store.new failed"
+  store
+}
+
+/// Validate a store name and open its namespaced table. Prefixes keep a
+/// store from ever aliasing a framework table (sessions, rate limits, ...)
+/// or a list store of the same name.
+fn open_table(
+  name: String,
+  prefix: String,
+  table_type: state_manager.EtsTableType,
+) -> Result(state_manager.EtsTable, StoreError) {
+  case name {
+    "" -> {
+      let err =
+        state_manager.InvalidTableName(
+          name: name,
+          reason: "Invalid name: must not be empty",
+        )
+      log.error(
+        "beacon.store",
+        "Cannot open store: " <> state_manager.describe_ets_error(err),
+      )
+      Error(err)
+    }
+    _ -> state_manager.ensure_table(prefix <> name, table_type)
+  }
 }
 
 /// Get a value by key.
@@ -47,24 +106,38 @@ pub fn count(store: Store(value)) -> Int {
   state_manager.ets_count(store.manager)
 }
 
-/// Get the PubSub topic for this store (used by `beacon.watch`).
+/// Get the PubSub topic for this store (return it from `beacon.subscriptions`).
 pub fn topic(store: Store(value)) -> String {
   store.topic
 }
 
-/// A list store backed by ETS bag — multiple values per key.
-/// Auto-broadcasts on append/delete.
+/// A list store backed by an ETS `duplicate_bag` — any number of values per
+/// key. Appending the same value twice stores it twice; `get_all` returns
+/// values in insertion order. Auto-broadcasts on append/delete.
 pub type ListStore(value) {
-  ListStore(table: EtsTable, topic: String)
+  ListStore(table: state_manager.EtsTable, topic: String)
 }
 
-/// Opaque ETS table reference for list stores.
-pub type EtsTable
+/// Create (or reuse) a list store, returning a typed error for an invalid
+/// name.
+pub fn try_new_list(name: String) -> Result(ListStore(value), StoreError) {
+  log.debug("beacon.store", "Opening list store: " <> name)
+  case open_table(name, "beacon_ls_", state_manager.EtsDuplicateBag) {
+    Ok(table) -> Ok(ListStore(table: table, topic: "store:" <> name))
+    Error(err) -> Error(err)
+  }
+}
 
-/// Create a new list store.
+/// Create (or reuse) a list store. Calling it again with the same name
+/// returns the same store.
+///
+/// A failure (an invalid name) is a programming error: it is logged and
+/// crashes the caller loudly. Use `try_new_list` to handle it as a value.
 pub fn new_list(name: String) -> ListStore(value) {
-  log.info("beacon.store", "Creating list store: " <> name)
-  ListStore(table: list_store_new_table(name), topic: "store:" <> name)
+  let result = try_new_list(name)
+  // Invariant: list store names are compile-time constants; see `new`.
+  let assert Ok(store) = result as "beacon.store.new_list failed"
+  store
 }
 
 /// Append a value. Auto-broadcasts to store-level watchers.
@@ -126,21 +199,25 @@ pub fn delete_all_notify(
   pubsub.broadcast(topic_prefix <> key, Nil)
 }
 
-/// Get the PubSub topic for this list store (used by `beacon.watch`).
+/// Get the PubSub topic for this list store (return it from `beacon.subscriptions`).
 pub fn list_topic(store: ListStore(value)) -> String {
   store.topic
 }
 
 // === Internal FFI ===
 
-@external(erlang, "beacon_store_ffi", "new_list_store")
-fn list_store_new_table(name: String) -> EtsTable
-
 @external(erlang, "beacon_store_ffi", "append")
-fn list_store_append_ffi(table: EtsTable, key: String, value: value) -> Nil
+fn list_store_append_ffi(
+  table: state_manager.EtsTable,
+  key: String,
+  value: value,
+) -> Nil
 
 @external(erlang, "beacon_store_ffi", "get_all")
-fn list_store_get_all_ffi(table: EtsTable, key: String) -> List(value)
+fn list_store_get_all_ffi(
+  table: state_manager.EtsTable,
+  key: String,
+) -> List(value)
 
 @external(erlang, "beacon_store_ffi", "delete_key")
-fn list_store_delete_ffi(table: EtsTable, key: String) -> Nil
+fn list_store_delete_ffi(table: state_manager.EtsTable, key: String) -> Nil

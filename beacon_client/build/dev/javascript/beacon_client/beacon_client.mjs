@@ -1,12 +1,12 @@
 import * as $int from "../gleam_stdlib/gleam/int.mjs";
 import * as $handler from "./beacon_client/handler.mjs";
 import {
+  ws_connect as connect_ws,
+  log_error,
   morph_html as morph_app_root_ffi,
   query_selector,
-  ws_send,
-  ws_connect as connect_ws,
   log,
-  log_error,
+  ws_send,
 } from "./beacon_client_ffi.mjs";
 import { Ok, CustomType as $CustomType } from "./gleam.mjs";
 
@@ -54,18 +54,12 @@ export const ClientState$ClientState$msg_affects_model = (value) =>
   value.msg_affects_model;
 export const ClientState$ClientState$7 = (value) => value.msg_affects_model;
 
-/**
- * Decide whether an event should be forwarded to the server.
- * Keydown events are always forwarded so server-side apps can react to them
- * even when their local update is model-neutral.
- */
-export function should_send_to_server(event_name, msg_affects_model, msg) {
-  let $ = msg_affects_model(msg);
-  if ($) {
-    return $;
-  } else {
-    return event_name === "keydown";
-  }
+function get_ws_url() {
+  return "ws://localhost:8080/ws";
+}
+
+function attach_events() {
+  return undefined;
 }
 
 function morph_app_root(html) {
@@ -76,37 +70,6 @@ function morph_app_root(html) {
   } else {
     return log_error("Missing required #beacon-app root; cannot render");
   }
-}
-
-function attach_events() {
-  return undefined;
-}
-
-/**
- * Handle authoritative Model from server.
- */
-export function handle_model_sync(state, new_model, version) {
-  $handler.start_render();
-  let html = state.view(new_model, state.local);
-  let new_registry = $handler.finish_render();
-  morph_app_root(html);
-  let $ = attach_events();
-  
-  log("Model sync v" + $int.to_string(version));
-  return new ClientState(
-    new_model,
-    state.local,
-    state.update,
-    state.view,
-    new_registry,
-    version,
-    state.event_clock,
-    state.msg_affects_model,
-  );
-}
-
-function get_ws_url() {
-  return "ws://localhost:8080/ws";
 }
 
 /**
@@ -141,6 +104,20 @@ function send_model_update(event_name, handler_id, data, clock) {
 }
 
 /**
+ * Decide whether an event should be forwarded to the server.
+ * Keydown events are always forwarded so server-side apps can react to them
+ * even when their local update is model-neutral.
+ */
+export function should_send_to_server(event_name, msg_affects_model, msg) {
+  let $ = msg_affects_model(msg);
+  if ($) {
+    return $;
+  } else {
+    return event_name === "keydown";
+  }
+}
+
+/**
  * Handle an event from the DOM.
  */
 export function handle_event(state, event_name, handler_id, event_data) {
@@ -148,10 +125,8 @@ export function handle_event(state, event_name, handler_id, event_data) {
   if ($ instanceof Ok) {
     let msg = $[0];
     let $1 = state.update(state.model, state.local, msg);
-    let new_model;
-    let new_local;
-    new_model = $1[0];
-    new_local = $1[1];
+    let new_model = $1[0];
+    let new_local = $1[1];
     $handler.start_render();
     let html = state.view(new_model, new_local);
     let new_registry = $handler.finish_render();
@@ -162,9 +137,9 @@ export function handle_event(state, event_name, handler_id, event_data) {
     let $3 = should_send_to_server(event_name, state.msg_affects_model, msg);
     if ($3) {
       send_model_update(event_name, handler_id, event_data, new_clock);
-      log(("Event " + handler_id) + " → server (model changed)")
+      log(("Event " + handler_id) + " → server (model changed)");
     } else {
-      log(("Event " + handler_id) + " → local only")
+      log(("Event " + handler_id) + " → local only");
     }
     return new ClientState(
       new_model,
@@ -181,4 +156,27 @@ export function handle_event(state, event_name, handler_id, event_data) {
     log("Handler error: " + reason);
     return state;
   }
+}
+
+/**
+ * Handle authoritative Model from server.
+ */
+export function handle_model_sync(state, new_model, version) {
+  $handler.start_render();
+  let html = state.view(new_model, state.local);
+  let new_registry = $handler.finish_render();
+  morph_app_root(html);
+  let $ = attach_events();
+  
+  log("Model sync v" + $int.to_string(version));
+  return new ClientState(
+    new_model,
+    state.local,
+    state.update,
+    state.view,
+    new_registry,
+    version,
+    state.event_clock,
+    state.msg_affects_model,
+  );
 }

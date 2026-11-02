@@ -7,13 +7,39 @@
 // flood the server while still supporting submit-by-enter.
 
 import { Ok, Error as GleamError } from "./gleam.mjs";
-import { applyOps } from "./beacon_client/patch.mjs";
+import {
+  applyOps,
+  classifyModelSync,
+  classifyPatch,
+  closeAction,
+  heartbeatAllowed,
+  messageCost,
+  PacedQueue,
+  reconnectDelayMs,
+  SendBudget,
+  splitEventBatch,
+  CLIENT_SEND_BUDGET,
+  CLIENT_SEND_WINDOW_MS,
+} from "./beacon_client/patch.mjs";
 
 // === State ===
 const _pd = {};
 let ws = null;
 let heartbeatTimer = null;
+let lastHeartbeatAt = null;
+const HEARTBEAT_INTERVAL_MS = 30000;
 let reconnectAttempts = 0;
+// Set on close code 4401: the session is revoked, so never reconnect with it.
+let reconnectStopped = false;
+// True once the join for the current socket has been written.
+let socketJoined = false;
+// True once a model_sync of the current connection has been applied.
+let modelSynced = false;
+// model_sync failures in a row; after MAX_MODEL_SYNC_RETRIES resync requests
+// the client stops asking (syncGaveUp) until the next connection.
+let consecutiveModelSyncFailures = 0;
+const MAX_MODEL_SYNC_RETRIES = 3;
+let syncGaveUp = false;
 let appRoot = null;
 let hydrated = false;
 let eventClock = 0;
@@ -24,11 +50,19 @@ const traceBuffer = [];
 const hookRegistry = new Map();
 const mountedHooks = new WeakMap();
 
-// === Client-Side Event Rate Limiting ===
-let eventSendCount = 0;
-let eventSendWindowStart = 0;
-const MAX_EVENTS_PER_SECOND = 30;
-const MAX_PENDING_SEND_QUEUE = 100;
+// === Outbound pacing ===
+// Every non-heartbeat message is charged against a client send budget the way
+// the server rate limiter counts it (an event_batch costs its length), and
+// waits in one paced queue. Nothing is dropped silently: when the queue is
+// full the message is reported with console.error and a full model sync is
+// requested once the queue drains.
+const MAX_PENDING_SEND_QUEUE = 200;
+const outbound = new PacedQueue(
+  new SendBudget(CLIENT_SEND_BUDGET, CLIENT_SEND_WINDOW_MS),
+  MAX_PENDING_SEND_QUEUE,
+);
+let outboundOverflowed = false;
+let pumpTimer = null;
 const MAX_PENDING_EARLY_EVENTS = 50;
 const INPUT_DEBOUNCE_MS = 80;
 const pendingInputEvents = new Map();
@@ -70,16 +104,6 @@ function ensureHookRegistry() {
   };
 }
 
-function isEventRateLimited() {
-  const now = Date.now();
-  if (now - eventSendWindowStart > 1000) {
-    eventSendCount = 0;
-    eventSendWindowStart = now;
-  }
-  eventSendCount++;
-  return eventSendCount > MAX_EVENTS_PER_SECOND;
-}
-
 // === Client-Side State (when BeaconApp is available) ===
 let clientModel = null;
 let clientLocal = null;
@@ -87,7 +111,6 @@ let clientRegistry = null;
 let clientInitialized = false;
 let renderPending = false;  // RAF throttle: true when a render is scheduled
 let clientModelJson = null;  // Cached JSON representation for patch diffing
-let pendingSendQueue = [];
 let pendingEarlyEvents = [];
 let readyForServerEvents = false;
 let syncRequestInFlight = false;
@@ -259,77 +282,125 @@ function setAppRoot(root) {
 
 // === WebSocket ===
 function connect(wsUrl) {
+  if (reconnectStopped) {
+    console.error("[beacon] Not connecting: the session was revoked (close 4401). Reload to sign in again.");
+    return;
+  }
   readyForServerEvents = false;
+  socketJoined = false;
+  modelSynced = false;
   currentModelVersion = 0;
   latestAckClock = 0;
   syncRequestInFlight = false;
+  syncGaveUp = false;
+  consecutiveModelSyncFailures = 0;
   pendingModelEventClock = 0;
   skippedAuthoritativeWhilePending = false;
-  ws = new WebSocket(wsUrl);
-  ws.onopen = () => {
+  // The server counts its rate limit per connection, so a new socket starts
+  // with a fresh budget. A queued request_sync is superseded by the join's
+  // model_sync.
+  outbound.setBudget(new SendBudget(CLIENT_SEND_BUDGET, CLIENT_SEND_WINDOW_MS));
+  const purged = outbound.removeWhere((msg) => msg.type === "request_sync");
+  if (purged > 0) trace("send_queue.purge_request_sync", { purged });
+  const socket = new WebSocket(wsUrl);
+  ws = socket;
+  socket.onopen = () => {
     mark("ws-open");
-    reconnectAttempts = 0;
-    startHeartbeat();
-    sendNow({ type: "join", token: "", path: location.pathname + location.search });
+    startHeartbeat(socket);
+    sendJoin(socket);
   };
-  ws.onmessage = (e) => handleMessage(e.data);
-  ws.onclose = () => { stopHeartbeat(); scheduleReconnect(wsUrl); };
-  ws.onerror = (e) => console.error("[beacon] WS error:", e);
+  socket.onmessage = (e) => handleMessage(e.data);
+  socket.onclose = (e) => handleClose(socket, wsUrl, e);
+  socket.onerror = (e) => console.error("[beacon] WS error:", e);
 }
 
-function send(msg) {
-  const encoded = JSON.stringify(msg);
-  if (readyForServerEvents && ws && ws.readyState === WebSocket.OPEN) {
-    try {
-      ws.send(encoded);
-      return;
-    } catch (e) {
-      console.error("[beacon] WS send failed, queueing message:", e);
-    }
+function sendJoin(socket) {
+  // A new connection has a fresh budget, so the join always fits. Charging it
+  // keeps the client budget in step with the server's count.
+  if (!outbound.budget.tryTake(performance.now(), 1)) {
+    throw new Error("[beacon] invariant violated: join does not fit a fresh send budget");
   }
-  enqueuePendingSend(encoded, msg.type || "unknown");
-}
-
-function sendNow(msg) {
-  const encoded = JSON.stringify(msg);
-  if (!ws || ws.readyState !== WebSocket.OPEN) {
-    enqueuePendingSend(encoded, msg.type || "unknown");
+  if (!writeSocket(socket, { type: "join", token: "", path: location.pathname + location.search })) {
+    console.error("[beacon] Join could not be written; closing the socket to reconnect");
+    socket.close(4000, "join send failed");
     return;
   }
+  socketJoined = true;
+  trace("ws.join");
+  pumpOutbound();
+}
+
+function handleClose(socket, wsUrl, e) {
+  if (socket !== ws) {
+    console.warn("[beacon] Close event for a replaced socket ignored (code " + e.code + ")");
+    return;
+  }
+  stopHeartbeat();
+  socketJoined = false;
+  readyForServerEvents = false;
+  trace("ws.close", { code: e.code, reason: e.reason });
+  if (closeAction(e.code) === "stop") {
+    reconnectStopped = true;
+    console.error("[beacon] Session revoked or authentication expired (close 4401" + (e.reason ? ": " + e.reason : "") + "); not reconnecting, reloading the page");
+    location.reload();
+    return;
+  }
+  console.warn("[beacon] WebSocket closed (code " + e.code + (e.reason ? ", " + e.reason : "") + "); reconnecting with backoff");
+  scheduleReconnect(wsUrl);
+}
+
+// Write one message to the socket. Returns false when it was not written.
+function writeSocket(socket, msg) {
+  if (socket !== ws || socket.readyState !== WebSocket.OPEN) return false;
   try {
-    ws.send(encoded);
+    socket.send(JSON.stringify(msg));
+    return true;
   } catch (e) {
-    console.error("[beacon] WS send failed, queueing message:", e);
-    enqueuePendingSend(encoded, msg.type || "unknown");
+    console.error("[beacon] WS send failed for " + msg.type + "; it stays queued:", e);
+    return false;
   }
 }
 
-function enqueuePendingSend(encoded, type) {
-  if (pendingSendQueue.length >= MAX_PENDING_SEND_QUEUE) {
-    console.error("[beacon] Pending WebSocket queue full; dropping " + type + " message");
-    trace("send_queue.full", { type, size: pendingSendQueue.length });
+// Queue a message for the paced sender. Returns false when the queue is full;
+// the message is then reported and a full sync follows once the queue drains.
+function send(msg) {
+  const cost = messageCost(msg);
+  if (!outbound.push(msg, cost, msg.type === "request_sync")) {
+    console.error("[beacon] Outbound queue full (" + MAX_PENDING_SEND_QUEUE + " messages); " + msg.type + " was not sent. A full model sync will follow.");
+    trace("send_queue.full", { type: msg.type, size: outbound.length });
+    outboundOverflowed = true;
     return false;
   }
-  pendingSendQueue.push(encoded);
-  trace("send_queue.enqueue", { type, size: pendingSendQueue.length });
+  trace("send_queue.enqueue", { type: msg.type, size: outbound.length });
+  pumpOutbound();
   return true;
 }
 
-function flushPendingSendQueue() {
-  if (!readyForServerEvents || !ws || ws.readyState !== WebSocket.OPEN || pendingSendQueue.length === 0) return;
+// request_sync only needs a joined socket; everything else also waits for
+// the first model_sync (or mount) so it is processed against a known model.
+function canSendNow(msg) {
+  if (!ws || ws.readyState !== WebSocket.OPEN || !socketJoined) return false;
+  return msg.type === "request_sync" || readyForServerEvents;
+}
 
-  while (pendingSendQueue.length > 0 && ws && ws.readyState === WebSocket.OPEN) {
-    const encoded = pendingSendQueue.shift();
-    if (encoded === undefined) break;
-    try {
-      ws.send(encoded);
-    } catch (e) {
-      console.error("[beacon] WS flush failed, preserving pending queue:", e);
-      pendingSendQueue.unshift(encoded);
-      return;
-    }
+function pumpOutbound() {
+  if (pumpTimer !== null) return;
+  const socket = ws;
+  const result = outbound.pump(performance.now(), canSendNow, (msg) => writeSocket(socket, msg));
+  if (result.waitMs > 0) {
+    trace("send_queue.paced", { waitMs: result.waitMs, size: outbound.length });
+    pumpTimer = setTimeout(() => {
+      pumpTimer = null;
+      pumpOutbound();
+    }, result.waitMs);
+    return;
+  }
+  if (outbound.length === 0 && outboundOverflowed) {
+    outboundOverflowed = false;
+    requestFullSync("outbound_queue_overflow");
   }
 }
+
 // Debug: expose WS state for testing when running in a browser.
 if (typeof window !== "undefined") {
   window.__beaconWsState = () => ws ? ws.readyState : -1;
@@ -343,26 +414,57 @@ if (typeof window !== "undefined") {
     };
   }
 }
-function startHeartbeat() { stopHeartbeat(); heartbeatTimer = setInterval(() => send({ type: "heartbeat" }), 30000); }
-function stopHeartbeat() { if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; } }
-function scheduleReconnect(wsUrl) {
-  const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), 30000);
-  const jitter = Math.floor(Math.random() * 1000);
-  reconnectAttempts++;
-  setTimeout(() => connect(wsUrl), delay + jitter);
+
+function startHeartbeat(socket) {
+  stopHeartbeat();
+  heartbeatTimer = setInterval(() => sendHeartbeat(socket), HEARTBEAT_INTERVAL_MS);
 }
 
-export function ws_send(data) { send(JSON.parse(data)); return undefined; }
+// Heartbeats are never queued: a queued burst would exceed the server's limit
+// of 2 per second, and a closed socket has nothing to keep alive.
+function sendHeartbeat(socket) {
+  const now = performance.now();
+  if (!heartbeatAllowed(lastHeartbeatAt, now)) {
+    console.warn("[beacon] Heartbeat skipped: the previous one was sent under 500ms ago");
+    return;
+  }
+  if (writeSocket(socket, { type: "heartbeat" })) {
+    lastHeartbeatAt = now;
+  } else {
+    trace("heartbeat.skip", { readyState: socket.readyState });
+  }
+}
+
+function stopHeartbeat() { if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; } }
+
+function scheduleReconnect(wsUrl) {
+  const delay = reconnectDelayMs(reconnectAttempts, Math.random());
+  reconnectAttempts++;
+  console.log("[beacon] Reconnect attempt " + reconnectAttempts + " in " + delay + "ms");
+  setTimeout(() => connect(wsUrl), delay);
+}
+
+export function ws_send(data) {
+  const msg = JSON.parse(data);
+  if (msg.type === "event_batch") {
+    for (const batch of splitEventBatch(msg, CLIENT_SEND_BUDGET)) send(batch);
+  } else {
+    send(msg);
+  }
+  return undefined;
+}
 export function ws_connect(url) { connect(url); return undefined; }
 
 // === Message Handling ===
 function handleMessage(raw) {
   let msg;
-  // Intentional early return on parse failure: malformed messages from the server
-  // cannot be processed. We log the error and discard the message rather than
-  // crashing the entire client runtime. This is acceptable because a single
-  // corrupt frame should not take down the WS connection.
-  try { msg = JSON.parse(raw); } catch (e) { console.error("[beacon] Failed to parse server message:", e.message, raw.substring(0, 100)); return; }
+  // A frame that is not JSON cannot be processed. It may have been a patch,
+  // so the cached model can no longer be trusted: log it and resync.
+  try { msg = JSON.parse(raw); } catch (e) {
+    console.error("[beacon] Failed to parse server message:", e.message, raw.substring(0, 100));
+    requestFullSync("unparseable_server_message");
+    return;
+  }
   switch (msg.type) {
     case "mount": handleMount(msg.payload); break;
     case "model_sync": handleModelSync(msg.model, msg.version, msg.ack_clock || 0); break;
@@ -371,7 +473,20 @@ function handleMessage(raw) {
     case "hard_navigate": handleServerHardNavigate(msg.path); break;
     case "reload": console.log("[beacon] Hot reload — refreshing..."); location.reload(); break;
     case "heartbeat_ack": break;
-    case "error": console.error("[beacon] Server error:", msg.reason); break;
+    case "error": handleServerError(msg.reason); break;
+    default: console.error("[beacon] Unknown server message type:", msg.type); break;
+  }
+}
+
+function handleServerError(reason) {
+  console.error("[beacon] Server error:", reason);
+  trace("server_error", { reason });
+  if (reason === "Rate limited" || reason === "Batch too large") {
+    // The server rejected a whole message, so the client may hold optimistic
+    // state the server never saw. The rejected message may have been our
+    // request_sync, so an in-flight request no longer counts.
+    syncRequestInFlight = false;
+    requestFullSync("server_rejected: " + reason);
   }
 }
 
@@ -386,135 +501,224 @@ function handleMount(payload) {
   syncHooks(appRoot);
   trace("mount", { length: payload.length });
   readyForServerEvents = true;
-  flushPendingSendQueue();
+  pumpOutbound();
+}
+
+// Decode authoritative client-visible model JSON into clientModel (and
+// clientLocal when the JSON carries it) and render. Returns null on success or
+// the reason it failed. May throw if generated code throws.
+function adoptAuthoritativeModel(App, modelStr) {
+  const result = App.decode_model(modelStr);
+  if (!result.isOk()) return "decode_model failed: " + String(result[0]);
+  clientModel = result[0];
+  if (App.decode_local) {
+    const localResult = App.decode_local(modelStr);
+    if (localResult.isOk()) {
+      clientLocal = localResult[0];
+    } else {
+      // Local state is client-owned; JSON without Local fields keeps it.
+      trace("local.kept", { reason: String(localResult[0]) });
+    }
+  }
+  if (!clientInitialized) {
+    if (!clientLocal && App.init_local) {
+      clientLocal = App.init_local(clientModel);
+    }
+    if (!clientLocal) clientLocal = null;
+    clientInitialized = true;
+    console.log("[beacon] Client-side execution ready (from model_sync)");
+  }
+  // Synchronous render so the DOM updates immediately
+  // (requestAnimationFrame may not fire in background tabs).
+  clientRenderNow();
+  return null;
+}
+
+function invalidateModelCache() {
+  clientModelJson = null;
+  modelSynced = false;
 }
 
 function handleModelSync(modelJson, version, ackClock) {
+  // Any model_sync answers an outstanding request_sync, applied or not.
+  syncRequestInFlight = false;
   if (!window.BeaconApp) return;
   const App = window.BeaconApp;
-  if (!App.decode_model) return;
+  if (!App.decode_model) {
+    console.error("[beacon] model_sync received but the generated client has no decode_model");
+    return;
+  }
   mark("model-sync-start");
-  if (version < currentModelVersion) {
+  const verdict = classifyModelSync({ version: currentModelVersion, synced: modelSynced }, version);
+  if (verdict === "invalid") {
+    modelSyncFailed(version, "invalid version " + JSON.stringify(version));
+    return;
+  }
+  if (verdict === "stale") {
     trace("model_sync.stale", { version, currentModelVersion });
     return;
   }
   if (shouldHoldServerState(ackClock, "model_sync", version)) return;
 
+  let parsed;
   try {
-    const result = App.decode_model(modelJson);
-    if (result.isOk()) {
-      clientModel = result[0];
-
-      // Cache JSON representation for future patch diffing
-      try { clientModelJson = JSON.parse(modelJson); } catch (e) { console.error("[beacon] Failed to parse cached model JSON:", e.message); console.warn("[beacon] Client patching disabled until next successful model_sync — JSON cache is null"); clientModelJson = null; }
-
-      // Decode Local state if available
-      if (App.decode_local) {
-        const localResult = App.decode_local(modelJson);
-        if (localResult.isOk()) {
-          clientLocal = localResult[0];
-        }
-      }
-
-      // Initialize client-side execution on first model_sync if not already done
-      if (!clientInitialized) {
-        if (!clientLocal && App.init_local) {
-          clientLocal = App.init_local(clientModel);
-        }
-        if (!clientLocal) clientLocal = null;
-        clientInitialized = true;
-        console.log("[beacon] Client-side execution ready (from model_sync)");
-      }
-
-      // Use synchronous render to ensure DOM updates immediately
-      // (requestAnimationFrame may not fire in background tabs)
-      clientRenderNow();
-      currentModelVersion = version;
-      markServerAckApplied(ackClock);
-      syncRequestInFlight = false;
-      console.log("[beacon] Model synced v" + version);
-      trace("model_sync", { version, ackClock });
-      readyForServerEvents = true;
-      flushPendingEarlyEvents();
-      flushPendingSendQueue();
-      mark("model-sync-end");
-      measure("model-sync", "model-sync-start", "model-sync-end");
+    parsed = JSON.parse(modelJson);
+    const failure = adoptAuthoritativeModel(App, modelJson);
+    if (failure !== null) {
+      modelSyncFailed(version, failure);
+      return;
     }
   } catch (e) {
-    console.error("[beacon] Model sync decode failed:", e);
+    modelSyncFailed(version, e && e.message ? e.message : String(e));
+    return;
   }
+  clientModelJson = parsed;
+  currentModelVersion = version;
+  modelSynced = true;
+  consecutiveModelSyncFailures = 0;
+  // Backoff resets only once a connection proved usable, so a server that
+  // accepts and immediately drops sockets is still retried with backoff.
+  reconnectAttempts = 0;
+  markServerAckApplied(ackClock);
+  console.log("[beacon] Model synced v" + version);
+  trace("model_sync", { version, ackClock });
+  readyForServerEvents = true;
+  flushPendingEarlyEvents();
+  pumpOutbound();
+  mark("model-sync-end");
+  measure("model-sync", "model-sync-start", "model-sync-end");
+}
+
+function modelSyncFailed(version, reason) {
+  consecutiveModelSyncFailures++;
+  invalidateModelCache();
+  if (consecutiveModelSyncFailures > MAX_MODEL_SYNC_RETRIES) {
+    syncGaveUp = true;
+    console.error("[beacon] model_sync v" + version + " failed " + consecutiveModelSyncFailures + " times in a row (" + reason + "). Client state is out of sync; no more resyncs on this connection. Reload the page to recover.");
+    return;
+  }
+  console.error("[beacon] model_sync v" + version + " could not be applied (" + reason + "); requesting resync " + consecutiveModelSyncFailures + "/" + MAX_MODEL_SYNC_RETRIES);
+  requestFullSync("model_sync_failed");
 }
 
 function handlePatch(opsJson, version, ackClock) {
   if (!window.BeaconApp) return;
   const App = window.BeaconApp;
-  mark("patch-start");
-  if (version < currentModelVersion) {
-    trace("patch.stale", { version, currentModelVersion });
+  if (!App.decode_model) {
+    console.error("[beacon] Patch received but the generated client has no decode_model");
     return;
   }
+  mark("patch-start");
+  let ops;
+  try {
+    ops = typeof opsJson === "string" ? JSON.parse(opsJson) : opsJson;
+  } catch (e) {
+    console.error("[beacon] Patch ops are not valid JSON; requesting full sync:", e.message);
+    invalidateModelCache();
+    requestFullSync("patch_ops_unparseable");
+    return;
+  }
+  if (!Array.isArray(ops)) {
+    console.error("[beacon] Patch ops are not an array; requesting full sync");
+    invalidateModelCache();
+    requestFullSync("patch_ops_not_array");
+    return;
+  }
+
+  const synced = modelSynced && clientModelJson !== null;
+  const verdict = classifyPatch({ version: currentModelVersion, synced }, version, ops.length);
+  switch (verdict) {
+    case "invalid":
+      console.error("[beacon] Patch with invalid version " + JSON.stringify(version) + "; requesting full sync");
+      invalidateModelCache();
+      requestFullSync("invalid_patch_version");
+      return;
+    case "stale":
+      trace("patch.stale", { version, currentModelVersion });
+      return;
+    case "gap":
+      console.warn("[beacon] Patch v" + version + " does not build on cached v" + currentModelVersion + (synced ? "" : " (no synced model)") + "; requesting full sync");
+      requestFullSync("patch_gap");
+      return;
+    case "ack":
+      handleAckPatch(App, version, ackClock);
+      return;
+    case "apply":
+      break;
+    default:
+      throw new Error("[beacon] invariant violated: unknown patch verdict " + verdict);
+  }
+
   if (shouldHoldServerState(ackClock, "patch", version)) return;
   if (needsFullSyncAfterHeldPatch(ackClock)) {
     requestFullSync("held_patch_base_mismatch");
     return;
   }
-  if (!App.decode_model || !clientModelJson) {
-    console.warn("[beacon] Patch received but no cached model, requesting full sync");
-    requestFullSync("missing_patch_cache");
-    return;
-  }
 
+  let newModelJson;
   try {
-    // Parse the ops (server sends them as a JSON string)
-    const ops = typeof opsJson === "string" ? JSON.parse(opsJson) : opsJson;
-    if (!Array.isArray(ops) || ops.length === 0) return;
-
-    // Apply patch operations to cached JSON model
-    const newModelJson = applyOps(clientModelJson, ops);
-    clientModelJson = newModelJson;
-
-    // Re-encode to string and decode to Gleam model
-    const newModelStr = JSON.stringify(newModelJson);
-    const result = App.decode_model(newModelStr);
-    if (result.isOk()) {
-      clientModel = result[0];
-
-      // Decode Local state if available
-      if (App.decode_local) {
-        const localResult = App.decode_local(newModelStr);
-        if (localResult.isOk()) {
-          clientLocal = localResult[0];
-        }
-      }
-
-      clientRenderNow();
-      currentModelVersion = version;
-      markServerAckApplied(ackClock);
-      console.log("[beacon] Patch applied v" + version + " (" + ops.length + " ops)");
-      trace("patch", { version, ackClock, ops: ops.length });
-      mark("patch-end");
-      measure("patch", "patch-start", "patch-end");
-    } else {
-      console.error("[beacon] Patch decode failed, requesting full sync");
-      clientModelJson = null;
+    // applyOps never mutates its input, so a failure leaves the cache intact
+    // until it is invalidated below.
+    newModelJson = applyOps(clientModelJson, ops);
+    const failure = adoptAuthoritativeModel(App, JSON.stringify(newModelJson));
+    if (failure !== null) {
+      console.error("[beacon] Patch v" + version + " produced a model the client cannot decode (" + failure + "); requesting full sync");
+      invalidateModelCache();
       requestFullSync("patch_decode_failed");
+      return;
     }
   } catch (e) {
     console.error("[beacon] Patch apply failed:", e);
-    clientModelJson = null;
+    invalidateModelCache();
     requestFullSync("patch_apply_failed");
+    return;
+  }
+  clientModelJson = newModelJson;
+  currentModelVersion = version;
+  markServerAckApplied(ackClock);
+  console.log("[beacon] Patch applied v" + version + " (" + ops.length + " ops)");
+  trace("patch", { version, ackClock, ops: ops.length });
+  mark("patch-end");
+  measure("patch", "patch-start", "patch-end");
+}
+
+// An empty patch at the cached revision: the server processed events up to
+// ackClock without changing the client-visible model. If that covers our
+// pending model event, the optimistic local result is replaced by the
+// authoritative cached model.
+function handleAckPatch(App, version, ackClock) {
+  const wasPending = hasPendingModelEvent();
+  markServerAckApplied(ackClock);
+  trace("patch.ack", { version, ackClock });
+  if (!wasPending || hasPendingModelEvent()) return;
+  try {
+    const failure = adoptAuthoritativeModel(App, JSON.stringify(clientModelJson));
+    if (failure !== null) {
+      console.error("[beacon] Cached model v" + version + " cannot be decoded after ack (" + failure + "); requesting full sync");
+      invalidateModelCache();
+      requestFullSync("ack_decode_failed");
+    }
+  } catch (e) {
+    console.error("[beacon] Re-render after ack failed:", e);
+    invalidateModelCache();
+    requestFullSync("ack_render_failed");
   }
 }
 
 function requestFullSync(reason) {
+  if (syncGaveUp) {
+    trace("sync_request.gave_up", { reason });
+    return;
+  }
   if (syncRequestInFlight) {
     trace("sync_request.skip", { reason });
     return;
   }
-  syncRequestInFlight = true;
   console.warn("[beacon] Requesting full model sync: " + reason);
   trace("sync_request", { reason });
-  send({ type: "request_sync" });
+  // When the queue is full, send() reports it and the overflow resync follows
+  // once the queue drains, so the request is not marked in flight here.
+  if (send({ type: "request_sync" })) syncRequestInFlight = true;
 }
 
 function enqueueEarlyEvent(eventName, hid, data, tp, clock) {
@@ -822,15 +1026,14 @@ function dispatchEvent(eventName, hid, data, tp, forcedClock) {
   if (clientInitialized) {
     const r = handleEventLocally(hid, data, eventName, tp, clock);
     if (r.action === "send") {
-      if (isEventRateLimited()) {
-        console.warn("[beacon] Event rate limited (>" + MAX_EVENTS_PER_SECOND + "/s)");
-        return;
-      }
-      if (r.affectsModel) pendingModelEventClock = Math.max(pendingModelEventClock, clock);
       if (r.ops) eventPayload.ops = r.ops;
       const encodedMsg = window.BeaconApp.encode_msg(r.msg);
       eventPayload.data = JSON.stringify({ __beacon_msg: encodedMsg, __beacon_event: data });
-      caseSendEvent(eventPayload);
+      // Paced, never dropped silently. Only a queued event can be acked, so
+      // only a queued event may hold back server state while pending.
+      if (caseSendEvent(eventPayload) && r.affectsModel) {
+        pendingModelEventClock = Math.max(pendingModelEventClock, clock);
+      }
     } else if (r.action === "error") {
       console.error("[beacon] Event dropped because generated event decoding is unavailable.");
     }
@@ -841,7 +1044,7 @@ function dispatchEvent(eventName, hid, data, tp, forcedClock) {
 }
 
 function caseSendEvent(eventPayload) {
-  send({ type: "event", ...eventPayload });
+  return send({ type: "event", ...eventPayload });
 }
 
 function dispatchInputEvent(hid, data, tp, debounceMs) {

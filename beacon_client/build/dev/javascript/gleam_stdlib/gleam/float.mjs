@@ -17,30 +17,20 @@ import {
 export { ceiling, exponential, floor, parse, random, to_string, truncate };
 
 /**
- * Compares two `Float`s, returning an `Order`:
- * `Lt` for lower than, `Eq` for equals, or `Gt` for greater than.
+ * Compares two `Float`s, returning the larger of the two.
  *
  * ## Examples
  *
  * ```gleam
- * assert compare(2.0, 2.3) == Lt
+ * assert max(2.0, 2.3) == 2.3
  * ```
- *
- * To handle
- * [Floating Point Imprecision](https://en.wikipedia.org/wiki/Floating-point_arithmetic#Accuracy_problems)
- * you may use [`loosely_compare`](#loosely_compare) instead.
  */
-export function compare(a, b) {
-  let $ = a === b;
+export function max(a, b) {
+  let $ = a > b;
   if ($) {
-    return new $order.Eq();
+    return a;
   } else {
-    let $1 = a < b;
-    if ($1) {
-      return new $order.Lt();
-    } else {
-      return new $order.Gt();
-    }
+    return b;
   }
 }
 
@@ -55,24 +45,6 @@ export function compare(a, b) {
  */
 export function min(a, b) {
   let $ = a < b;
-  if ($) {
-    return a;
-  } else {
-    return b;
-  }
-}
-
-/**
- * Compares two `Float`s, returning the larger of the two.
- *
- * ## Examples
- *
- * ```gleam
- * assert max(2.0, 2.3) == 2.3
- * ```
- */
-export function max(a, b) {
-  let $ = a > b;
   if ($) {
     return a;
   } else {
@@ -108,6 +80,34 @@ export function clamp(x, min_bound, max_bound) {
     let _pipe = x;
     let _pipe$1 = min(_pipe, max_bound);
     return max(_pipe$1, min_bound);
+  }
+}
+
+/**
+ * Compares two `Float`s, returning an `Order`:
+ * `Lt` for lower than, `Eq` for equals, or `Gt` for greater than.
+ *
+ * ## Examples
+ *
+ * ```gleam
+ * assert compare(2.0, 2.3) == Lt
+ * ```
+ *
+ * To handle
+ * [Floating Point Imprecision](https://en.wikipedia.org/wiki/Floating-point_arithmetic#Accuracy_problems)
+ * you may use [`loosely_compare`](#loosely_compare) instead.
+ */
+export function compare(a, b) {
+  let $ = a === b;
+  if ($) {
+    return $order.Order$Eq$const;
+  } else {
+    let $1 = a < b;
+    if ($1) {
+      return $order.Order$Lt$const;
+    } else {
+      return $order.Order$Gt$const;
+    }
   }
 }
 
@@ -156,7 +156,7 @@ export function loosely_compare(a, b, tolerance) {
   let difference = absolute_value(a - b);
   let $ = difference <= tolerance;
   if ($) {
-    return new $order.Eq();
+    return $order.Order$Eq$const;
   } else {
     return compare(a, b);
   }
@@ -185,59 +185,6 @@ export function loosely_compare(a, b, tolerance) {
 export function loosely_equals(a, b, tolerance) {
   let difference = absolute_value(a - b);
   return difference <= tolerance;
-}
-
-/**
- * Returns the result of the base being raised to the power of the
- * exponent, as a `Float`.
- *
- * ## Examples
- *
- * ```gleam
- * assert power(2.0, -1.0) == Ok(0.5)
- * ```
- *
- * ```gleam
- * assert power(2.0, 2.0) == Ok(4.0)
- * ```
- *
- * ```gleam
- * assert power(8.0, 1.5) == Ok(22.627416997969522)
- * ```
- *
- * ```gleam
- * assert 4.0 |> power(of: 2.0) == Ok(16.0)
- * ```
- *
- * ```gleam
- * assert power(-1.0, 0.5) == Error(Nil)
- * ```
- */
-export function power(base, exponent) {
-  let fractional = (ceiling(exponent) - exponent) > 0.0;
-  let $ = ((base < 0.0) && fractional) || ((base === 0.0) && (exponent < 0.0));
-  if ($) {
-    return new Error(undefined);
-  } else {
-    return new Ok(do_power(base, exponent));
-  }
-}
-
-/**
- * Returns the square root of the input as a `Float`.
- *
- * ## Examples
- *
- * ```gleam
- * assert square_root(4.0) == Ok(2.0)
- * ```
- *
- * ```gleam
- * assert square_root(-16.0) == Error(Nil)
- * ```
- */
-export function square_root(x) {
-  return power(x, 0.5);
 }
 
 /**
@@ -300,6 +247,59 @@ export function to_precision(x, precision) {
     let factor = do_power(10.0, do_to_float(precision));
     return divideFloat(do_to_float(round(x * factor)), factor);
   }
+}
+
+/**
+ * Returns the result of the base being raised to the power of the
+ * exponent, as a `Float`.
+ *
+ * ## Examples
+ *
+ * ```gleam
+ * assert power(2.0, -1.0) == Ok(0.5)
+ * ```
+ *
+ * ```gleam
+ * assert power(2.0, 2.0) == Ok(4.0)
+ * ```
+ *
+ * ```gleam
+ * assert power(8.0, 1.5) == Ok(22.627416997969522)
+ * ```
+ *
+ * ```gleam
+ * assert 4.0 |> power(of: 2.0) == Ok(16.0)
+ * ```
+ *
+ * ```gleam
+ * assert power(-1.0, 0.5) == Error(Nil)
+ * ```
+ */
+export function power(base, exponent) {
+  let fractional = (ceiling(exponent) - exponent) > 0.0;
+  let $ = ((base < 0.0) && fractional) || ((base === 0.0) && (exponent < 0.0));
+  if ($) {
+    return new Error(undefined);
+  } else {
+    return new Ok(do_power(base, exponent));
+  }
+}
+
+/**
+ * Returns the square root of the input as a `Float`.
+ *
+ * ## Examples
+ *
+ * ```gleam
+ * assert square_root(4.0) == Ok(2.0)
+ * ```
+ *
+ * ```gleam
+ * assert square_root(-16.0) == Error(Nil)
+ * ```
+ */
+export function square_root(x) {
+  return power(x, 0.5);
 }
 
 function sum_loop(loop$numbers, loop$initial) {

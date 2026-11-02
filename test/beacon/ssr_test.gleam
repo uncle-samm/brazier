@@ -1,8 +1,14 @@
+import beacon/auth
 import beacon/cookie
 import beacon/effect
 import beacon/element
 import beacon/route
+import beacon/session
 import beacon/ssr
+import gleam/bit_array
+import gleam/crypto
+import gleam/http/request
+import gleam/json
 import gleam/option
 import gleam/string
 
@@ -94,7 +100,7 @@ pub fn render_page_sets_session_token_without_dom_exposure_test() {
   // Verify the token is actually valid by verifying it with the same secret
   let assert Ok(_ts) =
     ssr.verify_session_token(
-      page.session_token,
+      ssr.join_token_for(page, ""),
       "test-secret-key-at-least-32-chars-long!!",
       3600,
     )
@@ -181,7 +187,7 @@ pub fn render_page_for_path_renders_route_specific_html_test() {
   // Should contain the view HTML
   let assert True = str_contains(page.html, "Hello, default!")
   // Should have a session token
-  let assert True = string_length(page.session_token) > 10
+  let assert True = string_length(ssr.join_token_for(page, "")) > 10
 }
 
 pub fn render_page_for_path_unmatched_route_renders_static_not_found_test() {
@@ -210,23 +216,32 @@ pub fn render_page_for_path_unmatched_route_renders_static_not_found_test() {
   let assert False = str_contains(page.html, "Hello, default!")
 }
 
-/// The session token goes into a Set-Cookie header; a token outside the
+/// The join token goes into a Set-Cookie header; a token outside the
 /// cookie-octet set is refused instead of being written as an injection.
 pub fn to_response_rejects_a_token_that_is_not_a_cookie_value_test() {
   let page =
-    ssr.RenderedPage(
-      ..ssr.render_page(test_config()),
-      session_token: "tok; Domain=evil.example",
-    )
+    ssr.RenderedPage(..ssr.render_page(test_config()), sign_join_token: fn(_) {
+      "tok; Domain=evil.example"
+    })
   let assert Error(cookie.InvalidValue(_)) = ssr.to_response(page)
+  let req =
+    request.new() |> request.set_header("cookie", "beacon_session=session-a")
+  let assert Error(cookie.InvalidValue(_)) =
+    ssr.to_response_for_request(page, req)
 }
 
-pub fn render_page_session_token_is_a_valid_cookie_value_test() {
+pub fn join_tokens_are_valid_cookie_values_test() {
   let page = ssr.render_page(test_config())
   let assert Ok(Nil) =
     cookie.validate(
       ssr.session_cookie_name,
-      page.session_token,
+      ssr.join_token_for(page, ""),
+      cookie.default_options(),
+    )
+  let assert Ok(Nil) =
+    cookie.validate(
+      ssr.session_cookie_name,
+      ssr.join_token_for(page, ssr.fingerprint_session_id("session-a")),
       cookie.default_options(),
     )
 }
@@ -261,11 +276,324 @@ pub fn serialized_model_is_stored_in_signed_cookie_token_test() {
   let page = ssr.render_page(config)
   let assert Ok(_) =
     ssr.verify_session_token(
-      page.session_token,
+      ssr.join_token_for(page, ""),
       "test-secret-key-at-least-32-chars-long!!",
       3600,
     )
   let assert False = str_contains(page.html, "SecretCookieState")
+}
+
+// --- Join token (v2) tests: unhappy paths first ---
+
+const join_secret = "join-token-secret-key-at-least-32-chars"
+
+fn signed_join_token(fingerprint: String, model: option.Option(String)) {
+  ssr.sign_join_token(
+    join_secret,
+    fingerprint,
+    model,
+    current_system_time_seconds(),
+  )
+}
+
+pub fn join_token_rejects_empty_server_secret_test() {
+  let token = signed_join_token("", option.Some("{}"))
+  let assert Error(ssr.JoinTokenInvalid(_)) =
+    ssr.verify_join_token(token, "", "", current_system_time_seconds())
+}
+
+pub fn join_token_signed_with_empty_secret_never_verifies_test() {
+  let token =
+    ssr.sign_join_token(
+      "",
+      "",
+      option.Some("{}"),
+      current_system_time_seconds(),
+    )
+  let assert Error(ssr.JoinTokenInvalid(_)) =
+    ssr.verify_join_token(token, "", "", current_system_time_seconds())
+}
+
+pub fn join_token_rejects_empty_token_test() {
+  let assert Error(ssr.JoinTokenMalformed(_)) =
+    ssr.verify_join_token("", join_secret, "", current_system_time_seconds())
+}
+
+pub fn join_token_rejects_garbage_test() {
+  let assert Error(ssr.JoinTokenInvalid(_)) =
+    ssr.verify_join_token(
+      "not.a.token",
+      join_secret,
+      "",
+      current_system_time_seconds(),
+    )
+}
+
+pub fn join_token_rejects_tampered_token_test() {
+  let token = signed_join_token("", option.Some("{\"count\":1}"))
+  let assert Error(ssr.JoinTokenInvalid(_)) =
+    ssr.verify_join_token(
+      token <> "x",
+      join_secret,
+      "",
+      current_system_time_seconds(),
+    )
+}
+
+pub fn join_token_rejects_other_secret_test() {
+  let token = signed_join_token("", option.Some("{}"))
+  let assert Error(ssr.JoinTokenInvalid(_)) =
+    ssr.verify_join_token(
+      token,
+      "a-completely-different-secret-key-0123",
+      "",
+      current_system_time_seconds(),
+    )
+}
+
+pub fn create_session_token_is_unbound_join_token_without_model_test() {
+  // The v1 API mints a join token that carries no model and no session
+  // binding, so it can never restore state or cross sessions.
+  let session_token = ssr.create_session_token(join_secret)
+  let assert Ok(ssr.JoinToken(model_json: option.None, ..)) =
+    ssr.verify_join_token(
+      session_token,
+      join_secret,
+      "",
+      current_system_time_seconds(),
+    )
+  let assert Error(ssr.JoinTokenSessionMismatch) =
+    ssr.verify_join_token(
+      session_token,
+      join_secret,
+      ssr.fingerprint_session_id("session-a"),
+      current_system_time_seconds(),
+    )
+}
+
+pub fn join_token_rejects_wrong_purpose_test() {
+  let token =
+    sign_raw_join_payload(
+      json.object([
+        #("v", json.int(2)),
+        #("purpose", json.string("beacon.other")),
+        #("iat", json.int(current_system_time_seconds())),
+        #("exp", json.int(current_system_time_seconds() + 60)),
+        #("sid", json.string("")),
+        #("model", json.null()),
+      ]),
+    )
+  let assert Error(ssr.JoinTokenInvalid(reason)) =
+    ssr.verify_join_token(token, join_secret, "", current_system_time_seconds())
+  let assert True = str_contains(reason, "purpose")
+}
+
+pub fn join_token_rejects_wrong_version_test() {
+  let token =
+    sign_raw_join_payload(
+      json.object([
+        #("v", json.int(1)),
+        #("purpose", json.string("beacon.join")),
+        #("iat", json.int(current_system_time_seconds())),
+        #("exp", json.int(current_system_time_seconds() + 60)),
+        #("sid", json.string("")),
+        #("model", json.null()),
+      ]),
+    )
+  let assert Error(ssr.JoinTokenInvalid(reason)) =
+    ssr.verify_join_token(token, join_secret, "", current_system_time_seconds())
+  let assert True = str_contains(reason, "version")
+}
+
+pub fn join_token_rejects_oversized_validity_window_test() {
+  // A forged-looking window longer than the lifetime is refused even when
+  // the signature is valid.
+  let now = current_system_time_seconds()
+  let token =
+    sign_raw_join_payload(
+      json.object([
+        #("v", json.int(2)),
+        #("purpose", json.string("beacon.join")),
+        #("iat", json.int(now)),
+        #("exp", json.int(now + ssr.join_token_lifetime_seconds + 1)),
+        #("sid", json.string("")),
+        #("model", json.null()),
+      ]),
+    )
+  let assert Error(ssr.JoinTokenInvalid(_)) =
+    ssr.verify_join_token(token, join_secret, "", now)
+}
+
+pub fn join_token_rejects_missing_fields_test() {
+  let token = sign_raw_join_payload(json.object([#("v", json.int(2))]))
+  let assert Error(ssr.JoinTokenMalformed(_)) =
+    ssr.verify_join_token(token, join_secret, "", current_system_time_seconds())
+}
+
+pub fn join_token_rejects_future_issue_time_test() {
+  let now = current_system_time_seconds()
+  let token = ssr.sign_join_token(join_secret, "", option.None, now + 3600)
+  let assert Error(ssr.JoinTokenInvalid(_)) =
+    ssr.verify_join_token(token, join_secret, "", now)
+}
+
+pub fn join_token_rejects_expired_token_test() {
+  let now = current_system_time_seconds()
+  let issued_at = now - ssr.join_token_lifetime_seconds
+  let token = ssr.sign_join_token(join_secret, "", option.None, issued_at)
+  let assert Error(ssr.JoinTokenExpired(expired_at:, now: checked_at)) =
+    ssr.verify_join_token(token, join_secret, "", now)
+  let assert True = expired_at == now
+  let assert True = checked_at == now
+}
+
+pub fn join_token_rejects_other_session_test() {
+  let token =
+    signed_join_token(ssr.fingerprint_session_id("session-a"), option.None)
+  let assert Error(ssr.JoinTokenSessionMismatch) =
+    ssr.verify_join_token(
+      token,
+      join_secret,
+      ssr.fingerprint_session_id("session-b"),
+      current_system_time_seconds(),
+    )
+}
+
+pub fn join_token_bound_token_rejects_unbound_connection_test() {
+  let token =
+    signed_join_token(ssr.fingerprint_session_id("session-a"), option.None)
+  let assert Error(ssr.JoinTokenSessionMismatch) =
+    ssr.verify_join_token(token, join_secret, "", current_system_time_seconds())
+}
+
+pub fn join_token_unbound_token_rejects_bound_connection_test() {
+  let token = signed_join_token("", option.None)
+  let assert Error(ssr.JoinTokenSessionMismatch) =
+    ssr.verify_join_token(
+      token,
+      join_secret,
+      ssr.fingerprint_session_id("session-a"),
+      current_system_time_seconds(),
+    )
+}
+
+pub fn join_token_round_trips_model_and_window_test() {
+  let now = current_system_time_seconds()
+  let fingerprint = ssr.fingerprint_session_id("session-a")
+  let token =
+    ssr.sign_join_token(join_secret, fingerprint, option.Some("{\"n\":1}"), now)
+  let assert Ok(ssr.JoinToken(issued_at:, expires_at:, model_json:)) =
+    ssr.verify_join_token(token, join_secret, fingerprint, now)
+  let assert True = issued_at == now
+  let assert True = expires_at == now + ssr.join_token_lifetime_seconds
+  let assert option.Some("{\"n\":1}") = model_json
+}
+
+pub fn join_token_round_trips_without_model_test() {
+  let token = signed_join_token("", option.None)
+  let assert Ok(ssr.JoinToken(model_json: option.None, ..)) =
+    ssr.verify_join_token(token, join_secret, "", current_system_time_seconds())
+}
+
+pub fn session_identity_cookie_matches_auth_default_test() {
+  let assert True =
+    ssr.session_identity_cookie_name == auth.default_session_cookie_name
+}
+
+pub fn fingerprint_matches_session_binding_fingerprint_test() {
+  let assert True =
+    ssr.fingerprint_session_id("abc") == session.binding_fingerprint("abc")
+  // The raw session id never appears in the fingerprint.
+  let assert False = str_contains(ssr.fingerprint_session_id("abc"), "abc")
+}
+
+pub fn session_fingerprint_is_empty_without_session_cookie_test() {
+  let assert "" = ssr.session_fingerprint(request.new())
+  let assert "" =
+    ssr.session_fingerprint(
+      request.new() |> request.set_header("cookie", "beacon_session="),
+    )
+}
+
+pub fn session_fingerprint_reads_session_cookie_test() {
+  let req =
+    request.new()
+    |> request.set_header("cookie", "other=1; beacon_session=session-a")
+  let assert True =
+    ssr.session_fingerprint(req) == ssr.fingerprint_session_id("session-a")
+}
+
+pub fn to_response_for_request_binds_token_to_session_test() {
+  let config =
+    ssr.SsrConfig(
+      ..test_config(),
+      secret_key: join_secret,
+      serialize_model: option.Some(fn(m: TestModel) {
+        "{\"name\":\"" <> m.name <> "\"}"
+      }),
+    )
+  let page = ssr.render_page(config)
+  let req =
+    request.new() |> request.set_header("cookie", "beacon_session=session-a")
+  let assert Ok(resp) = ssr.to_response_for_request(page, req)
+  let assert Ok(set_cookie) = find_header(resp.headers, "set-cookie")
+  let token = cookie_value(set_cookie, ssr.session_cookie_name)
+  let now = current_system_time_seconds()
+  let assert Error(ssr.JoinTokenSessionMismatch) =
+    ssr.verify_join_token(token, join_secret, "", now)
+  let assert Ok(ssr.JoinToken(model_json: option.Some(model_json), ..)) =
+    ssr.verify_join_token(
+      token,
+      join_secret,
+      ssr.fingerprint_session_id("session-a"),
+      now,
+    )
+  let assert "{\"name\":\"World\"}" = model_json
+}
+
+pub fn join_token_omits_model_over_cookie_budget_test() {
+  let big = string.repeat("x", 5000)
+  let config =
+    ssr.SsrConfig(
+      ..test_config(),
+      secret_key: join_secret,
+      serialize_model: option.Some(fn(_m: TestModel) { "\"" <> big <> "\"" }),
+    )
+  let token = ssr.join_token_for(ssr.render_page(config), "")
+  let assert True = string_length(token) <= 3800
+  let assert Ok(ssr.JoinToken(model_json: option.None, ..)) =
+    ssr.verify_join_token(token, join_secret, "", current_system_time_seconds())
+}
+
+pub fn join_token_carries_no_model_without_serializer_test() {
+  let config = ssr.SsrConfig(..test_config(), secret_key: join_secret)
+  let token = ssr.join_token_for(ssr.render_page(config), "")
+  let assert Ok(ssr.JoinToken(model_json: option.None, ..)) =
+    ssr.verify_join_token(token, join_secret, "", current_system_time_seconds())
+}
+
+/// Sign an arbitrary payload with the join-token key derivation, to build
+/// tokens the public signer refuses to produce.
+fn sign_raw_join_payload(payload: json.Json) -> String {
+  let key =
+    crypto.hmac(
+      bit_array.from_string("beacon.join_token.v2"),
+      crypto.Sha256,
+      bit_array.from_string(join_secret),
+    )
+  crypto.sign_message(
+    bit_array.from_string(json.to_string(payload)),
+    key,
+    crypto.Sha256,
+  )
+}
+
+fn cookie_value(set_cookie: String, name: String) -> String {
+  let assert Ok(#(_, rest)) = string.split_once(set_cookie, name <> "=")
+  case string.split_once(rest, ";") {
+    Ok(#(value, _)) -> value
+    Error(Nil) -> rest
+  }
 }
 
 // --- head_html tests ---

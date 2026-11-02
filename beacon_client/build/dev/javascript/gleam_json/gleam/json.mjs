@@ -7,7 +7,13 @@ import * as $option from "../../gleam_stdlib/gleam/option.mjs";
 import { None, Some } from "../../gleam_stdlib/gleam/option.mjs";
 import * as $result from "../../gleam_stdlib/gleam/result.mjs";
 import * as $string_tree from "../../gleam_stdlib/gleam/string_tree.mjs";
-import { Ok, Error, toList, prepend as listPrepend, CustomType as $CustomType } from "../gleam.mjs";
+import {
+  Ok,
+  Error,
+  List$Empty$const as $List$Empty$const,
+  prepend as listPrepend,
+  CustomType as $CustomType,
+} from "../gleam.mjs";
 import {
   decode as decode_string,
   json_to_string as do_to_string,
@@ -24,8 +30,10 @@ import {
 export { to_string_tree };
 
 export class UnexpectedEndOfInput extends $CustomType {}
-export const DecodeError$UnexpectedEndOfInput = () =>
+export const DecodeError$UnexpectedEndOfInput$const =
   new UnexpectedEndOfInput();
+export const DecodeError$UnexpectedEndOfInput = () =>
+  DecodeError$UnexpectedEndOfInput$const;
 export const DecodeError$isUnexpectedEndOfInput = (value) =>
   value instanceof UnexpectedEndOfInput;
 
@@ -318,7 +326,7 @@ export function dict(dict, keys, values) {
   return object(
     $dict.fold(
       dict,
-      toList([]),
+      $List$Empty$const,
       (acc, k, v) => { return listPrepend([keys(k), values(v)], acc); },
     ),
   );

@@ -1,4 +1,10 @@
-import { Ok, Error, toList, Empty as $Empty, prepend as listPrepend } from "../gleam.mjs";
+import {
+  Ok,
+  Error,
+  Empty as $Empty,
+  List$Empty$const as $List$Empty$const,
+  prepend as listPrepend,
+} from "../gleam.mjs";
 import * as $list from "../gleam/list.mjs";
 
 /**
@@ -347,7 +353,7 @@ function partition_loop(loop$results, loop$oks, loop$errors) {
  * ```
  */
 export function partition(results) {
-  return partition_loop(results, toList([]), toList([]));
+  return partition_loop(results, $List$Empty$const, $List$Empty$const);
 }
 
 /**
