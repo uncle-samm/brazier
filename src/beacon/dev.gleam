@@ -1,155 +1,185 @@
-/// Development tools — file watching, hot reload, auto-recompile.
-/// Run with: `gleam run -m beacon/dev`
+/// Development mode: build, run the app, rebuild and hot-reload on change.
+///
+/// Usage, from the app project's root:
+///
+/// ```sh
+/// gleam run -m beacon/dev
+/// ```
+///
+/// Dev mode is the only place Beacon builds automatically. It:
+///
+/// 1. Runs the Beacon build (`beacon/build`): server codec, `gleam build`
+///    and client bundle. If this first build fails, dev mode exits with
+///    status 1.
+/// 2. Loads the freshly compiled modules and starts the app by calling the
+///    app module's `main` (the module the build found, see
+///    `beacon/build/discovery`).
+/// 3. Watches `src` for `.gleam` changes. Each change reruns the build; on
+///    success the changed modules are hot-reloaded into the running app. A
+///    failed rebuild is logged and the app keeps running the last good build
+///    until the next change.
+///
+/// Production never builds: `beacon.start` requires the artifacts of
+/// `gleam run -m beacon/build`.
+import beacon/build
+import beacon/build/discovery.{type AppModule}
+import beacon/build/program
+import beacon/build/project_toml
 import beacon/log
+import gleam/int
+import gleam/list
+import gleam/string
 
-/// Start the dev server with file watching and hot reload.
-/// Watches .gleam files for changes, auto-recompiles, and hot-swaps modules.
-pub fn main() {
+const watch_dirs = ["src"]
+
+pub fn main() -> Nil {
   log.configure()
-  log.info("beacon.dev", "Starting dev server with hot reload...")
-
-  // Start file watcher
-  let watch_dirs = ["src"]
-  log.info("beacon.dev", "Watching: " <> join_dirs(watch_dirs))
-
-  // Initial build
-  log.info("beacon.dev", "Running initial build...")
-  case run_build() {
-    Ok(Nil) -> log.info("beacon.dev", "Initial build succeeded")
-    Error(reason) -> log.error("beacon.dev", "Initial build failed: " <> reason)
+  log.info("beacon.dev", "Starting dev mode")
+  case start() {
+    Ok(Nil) -> watch()
+    Error(reason) -> {
+      log.error("beacon.dev", "Dev mode failed to start: " <> reason)
+      program.exit_failure(reason)
+    }
   }
+}
 
-  // Choose watch strategy
+fn start() -> Result(Nil, String) {
+  case project_toml.read_project("gleam.toml") {
+    Error(reason) -> Error(reason)
+    Ok(project) ->
+      case rebuild(project.name) {
+        Error(reason) -> Error("Initial build failed: " <> reason)
+        Ok(app) -> {
+          log.info("beacon.dev", "Starting " <> app.module_path <> ".main")
+          start_app(erlang_module(app.module_path))
+        }
+      }
+  }
+}
+
+/// Build, then load every changed module of the project.
+fn rebuild(project_name: String) -> Result(AppModule, String) {
+  case build.build(".", build.SourceDir("src")) {
+    Error(reason) -> Error(reason)
+    Ok(built) ->
+      case reload_modules(ebin_dir(project_name)) {
+        Error(reason) -> Error("Hot reload failed: " <> reason)
+        Ok(reloaded) -> {
+          log.info(
+            "beacon.dev",
+            "Loaded "
+              <> int.to_string(list.length(reloaded))
+              <> " changed module(s): "
+              <> string.join(reloaded, ", "),
+          )
+          Ok(built.app)
+        }
+      }
+  }
+}
+
+fn watch() -> Nil {
   case native_watcher_available() {
     True -> {
-      log.info("beacon.dev", "Using native file watcher (fswatch/inotifywait)")
+      log.info(
+        "beacon.dev",
+        "Watching "
+          <> string.join(watch_dirs, ", ")
+          <> " with fswatch/inotifywait",
+      )
       case start_native_watcher(watch_dirs) {
-        Ok(Nil) -> native_watch_loop(watch_dirs)
-        Error(reason) ->
-          log.error("beacon.dev", "Failed to start native watcher: " <> reason)
+        Ok(Nil) -> native_watch_loop()
+        Error(reason) -> {
+          log.error("beacon.dev", "Cannot start the file watcher: " <> reason)
+          program.exit_failure(reason)
+        }
       }
     }
     False -> {
       log.info(
         "beacon.dev",
-        "Native watcher not available, using 500ms polling",
+        "Watching "
+          <> string.join(watch_dirs, ", ")
+          <> " by polling every 500ms (install fswatch or inotify-tools for instant rebuilds)",
       )
-      let _ = get_file_timestamps(watch_dirs)
-      poll_watch_loop(watch_dirs)
+      record_file_timestamps(watch_dirs)
+      poll_watch_loop()
     }
   }
 }
 
-/// Native watch loop — uses fswatch/inotifywait for instant detection.
-fn native_watch_loop(dirs: List(String)) -> Nil {
-  let changed = poll_native_watcher()
-  case changed {
+fn native_watch_loop() -> Nil {
+  case poll_native_watcher() {
+    False -> Nil
     True -> {
-      log.info("beacon.dev", "File change detected (native), recompiling...")
-      handle_recompile()
-      // Restart watcher for next change
-      case start_native_watcher(dirs) {
+      on_change()
+      case start_native_watcher(watch_dirs) {
         Ok(Nil) -> Nil
+        Error(reason) -> {
+          log.error("beacon.dev", "Cannot restart the file watcher: " <> reason)
+          program.exit_failure(reason)
+        }
+      }
+    }
+  }
+  native_watch_loop()
+}
+
+fn poll_watch_loop() -> Nil {
+  sleep(500)
+  case check_for_changes(watch_dirs) {
+    True -> on_change()
+    False -> Nil
+  }
+  poll_watch_loop()
+}
+
+fn on_change() -> Nil {
+  log.info("beacon.dev", "Change detected, rebuilding")
+  case project_toml.read_project("gleam.toml") {
+    Error(reason) -> log.error("beacon.dev", "Rebuild failed: " <> reason)
+    Ok(project) ->
+      case rebuild(project.name) {
         Error(reason) ->
           log.error(
             "beacon.dev",
-            "Failed to restart native watcher: " <> reason,
+            "Rebuild failed; the app keeps running the last good build: "
+              <> reason,
           )
+        Ok(_app) ->
+          case notify_browser_reload() {
+            Ok(Nil) -> log.info("beacon.dev", "Rebuild complete")
+            Error(reason) ->
+              log.warning(
+                "beacon.dev",
+                "Rebuild complete, but notifying browsers failed: " <> reason,
+              )
+          }
       }
-      Nil
-    }
-    False -> Nil
-  }
-  native_watch_loop(dirs)
-}
-
-/// Polling watch loop used when native watcher is unavailable.
-fn poll_watch_loop(dirs: List(String)) -> Nil {
-  sleep(500)
-  case check_for_changes(dirs) {
-    True -> {
-      log.info("beacon.dev", "File change detected (polling), recompiling...")
-      handle_recompile()
-    }
-    False -> Nil
-  }
-  poll_watch_loop(dirs)
-}
-
-/// Handle recompile + hot swap + client rebuild.
-fn handle_recompile() -> Nil {
-  case run_build() {
-    Ok(Nil) -> {
-      log.info("beacon.dev", "Recompile succeeded")
-      case hot_swap_modules() {
-        Ok(count) ->
-          log.info(
-            "beacon.dev",
-            "Hot-swapped " <> int_to_string(count) <> " module(s)",
-          )
-        Error(reason) ->
-          log.warning("beacon.dev", "Hot swap failed: " <> reason)
-      }
-      case run_client_build() {
-        Ok(Nil) -> log.info("beacon.dev", "Client JS rebuilt")
-        Error(reason) ->
-          log.warning("beacon.dev", "Client JS rebuild failed: " <> reason)
-      }
-      // Notify browsers to reload
-      case notify_browser_reload() {
-        Ok(Nil) -> Nil
-        Error(reason) ->
-          log.warning(
-            "beacon.dev",
-            "Browser reload notification failed: " <> reason,
-          )
-      }
-    }
-    Error(reason) -> log.error("beacon.dev", "Recompile failed: " <> reason)
   }
 }
 
-/// Run `gleam build` and return success/failure.
-fn run_build() -> Result(Nil, String) {
-  case run_program(".", "gleam", ["build"]) {
-    Ok(_output) -> Ok(Nil)
-    Error(reason) -> Error(reason)
-  }
+fn ebin_dir(project_name: String) -> String {
+  "build/dev/erlang/" <> project_name <> "/ebin"
 }
 
-/// Run client-side JS build.
-fn run_client_build() -> Result(Nil, String) {
-  case run_program(".", "gleam", ["run", "-m", "beacon/build"]) {
-    Ok(_output) -> Ok(Nil)
-    Error(reason) -> Error(reason)
-  }
-}
-
-/// Hot-swap compiled BEAM modules using Erlang code loading.
-fn hot_swap_modules() -> Result(Int, String) {
-  do_hot_swap()
-}
-
-fn join_dirs(dirs: List(String)) -> String {
-  do_join(dirs, "")
-}
-
-fn do_join(dirs: List(String), acc: String) -> String {
-  case dirs {
-    [] -> acc
-    [d] -> acc <> d
-    [d, ..rest] -> do_join(rest, acc <> d <> ", ")
-  }
+/// The Erlang module a Gleam module compiles to: `app/main` is `app@main`.
+fn erlang_module(module_path: String) -> String {
+  string.replace(module_path, "/", "@")
 }
 
 // === FFI ===
 
-@external(erlang, "beacon_dev_ffi", "run_program")
-fn run_program(
-  cwd: String,
-  program: String,
-  args: List(String),
-) -> Result(String, String)
+/// Load every module in `ebin` whose compiled code differs from the loaded
+/// version. Returns the reloaded module names.
+@external(erlang, "beacon_dev_ffi", "reload_modules")
+fn reload_modules(ebin: String) -> Result(List(String), String)
+
+/// Call `module:main()` (an Erlang module name) in a new process linked to
+/// this one.
+@external(erlang, "beacon_dev_ffi", "start_app")
+fn start_app(module: String) -> Result(Nil, String)
 
 @external(erlang, "beacon_dev_ffi", "sleep")
 fn sleep(ms: Int) -> Nil
@@ -157,14 +187,8 @@ fn sleep(ms: Int) -> Nil
 @external(erlang, "beacon_dev_ffi", "check_for_changes")
 fn check_for_changes(dirs: List(String)) -> Bool
 
-@external(erlang, "beacon_dev_ffi", "get_file_timestamps")
-fn get_file_timestamps(dirs: List(String)) -> List(#(String, Int))
-
-@external(erlang, "beacon_dev_ffi", "do_hot_swap")
-fn do_hot_swap() -> Result(Int, String)
-
-@external(erlang, "beacon_dev_ffi", "int_to_string")
-fn int_to_string(n: Int) -> String
+@external(erlang, "beacon_dev_ffi", "record_file_timestamps")
+fn record_file_timestamps(dirs: List(String)) -> Nil
 
 @external(erlang, "beacon_dev_ffi", "native_watcher_available")
 fn native_watcher_available() -> Bool

@@ -6,13 +6,17 @@
 /// 2. No catch-all `_` patterns in case expressions that don't log
 /// 3. Public functions in key modules should have logging
 /// 4. No degraded-path phrases in shipped source
+/// 5. No `let _ =` discards in `src/` (see `check_no_discarded_results`)
+/// 6. Every file must be readable and parse; failures are violations
 ///
 /// Reference: CLAUDE.md engineering principles, TigerBeetle approach.
 import beacon/build/analyzer
+import beacon/build/source_location
 import beacon/log
 import glance
 import gleam/int
 import gleam/list
+import gleam/option
 import gleam/string
 import simplifile
 
@@ -48,25 +52,25 @@ pub fn lint_directory(dir: String) -> List(Violation) {
                 False -> []
               }
             }
-            False, Error(err) -> {
-              log.warning(
-                "beacon.lint",
-                "Cannot stat " <> path <> ": " <> string.inspect(err),
-              )
-              []
-            }
+            False, Error(err) -> [
+              io_violation(path, "Cannot stat " <> path, err),
+            ]
           }
         })
       violations
     }
-    Error(err) -> {
-      log.warning(
-        "beacon.lint",
-        "Cannot read directory " <> dir <> ": " <> string.inspect(err),
-      )
-      []
-    }
+    Error(err) -> [io_violation(dir, "Cannot read directory " <> dir, err)]
   }
+}
+
+fn io_violation(
+  path: String,
+  context: String,
+  err: simplifile.FileError,
+) -> Violation {
+  let message = context <> ": " <> simplifile.describe_error(err)
+  log.error("beacon.lint", message)
+  Violation(file: path, location: "file", rule: "unreadable-path", message:)
 }
 
 /// Lint Markdown documentation for stale public model language.
@@ -86,35 +90,21 @@ pub fn lint_docs_directory(dir: String) -> List(Violation) {
               False -> []
             }
           }
-          False, Error(err) -> {
-            log.warning(
-              "beacon.lint",
-              "Cannot stat docs path " <> path <> ": " <> string.inspect(err),
-            )
-            []
-          }
+          False, Error(err) -> [
+            io_violation(path, "Cannot stat docs path " <> path, err),
+          ]
         }
       })
-    Error(err) -> {
-      log.warning(
-        "beacon.lint",
-        "Cannot read docs directory " <> dir <> ": " <> string.inspect(err),
-      )
-      []
-    }
+    Error(err) -> [
+      io_violation(dir, "Cannot read docs directory " <> dir, err),
+    ]
   }
 }
 
 fn lint_doc_file(path: String) -> List(Violation) {
   case simplifile.read(path) {
     Ok(source) -> lint_doc_source(path, source)
-    Error(err) -> {
-      log.warning(
-        "beacon.lint",
-        "Cannot read docs file " <> path <> ": " <> string.inspect(err),
-      )
-      []
-    }
+    Error(err) -> [io_violation(path, "Cannot read docs file " <> path, err)]
   }
 }
 
@@ -157,23 +147,25 @@ fn should_skip_entry(entry: String) -> Bool {
 pub fn lint_file(path: String) -> List(Violation) {
   case simplifile.read(path) {
     Ok(source) -> lint_source(path, source)
-    Error(_) -> {
-      log.warning("beacon.lint", "Cannot read file: " <> path)
-      []
-    }
+    Error(err) -> [io_violation(path, "Cannot read file " <> path, err)]
   }
 }
 
 /// Lint source code from a string.
+/// A file that does not parse is itself a violation: the linter cannot vouch
+/// for code it cannot read.
 pub fn lint_source(file_path: String, source: String) -> List(Violation) {
   case glance.module(source) {
     Ok(module) -> {
-      let todo_violations = check_no_todo_panic(file_path, module)
-      let logging_violations = check_public_functions_log(file_path, module)
+      let todo_violations = check_no_todo_panic(file_path, source, module)
+      let logging_violations =
+        check_public_functions_log(file_path, source, module)
+      let discard_violations =
+        check_no_discarded_results(file_path, source, module)
       let degraded_path_violations =
         check_no_degraded_path_phrases(file_path, source)
       let update_contract_violations =
-        check_client_update_contract(file_path, source)
+        check_client_update_contract(file_path, source, module)
       let deprecated_route_violations =
         check_deprecated_route_api(file_path, source)
       list.append(
@@ -181,16 +173,195 @@ pub fn lint_source(file_path: String, source: String) -> List(Violation) {
           list.append(todo_violations, logging_violations),
           degraded_path_violations,
         ),
-        list.append(update_contract_violations, deprecated_route_violations),
+        list.append(
+          list.append(update_contract_violations, deprecated_route_violations),
+          discard_violations,
+        ),
       )
     }
     Error(err) -> {
-      log.warning(
-        "beacon.lint",
-        "Cannot parse " <> file_path <> ": " <> string.inspect(err),
-      )
-      []
+      let message = source_location.describe_parse_error(file_path, source, err)
+      log.error("beacon.lint", "Cannot parse " <> message)
+      [
+        Violation(
+          file: file_path,
+          location: "file",
+          rule: "parse-error",
+          message: "Cannot parse: " <> message,
+        ),
+      ]
     }
+  }
+}
+
+/// The comment that opts a single `let _ =` out of the discard rule.
+/// It must sit on the line directly above the assignment and carry a reason:
+///
+/// ```gleam
+/// // lint:allow-discard the decrement returns the new count, which is unused
+/// let _ = connection_tracker_decrement()
+/// ```
+pub const allow_discard_marker = "// lint:allow-discard"
+
+/// Flag every `let _ =` (or `let _name =`) in `src/`.
+///
+/// The linter works on the untyped AST, so it cannot tell whether the
+/// discarded value is a `Result`. It therefore flags every discard and asks
+/// the author to either handle the value or state, with
+/// `allow_discard_marker`, why dropping it is safe.
+fn check_no_discarded_results(
+  file_path: String,
+  source: String,
+  module: glance.Module,
+) -> List(Violation) {
+  case string.starts_with(file_path, "src/") {
+    False -> []
+    True ->
+      list.flat_map(module.functions, fn(def) {
+        let func = def.definition
+        list.flat_map(func.body, discards_in_statement)
+        |> list.filter_map(fn(span) {
+          discard_violation(file_path, source, func.name, span)
+        })
+      })
+  }
+}
+
+fn discard_violation(
+  file_path: String,
+  source: String,
+  func_name: String,
+  span: glance.Span,
+) -> Result(Violation, Nil) {
+  let location = source_location.format_span(source, span)
+  let opt_out = case source_location.previous_line(source, span.start) {
+    Ok(line) -> parse_allow_discard(string.trim(line))
+    Error(Nil) -> NoOptOut
+  }
+  case opt_out {
+    OptOutWithReason -> Error(Nil)
+    OptOutWithoutReason ->
+      Ok(Violation(
+        file: file_path,
+        location:,
+        rule: "no-discarded-result",
+        message: "`"
+          <> allow_discard_marker
+          <> "` in `"
+          <> func_name
+          <> "` must give a reason after the marker.",
+      ))
+    NoOptOut ->
+      Ok(Violation(
+        file: file_path,
+        location:,
+        rule: "no-discarded-result",
+        message: "`let _ =` in `"
+          <> func_name
+          <> "` discards a value that may be a Result. Handle it, or add `"
+          <> allow_discard_marker
+          <> " <reason>` on the line above.",
+      ))
+  }
+}
+
+type DiscardOptOut {
+  NoOptOut
+  OptOutWithoutReason
+  OptOutWithReason
+}
+
+fn parse_allow_discard(line: String) -> DiscardOptOut {
+  case string.starts_with(line, allow_discard_marker) {
+    False -> NoOptOut
+    True -> {
+      let reason =
+        line
+        |> string.drop_start(string.length(allow_discard_marker))
+        |> string.trim
+      case reason {
+        "" -> OptOutWithoutReason
+        _ -> OptOutWithReason
+      }
+    }
+  }
+}
+
+fn discards_in_statement(statement: glance.Statement) -> List(glance.Span) {
+  case statement {
+    glance.Assignment(
+      kind: glance.Let,
+      pattern: glance.PatternDiscard(..),
+      value:,
+      location:,
+      ..,
+    ) -> [location, ..discards_in_expression(value)]
+    glance.Assignment(value:, ..) -> discards_in_expression(value)
+    glance.Use(function:, ..) -> discards_in_expression(function)
+    glance.Assert(expression:, ..) -> discards_in_expression(expression)
+    glance.Expression(expression) -> discards_in_expression(expression)
+  }
+}
+
+fn discards_in_expression(expression: glance.Expression) -> List(glance.Span) {
+  case expression {
+    glance.Block(statements:, ..) ->
+      list.flat_map(statements, discards_in_statement)
+    glance.Fn(body:, ..) -> list.flat_map(body, discards_in_statement)
+    glance.Case(subjects:, clauses:, ..) ->
+      list.append(
+        list.flat_map(subjects, discards_in_expression),
+        list.flat_map(clauses, fn(clause) {
+          discards_in_expression(clause.body)
+        }),
+      )
+    glance.Call(function:, arguments:, ..) ->
+      list.append(
+        discards_in_expression(function),
+        list.flat_map(arguments, discards_in_field),
+      )
+    glance.FnCapture(function:, arguments_before:, arguments_after:, ..) ->
+      list.flatten([
+        discards_in_expression(function),
+        list.flat_map(arguments_before, discards_in_field),
+        list.flat_map(arguments_after, discards_in_field),
+      ])
+    glance.BinaryOperator(left:, right:, ..) ->
+      list.append(discards_in_expression(left), discards_in_expression(right))
+    glance.List(elements:, ..) | glance.Tuple(elements:, ..) ->
+      list.flat_map(elements, discards_in_expression)
+    glance.NegateInt(value:, ..) | glance.NegateBool(value:, ..) ->
+      discards_in_expression(value)
+    glance.FieldAccess(container:, ..) -> discards_in_expression(container)
+    glance.TupleIndex(tuple:, ..) -> discards_in_expression(tuple)
+    glance.RecordUpdate(record:, fields:, ..) ->
+      list.append(
+        discards_in_expression(record),
+        list.flat_map(fields, fn(field) {
+          case field.item {
+            option.Some(item) -> discards_in_expression(item)
+            option.None -> []
+          }
+        }),
+      )
+    glance.Int(..)
+    | glance.Float(..)
+    | glance.String(..)
+    | glance.Variable(..)
+    | glance.Panic(..)
+    | glance.Todo(..)
+    | glance.BitString(..)
+    | glance.Echo(..) -> []
+  }
+}
+
+fn discards_in_field(
+  field: glance.Field(glance.Expression),
+) -> List(glance.Span) {
+  case field {
+    glance.LabelledField(item:, ..) | glance.UnlabelledField(item:) ->
+      discards_in_expression(item)
+    glance.ShorthandField(..) -> []
   }
 }
 
@@ -230,6 +401,7 @@ fn check_deprecated_route_api(
 fn check_client_update_contract(
   file_path: String,
   source: String,
+  module: glance.Module,
 ) -> List(Violation) {
   let is_app_code =
     string.starts_with(file_path, "examples/")
@@ -238,7 +410,7 @@ fn check_client_update_contract(
   case is_app_code || string.contains(source, "pub type Msg") {
     False -> []
     True -> {
-      analyzer.client_update_purity_errors(source)
+      analyzer.client_update_purity_errors(module)
       |> list.map(fn(err) {
         Violation(
           file: file_path,
@@ -272,6 +444,7 @@ fn client_update_error_message(err: analyzer.PurityError) -> String {
 /// Only applies to files in beacon/transport, beacon/runtime, beacon/diff.
 fn check_public_functions_log(
   file_path: String,
+  source: String,
   module: glance.Module,
 ) -> List(Violation) {
   // Only apply this rule to key framework modules
@@ -297,7 +470,10 @@ fn check_public_functions_log(
                   False ->
                     Ok(Violation(
                       file: file_path,
-                      location: span_to_string(func.location),
+                      location: source_location.format_span(
+                        source,
+                        func.location,
+                      ),
                       rule: "public-fn-must-log",
                       message: "Public function `"
                         <> func.name
@@ -430,12 +606,13 @@ fn expression_has_log(expr: glance.Expression) -> Bool {
 /// These are development placeholders and must not appear in shipped code.
 fn check_no_todo_panic(
   file_path: String,
+  source: String,
   module: glance.Module,
 ) -> List(Violation) {
   list.flat_map(module.functions, fn(def) {
     let func = def.definition
     list.flat_map(func.body, fn(statement) {
-      find_todo_panic_in_statement(file_path, func.name, statement)
+      find_todo_panic_in_statement(file_path, source, func.name, statement)
     })
   })
 }
@@ -443,14 +620,15 @@ fn check_no_todo_panic(
 /// Recursively search a statement for todo/panic expressions.
 fn find_todo_panic_in_statement(
   file_path: String,
+  source: String,
   func_name: String,
   statement: glance.Statement,
 ) -> List(Violation) {
   case statement {
     glance.Expression(expr) ->
-      find_todo_panic_in_expression(file_path, func_name, expr)
+      find_todo_panic_in_expression(file_path, source, func_name, expr)
     glance.Assignment(value: expr, ..) ->
-      find_todo_panic_in_expression(file_path, func_name, expr)
+      find_todo_panic_in_expression(file_path, source, func_name, expr)
     _ -> []
   }
 }
@@ -458,6 +636,7 @@ fn find_todo_panic_in_statement(
 /// Recursively search an expression for todo/panic.
 fn find_todo_panic_in_expression(
   file_path: String,
+  source: String,
   func_name: String,
   expr: glance.Expression,
 ) -> List(Violation) {
@@ -465,7 +644,7 @@ fn find_todo_panic_in_expression(
     glance.Todo(location: loc, ..) -> [
       Violation(
         file: file_path,
-        location: span_to_string(loc),
+        location: source_location.format_span(source, loc),
         rule: "no-todo",
         message: "Found `todo` in function `"
           <> func_name
@@ -475,7 +654,7 @@ fn find_todo_panic_in_expression(
     glance.Panic(location: loc, ..) -> [
       Violation(
         file: file_path,
-        location: span_to_string(loc),
+        location: source_location.format_span(source, loc),
         rule: "no-panic",
         message: "Found `panic` in function `"
           <> func_name
@@ -486,14 +665,14 @@ fn find_todo_panic_in_expression(
     // Recurse into sub-expressions
     glance.Call(function: func, arguments: args, ..) -> {
       let func_violations =
-        find_todo_panic_in_expression(file_path, func_name, func)
+        find_todo_panic_in_expression(file_path, source, func_name, func)
       let arg_violations =
         list.flat_map(args, fn(arg) {
           case arg {
             glance.LabelledField(item: value, ..) ->
-              find_todo_panic_in_expression(file_path, func_name, value)
+              find_todo_panic_in_expression(file_path, source, func_name, value)
             glance.UnlabelledField(item: value) ->
-              find_todo_panic_in_expression(file_path, func_name, value)
+              find_todo_panic_in_expression(file_path, source, func_name, value)
             glance.ShorthandField(..) -> []
           }
         })
@@ -502,55 +681,50 @@ fn find_todo_panic_in_expression(
 
     glance.BinaryOperator(left: left, right: right, ..) ->
       list.append(
-        find_todo_panic_in_expression(file_path, func_name, left),
-        find_todo_panic_in_expression(file_path, func_name, right),
+        find_todo_panic_in_expression(file_path, source, func_name, left),
+        find_todo_panic_in_expression(file_path, source, func_name, right),
       )
 
     glance.Block(statements: stmts, ..) ->
       list.flat_map(stmts, fn(s) {
-        find_todo_panic_in_statement(file_path, func_name, s)
+        find_todo_panic_in_statement(file_path, source, func_name, s)
       })
 
     glance.Case(subjects: subjects, clauses: clauses, ..) -> {
       let subj_v =
         list.flat_map(subjects, fn(s) {
-          find_todo_panic_in_expression(file_path, func_name, s)
+          find_todo_panic_in_expression(file_path, source, func_name, s)
         })
       let clause_v =
         list.flat_map(clauses, fn(c) {
-          find_todo_panic_in_expression(file_path, func_name, c.body)
+          find_todo_panic_in_expression(file_path, source, func_name, c.body)
         })
       list.append(subj_v, clause_v)
     }
 
     glance.Fn(body: body, ..) ->
       list.flat_map(body, fn(s) {
-        find_todo_panic_in_statement(file_path, func_name, s)
+        find_todo_panic_in_statement(file_path, source, func_name, s)
       })
 
     glance.List(elements: elems, ..) ->
       list.flat_map(elems, fn(e) {
-        find_todo_panic_in_expression(file_path, func_name, e)
+        find_todo_panic_in_expression(file_path, source, func_name, e)
       })
 
     glance.Tuple(elements: elems, ..) ->
       list.flat_map(elems, fn(e) {
-        find_todo_panic_in_expression(file_path, func_name, e)
+        find_todo_panic_in_expression(file_path, source, func_name, e)
       })
 
     glance.NegateInt(value: inner, ..) | glance.NegateBool(value: inner, ..) ->
-      find_todo_panic_in_expression(file_path, func_name, inner)
+      find_todo_panic_in_expression(file_path, source, func_name, inner)
 
     glance.FieldAccess(container: inner, ..) ->
-      find_todo_panic_in_expression(file_path, func_name, inner)
+      find_todo_panic_in_expression(file_path, source, func_name, inner)
 
     _ -> []
   }
-}
-
-/// Convert a Span to a human-readable location string.
-fn span_to_string(span: glance.Span) -> String {
-  "byte " <> int.to_string(span.start) <> "-" <> int.to_string(span.end)
 }
 
 /// Format a lint violation as a human-readable string.

@@ -750,7 +750,7 @@ pub fn view(model: Model, wrap: fn(Msg) -> msg) -> beacon.Node(msg) {
   ])
 }
 "
-  let assert True = analyzer.has_server_boundary(source)
+  let assert Ok(True) = analyzer.has_server_boundary(source)
   let assert Ok(extracted) = analyzer.extract_client_source(source)
   let assert True = string.contains(extracted, "pub type Model")
   let assert True = string.contains(extracted, "pub type Msg")
@@ -1679,7 +1679,7 @@ pub fn update(model: Model, local: Local, msg: Msg) -> #(Model, Local) {
 pub fn view(model: Model, local: Local) { model }
 "
   let assert Ok(analysis) = analyzer.analyze(source)
-  let report = analyzer.client_contract_report(source, analysis)
+  let report = analyzer.client_contract_report(analysis)
   let joined = string.join(report, "\n")
   let assert True = string.contains(joined, "Client contract")
   let assert True = string.contains(joined, "Model: count: Int")

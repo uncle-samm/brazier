@@ -3,7 +3,7 @@
 # The browser harness needs Gleam/Erlang, Node/npm for esbuild, Python for CDP,
 # and Chromium. Keep this image test-focused; the production Dockerfile remains
 # separate.
-FROM ghcr.io/gleam-lang/gleam:v1.14.0-erlang
+FROM ghcr.io/gleam-lang/gleam:v1.19.2-erlang
 
 WORKDIR /app
 
