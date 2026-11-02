@@ -3,6 +3,7 @@
 /// so that crashes are contained and services restart automatically.
 ///
 /// Reference: Phoenix application structure, Erlang/OTP supervisor pattern.
+import beacon/config as beacon_config
 import beacon/effect.{type Effect}
 import beacon/element.{type Node}
 import beacon/error
@@ -44,7 +45,8 @@ pub type AppConfig(model, msg) {
     decode_event: Option(
       fn(String, String, String, String) -> Result(msg, error.BeaconError),
     ),
-    /// Secret key for session tokens.
+    /// Secret key for session tokens: at least 32 bytes
+    /// (`config.min_secret_key_bytes`), or start fails with a ConfigError.
     secret_key: String,
     /// Application title (used in SSR HTML).
     title: String,
@@ -98,6 +100,9 @@ pub type App {
   App(
     /// The supervisor PID.
     supervisor_pid: process.Pid,
+    /// The TCP port the application is listening on. When the configured
+    /// port is 0 this is the OS-assigned port.
+    port: Int,
   )
 }
 
@@ -162,6 +167,16 @@ fn verify_public_application_contract(
 }
 
 fn start_verified(
+  config: AppConfig(model, msg),
+) -> Result(App, error.BeaconError) {
+  // A weak secret makes every signed join token forgeable: refuse to start.
+  case beacon_config.validate_secret_key(config.secret_key) {
+    Error(err) -> Error(err)
+    Ok(_) -> start_with_valid_secret(config)
+  }
+}
+
+fn start_with_valid_secret(
   config: AppConfig(model, msg),
 ) -> Result(App, error.BeaconError) {
   // Start PubSub for distributed broadcasting
@@ -260,14 +275,15 @@ fn start_verified(
       api_handler: config.api_handler,
       ws_auth: config.ws_auth,
     )
-  case transport.start(transport_config) {
-    Ok(transport_pid) -> {
+  case transport.start_listener(transport_config) {
+    Ok(listener) -> {
+      let port = server.get_port(listener)
       log.info(
         "beacon.application",
         "Beacon application started (per-connection mode) on port "
-          <> int.to_string(config.port),
+          <> int.to_string(port),
       )
-      Ok(App(supervisor_pid: transport_pid))
+      Ok(App(supervisor_pid: server.get_supervisor(listener), port: port))
     }
     Error(err) -> {
       log.error(
@@ -304,17 +320,41 @@ fn start_supervised_with(
   start_fn: fn(AppConfig(model, msg)) -> Result(App, error.BeaconError),
 ) -> Result(App, error.BeaconError) {
   log.configure()
+  // Refuse a weak secret before any process is started, so a failed start
+  // leaves nothing running.
+  case beacon_config.validate_secret_key(config.secret_key) {
+    Error(err) -> Error(err)
+    Ok(_) -> start_supervised_with_valid_secret(config, start_fn)
+  }
+}
+
+fn start_supervised_with_valid_secret(
+  config: AppConfig(model, msg),
+  start_fn: fn(AppConfig(model, msg)) -> Result(App, error.BeaconError),
+) -> Result(App, error.BeaconError) {
   log.info(
     "beacon.application",
     "Starting supervised Beacon application on port "
       <> int.to_string(config.port),
   )
 
-  // Start state manager under supervision
+  // Start state manager under supervision. The supervisor must be given
+  // the state manager's own pid (not the supervisor's) so it can monitor
+  // and restart it.
   let state_mgr_spec =
     supervision.worker(fn() {
       case state_manager.start_in_memory() {
-        Ok(subject) -> Ok(actor.Started(pid: process.self(), data: subject))
+        Ok(subject) ->
+          case process.subject_owner(subject) {
+            Ok(pid) -> Ok(actor.Started(pid: pid, data: subject))
+            Error(Nil) -> {
+              log.error(
+                "beacon.application",
+                "State manager subject has no owner process",
+              )
+              Error(actor.InitFailed("state manager subject has no owner"))
+            }
+          }
         Error(err) -> Error(err)
       }
     })
@@ -329,9 +369,9 @@ fn start_supervised_with(
     Ok(sup_started) -> {
       log.info("beacon.application", "Supervisor started")
       case start_fn(config) {
-        Ok(_app) -> {
+        Ok(app) -> {
           log.info("beacon.application", "Application fully started")
-          Ok(App(supervisor_pid: sup_started.pid))
+          Ok(App(supervisor_pid: sup_started.pid, port: app.port))
         }
         Error(err) -> Error(err)
       }
@@ -350,23 +390,49 @@ fn start_supervised_with(
 
 /// Keep the main process alive so the application keeps running.
 /// Call this after `start()` in your main function.
+///
+/// The calling process traps exits so a shutdown signal can drain
+/// connections. Because of that, the exit of any linked process (for
+/// example the listener supervisor giving up after repeated crashes) is
+/// received here and re-raised: the application never keeps running with
+/// a dead listener.
+///
+/// `BEACON_SHUTDOWN_TIMEOUT` (milliseconds, default 5000) is validated
+/// before waiting; a value that is not a non-negative integer stops the
+/// process with an error instead of being ignored.
 pub fn wait_forever() -> Nil {
+  let timeout = case shutdown_timeout() {
+    Ok(ms) -> ms
+    Error(reason) -> {
+      log.error("beacon.application", reason)
+      fail_loudly(reason)
+    }
+  }
   log.info("beacon.application", "Application running. Press Ctrl+C to stop.")
   // Trap exit signals for graceful shutdown
   trap_exit()
-  wait_for_shutdown()
+  wait_for_shutdown(timeout)
+}
+
+/// What `receive_shutdown_signal` observed.
+type ShutdownSignal {
+  /// Nothing arrived before the timeout.
+  NoSignal
+  /// A linked process asked this one to shut down.
+  ShutdownRequested
+  /// A linked process exited abnormally.
+  LinkedProcessExited(reason: String)
 }
 
 /// Wait for shutdown signal, then drain connections.
-fn wait_for_shutdown() -> Nil {
+fn wait_for_shutdown(timeout: Int) -> Nil {
   case receive_shutdown_signal(60_000) {
-    True -> {
+    ShutdownRequested -> {
       log.info(
         "beacon.application",
         "Shutdown signal received, draining connections...",
       )
       // Give in-flight requests time to complete
-      let timeout = shutdown_timeout()
       log.info(
         "beacon.application",
         "Draining for " <> int.to_string(timeout) <> "ms...",
@@ -374,21 +440,51 @@ fn wait_for_shutdown() -> Nil {
       process.sleep(timeout)
       log.info("beacon.application", "Shutdown complete.")
     }
-    False -> wait_for_shutdown()
+    LinkedProcessExited(reason) -> {
+      let message = "Linked application process exited: " <> reason
+      log.error("beacon.application", message)
+      fail_loudly(message)
+    }
+    NoSignal -> wait_for_shutdown(timeout)
   }
 }
 
-/// Get shutdown timeout from env or default 5 seconds.
-fn shutdown_timeout() -> Int {
+/// Why an integer environment variable could not be read.
+type EnvIntError {
+  EnvNotSet
+  EnvNotInteger(value: String)
+}
+
+/// Shutdown drain timeout in milliseconds from `BEACON_SHUTDOWN_TIMEOUT`,
+/// 5000 when the variable is unset. A malformed or negative value is an
+/// error.
+fn shutdown_timeout() -> Result(Int, String) {
   case get_env_int("BEACON_SHUTDOWN_TIMEOUT") {
-    Ok(ms) -> ms
-    Error(reason) -> {
+    Ok(ms) if ms >= 0 -> {
       log.debug(
         "beacon.application",
-        "BEACON_SHUTDOWN_TIMEOUT not set: " <> reason <> ", using 5000ms",
+        "BEACON_SHUTDOWN_TIMEOUT=" <> int.to_string(ms) <> "ms",
       )
-      5000
+      Ok(ms)
     }
+    Ok(ms) ->
+      Error(
+        "BEACON_SHUTDOWN_TIMEOUT must be a non-negative integer of milliseconds, got "
+        <> int.to_string(ms),
+      )
+    Error(EnvNotSet) -> {
+      log.debug(
+        "beacon.application",
+        "BEACON_SHUTDOWN_TIMEOUT not set, using the 5000ms default",
+      )
+      Ok(5000)
+    }
+    Error(EnvNotInteger(value)) ->
+      Error(
+        "BEACON_SHUTDOWN_TIMEOUT must be a non-negative integer of milliseconds, got \""
+        <> value
+        <> "\"",
+      )
   }
 }
 
@@ -396,7 +492,11 @@ fn shutdown_timeout() -> Int {
 fn trap_exit() -> Nil
 
 @external(erlang, "beacon_application_ffi", "receive_shutdown_signal")
-fn receive_shutdown_signal(timeout: Int) -> Bool
+fn receive_shutdown_signal(timeout: Int) -> ShutdownSignal
 
 @external(erlang, "beacon_application_ffi", "get_env_int")
-fn get_env_int(name: String) -> Result(Int, String)
+fn get_env_int(name: String) -> Result(Int, EnvIntError)
+
+/// Stop the calling process with an error (crash loudly).
+@external(erlang, "beacon_application_ffi", "fail_loudly")
+fn fail_loudly(reason: String) -> a

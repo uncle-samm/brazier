@@ -193,38 +193,50 @@ import beacon/build/analyzer
 import beacon/cookie
 import gleam/http/response
 
-pub fn cookie_value_newline_stripped_test() {
-  // CVE: newlines in cookie values enable header injection
-  // Fix: sanitize_cookie_value strips \r, \n, \0
-  let resp =
+pub fn cookie_value_newline_is_rejected_test() {
+  // CVE: newlines in cookie values enable header injection. The value is
+  // rejected outright rather than stripped into something else.
+  let assert Error(cookie.InvalidValue("session")) =
     response.new(200)
     |> cookie.set_default("session", "abc\r\nSet-Cookie: admin=true")
-  let assert Ok(header_val) = find_header(resp.headers, "set-cookie")
-  // Newlines must be stripped — no header injection possible
-  let assert False = string.contains(header_val, "\r")
-  let assert False = string.contains(header_val, "\n")
-  // After stripping CRLF, the injected text is harmless — it's part of the
-  // cookie VALUE, not a separate Set-Cookie header. The security fix is that
-  // without \r\n, the browser cannot split this into multiple headers.
-  let assert True = string.contains(header_val, "session=abc")
 }
 
-pub fn cookie_value_null_byte_stripped_test() {
-  let resp =
+pub fn cookie_value_null_byte_is_rejected_test() {
+  let assert Error(cookie.InvalidValue("tok")) =
     response.new(200)
     |> cookie.set_default("tok", "abc\u{0000}def")
-  let assert Ok(header_val) = find_header(resp.headers, "set-cookie")
-  let assert True = string.contains(header_val, "tok=abcdef")
-  let assert False = string.contains(header_val, "\u{0000}")
 }
 
-pub fn cookie_name_newline_stripped_test() {
-  let resp =
+pub fn cookie_name_newline_is_rejected_test() {
+  let assert Error(cookie.InvalidName(_)) =
     response.new(200)
     |> cookie.set_default("bad\r\nname", "value")
-  let assert Ok(header_val) = find_header(resp.headers, "set-cookie")
-  let assert False = string.contains(header_val, "\r")
-  let assert False = string.contains(header_val, "\n")
+}
+
+/// Regression: semicolons were passed through, so a value could append
+/// its own attributes (`Domain=`, `Path=`, `SameSite=None`).
+pub fn cookie_value_attribute_injection_is_rejected_test() {
+  let resp = response.new(200)
+  let assert Error(cookie.InvalidValue(_)) =
+    cookie.set_default(resp, "session", "abc; Domain=evil.example")
+  let assert Error(cookie.InvalidValue(_)) =
+    cookie.set_default(resp, "session", "abc,other=1")
+  let assert Error(cookie.InvalidPath(..)) =
+    cookie.set(
+      resp,
+      "session",
+      "abc",
+      cookie.CookieOptions(..cookie.default_options(), path: "/; Domain=evil"),
+    )
+  let assert Error(cookie.InvalidSameSite(..)) =
+    cookie.set(
+      resp,
+      "session",
+      "abc",
+      cookie.CookieOptions(..cookie.default_options(), same_site: "Lax; Secure"),
+    )
+  // Nothing was written by any of the refused calls.
+  let assert Error(Nil) = find_header(resp.headers, "set-cookie")
 }
 
 fn find_header(

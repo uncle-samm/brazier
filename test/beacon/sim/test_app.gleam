@@ -1,5 +1,6 @@
 /// Test application configurations for simulation testing.
-/// Each function starts a real Beacon app on a given port.
+/// Each function starts a real Beacon app on an OS-assigned port (port 0);
+/// read the bound port from the returned `App.port`.
 import beacon/application
 import beacon/effect
 import beacon/element
@@ -19,29 +20,27 @@ pub type CounterMsg {
 }
 
 /// Security limits for simulation apps. Every simulated client connects from
-/// localhost, so the per-IP WebSocket cap is raised above the largest pool
+/// localhost, so the per-IP caps are raised above the largest pool
 /// (1000 connections) the sim tests open.
 pub fn sim_security_limits() -> transport.SecurityLimits {
   transport.SecurityLimits(
     ..transport.default_security_limits(),
+    max_connections_per_ip: 10_000,
     max_ws_connections_per_ip: 10_000,
   )
 }
 
-pub fn start_counter_app(
-  port: Int,
-) -> Result(application.App, error.BeaconError) {
-  start_counter_app_with_limits(port, sim_security_limits())
+pub fn start_counter_app() -> Result(application.App, error.BeaconError) {
+  start_counter_app_with_limits(sim_security_limits())
 }
 
 /// Counter app with explicit security limits (for abuse-policy tests).
 pub fn start_counter_app_with_limits(
-  port: Int,
   limits: transport.SecurityLimits,
 ) -> Result(application.App, error.BeaconError) {
   let config =
     application.AppConfig(
-      port: port,
+      port: 0,
       init: fn() { #(CounterModel(count: 0), effect.none()) },
       update: fn(model: CounterModel, _msg) {
         #(CounterModel(count: model.count + 1), effect.none())
@@ -91,12 +90,11 @@ pub type TickerMsg {
 }
 
 pub fn start_ticker_app(
-  port: Int,
   interval_ms: Int,
 ) -> Result(application.App, error.BeaconError) {
   let config =
     application.AppConfig(
-      port: port,
+      port: 0,
       init: fn() {
         #(TickerModel(tick: 0), effect.every(interval_ms, fn() { Tick }))
       },
@@ -134,16 +132,3 @@ pub fn start_ticker_app(
     )
   application.start_advanced(config)
 }
-
-/// Generate a unique port in the 20000-48999 range for parallel test execution.
-/// The range stays below 49152 so it never collides with ports the OS hands
-/// out for outgoing connections (the macOS/IANA ephemeral range is 49152-65535).
-pub fn unique_port() -> Int {
-  20_000 + { abs(erlang_unique_pos()) % 29_000 }
-}
-
-@external(erlang, "erlang", "abs")
-fn abs(n: Int) -> Int
-
-@external(erlang, "erlang", "unique_integer")
-fn erlang_unique_pos() -> Int

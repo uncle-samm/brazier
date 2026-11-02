@@ -6,11 +6,14 @@
 /// instead of Mist. Direct gen_tcp for zero unnecessary abstraction layers.
 ///
 /// Reference: LiveView channel protocol, RFC 6455.
+import beacon/cookie
 import beacon/error
+import beacon/ip
 import beacon/log
 import beacon/middleware
 import beacon/ssr
 import beacon/static
+import beacon/transport/client
 import beacon/transport/http as transport_http
 import beacon/transport/server.{
   type Connection, type ResponseBody, type Socket, Bytes,
@@ -21,6 +24,7 @@ import gleam/bytes_tree
 import gleam/dynamic.{type Dynamic}
 import gleam/dynamic/decode
 import gleam/erlang/process
+import gleam/http
 import gleam/http/request.{type Request}
 import gleam/http/response
 import gleam/int
@@ -145,6 +149,33 @@ pub type SecurityLimits {
     max_http_header_bytes: Int,
     /// Timeout for request line/header reads before upgrade, in milliseconds. Default: 5000.
     pre_upgrade_timeout_ms: Int,
+    // HTTP limits
+    /// Maximum concurrent connections from one peer IP. Peers listed in
+    /// `trusted_proxies` are exempt (they multiplex many clients). Default: 256.
+    max_connections_per_ip: Int,
+    /// Maximum request-line length in bytes; longer lines get 414. Default: 8192.
+    max_request_line_bytes: Int,
+    /// Maximum declared request body size in bytes; larger Content-Length
+    /// gets 413 before the handler runs. Default: 8388608 (8MB).
+    max_body_bytes: Int,
+    /// Maximum wait for each chunk of request body, in milliseconds. Default: 30000.
+    body_read_timeout_ms: Int,
+    /// Absolute deadline for reading a request body, in milliseconds from
+    /// the moment its head was parsed (the head itself is bounded by
+    /// `pre_upgrade_timeout_ms`). Default: 60000.
+    request_timeout_ms: Int,
+    /// How long an idle keep-alive connection waits for the next request,
+    /// in milliseconds. Default: 15000.
+    keepalive_idle_timeout_ms: Int,
+    /// Maximum requests served on one keep-alive connection. Default: 1000.
+    max_keepalive_requests: Int,
+    /// Maximum time a blocked socket send may take before the connection
+    /// is closed, in milliseconds. Default: 30000.
+    send_timeout_ms: Int,
+    /// Reverse proxies (IP addresses or CIDRs) whose X-Forwarded-For and
+    /// Forwarded headers are believed. Empty means the socket peer address
+    /// is always the client address. Default: [].
+    trusted_proxies: List(String),
     // WebSocket limits
     /// Maximum concurrent WebSocket connections per peer IP (per listener).
     /// Upgrades beyond it get 429. Default: 100. Behind a reverse proxy every
@@ -193,6 +224,16 @@ pub fn default_security_limits() -> SecurityLimits {
     max_http_headers: 100,
     max_http_header_bytes: 65_536,
     pre_upgrade_timeout_ms: 5000,
+    // HTTP limits
+    max_connections_per_ip: 256,
+    max_request_line_bytes: 8192,
+    max_body_bytes: 8_388_608,
+    body_read_timeout_ms: 30_000,
+    request_timeout_ms: 60_000,
+    keepalive_idle_timeout_ms: 15_000,
+    max_keepalive_requests: 1000,
+    send_timeout_ms: 30_000,
+    trusted_proxies: [],
     max_ws_connections_per_ip: 100,
     ws_ping_interval_ms: 30_000,
     ws_pong_timeout_ms: 20_000,
@@ -211,8 +252,9 @@ const max_timer_ms = 4_294_967_295
 
 /// Validate security limits. Every count, size and interval must be
 /// positive (the two abuse thresholds may be 0, meaning "first offence
-/// closes"), timer intervals must fit `erlang:send_after/3`, and every
-/// allowed origin must be a bare `scheme://host[:port]` origin.
+/// closes", and `max_body_bytes` may be 0, meaning "no request bodies"),
+/// timer intervals must fit `erlang:send_after/3`, and every allowed origin
+/// must be a bare `scheme://host[:port]` origin.
 pub fn validate_security_limits(limits: SecurityLimits) -> Result(Nil, String) {
   let positive = [
     #("max_message_bytes", limits.max_message_bytes),
@@ -224,6 +266,14 @@ pub fn validate_security_limits(limits: SecurityLimits) -> Result(Nil, String) {
     #("max_ws_connections_per_ip", limits.max_ws_connections_per_ip),
     #("ws_send_timeout_ms", limits.ws_send_timeout_ms),
     #("ws_max_outbound_queue", limits.ws_max_outbound_queue),
+    // HTTP limits
+    #("max_connections_per_ip", limits.max_connections_per_ip),
+    #("max_request_line_bytes", limits.max_request_line_bytes),
+    #("body_read_timeout_ms", limits.body_read_timeout_ms),
+    #("request_timeout_ms", limits.request_timeout_ms),
+    #("keepalive_idle_timeout_ms", limits.keepalive_idle_timeout_ms),
+    #("max_keepalive_requests", limits.max_keepalive_requests),
+    #("send_timeout_ms", limits.send_timeout_ms),
   ]
   let timers = [
     #("ws_ping_interval_ms", limits.ws_ping_interval_ms),
@@ -234,6 +284,8 @@ pub fn validate_security_limits(limits: SecurityLimits) -> Result(Nil, String) {
   let non_negative = [
     #("ws_max_decode_errors", limits.ws_max_decode_errors),
     #("ws_max_rate_violations", limits.ws_max_rate_violations),
+    // HTTP limits: 0 means "no request body accepted".
+    #("max_body_bytes", limits.max_body_bytes),
   ]
   let outcome = {
     use _ <- result.try(
@@ -266,6 +318,13 @@ pub fn validate_security_limits(limits: SecurityLimits) -> Result(Nil, String) {
         }
       }),
     )
+    // HTTP limits: a typo in the proxy list must never silently change who
+    // is trusted.
+    use _ <- result.try(
+      ip.parse_trusted_proxies(limits.trusted_proxies)
+      |> result.map(fn(_) { Nil })
+      |> result.map_error(fn(reason) { "trusted_proxies: " <> reason }),
+    )
     list.try_each(limits.ws_allowed_origins, fn(origin) {
       case parse_origin(origin) {
         Ok(Origin(has_path: False, ..)) -> Ok(Nil)
@@ -289,6 +348,25 @@ pub fn validate_security_limits(limits: SecurityLimits) -> Result(Nil, String) {
     }
     Error(reason) -> {
       log.error("beacon.transport", "Invalid security limits: " <> reason)
+      Error(reason)
+    }
+  }
+}
+
+/// The parsed `trusted_proxies` of validated limits.
+/// `validate_security_limits` (run when the listener starts) has already
+/// rejected any unparsable entry, so an error here means the limits were
+/// built without validation; it is logged and the caller must refuse.
+pub fn trusted_proxies(
+  limits: SecurityLimits,
+) -> Result(ip.TrustedProxies, String) {
+  case ip.parse_trusted_proxies(limits.trusted_proxies) {
+    Ok(parsed) -> Ok(parsed)
+    Error(reason) -> {
+      log.error(
+        "beacon.transport",
+        "trusted_proxies is invalid (limits were not validated): " <> reason,
+      )
       Error(reason)
     }
   }
@@ -431,9 +509,6 @@ fn erlang_unique_integer() -> Int
 
 @external(erlang, "beacon_connection_tracker_ffi", "init")
 pub fn connection_tracker_init() -> Nil
-
-@external(erlang, "beacon_connection_tracker_ffi", "increment")
-fn connection_tracker_increment() -> Int
 
 @external(erlang, "beacon_connection_tracker_ffi", "decrement")
 fn connection_tracker_decrement() -> Int
@@ -1588,23 +1663,26 @@ fn parse_port(text: String) -> Result(Int, String) {
   }
 }
 
-/// The scheme the client used to reach us: the first X-Forwarded-Proto
-/// token when a proxy set one, otherwise plain http (Beacon itself does not
-/// terminate TLS).
-fn request_scheme(req: Request(Connection)) -> Result(String, String) {
-  case request.get_header(req, "x-forwarded-proto") {
-    Error(Nil) -> Ok("http")
-    Ok(value) -> {
-      let first = case string.split(value, ",") {
-        [token, ..] -> string.lowercase(string.trim(token))
-        [] -> ""
-      }
-      case first {
-        "http" | "https" -> Ok(first)
-        _ -> Error("invalid X-Forwarded-Proto \"" <> value <> "\"")
-      }
-    }
-  }
+/// The scheme the client used to reach us. X-Forwarded-Proto is honoured
+/// only from a trusted proxy (`beacon/transport/client`); otherwise plain
+/// http (Beacon itself does not terminate TLS).
+fn request_scheme(
+  req: Request(Connection),
+  limits: SecurityLimits,
+) -> Result(String, String) {
+  use trusted <- result.try(trusted_proxies(limits))
+  client.scheme(req, trusted)
+}
+
+/// The client address for an upgrade: the socket peer, or the forwarded
+/// client when the peer is a trusted proxy (same rule as the HTTP side).
+fn ws_client_ip(
+  socket: Socket,
+  req: Request(Connection),
+  limits: SecurityLimits,
+) -> Result(String, String) {
+  use trusted <- result.try(trusted_proxies(limits))
+  client.ip_for_socket(socket, req.headers, trusted)
 }
 
 /// Check that the Origin header matches the server's own origin (scheme,
@@ -1629,7 +1707,7 @@ fn check_origin(
         Ok(h) -> h
         Error(Nil) -> ""
       }
-      case request_scheme(req) {
+      case request_scheme(req, limits) {
         Error(reason) -> {
           log.warning("beacon.transport", "Origin check failed: " <> reason)
           Error(reason)
@@ -1734,7 +1812,7 @@ fn handle_ws_request(
 ) -> Nil {
   let conn_id = generate_connection_id()
   let limits = config.security_limits
-  case validate_security_limits(limits), ws.peer_ip(socket) {
+  case validate_security_limits(limits), ws_client_ip(socket, req, limits) {
     Error(reason), _ ->
       reject_ws_request(
         socket,
@@ -1784,28 +1862,61 @@ fn admit_ws_request(
           <> int.to_string(limits.max_connections)
           <> ")",
       )
-    False -> {
-      let slot_key = int.to_string(config.port) <> "|" <> peer_ip
-      case ws.acquire_ip_slot(slot_key, limits.max_ws_connections_per_ip) {
-        Error(count) ->
+    False ->
+      // Slots are scoped by the port the socket was accepted on (not the
+      // configured port, which is 0 for OS-assigned listeners) so two
+      // listeners in one VM never share per-IP counts.
+      case server.get_local_port(socket) {
+        Error(reason) ->
           reject_ws_request(
             socket,
             conn_id,
             peer_ip,
             None,
-            429,
-            "Too many connections from this address",
-            "per-IP WebSocket limit reached (" <> int.to_string(count) <> ")",
+            500,
+            "Server error",
+            "could not read local port: " <> reason,
           )
-        Ok(_count) ->
-          authorize_ws_request(
+        Ok(local_port) ->
+          acquire_ws_slot(
             socket,
             req,
             config,
-            Admission(conn_id: conn_id, peer_ip: peer_ip, slot_key: slot_key),
+            conn_id,
+            peer_ip,
+            int.to_string(local_port) <> "|" <> peer_ip,
           )
       }
-    }
+  }
+}
+
+fn acquire_ws_slot(
+  socket: Socket,
+  req: Request(Connection),
+  config: TransportConfig,
+  conn_id: ConnectionId,
+  peer_ip: String,
+  slot_key: String,
+) -> Nil {
+  let limits = config.security_limits
+  case ws.acquire_ip_slot(slot_key, limits.max_ws_connections_per_ip) {
+    Error(count) ->
+      reject_ws_request(
+        socket,
+        conn_id,
+        peer_ip,
+        None,
+        429,
+        "Too many connections from this address",
+        "per-IP WebSocket limit reached (" <> int.to_string(count) <> ")",
+      )
+    Ok(_count) ->
+      authorize_ws_request(
+        socket,
+        req,
+        config,
+        Admission(conn_id: conn_id, peer_ip: peer_ip, slot_key: slot_key),
+      )
   }
 }
 
@@ -1990,141 +2101,393 @@ fn try_api_handler(
 }
 
 /// Route a request through framework handlers: beacon_client.js, health, static, SSR.
+/// Paths are matched exactly (no segment normalisation), and framework
+/// assets answer only GET and HEAD.
 fn route_framework_request(
   config: TransportConfig,
   req: Request(Connection),
 ) -> response.Response(ResponseBody) {
-  case request.path_segments(req) {
-    ["beacon_client.js"] -> serve_client_js(req)
-    ["health"] -> {
+  case req.path {
+    "/health" ->
       response.new(200)
       |> response.set_header("content-type", "application/json")
       |> response.set_body(Bytes(bytes_tree.from_string("{\"status\":\"ok\"}")))
-    }
-    _ -> {
-      let path = req.path
-      case
-        string.starts_with(path, "/beacon_client_")
-        && string.ends_with(path, ".js")
-      {
-        True -> {
-          let name = string.drop_start(path, 1)
-          serve_hashed_client_js(name, req)
-        }
-        False -> {
-          case config.static_config {
-            Some(static_cfg) -> {
-              let if_none_match = case
-                request.get_header(req, "if-none-match")
-              {
-                Ok(val) -> val
-                Error(Nil) -> ""
-              }
-              case
-                static.serve_with_etag_check(
-                  static_cfg,
-                  req.path,
-                  if_none_match,
-                )
-              {
-                Ok(resp) -> resp
-                Error(Nil) ->
-                  serve_page_or_ssr(config.page_html, config.ssr_factory, req)
-              }
-            }
-            None -> serve_page_or_ssr(config.page_html, config.ssr_factory, req)
-          }
-        }
+    "/beacon_client.js" ->
+      when_readable_method(req, fn() { serve_client_js(req) })
+    "/beacon_client_" <> _ -> {
+      let name = string.drop_start(req.path, 1)
+      // Only exact build output names are read from the assets directory;
+      // anything else is an ordinary path.
+      case static.is_client_bundle_name(name) {
+        True ->
+          when_readable_method(req, fn() { serve_hashed_client_js(name, req) })
+        False -> route_static_or_page(config, req)
       }
     }
+    _ -> route_static_or_page(config, req)
+  }
+}
+
+/// Serve a static file when the path is under the static prefix, else the page.
+fn route_static_or_page(
+  config: TransportConfig,
+  req: Request(Connection),
+) -> response.Response(ResponseBody) {
+  let page = fn() {
+    serve_page_or_ssr(config.page_html, config.ssr_factory, req)
+  }
+  case config.static_config {
+    None -> page()
+    Some(static_cfg) ->
+      case static.matches_prefix(static_cfg, req.path) {
+        False -> page()
+        True ->
+          when_readable_method(req, fn() {
+            case
+              static.serve_with_etag_check(
+                static_cfg,
+                req.path,
+                header_or_empty(req, "if-none-match"),
+              )
+            {
+              Ok(resp) -> resp
+              Error(Nil) -> page()
+            }
+          })
+      }
+  }
+}
+
+/// Run `serve` for GET and HEAD; any other method gets 405 (RFC 9110 §15.5.6).
+fn when_readable_method(
+  req: Request(Connection),
+  serve: fn() -> response.Response(ResponseBody),
+) -> response.Response(ResponseBody) {
+  case req.method {
+    http.Get | http.Head -> serve()
+    method -> {
+      log.debug(
+        "beacon.transport",
+        "405 for "
+          <> http.method_to_string(method)
+          <> " on framework asset "
+          <> req.path,
+      )
+      response.new(405)
+      |> response.set_header("allow", "GET, HEAD")
+      |> response.set_header("content-type", "text/plain; charset=utf-8")
+      |> response.set_body(Bytes(bytes_tree.from_string("Method Not Allowed")))
+    }
+  }
+}
+
+/// A request header value, or "" when absent.
+fn header_or_empty(req: Request(Connection), name: String) -> String {
+  case request.get_header(req, name) {
+    Ok(value) -> value
+    Error(Nil) -> ""
   }
 }
 
 // --- Per-Connection Handler ---
 
-/// Handle a single TCP connection: read HTTP request, route to WS or HTTP handler.
+/// Unread request body bytes the server discards itself so a keep-alive
+/// connection can be reused (cowboy uses the same idea). A larger unread
+/// body closes the connection instead.
+const max_discard_body_bytes = 65_536
+
+/// Methods answered for `OPTIONS *`.
+const allowed_methods_header = "GET, HEAD, POST, PUT, DELETE, OPTIONS, PATCH"
+
+/// Serve one TCP connection: HTTP/1.1 requests in a keep-alive loop until
+/// the connection closes or is upgraded to a WebSocket.
 /// Middleware runs on ALL requests, including /ws, before routing.
-fn per_connection_handler(socket: Socket, config: TransportConfig) -> Nil {
-  let conn_count = connection_tracker_increment()
-  case conn_count > config.security_limits.max_connections {
-    True -> {
+///
+/// The connection slot is owned by the listener's connection owner, which
+/// releases it when this process exits, so there is no manual bookkeeping
+/// on the HTTP path.
+fn per_connection_handler(
+  socket: Socket,
+  config: TransportConfig,
+  handler: fn(Request(Connection)) -> response.Response(ResponseBody),
+) -> Nil {
+  log.debug("beacon.transport", "Connection handler started")
+  serve_requests(socket, config, handler, 0)
+}
+
+fn serve_requests(
+  socket: Socket,
+  config: TransportConfig,
+  handler: fn(Request(Connection)) -> response.Response(ResponseBody),
+  served: Int,
+) -> Nil {
+  let limits = config.security_limits
+  let head_limits =
+    transport_http.HeadLimits(
+      max_headers: limits.max_http_headers,
+      max_header_bytes: limits.max_http_header_bytes,
+      max_request_line_bytes: limits.max_request_line_bytes,
+    )
+  // The first request must arrive promptly after accept (slowloris guard);
+  // later ones may wait for the keep-alive idle timeout, but once a request
+  // line arrived its headers must follow within the pre-upgrade timeout.
+  let timing = case served {
+    0 ->
+      transport_http.HeadTiming(
+        request_line_timeout_ms: limits.pre_upgrade_timeout_ms,
+        header_deadline: transport_http.SharedWithRequestLine,
+      )
+    _ ->
+      transport_http.HeadTiming(
+        request_line_timeout_ms: limits.keepalive_idle_timeout_ms,
+        header_deadline: transport_http.AfterRequestLine(
+          limits.pre_upgrade_timeout_ms,
+        ),
+      )
+  }
+  case transport_http.read_request_head(socket, head_limits, timing) {
+    Error(err) ->
+      case transport_http.get_head_error_status(err) {
+        None -> {
+          log.debug(
+            "beacon.transport",
+            "Closing connection after "
+              <> int.to_string(served)
+              <> " requests: "
+              <> transport_http.get_head_error_message(err),
+          )
+          server.close(socket)
+        }
+        Some(status) ->
+          transport_http.write_error(
+            socket,
+            status,
+            transport_http.get_head_error_message(err),
+          )
+      }
+    Ok(#(req, version)) ->
+      case transport_http.check_framing(req, version, limits.max_body_bytes) {
+        Error(transport_http.FramingError(status: status, reason: reason)) ->
+          transport_http.write_error(socket, status, reason)
+        Ok(framing) ->
+          case request.path_segments(req) {
+            ["ws"] -> serve_ws_request(socket, req, framing, config)
+            _ ->
+              serve_http_request(
+                socket,
+                req,
+                version,
+                framing,
+                config,
+                handler,
+                served,
+              )
+          }
+      }
+  }
+}
+
+/// Route a /ws request: middleware, then the WebSocket upgrade. The
+/// connection never returns to the HTTP loop afterwards.
+fn serve_ws_request(
+  socket: Socket,
+  req: Request(Connection),
+  framing: transport_http.BodyFraming,
+  config: TransportConfig,
+) -> Nil {
+  case framing.content_length, transport_http.get_buffered_byte_count(socket) {
+    0, 0 ->
+      case check_middleware(req, config.middlewares) {
+        Ok(Nil) -> handle_ws_request(socket, req, config)
+        Error(resp) -> {
+          case transport_http.write_response(socket, resp) {
+            Ok(Nil) -> Nil
+            Error(reason) ->
+              log.error(
+                "beacon.transport",
+                "Failed to write middleware rejection: " <> reason,
+              )
+          }
+          transport_http.close_gracefully(socket)
+        }
+      }
+    0, buffered -> {
+      // RFC 6455 4.1: the client must wait for the handshake response
+      // before sending frames. The frame reader starts from the socket, so
+      // bytes already buffered here would be silently lost.
       log.warning(
         "beacon.transport",
-        "Global connection limit reached ("
-          <> int.to_string(conn_count)
-          <> "/"
-          <> int.to_string(config.security_limits.max_connections)
-          <> ") — rejecting pre-upgrade connection",
+        "Rejecting WebSocket upgrade: client sent "
+          <> int.to_string(buffered)
+          <> " bytes before the handshake completed",
       )
-      let _ = connection_tracker_decrement()
-      transport_http.write_error(socket, 503, "Too many connections")
+      transport_http.write_error(
+        socket,
+        400,
+        "Data received before the WebSocket handshake completed",
+      )
     }
-    False -> {
-      log.debug(
+    length, _ -> {
+      // Body bytes after an upgrade request would be parsed as WebSocket
+      // frames; refuse instead.
+      log.warning(
         "beacon.transport",
-        "Global connections after accept: " <> int.to_string(conn_count),
+        "Rejecting WebSocket upgrade request with a "
+          <> int.to_string(length)
+          <> " byte body",
       )
-      case
-        transport_http.read_request_with_limits(
-          socket,
-          config.security_limits.max_http_headers,
-          config.security_limits.max_http_header_bytes,
-          config.security_limits.pre_upgrade_timeout_ms,
-        )
-      {
-        Ok(req) -> {
-          case request.path_segments(req) {
-            ["ws"] -> {
-              case check_middleware(req, config.middlewares) {
-                Ok(Nil) -> handle_ws_request(socket, req, config)
-                Error(resp) -> {
-                  case transport_http.write_response(socket, resp) {
-                    Ok(Nil) -> Nil
-                    Error(reason) ->
-                      log.error(
-                        "beacon.transport",
-                        "Failed to write middleware rejection: " <> reason,
-                      )
-                  }
-                  server.close(socket)
-                  let _ = connection_tracker_decrement()
-                  Nil
-                }
-              }
-            }
-            _ -> {
-              let handler = create_handler(config)
-              let resp = handler(req)
-              case transport_http.write_response(socket, resp) {
-                Ok(Nil) -> Nil
-                Error(reason) ->
-                  log.error(
-                    "beacon.transport",
-                    "Failed to write response: " <> reason,
-                  )
-              }
-              server.close(socket)
-              let _ = connection_tracker_decrement()
-              Nil
-            }
-          }
-        }
+      transport_http.write_error(
+        socket,
+        400,
+        "WebSocket upgrade requests must not have a body",
+      )
+    }
+  }
+}
+
+fn serve_http_request(
+  socket: Socket,
+  req: Request(Connection),
+  version: transport_http.HttpVersion,
+  framing: transport_http.BodyFraming,
+  config: TransportConfig,
+  handler: fn(Request(Connection)) -> response.Response(ResponseBody),
+  served: Int,
+) -> Nil {
+  let limits = config.security_limits
+  let deadline = transport_http.get_monotonic_ms() + limits.request_timeout_ms
+  transport_http.begin_body(
+    socket,
+    framing,
+    limits.body_read_timeout_ms,
+    deadline,
+  )
+  let request_handler = case req.method, req.path {
+    http.Options, "*" -> asterisk_options_response
+    _, _ -> handler
+  }
+  let result = transport_http.run_handler(request_handler, req)
+  // A 100-continue client is still waiting for permission to send an unread
+  // body; reading it ourselves would invite it, so close instead.
+  let discard_limit = case framing.expect_continue {
+    True -> 0
+    False -> max_discard_body_bytes
+  }
+  let body = transport_http.finish_body(socket, discard_limit)
+  case result {
+    Error(_) -> {
+      // run_handler already logged the crash with its stacktrace.
+      let resp =
+        transport_http.create_error_response(500, "Internal Server Error")
+      case write_response_for(socket, req, version, resp, False) {
+        Ok(Nil) -> Nil
+        Error(reason) ->
+          log.warning(
+            "beacon.transport",
+            "Failed to write 500 after handler crash: " <> reason,
+          )
+      }
+      transport_http.close_gracefully(socket)
+    }
+    Ok(resp) -> {
+      let served = served + 1
+      let keep_alive =
+        decide_keep_alive(req, version, resp, body, served, limits)
+      case write_response_for(socket, req, version, resp, keep_alive) {
         Error(reason) -> {
           log.error(
             "beacon.transport",
-            "Failed to read HTTP request: " <> reason,
+            "Failed to write response, closing connection: " <> reason,
           )
           server.close(socket)
-          let _ = connection_tracker_decrement()
-          Nil
         }
+        Ok(Nil) ->
+          case keep_alive {
+            True -> serve_requests(socket, config, handler, served)
+            False -> transport_http.close_gracefully(socket)
+          }
       }
     }
   }
 }
 
+fn write_response_for(
+  socket: Socket,
+  req: Request(Connection),
+  version: transport_http.HttpVersion,
+  resp: response.Response(ResponseBody),
+  keep_alive: Bool,
+) -> Result(Nil, String) {
+  transport_http.write_framed_response(
+    socket,
+    resp,
+    transport_http.ResponseFraming(
+      version: version,
+      head_request: req.method == http.Head,
+      keep_alive: keep_alive,
+    ),
+  )
+}
+
+/// Whether the connection can serve another request after this one.
+fn decide_keep_alive(
+  req: Request(Connection),
+  version: transport_http.HttpVersion,
+  resp: response.Response(ResponseBody),
+  body: transport_http.BodyOutcome,
+  served: Int,
+  limits: SecurityLimits,
+) -> Bool {
+  case
+    transport_http.is_keep_alive_requested(req, version),
+    transport_http.is_close_requested_by_response(resp),
+    body,
+    served >= limits.max_keepalive_requests
+  {
+    False, _, _, _ -> False
+    _, True, _, _ -> False
+    _, _, transport_http.BodyUnread(remaining), _ -> {
+      log.info(
+        "beacon.transport",
+        "Closing connection: handler left "
+          <> int.to_string(remaining)
+          <> " request body bytes unread",
+      )
+      False
+    }
+    _, _, transport_http.BodyFailed, _ -> {
+      log.info(
+        "beacon.transport",
+        "Closing connection after a failed request body read",
+      )
+      False
+    }
+    _, _, transport_http.BodyConsumed, True -> {
+      log.info(
+        "beacon.transport",
+        "Closing connection after "
+          <> int.to_string(served)
+          <> " requests (max_keepalive_requests)",
+      )
+      False
+    }
+    True, False, transport_http.BodyConsumed, False -> True
+  }
+}
+
+/// `OPTIONS *` (RFC 9110 9.3.7) asks about the server as a whole.
+fn asterisk_options_response(
+  _req: Request(Connection),
+) -> response.Response(ResponseBody) {
+  log.debug("beacon.transport", "Answering OPTIONS *")
+  response.new(204)
+  |> response.set_header("allow", allowed_methods_header)
+  |> response.set_body(Bytes(bytes_tree.new()))
+}
+
 /// Run middleware on a request and check if it short-circuits.
 /// Returns Ok(Nil) if middleware passes through, Error(resp) if it rejects.
+/// A crashing middleware rejects the request with 500.
 fn check_middleware(
   req: Request(Connection),
   middlewares: List(middleware.Middleware),
@@ -2138,10 +2501,17 @@ fn check_middleware(
         |> response.set_body(Bytes(bytes_tree.new()))
       }
       let piped = middleware.pipeline(mws, marker)
-      let result = piped(req)
-      case result.status {
-        101 -> Ok(Nil)
-        _ -> Error(result)
+      case transport_http.run_handler(piped, req) {
+        Ok(result) ->
+          case result.status {
+            101 -> Ok(Nil)
+            _ -> Error(result)
+          }
+        Error(_) ->
+          Error(transport_http.create_error_response(
+            500,
+            "Internal Server Error",
+          ))
       }
     }
   }
@@ -2159,149 +2529,266 @@ fn serve_page_or_ssr(
   req: Request(Connection),
 ) -> response.Response(ResponseBody) {
   case ssr_factory {
-    option.Some(factory) -> ssr.to_response(factory(req, req.path))
+    option.Some(factory) -> page_response(factory(req, req.path), req)
     option.None ->
       case page_html {
-        option.Some(rendered) -> ssr.to_response(rendered)
+        option.Some(rendered) -> page_response(rendered, req)
         option.None ->
-          response.new(200)
-          |> response.set_header("content-type", "text/html; charset=utf-8")
-          |> response.set_body(
-            Bytes(bytes_tree.from_string(default_page_html())),
-          )
+          case default_page_html() {
+            Ok(html) ->
+              response.new(200)
+              |> response.set_header("content-type", "text/html; charset=utf-8")
+              |> response.set_body(Bytes(bytes_tree.from_string(html)))
+            Error(reason) -> client_js_unavailable(reason)
+          }
       }
   }
 }
 
-/// Default page when no SSR is configured.
-fn default_page_html() -> String {
-  "<!DOCTYPE html>"
-  <> "<html><head><meta charset=\"utf-8\"><title>Beacon</title>"
-  <> "</head><body>"
-  <> "<div id=\"beacon-app\"></div>"
-  <> "<script src=\"/"
-  <> get_client_js_filename()
-  <> "\" data-beacon-auto></script>"
-  <> "</body></html>"
+/// Default page when no SSR is configured. Fails when the client bundle
+/// has not been built: a page whose script cannot load is not served.
+fn default_page_html() -> Result(String, String) {
+  case get_client_js_filename(ssr.client_assets_dir()) {
+    Error(reason) -> Error(reason)
+    Ok(filename) ->
+      Ok(
+        "<!DOCTYPE html>"
+        <> "<html><head><meta charset=\"utf-8\"><title>Beacon</title>"
+        <> "</head><body>"
+        <> "<div id=\"beacon-app\"></div>"
+        <> "<script src=\"/"
+        <> filename
+        <> "\" data-beacon-auto></script>"
+        <> "</body></html>",
+      )
+  }
 }
 
-fn get_client_js_filename() -> String {
-  let manifest_path = ssr.client_assets_dir() <> "/beacon_client.manifest"
+/// The bundle file named by `beacon_client.manifest` in `assets_dir`. The
+/// name must be exact build output (`static.is_client_bundle_name`), so a
+/// damaged manifest can never point the server at another file.
+fn get_client_js_filename(assets_dir: String) -> Result(String, String) {
+  let manifest_path = assets_dir <> "/beacon_client.manifest"
   case simplifile.read(manifest_path) {
-    Ok(name) -> string.trim(name)
+    Ok(contents) -> {
+      let name = string.trim(contents)
+      case static.is_client_bundle_name(name) {
+        True -> Ok(name)
+        False -> {
+          let reason =
+            "beacon_client.manifest at "
+            <> manifest_path
+            <> " names an invalid bundle "
+            <> string.inspect(name)
+            <> " — rebuild with `gleam run -m beacon/build`"
+          log.error("beacon.transport", reason)
+          Error(reason)
+        }
+      }
+    }
     Error(err) -> {
-      log.error(
-        "beacon.transport",
-        "FATAL: No beacon_client.manifest found at "
-          <> manifest_path
-          <> ": "
-          <> string.inspect(err)
-          <> " — the client JS was not built. Run `gleam run -m beacon/build` first.",
-      )
-      "MISSING_CLIENT_JS_RUN_BEACON_BUILD"
+      let reason =
+        "No beacon_client.manifest at "
+        <> manifest_path
+        <> ": "
+        <> string.inspect(err)
+        <> " — the client JS was not built. Run `gleam run -m beacon/build` first."
+      log.error("beacon.transport", reason)
+      Error(reason)
     }
   }
 }
 
+/// The SSR page response. Its join token is bound to the request's
+/// session cookie (`ssr.to_response_for_request`), so a token lifted from
+/// one browser session does not join under another. A join cookie that
+/// cannot be set is a server bug: answer 500 rather than a page without it.
+fn page_response(
+  page: ssr.RenderedPage,
+  req: Request(Connection),
+) -> response.Response(ResponseBody) {
+  case ssr.to_response_for_request(page, req) {
+    Ok(resp) -> resp
+    Error(error) -> {
+      log.error(
+        "beacon.transport",
+        "Cannot set the SSR join cookie for "
+          <> req.path
+          <> ": "
+          <> cookie.error_to_string(error),
+      )
+      response.new(500)
+      |> response.set_header("content-type", "text/plain; charset=utf-8")
+      |> response.set_body(
+        Bytes(bytes_tree.from_string("Internal Server Error")),
+      )
+    }
+  }
+}
+
+/// 500 for a missing or invalid client bundle (a deployment error).
+fn client_js_unavailable(reason: String) -> response.Response(ResponseBody) {
+  log.error("beacon.transport", "Client JS unavailable: " <> reason)
+  response.new(500)
+  |> response.set_header("content-type", "text/plain; charset=utf-8")
+  |> response.set_body(
+    Bytes(bytes_tree.from_string(
+      "Client JS not built. Run `gleam run -m beacon/build` first.",
+    )),
+  )
+}
+
+/// `/beacon_client.js`: the current bundle under a stable URL, so it must be
+/// revalidated on every use (`no-cache` plus an ETag).
 fn serve_client_js(
   req: Request(Connection),
 ) -> response.Response(ResponseBody) {
   let assets_dir = ssr.client_assets_dir()
-  let manifest_path = assets_dir <> "/beacon_client.manifest"
-  case simplifile.read(manifest_path) {
-    Ok(name) -> serve_js_file(assets_dir <> "/" <> string.trim(name), req)
-    Error(err) -> {
-      log.error(
-        "beacon.transport",
-        "FATAL: No beacon_client.manifest: "
-          <> string.inspect(err)
-          <> " — client JS not built. Run `gleam run -m beacon/build`.",
-      )
-      response.new(500)
-      |> response.set_body(
-        Bytes(bytes_tree.from_string(
-          "Client JS not built. Run `gleam run -m beacon/build` first.",
-        )),
-      )
-    }
+  case get_client_js_filename(assets_dir) {
+    Ok(name) ->
+      case serve_js_file(assets_dir <> "/" <> name, "no-cache", req) {
+        Ok(resp) -> resp
+        // The manifest names a bundle that does not exist: broken build.
+        Error(Nil) ->
+          client_js_unavailable(
+            "beacon_client.manifest names " <> name <> " but it does not exist",
+          )
+      }
+    Error(reason) -> client_js_unavailable(reason)
   }
 }
 
+/// `/beacon_client_<hash>.js`: content-addressed, cached forever. A name that
+/// no longer exists (a page from before a deploy) is a 404.
 fn serve_hashed_client_js(
   name: String,
   req: Request(Connection),
 ) -> response.Response(ResponseBody) {
-  serve_js_file(ssr.client_assets_dir() <> "/" <> name, req)
-}
-
-fn serve_js_file(
-  path: String,
-  req: Request(Connection),
-) -> response.Response(ResponseBody) {
-  case simplifile.read(path) {
-    Ok(contents) -> {
-      let base_response =
-        response.new(200)
-        |> response.set_header(
-          "content-type",
-          "application/javascript; charset=utf-8",
-        )
-        |> response.set_header(
-          "cache-control",
-          "public, max-age=31536000, immutable",
-        )
-        |> response.set_header("vary", "accept-encoding")
-      let accepts_gzip = case request.get_header(req, "accept-encoding") {
-        Ok(header) -> string.contains(string.lowercase(header), "gzip")
-        Error(Nil) -> False
-      }
-      case accepts_gzip {
-        True ->
-          base_response
-          |> response.set_header("content-encoding", "gzip")
-          |> response.set_body(
-            Bytes(
-              bytes_tree.from_bit_array(
-                gzip_compress(bit_array.from_string(contents)),
-              ),
-            ),
-          )
-        False ->
-          base_response
-          |> response.set_body(Bytes(bytes_tree.from_string(contents)))
-      }
-    }
-    Error(err) -> {
-      log.error(
+  case
+    serve_js_file(
+      ssr.client_assets_dir() <> "/" <> name,
+      static.immutable_cache_control(),
+      req,
+    )
+  {
+    Ok(resp) -> resp
+    Error(Nil) -> {
+      log.warning(
         "beacon.transport",
-        "Client JS not found: "
-          <> string.inspect(err)
-          <> " — run `gleam run -m beacon/build` to compile client JS",
+        "Unknown client bundle requested: " <> name,
       )
-      response.new(500)
-      |> response.set_header("content-type", "text/plain")
-      |> response.set_body(
-        Bytes(bytes_tree.from_string(
-          "// beacon.js not found. Run: gleam run -m beacon/build\n",
-        )),
-      )
+      response.new(404)
+      |> response.set_header("content-type", "text/plain; charset=utf-8")
+      |> response.set_header("cache-control", "no-store")
+      |> response.set_body(Bytes(bytes_tree.from_string("Not Found")))
     }
   }
 }
 
-@external(erlang, "zlib", "gzip")
-fn gzip_compress(data: BitArray) -> BitArray
+/// Serve a client bundle from the asset cache (raw and gzip bodies are built
+/// once per file version). Content negotiation picks gzip when the client
+/// accepts it; each encoding has its own strong ETag. Error(Nil) when the
+/// file does not exist.
+fn serve_js_file(
+  path: String,
+  cache_control: String,
+  req: Request(Connection),
+) -> Result(response.Response(ResponseBody), Nil) {
+  case static.load_client_asset(path) {
+    Ok(asset) -> {
+      let use_gzip =
+        static.accepts_gzip(header_or_empty(req, "accept-encoding"))
+      let #(body, etag) = case use_gzip {
+        True -> #(asset.gzip, gzip_etag(asset.etag))
+        False -> #(asset.raw, asset.etag)
+      }
+      let base =
+        response.new(200)
+        |> response.set_header("cache-control", cache_control)
+        |> response.set_header("etag", etag)
+        |> response.set_header("vary", "accept-encoding")
+        |> response.set_header("x-content-type-options", "nosniff")
+      case static.etag_matches(header_or_empty(req, "if-none-match"), etag) {
+        True -> {
+          log.debug("beacon.transport", "304 for client JS " <> path)
+          Ok(
+            response.Response(..base, status: 304)
+            |> response.set_body(Bytes(bytes_tree.new())),
+          )
+        }
+        False -> {
+          let base =
+            base
+            |> response.set_header(
+              "content-type",
+              "application/javascript; charset=utf-8",
+            )
+          let base = case use_gzip {
+            True -> response.set_header(base, "content-encoding", "gzip")
+            False -> base
+          }
+          Ok(response.set_body(base, Bytes(bytes_tree.from_bit_array(body))))
+        }
+      }
+    }
+    Error(static.AssetNotFound) -> Error(Nil)
+    Error(static.AssetReadFailed(reason)) ->
+      Ok(client_js_unavailable("cannot read " <> path <> ": " <> reason))
+  }
+}
+
+/// The ETag of the gzip representation: the identity ETag with a `-gzip`
+/// suffix inside the quotes (strong validators must differ per encoding).
+fn gzip_etag(etag: String) -> String {
+  string.drop_end(etag, 1) <> "-gzip\""
+}
 
 // --- Server Start ---
 
 /// Default number of acceptor processes.
 const default_acceptor_count = 10
 
+/// Default listen backlog.
+const default_backlog = 1024
+
+/// The listener options implied by a transport configuration.
+pub fn to_listener_options(config: TransportConfig) -> server.ListenerOptions {
+  let limits = config.security_limits
+  server.ListenerOptions(
+    port: config.port,
+    acceptors: default_acceptor_count,
+    backlog: default_backlog,
+    max_connections: limits.max_connections,
+    max_connections_per_ip: limits.max_connections_per_ip,
+    trusted_proxies: limits.trusted_proxies,
+    send_timeout_ms: limits.send_timeout_ms,
+  )
+}
+
 /// Start the transport layer — binds to the given port and begins
-/// accepting connections. Returns the server process Pid for monitoring.
+/// accepting connections. Returns the listener supervisor's Pid.
+/// Use `start_listener` to also learn the bound port (for port 0).
 pub fn start(
   config: TransportConfig,
 ) -> Result(process.Pid, error.BeaconError) {
+  case start_listener(config) {
+    Ok(listener) -> {
+      log.debug(
+        "beacon.transport",
+        "Transport started on port " <> int.to_string(server.get_port(listener)),
+      )
+      Ok(server.get_supervisor(listener))
+    }
+    Error(err) -> Error(err)
+  }
+}
+
+/// Start the transport layer and return the running listener, which
+/// reports the bound port (`server.get_port`) and live connection counts.
+/// The listener supervisor is linked to the caller.
+pub fn start_listener(
+  config: TransportConfig,
+) -> Result(server.Listener, error.BeaconError) {
   log.info(
     "beacon.transport",
     "Starting on port " <> int.to_string(config.port),
@@ -2316,28 +2803,46 @@ pub fn start(
       )
     Some(_) -> Nil
   }
-
-  let handler_fn = fn(socket: Socket) { per_connection_handler(socket, config) }
-
-  case server.start(config.port, handler_fn, default_acceptor_count) {
-    Ok(pid) -> {
-      log.info(
-        "beacon.transport",
-        "Listening on port " <> int.to_string(config.port),
-      )
-      Ok(pid)
-    }
-    Error(reason) -> {
-      log.error(
-        "beacon.transport",
-        "Failed to start on port "
-          <> int.to_string(config.port)
-          <> ": "
-          <> reason,
-      )
-      Error(error.TransportError(
-        reason: "Failed to bind to port " <> int.to_string(config.port),
-      ))
+  let static_check = case config.static_config {
+    Some(static_cfg) -> static.validate_config(static_cfg)
+    None -> Ok(Nil)
+  }
+  case validate_security_limits(config.security_limits), static_check {
+    Error(reason), _ ->
+      Error(error.ConfigError(reason: "Invalid security limits: " <> reason))
+    _, Error(reason) ->
+      Error(error.ConfigError(reason: "Invalid static config: " <> reason))
+    Ok(Nil), Ok(Nil) -> {
+      // Built once: middleware and routing closures are shared by every
+      // connection instead of being rebuilt per request.
+      let handler = create_handler(config)
+      let handler_fn = fn(socket: Socket) {
+        per_connection_handler(socket, config, handler)
+      }
+      case server.start(to_listener_options(config), handler_fn) {
+        Ok(listener) -> {
+          log.info(
+            "beacon.transport",
+            "Listening on port " <> int.to_string(server.get_port(listener)),
+          )
+          Ok(listener)
+        }
+        Error(reason) -> {
+          log.error(
+            "beacon.transport",
+            "Failed to start on port "
+              <> int.to_string(config.port)
+              <> ": "
+              <> reason,
+          )
+          Error(error.TransportError(
+            reason: "Failed to bind to port "
+            <> int.to_string(config.port)
+            <> ": "
+            <> reason,
+          ))
+        }
+      }
     }
   }
 }

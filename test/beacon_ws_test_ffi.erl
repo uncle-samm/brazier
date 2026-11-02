@@ -19,22 +19,8 @@
     monotonic_us/0,
     all_processes/0,
     suspend/1,
-    resume/1,
-    blocked_in_accept/1
+    resume/1
 ]).
-
-%% True when Pid is an idle acceptor waiting in gen_tcp:accept (the server
-%% spawns a replacement acceptor for every accepted connection).
-blocked_in_accept(Pid) ->
-    case erlang:process_info(Pid, current_stacktrace) of
-        {current_stacktrace, Frames} ->
-            lists:any(fun({M, F, _, _}) ->
-                              (M =:= prim_inet orelse M =:= inet_tcp
-                               orelse M =:= inet6_tcp orelse M =:= gen_tcp)
-                                  andalso (F =:= accept orelse F =:= accept0)
-                      end, Frames);
-        undefined -> false
-    end.
 
 %% Wait for a session revocation message in the calling process.
 receive_revoked(TimeoutMs) ->

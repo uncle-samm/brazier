@@ -287,31 +287,35 @@ fn render_not_found_page(config: SsrConfig(model, msg)) -> RenderedPage {
 /// to a browser session (fingerprint ""). Prefer `to_response_for_request`,
 /// which binds the token to the request's session cookie; an unbound token
 /// only verifies for a connection that also has no session cookie.
-pub fn to_response(page: RenderedPage) -> Response(ResponseBody) {
+/// Errors when the join token cannot be set as a cookie.
+pub fn to_response(
+  page: RenderedPage,
+) -> Result(Response(ResponseBody), cookie.CookieError) {
   page_response(page, "")
 }
 
 /// Convert a RenderedPage to an HTTP response whose join token is bound to
 /// the session cookie on `req` (see `session_fingerprint`).
+/// Errors when the join token cannot be set as a cookie.
 pub fn to_response_for_request(
   page: RenderedPage,
   req: Request(body),
-) -> Response(ResponseBody) {
+) -> Result(Response(ResponseBody), cookie.CookieError) {
   page_response(page, session_fingerprint(req))
 }
 
 fn page_response(
   page: RenderedPage,
   fingerprint: String,
-) -> Response(ResponseBody) {
+) -> Result(Response(ResponseBody), cookie.CookieError) {
   response.new(200)
   |> response.set_header("content-type", "text/html; charset=utf-8")
+  |> response.set_body(Bytes(bytes_tree.from_string(page.html)))
   |> cookie.set(
     session_cookie_name,
     join_token_for(page, fingerprint),
     session_cookie_options(page.cookie_secure),
   )
-  |> response.set_body(Bytes(bytes_tree.from_string(page.html)))
 }
 
 /// Mint a fresh join token for this page, bound to `fingerprint`.

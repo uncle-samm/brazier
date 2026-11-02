@@ -1,5 +1,6 @@
 import beacon/api
 import beacon/auth
+import beacon/cookie
 import beacon/session
 import beacon/transport/server.{type Connection, type ResponseBody, Bytes}
 import gleam/bit_array
@@ -44,7 +45,8 @@ pub fn current_user_with_user_test() {
 pub fn login_response_sets_session_cookie_and_csrf_test() {
   let store = session.new_store("auth_login_response")
   let config = auth.dev_session_config()
-  let result = auth.login_response(store, "user789", empty_response(), config)
+  let assert Ok(result) =
+    auth.login_response(store, "user789", empty_response(), config)
 
   let assert Some(found) = session.get(store, result.session.id)
   let assert Some("user789") = session.get_value(found, "user_id")
@@ -65,7 +67,7 @@ pub fn create_login_then_with_session_cookie_supports_custom_response_test() {
   let config = auth.dev_session_config()
   let login = auth.create_login(store, "custom-user")
 
-  let resp =
+  let assert Ok(resp) =
     api_json("{\"csrf\":\"" <> login.csrf_token <> "\"}")
     |> auth.with_session_cookie(login.session, config)
 
@@ -80,7 +82,7 @@ pub fn create_login_then_with_session_cookie_supports_custom_response_test() {
 pub fn login_json_response_sets_standard_json_body_test() {
   let store = session.new_store("auth_login_json_response")
   let config = auth.dev_session_config()
-  let result = auth.login_json_response(store, "json-user", config)
+  let assert Ok(result) = auth.login_json_response(store, "json-user", config)
 
   should.equal(result.response.status, 200)
   should.be_true(contains(response_body(result.response), "\"ok\":true"))
@@ -88,6 +90,47 @@ pub fn login_json_response_sets_standard_json_body_test() {
   let assert Ok(cookie_header) =
     find_header(result.response.headers, "set-cookie")
   should.be_true(contains(cookie_header, "beacon_session=" <> result.session.id))
+}
+
+/// Regression: an invalid cookie config used to produce a broken
+/// Set-Cookie header. It is now refused before any session is created, so
+/// no orphan session is left in the store.
+pub fn login_with_invalid_cookie_config_creates_no_session_test() {
+  let store = session.new_store("auth_login_bad_cookie")
+  let bad_name =
+    auth.SessionConfig(..auth.dev_session_config(), cookie_name: "bad name")
+  let insecure_none =
+    auth.SessionConfig(
+      ..auth.dev_session_config(),
+      cookie_options: cookie.CookieOptions(
+        ..auth.dev_session_config().cookie_options,
+        same_site: "None",
+        secure: False,
+      ),
+    )
+  let before = session.count(store)
+  let assert Error(cookie.InvalidName(_)) =
+    auth.login_response(store, "u", empty_response(), bad_name)
+  let assert Error(cookie.InvalidName(_)) =
+    auth.login_json_response(store, "u", bad_name)
+  let assert Error(cookie.InsecureSameSiteNone(_)) =
+    auth.login_json_response_rotating(store, option.None, "u", insecure_none)
+  should.equal(session.count(store), before)
+}
+
+pub fn login_route_with_invalid_cookie_config_returns_500_test() {
+  let store = session.new_store("auth_login_route_bad_cookie")
+  let config =
+    auth.SessionConfig(..auth.dev_session_config(), cookie_name: "bad;name")
+  let handler =
+    api.routes([
+      auth.login_route("/api/login", store, config, fn(_req) { Ok("u") }),
+    ])
+  let req: Request(Connection) = make_request("POST", "/api/login")
+  let assert Some(resp) = handler(req)
+  should.equal(resp.status, 500)
+  let assert Error(Nil) = find_header(resp.headers, "set-cookie")
+  should.equal(session.count(store), 0)
 }
 
 pub fn default_session_config_uses_secure_cookie_defaults_test() {
@@ -102,7 +145,7 @@ pub fn default_session_config_uses_secure_cookie_defaults_test() {
 pub fn session_from_request_reads_configured_cookie_test() {
   let store = session.new_store("auth_request_session")
   let config = auth.dev_session_config()
-  let result =
+  let assert Ok(result) =
     auth.login_response(store, "request-user", empty_response(), config)
   let req =
     request.new()
@@ -137,7 +180,8 @@ pub fn session_from_request_rejects_missing_and_invalid_cookie_test() {
 pub fn validate_csrf_accepts_matching_header_test() {
   let store = session.new_store("auth_csrf_valid")
   let config = auth.dev_session_config()
-  let result = auth.login_response(store, "csrf-user", empty_response(), config)
+  let assert Ok(result) =
+    auth.login_response(store, "csrf-user", empty_response(), config)
   let req =
     request.new()
     |> request.set_method(http.Post)
@@ -149,7 +193,8 @@ pub fn validate_csrf_accepts_matching_header_test() {
 pub fn validate_csrf_rejects_missing_and_invalid_header_test() {
   let store = session.new_store("auth_csrf_invalid")
   let config = auth.dev_session_config()
-  let result = auth.login_response(store, "csrf-user", empty_response(), config)
+  let assert Ok(result) =
+    auth.login_response(store, "csrf-user", empty_response(), config)
   let missing_req =
     request.new()
     |> request.set_method(http.Post)
@@ -171,7 +216,7 @@ pub fn validate_csrf_rejects_missing_and_invalid_header_test() {
 pub fn ws_session_auth_accepts_valid_session_and_rejects_missing_test() {
   let store = session.new_store("auth_ws_session")
   let config = auth.dev_session_config()
-  let result =
+  let assert Ok(result) =
     auth.login_response(store, "socket-user", empty_response(), config)
   let auth_fn = auth.ws_session_auth(store, config)
   let authed_req: Request(Connection) =
@@ -186,7 +231,7 @@ pub fn ws_session_auth_accepts_valid_session_and_rejects_missing_test() {
 pub fn protect_ws_alias_matches_session_auth_test() {
   let store = session.new_store("auth_protect_ws")
   let config = auth.dev_session_config()
-  let result = auth.login_json_response(store, "socket-user", config)
+  let assert Ok(result) = auth.login_json_response(store, "socket-user", config)
   let auth_fn = auth.protect_ws(store, config)
   let req: Request(Connection) =
     make_request("GET", "/ws")
@@ -198,7 +243,8 @@ pub fn protect_ws_alias_matches_session_auth_test() {
 pub fn csrf_authenticated_wraps_api_handler_test() {
   let store = session.new_store("auth_api_wrapper")
   let config = auth.dev_session_config()
-  let result = auth.login_response(store, "api-user", empty_response(), config)
+  let assert Ok(result) =
+    auth.login_response(store, "api-user", empty_response(), config)
   let handler =
     auth.csrf_authenticated(store, config, fn(_req, _sess, user_id) {
       response.new(200)
@@ -255,7 +301,7 @@ pub fn auth_login_route_rejects_failed_authentication_test() {
 pub fn auth_current_user_route_returns_user_test() {
   let store = session.new_store("auth_current_user_route")
   let config = auth.dev_session_config()
-  let result = auth.login_json_response(store, "route-user", config)
+  let assert Ok(result) = auth.login_json_response(store, "route-user", config)
   let handler = api.routes([auth.current_user_route("/api/me", store, config)])
   let req: Request(Connection) =
     make_request("GET", "/api/me")
@@ -269,7 +315,7 @@ pub fn auth_current_user_route_returns_user_test() {
 pub fn auth_logout_route_requires_csrf_and_deletes_session_test() {
   let store = session.new_store("auth_logout_route")
   let config = auth.dev_session_config()
-  let result = auth.login_json_response(store, "route-user", config)
+  let assert Ok(result) = auth.login_json_response(store, "route-user", config)
   let handler = api.routes([auth.logout_route("/api/logout", store, config)])
   let req: Request(Connection) =
     make_request("POST", "/api/logout")
@@ -285,7 +331,7 @@ pub fn auth_logout_route_requires_csrf_and_deletes_session_test() {
 pub fn init_from_session_uses_authenticated_or_guest_init_test() {
   let store = session.new_store("auth_init_from_session")
   let config = auth.dev_session_config()
-  let result = auth.login_json_response(store, "init-user", config)
+  let assert Ok(result) = auth.login_json_response(store, "init-user", config)
   let init =
     auth.init_from_session(
       store,

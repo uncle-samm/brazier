@@ -14,6 +14,7 @@ import gleam/http/response.{type Response}
 import gleam/json as json_builder
 import gleam/list
 import gleam/option.{type Option, None, Some}
+import gleam/result
 
 pub const default_session_cookie_name = "beacon_session"
 
@@ -194,13 +195,31 @@ pub fn change_privileges(
 }
 
 /// Attach the configured HttpOnly session cookie to a response.
+/// Errors when `config` names an invalid cookie (see `cookie.validate`).
 pub fn with_session_cookie(
   resp: Response(ResponseBody),
   sess: session.Session,
   config: SessionConfig,
-) -> Response(ResponseBody) {
+) -> Result(Response(ResponseBody), cookie.CookieError) {
   resp
   |> cookie.set(config.cookie_name, sess.id, config.cookie_options)
+}
+
+/// Refuse a session config whose cookie cannot be set, before a session is
+/// created for it (so a bad config never leaves an orphan session).
+fn check_session_cookie(
+  config: SessionConfig,
+) -> Result(Nil, cookie.CookieError) {
+  case cookie.validate_options(config.cookie_name, config.cookie_options) {
+    Ok(Nil) -> Ok(Nil)
+    Error(error) -> {
+      log.error(
+        "beacon.auth",
+        "Invalid session cookie config: " <> cookie.error_to_string(error),
+      )
+      Error(error)
+    }
+  }
 }
 
 /// Log in a user and attach an HttpOnly session cookie to a response.
@@ -213,11 +232,10 @@ pub fn login_response(
   user_id: String,
   resp: Response(ResponseBody),
   config: SessionConfig,
-) -> LoginResult {
+) -> Result(LoginResult, cookie.CookieError) {
+  use Nil <- result.try(check_session_cookie(config))
   let login = create_login(store, user_id)
-  let resp =
-    resp
-    |> with_session_cookie(login.session, config)
+  use resp <- result.map(with_session_cookie(resp, login.session, config))
   LoginResult(
     session: login.session,
     csrf_token: login.csrf_token,
@@ -233,9 +251,10 @@ pub fn login_json_response(
   store: session.SessionStore,
   user_id: String,
   config: SessionConfig,
-) -> LoginResult {
+) -> Result(LoginResult, cookie.CookieError) {
+  use Nil <- result.try(check_session_cookie(config))
   let login = create_login(store, user_id)
-  let resp =
+  use resp <- result.map(
     api.json_value(
       200,
       json_builder.object([
@@ -243,7 +262,8 @@ pub fn login_json_response(
         #("csrf", json_builder.string(login.csrf_token)),
       ]),
     )
-    |> with_session_cookie(login.session, config)
+    |> with_session_cookie(login.session, config),
+  )
   LoginResult(
     session: login.session,
     csrf_token: login.csrf_token,
@@ -257,9 +277,10 @@ pub fn login_json_response_rotating(
   old_session_id: Option(String),
   user_id: String,
   config: SessionConfig,
-) -> LoginResult {
+) -> Result(LoginResult, cookie.CookieError) {
+  use Nil <- result.try(check_session_cookie(config))
   let login = create_login_rotating(store, old_session_id, user_id)
-  let resp =
+  use resp <- result.map(
     api.json_value(
       200,
       json_builder.object([
@@ -267,7 +288,8 @@ pub fn login_json_response_rotating(
         #("csrf", json_builder.string(login.csrf_token)),
       ]),
     )
-    |> with_session_cookie(login.session, config)
+    |> with_session_cookie(login.session, config),
+  )
   LoginResult(
     session: login.session,
     csrf_token: login.csrf_token,
@@ -282,12 +304,14 @@ pub fn logout(store: session.SessionStore, session_id: String) -> Nil {
 }
 
 /// Destroy the session and attach a matching cookie deletion header.
+/// The session is destroyed even when the cookie config is invalid (the
+/// error is still returned).
 pub fn logout_response(
   store: session.SessionStore,
   sess: session.Session,
   resp: Response(ResponseBody),
   config: SessionConfig,
-) -> Response(ResponseBody) {
+) -> Result(Response(ResponseBody), cookie.CookieError) {
   logout(store, sess.id)
   resp
   |> cookie.delete_with_options(config.cookie_name, config.cookie_options)
@@ -547,7 +571,17 @@ pub fn login_route(
       Ok(user_id) -> {
         let old_id =
           option.from_result(session.id_from_request(req, config.cookie_name))
-        login_json_response_rotating(store, old_id, user_id, config).response
+        case login_json_response_rotating(store, old_id, user_id, config) {
+          Ok(login) -> login.response
+          Error(error) -> {
+            log.error(
+              "beacon.auth",
+              "Login route cannot set the session cookie: "
+                <> cookie.error_to_string(error),
+            )
+            api.text(500, "Internal Server Error")
+          }
+        }
       }
       Error(reason) -> {
         log.warning("beacon.auth", "Login route rejected request")
@@ -583,15 +617,22 @@ pub fn logout_route(
   api.post(
     path,
     csrf_authenticated(store, config, fn(_req, sess, _user_id) {
-      logout_response(
-        store,
-        sess,
+      let ok =
         api.json_value(
           200,
           json_builder.object([#("ok", json_builder.bool(True))]),
-        ),
-        config,
-      )
+        )
+      case logout_response(store, sess, ok, config) {
+        Ok(resp) -> resp
+        Error(error) -> {
+          log.error(
+            "beacon.auth",
+            "Logout could not clear the session cookie: "
+              <> cookie.error_to_string(error),
+          )
+          api.text(500, "Internal Server Error")
+        }
+      }
     }),
   )
 }

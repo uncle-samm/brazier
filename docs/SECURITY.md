@@ -4,20 +4,78 @@ Beacon includes built-in security protections across the transport, middleware, 
 
 ## SecurityLimits
 
-The `SecurityLimits` type in `beacon/transport` controls connection-level protections:
+The `SecurityLimits` type in `beacon/transport` controls connection-level
+protections. `transport.validate_security_limits` checks it when the listener
+starts; an invalid value (a non-positive size or interval, a timer too large
+for `erlang:send_after/3`, a malformed trusted proxy or allowed origin)
+refuses to start.
 
 ```gleam
 pub type SecurityLimits {
   SecurityLimits(
-    max_message_bytes: Int,        // Default: 65536 (64KB)
-    max_events_per_second: Int,    // Default: 50
-    max_connections: Int,          // Default: 10000
-    max_http_headers: Int,         // Default: 100
-    max_http_header_bytes: Int,    // Default: 65536
-    pre_upgrade_timeout_ms: Int,   // Default: 5000
+    max_message_bytes: Int,           // 65536: one WS frame or reassembled message
+    max_events_per_second: Int,       // 50 per WS connection
+    max_connections: Int,             // 10000 HTTP + WS connections, global
+    max_http_headers: Int,            // 100
+    max_http_header_bytes: Int,       // 65536
+    pre_upgrade_timeout_ms: Int,      // 5000: deadline for request line + headers
+    // HTTP limits
+    max_connections_per_ip: Int,      // 256 (trusted proxies exempt)
+    max_request_line_bytes: Int,      // 8192, longer gets 414
+    max_body_bytes: Int,              // 8388608, larger Content-Length gets 413
+    body_read_timeout_ms: Int,        // 30000 per body chunk
+    request_timeout_ms: Int,          // 60000 total for the body
+    keepalive_idle_timeout_ms: Int,   // 15000 between keep-alive requests
+    max_keepalive_requests: Int,      // 1000 per connection
+    send_timeout_ms: Int,             // 30000 per blocked socket send
+    trusted_proxies: List(String),    // [] (see Trusted Proxies)
+    // WebSocket limits
+    max_ws_connections_per_ip: Int,   // 100
+    ws_ping_interval_ms: Int,         // 30000
+    ws_pong_timeout_ms: Int,          // 20000
+    ws_idle_timeout_ms: Int,          // 90000
+    ws_send_timeout_ms: Int,          // 15000
+    ws_max_outbound_queue: Int,       // 1000
+    ws_auth_recheck_interval_ms: Int, // 60000
+    ws_max_decode_errors: Int,        // 10
+    ws_max_rate_violations: Int,      // 100
+    ws_allowed_origins: List(String), // []
   )
 }
 ```
+
+## HTTP Server Hardening
+
+The HTTP/1.1 server (`beacon/transport/server`, `beacon/transport/http`)
+follows the cowboy/ranch and Plug conventions:
+
+- **Request line:** origin-form and absolute-form (the path is taken from an
+  absolute URI) are accepted; `*` only for `OPTIONS`; authority-form and
+  anything malformed get 400, an unknown method 501, a version other than
+  HTTP/1.0 or 1.1 505, and a request line over `max_request_line_bytes` 414.
+- **Headers:** more than `max_http_headers` or `max_http_header_bytes` gets
+  431; an invalid header line 400; HTTP/1.1 without exactly one `Host` 400.
+- **Smuggling:** `Content-Length` together with `Transfer-Encoding`, a
+  duplicate or non-numeric `Content-Length` get 400; chunked bodies get 501.
+- **Slow clients:** the request head must arrive within
+  `pre_upgrade_timeout_ms` (otherwise 408), each body chunk within
+  `body_read_timeout_ms` and the whole body within `request_timeout_ms`; an
+  idle keep-alive connection is closed after `keepalive_idle_timeout_ms`.
+- **Keep-alive:** `Connection: close` from either side and HTTP/1.0 without
+  `keep-alive` close the connection after the response, which then carries
+  `Connection: close`. `HEAD` responses keep `Content-Length` with no body.
+  An unread small body is discarded so the connection can be reused; a large
+  one closes it.
+- **Connections:** a supervised tracker owns the connection slots; a slot is
+  released when its process exits for any reason. Connections over
+  `max_connections` or `max_connections_per_ip` get 503 and are closed.
+- **Supervision:** acceptors run under an OTP supervisor and are restarted
+  (and logged) when they crash; a crashing handler gets 500 and closes only
+  its own connection.
+
+A seeded raw-socket fuzz test (`test/beacon/http_fuzz_test.gleam`) sends
+mutated and random requests and checks that the server never crashes, hangs,
+leaks a connection slot or loses an acceptor.
 
 Override defaults via the builder:
 
@@ -45,7 +103,18 @@ On every WebSocket upgrade, the transport checks the `Origin` header against the
 
 **Per-connection (server-side, transport layer):** Each WebSocket connection tracks events per 1-second sliding window. When `max_events_per_second` (default 50) is exceeded, the server sends a `ServerError("Rate limited")` message and drops the event. Heartbeats are exempt from rate limiting.
 
-**HTTP middleware:** The `middleware.rate_limit(limiter)` middleware returns HTTP 429 when a client exceeds the configured request rate. It identifies clients by `X-Forwarded-For` header or request host.
+**HTTP middleware:** The `middleware.rate_limit(limiter)` middleware returns HTTP 429 (with `Retry-After` set to the window length) when a client exceeds the configured request rate. It keys on the socket peer address and ignores `X-Forwarded-For` / `Forwarded`, so a client cannot get a fresh budget by inventing addresses. Behind a reverse proxy use `middleware.rate_limit_behind_proxies(limiter, trusted)` (see Trusted Proxies). A request whose peer address cannot be read gets 400.
+
+The limiter (`beacon/rate_limit`) is a fixed-window counter in an ETS table owned by a dedicated process, linked to and monitoring its creator. Memory is bounded: expired windows are swept every window, and the table holds at most `max_keys` clients (default `rate_limit.default_max_keys`, 100,000; set it with `rate_limit.new_with_max_keys`). At the cap, new clients are refused (fail closed) while known clients keep their budget, and every sweep logs an error with the number of refusals. If the limiter process is gone, every check is refused and logged.
+
+## Trusted Proxies
+
+`SecurityLimits.trusted_proxies` lists the reverse proxies (addresses or CIDRs such as `"10.0.0.0/8"`, `"fd00::/8"`) whose forwarding headers Beacon believes. It is validated at startup; an invalid entry refuses to start. `beacon/transport/client` is the single resolver used by the HTTP rate limiter, the per-IP WebSocket cap and the WebSocket Origin check:
+
+- **Client IP:** the socket peer, unless the peer is a trusted proxy. Then it is the right-most `Forwarded` (preferred) or `X-Forwarded-For` hop that is not itself a trusted proxy (RFC 7239 section 7.4; the Plug `RemoteIp` / Rails `remote_ip` rule). A client can prepend hops but cannot forge the ones its proxies append. A malformed hop stops the walk at the last trusted address and is logged.
+- **Scheme:** `http` (Beacon does not terminate TLS), unless a trusted proxy sends `X-Forwarded-Proto`, which must then be `http` or `https`; anything else, or several of the header, rejects the request. From an untrusted peer the header is ignored, so a direct client cannot claim `https` to pass an `https://` Origin check.
+
+With the default empty list, no forwarding header is ever honoured. Use the same list for `middleware.rate_limit_behind_proxies` via `ip.parse_trusted_proxies` (or `transport.trusted_proxies(limits)`).
 
 ## Message Size Limits
 
@@ -79,10 +148,16 @@ The `middleware.secure_headers()` middleware (included by default in all apps) s
 
 - `X-Content-Type-Options: nosniff`
 - `X-Frame-Options: SAMEORIGIN`
-- `X-XSS-Protection: 1; mode=block`
+- `X-XSS-Protection: 0` (the legacy XSS auditor is itself exploitable; OWASP recommends disabling it and relying on CSP)
 - `Referrer-Policy: strict-origin-when-cross-origin`
 - `Permissions-Policy: camera=(), microphone=(), geolocation=()`
-- `Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' ws: wss:`
+- `Content-Security-Policy:` `middleware.default_csp`, which is `default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https://avatars.githubusercontent.com; connect-src 'self' ws: wss:; frame-ancestors 'self'; object-src 'none'; base-uri 'self'`. `frame-ancestors 'self'` is the CSP form of `X-Frame-Options: SAMEORIGIN`.
+
+HSTS is opt-in because Beacon does not terminate TLS: add `middleware.hsts(31_536_000, True)` (it returns a `Result`; a negative max-age is an error) when the app is served over HTTPS behind a TLS proxy.
+
+## Route Scoping
+
+`middleware.only`, `middleware.at` and `middleware.except` compare paths segment by segment, the way the routers read them, not as raw string prefixes. `only("/admin", mw)` covers `/admin` and `/admin/users` but not `/administrator`. A path is read both with empty segments dropped (page routing) and with dot segments resolved (API routing): `only` and `at` apply when either reading matches, and `except` skips the middleware only when both readings are under the prefix. So `//admin` still gets `only("/admin", auth)`, and `/public/../admin` still gets `except("/public", auth)`.
 
 ## Session Tokens
 
@@ -90,13 +165,33 @@ SSR pages set a signed join/state recovery token in the HttpOnly `beacon_join_to
 
 The cookie is `HttpOnly`, `SameSite=Lax`, path `/`, and has `Max-Age=86400`. JavaScript cannot read it, so XSS cannot directly steal the join token from DOM state.
 
-Auto-generated secret keys are warned about at startup. Set an explicit key for production:
+The secret key must be at least 32 bytes (`config.min_secret_key_bytes`, the
+HMAC-SHA256 output size; RFC 2104 section 3). `application.start`,
+`start_advanced` and `start_supervised` refuse an empty key, a shorter key and
+the formerly built-in dev secret with a `ConfigError` before any process is
+started or port bound. The key is never logged. `config.secret_key()` reads
+`SECRET_KEY` and applies the same check; there is no default.
+
+`beacon.app` generates a random per-process key when none is set, and warns at
+startup: tokens then die on restart and differ between nodes. Set an explicit
+key for production (generate one with `openssl rand -base64 48`):
 
 ```gleam
+let assert Ok(secret) = config.secret_key() as "SECRET_KEY must be set"
 beacon.app(init, beacon.no_local, beacon.no_server, update, view)
-|> beacon.secret_key("your-production-secret")
+|> beacon.secret_key(secret)
 |> beacon.start(8080)
 ```
+
+## CSRF Tokens
+
+`beacon/form` CSRF tokens are 256 random bits from
+`crypto.strong_random_bytes`, hex encoded; they are not derived from the
+secret key, the time or a counter. `form.verify_session_csrf` compares the
+submitted token with `crypto:hash_equals` (constant time) and consumes it with
+an atomic compare-and-delete, so a token is accepted exactly once even when
+several requests race, and a wrong guess does not burn the real token.
+Issuing a new token for a session replaces the old one.
 
 ## Application Session Auth
 
@@ -114,6 +209,72 @@ Use `auth.protect_ws(store, config)` for WebSocket upgrades that should share
 the same session policy. Use `auth.dev_session_config()` only for localhost
 HTTP development, where the `Secure` cookie attribute would prevent the browser
 from storing the cookie.
+
+The login and logout helpers return `Result(_, cookie.CookieError)`. The
+cookie config is checked before a session is created, so an invalid
+`SessionConfig` never leaves an orphan session; `auth.login_route()` and
+`auth.logout_route()` answer 500 and log the error.
+
+## Cookies
+
+`beacon/cookie` validates every cookie it sets against RFC 6265 and returns a
+`Result`; nothing is stripped or rewritten:
+
+- the name must be an RFC 7230 token;
+- the value must be cookie-octets (optionally wrapped in double quotes): no
+  whitespace, `;`, `,`, `"`, `\` or control bytes, so a value cannot add its own
+  attributes (`abc; Domain=evil.example`) or headers;
+- `Path` must start with `/` and contain no control bytes or `;`;
+- `SameSite` must be exactly `Strict`, `Lax` or `None`, and `None` needs
+  `Secure`;
+- `Max-Age` cannot be negative;
+- `__Secure-` names need `Secure`, and `__Host-` names need `Secure` and
+  `Path=/` (prefixes are matched case-insensitively, as browsers do);
+- name plus value is at most 4096 bytes and the path at most 1024 bytes.
+
+A response carries one `Set-Cookie` per name: setting a name again replaces
+it, and other cookies are kept. `cookie.delete` uses the same attributes as
+`cookie.default_options()` (including `Secure`); use `delete_with_options`
+for a cookie set with other options. Error messages name the cookie but never
+include its value.
+
+When the browser sends two cookies with the same name, `cookie.get` returns
+the first. A sibling subdomain can plant such a cookie ("cookie tossing"); a
+`__Host-` name prevents that, because the browser accepts it only from the
+exact host, with `Secure` and `Path=/`.
+
+## File Uploads
+
+`beacon/upload` trusts nothing the client sends in a multipart request:
+
+- **Bounded reading.** `upload.read_multipart(req, config)` refuses a
+  non-multipart Content-Type (415) before touching the body, and a declared
+  Content-Length above `max_request_bytes` (413, default 11 MB) before reading
+  a byte. It then reads exactly that many bytes; chunked bodies are refused by
+  the server, so a request never buffers more than the cap. Each file is then
+  held to `max_size` (default 10 MB).
+- **Content sniffing.** A file's type comes from its leading bytes: PNG, JPEG,
+  GIF, WebP and PDF are recognised. The sniffed type must be in
+  `allowed_types` *and* match the declared Content-Type (case and parameters
+  ignored). Bytes that match no signature (HTML, SVG, scripts, text) are
+  refused, whatever they claim to be. `validate_config` refuses an allow-list
+  naming a type that cannot be sniffed.
+- **Strict parsing.** A missing close delimiter, a part without a `form-data`
+  Content-Disposition or name, duplicate part headers, a non-UTF-8 field and an
+  invalid boundary are all errors; a single bad file fails the whole form.
+- **Storage.** `upload.save(file, dir)` names the file `<32 random hex>.<ext>`,
+  with the extension taken from the content, and creates it exclusively
+  (`O_EXCL`), so an existing file or planted symlink is never overwritten. The
+  client's filename is kept only as `original_filename`: reduced to its last
+  path segment, without control characters, at most 255 characters.
+- **Serving.** `upload.serve(dir, stored_name, download_name)` accepts only a
+  name `save` produced, reads only regular files, takes the Content-Type from
+  the stored extension and always answers with `Content-Disposition:
+  attachment` (RFC 6266, with an RFC 8187 `filename*`),
+  `X-Content-Type-Options: nosniff` and `Content-Security-Policy: default-src
+  'none'; sandbox`, so a stored file is never rendered inline.
+
+`upload.error_status` maps each error to 400, 413, 415 or 500.
 
 ## Timer Cap
 

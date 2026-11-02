@@ -6,8 +6,10 @@
 /// auth library. You plug in whatever auth you want.
 ///
 /// Reference: Wisp middleware, Phoenix plugs, Express middleware.
+import beacon/ip
 import beacon/log
 import beacon/rate_limit
+import beacon/transport/client
 import beacon/transport/server.{type Connection, type ResponseBody, Bytes}
 import gleam/bytes_tree
 import gleam/dict.{type Dict}
@@ -17,6 +19,7 @@ import gleam/http/response.{type Response}
 import gleam/int
 import gleam/list
 import gleam/string
+import gleam/uri
 
 /// A middleware function.
 /// Takes a request and a `next` function, returns a response.
@@ -127,9 +130,12 @@ pub fn secure_headers() -> Middleware {
   secure_headers_with_csp(default_csp)
 }
 
-/// Default Content-Security-Policy value.
-const default_csp =
-  "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https://avatars.githubusercontent.com; connect-src 'self' ws: wss:"
+/// Default Content-Security-Policy value. `frame-ancestors 'self'` is the
+/// CSP equivalent of `X-Frame-Options: SAMEORIGIN` (clickjacking);
+/// `object-src 'none'` and `base-uri 'self'` close plugin and `<base>`
+/// injection vectors.
+pub const default_csp =
+  "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https://avatars.githubusercontent.com; connect-src 'self' ws: wss:; frame-ancestors 'self'; object-src 'none'; base-uri 'self'"
 
 /// Security headers middleware with a custom Content-Security-Policy.
 /// Use this when the default CSP is too strict (e.g., external stylesheets,
@@ -150,7 +156,9 @@ pub fn secure_headers_with_csp(csp: String) -> Middleware {
     resp
     |> response.set_header("x-content-type-options", "nosniff")
     |> response.set_header("x-frame-options", "SAMEORIGIN")
-    |> response.set_header("x-xss-protection", "1; mode=block")
+    // OWASP: the legacy XSS auditor is itself exploitable; disable it and
+    // rely on CSP.
+    |> response.set_header("x-xss-protection", "0")
     |> response.set_header("referrer-policy", "strict-origin-when-cross-origin")
     |> response.set_header(
       "permissions-policy",
@@ -160,29 +168,96 @@ pub fn secure_headers_with_csp(csp: String) -> Middleware {
   }
 }
 
-/// Rate limiting middleware — limits requests per IP using a RateLimiter.
+/// HTTP Strict Transport Security. Add this when the app is served over
+/// HTTPS (Beacon does not terminate TLS: this is for deployments behind a
+/// TLS proxy). Browsers ignore the header on plain-http responses
+/// (RFC 6797 section 8.1), so it cannot pin an http-only deployment.
+/// A typical production value is one year: `hsts(31_536_000, True)`.
+/// Errors on a negative max-age.
+pub fn hsts(
+  max_age_seconds: Int,
+  include_subdomains: Bool,
+) -> Result(Middleware, String) {
+  case max_age_seconds < 0 {
+    True -> {
+      let reason =
+        "HSTS max-age must be >= 0, got " <> int.to_string(max_age_seconds)
+      log.error("beacon.middleware", reason)
+      Error(reason)
+    }
+    False -> {
+      let value =
+        "max-age="
+        <> int.to_string(max_age_seconds)
+        <> case include_subdomains {
+          True -> "; includeSubDomains"
+          False -> ""
+        }
+      log.info("beacon.middleware", "HSTS enabled: " <> value)
+      Ok(
+        fn(
+          req: Request(Connection),
+          next: fn(Request(Connection)) -> Response(ResponseBody),
+        ) -> Response(ResponseBody) {
+          next(req)
+          |> response.set_header("strict-transport-security", value)
+        },
+      )
+    }
+  }
+}
+
+/// Rate limiting middleware — limits requests per client IP.
 /// Returns 429 Too Many Requests when the limit is exceeded.
+///
+/// The client is the socket peer address. Forwarding headers
+/// (`X-Forwarded-For`, `Forwarded`) are ignored, so a client cannot dodge
+/// the limit by inventing addresses. Behind a reverse proxy use
+/// `rate_limit_behind_proxies`, otherwise every client shares the proxy's
+/// budget.
 pub fn rate_limit(limiter: rate_limit.RateLimiter) -> Middleware {
+  rate_limit_behind_proxies(limiter, ip.no_trusted_proxies())
+}
+
+/// Rate limiting keyed on the client IP resolved through trusted proxies:
+/// forwarding headers are honoured only when the socket peer is one of
+/// `trusted`, and the client is the right-most hop that is not a trusted
+/// proxy. Build `trusted` with `ip.parse_trusted_proxies` (use the same
+/// list as `SecurityLimits.trusted_proxies`).
+pub fn rate_limit_behind_proxies(
+  limiter: rate_limit.RateLimiter,
+  trusted: ip.TrustedProxies,
+) -> Middleware {
+  let retry_after = int.to_string(limiter.config.window_seconds)
   fn(
     req: Request(Connection),
     next: fn(Request(Connection)) -> Response(ResponseBody),
   ) -> Response(ResponseBody) {
-    // Use the request path + host as a simple client identifier
-    // In production, you'd extract the real client IP from headers
-    let client_key = case request.get_header(req, "x-forwarded-for") {
-      Ok(ip) -> ip
-      Error(Nil) -> req.host
-    }
-    case rate_limit.check(limiter, client_key) {
-      rate_limit.Allowed(_remaining) -> next(req)
-      rate_limit.RateLimited -> {
-        response.new(429)
-        |> response.set_header("content-type", "text/plain")
-        |> response.set_header("retry-after", "60")
-        |> response.set_body(Bytes(bytes_tree.from_string("Too Many Requests")))
+    case client.ip(req, trusted) {
+      Error(reason) -> {
+        // No peer address means the connection is already gone; refuse
+        // rather than lumping the request in with some other key.
+        log.warning(
+          "beacon.middleware",
+          "Rate limit cannot identify client: " <> reason,
+        )
+        plain_text(400, "Bad Request")
       }
+      Ok(client_ip) ->
+        case rate_limit.check(limiter, client_ip) {
+          rate_limit.Allowed(_remaining) -> next(req)
+          rate_limit.RateLimited ->
+            plain_text(429, "Too Many Requests")
+            |> response.set_header("retry-after", retry_after)
+        }
     }
   }
+}
+
+fn plain_text(status: Int, body: String) -> Response(ResponseBody) {
+  response.new(status)
+  |> response.set_header("content-type", "text/plain; charset=utf-8")
+  |> response.set_body(Bytes(bytes_tree.from_string(body)))
 }
 
 /// Request ID middleware — generates a unique ID for each request.
@@ -308,57 +383,100 @@ fn erlang_monotonic_time() -> Int
 fn gzip_compress(data: BitArray) -> BitArray
 
 // ===== Route Scoping =====
+//
+// Paths are compared segment by segment, the way the routers see them, not
+// as raw strings: `only("/admin", ..)` covers `/admin` and `/admin/users`
+// but not `/administrator`, and `//admin` or `/public/../admin` cannot slip
+// past it. A request path is read two ways — raw segments with empty ones
+// dropped (page routing, `route.parse_path`) and dot-segment-resolved
+// segments (API routing, `request.path_segments`) — and each combinator
+// picks the conservative answer for its purpose.
 
-/// Apply middleware only when the request path starts with the given prefix.
+/// Apply middleware only when the request path is `prefix` or below it
+/// (segment boundary). Applied when either reading of the path matches.
 ///
 /// ```gleam
 /// middleware.only("/admin", auth.require_auth(store))
 /// middleware.only("/api", middleware.rate_limit(limiter))
 /// ```
 pub fn only(prefix: String, mw: Middleware) -> Middleware {
+  let prefix_segments = raw_segments(prefix)
   fn(
     req: Request(Connection),
     next: fn(Request(Connection)) -> Response(ResponseBody),
   ) -> Response(ResponseBody) {
-    case string.starts_with(req.path, prefix) {
+    case
+      list.any(path_readings(req.path), fn(segments) {
+        has_segment_prefix(segments, prefix_segments)
+      })
+    {
       True -> mw(req, next)
       False -> next(req)
     }
   }
 }
 
-/// Apply middleware only when the request path exactly matches.
+/// Apply middleware only when the request path is exactly `path`
+/// (ignoring empty segments and a trailing slash). Applied when either
+/// reading of the path matches.
 ///
 /// ```gleam
-/// middleware.at("/healthz", middleware.skip_auth())
+/// middleware.at("/login", middleware.rate_limit(login_limiter))
 /// ```
 pub fn at(path: String, mw: Middleware) -> Middleware {
+  let target = raw_segments(path)
   fn(
     req: Request(Connection),
     next: fn(Request(Connection)) -> Response(ResponseBody),
   ) -> Response(ResponseBody) {
-    case req.path == path {
+    case list.contains(path_readings(req.path), target) {
       True -> mw(req, next)
       False -> next(req)
     }
   }
 }
 
-/// Apply middleware to all paths EXCEPT those starting with the given prefix.
-/// Useful for skipping auth on public routes.
+/// Apply middleware to all paths EXCEPT `prefix` and below it (segment
+/// boundary). Useful for skipping auth on public routes. The middleware is
+/// skipped only when BOTH readings of the path are under the prefix, so
+/// `/public/../admin` still gets it.
 ///
 /// ```gleam
 /// middleware.except("/public", auth.require_auth(store))
 /// ```
 pub fn except(prefix: String, mw: Middleware) -> Middleware {
+  let prefix_segments = raw_segments(prefix)
   fn(
     req: Request(Connection),
     next: fn(Request(Connection)) -> Response(ResponseBody),
   ) -> Response(ResponseBody) {
-    case string.starts_with(req.path, prefix) {
+    case
+      list.all(path_readings(req.path), fn(segments) {
+        has_segment_prefix(segments, prefix_segments)
+      })
+    {
       True -> next(req)
       False -> mw(req, next)
     }
+  }
+}
+
+fn path_readings(path: String) -> List(List(String)) {
+  [raw_segments(path), uri.path_segments(path)]
+}
+
+fn raw_segments(path: String) -> List(String) {
+  path
+  |> string.split("/")
+  |> list.filter(fn(segment) { segment != "" })
+}
+
+fn has_segment_prefix(segments: List(String), prefix: List(String)) -> Bool {
+  case prefix, segments {
+    [], _ -> True
+    [_, ..], [] -> False
+    [p, ..prefix_rest], [s, ..rest] ->
+      p == s && has_segment_prefix(rest, prefix_rest)
   }
 }
 

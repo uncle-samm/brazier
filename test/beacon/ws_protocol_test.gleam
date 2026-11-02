@@ -6,6 +6,7 @@
 /// runtime factory, so the handler pid, the runtime subject, every decoded
 /// event and the `on_close` callback are observable.
 import beacon/auth
+import beacon/error
 import beacon/session
 import beacon/sim/test_app
 import beacon/transport
@@ -115,26 +116,16 @@ fn test_limits() -> transport.SecurityLimits {
   )
 }
 
-/// Start a transport with a recording runtime factory. Retries on another
-/// port when the randomly chosen one is taken by a concurrent test run.
+/// Start a transport with a recording runtime factory on an OS-assigned
+/// port (port 0), so concurrent test runs never collide.
 fn start_server(
   limits: transport.SecurityLimits,
   ws_auth: Option(fn(Request(Connection)) -> Result(Nil, String)),
 ) -> Server {
   let observer = process.new_subject()
-  start_server_attempt(limits, ws_auth, observer, 5)
-}
-
-fn start_server_attempt(
-  limits: transport.SecurityLimits,
-  ws_auth: Option(fn(Request(Connection)) -> Result(Nil, String)),
-  observer: Subject(Observed),
-  attempts: Int,
-) -> Server {
-  let port = test_app.unique_port()
   let config =
     transport.TransportConfig(
-      port: port,
+      port: 0,
       on_connect: fn(_, _) { Nil },
       on_event: fn(_, _) { Nil },
       on_disconnect: fn(_) { Nil },
@@ -155,11 +146,9 @@ fn start_server_attempt(
       security_limits: limits,
       api_handler: None,
     )
-  case transport.start(config), attempts {
-    Ok(_pid), _ -> Server(port: port, observer: observer)
-    Error(_bind_failure), n if n > 1 ->
-      start_server_attempt(limits, ws_auth, observer, n - 1)
-    Error(err), _ ->
+  case transport.start_listener(config) {
+    Ok(listener) -> Server(port: server.get_port(listener), observer: observer)
+    Error(err) ->
       panic as { "could not start transport: " <> string.inspect(err) }
   }
 }
@@ -583,8 +572,14 @@ pub fn cross_port_origin_gets_403_test() {
   raw_close(socket)
 }
 
-pub fn invalid_forwarded_proto_gets_403_test() {
-  let server = start_server(test_limits(), None)
+/// The test client connects from 127.0.0.1; trusting that address makes it
+/// act as a reverse proxy.
+fn behind_proxy_limits() -> transport.SecurityLimits {
+  transport.SecurityLimits(..test_limits(), trusted_proxies: ["127.0.0.1"])
+}
+
+pub fn invalid_forwarded_proto_from_trusted_proxy_gets_403_test() {
+  let server = start_server(behind_proxy_limits(), None)
   let headers =
     with_header(upgrade_headers(server.port), "X-Forwarded-Proto", "gopher")
   let #(socket, head) = raw_upgrade(server.port, headers)
@@ -592,13 +587,64 @@ pub fn invalid_forwarded_proto_gets_403_test() {
   raw_close(socket)
 }
 
-pub fn forwarded_https_matches_https_origin_test() {
-  let server = start_server(test_limits(), None)
+pub fn forwarded_https_from_trusted_proxy_matches_https_origin_test() {
+  let server = start_server(behind_proxy_limits(), None)
   let headers =
     upgrade_headers(server.port)
     |> with_header("X-Forwarded-Proto", "https")
     |> with_header("Origin", "https://" <> host_header(server.port))
   let probe = open_with(server, headers)
+  raw_close(probe.socket)
+}
+
+/// Regression: X-Forwarded-Proto was believed from any client, so a direct
+/// attacker could claim https and pass an https Origin check.
+pub fn forwarded_https_from_untrusted_peer_is_ignored_test() {
+  let server = start_server(test_limits(), None)
+  let headers =
+    upgrade_headers(server.port)
+    |> with_header("X-Forwarded-Proto", "https")
+    |> with_header("Origin", "https://" <> host_header(server.port))
+  let #(socket, head) = raw_upgrade(server.port, headers)
+  let assert "403" = status_of(head)
+  raw_close(socket)
+}
+
+/// An untrusted client's X-Forwarded-Proto is not read at all, so even a
+/// malformed one does not affect the (plain http) upgrade.
+pub fn invalid_forwarded_proto_from_untrusted_peer_is_ignored_test() {
+  let server = start_server(test_limits(), None)
+  let headers =
+    with_header(upgrade_headers(server.port), "X-Forwarded-Proto", "gopher")
+  let probe = open_with(server, headers)
+  raw_close(probe.socket)
+}
+
+/// Behind a trusted proxy the per-IP cap counts the forwarded client, not
+/// the proxy, so one proxy does not share a single slot bucket.
+pub fn per_ip_slot_uses_forwarded_client_behind_trusted_proxy_test() {
+  let server = start_server(behind_proxy_limits(), None)
+  let headers =
+    with_header(upgrade_headers(server.port), "X-Forwarded-For", "203.0.113.7")
+  let probe = open_with(server, headers)
+  let port = int.to_string(server.port)
+  let assert 1 = ws.get_ip_slot_count(port <> "|203.0.113.7")
+  let assert 0 = ws.get_ip_slot_count(port <> "|" <> host)
+  raw_close(probe.socket)
+  let assert True =
+    wait_until(fn() { ws.get_ip_slot_count(port <> "|203.0.113.7") == 0 }, 2000)
+}
+
+/// Regression: a direct client could pick its own per-IP bucket by sending
+/// X-Forwarded-For. Without trusted proxies the header is ignored.
+pub fn per_ip_slot_ignores_spoofed_forwarded_for_test() {
+  let server = start_server(test_limits(), None)
+  let headers =
+    with_header(upgrade_headers(server.port), "X-Forwarded-For", "198.51.100.9")
+  let probe = open_with(server, headers)
+  let port = int.to_string(server.port)
+  let assert 1 = ws.get_ip_slot_count(port <> "|" <> host)
+  let assert 0 = ws.get_ip_slot_count(port <> "|198.51.100.9")
   raw_close(probe.socket)
 }
 
@@ -618,12 +664,27 @@ pub fn allow_listed_origin_is_accepted_test() {
   raw_close(probe.socket)
 }
 
-pub fn invalid_security_limits_refuse_upgrade_with_500_test() {
+/// Invalid limits are refused when the listener starts, so a misconfigured
+/// server never accepts a single upgrade.
+pub fn invalid_security_limits_refuse_to_start_test() {
   let limits = transport.SecurityLimits(..test_limits(), ws_ping_interval_ms: 0)
-  let server = start_server(limits, None)
-  let #(socket, head) = raw_upgrade(server.port, upgrade_headers(server.port))
-  let assert "500" = status_of(head)
-  raw_close(socket)
+  let config =
+    transport.TransportConfig(
+      port: 0,
+      on_connect: fn(_, _) { Nil },
+      on_event: fn(_, _) { Nil },
+      on_disconnect: fn(_) { Nil },
+      page_html: None,
+      middlewares: [],
+      static_config: None,
+      runtime_factory: None,
+      ws_auth: None,
+      ssr_factory: None,
+      security_limits: limits,
+      api_handler: None,
+    )
+  let assert Error(error.ConfigError(reason)) = transport.start_listener(config)
+  let assert True = string.contains(reason, "ws_ping_interval_ms")
 }
 
 // --- Per-IP cap ---
@@ -699,7 +760,7 @@ pub fn missing_pong_tears_down_real_runtime_test() {
       ws_ping_interval_ms: 100,
       ws_pong_timeout_ms: 150,
     )
-  let port = start_counter_app(limits, 5)
+  let port = start_counter_app(limits)
   let before = all_processes()
   let #(socket, head) = raw_upgrade(port, upgrade_headers(port))
   let assert "101" = status_of(head)
@@ -711,28 +772,16 @@ pub fn missing_pong_tears_down_real_runtime_test() {
   let assert Ok(1000) = expect_closed(socket, 5000)
   raw_close(socket)
   // Handler, runtime and every helper the connection started are gone. The
-  // only survivor is the replacement acceptor the server spawned when it
-  // accepted this connection, which is idle in accept.
+  // acceptor pool is started with the listener (before the snapshot) and
+  // keeps accepting, so nothing spawned for this connection survives.
   let assert True =
-    wait_until(
-      fn() {
-        list.all(spawned, fn(p) { !process.is_alive(p) || blocked_in_accept(p) })
-      },
-      3000,
-    )
-  let survivors = list.filter(spawned, process.is_alive)
-  let assert 1 = list.length(survivors)
+    wait_until(fn() { list.all(spawned, fn(p) { !process.is_alive(p) }) }, 3000)
 }
 
-@external(erlang, "beacon_ws_test_ffi", "blocked_in_accept")
-fn blocked_in_accept(pid: Pid) -> Bool
-
-fn start_counter_app(limits: transport.SecurityLimits, attempts: Int) -> Int {
-  let port = test_app.unique_port()
-  case test_app.start_counter_app_with_limits(port, limits), attempts {
-    Ok(_app), _ -> port
-    Error(_bind_failure), n if n > 1 -> start_counter_app(limits, n - 1)
-    Error(err), _ -> panic as { "could not start app: " <> string.inspect(err) }
+fn start_counter_app(limits: transport.SecurityLimits) -> Int {
+  case test_app.start_counter_app_with_limits(limits) {
+    Ok(app) -> app.port
+    Error(err) -> panic as { "could not start app: " <> string.inspect(err) }
   }
 }
 
@@ -1180,7 +1229,7 @@ pub fn validate_security_limits_rejects_nonsense_test() {
 pub fn ws_load_no_process_leak_test() {
   let sockets = 50
   let events = 40
-  let port = start_counter_app(test_app.sim_security_limits(), 5)
+  let port = start_counter_app(test_app.sim_security_limits())
   process.sleep(100)
   let baseline = process_count()
   let started = monotonic_us()

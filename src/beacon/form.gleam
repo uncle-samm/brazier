@@ -4,6 +4,7 @@
 /// Reference: LiveView form handling, Livewire form validation.
 import beacon/element.{type Attr, type Node}
 import beacon/log
+import gleam/bit_array
 import gleam/crypto
 import gleam/int
 import gleam/list
@@ -33,9 +34,11 @@ pub type Form {
   )
 }
 
-/// Create a new empty form with a CSRF token.
-pub fn new(secret_key: String) -> Form {
-  Form(fields: [], form_errors: [], csrf_token: generate_csrf_token(secret_key))
+/// Create a new empty form with a CSRF token (256 random bits).
+/// `secret_key` is not needed for a random token; the parameter is kept so
+/// existing callers compile.
+pub fn new(_secret_key: String) -> Form {
+  Form(fields: [], form_errors: [], csrf_token: generate_csrf_token())
 }
 
 /// Add a field to the form.
@@ -264,11 +267,13 @@ pub fn select(
   element.el("select", all_attrs, option_nodes)
 }
 
-/// Generate a CSRF token.
-fn generate_csrf_token(secret_key: String) -> String {
-  let data = int.to_string(erlang_unique_integer())
-  let hash = crypto.hash(crypto.Sha256, <<data:utf8, secret_key:utf8>>)
-  encode_hex(hash)
+/// Generate a CSRF token: 256 bits from the OS CSPRNG, hex-encoded. (The
+/// token used to be SHA-256 of a sequential integer and the secret, which is
+/// guessable whenever the secret is weak or leaked.)
+fn generate_csrf_token() -> String {
+  crypto.strong_random_bytes(32)
+  |> bit_array.base16_encode
+  |> string.lowercase
 }
 
 // NOTE: A stateless `verify_csrf(token)` cannot provide real CSRF protection —
@@ -285,39 +290,34 @@ pub fn create_csrf_store(name: String) -> CsrfStore {
   csrf_ets_new(name)
 }
 
-/// Generate a session-bound CSRF token and store it in ETS.
-/// Returns the token string.
+/// Generate a session-bound CSRF token (256 random bits) and store it in
+/// ETS, replacing any earlier token for the session. Returns the token.
+/// `secret` is not needed for a random token; the parameter is kept so
+/// existing callers compile.
 pub fn generate_session_csrf(
   store: CsrfStore,
   session_id: String,
-  secret: String,
+  _secret: String,
 ) -> String {
-  let token = generate_csrf_token(secret)
+  let token = generate_csrf_token()
   csrf_ets_put(store, session_id, token)
   token
 }
 
 /// Verify a session-bound CSRF token against the store.
-/// Token is consumed on use (one-time, prevents replay).
+/// The comparison is constant-time, and the token is consumed atomically on
+/// success (one-time: of two concurrent requests with the same token, only
+/// one succeeds). A wrong token does not consume the stored one.
 /// Returns True if valid, False if invalid or already used.
 pub fn verify_session_csrf(
   store: CsrfStore,
   session_id: String,
   token: String,
 ) -> Bool {
-  case csrf_ets_get(store, session_id) {
-    Ok(stored_token) -> {
-      case stored_token == token {
-        True -> {
-          // Consume the token — one-time use
-          csrf_ets_delete(store, session_id)
-          True
-        }
-        False -> False
-      }
-    }
-    Error(Nil) -> {
-      log.warning("beacon.form", "CSRF token not found for session")
+  case csrf_consume(store, session_id, token) {
+    Ok(Nil) -> True
+    Error(reason) -> {
+      log.warning("beacon.form", "CSRF token rejected for session: " <> reason)
       False
     }
   }
@@ -329,11 +329,12 @@ fn csrf_ets_new(name: String) -> CsrfStore
 @external(erlang, "beacon_csrf_ffi", "put_token")
 fn csrf_ets_put(store: CsrfStore, key: String, value: String) -> Nil
 
-@external(erlang, "beacon_csrf_ffi", "get_token")
-fn csrf_ets_get(store: CsrfStore, key: String) -> Result(String, Nil)
-
-@external(erlang, "beacon_csrf_ffi", "delete_token")
-fn csrf_ets_delete(store: CsrfStore, key: String) -> Nil
+@external(erlang, "beacon_csrf_ffi", "consume_token")
+fn csrf_consume(
+  store: CsrfStore,
+  key: String,
+  token: String,
+) -> Result(Nil, String)
 
 /// Render a hidden CSRF input field.
 pub fn csrf_field(form: Form) -> Node(msg) {
@@ -381,45 +382,4 @@ pub fn text_input(form: Form, name: String, attrs: List(Attr)) -> Node(msg) {
     Error(Nil) -> input
   }
 }
-
 // --- Helpers ---
-
-@external(erlang, "erlang", "unique_integer")
-fn erlang_unique_integer() -> Int
-
-fn encode_hex(bytes: BitArray) -> String {
-  do_encode_hex(bytes, "")
-}
-
-fn do_encode_hex(bytes: BitArray, acc: String) -> String {
-  case bytes {
-    <<byte:int-size(8), rest:bits>> -> {
-      let high = byte / 16
-      let low = byte % 16
-      do_encode_hex(rest, acc <> hex_char(high) <> hex_char(low))
-    }
-    _ -> acc
-  }
-}
-
-fn hex_char(n: Int) -> String {
-  case n {
-    0 -> "0"
-    1 -> "1"
-    2 -> "2"
-    3 -> "3"
-    4 -> "4"
-    5 -> "5"
-    6 -> "6"
-    7 -> "7"
-    8 -> "8"
-    9 -> "9"
-    10 -> "a"
-    11 -> "b"
-    12 -> "c"
-    13 -> "d"
-    14 -> "e"
-    15 -> "f"
-    _ -> "?"
-  }
-}

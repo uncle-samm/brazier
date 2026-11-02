@@ -326,8 +326,14 @@ fn handle_login(
               |> dict.insert("display_name", "Ada Lovelace")
             })
             as "session was created on the line above and cannot have expired"
-          json_response(200, "{\"ok\":true,\"csrf\":\"" <> csrf_token <> "\"}")
-          |> cookie.set("beacon_session", sess.id, dev_cookie_options())
+          let assert Ok(resp) =
+            json_response(
+              200,
+              "{\"ok\":true,\"csrf\":\"" <> csrf_token <> "\"}",
+            )
+            |> cookie.set("beacon_session", sess.id, dev_cookie_options())
+            as "session ids are url-safe base64 and the options are constant"
+          resp
         }
         _, _ -> text_response(403, "Invalid login CSRF token")
       }
@@ -399,8 +405,14 @@ fn handle_logout(
           case token == expected {
             True -> {
               session.delete(store, sess.id)
-              text_response(200, "Logged out")
-              |> cookie.delete("beacon_session")
+              let assert Ok(resp) =
+                text_response(200, "Logged out")
+                |> cookie.delete_with_options(
+                  "beacon_session",
+                  dev_cookie_options(),
+                )
+                as "the cookie name and options are constant"
+              resp
             }
             False -> text_response(403, "Invalid CSRF token")
           }

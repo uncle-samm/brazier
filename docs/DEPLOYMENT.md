@@ -14,27 +14,59 @@ This generates `priv/static/beacon_client_<hash>.js` and `beacon_client.manifest
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `PORT` | `8080` | Server listen port |
-| `SECRET_KEY` | auto-generated | Session token signing key |
+| `PORT` | `8080` | Server listen port, `0..65535` (`0` binds an ephemeral port). A set value that is not an integer in range is an error. |
+| `SECRET_KEY` | none (required) | Token signing key, at least 32 bytes |
 | `BEACON_ENV` | `development` | Set to `production` for prod |
+
+`config.port()` and `config.secret_key()` return `Result(_, BeaconError)`:
+a malformed `PORT` or a missing or weak `SECRET_KEY` is a startup error, not
+a silent default.
 
 ## Secret Key
 
-Always set an explicit key in production. The auto-generated key changes on restart, invalidating all tokens:
+Join tokens and session tokens are signed with HMAC-SHA256, so the key must
+be at least 32 bytes (`config.min_secret_key_bytes`). `application.start`,
+`start_advanced` and `start_supervised` refuse an empty key, a shorter key,
+and the old published dev secret with a `ConfigError` before opening the
+port. Generate a key with:
+
+```bash
+openssl rand -base64 48
+```
+
+`beacon.app` uses a random per-process key when none is set; it changes on
+restart (invalidating all tokens) and differs between nodes, so always set an
+explicit key in production:
 
 ```gleam
-beacon.app(init, beacon.no_local, beacon.no_server, update, view)
-|> beacon.secret_key(config.secret_key())
-|> beacon.start(config.port())
+pub fn main() {
+  let assert Ok(secret) = config.secret_key() as "SECRET_KEY must be set"
+  let assert Ok(port) = config.port() as "PORT must be a valid port"
+  beacon.app(init, beacon.no_local, beacon.no_server, update, view)
+  |> beacon.secret_key(secret)
+  |> beacon.start(port)
+}
 ```
 
 ## Security Limits
 
+Start from the defaults and override what you need; the limits are
+validated at startup and an invalid value refuses to start. The full list is
+in [SECURITY.md](SECURITY.md#securitylimits).
+
 ```gleam
 beacon.security_limits(transport.SecurityLimits(
-  max_message_bytes: 65_536, max_events_per_second: 100, max_connections: 20_000,
+  ..transport.default_security_limits(),
+  max_connections: 20_000,
+  max_events_per_second: 100,
+  // Behind a reverse proxy: believe its X-Forwarded-For / Forwarded headers.
+  trusted_proxies: ["10.0.0.0/8"],
 ))
 ```
+
+Behind a reverse proxy, every client shares the proxy's address. Trusted
+proxies are exempt from `max_connections_per_ip`; raise
+`max_ws_connections_per_ip` or enforce per-client caps at the proxy.
 
 ## Health Check
 

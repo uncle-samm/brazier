@@ -13,8 +13,8 @@ import gleam/string
 // ===== Smoke Test =====
 
 pub fn sim_10_connections_smoke_test() {
-  let port = test_app.unique_port()
-  let assert Ok(_app) = test_app.start_counter_app(port)
+  let assert Ok(app) = test_app.start_counter_app()
+  let port = app.port
   process.sleep(200)
 
   let mt = metrics.new()
@@ -54,8 +54,8 @@ pub fn sim_10_connections_smoke_test() {
 // ===== Scale Tests =====
 
 pub fn sim_100_connections_counter_test() {
-  let port = test_app.unique_port()
-  let assert Ok(_app) = test_app.start_counter_app(port)
+  let assert Ok(app) = test_app.start_counter_app()
+  let port = app.port
   process.sleep(200)
 
   let mt = metrics.new()
@@ -95,8 +95,8 @@ pub fn sim_100_connections_counter_test() {
 // ===== Leak Detection =====
 
 pub fn sim_memory_leak_test() {
-  let port = test_app.unique_port()
-  let assert Ok(_app) = test_app.start_counter_app(port)
+  let assert Ok(app) = test_app.start_counter_app()
+  let port = app.port
   process.sleep(200)
 
   let mt = metrics.new()
@@ -138,8 +138,8 @@ pub fn sim_memory_leak_test() {
 // ===== Resilience Tests =====
 
 pub fn sim_malformed_frames_test() {
-  let port = test_app.unique_port()
-  let assert Ok(_app) = test_app.start_counter_app(port)
+  let assert Ok(app) = test_app.start_counter_app()
+  let port = app.port
   process.sleep(200)
 
   let mt = metrics.new()
@@ -183,7 +183,6 @@ pub fn sim_malformed_frames_test() {
 // ===== Flood Test =====
 
 pub fn sim_flood_single_connection_test() {
-  let port = test_app.unique_port()
   // A flood well past max_events_per_second must be rate limited without
   // crashing the connection. Under the default limits a sustained flood is
   // treated as abuse and closed with 1008 (covered in ws_protocol_test), so
@@ -193,7 +192,8 @@ pub fn sim_flood_single_connection_test() {
       ..test_app.sim_security_limits(),
       ws_max_rate_violations: 1_000_000,
     )
-  let assert Ok(_app) = test_app.start_counter_app_with_limits(port, limits)
+  let assert Ok(app) = test_app.start_counter_app_with_limits(limits)
+  let port = app.port
   process.sleep(200)
 
   let mt = metrics.new()
@@ -219,8 +219,8 @@ pub fn sim_flood_single_connection_test() {
 // ===== Process Leak Test =====
 
 pub fn sim_process_leak_test() {
-  let port = test_app.unique_port()
-  let assert Ok(_app) = test_app.start_counter_app(port)
+  let assert Ok(app) = test_app.start_counter_app()
+  let port = app.port
   process.sleep(200)
 
   let mt = metrics.new()
@@ -251,8 +251,8 @@ pub fn sim_process_leak_test() {
 // ===== Draw Simulation =====
 
 pub fn sim_50_draw_test() {
-  let port = test_app.unique_port()
-  let assert Ok(_app) = test_app.start_counter_app(port)
+  let assert Ok(app) = test_app.start_counter_app()
+  let port = app.port
   process.sleep(200)
 
   let mt = metrics.new()
@@ -292,8 +292,8 @@ pub fn sim_50_draw_test() {
 // ===== Fault-Based Kill Test =====
 
 pub fn sim_50_connections_test() {
-  let port = test_app.unique_port()
-  let assert Ok(_app) = test_app.start_counter_app(port)
+  let assert Ok(app) = test_app.start_counter_app()
+  let port = app.port
   process.sleep(200)
 
   let mt = metrics.new()
@@ -339,8 +339,8 @@ pub fn sim_50_connections_test() {
 // ===== 1000 Connections =====
 
 pub fn sim_1000_connections_test() {
-  let port = test_app.unique_port()
-  let assert Ok(_app) = test_app.start_counter_app(port)
+  let assert Ok(app) = test_app.start_counter_app()
+  let port = app.port
   process.sleep(300)
 
   let mt = metrics.new()
@@ -383,8 +383,8 @@ pub fn sim_1000_connections_test() {
 // ===== Corruption Resilience =====
 
 pub fn sim_corrupt_data_resilience_test() {
-  let port = test_app.unique_port()
-  let assert Ok(_app) = test_app.start_counter_app(port)
+  let assert Ok(app) = test_app.start_counter_app()
+  let port = app.port
   process.sleep(200)
 
   let mt = metrics.new()
@@ -449,8 +449,8 @@ pub fn sim_corrupt_data_resilience_test() {
 // (beacon/transport/server using gen_tcp directly).
 
 pub fn thundering_herd_no_500_test() {
-  let port = test_app.unique_port()
-  let assert Ok(_app) = test_app.start_counter_app(port)
+  let assert Ok(app) = test_app.start_counter_app()
+  let port = app.port
   process.sleep(200)
 
   // Phase 1: 20 connections sending corrupt data
@@ -492,8 +492,8 @@ pub fn thundering_herd_no_500_test() {
 // ===== Patch Efficiency Test =====
 
 pub fn sim_patch_efficiency_test() {
-  let port = test_app.unique_port()
-  let assert Ok(_app) = test_app.start_counter_app(port)
+  let assert Ok(app) = test_app.start_counter_app()
+  let port = app.port
   process.sleep(200)
 
   let mt = metrics.new()
@@ -522,8 +522,8 @@ pub fn sim_patch_efficiency_test() {
 // ===== Reconnection Test =====
 
 pub fn sim_reconnection_test() {
-  let port = test_app.unique_port()
-  let assert Ok(_app) = test_app.start_counter_app(port)
+  let assert Ok(app) = test_app.start_counter_app()
+  let port = app.port
   process.sleep(200)
 
   let mt = metrics.new()
@@ -551,8 +551,8 @@ pub fn sim_reconnection_test() {
 // ===== Concurrent Mutation Test =====
 
 pub fn sim_concurrent_mutation_test() {
-  let port = test_app.unique_port()
-  let assert Ok(_app) = test_app.start_counter_app(port)
+  let assert Ok(app) = test_app.start_counter_app()
+  let port = app.port
   process.sleep(200)
 
   let mt = metrics.new()
@@ -609,8 +609,8 @@ pub fn sim_concurrent_mutation_test() {
 // ===== State Correctness Test =====
 
 pub fn sim_state_correctness_test() {
-  let port = test_app.unique_port()
-  let assert Ok(_app) = test_app.start_counter_app(port)
+  let assert Ok(app) = test_app.start_counter_app()
+  let port = app.port
   process.sleep(200)
 
   let mt = metrics.new()
@@ -667,8 +667,8 @@ pub fn sim_state_correctness_test() {
 // ===== Patch Efficiency with Wire Assertion =====
 
 pub fn sim_patch_efficiency_with_assertion_test() {
-  let port = test_app.unique_port()
-  let assert Ok(_app) = test_app.start_counter_app(port)
+  let assert Ok(app) = test_app.start_counter_app()
+  let port = app.port
   process.sleep(200)
 
   let mt = metrics.new()
@@ -712,9 +712,9 @@ pub fn sim_patch_efficiency_with_assertion_test() {
 // ===== Server Push Test (effect.every) =====
 
 pub fn sim_server_push_ticker_test() {
-  let port = test_app.unique_port()
   // Start ticker app with 100ms interval
-  let assert Ok(_app) = test_app.start_ticker_app(port, 100)
+  let assert Ok(app) = test_app.start_ticker_app(100)
+  let port = app.port
   process.sleep(200)
 
   let mt = metrics.new()
@@ -742,8 +742,8 @@ pub fn sim_server_push_ticker_test() {
 // ===== Wire Efficiency Tracking Test =====
 
 pub fn sim_wire_tracking_test() {
-  let port = test_app.unique_port()
-  let assert Ok(_app) = test_app.start_counter_app(port)
+  let assert Ok(app) = test_app.start_counter_app()
+  let port = app.port
   process.sleep(200)
 
   let mt = metrics.new()

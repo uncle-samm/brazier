@@ -1,4 +1,5 @@
 import beacon/auth
+import beacon/cookie
 import beacon/effect
 import beacon/element
 import beacon/route
@@ -215,15 +216,45 @@ pub fn render_page_for_path_unmatched_route_renders_static_not_found_test() {
   let assert False = str_contains(page.html, "Hello, default!")
 }
 
+/// The join token goes into a Set-Cookie header; a token outside the
+/// cookie-octet set is refused instead of being written as an injection.
+pub fn to_response_rejects_a_token_that_is_not_a_cookie_value_test() {
+  let page =
+    ssr.RenderedPage(..ssr.render_page(test_config()), sign_join_token: fn(_) {
+      "tok; Domain=evil.example"
+    })
+  let assert Error(cookie.InvalidValue(_)) = ssr.to_response(page)
+  let req =
+    request.new() |> request.set_header("cookie", "beacon_session=session-a")
+  let assert Error(cookie.InvalidValue(_)) =
+    ssr.to_response_for_request(page, req)
+}
+
+pub fn join_tokens_are_valid_cookie_values_test() {
+  let page = ssr.render_page(test_config())
+  let assert Ok(Nil) =
+    cookie.validate(
+      ssr.session_cookie_name,
+      ssr.join_token_for(page, ""),
+      cookie.default_options(),
+    )
+  let assert Ok(Nil) =
+    cookie.validate(
+      ssr.session_cookie_name,
+      ssr.join_token_for(page, ssr.fingerprint_session_id("session-a")),
+      cookie.default_options(),
+    )
+}
+
 pub fn to_response_returns_200_test() {
   let page = ssr.render_page(test_config())
-  let resp = ssr.to_response(page)
+  let assert Ok(resp) = ssr.to_response(page)
   let assert 200 = resp.status
 }
 
 pub fn to_response_sets_httponly_session_cookie_test() {
   let page = ssr.render_page(test_config())
-  let resp = ssr.to_response(page)
+  let assert Ok(resp) = ssr.to_response(page)
   let assert Ok(cookie_header) = find_header(resp.headers, "set-cookie")
   let assert True = str_contains(cookie_header, ssr.session_cookie_name <> "=")
   let assert True = str_contains(cookie_header, "HttpOnly")
@@ -504,7 +535,7 @@ pub fn to_response_for_request_binds_token_to_session_test() {
   let page = ssr.render_page(config)
   let req =
     request.new() |> request.set_header("cookie", "beacon_session=session-a")
-  let resp = ssr.to_response_for_request(page, req)
+  let assert Ok(resp) = ssr.to_response_for_request(page, req)
   let assert Ok(set_cookie) = find_header(resp.headers, "set-cookie")
   let token = cookie_value(set_cookie, ssr.session_cookie_name)
   let now = current_system_time_seconds()

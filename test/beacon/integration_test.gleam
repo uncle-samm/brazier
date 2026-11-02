@@ -151,7 +151,9 @@ pub fn http_pre_upgrade_rejects_too_many_headers_test() {
       ],
       "",
     )
-  let assert Error(_) = result
+  // RFC 6585: too many header fields is answered with 431, then closed.
+  let assert Ok(#(431, headers, _body)) = result
+  let assert True = has_header(headers, "connection", "close")
 }
 
 pub fn http_pre_upgrade_rejects_large_headers_test() {
@@ -175,7 +177,9 @@ pub fn http_pre_upgrade_rejects_large_headers_test() {
       [#("x-large", string.repeat("x", 128))],
       "",
     )
-  let assert Error(_) = result
+  // RFC 6585: an oversized header block is answered with 431, then closed.
+  let assert Ok(#(431, headers, _body)) = result
+  let assert True = has_header(headers, "connection", "close")
 }
 
 // ===== 22.1: Real WebSocket Stress Test =====
