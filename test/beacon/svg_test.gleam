@@ -1,3 +1,4 @@
+import beacon/attribute
 import beacon/element
 import beacon/html
 import beacon/svg
@@ -75,7 +76,7 @@ pub fn svg_full_icon_test() {
   // Typical icon usage pattern
   let node =
     svg.svg(
-      [html.class("w-4 h-4"), svg.viewbox("0 0 24 24"), svg.fill("none")],
+      [attribute.class("w-4 h-4"), svg.viewbox("0 0 24 24"), svg.fill("none")],
       [
         svg.path([
           svg.d("M12 2L2 22h20L12 2z"),
@@ -113,9 +114,13 @@ pub fn svg_defs_and_use_test() {
   let node =
     svg.svg([], [
       svg.defs([], [
-        svg.circle([element.attr("id", "myCircle"), svg.r("10")]),
+        svg.circle([attribute.attribute("id", "myCircle"), svg.r("10")]),
       ]),
-      svg.use_([element.attr("href", "#myCircle"), svg.x("20"), svg.y("20")]),
+      svg.use_([
+        attribute.attribute("href", "#myCircle"),
+        svg.x("20"),
+        svg.y("20"),
+      ]),
     ])
   let result = element.to_string(node)
   let assert True = str_contains(result, "<defs>")
@@ -126,11 +131,14 @@ pub fn svg_defs_and_use_test() {
 
 pub fn svg_gradient_test() {
   let node =
-    svg.linear_gradient([element.attr("id", "grad1")], [
-      svg.stop([element.attr("offset", "0%"), element.attr("stop-color", "red")]),
+    svg.linear_gradient([attribute.attribute("id", "grad1")], [
       svg.stop([
-        element.attr("offset", "100%"),
-        element.attr("stop-color", "blue"),
+        attribute.attribute("offset", "0%"),
+        attribute.attribute("stop-color", "red"),
+      ]),
+      svg.stop([
+        attribute.attribute("offset", "100%"),
+        attribute.attribute("stop-color", "blue"),
       ]),
     ])
   let result = element.to_string(node)
@@ -142,8 +150,8 @@ pub fn svg_gradient_test() {
 pub fn svg_in_html_context_test() {
   // SVG embedded in an HTML page (common pattern)
   let node =
-    html.div([html.class("icon-container")], [
-      svg.svg([html.class("icon"), svg.viewbox("0 0 16 16")], [
+    html.div([attribute.class("icon-container")], [
+      svg.svg([attribute.class("icon"), svg.viewbox("0 0 16 16")], [
         svg.path([svg.d("M8 0L16 16H0Z")]),
       ]),
       html.span([], [html.text("Label")]),
@@ -179,7 +187,7 @@ pub fn svg_polygon_test() {
 
 pub fn svg_clip_path_test() {
   let node =
-    svg.clip_path([element.attr("id", "clip1")], [
+    svg.clip_path([attribute.attribute("id", "clip1")], [
       svg.rect([svg.width("100"), svg.height("100")]),
     ])
   let result = element.to_string(node)

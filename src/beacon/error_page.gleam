@@ -2,14 +2,16 @@
 /// Provides styled error pages for common HTTP errors.
 ///
 /// Reference: Phoenix error views, LiveView error handling.
-import beacon/element.{type Node}
+import beacon/attribute
+import beacon/element.{type Element}
+import beacon/html
 import beacon/transport/server.{type ResponseBody, Bytes}
 import gleam/bytes_tree
 import gleam/http/response.{type Response}
 import gleam/int
 
 /// Render a 404 Not Found error page.
-pub fn not_found() -> Node(msg) {
+pub fn not_found() -> Element(msg) {
   error_page(
     404,
     "Page Not Found",
@@ -18,7 +20,7 @@ pub fn not_found() -> Node(msg) {
 }
 
 /// Render a 500 Internal Server Error page.
-pub fn internal_error(detail: String) -> Node(msg) {
+pub fn internal_error(detail: String) -> Element(msg) {
   error_page(
     500,
     "Internal Server Error",
@@ -27,21 +29,15 @@ pub fn internal_error(detail: String) -> Node(msg) {
 }
 
 /// Render a generic error page with status code, title, and message.
-pub fn error_page(status: Int, title: String, message: String) -> Node(msg) {
-  element.el("div", [element.attr("class", "beacon-error")], [
-    element.el("div", [element.attr("class", "beacon-error-content")], [
-      element.el("h1", [element.attr("class", "beacon-error-status")], [
-        element.text(int.to_string(status)),
+pub fn error_page(status: Int, title: String, message: String) -> Element(msg) {
+  html.div([attribute.class("beacon-error")], [
+    html.div([attribute.class("beacon-error-content")], [
+      html.h1([attribute.class("beacon-error-status")], [
+        html.text(int.to_string(status)),
       ]),
-      element.el("h2", [element.attr("class", "beacon-error-title")], [
-        element.text(title),
-      ]),
-      element.el("p", [element.attr("class", "beacon-error-message")], [
-        element.text(message),
-      ]),
-      element.el("a", [element.attr("href", "/")], [
-        element.text("Go back home"),
-      ]),
+      html.h2([attribute.class("beacon-error-title")], [html.text(title)]),
+      html.p([attribute.class("beacon-error-message")], [html.text(message)]),
+      html.a([attribute.href("/")], [html.text("Go back home")]),
     ]),
   ])
 }
@@ -53,31 +49,30 @@ pub fn dev_error(
   error_type: String,
   message: String,
   details: String,
-) -> Node(msg) {
-  element.el("div", [element.attr("class", "beacon-dev-error")], [
-    element.el("h1", [element.attr("style", "color: #e74c3c")], [
-      element.text("Error: " <> error_type),
+) -> Element(msg) {
+  html.div([attribute.class("beacon-dev-error")], [
+    html.h1([attribute.style("color", "#e74c3c")], [
+      html.text("Error: " <> error_type),
     ]),
-    element.el("p", [], [element.text(message)]),
-    element.el(
-      "pre",
+    html.p([], [html.text(message)]),
+    html.pre(
       [
-        element.attr(
+        attribute.attribute(
           "style",
           "background:#1e1e1e;color:#ddd;padding:1rem;overflow-x:auto;border-radius:4px",
         ),
       ],
-      [element.text(details)],
+      [html.text(details)],
     ),
-    element.el("hr", [], []),
-    element.el("p", [element.attr("style", "color:#888;font-size:0.9em")], [
-      element.text("This error page is only shown in development mode."),
+    html.hr([]),
+    html.p([attribute.attribute("style", "color:#888;font-size:0.9em")], [
+      html.text("This error page is only shown in development mode."),
     ]),
   ])
 }
 
-/// Convert an error page Node to a full HTTP response.
-pub fn to_response(status: Int, page: Node(msg)) -> Response(ResponseBody) {
+/// Convert an error page element to a full HTTP response.
+pub fn to_response(status: Int, page: Element(msg)) -> Response(ResponseBody) {
   let html =
     "<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
     <> "<title>Error "

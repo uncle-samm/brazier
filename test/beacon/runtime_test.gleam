@@ -1,19 +1,19 @@
 import beacon/effect
-import beacon/element
 import beacon/error
-import beacon/handler
+import beacon/internal/context
 import beacon/pubsub
-import beacon/route
 import beacon/runtime
 import beacon/ssr
 import beacon/transport
 import beacon/transport/server
 import gleam/erlang/process
+import gleam/http
 import gleam/http/request
 import gleam/int
 import gleam/list
-import gleam/option
+import gleam/option.{type Option}
 import gleam/string
+import gleam/uri
 
 /// Create a fake socket for testing (nil wrapped as Socket type).
 @external(erlang, "beacon_runtime_test_ffi", "fake_socket")
@@ -34,16 +34,30 @@ pub type CounterMsg {
   Tick
 }
 
-pub type RouteModel {
-  RouteModel(current_path: String, leave_events: List(String))
+/// The connected-mount context for `path`.
+fn context_for(path: String) -> context.Context {
+  let assert Ok(parsed) = uri.parse(path)
+  context.new(
+    uri: uri.Uri(
+      ..uri.empty,
+      scheme: option.Some("http"),
+      host: option.Some("localhost"),
+      path: parsed.path,
+      query: parsed.query,
+    ),
+    cookies: [],
+    is_connected: True,
+    session_id: Error(Nil),
+  )
 }
 
-pub type RouteMsg {
-  RouteChangedTo(String)
-  RouteLeft(String)
+fn test_context() -> context.Context {
+  context_for("/")
 }
 
-fn counter_init() -> #(CounterModel, effect.Effect(CounterMsg)) {
+fn counter_init(
+  _ctx: context.Context,
+) -> #(CounterModel, effect.Effect(CounterMsg)) {
   #(CounterModel(count: 0), effect.none())
 }
 
@@ -59,8 +73,8 @@ fn counter_update(
   }
 }
 
-fn counter_view(model: CounterModel) -> element.Node(CounterMsg) {
-  element.el("div", [], [element.text(int.to_string(model.count))])
+fn counter_encode(model: CounterModel) -> String {
+  "{\"count\":" <> int.to_string(model.count) <> "}"
 }
 
 fn counter_decode_event(
@@ -80,140 +94,337 @@ fn counter_config() -> runtime.RuntimeConfig(CounterModel, CounterMsg) {
   runtime.RuntimeConfig(
     init: counter_init,
     update: counter_update,
-    view: counter_view,
-    decode_event: option.Some(counter_decode_event),
-    serialize_model: option.Some(fn(model: CounterModel) {
-      "{\"count\":" <> int.to_string(model.count) <> "}"
-    }),
-    deserialize_model: option.None,
-    route_patterns: [],
-    on_route_change: option.None,
-    on_route_leave: option.None,
+    encode_model: counter_encode,
+    decode_event: counter_decode_event,
+    restore_model: option.None,
+    route: option.None,
     dynamic_subscriptions: option.None,
     on_notify: option.None,
     on_notification: option.None,
-    init_from_request: option.None,
     secret_key: "",
-    dev_mode: False,
   )
 }
 
-fn route_init() -> #(RouteModel, effect.Effect(RouteMsg)) {
-  #(RouteModel(current_path: "unset", leave_events: []), effect.none())
+// --- Routing ---
+
+pub type Page {
+  Home
+  Settings
+  User(id: Int)
 }
 
-fn route_update(
-  model: RouteModel,
-  msg: RouteMsg,
-) -> #(RouteModel, effect.Effect(RouteMsg)) {
-  case msg {
-    RouteChangedTo(path) -> #(
-      RouteModel(..model, current_path: path),
-      effect.none(),
-    )
-    RouteLeft(event) -> #(
-      RouteModel(..model, leave_events: [event, ..model.leave_events]),
-      effect.none(),
-    )
+pub type RouteModel {
+  RouteModel(page: Option(Page), visits: List(String), tab: String)
+}
+
+pub type RouteMsg {
+  RouteChanged(page: Page, tab: String)
+}
+
+fn parse_page(page_uri: uri.Uri) -> Result(RouteMsg, Nil) {
+  let tab = case page_uri.query {
+    option.Some("tab=" <> tab) -> tab
+    _ -> ""
+  }
+  case uri.path_segments(page_uri.path) {
+    [] -> Ok(RouteChanged(Home, tab))
+    ["settings"] -> Ok(RouteChanged(Settings, tab))
+    ["users", id] ->
+      case int.parse(id) {
+        Ok(id) -> Ok(RouteChanged(User(id), tab))
+        Error(Nil) -> Error(Nil)
+      }
+    _ -> Error(Nil)
   }
 }
 
-fn route_view(model: RouteModel) -> element.Node(RouteMsg) {
-  element.el("div", [], [
-    element.text(model.current_path),
-    element.text("|"),
-    element.text(string.join(model.leave_events, ",")),
-  ])
+fn page_name(page: Option(Page)) -> String {
+  case page {
+    option.None -> "none"
+    option.Some(Home) -> "home"
+    option.Some(Settings) -> "settings"
+    option.Some(User(id)) -> "user" <> int.to_string(id)
+  }
 }
 
 fn route_config() -> runtime.RuntimeConfig(RouteModel, RouteMsg) {
   runtime.RuntimeConfig(
-    init: route_init,
-    update: route_update,
-    view: route_view,
-    decode_event: option.Some(fn(_name, _handler_id, _data, _path) {
-      Error(error.RuntimeError(reason: "route test does not decode events"))
-    }),
-    serialize_model: option.Some(fn(model: RouteModel) {
-      "{\"current_path\":\""
-      <> model.current_path
-      <> "\",\"leave_events\":\""
-      <> string.join(model.leave_events, ",")
+    init: fn(_ctx) {
+      #(RouteModel(page: option.None, visits: [], tab: ""), effect.none())
+    },
+    update: fn(model: RouteModel, msg: RouteMsg) {
+      let RouteChanged(page, tab) = msg
+      let visits = [page_name(option.Some(page)), ..model.visits]
+      #(
+        RouteModel(page: option.Some(page), visits: visits, tab: tab),
+        effect.none(),
+      )
+    },
+    encode_model: fn(model: RouteModel) {
+      "{\"page\":\""
+      <> page_name(model.page)
+      <> "\",\"visits\":\""
+      <> string.join(list.reverse(model.visits), ",")
+      <> "\",\"tab\":\""
+      <> model.tab
       <> "\"}"
-    }),
-    deserialize_model: option.None,
-    route_patterns: [route.pattern("/"), route.pattern("/settings")],
-    on_route_change: option.Some(fn(resolved: route.Route) {
-      RouteChangedTo(resolved.path)
-    }),
-    on_route_leave: option.Some(fn(previous: route.Route, next: route.Route) {
-      effect.from(fn(dispatch) {
-        dispatch(RouteLeft(previous.path <> "->" <> next.path))
-      })
-    }),
+    },
+    decode_event: fn(_name, _handler_id, _data, _path) {
+      Error(error.RuntimeError(reason: "route test does not decode events"))
+    },
+    restore_model: option.None,
+    route: option.Some(parse_page),
     dynamic_subscriptions: option.None,
     on_notify: option.None,
     on_notification: option.None,
-    init_from_request: option.None,
     secret_key: "",
-    dev_mode: False,
   )
 }
 
-// --- Tests ---
-
-pub fn route_leave_effect_runs_before_navigation_settles_test() {
-  let assert Ok(subject) = runtime.start(route_config())
+/// Start the routed runtime at `path` and join one connection there.
+fn join_routed(
+  path: String,
+  conn_id: String,
+) -> #(
+  process.Subject(runtime.RuntimeMessage(RouteMsg)),
+  process.Subject(transport.InternalMessage),
+  transport.InternalMessage,
+) {
+  let assert Ok(subject) = runtime.start(route_config(), context_for(path))
   let transport_subject = process.new_subject()
-
   process.send(
     subject,
-    runtime.ClientConnected(conn_id: "route_conn", subject: transport_subject),
+    runtime.ClientConnected(conn_id: conn_id, subject: transport_subject),
   )
-  process.sleep(20)
-
   process.send(
     subject,
-    runtime.ClientJoined(conn_id: "route_conn", token: "", path: "/"),
+    runtime.ClientJoined(conn_id: conn_id, token: "", path: path),
   )
-  process.sleep(80)
-  let _ = drain_messages(transport_subject, [])
+  let assert Ok(first) = process.receive(transport_subject, 1000)
+  #(subject, transport_subject, first)
+}
 
+pub fn start_applies_initial_route_before_first_sync_test() {
+  let #(_subject, _transport, first) = join_routed("/users/7?tab=posts", "r1")
+  // on_change ran exactly once (at start); the join for the same route did
+  // not run it again.
+  let assert transport.SendModelSync(
+    model_json: "{\"page\":\"user7\",\"visits\":\"user7\",\"tab\":\"posts\"}",
+    version: 0,
+    ack_clock: 0,
+  ) = first
+}
+
+pub fn start_with_unknown_route_keeps_init_state_test() {
+  let assert Ok(subject) =
+    runtime.start(route_config(), context_for("/nowhere"))
+  let transport_subject = process.new_subject()
   process.send(
     subject,
-    runtime.ClientNavigated(conn_id: "route_conn", path: "/settings"),
+    runtime.ClientConnected(conn_id: "r_unknown", subject: transport_subject),
   )
-  process.sleep(150)
-
-  let msgs = drain_messages(transport_subject, [])
-  let has_route_change =
+  process.send(
+    subject,
+    runtime.ClientJoined(conn_id: "r_unknown", token: "", path: "/nowhere"),
+  )
+  let msgs = receive_n(transport_subject, 2, [])
+  let assert True =
     list.any(msgs, fn(msg) {
       case msg {
-        transport.SendModelSync(model_json: json, ..) ->
-          string.contains(json, "\"current_path\":\"/settings\"")
-        transport.SendPatch(ops_json: json, ..) ->
-          string.contains(json, "/current_path")
-          && string.contains(json, "/settings")
+        transport.SendError(reason: reason) ->
+          string.contains(reason, "no route for the joined path /nowhere")
         _ -> False
       }
     })
-  let has_leave_effect =
+  let assert True =
+    list.contains(
+      msgs,
+      transport.SendModelSync(
+        model_json: "{\"page\":\"none\",\"visits\":\"\",\"tab\":\"\"}",
+        version: 0,
+        ack_clock: 0,
+      ),
+    )
+}
+
+pub fn start_refuses_badly_encoded_url_test() {
+  let ctx =
+    context.new(
+      uri: uri.Uri(..uri.empty, path: "/users/%ZZ"),
+      cookies: [],
+      is_connected: True,
+      session_id: Error(Nil),
+    )
+  let assert Error(error.RuntimeError(reason: reason)) =
+    runtime.start(route_config(), ctx)
+  let assert True = string.contains(reason, "Invalid page URL")
+}
+
+pub fn navigation_runs_on_change_for_known_route_test() {
+  let #(subject, transport_subject, _first) = join_routed("/", "r_nav")
+  process.send(
+    subject,
+    runtime.ClientNavigated(conn_id: "r_nav", path: "/settings?tab=a"),
+  )
+  let assert Ok(transport.SendPatch(ops_json: ops, version: 1, ack_clock: 0)) =
+    process.receive(transport_subject, 1000)
+  let assert True = string.contains(ops, "settings")
+  let assert True = string.contains(ops, "home,settings")
+}
+
+pub fn navigation_to_same_route_runs_on_change_again_test() {
+  // Like LiveView's handle_params, every navigation runs on_change.
+  let #(subject, transport_subject, _first) = join_routed("/settings", "r_same")
+  process.send(
+    subject,
+    runtime.ClientNavigated(conn_id: "r_same", path: "/settings"),
+  )
+  let assert Ok(transport.SendPatch(ops_json: ops, version: 1, ..)) =
+    process.receive(transport_subject, 1000)
+  let assert True = string.contains(ops, "settings,settings")
+}
+
+pub fn navigation_to_unknown_route_hard_navigates_test() {
+  let #(subject, transport_subject, _first) = join_routed("/", "r_404")
+  process.send(
+    subject,
+    runtime.ClientNavigated(conn_id: "r_404", path: "/nope"),
+  )
+  let assert Ok(transport.SendHardNavigate(path: "/nope")) =
+    process.receive(transport_subject, 1000)
+}
+
+pub fn navigation_with_bad_encoding_hard_navigates_test() {
+  let #(subject, transport_subject, _first) = join_routed("/", "r_400")
+  process.send(
+    subject,
+    runtime.ClientNavigated(conn_id: "r_400", path: "/users/%E0%A4"),
+  )
+  let assert Ok(transport.SendHardNavigate(path: "/users/%E0%A4")) =
+    process.receive(transport_subject, 1000)
+}
+
+pub fn navigation_to_non_local_path_is_refused_test() {
+  let #(subject, transport_subject, _first) = join_routed("/", "r_ext")
+  list.each(
+    ["//evil.example/x", "https://evil.example/", "javascript:x"],
+    fn(path) {
+      process.send(
+        subject,
+        runtime.ClientNavigated(conn_id: "r_ext", path: path),
+      )
+      let assert Ok(transport.SendError(reason: reason)) =
+        process.receive(transport_subject, 1000)
+      let assert True = string.contains(reason, "must start with /")
+    },
+  )
+  // The model was not touched.
+  process.send(subject, runtime.ClientSyncRequested(conn_id: "r_ext"))
+  let assert Ok(transport.SendModelSync(model_json: json, ..)) =
+    process.receive(transport_subject, 1000)
+  let assert "{\"page\":\"home\",\"visits\":\"home\",\"tab\":\"\"}" = json
+}
+
+pub fn navigation_without_router_hard_navigates_test() {
+  let assert Ok(subject) = runtime.start(counter_config(), test_context())
+  let #(transport_subject, _first) = join_and_receive(subject, "no_router", "")
+  process.send(
+    subject,
+    runtime.ClientNavigated(conn_id: "no_router", path: "/elsewhere"),
+  )
+  let assert Ok(transport.SendHardNavigate(path: "/elsewhere")) =
+    process.receive(transport_subject, 1000)
+}
+
+pub fn join_for_different_route_runs_on_change_test() {
+  // A connection whose page is at another URL than the session's (a second
+  // tab sharing the runtime) routes the runtime there on join.
+  let assert Ok(subject) = runtime.start(route_config(), context_for("/"))
+  let transport_subject = process.new_subject()
+  process.send(
+    subject,
+    runtime.ClientConnected(conn_id: "r_join", subject: transport_subject),
+  )
+  process.send(
+    subject,
+    runtime.ClientJoined(conn_id: "r_join", token: "", path: "/users/3"),
+  )
+  let msgs = receive_n(transport_subject, 1, [])
+  let assert True =
     list.any(msgs, fn(msg) {
       case msg {
         transport.SendModelSync(model_json: json, ..) ->
-          string.contains(json, "\"leave_events\":\"/->/settings\"")
-        transport.SendPatch(ops_json: json, ..) ->
-          string.contains(json, "/leave_events")
-          && string.contains(json, "/->/settings")
+          string.contains(json, "\"visits\":\"home,user3\"")
         _ -> False
       }
     })
-  let assert True = has_route_change
-  let assert True = has_leave_effect
+}
+
+/// Receive exactly `n` messages (1s timeout each).
+fn receive_n(
+  subject: process.Subject(transport.InternalMessage),
+  n: Int,
+  acc: List(transport.InternalMessage),
+) -> List(transport.InternalMessage) {
+  case n {
+    0 -> list.reverse(acc)
+    _ -> {
+      let assert Ok(msg) = process.receive(subject, 1000)
+      receive_n(subject, n - 1, [msg, ..acc])
+    }
+  }
+}
+
+// --- connected_context ---
+
+fn ws_request(
+  query: option.Option(String),
+) -> request.Request(server.Connection) {
+  request.Request(
+    method: http.Get,
+    headers: [#("host", "localhost:8080")],
+    body: server.Connection(socket: fake_socket()),
+    scheme: http.Http,
+    host: "localhost",
+    port: option.Some(8080),
+    path: "/ws",
+    query: query,
+  )
+}
+
+pub fn connected_context_uses_path_param_test() {
+  let req =
+    ws_request(option.Some("path=" <> uri.percent_encode("/users/7?tab=posts")))
+  let assert Ok(ctx) = runtime.connected_context(req)
+  let page_uri = context.uri(ctx)
+  let assert "/users/7" = page_uri.path
+  let assert option.Some("tab=posts") = page_uri.query
+  let assert True = context.is_connected(ctx)
+}
+
+pub fn connected_context_rejects_missing_or_foreign_path_test() {
+  let assert Error(_) = runtime.connected_context(ws_request(option.None))
+  let assert Error(_) =
+    runtime.connected_context(ws_request(option.Some("other=1")))
+  let assert Error(_) =
+    runtime.connected_context(
+      ws_request(option.Some("path=" <> uri.percent_encode("//evil.example/"))),
+    )
+  let assert Error(_) =
+    runtime.connected_context(
+      ws_request(option.Some(
+        "path=" <> uri.percent_encode("https://evil.example/"),
+      )),
+    )
+  // A path whose percent-encoding does not decode parses, and the runtime
+  // then refuses to start for it.
+  let assert Ok(ctx) =
+    runtime.connected_context(ws_request(option.Some("path=%2Fusers%2F%25ZZ")))
+  let assert Error(error.RuntimeError(_)) = runtime.start(route_config(), ctx)
 }
 
 pub fn runtime_starts_successfully_test() {
-  let assert Ok(subject) = runtime.start(counter_config())
+  let assert Ok(subject) = runtime.start(counter_config(), test_context())
   let transport_subject = process.new_subject()
 
   // Connect and join to verify we get authoritative model state without a remount.
@@ -242,7 +453,7 @@ pub fn runtime_starts_successfully_test() {
 }
 
 pub fn runtime_accepts_client_connect_test() {
-  let assert Ok(subject) = runtime.start(counter_config())
+  let assert Ok(subject) = runtime.start(counter_config(), test_context())
   let fake_transport_subject = process.new_subject()
   // Connect
   process.send(
@@ -275,7 +486,7 @@ pub fn runtime_accepts_client_connect_test() {
 }
 
 pub fn runtime_sends_model_sync_on_join_test() {
-  let assert Ok(subject) = runtime.start(counter_config())
+  let assert Ok(subject) = runtime.start(counter_config(), test_context())
   let transport_subject = process.new_subject()
 
   // Register connection
@@ -307,7 +518,7 @@ pub fn runtime_sends_model_sync_on_join_test() {
 }
 
 pub fn runtime_sends_model_sync_on_event_test() {
-  let assert Ok(subject) = runtime.start(counter_config())
+  let assert Ok(subject) = runtime.start(counter_config(), test_context())
   let transport_subject = process.new_subject()
 
   // Register connection
@@ -364,7 +575,7 @@ pub fn runtime_sends_model_sync_on_event_test() {
 }
 
 pub fn runtime_handles_disconnect_test() {
-  let assert Ok(subject) = runtime.start(counter_config())
+  let assert Ok(subject) = runtime.start(counter_config(), test_context())
   let transport_subject = process.new_subject()
 
   // Connect and disconnect
@@ -399,7 +610,7 @@ pub fn runtime_handles_disconnect_test() {
 }
 
 pub fn runtime_handles_unknown_event_test() {
-  let assert Ok(subject) = runtime.start(counter_config())
+  let assert Ok(subject) = runtime.start(counter_config(), test_context())
   let transport_subject = process.new_subject()
 
   // Connect
@@ -452,31 +663,26 @@ pub fn runtime_effect_dispatches_message_test() {
   // Create a config where init produces an effect that dispatches SetCount(42)
   let config =
     runtime.RuntimeConfig(
-      init: fn() {
+      init: fn(_ctx) {
         #(
           CounterModel(count: 0),
           effect.from(fn(dispatch) { dispatch(SetCount(42)) }),
         )
       },
       update: counter_update,
-      view: counter_view,
-      decode_event: option.Some(counter_decode_event),
-      serialize_model: option.Some(fn(model: CounterModel) {
+      decode_event: counter_decode_event,
+      encode_model: fn(model: CounterModel) {
         "{\"count\":" <> int.to_string(model.count) <> "}"
-      }),
-      deserialize_model: option.None,
-      route_patterns: [],
-      on_route_change: option.None,
-      on_route_leave: option.None,
+      },
+      route: option.None,
+      restore_model: option.None,
       dynamic_subscriptions: option.None,
       on_notify: option.None,
       on_notification: option.None,
-      init_from_request: option.None,
       secret_key: "",
-      dev_mode: False,
     )
 
-  let assert Ok(subject) = runtime.start(config)
+  let assert Ok(subject) = runtime.start(config, test_context())
   let transport_subject = process.new_subject()
 
   // Connect and join to get current state
@@ -526,33 +732,20 @@ pub fn live_update_does_not_render_server_view_test() {
   // not render the server view after an event.
   let config =
     runtime.RuntimeConfig(
-      init: fn() { #(CounterModel(count: 0), effect.none()) },
+      init: fn(_ctx) { #(CounterModel(count: 0), effect.none()) },
       update: counter_update,
-      view: fn(model: CounterModel) {
-        case model.count == 1 {
-          True -> {
-            // Intentionally crash to prove a failed render is not committed.
-            crash_for_test()
-          }
-          False -> element.el("button", [], [element.text("ok")])
-        }
-      },
-      decode_event: option.Some(counter_decode_event),
-      serialize_model: option.Some(fn(model: CounterModel) {
+      decode_event: counter_decode_event,
+      encode_model: fn(model: CounterModel) {
         "{\"count\":" <> int.to_string(model.count) <> "}"
-      }),
-      deserialize_model: option.None,
-      route_patterns: [],
-      on_route_change: option.None,
-      on_route_leave: option.None,
+      },
+      route: option.None,
+      restore_model: option.None,
       dynamic_subscriptions: option.None,
       on_notify: option.None,
       on_notification: option.None,
-      init_from_request: option.None,
       secret_key: "",
-      dev_mode: False,
     )
-  let assert Ok(subject) = runtime.start(config)
+  let assert Ok(subject) = runtime.start(config, test_context())
   let transport_subject = process.new_subject()
 
   // Connect
@@ -640,7 +833,7 @@ pub fn live_update_does_not_render_server_view_test() {
 }
 
 pub fn runtime_shutdown_test() {
-  let assert Ok(subject) = runtime.start(counter_config())
+  let assert Ok(subject) = runtime.start(counter_config(), test_context())
   process.send(subject, runtime.Shutdown)
   // Give it time to shut down
   process.sleep(50)
@@ -651,7 +844,7 @@ pub fn runtime_shutdown_test() {
 pub fn runtime_shutdown_stops_periodic_effects_test() {
   let proof_subject = process.new_subject()
   let config =
-    runtime.RuntimeConfig(..counter_config(), init: fn() {
+    runtime.RuntimeConfig(..counter_config(), init: fn(_ctx) {
       #(
         CounterModel(count: 0),
         effect.every(25, fn() {
@@ -661,7 +854,7 @@ pub fn runtime_shutdown_stops_periodic_effects_test() {
       )
     })
 
-  let assert Ok(subject) = runtime.start(config)
+  let assert Ok(subject) = runtime.start(config, test_context())
   let assert Ok("tick") = process.receive(proof_subject, 250)
   process.send(subject, runtime.Shutdown)
   let _ = process.receive(proof_subject, 50)
@@ -682,7 +875,7 @@ pub fn runtime_shutdown_stops_dynamic_subscription_listener_test() {
       }),
     )
 
-  let assert Ok(subject) = runtime.start(config)
+  let assert Ok(subject) = runtime.start(config, test_context())
   process.sleep(50)
   process.send(subject, runtime.Shutdown)
   process.sleep(50)
@@ -691,7 +884,7 @@ pub fn runtime_shutdown_stops_dynamic_subscription_listener_test() {
 }
 
 pub fn client_request_sync_sends_model_sync_without_mount_test() {
-  let assert Ok(subject) = runtime.start(counter_config())
+  let assert Ok(subject) = runtime.start(counter_config(), test_context())
   let transport_subject = process.new_subject()
 
   process.send(
@@ -732,8 +925,8 @@ fn recovery_config(
 ) -> runtime.RuntimeConfig(CounterModel, CounterMsg) {
   runtime.RuntimeConfig(
     ..counter_config(),
-    serialize_model: option.Some(fn(m: CounterModel) { int.to_string(m.count) }),
-    deserialize_model: option.Some(fn(s: String) {
+    encode_model: fn(m: CounterModel) { int.to_string(m.count) },
+    restore_model: option.Some(fn(s: String) {
       case int.parse(s) {
         Ok(n) -> Ok(CounterModel(count: n))
         Error(Nil) -> Error("invalid count")
@@ -765,7 +958,8 @@ fn join_and_receive(
 const recovery_secret = "runtime-test-secret-key-0123456789"
 
 pub fn state_recovery_rejects_token_signed_with_other_secret_test() {
-  let assert Ok(subject) = runtime.start(recovery_config(recovery_secret))
+  let assert Ok(subject) =
+    runtime.start(recovery_config(recovery_secret), test_context())
   let token =
     runtime.create_state_token(
       CounterModel(count: 3),
@@ -778,7 +972,8 @@ pub fn state_recovery_rejects_token_signed_with_other_secret_test() {
 }
 
 pub fn state_recovery_rejects_tampered_token_test() {
-  let assert Ok(subject) = runtime.start(recovery_config(recovery_secret))
+  let assert Ok(subject) =
+    runtime.start(recovery_config(recovery_secret), test_context())
   let token =
     runtime.create_state_token(
       CounterModel(count: 3),
@@ -791,7 +986,7 @@ pub fn state_recovery_rejects_tampered_token_test() {
 }
 
 pub fn state_recovery_ignores_token_when_secret_empty_test() {
-  let assert Ok(subject) = runtime.start(recovery_config(""))
+  let assert Ok(subject) = runtime.start(recovery_config(""), test_context())
   let token =
     runtime.create_state_token(
       CounterModel(count: 3),
@@ -803,7 +998,8 @@ pub fn state_recovery_ignores_token_when_secret_empty_test() {
 }
 
 pub fn state_recovery_rejects_session_bound_token_without_session_test() {
-  let assert Ok(subject) = runtime.start(recovery_config(recovery_secret))
+  let assert Ok(subject) =
+    runtime.start(recovery_config(recovery_secret), test_context())
   let token =
     ssr.sign_join_token(
       recovery_secret,
@@ -816,7 +1012,8 @@ pub fn state_recovery_rejects_session_bound_token_without_session_test() {
 }
 
 pub fn state_recovery_rejects_token_for_other_session_test() {
-  let assert Ok(subject) = runtime.start(recovery_config(recovery_secret))
+  let assert Ok(subject) =
+    runtime.start(recovery_config(recovery_secret), test_context())
   let token =
     ssr.sign_join_token(
       recovery_secret,
@@ -846,7 +1043,8 @@ pub fn state_recovery_rejects_token_for_other_session_test() {
 }
 
 pub fn state_recovery_rejects_expired_token_test() {
-  let assert Ok(subject) = runtime.start(recovery_config(recovery_secret))
+  let assert Ok(subject) =
+    runtime.start(recovery_config(recovery_secret), test_context())
   // Issued two days ago: past the join token lifetime.
   let token =
     ssr.sign_join_token(
@@ -860,7 +1058,8 @@ pub fn state_recovery_rejects_expired_token_test() {
 }
 
 pub fn state_recovery_rejects_model_the_deserializer_refuses_test() {
-  let assert Ok(subject) = runtime.start(recovery_config(recovery_secret))
+  let assert Ok(subject) =
+    runtime.start(recovery_config(recovery_secret), test_context())
   let token =
     ssr.sign_join_token(
       recovery_secret,
@@ -875,7 +1074,8 @@ pub fn state_recovery_rejects_model_the_deserializer_refuses_test() {
 pub fn state_recovery_only_applies_to_first_join_test() {
   // A second connection joining a live runtime must not replace the model
   // the first connection is already looking at.
-  let assert Ok(subject) = runtime.start(recovery_config(recovery_secret))
+  let assert Ok(subject) =
+    runtime.start(recovery_config(recovery_secret), test_context())
   let #(_, first) = join_and_receive(subject, "first_conn", "")
   let assert transport.SendModelSync(model_json: "0", ..) = first
   let token =
@@ -889,7 +1089,8 @@ pub fn state_recovery_only_applies_to_first_join_test() {
 }
 
 pub fn state_recovery_from_token_test() {
-  let assert Ok(subject) = runtime.start(recovery_config(recovery_secret))
+  let assert Ok(subject) =
+    runtime.start(recovery_config(recovery_secret), test_context())
   let token =
     runtime.create_state_token(
       CounterModel(count: 3),
@@ -903,7 +1104,8 @@ pub fn state_recovery_from_token_test() {
 }
 
 pub fn state_recovery_from_session_bound_token_test() {
-  let assert Ok(subject) = runtime.start(recovery_config(recovery_secret))
+  let assert Ok(subject) =
+    runtime.start(recovery_config(recovery_secret), test_context())
   let fingerprint = ssr.fingerprint_session_id("session-a")
   let token =
     ssr.sign_join_token(
@@ -939,23 +1141,18 @@ pub fn model_sync_sent_after_event_test() {
     runtime.RuntimeConfig(
       init: counter_init,
       update: counter_update,
-      view: counter_view,
-      decode_event: option.Some(counter_decode_event),
-      serialize_model: option.Some(fn(m: CounterModel) {
+      decode_event: counter_decode_event,
+      encode_model: fn(m: CounterModel) {
         "{\"count\":" <> int.to_string(m.count) <> "}"
-      }),
-      deserialize_model: option.None,
-      route_patterns: [],
-      on_route_change: option.None,
-      on_route_leave: option.None,
+      },
+      route: option.None,
+      restore_model: option.None,
       dynamic_subscriptions: option.None,
       on_notify: option.None,
       on_notification: option.None,
-      init_from_request: option.None,
       secret_key: "",
-      dev_mode: False,
     )
-  let assert Ok(subject) = runtime.start(config)
+  let assert Ok(subject) = runtime.start(config, test_context())
   let transport_subject = process.new_subject()
 
   process.send(
@@ -1011,16 +1208,13 @@ fn drain_messages(subject, acc) {
   }
 }
 
-@external(erlang, "beacon_test_ffi", "do_crash")
-fn crash_for_test() -> element.Node(CounterMsg)
-
 // === Patch optimization proof tests ===
 
 pub fn sends_patch_not_model_sync_after_join_test() {
   // After the initial join (which sends model_sync), subsequent events
   // MUST produce SendPatch, NOT SendModelSync. This catches regressions.
   let config = counter_config()
-  let assert Ok(subject) = runtime.start(config)
+  let assert Ok(subject) = runtime.start(config, test_context())
   let transport_subject = process.new_subject()
 
   process.send(
@@ -1084,7 +1278,7 @@ pub fn sends_patch_not_model_sync_after_join_test() {
 pub fn patch_contains_only_changed_field_test() {
   // After incrementing count, the patch should only contain /count
   let config = counter_config()
-  let assert Ok(subject) = runtime.start(config)
+  let assert Ok(subject) = runtime.start(config, test_context())
   let transport_subject = process.new_subject()
 
   process.send(
@@ -1135,7 +1329,7 @@ pub fn client_ops_are_ignored_server_update_authoritative_test() {
   // Client-sent patch ops are untrusted optimization hints. The server must
   // run its own update function and publish the server-computed result.
   let config = counter_config()
-  let assert Ok(subject) = runtime.start(config)
+  let assert Ok(subject) = runtime.start(config, test_context())
   let transport_subject = process.new_subject()
 
   process.send(
@@ -1233,7 +1427,7 @@ pub fn client_ops_are_ignored_server_update_authoritative_test() {
 
 pub fn post_mount_updates_never_send_html_mount_test() {
   let config = counter_config()
-  let assert Ok(subject) = runtime.start(config)
+  let assert Ok(subject) = runtime.start(config, test_context())
   let transport_subject = process.new_subject()
 
   process.send(
@@ -1287,7 +1481,7 @@ pub fn post_mount_updates_never_send_html_mount_test() {
 }
 
 pub fn slow_client_mailbox_triggers_backpressure_close_test() {
-  let assert Ok(subject) = runtime.start(counter_config())
+  let assert Ok(subject) = runtime.start(counter_config(), test_context())
   let transport_subject = process.new_subject()
 
   process.send(
@@ -1342,122 +1536,10 @@ fn fill_transport_mailbox(
   }
 }
 
-pub fn explicit_decode_event_skips_server_view_render_on_join_and_update_test() {
-  let view_subject = process.new_subject()
-  let config =
-    runtime.RuntimeConfig(
-      init: counter_init,
-      update: counter_update,
-      view: fn(model: CounterModel) {
-        process.send(view_subject, "view")
-        counter_view(model)
-      },
-      decode_event: option.Some(counter_decode_event),
-      serialize_model: option.Some(fn(model: CounterModel) {
-        "{\"count\":" <> int.to_string(model.count) <> "}"
-      }),
-      deserialize_model: option.None,
-      route_patterns: [],
-      on_route_change: option.None,
-      on_route_leave: option.None,
-      dynamic_subscriptions: option.None,
-      on_notify: option.None,
-      on_notification: option.None,
-      init_from_request: option.None,
-      secret_key: "",
-      dev_mode: False,
-    )
-  let assert Ok(subject) = runtime.start(config)
-  let transport_subject = process.new_subject()
-
-  process.send(
-    subject,
-    runtime.ClientConnected(conn_id: "decode_fast", subject: transport_subject),
-  )
-  process.sleep(20)
-  process.send(
-    subject,
-    runtime.ClientJoined(conn_id: "decode_fast", token: "", path: "/"),
-  )
-  process.sleep(50)
-  let assert 0 = count_string_messages(view_subject, 0)
-  let _ = drain_messages(transport_subject, [])
-
-  process.send(
-    subject,
-    runtime.ClientEventReceived(
-      conn_id: "decode_fast",
-      event_name: "click",
-      handler_id: "increment",
-      event_data: "{}",
-      target_path: "0",
-      clock: 1,
-      ops: "",
-    ),
-  )
-  process.sleep(50)
-
-  let assert 0 = count_string_messages(view_subject, 0)
-  let msgs = drain_messages(transport_subject, [])
-  let has_state_update =
-    list.any(msgs, fn(m) {
-      case m {
-        transport.SendPatch(..) -> True
-        transport.SendModelSync(..) -> True
-        _ -> False
-      }
-    })
-  let assert True = has_state_update
-}
-
-pub fn runtime_requires_event_decoder_test() {
-  let view_subject = process.new_subject()
-  let config =
-    runtime.RuntimeConfig(
-      init: counter_init,
-      update: counter_update,
-      view: fn(model: CounterModel) {
-        process.send(view_subject, "view")
-        element.el(
-          "button",
-          [element.on("click", handler.register_simple(Increment))],
-          [
-            element.text(int.to_string(model.count)),
-          ],
-        )
-      },
-      decode_event: option.None,
-      serialize_model: option.Some(fn(model: CounterModel) {
-        "{\"count\":" <> int.to_string(model.count) <> "}"
-      }),
-      deserialize_model: option.None,
-      route_patterns: [],
-      on_route_change: option.None,
-      on_route_leave: option.None,
-      dynamic_subscriptions: option.None,
-      on_notify: option.None,
-      on_notification: option.None,
-      init_from_request: option.None,
-      secret_key: "",
-      dev_mode: False,
-    )
-  let assert Error(error.ConfigError(reason: reason)) = runtime.start(config)
-  let assert True = string.contains(reason, "Missing event decoder")
-  let assert 0 = count_string_messages(view_subject, 0)
-}
-
-fn count_string_messages(subject: process.Subject(String), count: Int) -> Int {
-  let selector = process.new_selector() |> process.select(subject)
-  case process.selector_receive(selector, 100) {
-    Ok(_) -> count_string_messages(subject, count + 1)
-    Error(Nil) -> count
-  }
-}
-
 pub fn multiple_increments_produce_patches_test() {
   // After join, sending 5 increments should produce 5 patches (not model_syncs)
   let config = counter_config()
-  let assert Ok(subject) = runtime.start(config)
+  let assert Ok(subject) = runtime.start(config, test_context())
   let transport_subject = process.new_subject()
 
   process.send(
@@ -1515,7 +1597,7 @@ pub fn patch_content_correct_after_many_increments_test() {
   // After 10 increments (with waits), the final patch should contain "10"
   // and every patch should be small (< 50 bytes).
   let config = counter_config()
-  let assert Ok(subject) = runtime.start(config)
+  let assert Ok(subject) = runtime.start(config, test_context())
   let transport_subject = process.new_subject()
 
   process.send(
@@ -1576,7 +1658,7 @@ pub fn server_state_not_in_model_sync_test() {
   // Model + Server wrapped as #(Model, Server), serializer only encodes Model part
   let config =
     runtime.RuntimeConfig(
-      init: fn() {
+      init: fn(_ctx) {
         // Combined: #(Model, Server) — server state is api_key
         #(#(CounterModel(count: 0), "secret_api_key"), effect.none())
       },
@@ -1590,29 +1672,20 @@ pub fn server_state_not_in_model_sync_test() {
           _ -> #(#(model, server), effect.none())
         }
       },
-      view: fn(combined) {
-        // View only uses model part — server part is never accessed
-        let #(model, _server) = combined
-        element.el("div", [], [element.text(int.to_string(model.count))])
-      },
-      decode_event: option.Some(counter_decode_event),
+      decode_event: counter_decode_event,
       // Serializer only encodes the Model part, NOT the server state
-      serialize_model: option.Some(fn(combined: #(CounterModel, String)) {
+      encode_model: fn(combined: #(CounterModel, String)) {
         let #(model, _server) = combined
         "{\"count\":" <> int.to_string(model.count) <> "}"
-      }),
-      deserialize_model: option.None,
-      route_patterns: [],
-      on_route_change: option.None,
-      on_route_leave: option.None,
+      },
+      route: option.None,
+      restore_model: option.None,
       dynamic_subscriptions: option.None,
       on_notify: option.None,
       on_notification: option.None,
-      init_from_request: option.None,
       secret_key: "",
-      dev_mode: False,
     )
-  let assert Ok(subject) = runtime.start(config)
+  let assert Ok(subject) = runtime.start(config, test_context())
   let transport_subject = process.new_subject()
 
   process.send(
@@ -1652,7 +1725,7 @@ pub fn server_state_background_effect_pushes_update_test() {
   // to the client when serialize_model is set for #(Model, Server).
   let config =
     runtime.RuntimeConfig(
-      init: fn() {
+      init: fn(_ctx) {
         #(#(CounterModel(count: 0), "server_secret"), effect.none())
       },
       update: fn(combined, msg) {
@@ -1665,27 +1738,19 @@ pub fn server_state_background_effect_pushes_update_test() {
           _ -> #(#(model, server), effect.none())
         }
       },
-      view: fn(combined) {
-        let #(model, _server) = combined
-        element.el("div", [], [element.text(int.to_string(model.count))])
-      },
-      decode_event: option.Some(counter_decode_event),
-      serialize_model: option.Some(fn(combined: #(CounterModel, String)) {
+      decode_event: counter_decode_event,
+      encode_model: fn(combined: #(CounterModel, String)) {
         let #(model, _server) = combined
         "{\"count\":" <> int.to_string(model.count) <> "}"
-      }),
-      deserialize_model: option.None,
-      route_patterns: [],
-      on_route_change: option.None,
-      on_route_leave: option.None,
+      },
+      route: option.None,
+      restore_model: option.None,
       dynamic_subscriptions: option.None,
       on_notify: option.None,
       on_notification: option.None,
-      init_from_request: option.None,
       secret_key: "",
-      dev_mode: False,
     )
-  let assert Ok(subject) = runtime.start(config)
+  let assert Ok(subject) = runtime.start(config, test_context())
   let transport_subject = process.new_subject()
 
   // Connect and join
@@ -1737,7 +1802,9 @@ pub fn server_state_user_event_pushes_update_test() {
   // to the client when serialize_model is set for #(Model, Server).
   let config =
     runtime.RuntimeConfig(
-      init: fn() { #(#(CounterModel(count: 0), "private_key"), effect.none()) },
+      init: fn(_ctx) {
+        #(#(CounterModel(count: 0), "private_key"), effect.none())
+      },
       update: fn(combined, msg) {
         let #(model, server) = combined
         case msg {
@@ -1748,27 +1815,19 @@ pub fn server_state_user_event_pushes_update_test() {
           _ -> #(#(model, server), effect.none())
         }
       },
-      view: fn(combined) {
-        let #(model, _server) = combined
-        element.el("div", [], [element.text(int.to_string(model.count))])
-      },
-      decode_event: option.Some(counter_decode_event),
-      serialize_model: option.Some(fn(combined: #(CounterModel, String)) {
+      decode_event: counter_decode_event,
+      encode_model: fn(combined: #(CounterModel, String)) {
         let #(model, _server) = combined
         "{\"count\":" <> int.to_string(model.count) <> "}"
-      }),
-      deserialize_model: option.None,
-      route_patterns: [],
-      on_route_change: option.None,
-      on_route_leave: option.None,
+      },
+      route: option.None,
+      restore_model: option.None,
       dynamic_subscriptions: option.None,
       on_notify: option.None,
       on_notification: option.None,
-      init_from_request: option.None,
       secret_key: "",
-      dev_mode: False,
     )
-  let assert Ok(subject) = runtime.start(config)
+  let assert Ok(subject) = runtime.start(config, test_context())
   let transport_subject = process.new_subject()
 
   // Connect and join — view renders button with on_click handler
@@ -1832,7 +1891,7 @@ pub fn server_state_user_event_pushes_update_test() {
 pub fn runtime_handles_malformed_event_data_test() {
   // Send an event with a valid handler_id but garbage event_data.
   // The runtime must stay alive and send an error (not crash).
-  let assert Ok(subject) = runtime.start(counter_config())
+  let assert Ok(subject) = runtime.start(counter_config(), test_context())
   let transport_subject = process.new_subject()
 
   process.send(
@@ -1897,7 +1956,7 @@ pub fn runtime_handles_rapid_events_test() {
   // Send 50 events in rapid succession (no sleep between).
   // Verify runtime processes all of them and final state is correct.
   let config = counter_config()
-  let assert Ok(subject) = runtime.start(config)
+  let assert Ok(subject) = runtime.start(config, test_context())
   let transport_subject = process.new_subject()
 
   process.send(
@@ -1963,8 +2022,8 @@ pub fn runtime_handles_rapid_events_test() {
 pub fn connection_isolation_test() {
   // Verify connection B's state is NOT affected by connection A's events.
   // Per-connection runtimes mean each start() creates an independent actor.
-  let assert Ok(subject_a) = runtime.start(counter_config())
-  let assert Ok(subject_b) = runtime.start(counter_config())
+  let assert Ok(subject_a) = runtime.start(counter_config(), test_context())
+  let assert Ok(subject_b) = runtime.start(counter_config(), test_context())
   let transport_a = process.new_subject()
   let transport_b = process.new_subject()
 
@@ -2073,23 +2132,18 @@ pub fn on_update_effect_is_invoked_test() {
     runtime.RuntimeConfig(
       init: counter_init,
       update: wrapped_update,
-      view: counter_view,
-      decode_event: option.Some(counter_decode_event),
-      serialize_model: option.Some(fn(model: CounterModel) {
+      decode_event: counter_decode_event,
+      encode_model: fn(model: CounterModel) {
         "{\"count\":" <> int.to_string(model.count) <> "}"
-      }),
-      deserialize_model: option.None,
-      route_patterns: [],
-      on_route_change: option.None,
-      on_route_leave: option.None,
+      },
+      route: option.None,
+      restore_model: option.None,
       dynamic_subscriptions: option.None,
       on_notify: option.None,
       on_notification: option.None,
-      init_from_request: option.None,
       secret_key: "",
-      dev_mode: False,
     )
-  let assert Ok(subject) = runtime.start(config)
+  let assert Ok(subject) = runtime.start(config, test_context())
   let transport_subject = process.new_subject()
 
   // Connect
@@ -2136,129 +2190,88 @@ pub fn on_update_effect_is_invoked_test() {
   }
 }
 
-/// Verify that init_from_request replaces the default init when provided.
-/// This tests the core of ws_init: the runtime uses init_from_request(req)
-/// instead of init() when both are available.
-pub fn init_from_request_replaces_default_init_test() {
-  // Create a fake request with a cookie
-  // Use request.set_body to give it the Connection type
-  let fake_req =
-    request.new()
-    |> request.set_body(server.Connection(socket: fake_socket()))
-    |> request.set_header("cookie", "user_id=42")
-
-  // Default init creates count:0
-  // init_from_request reads cookie and creates count based on user_id
-  let init_from_req = fn(req: request.Request(server.Connection)) -> #(
-    CounterModel,
-    effect.Effect(CounterMsg),
-  ) {
-    case request.get_header(req, "cookie") {
-      Ok(cookie_val) -> {
-        // Parse "user_id=42" → use 42 as initial count
-        case string.split(cookie_val, "=") {
-          [_, val] ->
-            case int.parse(val) {
-              Ok(n) -> #(CounterModel(count: n), effect.none())
-              Error(Nil) -> #(CounterModel(count: -1), effect.none())
-            }
-          _ -> #(CounterModel(count: -1), effect.none())
-        }
+/// An init that seeds the count from the `user_id` cookie, -1 without one.
+fn cookie_init(
+  ctx: context.Context,
+) -> #(CounterModel, effect.Effect(CounterMsg)) {
+  let count = case context.cookie(ctx, "user_id") {
+    Ok(raw) ->
+      case int.parse(raw) {
+        Ok(n) -> n
+        Error(Nil) -> -2
       }
-      Error(Nil) -> #(CounterModel(count: -1), effect.none())
-    }
+    Error(Nil) -> -1
   }
+  #(CounterModel(count: count), effect.none())
+}
 
-  let config =
-    runtime.RuntimeConfig(
-      init: counter_init,
-      update: counter_update,
-      view: counter_view,
-      decode_event: option.Some(counter_decode_event),
-      serialize_model: option.Some(fn(model: CounterModel) {
-        "{\"count\":" <> int.to_string(model.count) <> "}"
-      }),
-      deserialize_model: option.None,
-      route_patterns: [],
-      on_route_change: option.None,
-      on_route_leave: option.None,
-      dynamic_subscriptions: option.None,
-      on_notify: option.None,
-      on_notification: option.None,
-      init_from_request: option.Some(init_from_req),
-      secret_key: "",
-      dev_mode: False,
-    )
+fn has_count_sync(msgs: List(transport.InternalMessage), count: Int) -> Bool {
+  list.any(msgs, fn(m) {
+    case m {
+      transport.SendModelSync(model_json: json, ..) ->
+        string.contains(json, "\"count\":" <> int.to_string(count) <> "}")
+      _ -> False
+    }
+  })
+}
 
-  // Use start_and_connect_with_request which should use init_from_request
+/// The connected mount's init sees the upgrade request's cookies.
+pub fn connected_init_reads_request_cookie_test() {
+  let req =
+    ws_request(option.Some("path=%2F"))
+    |> request.set_header("cookie", "user_id=42")
+  let config = runtime.RuntimeConfig(..counter_config(), init: cookie_init)
   let transport_subject = process.new_subject()
-  let assert Ok(#(on_event, _shutdown)) =
+  let assert Ok(#(on_event, shutdown)) =
     runtime.start_and_connect_with_request(
       config,
       "ws_init_conn",
       transport_subject,
-      option.Some(fake_req),
+      req,
     )
-
-  // Send ClientJoin; the runtime will send back model state.
   on_event("ws_init_conn", transport.ClientJoin(token: "", path: "/"))
-  process.sleep(200)
-
-  // Drain the transport subject for messages
+  process.sleep(100)
   let msgs = drain_messages(transport_subject, [])
-  // Look for a model_sync containing "42" (the count from cookie).
-  let has_42 =
+  let assert True = has_count_sync(msgs, 42)
+  let assert False =
     list.any(msgs, fn(m) {
       case m {
-        transport.SendModelSync(model_json: json, ..) ->
-          string.contains(json, "\"count\":42")
-        transport.SendMount(..) -> False
+        transport.SendMount(..) -> True
         _ -> False
       }
     })
-  let assert True = has_42
+  shutdown()
 }
 
-/// Without init_from_request, the default init is used (count:0).
-pub fn init_from_request_none_uses_default_init_test() {
-  let config =
-    runtime.RuntimeConfig(
-      init: counter_init,
-      update: counter_update,
-      view: counter_view,
-      decode_event: option.Some(counter_decode_event),
-      serialize_model: option.Some(fn(model: CounterModel) {
-        "{\"count\":" <> int.to_string(model.count) <> "}"
-      }),
-      deserialize_model: option.None,
-      route_patterns: [],
-      on_route_change: option.None,
-      on_route_leave: option.None,
-      dynamic_subscriptions: option.None,
-      on_notify: option.None,
-      on_notification: option.None,
-      init_from_request: option.None,
-      secret_key: "",
-      dev_mode: False,
-    )
-
-  // start_and_connect (no request) should use default init (count:0)
+/// Without a request, init gets the context it was handed (no cookies).
+pub fn start_and_connect_uses_given_context_test() {
+  let config = runtime.RuntimeConfig(..counter_config(), init: cookie_init)
   let transport_subject = process.new_subject()
-  let assert Ok(#(on_event, _shutdown)) =
-    runtime.start_and_connect(config, "default_init_conn", transport_subject)
+  let assert Ok(#(on_event, shutdown)) =
+    runtime.start_and_connect(
+      config,
+      test_context(),
+      "default_init_conn",
+      transport_subject,
+    )
   on_event("default_init_conn", transport.ClientJoin(token: "", path: "/"))
-  process.sleep(200)
-  let msgs = drain_messages(transport_subject, [])
-  let has_0 =
-    list.any(msgs, fn(m) {
-      case m {
-        transport.SendModelSync(model_json: json, ..) ->
-          string.contains(json, "\"count\":0")
-        transport.SendMount(..) -> False
-        _ -> False
-      }
-    })
-  let assert True = has_0
+  process.sleep(100)
+  let assert True = has_count_sync(drain_messages(transport_subject, []), -1)
+  shutdown()
+}
+
+/// A WebSocket upgrade without `?path=` is refused before any runtime starts.
+pub fn start_and_connect_with_request_refuses_missing_path_test() {
+  let transport_subject = process.new_subject()
+  let assert Error(error.RuntimeError(reason: reason)) =
+    runtime.start_and_connect_with_request(
+      counter_config(),
+      "no_path_conn",
+      transport_subject,
+      ws_request(option.None),
+    )
+  let assert True = string.contains(reason, "no path parameter")
+  let assert Error(Nil) = process.receive(transport_subject, 50)
 }
 
 pub fn join_recovers_state_from_httponly_cookie_test() {
@@ -2266,134 +2279,36 @@ pub fn join_recovers_state_from_httponly_cookie_test() {
   let serialize = fn(model: CounterModel) { int.to_string(model.count) }
   let token =
     runtime.create_state_token(CounterModel(count: 77), serialize, secret)
-  let fake_req =
-    request.new()
-    |> request.set_body(server.Connection(socket: fake_socket()))
+  let req =
+    ws_request(option.Some("path=%2F"))
     |> request.set_header("cookie", ssr.session_cookie_name <> "=" <> token)
 
   let config =
     runtime.RuntimeConfig(
-      init: counter_init,
-      update: counter_update,
-      view: counter_view,
-      decode_event: option.Some(counter_decode_event),
-      serialize_model: option.Some(fn(model: CounterModel) {
-        "{\"count\":" <> int.to_string(model.count) <> "}"
-      }),
-      deserialize_model: option.Some(fn(raw: String) {
+      ..counter_config(),
+      restore_model: option.Some(fn(raw: String) {
         case int.parse(raw) {
           Ok(count) -> Ok(CounterModel(count: count))
           Error(Nil) -> Error("invalid count")
         }
       }),
-      route_patterns: [],
-      on_route_change: option.None,
-      on_route_leave: option.None,
-      dynamic_subscriptions: option.None,
-      on_notify: option.None,
-      on_notification: option.None,
-      init_from_request: option.None,
       secret_key: secret,
-      dev_mode: False,
     )
 
   let transport_subject = process.new_subject()
-  let assert Ok(#(on_event, _shutdown)) =
+  let assert Ok(#(on_event, shutdown)) =
     runtime.start_and_connect_with_request(
       config,
       "cookie_join_conn",
       transport_subject,
-      option.Some(fake_req),
+      req,
     )
 
   on_event(
     "cookie_join_conn",
     transport.ClientJoin(token: "malicious-client-token", path: "/"),
   )
-  process.sleep(200)
-
-  let msgs = drain_messages(transport_subject, [])
-  let has_cookie_model =
-    list.any(msgs, fn(m) {
-      case m {
-        transport.SendModelSync(model_json: json, ..) ->
-          string.contains(json, "\"count\":77")
-        transport.SendMount(..) -> False
-        _ -> False
-      }
-    })
-  let assert True = has_cookie_model
-}
-
-/// Regression test: live join model sync must reflect the ws_init model, not the default init.
-pub fn model_sync_reflects_ws_init_model_test() {
-  // ws_init sets count to 99 (simulating auth-populated state)
-  let init_from_req = fn(_req: request.Request(server.Connection)) -> #(
-    CounterModel,
-    effect.Effect(CounterMsg),
-  ) {
-    #(CounterModel(count: 99), effect.none())
-  }
-
-  let config =
-    runtime.RuntimeConfig(
-      init: counter_init,
-      update: counter_update,
-      view: counter_view,
-      decode_event: option.Some(counter_decode_event),
-      serialize_model: option.Some(fn(model: CounterModel) {
-        "{\"count\":" <> int.to_string(model.count) <> "}"
-      }),
-      deserialize_model: option.None,
-      route_patterns: [],
-      on_route_change: option.None,
-      on_route_leave: option.None,
-      dynamic_subscriptions: option.None,
-      on_notify: option.None,
-      on_notification: option.None,
-      init_from_request: option.Some(init_from_req),
-      secret_key: "",
-      dev_mode: False,
-    )
-
-  let fake_req =
-    request.new()
-    |> request.set_body(server.Connection(socket: fake_socket()))
-    |> request.set_header("cookie", "session=test")
-
-  let transport_subject = process.new_subject()
-  let assert Ok(#(on_event, _shutdown)) =
-    runtime.start_and_connect_with_request(
-      config,
-      "ws_init_sync_conn",
-      transport_subject,
-      option.Some(fake_req),
-    )
-
-  // Join — sends authoritative model state without remounting SSR HTML.
-  on_event("ws_init_sync_conn", transport.ClientJoin(token: "", path: "/"))
-  process.sleep(200)
-
-  let msgs = drain_messages(transport_subject, [])
-
-  // The model sync MUST contain "99" (from ws_init), not "0" (from default init).
-  let sync_has_99 =
-    list.any(msgs, fn(m) {
-      case m {
-        transport.SendModelSync(model_json: json, ..) ->
-          string.contains(json, "\"count\":99")
-        _ -> False
-      }
-    })
-  let assert True = sync_has_99
-
-  // Verify join did not remount HTML.
-  let mount_msgs =
-    list.filter_map(msgs, fn(m) {
-      case m {
-        transport.SendMount(payload: html) -> Ok(html)
-        _ -> Error(Nil)
-      }
-    })
-  let assert 0 = list.length(mount_msgs)
+  process.sleep(100)
+  let assert True = has_count_sync(drain_messages(transport_subject, []), 77)
+  shutdown()
 }

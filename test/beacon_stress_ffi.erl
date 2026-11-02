@@ -69,7 +69,7 @@ mask_payload(Payload, Mask, Index, Acc) ->
 upgrade(Socket, Host) ->
     Key = base64:encode(crypto:strong_rand_bytes(16)),
     Request = iolist_to_binary([
-        <<"GET /ws HTTP/1.1\r\n">>,
+        <<"GET /ws?path=%2F HTTP/1.1\r\n">>,
         <<"Host: ">>, Host, <<"\r\n">>,
         <<"Origin: http://">>, Host, <<"\r\n">>,
         <<"Upgrade: websocket\r\n">>,

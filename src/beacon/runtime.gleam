@@ -18,15 +18,23 @@
 /// `ack_clock` is per connection: the highest event clock that connection
 /// sent which the server has processed. It is never shared between
 /// connections.
+///
+/// ## Routing (LiveView mount + handle_params)
+///
+/// `start` runs `init(ctx)` and then, when the app has a router, `update`
+/// with the route message for `ctx`'s URL, before anything is rendered. A
+/// client navigation runs `update` with the new route's message; a URL the
+/// app does not route (or whose encoding does not decode) is answered with
+/// a hard navigation, so the server's dead render produces the 404 or 400.
 import beacon/cookie
 import beacon/effect.{type Effect}
-import beacon/element.{type Node}
 import beacon/error
+import beacon/internal/context.{type Context}
+import beacon/internal/uri_check
 import beacon/log
 import beacon/notification.{type Notification, Notification}
 import beacon/patch
 import beacon/pubsub
-import beacon/route
 import beacon/ssr
 import beacon/transport
 import beacon/transport/server
@@ -35,39 +43,25 @@ import gleam/dynamic.{type Dynamic}
 import gleam/erlang/process.{type Pid, type Subject}
 import gleam/http/request
 import gleam/int
-import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
+import gleam/result
 import gleam/set.{type Set}
 import gleam/string
+import gleam/uri.{type Uri}
 
 /// The client-visible model JSON every joined connection currently holds
 /// (at `revision`). Diffs are computed against it.
 ///
-/// Invariant: when the cache is not `NoCache` it equals the snapshot of the
+/// Invariant: when the cache is not `NoCache` it equals the JSON of the
 /// runtime's current model as last sent to every joined connection.
 pub type CachedModelState {
   /// Nothing trustworthy is cached (no joined connections yet, or the last
   /// broadcast failed). The next broadcast is a full `model_sync`.
   NoCache
-  /// No substates — the full model JSON.
+  /// The full client-visible model JSON.
   FullModelCache(json: String)
-  /// Substates — per-substate JSON plus the flat (non-substate) fields JSON.
-  SubstateCache(substate_jsons: Dict(String, String), flat_fields_json: String)
-}
-
-/// The generated per-substate encoders, resolved once at start.
-@internal
-pub type SubstateCodecs(model) {
-  /// The model has no substates: diff the full model JSON.
-  NoSubstates
-  /// Encode each substate and the flat fields independently so unchanged
-  /// substates skip diffing.
-  Substates(
-    encoders: List(#(String, fn(model) -> String)),
-    flat: fn(model) -> String,
-  )
 }
 
 /// Messages the runtime actor can receive.
@@ -126,14 +120,15 @@ pub type RuntimeMessage(msg) {
   Shutdown
 }
 
-/// The runtime's internal state.
+/// The runtime's internal state. `model` is the app's server state (for
+/// `full_application`, the state record that `sync` projects).
 pub type RuntimeState(model, msg) {
   RuntimeState(
-    /// The application's current model.
+    /// The application's current server state.
     model: model,
-    /// The update function: model + message → new model + effects.
+    /// The update function: state + message → new state + effects.
     update: fn(model, msg) -> #(model, Effect(msg)),
-    /// Decodes client events into user messages (configured or generated).
+    /// Decodes client events into user messages.
     decode_event: fn(String, String, String, String) ->
       Result(msg, error.BeaconError),
     /// Currently connected clients: conn_id → transport subject.
@@ -153,23 +148,20 @@ pub type RuntimeState(model, msg) {
     accepted_first_join: Bool,
     /// The runtime's own subject for dispatching effect messages.
     self: Subject(RuntimeMessage(msg)),
-    /// Client-visible model encoder, resolved once at start (generated
-    /// `beacon_codec.encode_model` first, else the configured serializer).
-    model_encoder: Option(fn(model) -> String),
-    /// Generated substate encoders, resolved once at start.
-    substate_codecs: SubstateCodecs(model),
-    /// Deserialize model from string for state recovery.
-    deserialize_model: Option(fn(String) -> Result(model, String)),
+    /// Client-visible model encoder (the generated codec over `sync`).
+    model_encoder: fn(model) -> String,
+    /// Rebuild the server state from join-token model JSON (state recovery).
+    restore_model: Option(fn(String) -> Result(model, String)),
     /// Secret key for join tokens.
     secret_key: String,
-    /// Route patterns for URL matching.
-    route_patterns: List(route.RoutePattern),
-    /// Called when URL changes — produces a Msg for the update loop.
-    on_route_change: Option(fn(route.Route) -> msg),
-    /// Called before a client-side route transition is applied.
-    on_route_leave: Option(fn(route.Route, route.Route) -> Effect(msg)),
-    /// Most recently matched client route, used to gate route handlers.
-    current_route: Option(route.Route),
+    /// The app's `parse` composed with `on_change`, when it has a router.
+    route: Option(fn(Uri) -> Result(msg, Nil)),
+    /// The URL the session was started for. A navigation path replaces its
+    /// path and query; scheme, host and port stay.
+    page_uri: Uri,
+    /// The route message last applied, so a join for the same route does
+    /// not run `on_change` again.
+    current_route_msg: Option(msg),
     /// Subject for sending commands to the PubSub listener process.
     listener_subject: Option(Subject(ListenerCommand)),
     /// Current set of dynamic subscriptions (for diffing).
@@ -183,113 +175,101 @@ pub type RuntimeState(model, msg) {
   )
 }
 
-/// Configuration needed to start a runtime.
-pub type RuntimeConfig(model, msg) {
+/// Configuration needed to start a runtime. `beacon.start` builds it from
+/// the app and the generated codec; tests build it directly.
+pub type RuntimeConfig(state, msg) {
   RuntimeConfig(
-    /// Initial model and effects.
-    init: fn() -> #(model, Effect(msg)),
-    /// The update function.
-    update: fn(model, msg) -> #(model, Effect(msg)),
-    /// The view function.
-    view: fn(model) -> Node(msg),
-    /// Decode client events into user messages.
-    /// If None, beacon_codec.decode_event/4 must be generated and compiled.
-    decode_event: Option(
-      fn(String, String, String, String) -> Result(msg, error.BeaconError),
-    ),
-    /// Serialize model to a string. Used on the wire (and in join tokens)
-    /// only when no generated `beacon_codec.encode_model` exists.
-    serialize_model: option.Option(fn(model) -> String),
-    /// Deserialize model from a string (from the join token).
-    /// Receives the client-visible model JSON; it must rebuild any Server
-    /// state itself. Returns Error if the data is stale/invalid.
-    deserialize_model: option.Option(fn(String) -> Result(model, String)),
-    /// Route patterns for URL matching.
-    route_patterns: List(route.RoutePattern),
-    /// Called when URL changes — produces a Msg for the update loop.
-    on_route_change: option.Option(fn(route.Route) -> msg),
-    /// Called before a client-side route transition is applied.
-    on_route_leave: option.Option(fn(route.Route, route.Route) -> Effect(msg)),
-    /// Dynamic subscription function: given the current model, returns
+    /// The app's `init`, run with the connected-mount context.
+    init: fn(Context) -> #(state, Effect(msg)),
+    /// The app's server `update`.
+    update: fn(state, msg) -> #(state, Effect(msg)),
+    /// Encode the client-visible model (the codec's `encode_model` over the
+    /// app's `sync`). Its output is what `model_sync` and patches carry.
+    encode_model: fn(state) -> String,
+    /// Decode a client event into a message (the generated
+    /// `beacon_codec.decode_event`, which enforces the message allowlist).
+    decode_event: fn(String, String, String, String) ->
+      Result(msg, error.BeaconError),
+    /// Rebuild the server state from the client-visible model JSON carried
+    /// by a join token. Set only when the app opted into state recovery.
+    restore_model: Option(fn(String) -> Result(state, String)),
+    /// The app's `parse` composed with `on_change`, when it has a router.
+    route: Option(fn(Uri) -> Result(msg, Nil)),
+    /// Dynamic subscription function: given the current state, returns
     /// the set of topics this runtime should be subscribed to.
     /// Called after every update and join. The framework diffs against
     /// current subscriptions.
-    dynamic_subscriptions: option.Option(fn(model) -> List(String)),
+    dynamic_subscriptions: Option(fn(state) -> List(String)),
     /// Called when a PubSub notification arrives on a dynamically subscribed topic.
     /// Receives the topic string so the handler can distinguish between sources.
-    on_notify: option.Option(fn(String) -> msg),
+    on_notify: Option(fn(String) -> msg),
     /// Called when a typed PubSub notification arrives on a dynamically subscribed topic.
-    on_notification: option.Option(fn(Notification) -> msg),
-    /// Optional: request-aware init — replaces `init` when the HTTP request is available.
-    /// Used by ws_init to pass cookies/headers into server state initialization.
-    /// If set and a request is provided, this is used instead of `init`.
-    init_from_request: option.Option(
-      fn(request.Request(server.Connection)) -> #(model, Effect(msg)),
-    ),
+    on_notification: Option(fn(Notification) -> msg),
     /// Secret key for join-token verification.
-    /// Threaded from AppConfig — must not be empty when state recovery is enabled.
+    /// Must not be empty when state recovery is enabled.
     secret_key: String,
-    /// Enable framework-owned client tracing.
-    dev_mode: Bool,
   )
 }
 
-/// Start a runtime actor. Returns a Subject for sending RuntimeMessages.
+/// Start a runtime actor for the session described by `ctx`. Returns a
+/// Subject for sending RuntimeMessages.
 ///
-/// All codecs are resolved here, once: a missing event decoder, or a
-/// generated codec that declares substates without their encoders, is a
-/// `ConfigError`.
+/// Runs `init(ctx)` and, when the app has a router, `update` with the route
+/// message for `ctx`'s URL (LiveView's mount followed by handle_params).
+/// A URL whose encoding does not decode is a `RuntimeError`: the client
+/// only reports URLs the browser already loaded, so it means a forged or
+/// broken connect request.
 pub fn start(
   config: RuntimeConfig(model, msg),
+  ctx: Context,
 ) -> Result(Subject(RuntimeMessage(msg)), error.BeaconError) {
-  let event_decoder = case config.decode_event {
-    Some(decoder) -> Some(decoder)
-    None -> discover_event_decoder()
-  }
-  let model_encoder = ssr.client_visible_model_encoder(config.serialize_model)
-  let substate_codecs =
-    resolve_substate_codecs(
-      try_load_substate_names(),
-      try_load_substate_encoder,
-      try_load_flat_encoder,
-    )
-
-  case event_decoder, substate_codecs, model_encoder {
-    None, _, _ -> {
-      let reason =
-        "Missing event decoder. Beacon live apps must provide decode_event or run beacon/build so beacon_codec.decode_event/4 is generated; server-side view rendering is not used for event decoding."
-      log.error("beacon.runtime", reason)
-      Error(error.ConfigError(reason: reason))
+  let page_uri = context.uri(ctx)
+  case uri_check.check(page_uri) {
+    Error(reason) -> {
+      log.error(
+        "beacon.runtime",
+        "Refusing to start a runtime for "
+          <> uri.to_string(page_uri)
+          <> ": "
+          <> reason,
+      )
+      Error(error.RuntimeError(reason: "Invalid page URL: " <> reason))
     }
-    _, Error(err), _ -> Error(err)
-    _, Ok(Substates(..)), None -> {
-      let reason =
-        "beacon_codec declares substates but no model encoder is available for model_sync"
-      log.error("beacon.runtime", reason)
-      Error(error.ConfigError(reason: reason))
-    }
-    Some(event_decoder), Ok(substate_codecs), _ -> {
-      case model_encoder {
-        Some(_) -> Nil
-        None ->
-          log.warning(
-            "beacon.runtime",
-            "No model encoder (generated beacon_codec.encode_model or configured serialize_model); clients will receive \"Model encoder missing\" errors",
-          )
-      }
-      start_actor(config, event_decoder, model_encoder, substate_codecs)
-    }
+    Ok(Nil) -> start_actor(config, ctx, page_uri)
   }
 }
 
 fn start_actor(
   config: RuntimeConfig(model, msg),
-  event_decoder: fn(String, String, String, String) ->
-    Result(msg, error.BeaconError),
-  model_encoder: Option(fn(model) -> String),
-  substate_codecs: SubstateCodecs(model),
+  ctx: Context,
+  page_uri: Uri,
 ) -> Result(Subject(RuntimeMessage(msg)), error.BeaconError) {
-  let #(initial_model, initial_effects) = config.init()
+  let #(initial_model, init_effects) = config.init(ctx)
+  let #(initial_model, route_effects, route_msg) = case config.route {
+    None -> #(initial_model, effect.none(), None)
+    Some(route) ->
+      case route(page_uri) {
+        Ok(msg) -> {
+          log.debug(
+            "beacon.runtime",
+            "Applying the initial route for " <> describe_uri(page_uri),
+          )
+          let #(routed, effects) = config.update(initial_model, msg)
+          #(routed, effects, Some(msg))
+        }
+        Error(Nil) -> {
+          // The dead render answered this URL with a 404 page without the
+          // client script, so a connect for it is unusual; the join reports
+          // the unknown route to the client.
+          log.warning(
+            "beacon.runtime",
+            "No route for the session URL " <> describe_uri(page_uri),
+          )
+          #(initial_model, effect.none(), None)
+        }
+      }
+  }
+  let initial_effects = effect.batch([init_effects, route_effects])
   let result =
     actor.new_with_initialiser(5000, fn(subject) {
       let initial_effect_processes = run_effects(initial_effects, subject)
@@ -297,21 +277,19 @@ fn start_actor(
         RuntimeState(
           model: initial_model,
           update: config.update,
-          decode_event: event_decoder,
+          decode_event: config.decode_event,
           connections: dict.new(),
           joined: set.new(),
           client_acks: dict.new(),
           revision: 0,
           accepted_first_join: False,
           self: subject,
-          model_encoder: model_encoder,
-          substate_codecs: substate_codecs,
-          deserialize_model: config.deserialize_model,
+          model_encoder: config.encode_model,
+          restore_model: config.restore_model,
           secret_key: config.secret_key,
-          route_patterns: config.route_patterns,
-          on_route_change: config.on_route_change,
-          on_route_leave: config.on_route_leave,
-          current_route: None,
+          route: config.route,
+          page_uri: page_uri,
+          current_route_msg: route_msg,
           listener_subject: None,
           current_subscriptions: [],
           dynamic_subscriptions: config.dynamic_subscriptions,
@@ -339,11 +317,8 @@ fn start_actor(
           <> yes_no(option.is_some(config.on_notify))
           <> ", on_notification: "
           <> yes_no(option.is_some(config.on_notification))
-          <> ", substates: "
-          <> case substate_codecs {
-          NoSubstates -> "none"
-          Substates(encoders, _) -> int.to_string(list.length(encoders))
-        },
+          <> ", router: "
+          <> yes_no(option.is_some(config.route)),
       )
       case config.dynamic_subscriptions {
         Some(compute) -> {
@@ -388,70 +363,6 @@ fn yes_no(flag: Bool) -> String {
     True -> "YES"
     False -> "NO"
   }
-}
-
-/// Resolve the generated substate encoders once.
-///
-/// - no `substate_names` export, or an empty list → `NoSubstates`
-/// - names present → every `encode_substate_<name>` and `encode_flat_fields`
-///   must exist, otherwise the generated codec is stale or corrupt and this
-///   is a logged `ConfigError` (a silently skipped substate would never
-///   reach the client).
-@internal
-pub fn resolve_substate_codecs(
-  names: Result(List(String), Nil),
-  load_encoder: fn(String) -> Result(fn(model) -> String, Nil),
-  load_flat: fn() -> Result(fn(model) -> String, Nil),
-) -> Result(SubstateCodecs(model), error.BeaconError) {
-  case names {
-    Error(Nil) | Ok([]) -> Ok(NoSubstates)
-    Ok(names) -> {
-      let unique = list.unique(names)
-      case list.length(unique) == list.length(names) {
-        False ->
-          substate_config_error("beacon_codec.substate_names has duplicates")
-        True -> {
-          let #(encoders, missing) =
-            list.fold(names, #([], []), fn(acc, name) {
-              let #(found, missing) = acc
-              case load_encoder(name) {
-                Ok(encoder) -> #([#(name, encoder), ..found], missing)
-                Error(Nil) -> #(found, [name, ..missing])
-              }
-            })
-          case missing, load_flat() {
-            [], Ok(flat) -> {
-              log.debug(
-                "beacon.runtime",
-                "Resolved "
-                  <> int.to_string(list.length(names))
-                  <> " substate encoders: "
-                  <> string.join(names, ", "),
-              )
-              Ok(Substates(encoders: list.reverse(encoders), flat: flat))
-            }
-            [], Error(Nil) ->
-              substate_config_error(
-                "beacon_codec declares substates but encode_flat_fields/1 is missing",
-              )
-            _, _ ->
-              substate_config_error(
-                "beacon_codec declares substates without encoders: "
-                <> string.join(list.reverse(missing), ", "),
-              )
-          }
-        }
-      }
-    }
-  }
-}
-
-fn substate_config_error(reason: String) -> Result(a, error.BeaconError) {
-  log.error(
-    "beacon.runtime",
-    reason <> " (regenerate the codec with beacon/build)",
-  )
-  Error(error.ConfigError(reason: reason))
 }
 
 /// The main message loop for the runtime actor.
@@ -562,10 +473,7 @@ fn handle_message(
           actor.continue(reject_before_join(state, conn_id, "navigation"))
         True -> {
           log.info("beacon.runtime", "Navigation: " <> conn_id <> " → " <> path)
-          let matched_route = route_for_path(state.route_patterns, path)
-          let state =
-            apply_route(state, matched_route, Some(conn_id), RouteOnNavigate)
-          actor.continue(state)
+          actor.continue(handle_navigation(state, conn_id, path))
         }
       }
 
@@ -684,8 +592,10 @@ fn reject_before_join(
 ///   deserializer is configured, the model is recovered from it.
 /// - Repeated join on an already-joined connection: an explicit, logged
 ///   rejoin. The token is not used; the connection gets a full model_sync.
-/// - The route handlers run only when the joined path's route differs from
-///   the current route (a join never re-runs them for the same route).
+/// - `on_change` runs only when the joined path's route message differs
+///   from the one last applied (a join never re-runs it for the same
+///   route). A joined path the app does not route is reported to the
+///   client as an error.
 fn handle_join(
   state: RuntimeState(model, msg),
   conn_id: transport.ConnectionId,
@@ -722,10 +632,9 @@ fn handle_join(
           recover_from_join_token(state, conn_id, token, session_fingerprint)
         }
       }
-      let matched_route = route_for_path(state.route_patterns, path)
       // Route changes are broadcast to the OTHER joined connections; the
       // joiner is not joined yet and gets the result in its model_sync.
-      let state = apply_route(state, matched_route, Some(conn_id), RouteOnJoin)
+      let state = route_join(state, conn_id, path)
       // If the cache is unusable, the other joined connections may be stale
       // too: resync everyone, not just the joiner.
       let stale_others = case state.cached_model {
@@ -801,16 +710,16 @@ fn recover_from_join_token(
               state
             }
             False, Some(model_json) ->
-              case state.deserialize_model {
+              case state.restore_model {
                 None -> {
                   log.debug(
                     "beacon.runtime",
-                    "Join token carries a model but no deserializer is configured",
+                    "Join token carries a model but state recovery is not enabled",
                   )
                   state
                 }
-                Some(deserialize) ->
-                  case deserialize(model_json) {
+                Some(restore) ->
+                  case restore(model_json) {
                     Ok(model) -> {
                       log.info(
                         "beacon.runtime",
@@ -821,7 +730,7 @@ fn recover_from_join_token(
                     Error(reason) -> {
                       log.warning(
                         "beacon.runtime",
-                        "Join token model rejected by deserializer for "
+                        "Join token model could not be restored for "
                           <> conn_id
                           <> ": "
                           <> reason
@@ -982,44 +891,170 @@ fn ack_if_unchanged(
   state
 }
 
-type RouteMode {
-  /// A join: handlers run only if the route differs from the current one.
-  RouteOnJoin
-  /// A client navigation: on_route_change always runs for a matched route
-  /// (like LiveView's handle_params on every live patch).
-  RouteOnNavigate
+/// Why a client-reported path cannot be routed in place.
+type PathProblem {
+  /// Not a same-origin path (`/…`, not `//…`): never navigated to.
+  NotLocal
+  /// A path whose encoding does not decode: the dead render answers 400.
+  BadEncoding(reason: String)
+  /// A path the app's `parse` does not accept: the dead render answers 404.
+  UnknownRoute
 }
 
-/// Apply a matched route: leave effects (when the route changes), then
-/// on_route_change and its effects, then record the route. Model changes
-/// are broadcast to the joined connections.
-fn apply_route(
+/// Resolve a client-reported path (`/users/7?tab=posts`) to its route
+/// message, against the session's URL.
+fn route_for_path(
+  route: fn(Uri) -> Result(msg, Nil),
+  page_uri: Uri,
+  path: String,
+) -> Result(msg, PathProblem) {
+  use parsed <- result.try(
+    case string.starts_with(path, "/") && !string.starts_with(path, "//") {
+      False -> Error(NotLocal)
+      True ->
+        uri.parse(path)
+        |> result.replace_error(BadEncoding("the path does not parse as a URL"))
+    },
+  )
+  let target = uri.Uri(..page_uri, path: parsed.path, query: parsed.query)
+  use Nil <- result.try(
+    uri_check.check(target) |> result.map_error(BadEncoding),
+  )
+  route(target) |> result.replace_error(UnknownRoute)
+}
+
+/// A client navigation (link click, back/forward, or the client's half of
+/// `router.push`/`replace`). Like LiveView's `handle_params` on every live
+/// patch, `on_change` always runs for a known route.
+fn handle_navigation(
   state: RuntimeState(model, msg),
-  matched_route: Option(route.Route),
-  conn_id: Option(transport.ConnectionId),
-  mode: RouteMode,
+  conn_id: transport.ConnectionId,
+  path: String,
 ) -> RuntimeState(model, msg) {
-  let route_changed = matched_route != state.current_route
-  case mode, route_changed {
-    RouteOnJoin, False -> {
-      log.debug(
+  case state.route {
+    None -> {
+      log.warning(
         "beacon.runtime",
-        "Join route unchanged; route handlers not re-run",
+        "Navigation to "
+          <> path
+          <> " from "
+          <> conn_id
+          <> " but the app has no router; loading the page",
       )
-      state
+      hard_navigate(state, conn_id, path)
     }
-    _, _ -> {
-      let state = run_route_leave_effects(state, matched_route, conn_id)
-      let state = RuntimeState(..state, current_route: matched_route)
-      case state.on_route_change, matched_route {
-        Some(make_msg), Some(resolved_route) -> {
-          let #(state, _changed) =
-            run_update_for(state, make_msg(resolved_route), conn_id)
+    Some(route) ->
+      case route_for_path(route, state.page_uri, path) {
+        Ok(msg) -> {
+          let state = RuntimeState(..state, current_route_msg: Some(msg))
+          let #(state, _changed) = run_update_for(state, msg, Some(conn_id))
           state
         }
-        _, _ -> state
+        Error(NotLocal) -> {
+          log.warning(
+            "beacon.runtime",
+            "Navigation from "
+              <> conn_id
+              <> " to a non-local path refused: "
+              <> string.inspect(path),
+          )
+          send_to_conn_id(
+            state,
+            conn_id,
+            transport.SendError(reason: "navigation path must start with /"),
+          )
+          state
+        }
+        Error(BadEncoding(reason)) -> {
+          log.warning(
+            "beacon.runtime",
+            "Navigation from "
+              <> conn_id
+              <> " to "
+              <> path
+              <> " has an invalid encoding ("
+              <> reason
+              <> "); loading the page",
+          )
+          hard_navigate(state, conn_id, path)
+        }
+        Error(UnknownRoute) -> {
+          log.info(
+            "beacon.runtime",
+            "Navigation from "
+              <> conn_id
+              <> " to unknown route "
+              <> path
+              <> "; loading the page (the server answers 404)",
+          )
+          hard_navigate(state, conn_id, path)
+        }
       }
-    }
+  }
+}
+
+fn hard_navigate(
+  state: RuntimeState(model, msg),
+  conn_id: transport.ConnectionId,
+  path: String,
+) -> RuntimeState(model, msg) {
+  send_to_conn_id(state, conn_id, transport.SendHardNavigate(path: path))
+  state
+}
+
+/// Route a join's path: run `on_change` when its message differs from the
+/// last one applied.
+fn route_join(
+  state: RuntimeState(model, msg),
+  conn_id: transport.ConnectionId,
+  path: String,
+) -> RuntimeState(model, msg) {
+  case state.route {
+    None -> state
+    Some(route) ->
+      case route_for_path(route, state.page_uri, path) {
+        Ok(msg) ->
+          case state.current_route_msg == Some(msg) {
+            True -> {
+              log.debug(
+                "beacon.runtime",
+                "Join route unchanged; on_change not re-run",
+              )
+              state
+            }
+            False -> {
+              log.debug(
+                "beacon.runtime",
+                "Join path " <> path <> " changes the route; running on_change",
+              )
+              let state = RuntimeState(..state, current_route_msg: Some(msg))
+              let #(state, _changed) = run_update_for(state, msg, Some(conn_id))
+              state
+            }
+          }
+        Error(problem) -> {
+          let reason = case problem {
+            NotLocal -> "join path must start with /"
+            BadEncoding(reason) ->
+              "join path has an invalid encoding: " <> reason
+            UnknownRoute -> "no route for the joined path " <> path
+          }
+          log.warning(
+            "beacon.runtime",
+            "Join from " <> conn_id <> ": " <> reason,
+          )
+          send_to_conn_id(state, conn_id, transport.SendError(reason: reason))
+          state
+        }
+      }
+  }
+}
+
+/// Path and query for logs.
+fn describe_uri(page_uri: Uri) -> String {
+  case page_uri.query {
+    Some(query) -> page_uri.path <> "?" <> query
+    None -> page_uri.path
   }
 }
 
@@ -1095,102 +1130,71 @@ fn run_update_only(
   )
 }
 
-/// Verify that the generated server contract is compiled and discoverable.
-/// Public Beacon apps call this before binding a port so stale/missing codegen
-/// fails at startup instead of at the first WebSocket event.
-pub fn verify_generated_contract() -> Result(Nil, error.BeaconError) {
-  log.info("beacon.runtime", "Verifying generated Beacon contract")
-  case try_load_codec_encoder() {
-    Error(_) ->
-      Error(error.ConfigError(
-        reason: "Generated contract missing beacon_codec.encode_model/1",
-      ))
-    Ok(_) ->
-      case try_load_codec_event_decoder() {
-        Error(_) ->
-          Error(error.ConfigError(
-            reason: "Generated contract missing beacon_codec.decode_event/4",
-          ))
-        Ok(_) ->
-          case try_load_codec_renderer() {
-            Error(_) ->
-              Error(error.ConfigError(
-                reason: "Generated contract missing beacon_codec.render_model/1",
-              ))
-            Ok(_) -> Ok(Nil)
-          }
-      }
+/// The generated server codec (`beacon_codec`, written by
+/// `gleam run -m beacon/build`) for the app's Model and Msg.
+pub type GeneratedCodec(model, msg) {
+  GeneratedCodec(
+    encode_model: fn(model) -> String,
+    decode_model: fn(String) -> Result(model, String),
+    decode_event: fn(String, String, String, String) ->
+      Result(msg, error.BeaconError),
+  )
+}
+
+/// Load the generated codec. Public Beacon apps call this before binding a
+/// port, so stale or missing codegen fails at startup instead of at the
+/// first WebSocket event.
+///
+/// The codec is found by module name, so its types are not checked here:
+/// the build generates it from the same app's Model and Msg (see
+/// `beacon/build`), which is what makes these types right.
+pub fn load_generated_codec() -> Result(
+  GeneratedCodec(model, msg),
+  error.BeaconError,
+) {
+  log.info("beacon.runtime", "Loading the generated beacon_codec module")
+  let missing = fn(name) {
+    error.ConfigError(
+      reason: "Generated contract missing beacon_codec."
+      <> name
+      <> " — run `gleam run -m beacon/build`",
+    )
   }
+  use encode_model <- result.try(
+    try_load_codec_encoder() |> result.replace_error(missing("encode_model/1")),
+  )
+  use decode_model <- result.try(
+    try_load_codec_decoder() |> result.replace_error(missing("decode_model/1")),
+  )
+  use decode_event <- result.try(
+    try_load_codec_event_decoder()
+    |> result.replace_error(missing("decode_event/4")),
+  )
+  Ok(
+    GeneratedCodec(
+      encode_model: encode_model,
+      decode_model: decode_model,
+      decode_event: fn(name, handler_id, data, target_path) {
+        decode_event(name, handler_id, data, target_path)
+        |> result.map_error(fn(reason) {
+          error.CodecError(reason: reason, raw: data)
+        })
+      },
+    ),
+  )
 }
 
 @external(erlang, "beacon_runtime_ffi", "try_load_codec_encoder")
 fn try_load_codec_encoder() -> Result(fn(model) -> String, Nil)
 
-fn discover_event_decoder() -> Option(
-  fn(String, String, String, String) -> Result(msg, error.BeaconError),
-) {
-  case try_load_codec_event_decoder() {
-    Ok(decoder) -> {
-      log.info(
-        "beacon.runtime",
-        "Auto-discovered event decoder from beacon_codec",
-      )
-      Some(fn(name, handler_id, data, target_path) {
-        case decoder(name, handler_id, data, target_path) {
-          Ok(msg) -> Ok(msg)
-          Error(reason) -> Error(error.CodecError(reason: reason, raw: data))
-        }
-      })
-    }
-    Error(_) -> {
-      log.debug("beacon.runtime", "No beacon_codec event decoder available")
-      None
-    }
-  }
-}
+@external(erlang, "beacon_runtime_ffi", "try_load_codec_decoder")
+fn try_load_codec_decoder() -> Result(fn(String) -> Result(model, String), Nil)
 
 @external(erlang, "beacon_runtime_ffi", "try_load_codec_event_decoder")
 fn try_load_codec_event_decoder() -> Result(
   fn(String, String, String, String) -> Result(msg, String),
   Nil,
 )
-
-@external(erlang, "beacon_runtime_ffi", "try_load_codec_renderer")
-fn try_load_codec_renderer() -> Result(fn(model) -> String, Nil)
-
-/// Encode the client-visible snapshot of a model.
-@internal
-pub fn encode_snapshot(
-  encode_full: fn(model) -> String,
-  codecs: SubstateCodecs(model),
-  model: model,
-) -> CachedModelState {
-  case codecs {
-    NoSubstates -> FullModelCache(json: encode_full(model))
-    Substates(encoders, flat) ->
-      SubstateCache(
-        substate_jsons: list.fold(encoders, dict.new(), fn(acc, entry) {
-          let #(name, encode) = entry
-          dict.insert(acc, name, encode(model))
-        }),
-        flat_fields_json: flat(model),
-      )
-  }
-}
-
-/// Byte size of a snapshot (the sum of its parts in substate mode).
-fn snapshot_size(snapshot: CachedModelState) -> Int {
-  case snapshot {
-    NoCache -> 0
-    FullModelCache(json) -> string.byte_size(json)
-    SubstateCache(substate_jsons, flat_fields_json) ->
-      dict.fold(
-        substate_jsons,
-        string.byte_size(flat_fields_json),
-        fn(total, _name, json) { total + string.byte_size(json) },
-      )
-  }
-}
 
 @internal
 pub type SnapshotDiff {
@@ -1202,83 +1206,31 @@ pub type SnapshotDiff {
   Resync
 }
 
-/// Diff two snapshots. Equal JSON short-circuits without running the diff;
-/// a substate that did not change is skipped entirely.
+/// Diff the cached model JSON against the new one. Equal JSON
+/// short-circuits without running the diff.
 @internal
-pub fn diff_snapshot(
-  old: CachedModelState,
-  new: CachedModelState,
-) -> SnapshotDiff {
-  case old, new {
-    FullModelCache(old_json), FullModelCache(new_json) ->
+pub fn diff_snapshot(old: CachedModelState, new_json: String) -> SnapshotDiff {
+  case old {
+    FullModelCache(old_json) ->
       case old_json == new_json {
         True -> Unchanged
-        False -> ops_to_diff([patch.diff(old_json, new_json)])
-      }
-    SubstateCache(old_subs, old_flat), SubstateCache(new_subs, new_flat) ->
-      case same_substate_names(old_subs, new_subs) {
         False -> {
-          // Both snapshots normally come from the same resolved codecs; a
-          // different name set means the cache cannot be diffed against.
-          log.warning(
-            "beacon.runtime",
-            "Substate snapshots have different substate names; full resync",
-          )
-          Resync
-        }
-        True -> {
-          let substate_ops =
-            dict.fold(new_subs, [], fn(acc, name, new_json) {
-              // Invariant: same_substate_names checked the key sets match.
-              let assert Ok(old_json) = dict.get(old_subs, name)
-              case old_json == new_json {
-                True -> acc
-                False -> [diff_substate(name, old_json, new_json), ..acc]
-              }
-            })
-          let flat_ops = case old_flat == new_flat {
-            True -> []
-            False -> [patch.diff(old_flat, new_flat)]
+          let ops = patch.diff(old_json, new_json)
+          case patch.is_empty(ops) {
+            True -> Unchanged
+            False -> Changed(ops)
           }
-          ops_to_diff(list.append(substate_ops, flat_ops))
         }
       }
-    _, _ -> {
+    NoCache -> {
       log.debug(
         "beacon.runtime",
-        "No diffable cached snapshot (none, or a different mode); full resync",
+        "No cached model to diff against; full resync",
       )
       Resync
     }
   }
 }
-
-fn same_substate_names(
-  old: dict.Dict(String, String),
-  new: dict.Dict(String, String),
-) -> Bool {
-  dict.size(old) == dict.size(new)
-  && list.all(dict.keys(new), fn(name) { dict.has_key(old, name) })
-}
-
-fn diff_substate(name: String, old_json: String, new_json: String) -> String {
-  let key = json.to_string(json.string(name))
-  patch.diff(
-    "{" <> key <> ":" <> old_json <> "}",
-    "{" <> key <> ":" <> new_json <> "}",
-  )
-}
-
-fn ops_to_diff(ops: List(String)) -> SnapshotDiff {
-  case list.filter(ops, fn(o) { !patch.is_empty(o) }) {
-    [] -> Unchanged
-    [single] -> Changed(single)
-    many -> Changed(merge_ops_json_ffi(many))
-  }
-}
-
-@external(erlang, "beacon_patch_ffi", "merge_ops_json")
-fn merge_ops_json_ffi(ops_list: List(String)) -> String
 
 /// Model JSON size warning threshold: 1MB.
 const model_size_warn_bytes = 1_048_576
@@ -1344,27 +1296,6 @@ fn model_too_large(
   RuntimeState(..state, cached_model: NoCache)
 }
 
-fn model_encoder_missing(
-  state: RuntimeState(model, msg),
-  targets: List(transport.ConnectionId),
-  context: String,
-) -> RuntimeState(model, msg) {
-  log.error(
-    "beacon.runtime",
-    "No model encoder available in "
-      <> context
-      <> " — live state cannot be sent. Ensure beacon_codec.gleam is generated or serialize_model is configured.",
-  )
-  list.each(targets, fn(conn_id) {
-    send_to_conn_id(
-      state,
-      conn_id,
-      transport.SendError(reason: "Model encoder missing"),
-    )
-  })
-  RuntimeState(..state, cached_model: NoCache)
-}
-
 /// Broadcast the current model to every joined connection: a patch when
 /// the cache can be diffed, a full model_sync otherwise, nothing when the
 /// client-visible JSON is unchanged. Returns whether anything was sent.
@@ -1372,22 +1303,21 @@ fn broadcast_model(
   state: RuntimeState(model, msg),
 ) -> #(RuntimeState(model, msg), Bool) {
   let targets = set.to_list(state.joined)
-  case targets, state.model_encoder {
-    [], _ -> {
+  case targets {
+    [] -> {
       log.debug("beacon.runtime", "No joined connections; nothing to broadcast")
       #(RuntimeState(..state, cached_model: NoCache), False)
     }
-    _, None -> #(model_encoder_missing(state, targets, "broadcast"), False)
-    _, Some(encode_full) -> {
-      let snapshot =
-        encode_snapshot(encode_full, state.substate_codecs, state.model)
-      case check_model_size(snapshot_size(snapshot), "broadcast") {
+    _ -> {
+      let model_json = state.model_encoder(state.model)
+      let snapshot = FullModelCache(json: model_json)
+      case check_model_size(string.byte_size(model_json), "broadcast") {
         TooLarge(size) -> #(
           model_too_large(state, targets, size, "broadcast"),
           False,
         )
         SizeOk ->
-          case diff_snapshot(state.cached_model, snapshot) {
+          case diff_snapshot(state.cached_model, model_json) {
             Unchanged -> {
               log.debug("beacon.runtime", "Model unchanged, skipping broadcast")
               #(RuntimeState(..state, cached_model: snapshot), False)
@@ -1442,42 +1372,32 @@ fn send_model_sync_to(
   targets: List(transport.ConnectionId),
   context: String,
 ) -> RuntimeState(model, msg) {
-  case state.model_encoder {
-    None -> model_encoder_missing(state, targets, context)
-    Some(encode_full) -> {
-      let snapshot =
-        encode_snapshot(encode_full, state.substate_codecs, state.model)
-      let model_json = case snapshot {
-        FullModelCache(json) -> json
-        _ -> encode_full(state.model)
-      }
-      case check_model_size(string.byte_size(model_json), context) {
-        TooLarge(size) -> model_too_large(state, targets, size, context)
-        SizeOk -> {
-          list.each(targets, fn(conn_id) {
-            send_to_conn_id(
-              state,
-              conn_id,
-              transport.SendModelSync(
-                model_json: model_json,
-                version: state.revision,
-                ack_clock: ack_for(state, conn_id),
-              ),
-            )
-          })
-          log.debug(
-            "beacon.runtime",
-            "Sent model_sync ("
-              <> context
-              <> ") revision "
-              <> int.to_string(state.revision)
-              <> " to "
-              <> int.to_string(list.length(targets))
-              <> " connection(s)",
-          )
-          RuntimeState(..state, cached_model: snapshot)
-        }
-      }
+  let model_json = state.model_encoder(state.model)
+  case check_model_size(string.byte_size(model_json), context) {
+    TooLarge(size) -> model_too_large(state, targets, size, context)
+    SizeOk -> {
+      list.each(targets, fn(conn_id) {
+        send_to_conn_id(
+          state,
+          conn_id,
+          transport.SendModelSync(
+            model_json: model_json,
+            version: state.revision,
+            ack_clock: ack_for(state, conn_id),
+          ),
+        )
+      })
+      log.debug(
+        "beacon.runtime",
+        "Sent model_sync ("
+          <> context
+          <> ") revision "
+          <> int.to_string(state.revision)
+          <> " to "
+          <> int.to_string(list.length(targets))
+          <> " connection(s)",
+      )
+      RuntimeState(..state, cached_model: FullModelCache(json: model_json))
     }
   }
 }
@@ -1495,18 +1415,6 @@ fn resync(
   }
   send_model_sync_to(state, targets, context)
 }
-
-/// Discover substate names from beacon_codec.
-@external(erlang, "beacon_runtime_ffi", "try_load_substate_names")
-fn try_load_substate_names() -> Result(List(String), Nil)
-
-/// Discover a per-substate encoder from beacon_codec.
-@external(erlang, "beacon_runtime_ffi", "try_load_substate_encoder")
-fn try_load_substate_encoder(name: String) -> Result(fn(model) -> String, Nil)
-
-/// Discover the flat fields encoder from beacon_codec.
-@external(erlang, "beacon_runtime_ffi", "try_load_flat_encoder")
-fn try_load_flat_encoder() -> Result(fn(model) -> String, Nil)
 
 /// Execute effects by providing a dispatch function that sends messages
 /// back to the runtime actor.
@@ -1717,6 +1625,7 @@ pub fn connect_transport_with_ssr(
 /// with untyped ConnectionId + ClientMessage regardless of Model/Msg types.
 pub fn start_and_connect(
   config: RuntimeConfig(model, msg),
+  ctx: Context,
   conn_id: transport.ConnectionId,
   transport_subject: process.Subject(transport.InternalMessage),
 ) -> Result(
@@ -1724,14 +1633,85 @@ pub fn start_and_connect(
   error.BeaconError,
 ) {
   log.info("beacon.runtime", "Starting runtime connection for " <> conn_id)
-  start_and_connect_with_request(config, conn_id, transport_subject, None)
+  spawn_and_connect(config, ctx, conn_id, transport_subject, None)
 }
 
-/// Start a per-connection runtime with access to the HTTP request.
-/// When `req` is Some and `config.init_from_request` is set, uses the
-/// request-aware init instead of the static init function.
+/// Start a per-connection runtime for a WebSocket upgrade request. The
+/// client connects to `/ws?path=<page path and query>`; the Context's URL
+/// is the upgrade request's URL with that page path and query, so `init`
+/// sees the same URL as the dead render. A missing or invalid `path`
+/// refuses the connection.
 pub fn start_and_connect_with_request(
   config: RuntimeConfig(model, msg),
+  conn_id: transport.ConnectionId,
+  transport_subject: process.Subject(transport.InternalMessage),
+  req: request.Request(server.Connection),
+) -> Result(
+  #(fn(transport.ConnectionId, transport.ClientMessage) -> Nil, fn() -> Nil),
+  error.BeaconError,
+) {
+  case connected_context(req) {
+    Error(reason) -> {
+      log.warning(
+        "beacon.runtime",
+        "Refusing connection " <> conn_id <> ": " <> reason,
+      )
+      Error(error.RuntimeError(reason: reason))
+    }
+    Ok(ctx) ->
+      spawn_and_connect(config, ctx, conn_id, transport_subject, Some(req))
+  }
+}
+
+/// The Context for a connected mount, from the upgrade request.
+@internal
+pub fn connected_context(
+  req: request.Request(server.Connection),
+) -> Result(Context, String) {
+  log.debug(
+    "beacon.runtime",
+    "Building connected context from upgrade request " <> req.path,
+  )
+  use pairs <- result.try(
+    request.get_query(req)
+    |> result.replace_error("the WebSocket URL's query string does not parse"),
+  )
+  use page_path <- result.try(
+    list.key_find(pairs, "path")
+    |> result.replace_error(
+      "the WebSocket URL has no path parameter (expected /ws?path=<page path>)",
+    ),
+  )
+  use parsed <- result.try(
+    case
+      string.starts_with(page_path, "/") && !string.starts_with(page_path, "//")
+    {
+      False ->
+        Error(
+          "the WebSocket path parameter is not a local path: "
+          <> string.inspect(page_path),
+        )
+      True ->
+        uri.parse(page_path)
+        |> result.replace_error(
+          "the WebSocket path parameter does not parse: "
+          <> string.inspect(page_path),
+        )
+    },
+  )
+  let page_uri =
+    uri.Uri(..request.to_uri(req), path: parsed.path, query: parsed.query)
+  Ok(context.new(
+    uri: page_uri,
+    cookies: cookie.parse(req),
+    is_connected: True,
+    session_id: ssr.session_id_for_request(req),
+  ))
+}
+
+fn spawn_and_connect(
+  config: RuntimeConfig(model, msg),
+  ctx: Context,
   conn_id: transport.ConnectionId,
   transport_subject: process.Subject(transport.InternalMessage),
   req: Option(request.Request(server.Connection)),
@@ -1740,15 +1720,7 @@ pub fn start_and_connect_with_request(
   error.BeaconError,
 ) {
   log.info("beacon.runtime", "Spawning runtime for " <> conn_id)
-  // Use init_from_request if both the request and the callback are available
-  let effective_config = case req, config.init_from_request {
-    Some(r), Some(init_fn) -> {
-      log.debug("beacon.runtime", "Using request-aware init for " <> conn_id)
-      RuntimeConfig(..config, init: fn() { init_fn(r) })
-    }
-    _, _ -> config
-  }
-  case start(effective_config) {
+  case start(config, ctx) {
     Ok(runtime_subject) -> {
       // Register this connection with the new runtime
       process.send(
@@ -1906,7 +1878,7 @@ pub fn connect_transport_per_connection(
             config,
             conn_id,
             transport_subject,
-            Some(req),
+            req,
           )
         {
           Ok(#(on_event, shutdown)) -> {
@@ -2141,42 +2113,6 @@ fn store_redirect_target(
 pub fn get_redirect_target() -> option.Option(
   process.Subject(transport.InternalMessage),
 )
-
-fn route_for_path(
-  patterns: List(route.RoutePattern),
-  path: String,
-) -> Option(route.Route) {
-  case path {
-    "" -> None
-    _ -> route.match_path(patterns, path)
-  }
-}
-
-/// Run on_route_leave when moving between two different matched routes.
-/// The effect processes it starts are tracked like any other effect's.
-fn run_route_leave_effects(
-  state: RuntimeState(model, msg),
-  next_route: Option(route.Route),
-  conn_id: Option(transport.ConnectionId),
-) -> RuntimeState(model, msg) {
-  case state.on_route_leave, state.current_route, next_route {
-    Some(on_leave), Some(previous_route), Some(resolved_route)
-      if previous_route != resolved_route
-    -> {
-      log.debug("beacon.runtime", "Running route leave effects")
-      let leave_effect = on_leave(previous_route, resolved_route)
-      let processes =
-        run_effects_with_context(
-          leave_effect,
-          state.self,
-          conn_id,
-          state.connections,
-        )
-      track_effect_processes(state, processes)
-    }
-    _, _, _ -> state
-  }
-}
 
 /// Create a signed join token carrying the serialized model, not bound to
 /// any browser session. Prefer `ssr.join_token_for` for request-bound pages.

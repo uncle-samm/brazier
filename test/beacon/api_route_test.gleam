@@ -1,11 +1,11 @@
 /// Tests for the API route handler feature.
 /// Verifies that api_handler runs before SSR/static and can handle or pass through requests.
 import beacon/api
+import beacon/app_config_fixture
 import beacon/application
+import beacon/attribute
 import beacon/effect
-import beacon/element
-import beacon/middleware
-import beacon/transport
+import beacon/html
 import beacon/transport/server.{type Connection, type ResponseBody, Bytes}
 import gleam/bytes_tree
 import gleam/erlang/process
@@ -32,41 +32,36 @@ fn free_test_port() -> Int {
   port
 }
 
+fn test_app_config(
+  port: Int,
+  text: String,
+) -> application.AppConfig(TestModel, TestMsg) {
+  app_config_fixture.new(
+    port: port,
+    init: fn(_ctx) { #(TestModel(count: 0), effect.none()) },
+    update: fn(model, _msg) {
+      #(TestModel(count: model.count + 1), effect.none())
+    },
+    view: fn(model: TestModel) {
+      html.div([attribute.id("app")], [
+        html.text(text <> int.to_string(model.count)),
+      ])
+    },
+    encode_model: fn(model: TestModel) {
+      "{\"count\":" <> int.to_string(model.count) <> "}"
+    },
+    decode_event: fn(_name, _hid, _data, _path) { Ok(TestInc) },
+  )
+}
+
 fn test_app_config_with_api(
   port: Int,
   api_handler: fn(Request(Connection)) ->
     option.Option(response.Response(ResponseBody)),
 ) -> application.AppConfig(TestModel, TestMsg) {
   application.AppConfig(
-    port: port,
-    init: fn() { #(TestModel(count: 0), effect.none()) },
-    update: fn(model, _msg) {
-      #(TestModel(count: model.count + 1), effect.none())
-    },
-    view: fn(model: TestModel) {
-      element.el("div", [element.attr("id", "app")], [
-        element.text("count:" <> int.to_string(model.count)),
-      ])
-    },
-    decode_event: option.Some(fn(_name, _hid, _data, _path) { Ok(TestInc) }),
-    secret_key: "api-test-secret-key-long-enough-for-hmac!!",
-    title: "API Test",
-    serialize_model: option.None,
-    deserialize_model: option.None,
-    middlewares: [middleware.secure_headers()],
-    static_dir: option.None,
-    route_patterns: [],
-    on_route_change: option.None,
-    on_route_leave: option.None,
-    dynamic_subscriptions: option.None,
-    on_notify: option.None,
-    on_notification: option.None,
-    security_limits: transport.default_security_limits(),
-    head_html: option.None,
+    ..test_app_config(port, "count:"),
     api_handler: option.Some(api_handler),
-    ws_auth: option.None,
-    init_from_request: option.None,
-    dev_mode: False,
   )
 }
 
@@ -87,7 +82,7 @@ pub fn api_route_handler_serves_response_test() {
     }
   }
   let config = test_app_config_with_api(port, api)
-  let assert Ok(_app) = application.start_advanced(config)
+  let assert Ok(_app) = application.start(config)
   process.sleep(100)
 
   // Request /api/hello — should get the custom API response
@@ -110,7 +105,7 @@ pub fn api_route_handler_falls_through_test() {
     }
   }
   let config = test_app_config_with_api(port, api)
-  let assert Ok(_app) = application.start_advanced(config)
+  let assert Ok(_app) = application.start(config)
   process.sleep(100)
 
   // Request / — should fall through to SSR (page HTML)
@@ -147,7 +142,7 @@ pub fn api_route_handler_post_method_test() {
     }
   }
   let config = test_app_config_with_api(port, api)
-  let assert Ok(_app) = application.start_advanced(config)
+  let assert Ok(_app) = application.start(config)
   process.sleep(100)
 
   // GET /api/data
@@ -163,7 +158,7 @@ pub fn typed_api_routes_match_get_and_set_json_header_test() {
       api.get("/api/status", fn(_req) { api.json(200, "{\"status\":\"ok\"}") }),
     ])
   let config = test_app_config_with_api(port, api_handler)
-  let assert Ok(_app) = application.start_advanced(config)
+  let assert Ok(_app) = application.start(config)
   process.sleep(100)
 
   let assert Ok(#(status, headers, body)) =
@@ -186,7 +181,7 @@ pub fn typed_api_routes_match_in_order_test() {
       api.get("/api/items", fn(_req) { api.text(200, "second") }),
     ])
   let config = test_app_config_with_api(port, api_handler)
-  let assert Ok(_app) = application.start_advanced(config)
+  let assert Ok(_app) = application.start(config)
   process.sleep(100)
 
   let resp = http_get(port, "/api/items")
@@ -201,7 +196,7 @@ pub fn typed_api_routes_fall_through_on_method_mismatch_test() {
       api.post("/api/items", fn(_req) { api.json(201, "{\"created\":true}") }),
     ])
   let config = test_app_config_with_api(port, api_handler)
-  let assert Ok(_app) = application.start_advanced(config)
+  let assert Ok(_app) = application.start(config)
   process.sleep(100)
 
   let resp = http_get(port, "/api/items")
@@ -216,7 +211,7 @@ pub fn typed_api_routes_handle_post_test() {
       api.post("/api/items", fn(_req) { api.json(201, "{\"created\":true}") }),
     ])
   let config = test_app_config_with_api(port, api_handler)
-  let assert Ok(_app) = application.start_advanced(config)
+  let assert Ok(_app) = application.start(config)
   process.sleep(100)
 
   let assert Ok(#(status, _headers, body)) =
@@ -245,7 +240,7 @@ pub fn typed_api_json_value_encodes_json_test() {
       }),
     ])
   let config = test_app_config_with_api(port, api_handler)
-  let assert Ok(_app) = application.start_advanced(config)
+  let assert Ok(_app) = application.start(config)
   process.sleep(100)
 
   let assert Ok(#(status, headers, body)) =
@@ -272,7 +267,7 @@ pub fn typed_api_read_text_reads_limited_utf8_body_test() {
       }),
     ])
   let config = test_app_config_with_api(port, api_handler)
-  let assert Ok(_app) = application.start_advanced(config)
+  let assert Ok(_app) = application.start(config)
   process.sleep(100)
 
   let assert Ok(#(status, _headers, body)) =
@@ -303,7 +298,7 @@ pub fn typed_api_read_form_decodes_required_fields_test() {
       }),
     ])
   let config = test_app_config_with_api(port, api_handler)
-  let assert Ok(_app) = application.start_advanced(config)
+  let assert Ok(_app) = application.start(config)
   process.sleep(100)
 
   let assert Ok(#(status, _headers, body)) =
@@ -328,36 +323,8 @@ pub fn typed_api_form_field_reports_missing_field_test() {
 pub fn no_api_handler_falls_through_test() {
   let port = free_test_port()
   let config =
-    application.AppConfig(
-      port: port,
-      init: fn() { #(TestModel(count: 0), effect.none()) },
-      update: fn(model, _msg) {
-        #(TestModel(count: model.count + 1), effect.none())
-      },
-      view: fn(_model: TestModel) {
-        element.el("div", [], [element.text("hello")])
-      },
-      decode_event: option.Some(fn(_name, _hid, _data, _path) { Ok(TestInc) }),
-      secret_key: "no-api-test-secret-key-long-enough-for-hmac!!",
-      title: "No API Test",
-      serialize_model: option.None,
-      deserialize_model: option.None,
-      middlewares: [],
-      static_dir: option.None,
-      route_patterns: [],
-      on_route_change: option.None,
-      on_route_leave: option.None,
-      dynamic_subscriptions: option.None,
-      on_notify: option.None,
-      on_notification: option.None,
-      security_limits: transport.default_security_limits(),
-      head_html: option.None,
-      api_handler: option.None,
-      ws_auth: option.None,
-      init_from_request: option.None,
-      dev_mode: False,
-    )
-  let assert Ok(_app) = application.start_advanced(config)
+    application.AppConfig(..test_app_config(port, "hello"), middlewares: [])
+  let assert Ok(_app) = application.start(config)
   process.sleep(100)
 
   let resp = http_get(port, "/")

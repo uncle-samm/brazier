@@ -1,17 +1,20 @@
-/// Beacon application — top-level OTP application with supervision tree.
-/// All framework services (transport, state manager) run under a supervisor
-/// so that crashes are contained and services restart automatically.
+/// Beacon application: starts the HTTP/WebSocket listener with a runtime per
+/// connection and per-request server rendering, optionally under an OTP
+/// supervisor.
+///
+/// `beacon.start` builds an `AppConfig` from the app and the generated codec;
+/// tests build it directly with hand-written codecs.
 ///
 /// Reference: Phoenix application structure, Erlang/OTP supervisor pattern.
 import beacon/config as beacon_config
 import beacon/effect.{type Effect}
-import beacon/element.{type Node}
+import beacon/element.{type Element}
 import beacon/error
+import beacon/internal/context.{type Context}
 import beacon/log
 import beacon/middleware
 import beacon/notification.{type Notification}
 import beacon/pubsub
-import beacon/route
 import beacon/runtime
 import beacon/ssr
 import beacon/state_manager
@@ -27,69 +30,58 @@ import gleam/otp/actor
 import gleam/otp/static_supervisor as supervisor
 import gleam/otp/supervision
 import gleam/string
+import gleam/uri.{type Uri}
 
-/// Configuration for starting a Beacon application.
-pub type AppConfig(model, msg) {
+/// Everything needed to serve an app, over the app's server `state`.
+pub type AppConfig(state, msg) {
   AppConfig(
-    /// Port to listen on.
+    /// Port to listen on (0 picks a free port).
     port: Int,
-    /// Initialize the model.
-    init: fn() -> #(model, Effect(msg)),
-    /// Update function.
-    update: fn(model, msg) -> #(model, Effect(msg)),
-    /// View function.
-    view: fn(model) -> Node(msg),
-    /// Decode client events to app messages.
-    /// Public Beacon apps use generated beacon_codec.decode_event/4.
-    /// Supplying this manually is an advanced non-browser transport hook.
-    decode_event: Option(
-      fn(String, String, String, String) -> Result(msg, error.BeaconError),
-    ),
-    /// Secret key for session tokens: at least 32 bytes
+    /// Build the state for a request (dead render) or a connection.
+    init: fn(Context) -> #(state, Effect(msg)),
+    /// The server update.
+    update: fn(state, msg) -> #(state, Effect(msg)),
+    /// Render the state (the app's `view` over `sync` and the initial
+    /// Local), for the dead render.
+    view: fn(state) -> Element(msg),
+    /// The page title for the dead render.
+    title: fn(state) -> String,
+    /// Encode the client-visible model of a state (`model_sync`, patches).
+    encode_model: fn(state) -> String,
+    /// Decode a client event into a message (the generated
+    /// `beacon_codec.decode_event`).
+    decode_event: fn(String, String, String, String) ->
+      Result(msg, error.BeaconError),
+    /// Rebuild a state from client-visible model JSON (state recovery).
+    /// When set, the dead render embeds the model in the signed join token.
+    restore_model: Option(fn(String) -> Result(state, String)),
+    /// The app's `parse` composed with `on_change`, when it has a router.
+    route: Option(fn(Uri) -> Result(msg, Nil)),
+    /// Secret key for join tokens: at least 32 bytes
     /// (`config.min_secret_key_bytes`), or start fails with a ConfigError.
     secret_key: String,
-    /// Application title (used in SSR HTML).
-    title: String,
-    /// Serialize model to string for session token (None = disabled).
-    serialize_model: Option(fn(model) -> String),
-    /// Deserialize model from string (None = disabled).
-    deserialize_model: Option(fn(String) -> Result(model, String)),
-    /// PubSub topics each per-connection runtime subscribes to.
     /// Middleware pipeline (applied to all HTTP requests).
     middlewares: List(middleware.Middleware),
     /// Static file serving directory (e.g., "priv/static").
     static_dir: Option(String),
-    /// Route patterns for URL matching.
-    route_patterns: List(route.RoutePattern),
-    /// Called when URL changes — produces a Msg for the update loop.
-    on_route_change: Option(fn(route.Route) -> msg),
-    /// Called before a client-side route transition is applied.
-    on_route_leave: Option(fn(route.Route, route.Route) -> effect.Effect(msg)),
-    /// Dynamic subscription function: model → list of topics.
-    dynamic_subscriptions: Option(fn(model) -> List(String)),
+    /// Dynamic subscription function: state → list of topics.
+    dynamic_subscriptions: Option(fn(state) -> List(String)),
     /// Topic-aware notification handler for dynamic subscriptions.
     on_notify: Option(fn(String) -> msg),
     /// Typed notification handler for dynamic subscriptions.
     on_notification: Option(fn(Notification) -> msg),
     /// Configurable security limits for the transport layer.
     security_limits: transport.SecurityLimits,
-    /// Optional: extra HTML to inject into `<head>` (stylesheets, meta tags, etc.).
-    /// Example: `Some("<link rel=\"stylesheet\" href=\"/static/styles.css\">")`
+    /// Extra HTML for `<head>` (stylesheets, meta tags, etc.).
     head_html: Option(String),
-    /// Optional: API route handler — runs BEFORE SSR/static file routing.
-    /// If it returns Some(response), that response is sent immediately.
-    /// If it returns None, the request falls through to SSR/static serving.
+    /// API route handler — runs BEFORE SSR/static file routing. Some(response)
+    /// is sent immediately; None falls through to SSR/static serving.
     api_handler: Option(
       fn(Request(Connection)) -> Option(response.Response(ResponseBody)),
     ),
-    /// Optional: WebSocket authentication function.
-    /// Runs before WS upgrade — Ok allows, Error(reason) rejects with 401.
+    /// WebSocket authentication: runs before the upgrade; Error(reason)
+    /// rejects with 401.
     ws_auth: Option(fn(Request(Connection)) -> Result(Nil, String)),
-    /// Optional: request-aware init — replaces init when HTTP request is available.
-    /// Used by ws_init to pass cookies/headers into server state initialization.
-    init_from_request: Option(
-      fn(Request(Connection)) -> #(model, effect.Effect(msg)),
-    ),
     /// Enable framework-owned client tracing.
     dev_mode: Bool,
   )
@@ -106,69 +98,11 @@ pub type App {
   )
 }
 
-/// Start a Beacon application.
-///
-/// Normal applications must use the generated Beacon contract:
-/// `beacon_codec.encode_model/1`, `beacon_codec.decode_event/4`, and
-/// `beacon_codec.render_model/1`. Supplying a manual event decoder to this
-/// entry point is rejected so browser apps cannot accidentally bypass generated
-/// client/server contract checks.
-///
-/// Creates a supervision tree:
-/// - State manager (ETS-backed)
-/// - Runtime (MVU loop actor)
-/// - Transport (HTTP + WebSocket via beacon/transport/server)
-///
-/// Uses `one_for_one` strategy: if one child crashes, only that child restarts.
-pub fn start(config: AppConfig(model, msg)) -> Result(App, error.BeaconError) {
+/// Start a Beacon application: every page request is rendered with
+/// `init(ctx)` (and the route), and every WebSocket connection gets its own
+/// runtime process. Refuses a weak secret key.
+pub fn start(config: AppConfig(state, msg)) -> Result(App, error.BeaconError) {
   log.configure()
-  case verify_public_application_contract(config) {
-    Error(err) -> Error(err)
-    Ok(Nil) -> start_verified(config)
-  }
-}
-
-/// Start an explicitly advanced Beacon application.
-///
-/// This is for test harnesses and non-browser transports that intentionally
-/// provide their own event decoder. Normal apps should use `beacon.start`, which
-/// generates and verifies the contract before the port is opened.
-pub fn start_advanced(
-  config: AppConfig(model, msg),
-) -> Result(App, error.BeaconError) {
-  log.configure()
-  case config.decode_event {
-    Some(_) -> {
-      log.warning(
-        "beacon.application",
-        "Starting with manual decode_event via start_advanced; generated browser contract checks are caller-owned",
-      )
-      start_verified(config)
-    }
-    None -> {
-      case runtime.verify_generated_contract() {
-        Ok(Nil) -> start_verified(config)
-        Error(err) -> Error(err)
-      }
-    }
-  }
-}
-
-fn verify_public_application_contract(
-  config: AppConfig(model, msg),
-) -> Result(Nil, error.BeaconError) {
-  case config.decode_event {
-    Some(_) ->
-      Error(error.ConfigError(
-        reason: "Manual decode_event is not accepted by application.start. Use generated contracts through beacon.start, or call application.start_advanced for an explicit non-browser/test transport.",
-      ))
-    None -> runtime.verify_generated_contract()
-  }
-}
-
-fn start_verified(
-  config: AppConfig(model, msg),
-) -> Result(App, error.BeaconError) {
   // A weak secret makes every signed join token forgeable: refuse to start.
   case beacon_config.validate_secret_key(config.secret_key) {
     Error(err) -> Error(err)
@@ -177,89 +111,63 @@ fn start_verified(
 }
 
 fn start_with_valid_secret(
-  config: AppConfig(model, msg),
+  config: AppConfig(state, msg),
 ) -> Result(App, error.BeaconError) {
-  // Start PubSub for distributed broadcasting
   pubsub.start()
   log.info(
     "beacon.application",
-    "Starting Beacon application on port " <> int.to_string(config.port),
+    "Starting Beacon application on port "
+      <> int.to_string(config.port)
+      <> " (router: "
+      <> case config.route {
+      Some(_) -> "yes"
+      None -> "no"
+    }
+      <> ", state recovery: "
+      <> case config.restore_model {
+      Some(_) -> "yes"
+      None -> "no"
+    }
+      <> ")",
   )
 
-  // SSR rendering: route-aware (per-request) or static (pre-rendered once)
   let ssr_config =
     ssr.SsrConfig(
       init: config.init,
+      update: config.update,
+      route: config.route,
       view: config.view,
-      secret_key: config.secret_key,
       title: config.title,
+      secret_key: config.secret_key,
       head_html: config.head_html,
       dev_mode: config.dev_mode,
-      serialize_model: config.serialize_model,
+      recovery_encoder: case config.restore_model {
+        Some(_) -> Some(config.encode_model)
+        None -> None
+      },
     )
-
-  // When routes are configured, render per-request so each URL gets
-  // route-specific HTML (e.g. /login renders the login page).
-  // Otherwise, pre-render once at startup.
-  let #(page_html, ssr_factory) = case
-    config.route_patterns,
-    config.on_route_change
-  {
-    [_, ..], Some(_) -> {
-      log.info("beacon.application", "Route-aware SSR enabled")
-      let factory = fn(req: request.Request(server.Connection), path: String) {
-        // Use init_from_request if available — renders SSR with auth context
-        // (e.g., ws_init reads session cookie → model has auth_user → SSR shows Home)
-        let init_fn = case config.init_from_request {
-          Some(ifr) -> fn() { ifr(req) }
-          None -> config.init
-        }
-        let page =
-          ssr.render_page_for_path(
-            ssr.SsrConfig(..ssr_config, init: init_fn),
-            path,
-            config.route_patterns,
-            config.on_route_change,
-            config.update,
-          )
-        page
-      }
-      #(None, Some(factory))
-    }
-    _, _ -> {
-      let page = ssr.render_page(ssr_config)
-      log.info("beacon.application", "SSR page rendered (static)")
-      #(Some(page), None)
-    }
+  // Every page is rendered for its request: init reads the request's URL,
+  // cookies and session through the Context.
+  let ssr_factory = fn(req: Request(Connection), _path: String) {
+    ssr.render_page(ssr_config, req)
   }
 
-  // Per-connection runtime: each WebSocket gets its own runtime process
   let runtime_config =
     runtime.RuntimeConfig(
       init: config.init,
       update: config.update,
-      view: config.view,
+      encode_model: config.encode_model,
       decode_event: config.decode_event,
-      serialize_model: config.serialize_model,
-      deserialize_model: config.deserialize_model,
-      route_patterns: config.route_patterns,
-      on_route_change: config.on_route_change,
-      on_route_leave: config.on_route_leave,
+      restore_model: config.restore_model,
+      route: config.route,
       dynamic_subscriptions: config.dynamic_subscriptions,
       on_notify: config.on_notify,
       on_notification: config.on_notification,
-      init_from_request: config.init_from_request,
       secret_key: config.secret_key,
-      dev_mode: config.dev_mode,
     )
 
-  // Create transport with per-connection runtime factory
   let base_transport_config =
-    runtime.connect_transport_per_connection(
-      runtime_config,
-      config.port,
-      page_html,
-    )
+    runtime.connect_transport_per_connection(runtime_config, config.port, None)
   let static_cfg = case config.static_dir {
     Some(dir) ->
       Some(static.StaticConfig(directory: dir, prefix: "/static", max_age: 3600))
@@ -271,7 +179,7 @@ fn start_with_valid_secret(
       middlewares: config.middlewares,
       static_config: static_cfg,
       security_limits: config.security_limits,
-      ssr_factory: ssr_factory,
+      ssr_factory: Some(ssr_factory),
       api_handler: config.api_handler,
       ws_auth: config.ws_auth,
     )
@@ -300,19 +208,9 @@ fn start_with_valid_secret(
 ///
 /// This is the production-ready entry point.
 pub fn start_supervised(
-  config: AppConfig(model, msg),
+  config: AppConfig(state, msg),
 ) -> Result(App, error.BeaconError) {
   start_supervised_with(config, start)
-}
-
-/// Start an explicitly advanced Beacon application with the OTP supervisor.
-///
-/// This has the same contract caveat as `start_advanced`: manual decoders are
-/// caller-owned and should not be used for normal browser apps.
-pub fn start_supervised_advanced(
-  config: AppConfig(model, msg),
-) -> Result(App, error.BeaconError) {
-  start_supervised_with(config, start_advanced)
 }
 
 fn start_supervised_with(

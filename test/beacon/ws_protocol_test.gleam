@@ -194,7 +194,10 @@ fn raw_upgrade(
 ) -> #(RawSocket, String) {
   let assert Ok(socket) = raw_connect(host, port)
   let assert Ok(Nil) =
-    raw_send(socket, raw_upgrade_request("/ws", host_header(port), headers))
+    raw_send(
+      socket,
+      raw_upgrade_request("/ws?path=%2F", host_header(port), headers),
+    )
   let assert Ok(#(-1, head)) = raw_recv_frame(socket, 3000)
   let assert Ok(head) = bit_array.to_string(head)
   #(socket, head)
@@ -824,7 +827,7 @@ pub fn slow_reader_is_closed_by_send_timeout_test() {
     raw_send(
       socket,
       raw_upgrade_request(
-        "/ws",
+        "/ws?path=%2F",
         host_header(server.port),
         upgrade_headers(server.port),
       ),

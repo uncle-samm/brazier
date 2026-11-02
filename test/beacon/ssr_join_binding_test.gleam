@@ -1,16 +1,15 @@
 /// The real server binds the SSR join token to the request's session
 /// cookie (`ssr.to_response_for_request`), so a token minted for one browser
 /// session does not verify for another. Real HTTP over a real socket.
+import beacon/app_config_fixture
 import beacon/application
 import beacon/effect
-import beacon/element
 import beacon/error
+import beacon/html
 import beacon/ssr
-import beacon/transport
 import gleam/erlang/process
 import gleam/int
 import gleam/list
-import gleam/option
 import gleam/string
 
 const secret = "ssr-join-binding-test-secret-key-0123456789"
@@ -25,42 +24,29 @@ pub type Msg {
 
 fn config() -> application.AppConfig(Model, Msg) {
   application.AppConfig(
-    port: 0,
-    init: fn() { #(Model(count: 0), effect.none()) },
-    update: fn(model: Model, _msg) {
-      #(Model(count: model.count + 1), effect.none())
-    },
-    view: fn(model: Model) {
-      element.el("div", [], [element.text(int.to_string(model.count))])
-    },
-    decode_event: option.Some(fn(_name, _handler_id, _data, _path) {
-      Error(error.RuntimeError(reason: "no events"))
-    }),
+    ..app_config_fixture.new(
+      port: 0,
+      init: fn(_ctx) { #(Model(count: 0), effect.none()) },
+      update: fn(model: Model, _msg) {
+        #(Model(count: model.count + 1), effect.none())
+      },
+      view: fn(model: Model) {
+        html.div([], [html.text(int.to_string(model.count))])
+      },
+      encode_model: fn(model: Model) {
+        "{\"count\":" <> int.to_string(model.count) <> "}"
+      },
+      decode_event: fn(_name, _handler_id, _data, _path) {
+        Error(error.RuntimeError(reason: "no events"))
+      },
+    ),
     secret_key: secret,
-    title: "Join Binding",
-    serialize_model: option.Some(fn(model: Model) {
-      "{\"count\":" <> int.to_string(model.count) <> "}"
-    }),
-    deserialize_model: option.None,
     middlewares: [],
-    static_dir: option.None,
-    route_patterns: [],
-    on_route_change: option.None,
-    on_route_leave: option.None,
-    dynamic_subscriptions: option.None,
-    on_notify: option.None,
-    on_notification: option.None,
-    security_limits: transport.default_security_limits(),
-    head_html: option.None,
-    api_handler: option.None,
-    ws_auth: option.None,
-    init_from_request: option.None,
-    dev_mode: False,
   )
 }
 
 pub fn served_join_token_is_bound_to_the_session_cookie_test() {
-  let assert Ok(app) = application.start_advanced(config())
+  let assert Ok(app) = application.start(config())
   let url = "http://localhost:" <> int.to_string(app.port) <> "/"
   let now = system_time_seconds()
 
@@ -88,7 +74,7 @@ pub fn served_join_token_is_bound_to_the_session_cookie_test() {
 }
 
 pub fn served_join_token_without_a_session_is_unbound_test() {
-  let assert Ok(app) = application.start_advanced(config())
+  let assert Ok(app) = application.start(config())
   let url = "http://localhost:" <> int.to_string(app.port) <> "/"
   let now = system_time_seconds()
 

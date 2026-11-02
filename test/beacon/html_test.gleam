@@ -1,31 +1,30 @@
+import beacon/attribute
 import beacon/element
 import beacon/html
 
-pub fn div_matches_element_el_test() {
-  let a = html.div([html.class("x")], [html.text("hi")])
-  let b = element.el("div", [element.attr("class", "x")], [element.text("hi")])
+pub fn div_matches_element_test() {
+  let a = html.div([attribute.class("x")], [html.text("hi")])
+  let b =
+    element.element("div", [attribute.attribute("class", "x")], [
+      element.text("hi"),
+    ])
   let assert True = element.to_string(a) == element.to_string(b)
 }
 
 pub fn button_test() {
-  let node = html.button([html.id("btn")], [html.text("Click")])
-  let s = element.to_string(node)
-  let assert True = str_contains(s, "<button")
-  let assert True = str_contains(s, "id=\"btn\"")
-  let assert True = str_contains(s, "Click")
+  let node = html.button([attribute.id("btn")], [html.text("Click")])
+  let assert "<button id=\"btn\">Click</button>" = element.to_string(node)
 }
 
 pub fn input_void_test() {
-  let node = html.input([html.type_("text"), html.placeholder("Name...")])
-  let s = element.to_string(node)
-  let assert True = str_contains(s, "<input")
-  let assert True = str_contains(s, "type=\"text\"")
-  // Void — no closing tag
-  let assert False = str_contains(s, "</input>")
+  let node =
+    html.input([attribute.type_("text"), attribute.placeholder("Name...")])
+  let assert "<input type=\"text\" placeholder=\"Name...\">" =
+    element.to_string(node)
 }
 
 pub fn br_test() {
-  let assert "<br>" = element.to_string(html.br())
+  let assert "<br>" = element.to_string(html.br([]))
 }
 
 pub fn nested_test() {
@@ -39,33 +38,33 @@ pub fn nested_test() {
 
 pub fn ul_li_test() {
   let node =
-    html.ul([], [
-      html.li([], [html.text("a")]),
-      html.li([], [html.text("b")]),
-    ])
-  let s = element.to_string(node)
-  let assert True = str_contains(s, "<ul>")
-  let assert True = str_contains(s, "<li>a</li>")
+    html.ul([], [html.li([], [html.text("a")]), html.li([], [html.text("b")])])
+  let assert "<ul><li>a</li><li>b</li></ul>" = element.to_string(node)
 }
 
-pub fn attribute_shortcuts_test() {
+pub fn link_test() {
   let node =
-    html.a([html.href("/about"), html.class("link")], [html.text("About")])
-  let s = element.to_string(node)
-  let assert True = str_contains(s, "href=\"/about\"")
-  let assert True = str_contains(s, "class=\"link\"")
+    html.a([attribute.href("/about"), attribute.class("link")], [
+      html.text("About"),
+    ])
+  let assert "<a href=\"/about\" class=\"link\">About</a>" =
+    element.to_string(node)
 }
 
 pub fn img_void_test() {
-  let node = html.img([html.src_("/logo.png")])
-  let s = element.to_string(node)
-  let assert True = str_contains(s, "<img")
-  let assert True = str_contains(s, "src=\"/logo.png\"")
+  let node = html.img([attribute.src("/logo.png"), attribute.alt("Logo")])
+  let assert "<img src=\"/logo.png\" alt=\"Logo\">" = element.to_string(node)
 }
 
-fn str_contains(haystack: String, needle: String) -> Bool {
-  do_str_contains(haystack, needle)
+pub fn textarea_and_select_test() {
+  let node =
+    html.select([attribute.name("pick")], [
+      html.option([attribute.value("a"), attribute.selected(True)], [
+        html.text("A"),
+      ]),
+    ])
+  let assert "<select name=\"pick\"><option value=\"a\" selected=\"\">A</option></select>" =
+    element.to_string(node)
+  let assert "<textarea rows=\"3\">hi</textarea>" =
+    element.to_string(html.textarea([attribute.rows(3)], [html.text("hi")]))
 }
-
-@external(erlang, "beacon_test_ffi", "string_contains")
-fn do_str_contains(haystack: String, needle: String) -> Bool

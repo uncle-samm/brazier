@@ -94,6 +94,9 @@ pub type ServerMessage {
   ServerPatch(ops_json: String, version: Int, ack_clock: Int)
   /// Server-initiated navigation (redirect via pushState).
   ServerNavigate(path: String)
+  /// Server-initiated navigation that replaces the current history entry
+  /// (`replaceState`). Encoded as `navigate` with `"replace": true`.
+  ServerReplaceNavigate(path: String)
   /// Server-initiated hard navigation (full page reload via window.location.href).
   /// Use when the browser needs to make a real HTTP request (e.g., to receive Set-Cookie).
   ServerHardNavigate(path: String)
@@ -114,6 +117,8 @@ pub type InternalMessage {
   SendPatch(ops_json: String, version: Int, ack_clock: Int)
   /// Send navigation redirect to the client (pushState).
   SendNavigate(path: String)
+  /// Send navigation to the client that replaces the history entry.
+  SendReplaceNavigate(path: String)
   /// Send hard navigation to the client (full page reload).
   SendHardNavigate(path: String)
   /// Close the connection because the server has detected sustained pressure.
@@ -567,6 +572,13 @@ pub fn encode_server_message(msg: ServerMessage) -> String {
       json.object([
         #("type", json.string("navigate")),
         #("path", json.string(path)),
+      ])
+      |> json.to_string
+    ServerReplaceNavigate(path) ->
+      json.object([
+        #("type", json.string("navigate")),
+        #("path", json.string(path)),
+        #("replace", json.bool(True)),
       ])
       |> json.to_string
     ServerHardNavigate(path) ->
@@ -1356,6 +1368,8 @@ fn handle_runtime_message(
             ),
           )
         SendNavigate(path) -> send_or_stop(state, ServerNavigate(path: path))
+        SendReplaceNavigate(path) ->
+          send_or_stop(state, ServerReplaceNavigate(path: path))
         SendHardNavigate(path) ->
           send_or_stop(state, ServerHardNavigate(path: path))
         CloseForBackpressure(reason) -> {
