@@ -3,6 +3,7 @@
 /// Parses user source code, resolves the types of every field that crosses
 /// the wire, and classifies Msg variants. Also validates purity and extracts
 /// pure code for JS compilation.
+import beacon/build/ast_refs
 import beacon/build/field_type.{type FieldType, type TypeDef}
 import beacon/build/source_location
 import beacon/log
@@ -104,8 +105,12 @@ pub type MsgTypeInfo {
   MsgTypeInfo(
     /// Module alias used from the app source.
     module: String,
-    /// Variants carried by this Msg type.
+    /// Variants the browser may send: the module's `ClientMsg` allowlist when
+    /// it has one, otherwise every variant.
     variants: List(MsgVariant),
+    /// Every variant of the Msg type, whether or not the browser may send it.
+    /// Generated client encoders match on these exhaustively.
+    all_variants: List(MsgVariant),
   )
 }
 
@@ -118,8 +123,14 @@ pub type Analysis {
     model_module: String,
     /// Type name of the Model type.
     model_type_name: String,
-    /// All Msg type variants with their classification.
+    /// Msg variants with their classification. Empty when the app has no
+    /// update function. When the Msg type is imported and the app defines a
+    /// `ClientMsg` allowlist, only the allowed variants.
     msg_variants: List(MsgVariant),
+    /// Every variant of the primary Msg type, classified against the update
+    /// function when there is one. Generated client code matches on these
+    /// exhaustively, so a Msg variant is never handled by a catch-all.
+    msg_type_variants: List(MsgVariant),
     /// Module alias of the primary Msg type (empty string if in primary file).
     msg_module: String,
     /// Type name of the primary Msg type.
@@ -335,8 +346,13 @@ fn analyze_primary(module: glance.Module, scope: field_type.Scope) -> Analysis {
   let computed_fields =
     list.filter_map(module.functions, fn(def) { computed_field(scope, def) })
 
-  let variants = case msg_type, update_fn {
+  let msg_type_variants = case msg_type, update_fn {
     Ok(msg), Ok(func) -> classify_variants(scope, msg, func, has_local)
+    Ok(msg), Error(_) -> variants_from_msg_type(scope, msg)
+    Error(_), _ -> []
+  }
+  let variants = case msg_type, update_fn {
+    Ok(_), Ok(_) -> msg_type_variants
     _, _ -> {
       log.debug(
         "beacon.build.analyzer",
@@ -354,6 +370,7 @@ fn analyze_primary(module: glance.Module, scope: field_type.Scope) -> Analysis {
     model_module: "",
     model_type_name: "Model",
     msg_variants: variants,
+    msg_type_variants:,
     msg_module: "",
     msg_type_name: "Msg",
     client_msg_variants: client_variants,
@@ -541,6 +558,7 @@ fn merge_externals(analysis: Analysis, externals: List(External)) -> Analysis {
           Ok(MsgTypeInfo(
             module: ext.alias,
             variants: external_msg_variants(ext, False),
+            all_variants: external_msg_type_variants(ext, False),
           ))
         Error(_) -> Error(Nil)
       }
@@ -582,11 +600,16 @@ fn merge_externals(analysis: Analysis, externals: List(External)) -> Analysis {
       }
   }
 
-  let #(msg_variants, msg_module, msg_type_name, client_msg_variants) = case
-    analysis.msg_variants
-  {
+  let #(
+    msg_variants,
+    msg_type_variants,
+    msg_module,
+    msg_type_name,
+    client_msg_variants,
+  ) = case analysis.msg_variants {
     [_, ..] -> #(
       analysis.msg_variants,
+      analysis.msg_type_variants,
       analysis.msg_module,
       analysis.msg_type_name,
       analysis.client_msg_variants,
@@ -618,9 +641,15 @@ fn merge_externals(analysis: Analysis, externals: List(External)) -> Analysis {
               [],
             )
           }
-          #(variants, ext.alias, "Msg", client_variants)
+          #(
+            variants,
+            external_msg_type_variants(ext, analysis.has_local),
+            ext.alias,
+            "Msg",
+            client_variants,
+          )
         }
-        Error(Nil) -> #([], "", "Msg", [])
+        Error(Nil) -> #([], analysis.msg_type_variants, "", "Msg", [])
       }
   }
 
@@ -683,6 +712,7 @@ fn merge_externals(analysis: Analysis, externals: List(External)) -> Analysis {
     model_module:,
     model_type_name:,
     msg_variants:,
+    msg_type_variants:,
     msg_module:,
     msg_type_name:,
     client_msg_variants:,
@@ -717,6 +747,22 @@ fn external_msg_variants(ext: External, has_local: Bool) -> List(MsgVariant) {
             Ok(func) -> classify_variants(ext.scope, msg_type, func, has_local)
             Error(_) -> variants_from_msg_type(ext.scope, msg_type)
           }
+      }
+  }
+}
+
+/// Every variant of an imported module's Msg type, classified against the
+/// module's update function when it has one.
+fn external_msg_type_variants(
+  ext: External,
+  has_local: Bool,
+) -> List(MsgVariant) {
+  case find_custom_type(ext.module, "Msg") {
+    Error(_) -> []
+    Ok(msg_type) ->
+      case find_update_function(ext.module) {
+        Ok(func) -> classify_variants(ext.scope, msg_type, func, has_local)
+        Error(_) -> variants_from_msg_type(ext.scope, msg_type)
       }
   }
 }
@@ -776,9 +822,14 @@ fn finish(analysis: Analysis) -> Analysis {
     local_fields: expand_fields(analysis.local_fields),
     server_fields: expand_fields(analysis.server_fields),
     msg_variants: expand_variants(analysis.msg_variants),
+    msg_type_variants: expand_variants(analysis.msg_type_variants),
     client_msg_variants: expand_variants(analysis.client_msg_variants),
     external_msg_types: list.map(analysis.external_msg_types, fn(info) {
-      MsgTypeInfo(..info, variants: expand_variants(info.variants))
+      MsgTypeInfo(
+        ..info,
+        variants: expand_variants(info.variants),
+        all_variants: expand_variants(info.all_variants),
+      )
     }),
     computed_fields: list.map(analysis.computed_fields, fn(c) {
       ComputedField(..c, field_type: expand(c.field_type))
@@ -1717,10 +1768,9 @@ pub fn validate_client_update_purity(source: String) -> Result(Nil, String) {
 
 /// Return client-visible update purity violations without formatting.
 pub fn client_update_purity_errors(module: glance.Module) -> List(PurityError) {
-  let aliases = side_effect_import_aliases(module)
-  let external_names = erlang_external_function_names(module)
+  let names = effect_names(module)
   let update_errors = case find_function(module, "update") {
-    Ok(func) -> function_body_side_effects(func.body, aliases, external_names)
+    Ok(func) -> function_body_side_effects(func.body, names)
     // An app without a direct `update` has no client-visible update to check.
     Error(_) -> []
   }
@@ -1842,21 +1892,56 @@ fn erlang_external_function_names(module: glance.Module) -> List(String) {
   })
 }
 
+/// Names through which an update function can reach a side-effecting API.
+type EffectNames {
+  EffectNames(
+    /// #(local alias, module path) of imported side-effect modules.
+    aliases: List(#(String, String)),
+    /// Functions defined in this module with `@external(erlang, ...)`.
+    external_names: List(String),
+    /// #(local name, "module.name") of values imported unqualified from
+    /// side-effect modules, e.g. `import beacon/store.{put}`.
+    unqualified: List(#(String, String)),
+  )
+}
+
+fn effect_names(module: glance.Module) -> EffectNames {
+  EffectNames(
+    aliases: side_effect_import_aliases(module),
+    external_names: erlang_external_function_names(module),
+    unqualified: side_effect_unqualified_values(module),
+  )
+}
+
+/// Imported side-effect modules and the alias they are referenced by. An
+/// import discarded with `as _name` cannot be referenced, so it has no alias.
 fn side_effect_import_aliases(
   module: glance.Module,
 ) -> List(#(String, String)) {
   list.filter_map(module.imports, fn(def) {
     let import_ = def.definition
+    case is_update_side_effect_module(import_.module), import_.alias {
+      False, _ -> Error(Nil)
+      True, option.Some(glance.Discarded(_)) -> Error(Nil)
+      True, option.Some(glance.Named(name)) -> Ok(#(name, import_.module))
+      True, option.None ->
+        Ok(#(module_short_name(import_.module), import_.module))
+    }
+  })
+}
+
+fn side_effect_unqualified_values(
+  module: glance.Module,
+) -> List(#(String, String)) {
+  list.flat_map(module.imports, fn(def) {
+    let import_ = def.definition
     case is_update_side_effect_module(import_.module) {
-      True -> {
-        let alias = case import_.alias {
-          option.Some(glance.Named(name)) -> name
-          option.Some(glance.Discarded(name)) -> name
-          option.None -> module_short_name(import_.module)
-        }
-        Ok(#(alias, import_.module))
-      }
-      False -> Error(Nil)
+      False -> []
+      True ->
+        list.map(import_.unqualified_values, fn(value) {
+          let local = option.unwrap(value.alias, value.name)
+          #(local, import_.module <> "." <> value.name)
+        })
     }
   })
 }
@@ -1884,95 +1969,152 @@ fn is_update_side_effect_module(module_path: String) -> Bool {
 
 fn function_body_side_effects(
   body: List(glance.Statement),
-  aliases: List(#(String, String)),
-  external_names: List(String),
+  names: EffectNames,
 ) -> List(PurityError) {
   body
-  |> list.flat_map(fn(statement) {
-    statement_side_effects(statement, aliases, external_names)
-  })
+  |> list.flat_map(statement_side_effects(_, names))
   |> unique_purity_errors
 }
 
 fn statement_side_effects(
   statement: glance.Statement,
-  aliases: List(#(String, String)),
-  external_names: List(String),
+  names: EffectNames,
 ) -> List(PurityError) {
   case statement {
-    glance.Expression(expr) ->
-      expression_side_effects(expr, aliases, external_names)
-    glance.Assignment(value: expr, ..) ->
-      expression_side_effects(expr, aliases, external_names)
-    _ -> []
+    glance.Expression(expr) -> expression_side_effects(expr, names)
+    glance.Assignment(value:, kind:, ..) ->
+      list.append(expression_side_effects(value, names), case kind {
+        glance.LetAssert(message: option.Some(message)) ->
+          expression_side_effects(message, names)
+        glance.LetAssert(message: option.None) | glance.Let -> []
+      })
+    glance.Use(function:, ..) -> expression_side_effects(function, names)
+    glance.Assert(expression:, message:, ..) ->
+      list.append(
+        expression_side_effects(expression, names),
+        optional_side_effects(message, names),
+      )
   }
 }
 
-fn expression_side_effects(
-  expr: glance.Expression,
-  aliases: List(#(String, String)),
-  external_names: List(String),
+fn optional_side_effects(
+  expr: option.Option(glance.Expression),
+  names: EffectNames,
 ) -> List(PurityError) {
   case expr {
-    glance.Call(function: func, arguments: args, ..) -> {
-      let own = call_side_effect(func, aliases, external_names)
-      let func_nested = expression_side_effects(func, aliases, external_names)
-      let arg_nested =
-        list.flat_map(args, fn(arg) {
-          case arg {
-            glance.LabelledField(item: value, ..) ->
-              expression_side_effects(value, aliases, external_names)
-            glance.UnlabelledField(item: value) ->
-              expression_side_effects(value, aliases, external_names)
-            glance.ShorthandField(..) -> []
-          }
-        })
-      list.flatten([own, func_nested, arg_nested])
-    }
-    glance.Block(statements: stmts, ..) ->
-      list.flat_map(stmts, fn(stmt) {
-        statement_side_effects(stmt, aliases, external_names)
-      })
-    glance.Case(subjects: subjects, clauses: clauses, ..) -> {
-      let subject_errors =
-        list.flat_map(subjects, fn(subject) {
-          expression_side_effects(subject, aliases, external_names)
-        })
-      let clause_errors =
-        list.flat_map(clauses, fn(clause) {
-          expression_side_effects(clause.body, aliases, external_names)
-        })
-      list.append(subject_errors, clause_errors)
-    }
-    glance.BinaryOperator(left: left, right: right, ..) ->
-      list.append(
-        expression_side_effects(left, aliases, external_names),
-        expression_side_effects(right, aliases, external_names),
-      )
-    glance.Fn(body: body, ..) ->
-      list.flat_map(body, fn(stmt) {
-        statement_side_effects(stmt, aliases, external_names)
-      })
-    glance.List(elements: elements, ..) ->
-      list.flat_map(elements, fn(item) {
-        expression_side_effects(item, aliases, external_names)
-      })
-    glance.Tuple(elements: elements, ..) ->
-      list.flat_map(elements, fn(item) {
-        expression_side_effects(item, aliases, external_names)
-      })
-    glance.FieldAccess(container: inner, ..) ->
-      expression_side_effects(inner, aliases, external_names)
-    glance.NegateInt(value: inner, ..) | glance.NegateBool(value: inner, ..) ->
-      expression_side_effects(inner, aliases, external_names)
-    _ -> []
+    option.Some(inner) -> expression_side_effects(inner, names)
+    option.None -> []
   }
 }
 
+fn field_side_effects(
+  fields: List(glance.Field(glance.Expression)),
+  names: EffectNames,
+) -> List(PurityError) {
+  list.flat_map(fields, fn(field) {
+    case field {
+      glance.LabelledField(item: value, ..)
+      | glance.UnlabelledField(item: value) ->
+        expression_side_effects(value, names)
+      glance.ShorthandField(..) -> []
+    }
+  })
+}
+
+/// Walk every sub-expression. Every expression form is listed so a new
+/// glance variant is a compile error here rather than a silent gap.
+fn expression_side_effects(
+  expr: glance.Expression,
+  names: EffectNames,
+) -> List(PurityError) {
+  case expr {
+    glance.Call(function:, arguments:, ..) ->
+      list.flatten([
+        call_side_effect(function, names),
+        expression_side_effects(function, names),
+        field_side_effects(arguments, names),
+      ])
+    glance.FnCapture(function:, arguments_before:, arguments_after:, ..) ->
+      list.flatten([
+        call_side_effect(function, names),
+        expression_side_effects(function, names),
+        field_side_effects(arguments_before, names),
+        field_side_effects(arguments_after, names),
+      ])
+    glance.BinaryOperator(name: glance.Pipe, left:, right:, ..) ->
+      list.flatten([
+        expression_side_effects(left, names),
+        // `x |> store.put` calls the right-hand side.
+        call_side_effect(right, names),
+        expression_side_effects(right, names),
+      ])
+    glance.BinaryOperator(left:, right:, ..) ->
+      list.append(
+        expression_side_effects(left, names),
+        expression_side_effects(right, names),
+      )
+    glance.Block(statements:, ..) | glance.Fn(body: statements, ..) ->
+      list.flat_map(statements, statement_side_effects(_, names))
+    glance.Case(subjects:, clauses:, ..) ->
+      list.append(
+        list.flat_map(subjects, expression_side_effects(_, names)),
+        list.flat_map(clauses, fn(clause) {
+          list.append(
+            optional_side_effects(clause.guard, names),
+            expression_side_effects(clause.body, names),
+          )
+        }),
+      )
+    glance.List(elements:, rest:, ..) ->
+      list.append(
+        list.flat_map(elements, expression_side_effects(_, names)),
+        optional_side_effects(rest, names),
+      )
+    glance.Tuple(elements:, ..) ->
+      list.flat_map(elements, expression_side_effects(_, names))
+    glance.RecordUpdate(record:, fields:, ..) ->
+      list.append(
+        expression_side_effects(record, names),
+        list.flat_map(fields, fn(field) {
+          optional_side_effects(field.item, names)
+        }),
+      )
+    glance.FieldAccess(container: inner, ..)
+    | glance.TupleIndex(tuple: inner, ..)
+    | glance.NegateInt(value: inner, ..)
+    | glance.NegateBool(value: inner, ..) ->
+      expression_side_effects(inner, names)
+    glance.BitString(segments:, ..) ->
+      list.flat_map(segments, fn(segment) {
+        list.append(
+          expression_side_effects(segment.0, names),
+          list.flat_map(segment.1, fn(option) {
+            case option {
+              glance.SizeValueOption(size) ->
+                expression_side_effects(size, names)
+              _ -> []
+            }
+          }),
+        )
+      })
+    glance.Echo(expression:, message:, ..) ->
+      list.append(
+        optional_side_effects(expression, names),
+        optional_side_effects(message, names),
+      )
+    glance.Panic(message:, ..) | glance.Todo(message:, ..) ->
+      optional_side_effects(message, names)
+    glance.Int(..)
+    | glance.Float(..)
+    | glance.String(..)
+    | glance.Variable(..) -> []
+  }
+}
+
+/// The side effect of calling `func`, if it names a side-effecting API.
 fn call_side_effect(
   func: glance.Expression,
-  aliases: List(#(String, String)),
-  external_names: List(String),
+  names: EffectNames,
 ) -> List(PurityError) {
   case func {
     glance.FieldAccess(
@@ -1980,7 +2122,9 @@ fn call_side_effect(
       label: call_name,
       ..,
     ) -> {
-      let module_error = case list.find(aliases, fn(item) { item.0 == alias }) {
+      let module_error = case
+        list.find(names.aliases, fn(item) { item.0 == alias })
+      {
         Ok(#(_, module_path)) -> [
           UpdateSideEffect(alias <> "." <> call_name <> " from " <> module_path),
         ]
@@ -1992,11 +2136,20 @@ fn call_side_effect(
       }
       list.append(module_error, random_error)
     }
-    glance.Variable(name: name, ..) -> {
-      case list.contains(external_names, name) {
+    glance.Variable(name:, ..) -> {
+      let external_error = case list.contains(names.external_names, name) {
         True -> [UpdateSideEffect(name <> " external FFI")]
         False -> []
       }
+      let unqualified_error = case
+        list.find(names.unqualified, fn(item) { item.0 == name })
+      {
+        Ok(#(_, qualified)) -> [
+          UpdateSideEffect(name <> " (imported " <> qualified <> ")"),
+        ]
+        Error(Nil) -> []
+      }
+      list.append(external_error, unqualified_error)
     }
     _ -> []
   }
@@ -2122,21 +2275,28 @@ fn extract_client_source_with_update(
       // Collect all type definitions (Model, Local, Msg, custom types)
       // Exclude Server/ServerState types — private server-side state is never
       // sent to client bundles or codecs.
+      let client_types =
+        list.filter(module.custom_types, fn(def) {
+          def.definition.name != "Server"
+          && def.definition.name != "ServerState"
+        })
       let type_texts =
-        list.filter_map(module.custom_types, fn(def) {
-          case
-            def.definition.name == "Server"
-            || def.definition.name == "ServerState"
-          {
-            True -> Error(Nil)
-            False -> Ok(slice_source(source_bytes, def.definition.location))
-          }
+        list.map(client_types, fn(def) {
+          slice_source(source_bytes, def.definition.location)
         })
 
       // Collect type aliases
       let alias_texts =
         list.map(module.type_aliases, fn(def) {
           slice_source(source_bytes, def.definition.location)
+        })
+      let type_refs =
+        list.fold(module.type_aliases, ast_refs.empty(), fn(acc, def) {
+          ast_refs.type_alias(acc, def.definition)
+        })
+      let type_refs =
+        list.fold(client_types, type_refs, fn(acc, def) {
+          ast_refs.custom_type(acc, def.definition)
         })
 
       // Collect pure functions (skip server-only, skip @external(erlang),
@@ -2158,7 +2318,7 @@ fn extract_client_source_with_update(
                   }
                   // Always extract view/init/init_local — client needs them
                   case list.contains(always_extract_functions, func.name) {
-                    True -> Ok(#(func.name, is_public, func_text))
+                    True -> Ok(#(func.name, is_public, func_text, func))
                     False -> {
                       // Skip computed fields — pub fn(Model) -> T (not Node return)
                       let is_computed = case func.publicity, func.parameters {
@@ -2200,7 +2360,8 @@ fn extract_client_source_with_update(
                               // Skip if the body references server-only modules
                               case function_references_server_code(func_text) {
                                 True -> Error(Nil)
-                                False -> Ok(#(func.name, is_public, func_text))
+                                False ->
+                                  Ok(#(func.name, is_public, func_text, func))
                               }
                           }
                         }
@@ -2213,15 +2374,24 @@ fn extract_client_source_with_update(
           }
         })
 
+      let candidate_refs =
+        list.map(function_candidates, fn(candidate) {
+          let #(name, is_public, text, func) = candidate
+          #(name, is_public, text, ast_refs.function(ast_refs.empty(), func))
+        })
+      let kept_functions = reachable_functions(candidate_refs)
       let function_texts =
-        list.filter_map(function_candidates, fn(candidate) {
-          let #(name, is_public, func_text) = candidate
-          case
-            is_public
-            || function_is_referenced_by_candidate(name, function_candidates)
-          {
-            True -> Ok(func_text)
+        list.filter_map(candidate_refs, fn(candidate) {
+          case set.contains(kept_functions, candidate.0) {
+            True -> Ok(candidate.2)
             False -> Error(Nil)
+          }
+        })
+      let function_refs =
+        list.fold(candidate_refs, ast_refs.empty(), fn(acc, candidate) {
+          case set.contains(kept_functions, candidate.0) {
+            True -> ast_refs.merge(acc, candidate.3)
+            False -> acc
           }
         })
 
@@ -2229,62 +2399,57 @@ fn extract_client_source_with_update(
       // Rules (in order):
       // 1. Skip if constant name starts with "server_" (server-only by convention)
       // 2. Skip if constant body references server-only modules
-      // 3. Skip if constant is not referenced by any extracted function
-      let constant_texts =
+      // 3. Skip if no extracted function (or kept constant) refers to it
+      let constant_candidates =
         list.filter_map(module.constants, fn(def) {
-          let const_name = def.definition.name
-          // Rule 1: skip server_ prefixed constants
-          case string.starts_with(const_name, "server_") {
+          let constant = def.definition
+          case string.starts_with(constant.name, "server_") {
             True -> Error(Nil)
             False -> {
-              let const_text =
-                slice_source(source_bytes, def.definition.location)
-              // Rule 2: skip if body references server-only code
-              case function_references_server_code(const_text) {
+              let text = slice_source(source_bytes, constant.location)
+              case function_references_server_code(text) {
                 True -> Error(Nil)
-                False -> {
-                  // Rule 3: skip if not referenced by any extracted function
-                  let is_referenced =
-                    list.any(function_texts, fn(ft) {
-                      string.contains(ft, const_name)
-                    })
-                  case is_referenced {
-                    True -> Ok(const_text)
-                    False -> Error(Nil)
-                  }
-                }
+                False ->
+                  Ok(#(
+                    constant.name,
+                    text,
+                    ast_refs.constant(ast_refs.empty(), constant),
+                  ))
               }
             }
           }
         })
+      let kept_constants =
+        reachable_constants(function_refs, constant_candidates)
+      let constant_texts =
+        list.filter_map(constant_candidates, fn(candidate) {
+          case set.contains(kept_constants, candidate.0) {
+            True -> Ok(candidate.1)
+            False -> Error(Nil)
+          }
+        })
 
-      let body_text =
-        list.flatten([type_texts, alias_texts, constant_texts, function_texts])
-        |> string.join("\n\n")
+      let body_refs =
+        constant_candidates
+        |> list.filter(fn(candidate) {
+          set.contains(kept_constants, candidate.0)
+        })
+        |> list.fold(ast_refs.merge(type_refs, function_refs), fn(acc, c) {
+          ast_refs.merge(acc, c.2)
+        })
 
-      // Collect safe imports that are still referenced by the extracted client
-      // code. Server-only functions are stripped above, so their imports must
-      // not keep server graphs reachable in the generated JS project.
+      // Keep the safe imports the extracted client code still refers to.
+      // Server-only functions are stripped above, so their imports must not
+      // keep server graphs reachable in the generated JS project.
       let import_texts =
         list.filter_map(module.imports, fn(def) {
           let import_ = def.definition
-          let import_text = slice_source(source_bytes, import_.location)
-          let alias_name = case import_.alias {
-            option.Some(glance.Named(name)) -> name
-            option.Some(glance.Discarded(name)) -> name
-            option.None -> {
-              case string.split(import_.module, "/") |> list.last {
-                Ok(name) -> name
-                Error(_) -> import_.module
-              }
-            }
-          }
           case
             is_server_only_import(import_.module)
-            || !import_referenced(import_text, alias_name, body_text)
+            || !ast_refs.uses_import(body_refs, import_)
           {
             True -> Error(Nil)
-            False -> Ok(import_text)
+            False -> Ok(slice_source(source_bytes, import_.location))
           }
         })
 
@@ -2307,65 +2472,61 @@ fn extract_client_source_with_update(
   }
 }
 
-/// Check if a function body references server-only code.
-/// Checks if the function text references any module that was skipped
-/// from the safe imports list, or uses known server-only patterns.
-fn import_referenced(
-  import_text: String,
-  alias_name: String,
-  body_text: String,
-) -> Bool {
-  string.contains(body_text, alias_name <> ".")
-  || imported_unqualified_name_referenced(import_text, body_text)
-}
-
-fn imported_unqualified_name_referenced(
-  import_text: String,
-  body_text: String,
-) -> Bool {
-  case string.split(import_text, "{") {
-    [_, rest] -> {
-      let names_text = case string.split(rest, "}") {
-        [names, ..] -> names
-        _ -> ""
-      }
-      names_text
-      |> string.split(",")
-      |> list.any(fn(raw_name) {
-        let name =
-          raw_name
-          |> string.trim
-          |> strip_prefix("type ")
-          |> strip_import_alias
-        name != "" && string.contains(body_text, name)
-      })
+/// Public candidates plus every private candidate they reach.
+fn reachable_functions(
+  candidates: List(#(String, Bool, String, ast_refs.Refs)),
+) -> Set(String) {
+  let roots =
+    candidates
+    |> list.filter(fn(candidate) { candidate.1 })
+    |> list.map(fn(candidate) { candidate.0 })
+  reach(set.from_list(roots), roots, fn(name) {
+    case list.find(candidates, fn(candidate) { candidate.0 == name }) {
+      Ok(candidate) ->
+        list.filter_map(candidates, fn(other) {
+          case set.contains(candidate.3.names, other.0) {
+            True -> Ok(other.0)
+            False -> Error(Nil)
+          }
+        })
+      Error(Nil) -> []
     }
-    _ -> False
-  }
-}
-
-fn function_is_referenced_by_candidate(
-  name: String,
-  candidates: List(#(String, Bool, String)),
-) -> Bool {
-  candidates
-  |> list.any(fn(candidate) {
-    let #(other_name, _is_public, other_text) = candidate
-    other_name != name && string.contains(other_text, name)
   })
 }
 
-fn strip_prefix(text: String, prefix: String) -> String {
-  case string.starts_with(text, prefix) {
-    True -> string.drop_start(text, string.length(prefix))
-    False -> text
+/// Constants referenced by kept functions, plus the constants they reach.
+fn reachable_constants(
+  function_refs: ast_refs.Refs,
+  candidates: List(#(String, String, ast_refs.Refs)),
+) -> Set(String) {
+  let refers = fn(refs: ast_refs.Refs) {
+    list.filter_map(candidates, fn(candidate) {
+      case set.contains(refs.names, candidate.0) {
+        True -> Ok(candidate.0)
+        False -> Error(Nil)
+      }
+    })
   }
+  let roots = refers(function_refs)
+  reach(set.from_list(roots), roots, fn(name) {
+    case list.find(candidates, fn(candidate) { candidate.0 == name }) {
+      Ok(candidate) -> refers(candidate.2)
+      Error(Nil) -> []
+    }
+  })
 }
 
-fn strip_import_alias(text: String) -> String {
-  case string.split(text, " as ") {
-    [name, ..] -> string.trim(name)
-    _ -> text
+fn reach(
+  seen: Set(String),
+  pending: List(String),
+  next: fn(String) -> List(String),
+) -> Set(String) {
+  case pending {
+    [] -> seen
+    [name, ..rest] -> {
+      let fresh = list.filter(next(name), fn(n) { !set.contains(seen, n) })
+      reach(list.fold(fresh, seen, set.insert), list.append(rest, fresh), next)
+    }
   }
 }
 
