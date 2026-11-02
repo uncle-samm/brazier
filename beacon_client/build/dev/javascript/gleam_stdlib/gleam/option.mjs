@@ -1,8 +1,8 @@
 import {
   Ok,
   Error,
-  toList,
   Empty as $Empty,
+  List$Empty$const as $List$Empty$const,
   prepend as listPrepend,
   CustomType as $CustomType,
 } from "../gleam.mjs";
@@ -18,7 +18,8 @@ export const Option$isSome = (value) => value instanceof Some;
 export const Option$Some$0 = (value) => value[0];
 
 export class None extends $CustomType {}
-export const Option$None = () => new None();
+export const Option$None$const = new None();
+export const Option$None = () => Option$None$const;
 export const Option$isNone = (value) => value instanceof None;
 
 function reverse_and_prepend(loop$prefix, loop$suffix) {
@@ -37,7 +38,7 @@ function reverse_and_prepend(loop$prefix, loop$suffix) {
 }
 
 function reverse(list) {
-  return reverse_and_prepend(list, toList([]));
+  return reverse_and_prepend(list, $List$Empty$const);
 }
 
 function all_loop(loop$list, loop$acc) {
@@ -54,7 +55,7 @@ function all_loop(loop$list, loop$acc) {
         loop$list = rest;
         loop$acc = listPrepend(first, acc);
       } else {
-        return new None();
+        return Option$None$const;
       }
     }
   }
@@ -76,7 +77,7 @@ function all_loop(loop$list, loop$acc) {
  * ```
  */
 export function all(list) {
-  return all_loop(list, toList([]));
+  return all_loop(list, $List$Empty$const);
 }
 
 /**
@@ -153,7 +154,7 @@ export function from_result(result) {
     let a = result[0];
     return new Some(a);
   } else {
-    return new None();
+    return Option$None$const;
   }
 }
 
@@ -382,5 +383,5 @@ function values_loop(loop$list, loop$acc) {
  * ```
  */
 export function values(options) {
-  return values_loop(options, toList([]));
+  return values_loop(options, $List$Empty$const);
 }

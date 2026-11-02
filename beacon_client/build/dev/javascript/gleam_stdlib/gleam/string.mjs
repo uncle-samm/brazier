@@ -9,7 +9,7 @@ import {
 } from "../gleam.mjs";
 import * as $list from "../gleam/list.mjs";
 import * as $option from "../gleam/option.mjs";
-import { None, Some } from "../gleam/option.mjs";
+import { Some, Option$None$const } from "../gleam/option.mjs";
 import * as $order from "../gleam/order.mjs";
 import * as $string_tree from "../gleam/string_tree.mjs";
 import {
@@ -20,20 +20,20 @@ import {
   string_grapheme_slice as grapheme_slice,
   string_byte_slice as unsafe_byte_slice,
   crop_string as crop,
+  byte_size,
   contains_string as contains,
   starts_with,
   ends_with,
-  split_once,
-  trim_start,
-  trim_end,
   pop_grapheme,
   graphemes as to_graphemes,
+  split_once,
+  trim_end,
+  trim_start,
   codepoint as unsafe_int_to_utf_codepoint,
   string_to_codepoint_integer_list,
   utf_codepoint_list_to_string as from_utf_codepoints,
   utf_codepoint_to_int,
   inspect as do_inspect,
-  byte_size,
 } from "../gleam_stdlib.mjs";
 
 export {
@@ -55,8 +55,10 @@ export {
 };
 
 class Leading extends $CustomType {}
+const Direction$Leading$const = new Leading();
 
 class Trailing extends $CustomType {}
+const Direction$Trailing$const = new Trailing();
 
 /**
  * Determines if a `String` is empty.
@@ -136,13 +138,13 @@ export function replace(string, pattern, substitute) {
 export function compare(a, b) {
   let $ = a === b;
   if ($) {
-    return new $order.Eq();
+    return $order.Order$Eq$const;
   } else {
     let $1 = less_than(a, b);
     if ($1) {
-      return new $order.Lt();
+      return $order.Order$Lt$const;
     } else {
-      return new $order.Gt();
+      return $order.Order$Gt$const;
     }
   }
 }
@@ -198,6 +200,32 @@ export function slice(string, idx, len) {
 }
 
 /**
+ * Drops *n* graphemes from the start of a `String`.
+ *
+ * This function runs in linear time with the number of graphemes to drop.
+ *
+ * ## Examples
+ *
+ * ```gleam
+ * assert drop_start(from: "The Lone Gunmen", up_to: 2) == "e Lone Gunmen"
+ * ```
+ */
+export function drop_start(string, num_graphemes) {
+  let $ = num_graphemes <= 0;
+  if ($) {
+    return string;
+  } else {
+    let prefix = grapheme_slice(string, 0, num_graphemes);
+    let prefix_size = byte_size(prefix);
+    return unsafe_byte_slice(
+      string,
+      prefix_size,
+      byte_size(string) - prefix_size,
+    );
+  }
+}
+
+/**
  * Drops *n* graphemes from the end of a `String`.
  *
  * This function traverses the full string, so it runs in linear time with the
@@ -216,6 +244,43 @@ export function drop_end(string, num_graphemes) {
     return string;
   } else {
     return slice(string, 0, length(string) - num_graphemes);
+  }
+}
+
+function to_graphemes_loop(loop$string, loop$acc) {
+  while (true) {
+    let string = loop$string;
+    let acc = loop$acc;
+    let $ = pop_grapheme(string);
+    if ($ instanceof Ok) {
+      let grapheme = $[0][0];
+      let rest = $[0][1];
+      loop$string = rest;
+      loop$acc = listPrepend(grapheme, acc);
+    } else {
+      return acc;
+    }
+  }
+}
+
+/**
+ * Creates a list of `String`s by splitting a given string on a given substring.
+ *
+ * ## Examples
+ *
+ * ```gleam
+ * assert split("home/gleam/desktop/", on: "/")
+ *   == ["home", "gleam", "desktop", ""]
+ * ```
+ */
+export function split(x, substring) {
+  if (substring === "") {
+    return to_graphemes(x);
+  } else {
+    let _pipe = x;
+    let _pipe$1 = $string_tree.from_string(_pipe);
+    let _pipe$2 = $string_tree.split(_pipe$1, substring);
+    return $list.map(_pipe$2, $string_tree.to_string);
   }
 }
 
@@ -437,43 +502,6 @@ export function trim(string) {
   return trim_end(_pipe$1);
 }
 
-function to_graphemes_loop(loop$string, loop$acc) {
-  while (true) {
-    let string = loop$string;
-    let acc = loop$acc;
-    let $ = pop_grapheme(string);
-    if ($ instanceof Ok) {
-      let grapheme = $[0][0];
-      let rest = $[0][1];
-      loop$string = rest;
-      loop$acc = listPrepend(grapheme, acc);
-    } else {
-      return acc;
-    }
-  }
-}
-
-/**
- * Creates a list of `String`s by splitting a given string on a given substring.
- *
- * ## Examples
- *
- * ```gleam
- * assert split("home/gleam/desktop/", on: "/")
- *   == ["home", "gleam", "desktop", ""]
- * ```
- */
-export function split(x, substring) {
-  if (substring === "") {
-    return to_graphemes(x);
-  } else {
-    let _pipe = x;
-    let _pipe$1 = $string_tree.from_string(_pipe);
-    let _pipe$2 = $string_tree.split(_pipe$1, substring);
-    return $list.map(_pipe$2, $string_tree.to_string);
-  }
-}
-
 function do_to_utf_codepoints(string) {
   let _pipe = string;
   let _pipe$1 = string_to_codepoint_integer_list(_pipe);
@@ -520,16 +548,16 @@ export function utf_codepoint(value) {
   if (i > 1_114_111) {
     return new Error(undefined);
   } else {
-    let i = value;
-    if ((i >= 55_296) && (i <= 57_343)) {
+    let i$1 = value;
+    if ((i$1 >= 55_296) && (i$1 <= 57_343)) {
       return new Error(undefined);
     } else {
-      let i = value;
-      if (i < 0) {
+      let i$2 = value;
+      if (i$2 < 0) {
         return new Error(undefined);
       } else {
-        let i = value;
-        return new Ok(unsafe_int_to_utf_codepoint(i));
+        let i$3 = value;
+        return new Ok(unsafe_int_to_utf_codepoint(i$3));
       }
     }
   }
@@ -551,7 +579,7 @@ export function utf_codepoint(value) {
  */
 export function to_option(string) {
   if (string === "") {
-    return new None();
+    return Option$None$const;
   } else {
     return new Some(string);
   }
@@ -666,30 +694,4 @@ export function inspect(term) {
   let _pipe = term;
   let _pipe$1 = do_inspect(_pipe);
   return $string_tree.to_string(_pipe$1);
-}
-
-/**
- * Drops *n* graphemes from the start of a `String`.
- *
- * This function runs in linear time with the number of graphemes to drop.
- *
- * ## Examples
- *
- * ```gleam
- * assert drop_start(from: "The Lone Gunmen", up_to: 2) == "e Lone Gunmen"
- * ```
- */
-export function drop_start(string, num_graphemes) {
-  let $ = num_graphemes <= 0;
-  if ($) {
-    return string;
-  } else {
-    let prefix = grapheme_slice(string, 0, num_graphemes);
-    let prefix_size = byte_size(prefix);
-    return unsafe_byte_slice(
-      string,
-      prefix_size,
-      byte_size(string) - prefix_size,
-    );
-  }
 }

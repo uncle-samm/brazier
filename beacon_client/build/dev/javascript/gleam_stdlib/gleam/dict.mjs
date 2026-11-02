@@ -2,17 +2,22 @@ import {
   toTransient as to_transient,
   fromTransient as from_transient,
   size,
-  has as has_key,
+  fold,
   make as new$,
+  destructiveTransientInsert as transient_insert,
+  has as has_key,
   get,
   insert,
-  destructiveTransientInsert as transient_insert,
   map as map_values,
-  destructiveTransientDelete as transient_delete,
-  fold,
   destructiveTransientUpdateWith as transient_update_with,
+  destructiveTransientDelete as transient_delete,
 } from "../dict.mjs";
-import { Ok, toList, Empty as $Empty, prepend as listPrepend } from "../gleam.mjs";
+import {
+  Ok,
+  Empty as $Empty,
+  List$Empty$const as $List$Empty$const,
+  prepend as listPrepend,
+} from "../gleam.mjs";
 import * as $option from "../gleam/option.mjs";
 
 export { fold, get, has_key, insert, map_values, new$, size };
@@ -32,6 +37,40 @@ export { fold, get, has_key, insert, map_values, new$, size };
  */
 export function is_empty(dict) {
   return size(dict) === 0;
+}
+
+/**
+ * Converts the dict to a list of 2-element tuples `#(key, value)`, one for
+ * each key-value pair in the dict.
+ *
+ * The tuples in the list have no specific order.
+ *
+ * ## Examples
+ *
+ * Calling `to_list` on an empty `dict` returns an empty list.
+ *
+ * ```gleam
+ * assert new() |> to_list == []
+ * ```
+ *
+ * The ordering of elements in the resulting list is an implementation detail
+ * that should not be relied upon.
+ *
+ * ```gleam
+ * assert new()
+ *   |> insert("b", 1)
+ *   |> insert("a", 0)
+ *   |> insert("c", 2)
+ *   |> to_list
+ *   == [#("a", 0), #("b", 1), #("c", 2)]
+ * ```
+ */
+export function to_list(dict) {
+  return fold(
+    dict,
+    $List$Empty$const,
+    (acc, key, value) => { return listPrepend([key, value], acc); },
+  );
 }
 
 function from_list_loop(loop$transient, loop$list) {
@@ -58,6 +97,87 @@ function from_list_loop(loop$transient, loop$list) {
  */
 export function from_list(list) {
   return from_list_loop(to_transient(new$()), list);
+}
+
+/**
+ * Gets a list of all keys in a given dict.
+ *
+ * Dicts are not ordered so the keys are not returned in any specific order. Do
+ * not write code that relies on the order keys are returned by this function
+ * as it may change in later versions of Gleam or Erlang.
+ *
+ * ## Examples
+ *
+ * ```gleam
+ * assert from_list([#("a", 0), #("b", 1)]) |> keys == ["a", "b"]
+ * ```
+ */
+export function keys(dict) {
+  return fold(
+    dict,
+    $List$Empty$const,
+    (acc, key, _) => { return listPrepend(key, acc); },
+  );
+}
+
+/**
+ * Gets a list of all values in a given dict.
+ *
+ * Dicts are not ordered so the values are not returned in any specific order. Do
+ * not write code that relies on the order values are returned by this function
+ * as it may change in later versions of Gleam or Erlang.
+ *
+ * ## Examples
+ *
+ * ```gleam
+ * assert from_list([#("a", 0), #("b", 1)]) |> values == [0, 1]
+ * ```
+ */
+export function values(dict) {
+  return fold(
+    dict,
+    $List$Empty$const,
+    (acc, _, value) => { return listPrepend(value, acc); },
+  );
+}
+
+function do_filter(f, dict) {
+  let _pipe = to_transient(new$());
+  let _pipe$1 = fold(
+    dict,
+    _pipe,
+    (transient, key, value) => {
+      let $ = f(key, value);
+      if ($) {
+        return transient_insert(key, value, transient);
+      } else {
+        return transient;
+      }
+    },
+  );
+  return from_transient(_pipe$1);
+}
+
+/**
+ * Creates a new dict from a given dict, minus any entries that a given function
+ * returns `False` for.
+ *
+ * ## Examples
+ *
+ * ```gleam
+ * assert from_list([#("a", 0), #("b", 1)])
+ *   |> filter(fn(key, value) { value != 0 })
+ *   == from_list([#("b", 1)])
+ * ```
+ *
+ * ```gleam
+ * assert from_list([#("a", 0), #("b", 1)])
+ *   |> filter(fn(key, value) { True })
+ *   == from_list([#("a", 0), #("b", 1)])
+ * ```
+ */
+export function filter(dict, predicate) {
+  return do_filter(predicate, dict);
 }
 
 function do_take_loop(loop$dict, loop$desired_keys, loop$acc) {
@@ -109,6 +229,67 @@ function do_take(desired_keys, dict) {
  */
 export function take(dict, desired_keys) {
   return do_take(desired_keys, dict);
+}
+
+function do_combine(combine, left, right) {
+  let _block;
+  let $1 = size(left) >= size(right);
+  if ($1) {
+    _block = [left, right, combine];
+  } else {
+    _block = [right, left, (k, l, r) => { return combine(k, r, l); }];
+  }
+  let $ = _block;
+  let big = $[0];
+  let small = $[1];
+  let combine$1 = $[2];
+  let _pipe = to_transient(big);
+  let _pipe$1 = fold(
+    small,
+    _pipe,
+    (transient, key, value) => {
+      let update = (existing) => { return combine$1(key, existing, value); };
+      return transient_update_with(key, update, value, transient);
+    },
+  );
+  return from_transient(_pipe$1);
+}
+
+/**
+ * Creates a new dict from a pair of given dicts by combining their entries.
+ *
+ * If there are entries with the same keys in both dicts the given function is
+ * used to determine the new value to use in the resulting dict.
+ *
+ * ## Examples
+ *
+ * ```gleam
+ * let a = from_list([#("a", 0), #("b", 1)])
+ * let b = from_list([#("a", 2), #("c", 3)])
+ * assert combine(a, b, fn(one, other) { one + other })
+ *   == from_list([#("a", 2), #("b", 1), #("c", 3)])
+ * ```
+ */
+export function combine(dict, other, fun) {
+  return do_combine((_, l, r) => { return fun(l, r); }, dict, other);
+}
+
+/**
+ * Creates a new dict from a pair of given dicts by combining their entries.
+ *
+ * If there are entries with the same keys in both dicts the entry from the
+ * second dict takes precedence.
+ *
+ * ## Examples
+ *
+ * ```gleam
+ * let a = from_list([#("a", 0), #("b", 1)])
+ * let b = from_list([#("b", 2), #("c", 3)])
+ * assert merge(a, b) == from_list([#("a", 0), #("b", 2), #("c", 3)])
+ * ```
+ */
+export function merge(dict, new_entries) {
+  return combine(dict, new_entries, (_, new_entry) => { return new_entry; });
 }
 
 /**
@@ -209,123 +390,8 @@ export function upsert(dict, key, fun) {
     let value = $[0];
     return insert(dict, key, fun(new $option.Some(value)));
   } else {
-    return insert(dict, key, fun(new $option.None()));
+    return insert(dict, key, fun($option.Option$None$const));
   }
-}
-
-/**
- * Converts the dict to a list of 2-element tuples `#(key, value)`, one for
- * each key-value pair in the dict.
- *
- * The tuples in the list have no specific order.
- *
- * ## Examples
- *
- * Calling `to_list` on an empty `dict` returns an empty list.
- *
- * ```gleam
- * assert new() |> to_list == []
- * ```
- *
- * The ordering of elements in the resulting list is an implementation detail
- * that should not be relied upon.
- *
- * ```gleam
- * assert new()
- *   |> insert("b", 1)
- *   |> insert("a", 0)
- *   |> insert("c", 2)
- *   |> to_list
- *   == [#("a", 0), #("b", 1), #("c", 2)]
- * ```
- */
-export function to_list(dict) {
-  return fold(
-    dict,
-    toList([]),
-    (acc, key, value) => { return listPrepend([key, value], acc); },
-  );
-}
-
-/**
- * Gets a list of all keys in a given dict.
- *
- * Dicts are not ordered so the keys are not returned in any specific order. Do
- * not write code that relies on the order keys are returned by this function
- * as it may change in later versions of Gleam or Erlang.
- *
- * ## Examples
- *
- * ```gleam
- * assert from_list([#("a", 0), #("b", 1)]) |> keys == ["a", "b"]
- * ```
- */
-export function keys(dict) {
-  return fold(
-    dict,
-    toList([]),
-    (acc, key, _) => { return listPrepend(key, acc); },
-  );
-}
-
-/**
- * Gets a list of all values in a given dict.
- *
- * Dicts are not ordered so the values are not returned in any specific order. Do
- * not write code that relies on the order values are returned by this function
- * as it may change in later versions of Gleam or Erlang.
- *
- * ## Examples
- *
- * ```gleam
- * assert from_list([#("a", 0), #("b", 1)]) |> values == [0, 1]
- * ```
- */
-export function values(dict) {
-  return fold(
-    dict,
-    toList([]),
-    (acc, _, value) => { return listPrepend(value, acc); },
-  );
-}
-
-function do_filter(f, dict) {
-  let _pipe = to_transient(new$());
-  let _pipe$1 = fold(
-    dict,
-    _pipe,
-    (transient, key, value) => {
-      let $ = f(key, value);
-      if ($) {
-        return transient_insert(key, value, transient);
-      } else {
-        return transient;
-      }
-    },
-  );
-  return from_transient(_pipe$1);
-}
-
-/**
- * Creates a new dict from a given dict, minus any entries that a given function
- * returns `False` for.
- *
- * ## Examples
- *
- * ```gleam
- * assert from_list([#("a", 0), #("b", 1)])
- *   |> filter(fn(key, value) { value != 0 })
- *   == from_list([#("b", 1)])
- * ```
- *
- * ```gleam
- * assert from_list([#("a", 0), #("b", 1)])
- *   |> filter(fn(key, value) { True })
- *   == from_list([#("a", 0), #("b", 1)])
- * ```
- */
-export function filter(dict, predicate) {
-  return do_filter(predicate, dict);
 }
 
 /**
@@ -363,70 +429,6 @@ export function each(dict, fun) {
   );
 }
 
-function do_combine(combine, left, right) {
-  let _block;
-  let $1 = size(left) >= size(right);
-  if ($1) {
-    _block = [left, right, combine];
-  } else {
-    _block = [right, left, (k, l, r) => { return combine(k, r, l); }];
-  }
-  let $ = _block;
-  let big;
-  let small;
-  let combine$1;
-  big = $[0];
-  small = $[1];
-  combine$1 = $[2];
-  let _pipe = to_transient(big);
-  let _pipe$1 = fold(
-    small,
-    _pipe,
-    (transient, key, value) => {
-      let update = (existing) => { return combine$1(key, existing, value); };
-      return transient_update_with(key, update, value, transient);
-    },
-  );
-  return from_transient(_pipe$1);
-}
-
-/**
- * Creates a new dict from a pair of given dicts by combining their entries.
- *
- * If there are entries with the same keys in both dicts the given function is
- * used to determine the new value to use in the resulting dict.
- *
- * ## Examples
- *
- * ```gleam
- * let a = from_list([#("a", 0), #("b", 1)])
- * let b = from_list([#("a", 2), #("c", 3)])
- * assert combine(a, b, fn(one, other) { one + other })
- *   == from_list([#("a", 2), #("b", 1), #("c", 3)])
- * ```
- */
-export function combine(dict, other, fun) {
-  return do_combine((_, l, r) => { return fun(l, r); }, dict, other);
-}
-
-/**
- * Creates a new dict from a pair of given dicts by combining their entries.
- *
- * If there are entries with the same keys in both dicts the entry from the
- * second dict takes precedence.
- *
- * ## Examples
- *
- * ```gleam
- * let a = from_list([#("a", 0), #("b", 1)])
- * let b = from_list([#("b", 2), #("c", 3)])
- * assert merge(a, b) == from_list([#("a", 0), #("b", 2), #("c", 3)])
- * ```
- */
-export function merge(dict, new_entries) {
-  return combine(dict, new_entries, (_, new_entry) => { return new_entry; });
-}
-
 function group_loop(loop$transient, loop$to_key, loop$list) {
   while (true) {
     let transient = loop$transient;
@@ -441,7 +443,12 @@ function group_loop(loop$transient, loop$to_key, loop$list) {
       let update = (existing) => { return listPrepend(value, existing); };
       let _pipe = transient;
       let _pipe$1 = ((_capture) => {
-        return transient_update_with(key, update, toList([value]), _capture);
+        return transient_update_with(
+          key,
+          update,
+          listPrepend(value, $List$Empty$const),
+          _capture,
+        );
       })(_pipe);
       loop$transient = _pipe$1;
       loop$to_key = to_key;
