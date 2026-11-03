@@ -3,7 +3,7 @@
     new_metrics/0, increment/2, increment_by/3, record_latency/2, record_payload/2,
     mark_event_send_start/1, take_event_send_start/0, collect/1, destroy/1,
     monotonic_us/0, snapshot_memory/0, snapshot_processes/0,
-    snapshot_pids/0, describe_new_processes/1,
+    snapshot_pids/0, count_new_processes/1, describe_new_processes/1,
     message_queue_len/1,
     watch_teardown/1, await_teardown/3, handle_ws_close/4
 ]).
@@ -145,11 +145,18 @@ snapshot_processes() ->
 snapshot_pids() ->
     erlang:processes().
 
+%% Count the processes alive now that were not in Before.
+count_new_processes(Before) ->
+    length(new_processes(Before)).
+
+new_processes(Before) ->
+    Old = sets:from_list(Before, [{version, 2}]),
+    [P || P <- erlang:processes(), not sets:is_element(P, Old)].
+
 %% Describe the processes alive now that were not in Before: registered
 %% name or initial call, current function and queue length.
 describe_new_processes(Before) ->
-    Old = sets:from_list(Before, [{version, 2}]),
-    New = [P || P <- erlang:processes(), not sets:is_element(P, Old)],
+    New = new_processes(Before),
     Info = [{P, erlang:process_info(P, [registered_name, initial_call,
                                         current_function, dictionary,
                                         message_queue_len])} || P <- New],

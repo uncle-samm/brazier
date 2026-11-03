@@ -85,6 +85,11 @@ pub fn snapshot_pids() -> List(Pid) {
   snapshot_pids_ffi()
 }
 
+/// How many processes alive now are not in `before`.
+pub fn count_new_processes(before: List(Pid)) -> Int {
+  count_new_processes_ffi(before)
+}
+
 /// Describe each process alive now that is not in `before`: registered
 /// name, initial call, current function, queue length.
 pub fn describe_new_processes(before: List(Pid)) -> String {
@@ -194,6 +199,9 @@ fn snapshot_processes_ffi() -> Int
 
 @external(erlang, "beacon_sim_ffi", "snapshot_pids")
 fn snapshot_pids_ffi() -> List(Pid)
+
+@external(erlang, "beacon_sim_ffi", "count_new_processes")
+fn count_new_processes_ffi(before: List(Pid)) -> Int
 
 @external(erlang, "beacon_sim_ffi", "describe_new_processes")
 fn describe_new_processes_ffi(before: List(Pid)) -> String

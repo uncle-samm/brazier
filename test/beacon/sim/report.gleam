@@ -25,6 +25,10 @@ pub type SimReport {
     memory_delta_kb: Int,
     processes_before: Int,
     processes_after: Int,
+    /// Processes started during the run that are still alive after
+    /// teardown. Counted by pid, not as `after - before`: the process count
+    /// is node-wide, so a process from an earlier test exiting during the
+    /// run would hide a leak (and once showed up as a "leak" of -4).
     processes_leaked: Int,
     duration_ms: Int,
     /// Wire efficiency metrics
@@ -45,6 +49,7 @@ pub fn generate(
   mem_after: Int,
   procs_before: Int,
   procs_after: Int,
+  procs_survived: Int,
 ) -> SimReport {
   let success_rate = case pool.total > 0 {
     True -> int.to_float(pool.succeeded) /. int.to_float(pool.total)
@@ -72,7 +77,7 @@ pub fn generate(
     memory_delta_kb: { mem_after - mem_before } / 1024,
     processes_before: procs_before,
     processes_after: procs_after,
-    processes_leaked: procs_after - procs_before,
+    processes_leaked: procs_survived,
     duration_ms: pool.duration_ms,
     bytes_sent: m.bytes_sent,
     bytes_received: m.bytes_received,
@@ -119,8 +124,13 @@ pub fn log_report(r: SimReport) -> Nil {
     "beacon.sim",
     "Memory: delta="
       <> int.to_string(r.memory_delta_kb)
-      <> "KB, Processes: delta="
-      <> int.to_string(r.processes_leaked),
+      <> "KB, Processes: "
+      <> int.to_string(r.processes_before)
+      <> " -> "
+      <> int.to_string(r.processes_after)
+      <> ", "
+      <> int.to_string(r.processes_leaked)
+      <> " started during the run still alive",
   )
   log.info("beacon.sim", "Duration: " <> int.to_string(r.duration_ms) <> "ms")
   log.info(
@@ -137,33 +147,6 @@ pub fn log_report(r: SimReport) -> Nil {
       <> int.to_string(r.mounts_received)
       <> " mounts",
   )
-}
-
-/// Assert the report passes standard thresholds.
-pub fn assert_passed(r: SimReport) -> Nil {
-  // Success rate >= 90%
-  let assert True = r.success_rate >=. 0.9
-  // Process leak < 50
-  let assert True = r.processes_leaked < 50
-  Nil
-}
-
-/// Assert strict pass criteria for non-fault scenarios.
-pub fn assert_strict(r: SimReport) -> Nil {
-  // Success rate >= 99%
-  let assert True = r.success_rate >=. 0.99
-  // Process leak < 20
-  let assert True = r.processes_leaked < 20
-  Nil
-}
-
-/// Assert the report passes strict thresholds for clean (non-fault) scenarios.
-pub fn assert_clean_passed(r: SimReport) -> Nil {
-  // Clean scenarios should have 100% success rate (or very close)
-  let assert True = r.success_rate >=. 0.98
-  // Process leak < 20
-  let assert True = r.processes_leaked < 20
-  Nil
 }
 
 /// Assert wire efficiency: if patches were received, they must outnumber

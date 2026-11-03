@@ -56,6 +56,7 @@ fn run_measured(
 
   let mem_after = metrics.snapshot_memory()
   let procs_after = metrics.snapshot_processes()
+  let procs_survived = metrics.count_new_processes(pids_before)
   let m = metrics.collect(mt)
   metrics.destroy(mt)
   let r =
@@ -67,6 +68,7 @@ fn run_measured(
       mem_after,
       procs_before,
       procs_after,
+      procs_survived,
     )
   report.log_report(r)
   case r.processes_leaked {
