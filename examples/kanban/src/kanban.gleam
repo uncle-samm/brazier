@@ -1,17 +1,24 @@
-/// Kanban Board — demonstrates:
-/// - HTML5 Drag and Drop (on_dragstart, on_dragover, on_drop)
-/// - Shared store for board state (multi-user concurrent edits)
-/// - Dynamic PubSub subscriptions
-/// - Cards moving between columns (Todo/Doing/Done)
-/// - Pure update + on_update pattern (store calls separated from update logic)
+/// Kanban Board, demonstrating:
+/// - HTML5 drag and drop with typed messages: `on_drag_start(DragStart(id))`
+///   on a card and `on_drop(DropOn(column))` on a column;
+/// - the high-frequency `dragover` events and the new-card draft handled in
+///   Local state, so they never reach the server;
+/// - a board shared by every session, kept in a `beacon/store` list as an
+///   append-only change log, so concurrent sessions never overwrite each
+///   other's changes;
+/// - a PubSub subscription that re-reads the log when any session changes it.
 import beacon
-import beacon/effect
+import beacon/attribute
+import beacon/effect.{type Effect}
+import beacon/element.{type Element}
+import beacon/event
 import beacon/html
+import beacon/local
 import beacon/log
-import beacon/pubsub
-import beacon/store
+import beacon/store.{type ListStore}
 import gleam/int
 import gleam/list
+import gleam/option.{type Option, None, Some}
 import gleam/string
 
 // --- Types ---
@@ -26,272 +33,366 @@ pub type Card {
   Card(id: Int, title: String, column: Column)
 }
 
+/// Synced to the browser.
 pub type Model {
-  Model(
-    cards: List(Card),
-    next_id: Int,
-    new_card_input: String,
-    /// ID of card currently being dragged (-1 = none)
-    dragging_id: Int,
+  Model(cards: List(Card))
+}
+
+/// Server-only, per session.
+pub type State {
+  State(
+    model: Model,
+    /// The card this session is dragging. A drop target does not know which
+    /// card was dropped on it, so the server remembers `DragStart`.
+    dragging: Option(Int),
   )
 }
 
+/// Client-only.
 pub type Local {
-  Local
+  Local(draft: String, dragging: Option(Int), over: Option(Column))
 }
 
 pub type Msg {
-  UpdateInput(String)
-  AddCard
-  StartDrag(String)
-  DropOnColumn(String)
-  DragOverColumn
+  DraftChanged(String)
+  AddCard(String)
   DeleteCard(Int)
-  BoardUpdated
-  /// Received from on_update after reading shared store — sets authoritative cards.
-  SetCards(List(Card), Int)
+  DragStart(Int)
+  DragOver(Column)
+  DropOn(Column)
+  DragEnd
+  /// A session (this one included) changed the shared log.
+  BoardChanged
 }
 
-fn column_from_string(s: String) -> Column {
-  case s {
-    "doing" -> Doing
-    "done" -> Done
-    _ -> Todo
-  }
+/// One entry of the shared change log. A card's id is the position of its
+/// `Added` change in `starting_board` followed by the log, which is the
+/// same for every reader because a local list store returns values in
+/// insertion order. Server-only.
+pub type Change {
+  Added(title: String)
+  Moved(id: Int, column: Column)
+  Deleted(id: Int)
 }
 
-fn column_to_string(c: Column) -> String {
-  case c {
-    Todo -> "todo"
-    Doing -> "doing"
-    Done -> "done"
-  }
-}
+const log_key = "board"
 
-fn column_label(c: Column) -> String {
-  case c {
+const max_title_length = 100
+
+const columns = [Todo, Doing, Done]
+
+fn column_label(column: Column) -> String {
+  case column {
     Todo -> "Todo"
     Doing -> "In Progress"
     Done -> "Done"
   }
 }
 
-fn column_color(c: Column) -> String {
-  case c {
+fn column_slug(column: Column) -> String {
+  case column {
+    Todo -> "todo"
+    Doing -> "doing"
+    Done -> "done"
+  }
+}
+
+fn column_colour(column: Column) -> String {
+  case column {
     Todo -> "#e3f2fd"
     Doing -> "#fff3e0"
     Done -> "#e8f5e9"
   }
 }
 
-// --- Init ---
+// --- Shared log ---
 
-pub fn init() -> Model {
+fn replay(changes: List(Change)) -> List(Card) {
+  let #(reversed, _position) =
+    list.fold(changes, #([], 0), fn(acc, change) {
+      let #(cards, position) = acc
+      let cards = case change {
+        Added(title) -> [Card(id: position, title:, column: Todo), ..cards]
+        Moved(id, column) ->
+          list.map(cards, fn(card) {
+            case card.id == id {
+              True -> Card(..card, column:)
+              False -> card
+            }
+          })
+        Deleted(id) -> list.filter(cards, fn(card) { card.id != id })
+      }
+      #(cards, position + 1)
+    })
+  list.reverse(reversed)
+}
+
+/// The starting board, replayed ahead of the shared log. It is a constant
+/// rather than a startup write, so there is nothing to seed and no race
+/// between sessions over who seeds.
+const starting_board = [
+  Added("Design API"),
+  Added("Write tests"),
+  Added("Build UI"),
+  Moved(id: 2, column: Doing),
+  Added("Deploy v0.1"),
+]
+
+fn read_board(changes: ListStore(Change)) -> Model {
   Model(
-    cards: [
-      Card(id: 1, title: "Design API", column: Todo),
-      Card(id: 2, title: "Write tests", column: Todo),
-      Card(id: 3, title: "Build UI", column: Doing),
-      Card(id: 4, title: "Deploy v0.1", column: Todo),
-    ],
-    next_id: 5,
-    new_card_input: "",
-    dragging_id: -1,
+    cards: replay(list.append(starting_board, store.get_all(changes, log_key))),
   )
 }
 
-pub fn init_local(_model: Model) -> Local {
-  Local
+/// Append a change; the store broadcasts on its topic, which every session
+/// (this one included) turns into `BoardChanged`.
+fn record(changes: ListStore(Change), change: Change) -> Effect(Msg) {
+  effect.from(fn(_dispatch) { store.append(changes, log_key, change) })
 }
 
-// --- Update (pure — no stores, no side effects) ---
+// --- Init and update (server) ---
 
-pub fn update(
-  model: Model,
-  local: Local,
-  _server: Nil,
+fn init(changes: ListStore(Change)) -> #(State, Effect(Msg)) {
+  #(State(model: read_board(changes), dragging: None), effect.none())
+}
+
+fn update(
+  changes: ListStore(Change),
+  state: State,
   msg: Msg,
-) -> #(Model, Local, Nil) {
-  let #(model, local) = case msg {
-    UpdateInput(text) -> #(Model(..model, new_card_input: text), local)
-
-    AddCard -> {
-      let title = string.trim(model.new_card_input)
-      case string.is_empty(title) {
-        True -> #(model, local)
-        False -> {
-          let card = Card(id: model.next_id, title: title, column: Todo)
-          #(
-            Model(
-              ..model,
-              cards: list.append(model.cards, [card]),
-              next_id: model.next_id + 1,
-              new_card_input: "",
-            ),
-            local,
+) -> #(State, Effect(Msg)) {
+  case msg {
+    AddCard(title) -> {
+      let title = string.trim(title)
+      case string.is_empty(title), string.length(title) > max_title_length {
+        True, _ -> {
+          log.warning("kanban", "Rejected an empty card")
+          #(state, effect.none())
+        }
+        _, True -> {
+          log.warning(
+            "kanban",
+            "Rejected a card title of "
+              <> int.to_string(string.length(title))
+              <> " characters (max "
+              <> int.to_string(max_title_length)
+              <> ")",
           )
+          #(state, effect.none())
         }
+        False, False -> #(state, record(changes, Added(title)))
       }
     }
-
-    StartDrag(id_str) -> {
-      case int.parse(id_str) {
-        Ok(id) -> #(Model(..model, dragging_id: id), local)
-        Error(_) -> {
-          log.warning("kanban", "Invalid card id for drag: " <> id_str)
-          #(model, local)
+    DeleteCard(id) ->
+      case has_card(state.model, id) {
+        True -> #(state, record(changes, Deleted(id)))
+        False -> {
+          log.warning(
+            "kanban",
+            "Ignored delete of unknown card " <> int.to_string(id),
+          )
+          #(state, effect.none())
         }
       }
-    }
-
-    DropOnColumn(col_str) -> {
-      case model.dragging_id >= 0 {
-        False -> #(model, local)
-        True -> {
-          let col = column_from_string(col_str)
-          let new_cards =
-            list.map(model.cards, fn(c) {
-              case c.id == model.dragging_id {
-                True -> Card(..c, column: col)
-                False -> c
-              }
-            })
-          #(Model(..model, cards: new_cards, dragging_id: -1), local)
+    DragStart(id) ->
+      case has_card(state.model, id) {
+        True -> #(State(..state, dragging: Some(id)), effect.none())
+        False -> {
+          log.warning(
+            "kanban",
+            "Ignored drag of unknown card " <> int.to_string(id),
+          )
+          #(State(..state, dragging: None), effect.none())
         }
       }
-    }
-
-    DragOverColumn -> #(model, local)
-
-    DeleteCard(id) -> {
-      let new_cards = list.filter(model.cards, fn(c) { c.id != id })
-      #(Model(..model, cards: new_cards, dragging_id: -1), local)
-    }
-
-    BoardUpdated -> #(model, local)
-
-    SetCards(cards, next_id) -> #(
-      Model(..model, cards: cards, next_id: next_id),
-      local,
-    )
+    DropOn(column) ->
+      case state.dragging {
+        None -> {
+          log.warning(
+            "kanban",
+            "Ignored a drop on " <> column_slug(column) <> " with no drag",
+          )
+          #(state, effect.none())
+        }
+        Some(id) ->
+          case has_card(state.model, id) {
+            True -> {
+              log.info(
+                "kanban",
+                "Moving card "
+                  <> int.to_string(id)
+                  <> " to "
+                  <> column_slug(column),
+              )
+              #(
+                State(..state, dragging: None),
+                record(changes, Moved(id:, column:)),
+              )
+            }
+            // Another session deleted the card mid-drag.
+            False -> {
+              log.warning(
+                "kanban",
+                "Ignored a drop of card "
+                  <> int.to_string(id)
+                  <> ", which no longer exists",
+              )
+              #(State(..state, dragging: None), effect.none())
+            }
+          }
+      }
+    DragEnd -> #(State(..state, dragging: None), effect.none())
+    BoardChanged -> #(State(..state, model: read_board(changes)), effect.none())
+    // `update_local` handles these in the browser and never forwards them.
+    DraftChanged(_) | DragOver(_) -> #(state, effect.none())
   }
-  #(model, local, Nil)
 }
 
-// --- Side Effects (server only — store writes) ---
+fn has_card(model: Model, id: Int) -> Bool {
+  list.any(model.cards, fn(card) { card.id == id })
+}
 
-fn make_on_update(
-  card_store: store.ListStore(Card),
-) -> fn(#(Model, Local, Nil), Msg) -> effect.Effect(Msg) {
-  fn(state: #(Model, Local, Nil), msg: Msg) -> effect.Effect(Msg) {
-    let #(model, _local, _server) = state
-    case msg {
-      AddCard | DropOnColumn(_) | DeleteCard(_) ->
-        // Write full card list to shared store and notify other users
-        effect.from(fn(_dispatch) {
-          store.delete_all(card_store, "cards")
-          store.append_many(card_store, "cards", model.cards)
-          pubsub.broadcast("kanban:cards", Nil)
-        })
-      BoardUpdated ->
-        // Read authoritative card list from shared store
-        effect.from(fn(dispatch) {
-          let cards = store.get_all(card_store, "cards")
-          let next_id = case
-            list.fold(cards, 0, fn(max, c) {
-              case c.id > max {
-                True -> c.id
-                False -> max
-              }
-            })
-          {
-            0 -> 5
-            max -> max + 1
-          }
-          dispatch(SetCards(cards, next_id))
-        })
-      _ -> effect.none()
-    }
+fn sync(state: State) -> Model {
+  state.model
+}
+
+// --- Local (browser) ---
+
+pub fn init_local(_model: Model) -> Local {
+  Local(draft: "", dragging: None, over: None)
+}
+
+pub fn update_local(
+  _model: Model,
+  local: Local,
+  msg: Msg,
+) -> local.Update(Local) {
+  case msg {
+    DraftChanged(text) -> local.handled(Local(..local, draft: text))
+    AddCard(title) ->
+      case string.trim(title) {
+        "" -> local.handled(local)
+        _ -> local.forward(Local(..local, draft: ""))
+      }
+    DragStart(id) -> local.forward(Local(..local, dragging: Some(id)))
+    // `dragover` fires many times a second; only a change of column
+    // re-renders, and none of it reaches the server.
+    DragOver(column) -> local.handled(Local(..local, over: Some(column)))
+    DropOn(_) | DragEnd ->
+      local.forward(Local(..local, dragging: None, over: None))
+    DeleteCard(_) | BoardChanged -> local.forward(local)
   }
 }
 
 // --- View ---
 
-pub fn view(model: Model, _local: Local) -> beacon.Node(Msg) {
+pub fn view(model: Model, local: Local) -> Element(Msg) {
   html.div(
     [
-      html.style(
-        "font-family:system-ui;max-width:900px;margin:2rem auto;padding:0 1rem",
-      ),
+      attribute.styles([
+        #("font-family", "system-ui"),
+        #("max-width", "900px"),
+        #("margin", "2rem auto"),
+        #("padding", "0 1rem"),
+      ]),
     ],
     [
       html.h1([], [html.text("Kanban Board")]),
-      html.p([html.style("color:#666;margin-bottom:1rem")], [
-        html.text("Drag cards between columns"),
-      ]),
-      // Add card form
-      html.div([html.style("display:flex;gap:8px;margin-bottom:1.5rem")], [
-        html.input([
-          html.type_("text"),
-          html.placeholder("New card title..."),
-          html.value(model.new_card_input),
-          beacon.on_input(UpdateInput),
-          html.style(
-            "flex:1;padding:10px;border:1px solid #ddd;border-radius:6px;font-size:14px",
+      html.p(
+        [attribute.styles([#("color", "#666"), #("margin-bottom", "1rem")])],
+        [
+          html.text("Drag cards between columns"),
+        ],
+      ),
+      html.form(
+        [
+          event.on_submit(fn(_fields) { AddCard(local.draft) }),
+          attribute.styles([
+            #("display", "flex"),
+            #("gap", "8px"),
+            #("margin-bottom", "1.5rem"),
+          ]),
+        ],
+        [
+          html.input([
+            attribute.type_("text"),
+            attribute.placeholder("New card title..."),
+            attribute.aria("label", "New card title"),
+            attribute.value(local.draft),
+            event.on_input(DraftChanged),
+            attribute.styles([
+              #("flex", "1"),
+              #("padding", "10px"),
+              #("border", "1px solid #ddd"),
+              #("border-radius", "6px"),
+              #("font-size", "14px"),
+            ]),
+          ]),
+          html.button(
+            [
+              attribute.type_("submit"),
+              attribute.styles([
+                #("padding", "10px 20px"),
+                #("background", "#4CAF50"),
+                #("color", "white"),
+                #("border", "none"),
+                #("border-radius", "6px"),
+                #("cursor", "pointer"),
+                #("font-size", "14px"),
+                #("font-weight", "500"),
+              ]),
+            ],
+            [html.text("Add Card")],
           ),
-        ]),
-        html.button(
-          [
-            beacon.on_click(AddCard),
-            html.style(
-              "padding:10px 20px;background:#4CAF50;color:white;border:none;border-radius:6px;cursor:pointer;font-size:14px;font-weight:500",
-            ),
-          ],
-          [html.text("Add Card")],
-        ),
-      ]),
-      // Columns
+        ],
+      ),
       html.div(
         [
-          html.style(
-            "display:grid;grid-template-columns:repeat(3,1fr);gap:1rem",
-          ),
+          attribute.styles([
+            #("display", "grid"),
+            #("grid-template-columns", "repeat(3,1fr)"),
+            #("gap", "1rem"),
+          ]),
         ],
-        [
-          render_column(model, Todo),
-          render_column(model, Doing),
-          render_column(model, Done),
-        ],
+        list.map(columns, fn(column) { render_column(model, local, column) }),
       ),
     ],
   )
 }
 
-fn render_column(model: Model, col: Column) -> beacon.Node(Msg) {
-  let cards = list.filter(model.cards, fn(c) { c.column == col })
-  let col_str = column_to_string(col)
+fn render_column(model: Model, local: Local, column: Column) -> Element(Msg) {
+  let cards = list.filter(model.cards, fn(card) { card.column == column })
+  let outline = case local.dragging, local.over == Some(column) {
+    Some(_), True -> "2px dashed #2196F3"
+    _, _ -> "2px solid transparent"
+  }
   html.div(
     [
-      html.style(
-        "background:"
-        <> column_color(col)
-        <> ";border-radius:12px;padding:1rem;min-height:250px;transition:outline 0.15s",
-      ),
-      // Drop target
-      beacon.on_dragover(DragOverColumn),
-      beacon.on_drop(fn(_id_str) { DropOnColumn(col_str) }),
-      html.attribute("data-column", col_str),
+      event.on_drag_over(DragOver(column)),
+      event.on_drop(DropOn(column)),
+      attribute.data("column", column_slug(column)),
+      attribute.styles([
+        #("background", column_colour(column)),
+        #("border-radius", "12px"),
+        #("padding", "1rem"),
+        #("min-height", "250px"),
+        #("outline", outline),
+      ]),
     ],
     [
       html.h3(
         [
-          html.style(
-            "margin:0 0 1rem 0;color:#555;font-size:0.9rem;text-transform:uppercase;letter-spacing:0.5px",
-          ),
+          attribute.styles([
+            #("margin", "0 0 1rem 0"),
+            #("color", "#555"),
+            #("font-size", "0.9rem"),
+            #("text-transform", "uppercase"),
+            #("letter-spacing", "0.5px"),
+          ]),
         ],
         [
           html.text(
-            column_label(col)
+            column_label(column)
             <> " ("
             <> int.to_string(list.length(cards))
             <> ")",
@@ -299,33 +400,68 @@ fn render_column(model: Model, col: Column) -> beacon.Node(Msg) {
         ],
       ),
       html.div(
-        [html.style("display:flex;flex-direction:column;gap:8px")],
-        list.map(cards, render_card),
+        [
+          attribute.styles([
+            #("display", "flex"),
+            #("flex-direction", "column"),
+            #("gap", "8px"),
+          ]),
+        ],
+        list.map(cards, fn(card) {
+          element.keyed(
+            int.to_string(card.id),
+            render_card(card, local.dragging == Some(card.id)),
+          )
+        }),
       ),
     ],
   )
 }
 
-fn render_card(card: Card) -> beacon.Node(Msg) {
+fn render_card(card: Card, is_dragging: Bool) -> Element(Msg) {
+  let opacity = case is_dragging {
+    True -> "0.4"
+    False -> "1"
+  }
   html.div(
     [
-      html.attribute("draggable", "true"),
-      html.attribute("data-drag-id", int.to_string(card.id)),
-      beacon.on_dragstart(StartDrag),
-      html.style(
-        "background:white;padding:12px 16px;border-radius:8px;border:1px solid #e0e0e0;cursor:grab;display:flex;justify-content:space-between;align-items:center;box-shadow:0 1px 3px rgba(0,0,0,0.08);transition:box-shadow 0.15s,opacity 0.15s",
-      ),
+      attribute.draggable(True),
+      attribute.data("card", int.to_string(card.id)),
+      event.on_drag_start(DragStart(card.id)),
+      event.on_drag_end(DragEnd),
+      attribute.styles([
+        #("background", "white"),
+        #("padding", "12px 16px"),
+        #("border-radius", "8px"),
+        #("border", "1px solid #e0e0e0"),
+        #("cursor", "grab"),
+        #("display", "flex"),
+        #("justify-content", "space-between"),
+        #("align-items", "center"),
+        #("box-shadow", "0 1px 3px rgba(0,0,0,0.08)"),
+        #("opacity", opacity),
+      ]),
     ],
     [
-      html.span([html.style("font-size:14px;color:#333")], [
-        html.text(card.title),
-      ]),
+      html.span(
+        [attribute.styles([#("font-size", "14px"), #("color", "#333")])],
+        [
+          html.text(card.title),
+        ],
+      ),
       html.button(
         [
-          beacon.on_click(DeleteCard(card.id)),
-          html.style(
-            "background:none;border:none;color:#bbb;cursor:pointer;font-size:18px;padding:0 4px;line-height:1",
-          ),
+          event.on_click(DeleteCard(card.id)),
+          attribute.aria("label", "Delete " <> card.title),
+          attribute.styles([
+            #("background", "none"),
+            #("border", "none"),
+            #("color", "#bbb"),
+            #("cursor", "pointer"),
+            #("font-size", "18px"),
+            #("padding", "0 4px"),
+            #("line-height", "1"),
+          ]),
         ],
         [html.text("x")],
       ),
@@ -336,53 +472,16 @@ fn render_card(card: Card) -> beacon.Node(Msg) {
 // --- Start ---
 
 pub fn main() {
-  start()
-}
-
-pub fn start() {
-  let card_store = store.new_list("kanban_cards")
-
-  // Seed store with initial cards if empty
-  case store.get_all(card_store, "cards") {
-    [] -> {
-      let initial_cards = [
-        Card(id: 1, title: "Design API", column: Todo),
-        Card(id: 2, title: "Write tests", column: Todo),
-        Card(id: 3, title: "Build UI", column: Doing),
-        Card(id: 4, title: "Deploy v0.1", column: Todo),
-      ]
-      store.append_many(card_store, "cards", initial_cards)
-    }
-    _ -> log.debug("kanban", "Card store already seeded")
-  }
-
-  // Init reads from shared store — new sessions see existing cards
-  let init_from_store = fn() {
-    let cards = store.get_all(card_store, "cards")
-    let next_id = case
-      list.fold(cards, 0, fn(max, c) {
-        case c.id > max {
-          True -> c.id
-          False -> max
-        }
-      })
-    {
-      0 -> 5
-      max_id -> max_id + 1
-    }
-    Model(cards: cards, next_id: next_id, new_card_input: "", dragging_id: -1)
-  }
-
-  beacon.app(
-    fn() { #(init_from_store(), effect.none()) },
-    init_local,
-    beacon.no_server,
-    update,
-    view,
+  let changes = store.new_list("kanban_changes")
+  beacon.full_application(
+    init: fn(_ctx) { init(changes) },
+    update: fn(state, msg) { update(changes, state, msg) },
+    sync:,
+    local: local.layer(init: init_local, update: update_local),
+    view:,
   )
-  |> beacon.title("Kanban Board")
-  |> beacon.on_update(make_on_update(card_store))
-  |> beacon.subscriptions(fn(_model) { ["kanban:cards"] })
-  |> beacon.on_notify(fn(_topic) { BoardUpdated })
+  |> beacon.title(fn(_model) { "Kanban Board" })
+  |> beacon.subscriptions(fn(_state) { [store.list_topic(changes)] })
+  |> beacon.on_notify(fn(_topic) { BoardChanged })
   |> beacon.start(8080)
 }
