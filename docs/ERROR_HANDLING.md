@@ -29,8 +29,11 @@ from 400 to 599; another status crashes, because it is a bug in the app).
 | WebSocket mount | Close with `4000 + status` (4503, 4404, ...) and the reason `init refused` | Close with 1011 and the reason `startup failure` |
 
 The reason is logged, as an error for a 5xx status and as a warning for a 4xx
-one, and never sent to the browser. The browser reloads the page on 4401 and
-reconnects with backoff on any other close. A static error page (a refusal,
+one, and never sent to the browser. The browser reloads the page on 4400 to
+4499, at most 3 times per tab within 60 seconds (after that it shows an error
+state instead), and reconnects with backoff on any other close, 4500 to 4599
+and 1011 included. See
+[WIRE_PROTOCOL.md](WIRE_PROTOCOL.md#client-connection-behaviour). A static error page (a refusal,
 an init crash, an unknown route, a missing bundle) opens no session, so it
 neither sets the `beacon_join_token` cookie nor replaces one that another tab
 is still joining with. `auth.init_from_session` answers a

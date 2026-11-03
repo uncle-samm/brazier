@@ -38,11 +38,16 @@ import {
   heartbeatAllowed,
   messageCost,
   PacedQueue,
+  parseReloadHistory,
   reconnectDelayMs,
+  reloadDecision,
   SendBudget,
   splitEventBatch,
   CLIENT_SEND_BUDGET,
   CLIENT_SEND_WINDOW_MS,
+  MAX_RELOADS,
+  RELOAD_HISTORY_KEY,
+  RELOAD_WINDOW_MS,
 } from "./beacon_client/patch.mjs";
 
 // === Generated entry ===
@@ -73,7 +78,8 @@ let heartbeatTimer = null;
 let lastHeartbeatAt = null;
 const HEARTBEAT_INTERVAL_MS = 30000;
 let reconnectAttempts = 0;
-// Set on close code 4401: the session is revoked, so never reconnect with it.
+// Set on close codes 4400 to 4499: the server refused this page's session,
+// so never reconnect with it (the page reloads or shows an error state).
 let reconnectStopped = false;
 // True once the join for the current socket has been written.
 let socketJoined = false;
@@ -599,7 +605,7 @@ function socketUrl() {
 
 function connect() {
   if (reconnectStopped) {
-    console.error("[beacon] Not connecting: the session was revoked (close 4401). Reload to sign in again.");
+    console.error("[beacon] Not connecting: the server refused this page's session. Reload the page to try again.");
     return;
   }
   // Events sent on the old socket are never acknowledged on this one, so
@@ -663,14 +669,64 @@ function handleClose(socket, e) {
   socketJoined = false;
   readyForServerEvents = false;
   trace("ws.close", { code: e.code, reason: e.reason });
-  if (closeAction(e.code) === "stop") {
+  if (closeAction(e.code) === "reload") {
     reconnectStopped = true;
-    console.error("[beacon] Session revoked or authentication expired (close 4401" + (e.reason ? ": " + e.reason : "") + "); not reconnecting, reloading the page");
-    location.reload();
+    reloadRefusedPage(e);
     return;
   }
   console.warn("[beacon] WebSocket closed (code " + e.code + (e.reason ? ", " + e.reason : "") + "); reconnecting with backoff");
   scheduleReconnect();
+}
+
+// The server refused this page's session (close 4400 to 4499): reload, so
+// a new page load decides. The reload guard allows MAX_RELOADS within
+// RELOAD_WINDOW_MS per tab; past that, or when the guard cannot keep its
+// count, the page shows an error state instead of reloading forever.
+// Reference (knowledge, not code read): LiveView reloads on a stale or
+// unauthorized join and counts consecutive reloads to stop a reload loop.
+function reloadRefusedPage(e) {
+  const close = "close " + e.code + (e.reason ? " " + e.reason : "");
+  let raw;
+  try {
+    raw = sessionStorage.getItem(RELOAD_HISTORY_KEY);
+  } catch (err) {
+    showFatalError("The server refused this page's session (" + close + "). The reload guard cannot read sessionStorage (" + err + "), so the page is not reloaded.");
+    return;
+  }
+  const parsed = parseReloadHistory(raw);
+  if (!parsed.ok) {
+    showFatalError("The server refused this page's session (" + close + "). The stored reload history " + RELOAD_HISTORY_KEY + " is invalid (" + parsed.reason + "), so the page is not reloaded.");
+    return;
+  }
+  const decision = reloadDecision(parsed.history, Date.now());
+  if (decision.action === "give_up") {
+    trace("ws.reload_give_up", { code: e.code, reloads: decision.history.length });
+    showFatalError("The server refused this page's session (" + close + ") after " + decision.history.length + " reloads within " + RELOAD_WINDOW_MS / 1000 + "s; not reloading again.");
+    return;
+  }
+  try {
+    sessionStorage.setItem(RELOAD_HISTORY_KEY, JSON.stringify(decision.history));
+  } catch (err) {
+    showFatalError("The server refused this page's session (" + close + "). The reload guard cannot write sessionStorage (" + err + "), so the page is not reloaded.");
+    return;
+  }
+  trace("ws.reload", { code: e.code, reloads: decision.history.length });
+  console.error("[beacon] The server refused this page's session (" + close + "); not reconnecting, reloading the page (reload " + decision.history.length + " of at most " + MAX_RELOADS + " within " + RELOAD_WINDOW_MS / 1000 + "s)");
+  location.reload();
+}
+
+// The page cannot continue: log why, mark the app root with
+// data-beacon-error (for the app's styles) and put a short notice at its
+// top. Nothing patches the root afterwards, because nothing reconnects.
+function showFatalError(message) {
+  if (!appRoot) throw new Error("[beacon] invariant violated: an error state without an app root");
+  console.error("[beacon] " + message);
+  appRoot.setAttribute("data-beacon-error", "");
+  const notice = document.createElement("div");
+  notice.setAttribute("role", "alert");
+  notice.setAttribute("data-beacon-error-notice", "");
+  notice.textContent = "This page could not be loaded. Reload the page to try again.";
+  appRoot.insertBefore(notice, appRoot.firstChild);
 }
 
 // Write one message to the socket. Returns false when it was not written.

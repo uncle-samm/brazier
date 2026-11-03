@@ -401,6 +401,22 @@ export const RECONNECT_MAX_MS = 30000;
 export const RECONNECT_JITTER_MS = 1000;
 /** Close code for a revoked session or expired authentication. */
 export const CLOSE_AUTH_REVOKED = 4401;
+/**
+ * Close codes 4400 to 4499: `init` refused the session with a client error
+ * (4000 + an HTTP 4xx status, 4401 also for a revoked session). The page is
+ * stale for this session, so a new page load decides: the server renders it
+ * again, or answers with its error page, which opens no socket.
+ */
+export const CLOSE_RELOAD_MIN = 4400;
+export const CLOSE_RELOAD_MAX = 4499;
+/**
+ * The reload guard: at most MAX_RELOADS refusal reloads per tab within
+ * RELOAD_WINDOW_MS. The times are kept in sessionStorage under
+ * RELOAD_HISTORY_KEY, so they survive the reloads they count.
+ */
+export const MAX_RELOADS = 3;
+export const RELOAD_WINDOW_MS = 60000;
+export const RELOAD_HISTORY_KEY = "beacon:reloads";
 
 function isRevision(value) {
   return Number.isSafeInteger(value) && value >= 0;
@@ -439,9 +455,56 @@ export function classifyPatch(state, version, opsCount) {
   return version <= state.version ? "stale" : "gap";
 }
 
-/** "stop" for 4401 (do not reconnect with this session), else "reconnect". */
+/**
+ * "reload" for 4400 to 4499 (the server refused this page's session: never
+ * reconnect with it), else "reconnect" with backoff. That includes 4500 to
+ * 4599 (`init` refused with a server error, such as 4503 for a store that is
+ * down) and 1011 (`init` crashed): the server may recover, and the backoff
+ * keeps a server that keeps refusing at one attempt per RECONNECT_MAX_MS.
+ */
 export function closeAction(code) {
-  return code === CLOSE_AUTH_REVOKED ? "stop" : "reconnect";
+  if (!Number.isSafeInteger(code)) {
+    throw new Error("closeAction: the close code must be an integer, got " + code);
+  }
+  return code >= CLOSE_RELOAD_MIN && code <= CLOSE_RELOAD_MAX ? "reload" : "reconnect";
+}
+
+/**
+ * Parse the stored reload history: `null` when nothing is stored, else a JSON
+ * array of at most MAX_RELOADS timestamps (milliseconds since the epoch).
+ * Returns { ok: true, history } or { ok: false, reason }.
+ */
+export function parseReloadHistory(raw) {
+  if (raw === null) return { ok: true, history: [] };
+  let value;
+  try {
+    value = JSON.parse(raw);
+  } catch (e) {
+    return { ok: false, reason: "not JSON (" + e.message + "): " + raw };
+  }
+  if (!Array.isArray(value) || !value.every((t) => Number.isSafeInteger(t) && t >= 0)) {
+    return { ok: false, reason: "not a list of timestamps: " + raw };
+  }
+  if (value.length > MAX_RELOADS) {
+    return { ok: false, reason: "more than " + MAX_RELOADS + " entries: " + raw };
+  }
+  return { ok: true, history: value };
+}
+
+/**
+ * Decide whether a refused page may reload at `now`, given the times of this
+ * tab's earlier refusal reloads. Returns { action: "reload" | "give_up",
+ * history }, `history` being what to store: the reloads still inside the
+ * window, plus this one when it reloads. A time ahead of `now` (the clock
+ * went back) still counts, so a clock change never opens a reload loop.
+ */
+export function reloadDecision(history, now) {
+  if (!Number.isSafeInteger(now) || now < 0) {
+    throw new Error("reloadDecision: now must be a non-negative integer, got " + now);
+  }
+  const recent = history.filter((t) => now - t < RELOAD_WINDOW_MS);
+  if (recent.length >= MAX_RELOADS) return { action: "give_up", history: recent };
+  return { action: "reload", history: [...recent, now] };
 }
 
 /** Exponential backoff with jitter. `random01` is in [0, 1). */

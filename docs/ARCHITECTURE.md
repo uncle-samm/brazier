@@ -164,8 +164,10 @@ exports at startup: `decode_model`, `init_local`, `render`, `lookup_handler`,
   are queued with a snapshot of their fields and replayed after the first
   `model_sync`.
 - **Connection.** Heartbeats every 30 s, a client send budget, reconnect
-  with exponential backoff and jitter. Close code 4401 (session revoked)
-  stops reconnecting.
+  with exponential backoff and jitter. Close codes 4400 to 4499 (an `init`
+  refusal with a client error, 4401 for a revoked session) stop reconnecting
+  and reload the page, at most 3 times per tab within 60 s (counted in
+  `sessionStorage`); after that the page shows an error state.
 
 ## Build (`build.gleam`, `build/`)
 

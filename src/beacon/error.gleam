@@ -99,7 +99,9 @@ pub fn init_error_reason(error: InitError) -> String {
 
 /// The WebSocket close code for an init refusal with `status`:
 /// `init_close_code_base + status` (4503, 4404, ...). The browser reloads
-/// the page on 4401 and reconnects with backoff on every other code.
+/// the page on 4400 to 4499 (at most 3 times per tab within 60 seconds,
+/// then it shows an error state) and reconnects with backoff on every other
+/// code, 4500 to 4599 included.
 pub fn init_close_code(error: InitError) -> Int {
   init_close_code_base + error.status
 }

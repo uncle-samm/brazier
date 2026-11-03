@@ -23,13 +23,17 @@ import {
   heartbeatAllowed,
   messageCost,
   PacedQueue,
+  parseReloadHistory,
   reconnectDelayMs,
+  reloadDecision,
   SendBudget,
   splitEventBatch,
   CLIENT_SEND_BUDGET,
   CLIENT_SEND_WINDOW_MS,
   SERVER_MAX_BATCH_SIZE,
   SERVER_MAX_EVENTS_PER_SECOND,
+  MAX_RELOADS,
+  RELOAD_WINDOW_MS,
 } from "../src/beacon_client/patch.mjs";
 
 let checks = 0;
@@ -95,13 +99,46 @@ check("patch producing the next revision applies", () => {
 });
 
 // --- closeAction ---
-check("4401 stops reconnecting", () => {
-  assert.equal(closeAction(4401), "stop");
+check("closeAction rejects a code that is not an integer", () => {
+  assert.throws(() => closeAction(undefined));
+  assert.throws(() => closeAction(4401.5));
 });
-check("every other close code reconnects", () => {
-  for (const code of [1000, 1002, 1003, 1006, 1007, 1008, 1009, 1011, 1013, 4000, 4400, 4402]) {
+check("4400 to 4499 reload the page", () => {
+  for (const code of [4400, 4401, 4403, 4404, 4499]) {
+    assert.equal(closeAction(code), "reload", String(code));
+  }
+});
+check("every other close code reconnects, 4500 to 4599 and 1011 included", () => {
+  for (const code of [1000, 1001, 1002, 1003, 1006, 1007, 1008, 1009, 1011, 1013, 4000, 4399, 4500, 4503, 4599]) {
     assert.equal(closeAction(code), "reconnect", String(code));
   }
+});
+
+// --- reload guard ---
+check("parseReloadHistory rejects anything but a short list of timestamps", () => {
+  for (const raw of ["", "{", "{}", "[1.5]", "[-1]", '["1"]', "null", JSON.stringify([1, 2, 3, 4])]) {
+    assert.equal(parseReloadHistory(raw).ok, false, raw);
+  }
+});
+check("parseReloadHistory reads nothing stored as no reloads", () => {
+  assert.deepEqual(parseReloadHistory(null), { ok: true, history: [] });
+  assert.deepEqual(parseReloadHistory("[5,6]"), { ok: true, history: [5, 6] });
+});
+check("reloadDecision rejects a bad clock", () => {
+  assert.throws(() => reloadDecision([], -1));
+  assert.throws(() => reloadDecision([], 1.5));
+});
+check("reloadDecision gives up after MAX_RELOADS within the window", () => {
+  const full = [1000, 2000, 3000];
+  assert.equal(full.length, MAX_RELOADS);
+  assert.deepEqual(reloadDecision(full, 4000), { action: "give_up", history: full });
+  // A time ahead of now (the clock went back) still counts.
+  assert.equal(reloadDecision([9000, 9500, 9900], 4000).action, "give_up");
+});
+check("reloadDecision forgets reloads older than the window", () => {
+  const now = 1000 + RELOAD_WINDOW_MS;
+  assert.deepEqual(reloadDecision([1000, 2000, 3000], now), { action: "reload", history: [2000, 3000, now] });
+  assert.deepEqual(reloadDecision([], 7), { action: "reload", history: [7] });
 });
 
 // --- reconnectDelayMs ---
