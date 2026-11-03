@@ -40,8 +40,10 @@ const max_todo_length = 200
 
 // --- Init and update (server) ---
 
-fn init(_ctx: beacon.Context) -> #(Model, Effect(Msg)) {
-  #(
+fn init(
+  _ctx: beacon.Context,
+) -> Result(#(Model, Effect(Msg)), beacon.InitError) {
+  Ok(#(
     Model(
       todos: [
         task.TodoItem(id: 1, text: "Learn Gleam", completed: True),
@@ -51,7 +53,7 @@ fn init(_ctx: beacon.Context) -> #(Model, Effect(Msg)) {
       next_id: 4,
     ),
     effect.none(),
-  )
+  ))
 }
 
 fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {

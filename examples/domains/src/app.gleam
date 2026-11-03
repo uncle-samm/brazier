@@ -30,8 +30,8 @@ pub type Msg {
 
 const max_item_length = 200
 
-fn init(_ctx: beacon.Context) -> Model {
-  Model(
+fn init(_ctx: beacon.Context) -> Result(Model, beacon.InitError) {
+  Ok(Model(
     user: auth.User(
       name: "Alice",
       email: "alice@example.com",
@@ -43,7 +43,7 @@ fn init(_ctx: beacon.Context) -> Model {
     ],
     next_id: 3,
     input: "",
-  )
+  ))
 }
 
 /// Runs in the browser and on the server, so it is pure apart from logging.

@@ -40,8 +40,13 @@ const max_query_length = 200
 
 // --- Init and update (server) ---
 
-fn init(_ctx: beacon.Context) -> #(Model, Effect(Msg)) {
-  #(Model(saved_query: "", saved_filter: "all", submissions: 0), effect.none())
+fn init(
+  _ctx: beacon.Context,
+) -> Result(#(Model, Effect(Msg)), beacon.InitError) {
+  Ok(#(
+    Model(saved_query: "", saved_filter: "all", submissions: 0),
+    effect.none(),
+  ))
 }
 
 fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {

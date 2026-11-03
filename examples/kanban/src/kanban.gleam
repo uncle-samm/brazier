@@ -152,8 +152,10 @@ fn record(changes: ListStore(Change), change: Change) -> Effect(Msg) {
 
 // --- Init and update (server) ---
 
-fn init(changes: ListStore(Change)) -> #(State, Effect(Msg)) {
-  #(State(model: read_board(changes), dragging: None), effect.none())
+fn init(
+  changes: ListStore(Change),
+) -> Result(#(State, Effect(Msg)), beacon.InitError) {
+  Ok(#(State(model: read_board(changes), dragging: None), effect.none()))
 }
 
 fn update(

@@ -108,17 +108,12 @@ fn decode_type__chat__model() -> beacon_decode.Decoder(beacon_m_chat.Model) {
     "typing",
     beacon_decode.list(beacon_decode.string),
   )
-  use beacon_v_presence_error <- beacon_decode.field(
-    "presence_error",
-    beacon_decode.optional(beacon_decode.string),
-  )
   beacon_decode.success(beacon_m_chat.Model(
     username: beacon_v_username,
     room: beacon_v_room,
     messages: beacon_v_messages,
     online: beacon_v_online,
     typing: beacon_v_typing,
-    presence_error: beacon_v_presence_error,
   ))
 }
 
@@ -146,10 +141,6 @@ fn encode_type__chat__model(
     ),
     #("online", beacon_json.array(beacon_value.online, beacon_json.string)),
     #("typing", beacon_json.array(beacon_value.typing, beacon_json.string)),
-    #(
-      "presence_error",
-      beacon_json.nullable(beacon_value.presence_error, beacon_json.string),
-    ),
   ])
 }
 

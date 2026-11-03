@@ -89,8 +89,10 @@ fn read_grid(cells: Store(String)) -> Model {
 
 // --- Init and update (server) ---
 
-fn init(cells: Store(String)) -> #(Model, Effect(Msg)) {
-  #(read_grid(cells), effect.none())
+fn init(
+  cells: Store(String),
+) -> Result(#(Model, Effect(Msg)), beacon.InitError) {
+  Ok(#(read_grid(cells), effect.none()))
 }
 
 fn update(

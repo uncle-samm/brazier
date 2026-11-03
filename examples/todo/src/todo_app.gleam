@@ -103,8 +103,10 @@ fn record(changes: ListStore(Change), change: Change) -> Effect(Msg) {
 
 // --- Init and update (server) ---
 
-fn init(changes: ListStore(Change)) -> #(Model, Effect(Msg)) {
-  #(Model(todos: read_todos(changes)), effect.none())
+fn init(
+  changes: ListStore(Change),
+) -> Result(#(Model, Effect(Msg)), beacon.InitError) {
+  Ok(#(Model(todos: read_todos(changes)), effect.none()))
 }
 
 fn update(

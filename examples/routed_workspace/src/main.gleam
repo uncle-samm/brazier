@@ -112,10 +112,12 @@ pub fn href(route: Route) -> String {
 
 // --- Init and update (server) ---
 
-fn init(_ctx: beacon.Context) -> #(Model, Effect(Msg)) {
+fn init(
+  _ctx: beacon.Context,
+) -> Result(#(Model, Effect(Msg)), beacon.InitError) {
   // `with_router` dispatches RouteChanged for the requested URL before the
   // first render, so this route is only a placeholder.
-  #(
+  Ok(#(
     Model(
       route: OverviewPage,
       open_tickets: 7,
@@ -132,7 +134,7 @@ fn init(_ctx: beacon.Context) -> #(Model, Effect(Msg)) {
       saved_version: 1,
     ),
     effect.none(),
-  )
+  ))
 }
 
 fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {

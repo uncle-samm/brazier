@@ -62,8 +62,10 @@ fn add_shared(deltas: ListStore(Int), delta: Int) -> Effect(Msg) {
 
 // --- Init and update (server) ---
 
-fn init(deltas: ListStore(Int)) -> #(Model, Effect(Msg)) {
-  #(Model(my_count: 0, shared_count: shared_count(deltas)), effect.none())
+fn init(
+  deltas: ListStore(Int),
+) -> Result(#(Model, Effect(Msg)), beacon.InitError) {
+  Ok(#(Model(my_count: 0, shared_count: shared_count(deltas)), effect.none()))
 }
 
 fn update(
