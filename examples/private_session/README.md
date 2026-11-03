@@ -1,14 +1,23 @@
 # Private Session
 
-Private Session exercises `beacon.Server state` with a public model and private server state.
+A `beacon.full_application` whose session holds private state next to a
+public Model.
 
-Use this for browser integration coverage:
+- The session keeps a signing key, an audit trail of the newest 100
+  entries, a count of audited events, and a count of denied transfers.
+- `sync` hands only the Model to the browser. The build compiles only what
+  `view` reaches, so none of the private state is in the HTML, the model
+  sync or the client bundle.
+- Approving a transfer moves 25 out of the visible balance. When the
+  balance is too low, the server refuses it, logs a warning and says so on
+  the page.
+- "Refresh public summary" copies one private value, the number of audited
+  events, into the Model on purpose.
 
-- SSR first paint renders only the public model
-- Hydration updates the public model from server-authoritative state sync
-- Server-only secret constants, audit entries, and private counters do not appear in HTML or generated client JavaScript
-- User events can mutate private server state while the `view` only receives `Model`
+The browser integration tests use this example to check that the signing
+key and audit entries never reach the page or the bundle.
 
 ```sh
+gleam run -m beacon/build   # after changing the source
 gleam run -m private_session
 ```

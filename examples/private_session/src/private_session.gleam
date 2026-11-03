@@ -1,10 +1,26 @@
+/// Private Session: a public Model next to private session state.
+///
+/// The session holds a signing key, an audit trail and a count of denied
+/// transfers. `sync` hands only the Model to the browser, and the build
+/// compiles only what `view` reaches, so none of the private state is in
+/// the HTML, the model sync or the client bundle.
 import beacon
-import beacon/effect
+import beacon/attribute
+import beacon/effect.{type Effect}
+import beacon/element.{type Element}
+import beacon/event
 import beacon/html
+import beacon/local
+import beacon/log
 import gleam/int
 import gleam/list
 
-const server_signing_key = "beacon_private_session_signing_key_must_not_ship"
+const signing_key = "beacon_private_session_signing_key_must_not_ship"
+
+const transfer_amount = 25
+
+/// The session keeps the newest audit entries up to this many.
+const max_audit_entries = 100
 
 pub type Model {
   Model(
@@ -15,8 +31,17 @@ pub type Model {
   )
 }
 
-pub type Server {
-  Server(signing_key: String, audit_entries: List(String), denied_attempts: Int)
+/// What the server holds per session. Only `model` is synced.
+pub type Session {
+  Session(
+    model: Model,
+    signing_key: String,
+    /// Newest first, at most `max_audit_entries`.
+    audit_entries: List(String),
+    /// Every audited event, including those dropped from `audit_entries`.
+    audited_events: Int,
+    denied_attempts: Int,
+  )
 }
 
 pub type Msg {
@@ -25,117 +50,167 @@ pub type Msg {
   RefreshPublicSummary
 }
 
-pub fn init() -> #(Model, effect.Effect(Msg)) {
+fn init(_ctx: beacon.Context) -> #(Session, Effect(Msg)) {
   #(
-    Model(
-      user: "Ada",
-      public_balance: 1200,
-      approved_actions: 0,
-      last_public_event: "Session opened",
+    Session(
+      model: Model(
+        user: "Ada",
+        public_balance: 1200,
+        approved_actions: 0,
+        last_public_event: "Session opened",
+      ),
+      signing_key:,
+      audit_entries: ["session-created"],
+      audited_events: 1,
+      denied_attempts: 0,
     ),
     effect.none(),
   )
 }
 
-pub fn init_server() -> Server {
-  Server(
-    signing_key: server_signing_key,
-    audit_entries: ["session-created"],
-    denied_attempts: 0,
-  )
-}
+fn update(session: Session, msg: Msg) -> #(Session, Effect(Msg)) {
+  let model = session.model
+  let session = case msg {
+    ApproveTransfer ->
+      case model.public_balance >= transfer_amount {
+        True -> {
+          let approved = model.approved_actions + 1
+          log.info(
+            "private_session",
+            "Approved transfer " <> int.to_string(approved),
+          )
+          Session(
+            ..audit(session, "approved-transfer-" <> int.to_string(approved)),
+            model: Model(
+              ..model,
+              public_balance: model.public_balance - transfer_amount,
+              approved_actions: approved,
+              last_public_event: "Transfer approved",
+            ),
+          )
+        }
+        False -> {
+          log.warning(
+            "private_session",
+            "Refused a transfer: balance "
+              <> int.to_string(model.public_balance)
+              <> " is below "
+              <> int.to_string(transfer_amount),
+          )
+          Session(
+            ..audit(session, "refused-transfer-insufficient-balance"),
+            model: Model(
+              ..model,
+              last_public_event: "Transfer refused: insufficient balance",
+            ),
+          )
+        }
+      }
 
-pub fn update(
-  model: Model,
-  _local: Nil,
-  server: Server,
-  msg: Msg,
-) -> #(Model, Nil, Server) {
-  case msg {
-    ApproveTransfer -> {
-      let audit =
-        "approved-transfer-" <> int.to_string(model.approved_actions + 1)
-      #(
-        Model(
-          ..model,
-          public_balance: model.public_balance - 25,
-          approved_actions: model.approved_actions + 1,
-          last_public_event: "Transfer approved",
-        ),
-        Nil,
-        Server(..server, audit_entries: [audit, ..server.audit_entries]),
+    DenyTransfer -> {
+      let denied = session.denied_attempts + 1
+      log.info("private_session", "Denied transfer " <> int.to_string(denied))
+      Session(
+        ..audit(session, "denied-transfer-" <> int.to_string(denied)),
+        denied_attempts: denied,
+        model: Model(..model, last_public_event: "Transfer denied"),
       )
     }
 
-    DenyTransfer -> #(
-      Model(..model, last_public_event: "Transfer denied"),
-      Nil,
-      Server(..server, denied_attempts: server.denied_attempts + 1),
-    )
-
-    RefreshPublicSummary -> #(
-      Model(
-        ..model,
-        last_public_event: "Public summary refreshed after "
-          <> int.to_string(list.length(server.audit_entries))
-          <> " audited server events",
-      ),
-      Nil,
-      server,
-    )
+    RefreshPublicSummary ->
+      Session(
+        ..session,
+        model: Model(
+          ..model,
+          last_public_event: "Public summary refreshed after "
+            <> int.to_string(session.audited_events)
+            <> " audited server events",
+        ),
+      )
   }
+  #(session, effect.none())
 }
 
-pub fn view(model: Model, _local: Nil) -> beacon.Node(Msg) {
+fn audit(session: Session, entry: String) -> Session {
+  Session(
+    ..session,
+    audit_entries: list.take(
+      [entry, ..session.audit_entries],
+      max_audit_entries,
+    ),
+    audited_events: session.audited_events + 1,
+  )
+}
+
+fn sync(session: Session) -> Model {
+  session.model
+}
+
+pub fn view(model: Model, _local: Nil) -> Element(Msg) {
   html.main(
     [
-      html.style(
-        "font-family:system-ui;max-width:760px;margin:32px auto;padding:0 16px;",
-      ),
+      attribute.styles([
+        #("font-family", "system-ui"),
+        #("max-width", "760px"),
+        #("margin", "32px auto"),
+        #("padding", "0 16px"),
+      ]),
     ],
     [
       html.h1([], [html.text("Private Session")]),
       html.section(
         [
-          html.style(
-            "border:1px solid #d0d7de;border-radius:6px;padding:16px;margin-bottom:16px;",
-          ),
+          attribute.styles([
+            #("border", "1px solid #d0d7de"),
+            #("border-radius", "6px"),
+            #("padding", "16px"),
+            #("margin-bottom", "16px"),
+          ]),
         ],
         [
           html.h2([], [html.text("Public account")]),
-          html.p([html.attribute("data-testid", "session-user")], [
+          html.p([attribute.data("testid", "session-user")], [
             html.text("User: " <> model.user),
           ]),
-          html.p([html.attribute("data-testid", "session-balance")], [
+          html.p([attribute.data("testid", "session-balance")], [
             html.text(
               "Visible balance: " <> int.to_string(model.public_balance),
             ),
           ]),
-          html.p([html.attribute("data-testid", "session-approved-actions")], [
+          html.p([attribute.data("testid", "session-approved-actions")], [
             html.text(
               "Approved actions: " <> int.to_string(model.approved_actions),
             ),
           ]),
-          html.p([html.attribute("data-testid", "session-last-event")], [
+          html.p([attribute.data("testid", "session-last-event")], [
             html.text(model.last_public_event),
           ]),
         ],
       ),
-      html.section([html.style("display:flex;gap:8px;flex-wrap:wrap;")], [
-        html.button([beacon.on_click(ApproveTransfer)], [
-          html.text("Approve transfer"),
-        ]),
-        html.button([beacon.on_click(DenyTransfer)], [
-          html.text("Deny transfer"),
-        ]),
-        html.button([beacon.on_click(RefreshPublicSummary)], [
-          html.text("Refresh public summary"),
-        ]),
-      ]),
+      html.section(
+        [
+          attribute.styles([
+            #("display", "flex"),
+            #("gap", "8px"),
+            #("flex-wrap", "wrap"),
+          ]),
+        ],
+        [
+          html.button([event.on_click(ApproveTransfer)], [
+            html.text("Approve transfer"),
+          ]),
+          html.button([event.on_click(DenyTransfer)], [
+            html.text("Deny transfer"),
+          ]),
+          html.button([event.on_click(RefreshPublicSummary)], [
+            html.text("Refresh public summary"),
+          ]),
+        ],
+      ),
       html.p(
         [
-          html.attribute("data-testid", "privacy-assertion"),
-          html.style("color:#57606a;"),
+          attribute.data("testid", "privacy-assertion"),
+          attribute.style("color", "#57606a"),
         ],
         [
           html.text(
@@ -148,7 +223,7 @@ pub fn view(model: Model, _local: Nil) -> beacon.Node(Msg) {
 }
 
 pub fn main() {
-  beacon.app(init, beacon.no_local, init_server, update, view)
-  |> beacon.title("Private Session")
+  beacon.full_application(init:, update:, sync:, local: local.none(), view:)
+  |> beacon.title(fn(_model) { "Private Session" })
   |> beacon.start(8080)
 }
