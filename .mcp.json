@@ -1,8 +1,0 @@
-{
-  "mcpServers": {
-    "cross-claude": {
-      "command": "node",
-      "args": ["/tmp/cross-claude-mcp/server.mjs"]
-    }
-  }
-}
