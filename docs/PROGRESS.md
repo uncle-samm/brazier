@@ -194,8 +194,8 @@
 
 **Decisions (Milestone 117, coordinator):**
 - 2026-11-03, WS8b part 2's source follow-ups became their own workstream, WS8c, which runs beside WS9 with disjoint files.
-  - WS8c owns `src/**` and `beacon_client/**`, except `src/beacon/lint.gleam` and the lint FFI.
-  - WS9 owns `test/**`, `test_all_cdp.py`, benchmarks, CI and scripts. WS9 records any source hook it needs rather than editing a WS8c file.
+  - WS8c owns `src/**` and `beacon_client/src/**`, except `src/beacon/lint.gleam` and the lint FFI.
+  - WS9 owns `test/**`, `beacon_client/test/**`, `test_all_cdp.py`, benchmarks, CI and scripts. WS9 records any source hook it needs rather than editing a WS8c file.
   - WS8c may add new test files, plus the edits to existing tests that its source changes make necessary to compile, and it lists every such edit for the merge.
   - The alternative was to fold these into the final stability audit. It was rejected because they are known defects (a sleep, missing stop events, unreadable logs), and fixing them now keeps the audit for unknowns.
   - The ≈10% per-event telemetry cost is accepted, because it matches LiveView's per-event spans. WS9's thresholds start from the post-telemetry numbers.
