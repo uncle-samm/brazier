@@ -13,7 +13,7 @@ Counter demonstrating the Model + Local state split.
 
 ```bash
 cd examples/counter_local
-gleam run -m beacon/build   # after changing the source
+gleam run -m beacon/build   # first, and after every change
 gleam run
 ```
 

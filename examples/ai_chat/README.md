@@ -23,7 +23,7 @@ Real-time chat with a deterministic server-side streaming response.
 
 ```bash
 cd examples/ai_chat
-gleam run -m beacon/build   # after changing the source
+gleam run -m beacon/build   # first, and after every change
 gleam run -m ai_chat
 ```
 

@@ -20,7 +20,7 @@ Shows how `beacon.full_application` keeps secrets on the server.
 
 ```bash
 cd examples/privacy_demo
-gleam run -m beacon/build   # after changing the source
+gleam run -m beacon/build   # first, and after every change
 gleam run -m privacy_demo
 ```
 

@@ -51,8 +51,10 @@ pub fn view(model: Model) -> Element(Msg) {
 }
 
 pub fn main() {
-  beacon.simple(init:, update:, view:)
-  |> beacon.start(8080)
+  let assert Ok(Nil) =
+    beacon.simple(init:, update:, view:)
+    |> beacon.start(8080)
+    as "beacon.start failed (it logs the error)"
 }
 ```
 
@@ -60,12 +62,14 @@ An app needs two generated artifacts before it starts: the server codec
 (`src/beacon_codec.gleam`) and the client bundle (`priv/static/`). Generate
 them with `gleam run -m beacon/build`, then `gleam run`; or use
 `gleam run -m beacon/dev`, which builds, runs and rebuilds on change.
-`beacon.start` returns an error when either artifact is missing. To run the
-counter example from this repository:
+`beacon.start` logs and returns an error when either artifact is missing,
+and `main` crashes on it, so `gleam run` exits with status 1 and says what to
+run. The examples do not track their generated files, so build one before its
+first run. To run the counter example from this repository:
 
 ```sh
 cd examples/counter
-gleam run -m beacon/build
+gleam run -m beacon/build   # first, and after every change
 gleam run
 ```
 

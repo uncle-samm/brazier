@@ -23,7 +23,7 @@ restarts; a real shop would expire reservations.
 
 ```bash
 cd examples/cart
-gleam run -m beacon/build   # after changing the source
+gleam run -m beacon/build   # first, and after every change
 gleam run
 ```
 

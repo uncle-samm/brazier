@@ -27,7 +27,7 @@ Routing, a Local layer and server-authoritative Model updates in one
 
 ```bash
 cd examples/routed_workspace
-gleam run -m beacon/build   # after changing the source
+gleam run -m beacon/build   # first, and after every change
 gleam run -m main
 ```
 

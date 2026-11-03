@@ -20,6 +20,10 @@ import gleam/list
 import gleam/order
 import gleam/string
 
+/// The tab icon, inline so the browser does not request `/favicon.ico`.
+const favicon =
+  "<link rel=\"icon\" href=\"data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='7' fill='%23f59e0b'/></svg>\">"
+
 // --- Types ---
 
 pub type Point {
@@ -504,15 +508,18 @@ fn view_high_scores(high_scores: List(HighScore)) -> Element(Msg) {
 
 pub fn main() {
   let scores = store.new_list("snake_scores")
-  beacon.full_application(
-    init: fn(_ctx) { init(scores) },
-    update: fn(model, msg) { update(scores, model, msg) },
-    sync:,
-    local: local.layer(init: init_local, update: update_local),
-    view:,
-  )
-  |> beacon.title(fn(_model) { "Snake" })
-  |> beacon.subscriptions(fn(_model) { [store.list_topic(scores)] })
-  |> beacon.on_notify(fn(_topic) { ScoresChanged })
-  |> beacon.start(8080)
+  let assert Ok(Nil) =
+    beacon.full_application(
+      init: fn(_ctx) { init(scores) },
+      update: fn(model, msg) { update(scores, model, msg) },
+      sync:,
+      local: local.layer(init: init_local, update: update_local),
+      view:,
+    )
+    |> beacon.title(fn(_model) { "Snake" })
+    |> beacon.subscriptions(fn(_model) { [store.list_topic(scores)] })
+    |> beacon.on_notify(fn(_topic) { ScoresChanged })
+    |> beacon.head_html(favicon)
+    |> beacon.start(8080)
+    as "beacon.start failed (it logs the error)"
 }

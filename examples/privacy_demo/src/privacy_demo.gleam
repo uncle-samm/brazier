@@ -20,6 +20,10 @@ import gleam/int
 import gleam/list
 import gleam/string
 
+/// The tab icon, inline so the browser does not request `/favicon.ico`.
+const favicon =
+  "<link rel=\"icon\" href=\"data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='7' fill='%23f59e0b'/></svg>\">"
+
 // Only the server reads these: `init` puts them in the Session, and `view`
 // never reaches them.
 const api_key = "sk_live_secret_do_not_leak_this"
@@ -160,7 +164,10 @@ fn view_item(item: Item) -> Element(Msg) {
 }
 
 pub fn main() {
-  beacon.full_application(init:, update:, sync:, local: local.none(), view:)
-  |> beacon.title(fn(_model) { app_title })
-  |> beacon.start(8080)
+  let assert Ok(Nil) =
+    beacon.full_application(init:, update:, sync:, local: local.none(), view:)
+    |> beacon.title(fn(_model) { app_title })
+    |> beacon.head_html(favicon)
+    |> beacon.start(8080)
+    as "beacon.start failed (it logs the error)"
 }

@@ -24,7 +24,7 @@ A drag-and-drop board shared by every open tab, built with
 
 ```bash
 cd examples/kanban
-gleam run -m beacon/build   # after changing the source
+gleam run -m beacon/build   # first, and after every change
 gleam run
 ```
 

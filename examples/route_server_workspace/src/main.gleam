@@ -17,6 +17,10 @@ import gleam/uri.{type Uri}
 import route_server_workspace/pages/accounts
 import route_server_workspace/pages/settings
 
+/// The tab icon, inline so the browser does not request `/favicon.ico`.
+const favicon =
+  "<link rel=\"icon\" href=\"data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='7' fill='%23f59e0b'/></svg>\">"
+
 pub type Route {
   AccountsPage
   SettingsPage
@@ -149,8 +153,11 @@ pub fn view(model: Model, _local: Nil) -> Element(Msg) {
 }
 
 pub fn main() {
-  beacon.full_application(init:, update:, sync:, local: local.none(), view:)
-  |> beacon.with_router(parse: parse_route, on_change: RouteChanged)
-  |> beacon.title(fn(_model) { "Route Server Workspace" })
-  |> beacon.start(8080)
+  let assert Ok(Nil) =
+    beacon.full_application(init:, update:, sync:, local: local.none(), view:)
+    |> beacon.with_router(parse: parse_route, on_change: RouteChanged)
+    |> beacon.title(fn(_model) { "Route Server Workspace" })
+    |> beacon.head_html(favicon)
+    |> beacon.start(8080)
+    as "beacon.start failed (it logs the error)"
 }

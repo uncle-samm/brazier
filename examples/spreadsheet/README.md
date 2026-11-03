@@ -20,7 +20,7 @@ An editable 10x5 grid shared by every open tab, built with
 
 ```bash
 cd examples/spreadsheet
-gleam run -m beacon/build   # after changing the source
+gleam run -m beacon/build   # first, and after every change
 gleam run
 ```
 

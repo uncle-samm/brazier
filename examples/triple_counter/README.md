@@ -19,7 +19,7 @@ Three counters, one per Beacon state layer, built with
 
 ```bash
 cd examples/triple_counter
-gleam run -m beacon/build   # after changing the source
+gleam run -m beacon/build   # first, and after every change
 gleam run
 ```
 

@@ -16,6 +16,10 @@ import gleam/int
 import gleam/list
 import gleam/string
 
+/// The tab icon, inline so the browser does not request `/favicon.ico`.
+const favicon =
+  "<link rel=\"icon\" href=\"data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='7' fill='%23f59e0b'/></svg>\">"
+
 pub type Model {
   Model(user: auth.User, items: List(items.Item), next_id: Int, input: String)
 }
@@ -190,7 +194,10 @@ fn view_item(item: items.Item) -> Element(Msg) {
 }
 
 pub fn main() {
-  beacon.simple(init:, update:, view:)
-  |> beacon.title(fn(_model) { "Beacon Domains" })
-  |> beacon.start(8080)
+  let assert Ok(Nil) =
+    beacon.simple(init:, update:, view:)
+    |> beacon.title(fn(_model) { "Beacon Domains" })
+    |> beacon.head_html(favicon)
+    |> beacon.start(8080)
+    as "beacon.start failed (it logs the error)"
 }

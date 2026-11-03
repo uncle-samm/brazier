@@ -18,6 +18,6 @@ The browser integration tests use this example to check that the signing
 key and audit entries never reach the page or the bundle.
 
 ```sh
-gleam run -m beacon/build   # after changing the source
+gleam run -m beacon/build   # first, and after every change
 gleam run -m private_session
 ```

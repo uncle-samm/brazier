@@ -33,7 +33,7 @@ A multi-room chat with presence and typing indicators, built with
 
 ```bash
 cd examples/chat
-gleam run -m beacon/build   # after changing the source
+gleam run -m beacon/build   # first, and after every change
 gleam run
 ```
 

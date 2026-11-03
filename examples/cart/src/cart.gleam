@@ -20,6 +20,10 @@ import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
 
+/// The tab icon, inline so the browser does not request `/favicon.ico`.
+const favicon =
+  "<link rel=\"icon\" href=\"data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='7' fill='%23f59e0b'/></svg>\">"
+
 // --- Types ---
 
 /// A catalog entry with the stock left after every cart's takes.
@@ -513,15 +517,18 @@ fn total_row(label: String, amount: Int) -> Element(Msg) {
 
 pub fn main() {
   let changes = store.new_list("cart_stock")
-  beacon.full_application(
-    init: fn(_ctx) { init(changes) },
-    update: fn(state, msg) { update(changes, state, msg) },
-    sync:,
-    local: local.none(),
-    view:,
-  )
-  |> beacon.title(fn(_model) { "Shopping Cart" })
-  |> beacon.subscriptions(fn(_state) { [store.list_topic(changes)] })
-  |> beacon.on_notify(fn(_topic) { StockChanged })
-  |> beacon.start(8080)
+  let assert Ok(Nil) =
+    beacon.full_application(
+      init: fn(_ctx) { init(changes) },
+      update: fn(state, msg) { update(changes, state, msg) },
+      sync:,
+      local: local.none(),
+      view:,
+    )
+    |> beacon.title(fn(_model) { "Shopping Cart" })
+    |> beacon.subscriptions(fn(_state) { [store.list_topic(changes)] })
+    |> beacon.on_notify(fn(_topic) { StockChanged })
+    |> beacon.head_html(favicon)
+    |> beacon.start(8080)
+    as "beacon.start failed (it logs the error)"
 }
