@@ -10,7 +10,7 @@
 **Active Milestone:** 117 — Full Review Remediation
 **Last Completed:** 116 — Review Hardening (CSRF, Timers, Auth, Cookies, Docs)
 **Build Status:** GREEN (zero errors, zero warnings) on Gleam 1.19.2
-**Test Status:** GREEN (1362 tests passed, 0 failures, after the WS8b part 2 merge)
+**Test Status:** GREEN (1456 tests passed, 0 failures, after the WS8c and WS9 merges)
 **Linter:** PASSING (zero violations)
 
 ### Milestone 117: Full Review Remediation 🚧
@@ -190,7 +190,31 @@
     - after node A's shard restarts, watchers on node B still see A's re-tracked entries leave and join again with new refs;
     - local entries re-tracked by other watchers can arrive as separate leave and join messages;
     - no public builder combines tracking with extra watched topics (`new_watching` supports it internally).
-- [ ] WS9 Test quality + performance (follow-ups: from WS8a, `test/beacon_effect_test_ffi.erl` `await_pg_empty` now polls every 5 ms, so use an event instead; `sim_1000_connections_test` failed once under synthetic CPU starvation, so review its threshold together with the perf thresholds; run the suite under CPU stress as a flake gate): replace sleeps with synchronization, meaningful assertions, client JS tests in CI, HTTP/WS/runtime load tests and benchmarks with recorded baselines and regression thresholds
+- [x] WS9 Test quality + performance (follow-ups: from WS8a, `test/beacon_effect_test_ffi.erl` `await_pg_empty` now polls every 5 ms, so use an event instead; `sim_1000_connections_test` failed once under synthetic CPU starvation, so review its threshold together with the perf thresholds; run the suite under CPU stress as a flake gate): replace sleeps with synchronization, meaningful assertions, client JS tests in CI, HTTP/WS/runtime load tests and benchmarks with recorded baselines and regression thresholds
+  - Merged 2026-11-03 as 327d2aa (19 commits). The only conflict was the Makefile `.PHONY` line, which now lists both WS9's targets and WS10a's `publish-dry-run`. Coordinator verify on the merged tree (WS8c and WS10a already in): a clean build with zero warnings; format and lint clean; 1456 tests passing in each of 3 runs; `scripts/check_docs.sh` OK; `make test-client` OK (33 harness scenarios, 5 patch-safety checks).
+  - The agent's gate on its own HEAD (dd2ad87): a clean build with zero warnings; format and lint clean; 1411 tests passing in each of 2 runs; the flake gate (5 runs under 8 `yes` loops) 5/5; desktop CDP 603 passed, mobile CDP 612 passed. `sim_1000` now requires all 1000 connections and 5000 acks.
+  - What was built:
+    - tests wait on barriers, monitors, `sys` hooks, pg monitors and telemetry instead of sleeps (runtime, effect, state manager, sim, rate limit, session, ws_protocol, api_route, stress). `await_pg_empty` no longer polls. Integration tests bind port 0. The remaining sleeps are each commented and listed in TESTING.md;
+    - log, debug, token and SSR tests assert what was produced, not only that nothing crashed;
+    - analyzer tests run against the chat example with presence and `on_notification`;
+    - the CDP harness waits on conditions, builds each example, and its start/stop fail loudly;
+    - test temp directories get unique names, refuse reuse and are deleted. The colliding counter names in `/tmp` caused the `ssr_test` flake WS8c saw;
+    - CI fails on unformatted code and build warnings and runs `make test-client` first; `make test-flake` (`scripts/flake_gate.sh`);
+    - a bench suite (`beacon_bench`: HTTP, WS N×M, runtime, PubSub, store) with `bench/baselines.json` and `make bench-check`. Each metric's tolerance is the larger of 25% and twice its observed spread. `ws.1x200.latency_p99` (127% spread) is not gated. Benches stay out of `gleam test`;
+    - `docs/PERFORMANCE.md` (new) and `docs/TESTING.md` (rewritten).
+  - Source bug found (pre-existing, so the merge did not wait on it): `beacon_http_acceptors_sup` owns the listen socket and never closes it. The runtime closes the port asynchronously after the owner exits, so a listener restarted under load can fail with `eaddrinuse` and use up the restart tolerance. It caused the one failure in the first stress gate (`app_tree_test` `wait_forever_crashes_when_the_tree_gives_up_test_`). A plain-Erlang reproduction failed 366 and 376 of 20000 rebinds under load, and 0 of 20000 with an explicit `gen_tcp:close`. WS10b fixes it first.
+  - Source hooks WS9 needs (WS10b):
+    - an observable runtime PubSub subscribe/unsubscribe (a `[beacon, subscription, changed]` telemetry event or a synchronous ack), so `runtime_versioning_test` stops polling;
+    - a client `window.__beaconOutboundPendingForTest()` behind `__BEACON_ENABLE_TEST_HOOKS`, to replace the CDP quiet window;
+    - an early upload refusal (413) arrives about 0.5 s late because the server discards the unread body first: write the refusal first, or close, and stop discarding when the peer closes.
+  - Other follow-ups:
+    - `beacon_ws_pg` is started without a supervisor (`beacon_transport_ffi.erl:735`);
+    - stopping an app twice logs "Application stop failed" a second time;
+    - the examples need `beacon/build` before they run;
+    - CI runs neither mobile CDP nor `scripts/check_docs.sh`;
+    - TESTING.md's 4 samples use test-only modules and need `docs-check` markers;
+    - the bench baselines were taken at load average about 5.9: re-baseline on an idle machine in final verification;
+    - the old sim latency metrics were always 0, and are gone.
 
 **Phase 4 — Docs, hygiene, rename, final audits**
 - [ ] WS10 Docs that compile, LICENSE, remove stale committed builds/stray files, archive old PROGRESS notes, honest CHANGELOG, publish script (split into WS10a and WS10b; see Decisions)
