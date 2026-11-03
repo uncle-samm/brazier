@@ -10,7 +10,7 @@
 **Active Milestone:** 117 — Full Review Remediation
 **Last Completed:** 116 — Review Hardening (CSRF, Timers, Auth, Cookies, Docs)
 **Build Status:** GREEN (zero errors, zero warnings) on Gleam 1.19.2
-**Test Status:** GREEN (1287 tests passed, 0 failures, after the WS7 merge; the drop from 1484 is the deleted legacy modules' own tests)
+**Test Status:** GREEN (1362 tests passed, 0 failures, after the WS8b part 2 merge)
 **Linter:** PASSING (zero violations)
 
 ### Milestone 117: Full Review Remediation 🚧
@@ -81,7 +81,7 @@
       - examples ship no favicon, so Chrome's `/favicon.ico` gets a 404.
 
 **Phase 3 — Platform features + verification (parallel)**
-- [ ] WS8 (design: `docs/design/CLUSTER_PRESENCE_TELEMETRY.md`; replicated store mode confirmed, ships last) Clustering (node-consistent stores/pubsub, cross-node sessions), Presence (CRDT-style, per-topic, cluster-aware), Telemetry (structured events for HTTP, WS, runtime, effects, stores; handler attach API)
+- [x] WS8 (design: `docs/design/CLUSTER_PRESENCE_TELEMETRY.md`; replicated store mode confirmed, ships last) Clustering (node-consistent stores/pubsub, cross-node sessions), Presence (CRDT-style, per-topic, cluster-aware), Telemetry (structured events for HTTP, WS, runtime, effects, stores; handler attach API)
   - [x] WS8a foundations (merged 2026-11-03; 1405 tests green twice on the merged tree, zero warnings, lint clean). What was built:
     - `beacon/telemetry` over Erlang `telemetry` 1.4. A crashing handler is detached and logged. A no-handler emit costs ≈43–68 ns.
     - PubSub rewritten as a Phoenix.PubSub pg-adapter port: partitioned registry, `local_broadcast`/`direct_broadcast`. Fan-out across 3 nodes × 10k subscribers, all delivered: median ≈25 ms.
@@ -119,7 +119,43 @@
         - Also: wait until a's pg view lists b's forwarding worker before writing. That race is real but was not the cause seen here.
         - The module passed 15 of 15 runs alone under 12 busy-loop processes, where 4 of 10 had failed.
       - Seen once under 10 synthetic busy loops, never in normal runs: `sim_test.sim_1000_connections_test` (needs at least 950 of 1000 connections to succeed). Left to WS9's thresholds work.
-  - [ ] WS8b part 2 (after WS7 merges; it touches WS7 files):
+  - [x] WS8b part 2 (merged 2026-11-03 at df62061; the merged tree is identical to the branch, which already contained the coordinator tip).
+    - Coordinator verify: a clean build with zero warnings; format and lint clean; 1362 tests passing in each of 3 runs.
+    - Agent's checks:
+      - a 4th test run under 8 `yes` busy loops passed;
+      - CDP desktop 499/499 and mobile 508/508;
+      - all 24 examples rebuilt with zero warnings.
+    - What was built:
+      - one rest-for-one application tree (PubSub → cluster → session scope → presence → listener) with a real stop; it refuses infrastructure started outside the tree;
+      - `beacon.presence(tracker:, track:, on_presence:)`: runtime state decides what is tracked, and diffs arrive as messages. The presence data types moved to the client-safe `beacon/presence/sync`, and the analyzer now accepts `beacon/presence/sync` and `beacon/notification` in client code;
+      - telemetry call sites with route tags, plus WS and runtime events;
+      - the init error channel: init returns `Result(_, InitError)`. A refusal closes the WS with 4000 + the HTTP status; a crash closes it with 1011, and the server render answers 500;
+      - `auth.allow_guests_ws`;
+      - examples migrated, manifests regenerated, chat moved to `beacon.presence`;
+      - STATE_MANAGEMENT/CLUSTERING/GETTING_STARTED/ARCHITECTURE updated;
+      - a regression fix: the supervised listener prints "Listening on port N" again (operators and the CDP harness rely on it) and logs start errors.
+    - Bench (`beacon_runtime_bench`, baseline commit re-run next to the branch): changed events 41–42 → 45–47 µs, unchanged 17–18 → 18–21 µs. About 10% for the per-event handle/render telemetry spans, accepted (LiveView emits the same spans). WS9 records it as the baseline.
+    - Follow-ups:
+      - WS9:
+        - `test_all_cdp.py` `start_example` blocks on `readline()` with no bound;
+        - steps 1–5 never had a CDP run, and step 2's tests never ran an app through the analyzer, which is how two regressions slipped through. Add an analyzer-level presence test and run CDP in the gate;
+        - the refused-upgrade test takes about 1 s.
+      - WS8c:
+        - the ETS owner sits outside the tree;
+        - the listener does not trap exits;
+        - `wait_forever` drains with a sleep;
+        - a crashed runtime emits no `runtime_stop`;
+        - a WS init crash logs twice;
+        - init error pages still set the join cookie;
+        - FFI `logger` calls with format args print as inspected tuples (about 170 call sites);
+        - the client could reload on 4400–4499 closes, with a loop guard;
+        - presence membership can flap during reconciliation after a shard restart;
+        - there is no spectator (watch-only) presence.
+      - WS10:
+        - WIRE_PROTOCOL.md close-code table (around 306–319) and 4401 text (around 179) need 4000+status and 1011; line 295 mentions `auth.ws_session_auth`;
+        - CONFORMANCE.md:18 and :131 mention `ws_init`;
+        - API_REDESIGN.md:364/426/497 mention `ws_init` (historical; annotate rather than rewrite).
+    - Scope as planned:
     - Root supervision tree: pubsub → cluster → session revocation scope → presence, plus app stop.
     - Runtime `on_presence` hook: coalesce up to 100 diffs; monitor `pubsub.partition_for` and the presence shard, and track again when a shard restarts.
     - Telemetry call sites in `transport.gleam`, runtime and the WS upgrade:
@@ -131,6 +167,7 @@
     - Move the auth_workspace example (:134, :173, :260), GETTING_STARTED's auth section and SECURITY.md:202 to the new auth signatures.
     - Regenerate the example manifests for the `telemetry` dependency (23 of 24 lack it).
     - Session recheck path: emit the revoked event.
+- [ ] WS8c Runtime/supervision follow-ups from WS8b part 2 (source only; runs beside WS9): see the WS8c list under WS8b part 2 above
 - [ ] WS9 Test quality + performance (follow-ups: from WS8a, `test/beacon_effect_test_ffi.erl` `await_pg_empty` now polls every 5 ms, so use an event instead; `sim_1000_connections_test` failed once under synthetic CPU starvation, so review its threshold together with the perf thresholds; run the suite under CPU stress as a flake gate): replace sleeps with synchronization, meaningful assertions, client JS tests in CI, HTTP/WS/runtime load tests and benchmarks with recorded baselines and regression thresholds
 
 **Phase 4 — Docs, hygiene, rename, final audits**
@@ -156,6 +193,12 @@
 - [ ] Final verification: build (zero warnings), tests, all examples, CDP browser suite, perf baselines
 
 **Decisions (Milestone 117, coordinator):**
+- 2026-11-03, WS8b part 2's source follow-ups became their own workstream, WS8c, which runs beside WS9 with disjoint files.
+  - WS8c owns `src/**` and `beacon_client/**`, except `src/beacon/lint.gleam` and the lint FFI.
+  - WS9 owns `test/**`, `test_all_cdp.py`, benchmarks, CI and scripts. WS9 records any source hook it needs rather than editing a WS8c file.
+  - WS8c may add new test files, plus the edits to existing tests that its source changes make necessary to compile, and it lists every such edit for the merge.
+  - The alternative was to fold these into the final stability audit. It was rejected because they are known defects (a sleep, missing stop events, unreadable logs), and fixing them now keeps the audit for unknowns.
+  - The ≈10% per-event telemetry cost is accepted, because it matches LiveView's per-event spans. WS9's thresholds start from the post-telemetry numbers.
 - 2026-11-03, WS7 merged with 197 fewer tests. Before merging I checked that every deleted test file belongs to a source module the design deletes. The init error channel goes to WS8b part 2, not WS10: it changes all three constructor signatures, and part 2 already owns runtime, transport and the init-failure path.
 - 2026-11-03, WS8b was split in two:
   - Part 1 took only files WS7 does not own (HTTP and connection telemetry, effects, sessions, stores, auth, the replicated store), so it ran beside WS7.
