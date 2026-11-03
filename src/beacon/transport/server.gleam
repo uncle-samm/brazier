@@ -246,16 +246,29 @@ pub fn supervised(
           case static_supervisor.start(builder) {
             Ok(started) -> {
               let port = ffi_conns_get_port(name)
+              // Same line as `start`: operators and the browser
+              // conformance harness wait for "Listening on port".
               log.info(
                 "beacon.server",
-                "Supervised listener on port " <> int.to_string(port),
+                "Listening on port "
+                  <> int.to_string(port)
+                  <> " with "
+                  <> int.to_string(options.acceptors)
+                  <> " acceptors (supervised)",
               )
               Ok(actor.Started(
                 pid: started.pid,
                 data: Listener(supervisor: started.pid, conns: name, port: port),
               ))
             }
-            Error(err) -> Error(err)
+            Error(err) -> {
+              log.error(
+                "beacon.server",
+                "Supervised listener failed to start: "
+                  <> describe_start_error(err),
+              )
+              Error(err)
+            }
           }
         }),
       )
