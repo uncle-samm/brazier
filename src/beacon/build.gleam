@@ -106,6 +106,7 @@ pub fn parse_args(args: List(String)) -> Result(Target, String) {
 /// one). Target paths are relative to `project`.
 pub fn build(project: String, target: Target) -> Result(Built, String) {
   use beacon_root <- result.try(project_toml.beacon_root(project))
+  use runtime_dir <- result.try(project_toml.client_runtime_dir(project))
   use config <- result.try(
     project_toml.read_project(files.join(project, "gleam.toml")),
   )
@@ -119,7 +120,14 @@ pub fn build(project: String, target: Target) -> Result(Built, String) {
   use codec_path <- result.try(write_codec(project, src_dir, analysis))
   use Nil <- result.try(compile(project, config.name, codec_path))
   use bundle <- result.try(
-    client_bundle.build(project, src_dir, beacon_root, app, analysis)
+    client_bundle.build(
+      project,
+      src_dir,
+      beacon_root,
+      runtime_dir,
+      app,
+      analysis,
+    )
     |> result.try_recover(fn(reason) { remove_manifest(project, reason) }),
   )
   Ok(Built(app:, codec_path:, bundle:))

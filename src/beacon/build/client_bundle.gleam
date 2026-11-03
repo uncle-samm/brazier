@@ -63,12 +63,14 @@ type ProjectFile =
   #(String, String)
 
 /// Build the client bundle of `app` in the app project at `project`, whose
-/// Gleam sources are in `src_dir` and whose Beacon sources are at
-/// `beacon_root`.
+/// Gleam sources are in `src_dir`, whose Beacon sources are at
+/// `beacon_root`, and whose client runtime is in `runtime_dir` (see
+/// `project_toml.client_runtime_dir`).
 pub fn build(
   project: String,
   src_dir: String,
   beacon_root: String,
+  runtime_dir: String,
   app: AppModule,
   analysis: Analysis,
 ) -> Result(Bundle, String) {
@@ -76,7 +78,12 @@ pub fn build(
     "beacon.build.client_bundle",
     "Building client bundle for " <> app.path,
   )
-  use project_files <- result.try(project_files(src_dir, beacon_root, analysis))
+  use project_files <- result.try(project_files(
+    src_dir,
+    beacon_root,
+    runtime_dir,
+    analysis,
+  ))
   use dependencies <- result.try(dependencies(project, project_files))
   let dir = files.join(project, client_dir)
   use Nil <- result.try(write_project(dir, project_files, dependencies))
@@ -132,6 +139,7 @@ start(App);
 fn project_files(
   src_dir: String,
   beacon_root: String,
+  runtime_dir: String,
   analysis: Analysis,
 ) -> Result(List(ProjectFile), String) {
   use entry_module <- result.try(client_entry.generate(analysis))
@@ -150,7 +158,7 @@ fn project_files(
       ..list.map(analysis.client, fn(emitted) { emitted.source })
     ]),
   )
-  use runtime <- result.try(runtime_files(beacon_root))
+  use runtime <- result.try(runtime_files(runtime_dir))
   let project_files =
     list.flatten([
       list.map(analysis.client, fn(emitted) {
@@ -178,10 +186,9 @@ fn project_files(
   Ok(project_files)
 }
 
-/// The client runtime from `beacon_root/beacon_client/src`: the FFI module
-/// and every `.mjs` module in `beacon_client/`.
-fn runtime_files(beacon_root: String) -> Result(List(ProjectFile), String) {
-  let runtime_src = files.join(beacon_root, "beacon_client/src")
+/// The client runtime from `runtime_src`: the FFI module and every `.mjs`
+/// module in `beacon_client/`.
+fn runtime_files(runtime_src: String) -> Result(List(ProjectFile), String) {
   let package_dir = files.join(runtime_src, "beacon_client")
   use entries <- result.try(files.list_directory(package_dir))
   use package_files <- result.try(

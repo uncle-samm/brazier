@@ -153,6 +153,11 @@ with its own changelog, so they are not listed here.
   status 1 and names the missing artifact; before, it exited 0 in silence.
   The examples ship an inline SVG favicon, so the browser requests no
   `/favicon.ico`.
+- (WS10b) The Hex package carries the client runtime: `scripts/publish.sh`
+  copies `beacon_client/src` to `priv/beacon_client_src` for the tarball and
+  checks the tarball holds it, and `beacon/build` reads the runtime from
+  there when the app gets Beacon from Hex. Before, an app on the Hex package
+  could not build its client bundle.
 - (WS10b) The examples' generated `src/beacon_codec.gleam` and
   `priv/static/` bundles are no longer tracked; build an example before its
   first run.

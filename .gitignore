@@ -29,6 +29,10 @@ src/generated/
 # Client build artifacts (compiled JS in build dir)
 beacon_client/build/
 
+# The copy of beacon_client/src that scripts/publish.sh stages for the Hex
+# tarball and removes on exit.
+/priv/beacon_client_src/
+
 # Secrets & credentials
 .env
 .env.*
