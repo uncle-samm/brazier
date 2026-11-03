@@ -1,31 +1,28 @@
 # Beacon
 
 Beacon is an alpha full-stack Gleam framework for building MVU web apps on the
-BEAM.
+BEAM. It is not published on Hex (the name `beacon` there belongs to another
+package) and will be renamed `brazier` before its first release; see
+[CHANGELOG.md](CHANGELOG.md).
 
-The intended model is:
+How a page works:
 
-- SSR renders the first page.
-- The browser hydrates a generated client bundle.
-- Server-authoritative `Model` changes sync as JSON state updates.
-- Optional `Local` state handles per-tab interactions such as dropdowns and
-  form drafts without server round trips.
-- Optional private `Server` state stays on the BEAM and is never passed to the
-  client view.
+- The server renders the first page (SSR).
+- The browser loads a generated client bundle and connects over a WebSocket,
+  one BEAM process per session.
+- The server is authoritative: `update` runs there, and the synced `Model`
+  reaches the browser as JSON state updates.
+- An optional Local layer handles per-tab state such as dropdowns and form
+  drafts in the browser, without a server round trip.
+- With `beacon.full_application`, server state that `sync` does not return
+  stays on the BEAM and is never sent to the browser.
 
-## Quick Start
-
-```sh
-gleam build
-gleam test
-gleam run
-```
-
-Minimal app:
+## Minimal App
 
 ```gleam
 import beacon
-import beacon/effect
+import beacon/element.{type Element}
+import beacon/event
 import beacon/html
 import gleam/int
 
@@ -37,38 +34,79 @@ pub type Msg {
   Increment
 }
 
-pub fn init() -> #(Model, effect.Effect(Msg)) {
-  #(Model(count: 0), effect.none())
+fn init(_ctx: beacon.Context) -> Result(Model, beacon.InitError) {
+  Ok(Model(count: 0))
 }
 
-pub fn update(model: Model, _local: Nil, _server: Nil, msg: Msg) -> #(Model, Nil, Nil) {
+pub fn update(model: Model, msg: Msg) -> Model {
   case msg {
-    Increment -> #(Model(count: model.count + 1), Nil, Nil)
+    Increment -> Model(count: model.count + 1)
   }
 }
 
-pub fn view(model: Model, _local: Nil) -> beacon.Node(Msg) {
-  html.button([beacon.on_click(Increment)], [
+pub fn view(model: Model) -> Element(Msg) {
+  html.button([event.on_click(Increment)], [
     html.text("Count: " <> int.to_string(model.count)),
   ])
 }
 
 pub fn main() {
-  beacon.app(init, beacon.no_local, beacon.no_server, update, view)
+  beacon.simple(init:, update:, view:)
   |> beacon.start(8080)
 }
 ```
 
+An app needs two generated artifacts before it starts: the server codec
+(`src/beacon_codec.gleam`) and the client bundle (`priv/static/`). Generate
+them with `gleam run -m beacon/build`, then `gleam run`; or use
+`gleam run -m beacon/dev`, which builds, runs and rebuilds on change.
+`beacon.start` returns an error when either artifact is missing. To run the
+counter example from this repository:
+
+```sh
+cd examples/counter
+gleam run -m beacon/build
+gleam run
+```
+
+[Getting Started](docs/GETTING_STARTED.md) walks through a full app.
+
 ## Recommended APIs
 
-- Use one constructor: `beacon.app(init, init_local, init_server, update, view)`.
-- Use `beacon.no_local` when the app has no per-tab `Local` state.
-- Use `beacon.no_server` when the app has no private `Server` state.
-- Use `beacon.route_pages([...])` for routed apps.
-- Use `beacon/api.routes`, `api.json_value`, `api.read_text`, and
-  `api.read_form` for API routes.
-- Use `beacon/auth.session_routes`, `auth.protect_ws`, and
-  `auth.init_from_session` for the standard session-cookie auth path.
+- Pick one constructor: `beacon.simple` (a pure `update` that also runs in the
+  browser), `beacon.application` (server `update` with effects) or
+  `beacon.full_application` (private server state, `sync` and a Local layer).
+- `beacon.with_router(parse:, on_change:)` routes by URL; see
+  [Routing](docs/ROUTING.md).
+- `beacon/api.routes`, `api.json_value`, `api.read_text` and `api.read_form`
+  for API routes.
+- `beacon/auth.session_routes`, `auth.protect_ws` (or `auth.allow_guests_ws`)
+  and `auth.init_from_session` for session-cookie auth.
+
+## Requirements
+
+- Gleam 1.19.2 and Erlang/OTP 28.
+- `node` and `npx`: the build bundles the client with a pinned esbuild through
+  `npx`, and `gleam test` needs both (client round-trip tests run in `node`,
+  and the build fixture tests bundle with esbuild). A missing tool fails
+  those tests; they are never skipped.
+- For the browser (CDP) tests: Python 3 with `requirements-dev.txt` in
+  `.venv`, and Chrome or Chromium. See [Testing](docs/TESTING.md).
+
+## Development
+
+In the repository root (the framework itself has no `main`; run an app from
+`examples/`):
+
+```sh
+gleam build                  # zero warnings
+gleam format --check src test
+gleam run -m beacon/lint     # 0 violations
+gleam test
+scripts/check_docs.sh        # doc samples compile, doc links resolve
+```
+
+All of them must pass before a change is done.
 
 ## Project Docs
 
@@ -76,15 +114,10 @@ pub fn main() {
 - [Architecture](docs/ARCHITECTURE.md)
 - [Routing](docs/ROUTING.md)
 - [Security](docs/SECURITY.md)
+- [Deployment](docs/DEPLOYMENT.md)
 - [Testing](docs/TESTING.md)
 - [Current Progress](docs/PROGRESS.md)
 
-## Development
+## License
 
-```sh
-gleam build
-gleam test
-gleam run -m beacon/lint
-```
-
-All three must pass before a change is considered done.
+MIT; see [LICENSE](LICENSE).
