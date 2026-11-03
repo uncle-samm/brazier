@@ -378,6 +378,7 @@ fn start_app_server(
       page_html: Some(ssr.RenderedPage(
         html: "<html><body>page</body></html>",
         sign_join_token: fn(_fingerprint) { "" },
+        join_cookie: True,
         cookie_secure: False,
         status: 200,
       )),

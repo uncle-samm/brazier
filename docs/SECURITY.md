@@ -173,7 +173,7 @@ HSTS is opt-in because Beacon does not terminate TLS: add `middleware.hsts(31_53
 
 ## Session Tokens
 
-SSR pages set a signed join/state recovery token in the HttpOnly `beacon_join_token` cookie. The browser client sends an empty join token; the runtime reads the cookie from the WebSocket upgrade request. Tokens are created with `crypto.sign_message` using HMAC-SHA256 and contain a JSON payload with a timestamp, version, and optionally serialized model state. The `verify_session_token` function checks the signature and rejects tokens older than `max_age_seconds` (default 24 hours / 86400 seconds).
+SSR pages set a signed join/state recovery token in the HttpOnly `beacon_join_token` cookie; static error pages (4xx/5xx, which load no client) set none. The browser client sends an empty join token; the runtime reads the cookie from the WebSocket upgrade request. Tokens are created with `crypto.sign_message` using HMAC-SHA256 and contain a JSON payload with a timestamp, version, and optionally serialized model state. The `verify_session_token` function checks the signature and rejects tokens older than `max_age_seconds` (default 24 hours / 86400 seconds).
 
 The cookie is `HttpOnly`, `SameSite=Lax`, path `/`, and has `Max-Age=86400`. JavaScript cannot read it, so XSS cannot directly steal the join token from DOM state.
 

@@ -25,12 +25,15 @@ from 400 to 599; another status crashes, because it is a bug in the app).
 
 | Where | `Error(InitError)` | `init` crashes |
 |---|---|---|
-| HTML render | A static error page with the error's status; the bundle is not loaded | 500 |
+| HTML render | A static error page with the error's status; the bundle is not loaded and no join cookie is set | 500, with no join cookie |
 | WebSocket mount | Close with `4000 + status` (4503, 4404, ...) and the reason `init refused` | Close with 1011 and the reason `startup failure` |
 
 The reason is logged, as an error for a 5xx status and as a warning for a 4xx
 one, and never sent to the browser. The browser reloads the page on 4401 and
-reconnects with backoff on any other close. `auth.init_from_session` answers a
+reconnects with backoff on any other close. A static error page (a refusal,
+an init crash, an unknown route, a missing bundle) opens no session, so it
+neither sets the `beacon_join_token` cookie nor replaces one that another tab
+is still joining with. `auth.init_from_session` answers a
 session store outage with `error.unavailable`. See
 [GETTING_STARTED.md](GETTING_STARTED.md#refusing-in-init).
 
