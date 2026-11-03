@@ -1,10 +1,11 @@
 /// Real integration tests — starts a server and makes actual HTTP/WebSocket requests.
 /// No mocks. Real network calls.
+import beacon/app_config_fixture
 import beacon/application
+import beacon/attribute
 import beacon/effect
-import beacon/element
 import beacon/error
-import beacon/middleware
+import beacon/html
 import beacon/transport
 import beacon/transport/server.{type Connection, Bytes}
 import gleam/bytes_tree
@@ -27,42 +28,28 @@ pub type TestMsg {
 
 fn test_app_config(port: Int) -> application.AppConfig(TestModel, TestMsg) {
   application.AppConfig(
-    port: port,
-    init: fn() { #(TestModel(count: 0), effect.none()) },
-    update: fn(model, _msg) {
-      #(TestModel(count: model.count + 1), effect.none())
-    },
-    view: fn(model: TestModel) {
-      element.el("div", [element.attr("id", "app")], [
-        element.text("count:" <> int.to_string(model.count)),
-      ])
-    },
-    decode_event: option.Some(fn(_name, handler_id, _data, _path) {
-      case handler_id {
-        "inc" -> Ok(TestInc)
-        _ -> Error(error.RuntimeError(reason: "unknown"))
-      }
-    }),
-    secret_key: "integration-test-secret-key-long-enough!!",
-    title: "Integration Test",
-    serialize_model: option.Some(fn(model: TestModel) {
-      "{\"count\":" <> int.to_string(model.count) <> "}"
-    }),
-    deserialize_model: option.None,
-    middlewares: [middleware.secure_headers()],
-    static_dir: option.None,
-    route_patterns: [],
-    on_route_change: option.None,
-    on_route_leave: option.None,
-    dynamic_subscriptions: option.None,
-    on_notify: option.None,
-    on_notification: option.None,
-    security_limits: transport.default_security_limits(),
-    head_html: option.None,
-    api_handler: option.None,
-    ws_auth: option.None,
-    init_from_request: option.None,
-    dev_mode: False,
+    ..app_config_fixture.new(
+      port: port,
+      init: fn(_ctx) { #(TestModel(count: 0), effect.none()) },
+      update: fn(model, _msg) {
+        #(TestModel(count: model.count + 1), effect.none())
+      },
+      view: fn(model: TestModel) {
+        html.div([attribute.id("app")], [
+          html.text("count:" <> int.to_string(model.count)),
+        ])
+      },
+      encode_model: fn(model: TestModel) {
+        "{\"count\":" <> int.to_string(model.count) <> "}"
+      },
+      decode_event: fn(_name, handler_id, _data, _path) {
+        case handler_id {
+          "inc" -> Ok(TestInc)
+          _ -> Error(error.RuntimeError(reason: "unknown"))
+        }
+      },
+    ),
+    title: fn(_model) { "Integration Test" },
   )
 }
 
@@ -71,7 +58,7 @@ fn test_app_config(port: Int) -> application.AppConfig(TestModel, TestMsg) {
 pub fn http_get_root_returns_200_with_ssr_html_test() {
   start_httpc()
   let port = 11_000 + unique_port_offset()
-  let assert Ok(_app) = application.start_advanced(test_app_config(port))
+  let assert Ok(_app) = application.start(test_app_config(port))
   process.sleep(100)
 
   let assert Ok(#(status, _headers, body)) =
@@ -85,7 +72,7 @@ pub fn http_get_root_returns_200_with_ssr_html_test() {
 pub fn http_get_beacon_js_returns_runtime_javascript_test() {
   start_httpc()
   let port = 12_000 + unique_port_offset()
-  let assert Ok(_app) = application.start_advanced(test_app_config(port))
+  let assert Ok(_app) = application.start(test_app_config(port))
   process.sleep(100)
 
   let assert Ok(#(status, _headers, body)) =
@@ -98,7 +85,7 @@ pub fn http_get_beacon_js_returns_runtime_javascript_test() {
 pub fn http_get_beacon_js_gzips_when_requested_test() {
   start_httpc()
   let port = 12_500 + unique_port_offset()
-  let assert Ok(_app) = application.start_advanced(test_app_config(port))
+  let assert Ok(_app) = application.start(test_app_config(port))
   process.sleep(100)
 
   let assert Ok(#(status, headers, _body)) =
@@ -116,7 +103,7 @@ pub fn http_get_beacon_js_gzips_when_requested_test() {
 pub fn http_get_has_security_headers_test() {
   start_httpc()
   let port = 13_000 + unique_port_offset()
-  let assert Ok(_app) = application.start_advanced(test_app_config(port))
+  let assert Ok(_app) = application.start(test_app_config(port))
   process.sleep(100)
 
   let assert Ok(#(_status, headers, _body)) =
@@ -135,7 +122,7 @@ pub fn http_pre_upgrade_rejects_too_many_headers_test() {
       max_http_headers: 2,
     )
   let assert Ok(_app) =
-    application.start_advanced(
+    application.start(
       application.AppConfig(..test_app_config(port), security_limits: limits),
     )
   process.sleep(100)
@@ -165,7 +152,7 @@ pub fn http_pre_upgrade_rejects_large_headers_test() {
       max_http_header_bytes: 32,
     )
   let assert Ok(_app) =
-    application.start_advanced(
+    application.start(
       application.AppConfig(..test_app_config(port), security_limits: limits),
     )
   process.sleep(100)
@@ -187,7 +174,7 @@ pub fn http_pre_upgrade_rejects_large_headers_test() {
 pub fn ws_connect_and_receive_model_sync_test() {
   start_httpc()
   let port = 14_000 + unique_port_offset()
-  let assert Ok(_app) = application.start_advanced(test_app_config(port))
+  let assert Ok(_app) = application.start(test_app_config(port))
   process.sleep(100)
 
   // Open a real WebSocket connection via gen_tcp
@@ -205,7 +192,7 @@ pub fn ws_connect_and_receive_model_sync_test() {
 pub fn ws_50_concurrent_connections_test() {
   start_httpc()
   let port = 15_000 + unique_port_offset()
-  let assert Ok(_app) = application.start_advanced(test_app_config(port))
+  let assert Ok(_app) = application.start(test_app_config(port))
   process.sleep(200)
 
   let result_subject = process.new_subject()
@@ -224,7 +211,7 @@ pub fn ws_50_concurrent_connections_test() {
 pub fn two_connections_have_independent_state_test() {
   start_httpc()
   let port = 17_000 + unique_port_offset()
-  let assert Ok(_app) = application.start_advanced(test_app_config(port))
+  let assert Ok(_app) = application.start(test_app_config(port))
   process.sleep(200)
 
   // Open two independent WebSocket connections
@@ -275,7 +262,7 @@ pub fn auth_middleware_blocks_ws_upgrade_test() {
   let auth_mw = fn(_req, _next) { gleam_http_response_new(401) }
   let config =
     application.AppConfig(..test_app_config(port), middlewares: [auth_mw])
-  let assert Ok(_app) = application.start_advanced(config)
+  let assert Ok(_app) = application.start(config)
   process.sleep(100)
 
   // HTTP GET should be blocked by auth middleware
@@ -310,7 +297,7 @@ pub fn api_handler_serves_json_test() {
       ..test_app_config(port),
       api_handler: option.Some(api_handler),
     )
-  let assert Ok(_app) = application.start_advanced(config)
+  let assert Ok(_app) = application.start(config)
   process.sleep(100)
 
   let assert Ok(#(status, _headers, body)) =
@@ -339,7 +326,7 @@ pub fn api_handler_fallthrough_to_ssr_test() {
       ..test_app_config(port),
       api_handler: option.Some(api_handler),
     )
-  let assert Ok(_app) = application.start_advanced(config)
+  let assert Ok(_app) = application.start(config)
   process.sleep(100)
 
   // Root path should fall through to SSR
@@ -363,7 +350,7 @@ pub fn ws_auth_rejects_unauthorized_test() {
       ..test_app_config(port),
       ws_auth: option.Some(ws_auth),
     )
-  let assert Ok(_app) = application.start_advanced(config)
+  let assert Ok(_app) = application.start(config)
   process.sleep(100)
 
   // WebSocket upgrade to /ws should be rejected with 401

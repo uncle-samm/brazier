@@ -153,40 +153,46 @@ pub fn server_error_does_not_leak_stack_trace_test() {
 
 // === Constant Leak Prevention Security Tests ===
 
-pub fn server_prefix_prevents_secret_in_client_bundle_test() {
-  // Verify that server_ prefix constants are never extracted
-  // even when combined with other constants and functions
+pub fn unreached_secret_constants_never_reach_client_code_test() {
+  // Only what view reaches is emitted for the browser, whatever the
+  // constants are called.
   let source =
     "
 import beacon
+import beacon/element.{type Element}
+import beacon/html
+
 pub type Model { Model(count: Int) }
 pub type Msg { Inc }
 
-const server_stripe_key = \"sk_live_secret\"
+const stripe_key = \"sk_live_secret\"
 const server_db_password = \"p@ssw0rd!\"
-const server_jwt_secret = \"jwt_hmac_256_key\"
+pub const jwt_secret = \"jwt_hmac_256_key\"
 const public_app_name = \"My App\"
 
+fn init(_ctx) { Model(count: bool_to_int(stripe_key == server_db_password)) }
+fn bool_to_int(b: Bool) -> Int { case b { True -> 1 False -> 0 } }
 pub fn update(model: Model, msg: Msg) -> Model {
   case msg { Inc -> model }
 }
-pub fn view(model: Model) -> beacon.Node(Msg) {
-  beacon.text(public_app_name)
+pub fn view(_model: Model) -> Element(Msg) {
+  html.text(public_app_name)
 }
+pub fn main() { beacon.simple(init:, update:, view:) |> beacon.start(8080) }
 "
-  let assert Ok(extracted) = analyzer.extract_client_source(source)
-  // ALL server_ constants must be absent
-  let assert False = string.contains(extracted, "sk_live_secret")
-  let assert False = string.contains(extracted, "p@ssw0rd!")
-  let assert False = string.contains(extracted, "jwt_hmac_256_key")
-  let assert False = string.contains(extracted, "server_stripe_key")
-  let assert False = string.contains(extracted, "server_db_password")
-  let assert False = string.contains(extracted, "server_jwt_secret")
-  // Public constant IS present
-  let assert True = string.contains(extracted, "public_app_name")
+  let assert Ok(analysis) = analyzer.analyze("app", [#("app", source)])
+  let client =
+    string.join(list.map(analysis.client, fn(emitted) { emitted.source }), "\n")
+  let assert False = string.contains(client, "sk_live_secret")
+  let assert False = string.contains(client, "p@ssw0rd!")
+  let assert False = string.contains(client, "jwt_hmac_256_key")
+  let assert False = string.contains(client, "stripe_key")
+  let assert False = string.contains(client, "fn init")
+  let assert True = string.contains(client, "public_app_name")
 }
 
 import beacon/build/analyzer
+import gleam/list
 
 // === Cookie Header Injection Tests ===
 

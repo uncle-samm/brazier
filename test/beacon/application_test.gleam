@@ -1,12 +1,12 @@
+import beacon/app_config_fixture
 import beacon/application
 import beacon/effect
-import beacon/element
 import beacon/error
+import beacon/html
 import beacon/middleware as beacon_middleware
-import beacon/transport
 import gleam/erlang/process
 import gleam/int
-import gleam/string
+import gleam/option
 
 pub type TestModel {
   TestModel(count: Int)
@@ -18,63 +18,41 @@ pub type TestMsg {
 
 fn test_config(port: Int) -> application.AppConfig(TestModel, TestMsg) {
   application.AppConfig(
-    port: port,
-    init: fn() { #(TestModel(count: 0), effect.none()) },
-    update: fn(model, _msg) {
-      #(TestModel(count: model.count + 1), effect.none())
-    },
-    view: fn(model: TestModel) {
-      element.el("div", [], [
-        element.text(int.to_string(model.count)),
-      ])
-    },
-    decode_event: option.Some(fn(_name, handler_id, _data, _path) {
-      case handler_id {
-        "inc" -> Ok(Inc)
-        _ -> Error(error.RuntimeError(reason: "unknown"))
-      }
-    }),
-    secret_key: "test-secret-key-must-be-long-enough!!",
-    title: "Test App",
-    serialize_model: option.None,
-    deserialize_model: option.None,
+    ..app_config_fixture.new(
+      port: port,
+      init: fn(_ctx) { #(TestModel(count: 0), effect.none()) },
+      update: fn(model, _msg) {
+        #(TestModel(count: model.count + 1), effect.none())
+      },
+      view: fn(model: TestModel) {
+        html.div([], [html.text(int.to_string(model.count))])
+      },
+      encode_model: fn(model: TestModel) {
+        "{\"count\":" <> int.to_string(model.count) <> "}"
+      },
+      decode_event: fn(_name, handler_id, _data, _path) {
+        case handler_id {
+          "inc" -> Ok(Inc)
+          _ -> Error(error.RuntimeError(reason: "unknown"))
+        }
+      },
+    ),
     middlewares: [],
-    static_dir: option.None,
-    route_patterns: [],
-    on_route_change: option.None,
-    on_route_leave: option.None,
-    dynamic_subscriptions: option.None,
-    on_notify: option.None,
-    on_notification: option.None,
-    security_limits: transport.default_security_limits(),
-    head_html: option.None,
-    api_handler: option.None,
-    ws_auth: option.None,
-    init_from_request: option.None,
-    dev_mode: False,
   )
 }
 
-import gleam/option
-
 pub fn application_starts_test() {
-  let assert Ok(_app) = application.start_advanced(test_config(0))
+  let assert Ok(_app) = application.start(test_config(0))
   process.sleep(50)
 }
 
-pub fn application_start_rejects_manual_decode_event_test() {
-  let assert Error(error.ConfigError(reason: reason)) =
-    application.start(test_config(0))
-  let assert True = string.contains(reason, "Manual decode_event")
-}
-
 pub fn application_supervised_starts_test() {
-  let assert Ok(_app) = application.start_supervised_advanced(test_config(0))
+  let assert Ok(_app) = application.start_supervised(test_config(0))
   process.sleep(50)
 }
 
 pub fn application_returns_supervisor_pid_test() {
-  let assert Ok(app) = application.start_advanced(test_config(0))
+  let assert Ok(app) = application.start(test_config(0))
   // PID should be valid
   let assert True = is_process_alive(app.supervisor_pid)
 }
@@ -84,7 +62,7 @@ pub fn application_with_middleware_starts_test() {
     application.AppConfig(..test_config(0), middlewares: [
       beacon_middleware.secure_headers(),
     ])
-  let assert Ok(_app) = application.start_advanced(config)
+  let assert Ok(_app) = application.start(config)
   process.sleep(50)
 }
 
@@ -94,7 +72,7 @@ pub fn application_with_static_dir_starts_test() {
       ..test_config(0),
       static_dir: option.Some("priv/static"),
     )
-  let assert Ok(_app) = application.start_advanced(config)
+  let assert Ok(_app) = application.start(config)
   process.sleep(50)
 }
 

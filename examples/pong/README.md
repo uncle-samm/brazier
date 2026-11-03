@@ -1,19 +1,27 @@
 # Pong
 
-Two-player Pong with all game logic running on the server.
+Two-player Pong built with `beacon.application`. All game logic runs on the
+server, and the browser only renders.
 
 ## Features
 
-- Server-side game loop via `effect.background` at ~60fps
-- Paddle controls for two players (button-based)
-- Ball physics with wall bouncing and paddle collision
-- Score tracking with automatic ball reset on point
+- A game loop of about 60 ticks a second. Each tick schedules the next with
+  `effect.keyed("pong_tick", effect.after(16, fn() { Tick }))` while the
+  game runs, so pausing stops the loop.
+- The key makes the timer single-flight: pressing Start right after Pause
+  replaces the pending tick instead of running a second loop.
+- Ball physics with wall bounces and paddle collisions, and a score that
+  resets the ball after each point.
+- Button controls for both paddles. A Start while running, or a Pause while
+  paused, is ignored with a warning logged.
 
 ## Run
 
 ```bash
 cd examples/pong
+gleam run -m beacon/build   # after changing the source
 gleam run
 ```
 
-Open http://localhost:8080 -- click Start, then use the Up/Down buttons for P1 and P2.
+Open http://localhost:8080, click Start, then use the Up and Down buttons
+for P1 and P2.

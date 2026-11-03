@@ -2,29 +2,45 @@
 
 Effects are descriptions of side effects that the Beacon runtime executes. Following Lustre's design, effects are data -- not actions. The `Effect(msg)` type is opaque and composed via combinators.
 
-## Effects Outside Update
+## Where Effects Come From
 
-Prefer a pure `update` plus `beacon.on_update` for application side effects.
-That shape keeps the generated client renderer predictable: `update` can be
-analyzed and compiled for client rendering, while stores, PubSub, HTTP, env
-reads, randomness, and other BEAM-only work stay on the server.
-
-`init` returns the initial model and a startup effect. Event-triggered effects
-belong in `on_update`; `update` returns only the new `Model`, `Local`, and
-`Server` values.
+`beacon.application` and `beacon.full_application` return effects from
+`init` and `update`, as Lustre's `application` does. Both functions run only
+on the server, so an effect may use stores, PubSub, HTTP, the environment,
+randomness and any other BEAM-only code.
 
 ```gleam
-fn init() -> #(Model, effect.Effect(Msg)) {
-  #(Model(loading: True), effect.background(fn(dispatch) {
-    let data = fetch_data()
-    dispatch(DataLoaded(data))
+fn init(_ctx: beacon.Context) -> #(Model, Effect(Msg)) {
+  #(Model(loading: True, items: []), effect.background(fn(dispatch) {
+    dispatch(ItemsLoaded(load_items()))
   }))
 }
 
-fn update(model: Model, local: Nil, server: Nil, msg: Msg) -> #(Model, Nil, Nil) {
-  #(handle_msg(model, msg), local, server)
+fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
+  case msg {
+    ItemsLoaded(items) -> #(Model(loading: False, items:), effect.none())
+    Save(item) -> #(model, effect.from(fn(_dispatch) { db.save(item) }))
+  }
+}
+
+pub fn main() {
+  beacon.application(init:, update:, view:)
+  |> beacon.start(8080)
 }
 ```
+
+`beacon.simple` has no effects: its `update` is also compiled to JavaScript
+and runs in the browser. Use `application` as soon as an update needs
+server-only work.
+
+`init` runs twice per page, as LiveView's mount does. On the HTML render
+(`beacon.is_connected(ctx)` is False) Beacon drops the returned effect. When
+the WebSocket connects, it runs `init` again and performs the effect. A
+startup effect therefore runs once per connected session, not once per HTTP
+request.
+
+Beacon performs an effect after the update that returned it and after the
+new model is sent to the browser.
 
 ## Core Functions
 
@@ -62,20 +78,34 @@ effect.keyed("poll", effect.every(5000, fn() { Poll }))
 
 Effects that spawn their own processes inside `effect.from` are not tracked; use `effect.background` for work that should die with the session.
 
-## Server-Side Effect Handler
+## Navigation Effects
 
-Use `beacon.on_update` to attach server-only effects that run after update:
+`beacon/router` returns navigation as effects (LiveView's `push_patch`,
+`push_navigate` and `redirect`):
+
+- **`router.push(path)`**: change the URL and add a history entry without
+  reloading. The app's `on_change` then runs for the new route, as for a link
+  click.
+- **`router.replace(path)`**: the same, replacing the current history entry.
+- **`router.redirect(url)`**: a full page load. It ends the session. Use it
+  when the browser must make a real HTTP request, for example to receive a
+  `Set-Cookie` header.
+
+All three take same-origin paths only (`/` but not `//`). Any other value is
+logged as an error and not sent.
 
 ```gleam
-beacon.app(init, init_local, beacon.no_server, update, view)
-|> beacon.on_update(fn(state, msg) {
-  let #(model, _local, _server) = state
+fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
   case msg {
-    SaveItem(item) -> effect.from(fn(_) { db.save(item) })
-    _ -> effect.none()
+    LoggedIn -> #(model, router.push("/dashboard"))
+    LoggedOut -> #(model, router.redirect("/login"))
+    _ -> #(model, effect.none())
   }
-})
-|> beacon.start(8080)
+}
 ```
 
-This keeps `update` pure (compilable to JS) while server effects run only on the BEAM.
+## Child Modules
+
+A parent that nests a child module maps the child's effects into its own
+message type with `effect.map`, as it maps the child's view with
+`element.map`. See [COMPONENTS.md](COMPONENTS.md).

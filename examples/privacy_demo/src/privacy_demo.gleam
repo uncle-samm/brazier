@@ -1,36 +1,45 @@
-/// Privacy Demo — exercises all Milestone 83 features:
-/// - server_ prefix constants (never leaked to client)
-/// - Server type (private server-side state, excluded from client bundle)
-/// - Computed fields (pub fn(Model) -> T, server-derived values in model_sync)
+/// Privacy Demo: secrets stay on the server.
+///
+/// The session holds an API key, a database URL and a request count next to
+/// the Model. `sync` hands only the Model to the browser, and the build
+/// compiles for the browser only what `view` reaches. So the secrets are
+/// never encoded and never in the client bundle, whatever they are named.
+///
+/// The subtotal, tax and total are not stored: `view` derives them from
+/// the Model, and those functions run in the browser too.
 import beacon
-import beacon/effect
+import beacon/attribute
+import beacon/effect.{type Effect}
+import beacon/element.{type Element}
+import beacon/event
 import beacon/html
+import beacon/local
+import beacon/log
 import gleam/float
 import gleam/int
 import gleam/list
+import gleam/string
 
-// === Server-only constants — server_ prefix, never in client JS bundle ===
+// Only the server reads these: `init` puts them in the Session, and `view`
+// never reaches them.
+const api_key = "sk_live_secret_do_not_leak_this"
 
-const server_api_key = "sk_live_secret_do_not_leak_this"
+const db_url = "postgres://user:pass@localhost/db"
 
-const server_db_url = "postgres://user:pass@localhost/db"
-
-// === Client-safe constant — referenced by view, WILL be in bundle ===
-
+// `view` reaches this one, so it is in the client bundle.
 const app_title = "Privacy Demo"
-
-// === Types ===
 
 pub type Model {
   Model(items: List(Item), tax_rate: Float)
 }
 
 pub type Item {
-  Item(name: String, price: Int, qty: Int)
+  Item(name: String, price_cents: Int, qty: Int)
 }
 
-pub type Server {
-  Server(api_key: String, db_url: String, request_count: Int)
+/// What the server holds per session. Only `model` is synced.
+pub type Session {
+  Session(model: Model, api_key: String, db_url: String, request_count: Int)
 }
 
 pub type Msg {
@@ -38,74 +47,118 @@ pub type Msg {
   ClearItems
 }
 
-// === Init ===
-
-pub fn init() -> #(Model, effect.Effect(Msg)) {
+fn init(_ctx: beacon.Context) -> #(Session, Effect(Msg)) {
   #(
-    Model(
-      items: [
-        Item(name: "Widget", price: 1000, qty: 2),
-        Item(name: "Gadget", price: 2500, qty: 1),
-      ],
-      tax_rate: 0.08,
+    Session(
+      model: Model(
+        items: [
+          Item(name: "Widget", price_cents: 1000, qty: 2),
+          Item(name: "Gadget", price_cents: 2500, qty: 1),
+        ],
+        tax_rate: 0.08,
+      ),
+      api_key:,
+      db_url:,
+      request_count: 0,
     ),
     effect.none(),
   )
 }
 
-pub fn init_server() -> Server {
-  Server(api_key: server_api_key, db_url: server_db_url, request_count: 0)
-}
-
-// === Computed fields — pub fn(Model) -> T, auto-detected by signature ===
-
-pub fn subtotal(model: Model) -> Int {
-  list.fold(model.items, 0, fn(sum, item) { sum + item.price * item.qty })
-}
-
-pub fn total(model: Model) -> Int {
-  let sub = subtotal(model)
-  sub + float.round(int.to_float(sub) *. model.tax_rate)
-}
-
-pub fn item_count(model: Model) -> Int {
-  list.length(model.items)
-}
-
-// === Update ===
-
-pub fn update(
-  model: Model,
-  _local: Nil,
-  server: Server,
-  msg: Msg,
-) -> #(Model, Nil, Server) {
-  case msg {
-    AddItem -> {
-      let new_item = Item(name: "New Item", price: 500, qty: 1)
-      let new_server = Server(..server, request_count: server.request_count + 1)
-      #(Model(..model, items: [new_item, ..model.items]), Nil, new_server)
-    }
-    ClearItems -> {
-      #(Model(..model, items: []), Nil, server)
-    }
+fn update(session: Session, msg: Msg) -> #(Session, Effect(Msg)) {
+  let session = Session(..session, request_count: session.request_count + 1)
+  let model = session.model
+  let model = case msg {
+    AddItem ->
+      Model(..model, items: [
+        Item(name: "New Item", price_cents: 500, qty: 1),
+        ..model.items
+      ])
+    ClearItems -> Model(..model, items: [])
   }
+  log.info(
+    "privacy_demo",
+    "Handled request "
+      <> int.to_string(session.request_count)
+      <> " ("
+      <> int.to_string(list.length(model.items))
+      <> " items)",
+  )
+  #(Session(..session, model:), effect.none())
 }
 
-// === View — can only access Model, NOT Server (compiler enforces this) ===
+fn sync(session: Session) -> Model {
+  session.model
+}
 
-pub fn view(model: Model, _local: Nil) -> beacon.Node(Msg) {
-  html.div([], [
-    html.h1([], [html.text(app_title)]),
-    html.p([], [html.text("Items: " <> int.to_string(list.length(model.items)))]),
-    html.p([], [html.text("Tax rate: " <> float.to_string(model.tax_rate))]),
-    html.button([beacon.on_click(AddItem)], [html.text("Add Item")]),
-    html.button([beacon.on_click(ClearItems)], [html.text("Clear")]),
+fn subtotal(model: Model) -> Int {
+  list.fold(model.items, 0, fn(sum, item) { sum + item.price_cents * item.qty })
+}
+
+fn tax(model: Model) -> Int {
+  float.round(int.to_float(subtotal(model)) *. model.tax_rate)
+}
+
+fn format_cents(cents: Int) -> String {
+  "$"
+  <> int.to_string(cents / 100)
+  <> "."
+  <> string.pad_start(int.to_string(cents % 100), to: 2, with: "0")
+}
+
+pub fn view(model: Model, _local: Nil) -> Element(Msg) {
+  html.div(
+    [
+      attribute.styles([
+        #("font-family", "system-ui"),
+        #("max-width", "600px"),
+        #("margin", "2rem auto"),
+        #("padding", "0 1rem"),
+      ]),
+    ],
+    [
+      html.h1([], [html.text(app_title)]),
+      html.ul([], list.map(model.items, view_item)),
+      html.p([], [
+        html.text("Items: " <> int.to_string(list.length(model.items))),
+      ]),
+      html.p([], [html.text("Subtotal: " <> format_cents(subtotal(model)))]),
+      html.p([], [
+        html.text(
+          "Tax ("
+          <> int.to_string(float.round(model.tax_rate *. 100.0))
+          <> "%): "
+          <> format_cents(tax(model)),
+        ),
+      ]),
+      html.p([], [
+        html.strong([], [
+          html.text("Total: " <> format_cents(subtotal(model) + tax(model))),
+        ]),
+      ]),
+      html.button(
+        [event.on_click(AddItem), attribute.style("margin-right", "8px")],
+        [html.text("Add Item")],
+      ),
+      html.button([event.on_click(ClearItems)], [html.text("Clear")]),
+    ],
+  )
+}
+
+fn view_item(item: Item) -> Element(Msg) {
+  html.li([], [
+    html.text(
+      item.name
+      <> " x"
+      <> int.to_string(item.qty)
+      <> ": "
+      <> format_cents(item.price_cents * item.qty),
+    ),
   ])
 }
 
 pub fn main() {
-  beacon.app(init, beacon.no_local, init_server, update, view)
-  |> beacon.title("Privacy Demo")
+  beacon.full_application(init:, update:, sync:, local: local.none(), view:)
+  |> beacon.title(fn(_model) { app_title })
   |> beacon.start(8080)
 }

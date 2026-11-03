@@ -74,7 +74,7 @@ ws_connect(Host, Port, Attempt) ->
             %% Send WebSocket upgrade request
             Key = base64:encode(crypto:strong_rand_bytes(16)),
             Req = iolist_to_binary([
-                <<"GET /ws HTTP/1.1\r\n">>,
+                <<"GET /ws?path=%2F HTTP/1.1\r\n">>,
                 <<"Host: ">>, Host, <<"\r\n">>,
                 <<"Origin: http://">>, Host, <<"\r\n">>,
                 <<"Upgrade: websocket\r\n">>,
@@ -107,7 +107,7 @@ ws_connect_with_headers(Host, Port, Headers) ->
         {ok, Socket} ->
             Key = base64:encode(crypto:strong_rand_bytes(16)),
             Req = iolist_to_binary([
-                <<"GET /ws HTTP/1.1\r\n">>,
+                <<"GET /ws?path=%2F HTTP/1.1\r\n">>,
                 <<"Host: ">>, Host, <<"\r\n">>,
                 render_headers(Headers),
                 <<"Origin: http://">>, Host, <<"\r\n">>,
@@ -151,7 +151,7 @@ ws_connect_no_retry(Host, Port) ->
         {ok, Socket} ->
             Key = base64:encode(crypto:strong_rand_bytes(16)),
             Req = iolist_to_binary([
-                <<"GET /ws HTTP/1.1\r\n">>,
+                <<"GET /ws?path=%2F HTTP/1.1\r\n">>,
                 <<"Host: ">>, Host, <<"\r\n">>,
                 <<"Origin: http://">>, Host, <<"\r\n">>,
                 <<"Upgrade: websocket\r\n">>,

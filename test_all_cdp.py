@@ -50,6 +50,7 @@ ALL_EXAMPLES = [
     "cart",
     "spreadsheet",
     "ai_chat",
+    "privacy_demo",
     "middleware_demo",
     "domains",
     "multi_kanban",
@@ -83,6 +84,8 @@ CANONICAL_EXAMPLES = {
     "auth_workspace",
 }
 CONTRACT_REPORTS = {}
+# Examples whose view has no event handlers: the browser sends no messages.
+NO_HANDLER_EXAMPLES = {"dashboard"}
 
 def parse_shard(value):
     if not value:
@@ -182,8 +185,17 @@ def record_cdp_message(data):
             browser_errors.append(str(description))
         elif method == "Log.entryAdded":
             entry = data.get("params", {}).get("entry", {})
-            if entry.get("level") == "error":
-                browser_errors.append(str(entry.get("text", "Browser log entry")))
+            # The examples ship no favicon. Chrome requests /favicon.ico on
+            # its own (not the page or Beacon), so that one 404 is not an app
+            # error. It is still logged in verbose mode.
+            if (entry.get("source") == "network"
+                    and str(entry.get("url", "")).endswith("/favicon.ico")):
+                vlog(f"Ignoring browser favicon request: {entry.get('text')}")
+            elif entry.get("level") == "error":
+                message = str(entry.get("text", "Browser log entry"))
+                if entry.get("url"):
+                    message += f" [{entry.get('url')}]"
+                browser_errors.append(message)
 
 def cdp(method, params=None, timeout=8, retry=True):
     global MID
@@ -242,10 +254,15 @@ def evl_async(expr):
         return r["result"].get("result", {}).get("value", "ERR")
     return "TIMEOUT"
 
+DRAIN_MAX_SECONDS = 1.0
+
 def drain():
+    # Bounded: a 60 Hz game loop (pong) emits a CDP network event every frame,
+    # so "read until quiet" would never return.
+    deadline = time.time() + DRAIN_MAX_SECONDS
     ws.settimeout(0.3)
     try:
-        while True:
+        while time.time() < deadline:
             data = json.loads(ws.recv())
             record_cdp_message(data)
     except: pass
@@ -376,7 +393,51 @@ def click(sel, debug=False):
 
 def click_by_text(button_text):
     before = evl('document.getElementById("beacon-app").textContent')
-    evl(f'var btns=document.querySelectorAll("[data-beacon-event-click]"); for(var b of btns){{if(b.textContent.includes("{button_text}")){{b.click();break}}}}')
+    evl(f'var btns=document.querySelectorAll("[data-beacon-on-click]"); for(var b of btns){{if(b.textContent.includes("{button_text}")){{b.click();break}}}}')
+    for i in range(10):
+        time.sleep(0.5)
+        drain()
+        after = evl('document.getElementById("beacon-app").textContent')
+        if after != before:
+            return
+
+def click_button(label, nth=0):
+    """Click the nth handled button whose trimmed text is exactly `label`.
+
+    Handler ids are positional and internal, so tests find buttons by text.
+    """
+    before = evl('document.getElementById("beacon-app").textContent')
+    label_js = json.dumps(label)
+    result = evl(
+        'var bs=Array.from(document.querySelectorAll("button[data-beacon-on-click]"))'
+        f'.filter(function(b){{return b.textContent.trim()==={label_js}}}); '
+        f'bs.length>{nth} ? (bs[{nth}].click(), "clicked") : "not found"'
+    )
+    if result != "clicked":
+        check(False, f"button {label!r} #{nth} exists")
+        return
+    for i in range(10):
+        time.sleep(0.5)
+        drain()
+        after = evl('document.getElementById("beacon-app").textContent')
+        if after != before:
+            return
+
+def submit_by_text(button_text):
+    """Click the submit button whose text contains `button_text`.
+
+    The click submits its form natively, so the form's `on_submit` handler runs.
+    """
+    before = evl('document.getElementById("beacon-app").textContent')
+    text_js = json.dumps(button_text)
+    result = evl(
+        'var bs=Array.from(document.querySelectorAll("form[data-beacon-on-submit] button[type=submit]"))'
+        f'.filter(function(b){{return b.textContent.includes({text_js})}}); '
+        'bs.length>0 ? (bs[0].click(), "clicked") : "not found"'
+    )
+    if result != "clicked":
+        check(False, f"submit button {button_text!r} exists")
+        return
     for i in range(10):
         time.sleep(0.5)
         drain()
@@ -423,8 +484,14 @@ def wait_for_path_and_text(path, text_fragment, timeout_seconds=8):
 
 def check_history_go(delta, path, text_fragment, label):
     clear_cdp_events()
-    evl(f"history.go({delta})")
-    check(wait_for_path_and_text(path, text_fragment), f"{label}: URL and view restore {path}")
+    before = str(evl("location.pathname"))
+    check(before != path, f"{label}: starts away from {path} (at {before})")
+    went = evl(f'history.go({delta}); "ok"')
+    check(went == "ok", f"{label}: history.go({delta}) evaluated ({went})")
+    restored = wait_for_path_and_text(path, text_fragment)
+    after = str(evl("location.pathname"))
+    length = str(evl("history.length"))
+    check(restored, f"{label}: URL and view restore {path} (from {before}, now {after}, history.length {length})")
     check(websocket_type_count("Sent", "navigate") >= 1, f"{label}: popstate sends navigate")
     check(
         websocket_type_count("Received", "mount") >= 1
@@ -490,6 +557,7 @@ def install_dom_monitor():
       mutations: [],
       bodySamples: [],
       layoutShifts: [],
+      layoutShiftSources: [],
       emptyAfterContent: 0,
       sawContent: false
     };
@@ -558,9 +626,19 @@ def install_dom_monitor():
       maxBucket: values.length ? Math.max(...values) : 0,
       emptyAfterContent: m.emptyAfterContent || 0,
       layoutShiftCount: (m.layoutShifts || []).length,
-      layoutShiftTotal: (m.layoutShifts || []).reduce((a, b) => a + b, 0)
+      layoutShiftTotal: (m.layoutShifts || []).reduce((a, b) => a + b, 0),
+      layoutShiftSources: (m.layoutShiftSources || []).slice(0, 6)
     });
   };
+
+  function describeShiftSource(source) {
+    const node = source.node;
+    const name = node ? (node.nodeName + " " + (node.textContent || "").trim().slice(0, 24)) : "?";
+    const before = source.previousRect;
+    const after = source.currentRect;
+    return name + " y" + Math.round(before.y) + "->" + Math.round(after.y)
+      + " h" + Math.round(before.height) + "->" + Math.round(after.height);
+  }
 
   if ("PerformanceObserver" in window) {
     try {
@@ -568,6 +646,9 @@ def install_dom_monitor():
         for (const entry of list.getEntries()) {
           if (!entry.hadRecentInput) {
             window.__beaconMonitor.layoutShifts.push(entry.value);
+            for (const source of entry.sources || []) {
+              window.__beaconMonitor.layoutShiftSources.push(describeShiftSource(source));
+            }
           }
         }
       }).observe({type: "layout-shift", buffered: true});
@@ -659,13 +740,19 @@ def report_contract(name, directory):
         check(False, f"{name}: generated contract report is valid JSON ({exc})")
         return
     CONTRACT_REPORTS[name] = report
-    summary = report.get("summary")
-    if summary:
-        print(f"  contract: {summary}")
-    check(report.get("rendering") == "ssr-first-then-client-state", f"{name}: generated contract uses single rendering model")
-    generated = set(report.get("generated_codecs", []))
-    required = {"encode_model", "decode_model", "decode_event", "encode_msg", "render_model"}
-    check(required.issubset(generated), f"{name}: generated contract includes required codecs")
+    kind = report.get("kind")
+    client_messages = report.get("client_messages", [])
+    print(f"  contract: {kind} app, view {report.get('view')}, {len(client_messages)} browser messages")
+    check(kind in ("simple", "application", "full_application"), f"{name}: generated contract names the constructor ({kind})")
+    check(bool(report.get("view")) and bool(report.get("model")) and bool(report.get("msg")), f"{name}: generated contract names view, Model and Msg")
+    check(
+        (kind == "simple") == bool(report.get("client_update")),
+        f"{name}: only beacon.simple compiles its update for the browser",
+    )
+    if name in NO_HANDLER_EXAMPLES:
+        check(client_messages == [], f"{name}: generated contract lists no browser messages (view has no handlers)")
+    else:
+        check(isinstance(client_messages, list) and len(client_messages) >= 1, f"{name}: generated contract lists browser messages")
 
 def stop_server():
     global server_proc
@@ -725,22 +812,22 @@ if start_example("counter"):
     check("Count: 0" in t, "Initial: Count: 0")
     reset_dom_monitor()
     clear_cdp_events()
-    click("[data-beacon-event-click='h1']")
+    click_button("+")
     t = text()
     check("Count: 1" in t, "Increment: Count: 1")
     check_model_ws_update("Counter increment")
     clear_cdp_events()
-    click("[data-beacon-event-click='h1']")
+    click_button("+")
     t = text()
     check("Count: 2" in t, "Increment: Count: 2")
     check_model_ws_update("Counter second increment")
     clear_cdp_events()
-    click("[data-beacon-event-click='h0']")
+    click_button("-")
     t = text()
     check("Count: 1" in t, "Decrement: Count: 1")
     check_model_ws_update("Counter decrement")
     clear_cdp_events()
-    click("[data-beacon-event-click='h0']")
+    click_button("-")
     t = text()
     check("Count: 0" in t, "Decrement: Count: 0")
     check_model_ws_update("Counter second decrement")
@@ -749,7 +836,7 @@ if start_example("counter"):
     reset_dom_monitor()
     force_socket_reconnect("Counter reconnect", "Count: 0")
     clear_cdp_events()
-    click("[data-beacon-event-click='h1']")
+    click_button("+")
     check(
         wait_for_js('(document.getElementById("beacon-app")?.textContent || "").includes("Count: 1")'),
         "Counter reconnect: click works after reconnect",
@@ -777,17 +864,17 @@ if start_example("counter_local"):
     check("Count (server): 0" in t, "Initial server count: 0")
     reset_dom_monitor()
     clear_cdp_events()
-    click("[data-beacon-event-click='h1']")
+    click_button("+")
     t = text()
     check("Count (server): 1" in t, "Server +1")
     check_model_ws_update("Counter local server +1")
     clear_cdp_events()
-    click("[data-beacon-event-click='h1']")
+    click_button("+")
     t = text()
     check("Count (server): 2" in t, "Server +2")
     check_model_ws_update("Counter local server +2")
     clear_cdp_events()
-    click("[data-beacon-event-click='h0']")
+    click_button("-")
     t = text()
     check("Count (server): 1" in t, "Server -1")
     check_model_ws_update("Counter local server -1")
@@ -805,13 +892,13 @@ if start_example("counter_local"):
     check_local_ws_quiet("Counter local menu off")
     # LOCAL: input
     clear_cdp_events()
-    type_input("[data-beacon-event-input]", "testlocal")
+    type_input("[data-beacon-on-input]", "testlocal")
     time.sleep(0.5); drain()
     t = text()
     check("testlocal" in t, "Local input shows text")
     check_local_ws_quiet("Counter local input")
     clear_cdp_events()
-    click("[data-beacon-event-click='h1']")
+    click_button("+")
     t = text()
     check("Count (server): 2" in t, "Server event after local input still works")
     check(websocket_payload_count("Sent", '"type":"event"') >= 1, "Server event after local input sends one model event")
@@ -831,23 +918,23 @@ if start_example("kanban"):
     check("(3)" in t, "Todo shows (3)")
     check("(1)" in t, "In Progress shows (1)")
     # Add card
-    type_input("[data-beacon-event-input]", "CDP Card")
+    type_input("[data-beacon-on-input]", "CDP Card")
     time.sleep(1); drain()
-    click_by_text("Add Card")
+    submit_by_text("Add Card")
     time.sleep(2); drain()
     t = text()
     check("CDP Card" in t, f"Added card visible")
     check("(4)" in t, "Todo shows (4)")
     # Delete card — count delete buttons via DOM, not character "x" in text
-    card_count_before = int(str(evl('var c=0; document.querySelectorAll("[data-beacon-event-click]").forEach(function(b){if(b.textContent.trim()==="x")c++}); c')))
-    evl('var xs=document.querySelectorAll("[data-beacon-event-click]"); for(var x of xs){if(x.textContent.trim()==="x"){x.click();break}}')
+    card_count_before = int(str(evl('var c=0; document.querySelectorAll("[data-beacon-on-click]").forEach(function(b){if(b.textContent.trim()==="x")c++}); c')))
+    evl('var xs=document.querySelectorAll("[data-beacon-on-click]"); for(var x of xs){if(x.textContent.trim()==="x"){x.click();break}}')
     time.sleep(2); drain()
-    card_count_after = int(str(evl('var c=0; document.querySelectorAll("[data-beacon-event-click]").forEach(function(b){if(b.textContent.trim()==="x")c++}); c')))
+    card_count_after = int(str(evl('var c=0; document.querySelectorAll("[data-beacon-on-click]").forEach(function(b){if(b.textContent.trim()==="x")c++}); c')))
     check(card_count_after < card_count_before, f"Delete: {card_count_before} -> {card_count_after}")
-    # DnD: drag card 2 to Done
+    # DnD: drag "Write tests" to Done
     evl("""
     (function() {
-      var card = document.querySelector('[data-drag-id="2"]');
+      var card = Array.from(document.querySelectorAll('[data-card]')).find(function(c){return c.textContent.includes("Write tests")});
       var done = document.querySelector('[data-column="done"]');
       if (!card || !done) return "not found";
       var dt = new DataTransfer();
@@ -884,17 +971,17 @@ if start_example("canvas"):
         x = 50 + (i+1)*30
         evl(f'var s=document.querySelector("svg"),r=s.getBoundingClientRect(); s.dispatchEvent(new MouseEvent("mousemove",{{clientX:r.left+{x},clientY:r.top+{50+i*20},bubbles:true}}))')
         time.sleep(0.1)
-    lines_during = int(str(evl('document.querySelectorAll("line").length')))
+    lines_during = int(str(evl('document.querySelectorAll("polyline").length')))
     check(lines_during > 0, f"LOCAL drawing: {lines_during} lines while dragging")
     # Release → commit strokes
     evl('document.querySelector("svg").dispatchEvent(new MouseEvent("mouseup",{bubbles:true}))')
     time.sleep(3); drain()
-    lines_after = int(str(evl('document.querySelectorAll("line").length')))
+    lines_after = int(str(evl('document.querySelectorAll("polyline").length')))
     t = text()
     check(lines_after > 0, f"Lines persist after mouseup: {lines_after}")
     check("Strokes: 0" not in t, f"Stroke count changed from 0")
     # Color change
-    evl('var btns=document.querySelectorAll("[data-beacon-event-click]"); for(var b of btns){var s=b.getAttribute("style")||""; if(s.includes("ff0000")){b.click();break}}')
+    evl('var btns=document.querySelectorAll("[data-beacon-on-click]"); for(var b of btns){var s=b.getAttribute("style")||""; if(s.includes("ff0000")){b.click();break}}')
     time.sleep(1); drain()
     h = html()
     check('ff0000' in h, "Color picker works")
@@ -902,7 +989,7 @@ if start_example("canvas"):
     navigate()
     time.sleep(3); drain()
     t = text()
-    lines_new_session = int(str(evl('document.querySelectorAll("line").length')))
+    lines_new_session = int(str(evl('document.querySelectorAll("polyline").length')))
     check(lines_new_session > 0, f"Multi-user: {lines_new_session} strokes in new session (from store)")
     check("Strokes: 0" not in t, f"Multi-user: stroke count > 0 in new session")
     check(errors() == "0", f"Zero errors ({error_list()})")
@@ -914,8 +1001,8 @@ if start_example("snake"):
     navigate()
     t = text()
     check("Snake" in t, "Title")
-    type_input("[data-beacon-event-input]", "CDPPlayer")
-    click_by_text("Play")
+    type_input("[data-beacon-on-input]", "CDPPlayer")
+    submit_by_text("Play")
     time.sleep(1); drain()
     t = text()
     check("Score" in t, "Game started, Score visible")
@@ -939,8 +1026,8 @@ if start_example("chat"):
     t = text()
     check("Beacon Chat" in t, "Title")
     # Login
-    type_input("[data-beacon-event-input]", "TestUser")
-    click_by_text("Join")
+    type_input("[data-beacon-on-input]", "TestUser")
+    submit_by_text("Join")
     time.sleep(2); drain()
     t = text()
     check("#general" in t or "general" in t, "Room shown")
@@ -949,7 +1036,7 @@ if start_example("chat"):
     # Send message
     evl('''
     (function() {
-      var inputs = document.querySelectorAll("input[data-beacon-event-input]");
+      var inputs = document.querySelectorAll("input[data-beacon-on-input]");
       for (var i = 0; i < inputs.length; i++) {
         if (inputs[i].placeholder && inputs[i].placeholder.toLowerCase().includes("message")) {
           inputs[i].value = "Hello from CDP";
@@ -966,7 +1053,7 @@ if start_example("chat"):
     })()
     ''')
     time.sleep(1); drain()
-    evl('var btns=document.querySelectorAll("[data-beacon-event-click]"); for(var b of btns){if(b.textContent.trim()==="Send"){b.click();break}}')
+    submit_by_text("Send")
     time.sleep(3); drain()
     t = text()
     check("Hello from CDP" in t, "Message appears in chat")
@@ -975,8 +1062,8 @@ if start_example("chat"):
     # MULTI-USER: reload → re-login → message persists from store
     navigate()
     time.sleep(2); drain()
-    type_input("[data-beacon-event-input]", "User2")
-    click_by_text("Join")
+    type_input("[data-beacon-on-input]", "User2")
+    submit_by_text("Join")
     time.sleep(2); drain()
     t = text()
     check("Hello from CDP" in t, "Multi-user: message persists for new user")
@@ -1037,7 +1124,7 @@ if start_example("pong"):
       return pause ? "pause-clicked" : "missing-pause";
     })()
     ''')
-    wait_for_js('"Start" in document.getElementById("beacon-app").textContent', timeout_seconds=3)
+    wait_for_js('document.getElementById("beacon-app").textContent.includes("Start")', timeout_seconds=3)
     drain()
     t = text()
     check("Start" in t, "Pause -> Start")
@@ -1069,23 +1156,23 @@ if start_example("triple_counter"):
     check("Shared Counter" in t, "Shared section")
     check("Server Counter" in t, "Server section")
     check("Local Counter" in t, "Local section")
-    bc = evl('document.querySelectorAll("[data-beacon-event-click]").length')
+    bc = evl('document.querySelectorAll("[data-beacon-on-click]").length')
     check(int(str(bc)) >= 6, f"6+ buttons ({bc})")
     # Increment all 3 counters
-    click("[data-beacon-event-click='h1']")  # Shared +
-    click("[data-beacon-event-click='h3']")  # Server +
-    click("[data-beacon-event-click='h5']")  # Local +
+    click_button("+", 0)  # Shared +
+    click_button("+", 1)  # Server +
+    click_button("+", 2)  # Local +
     t = text()
     check(t.count("1") >= 3, "All 3 counters show 1")
     # Decrement shared back
-    click("[data-beacon-event-click='h0']")
+    click_button("-")
     t = text()
     check("0" in t, "Shared decremented")
     # MULTI-USER: navigate away → new session
     # Increment shared to 3 first
-    click("[data-beacon-event-click='h1']")
-    click("[data-beacon-event-click='h1']")
-    click("[data-beacon-event-click='h1']")
+    click_button("+")
+    click_button("+")
+    click_button("+")
     time.sleep(1); drain()
     navigate()
     time.sleep(2); drain()
@@ -1113,21 +1200,21 @@ if start_example("todo", module="todo_app"):
     check("Todo" in t, "Title")
     check("0 items left" in t or "item" in t, f"Items left counter ({t[:60]})")
     # Add todo
-    type_input("[data-beacon-event-input]", "Buy milk")
-    click_by_text("Add")
+    type_input("[data-beacon-on-input]", "Buy milk")
+    submit_by_text("Add")
     time.sleep(2); drain()
     t = text()
     check("Buy milk" in t, "Added todo visible")
     check("1 item" in t, f"1 item left ({t[:80]})")
     # Add another
-    type_input("[data-beacon-event-input]", "Walk dog")
-    click_by_text("Add")
+    type_input("[data-beacon-on-input]", "Walk dog")
+    submit_by_text("Add")
     time.sleep(2); drain()
     t = text()
     check("Walk dog" in t, "Second todo visible")
     check("2 items" in t, f"2 items left")
     # Toggle first todo (click the circle button)
-    evl('var btns=document.querySelectorAll("[data-beacon-event-click]"); for(var b of btns){if(b.style&&b.style.borderRadius==="50%"){b.click();break}}')
+    evl('var btns=document.querySelectorAll("[data-beacon-on-click]"); for(var b of btns){if(b.style&&b.style.borderRadius==="50%"){b.click();break}}')
     time.sleep(2); drain()
     t = text()
     check("1 item" in t, f"Toggle: 1 item left after completing one")
@@ -1143,10 +1230,10 @@ if start_example("todo", module="todo_app"):
     t = text()
     check("Buy milk" in t and "Walk dog" in t, "Filter All: both visible")
     # Delete todo — count delete buttons via DOM, not character "x" in text
-    before_count = int(str(evl('var c=0; document.querySelectorAll("[data-beacon-event-click]").forEach(function(b){if(b.textContent.trim()==="x")c++}); c')))
-    evl('var xs=document.querySelectorAll("[data-beacon-event-click]"); for(var x of xs){if(x.textContent.trim()==="x"){x.click();break}}')
+    before_count = int(str(evl('var c=0; document.querySelectorAll("[data-beacon-on-click]").forEach(function(b){if(b.textContent.trim()==="x")c++}); c')))
+    evl('var xs=document.querySelectorAll("[data-beacon-on-click]"); for(var x of xs){if(x.textContent.trim()==="x"){x.click();break}}')
     time.sleep(2); drain()
-    after_count = int(str(evl('var c=0; document.querySelectorAll("[data-beacon-event-click]").forEach(function(b){if(b.textContent.trim()==="x")c++}); c')))
+    after_count = int(str(evl('var c=0; document.querySelectorAll("[data-beacon-on-click]").forEach(function(b){if(b.textContent.trim()==="x")c++}); c')))
     check(after_count < before_count, f"Delete: removed ({before_count}->{after_count})")
     # Multi-user: navigate away+back, remaining todo persists
     navigate()
@@ -1176,12 +1263,12 @@ if start_example("cart"):
     check("Tax" in t, f"Tax shown")
     check("Total" in t, f"Total shown")
     # Increment quantity
-    evl('var btns=document.querySelectorAll("[data-beacon-event-click]"); for(var b of btns){if(b.textContent.trim()==="+"){b.click();break}}')
+    evl('var btns=document.querySelectorAll("[data-beacon-on-click]"); for(var b of btns){if(b.textContent.trim()==="+"){b.click();break}}')
     time.sleep(2); drain()
     t = text()
     check("2" in t, "Quantity incremented")
     # Remove from cart
-    evl('var btns=document.querySelectorAll("[data-beacon-event-click]"); for(var b of btns){if(b.textContent.trim()==="x"&&b.style.color){b.click();break}}')
+    evl('var btns=document.querySelectorAll("[data-beacon-on-click]"); for(var b of btns){if(b.textContent.trim()==="x"&&b.style.color){b.click();break}}')
     time.sleep(2); drain()
     t = text()
     check("Cart is empty" in t, "Cart empty after remove")
@@ -1210,7 +1297,7 @@ if start_example("spreadsheet"):
     (function() {
       var tds = document.querySelectorAll("td");
       for (var i = 0; i < tds.length; i++) {
-        if (tds[i].hasAttribute("data-beacon-event-click") && tds[i].textContent === "") {
+        if (tds[i].hasAttribute("data-beacon-on-click") && tds[i].textContent === "") {
           tds[i].click();
           return "selected " + i;
         }
@@ -1224,9 +1311,9 @@ if start_example("spreadsheet"):
     # Click same cell again to enter edit mode
     evl('''
     (function() {
-      var tds = document.querySelectorAll("td[data-beacon-event-click]");
+      var tds = document.querySelectorAll("td[data-beacon-on-click]");
       for (var i = 0; i < tds.length; i++) {
-        if (tds[i].hasAttribute("data-beacon-event-click")) {
+        if (tds[i].hasAttribute("data-beacon-on-click")) {
           tds[i].click();
           return "edit " + i;
         }
@@ -1238,7 +1325,7 @@ if start_example("spreadsheet"):
     # Type into the edit input and submit
     typed = evl('''
     (function() {
-      var inp = document.querySelector("input[data-beacon-event-input]");
+      var inp = document.querySelector("input[data-beacon-on-input]");
       if (!inp) return "no-input";
       inp.value = "CellData";
       inp.dispatchEvent(new Event("input", {bubbles: true}));
@@ -1246,7 +1333,7 @@ if start_example("spreadsheet"):
     })()
     ''')
     time.sleep(0.5); drain()
-    click_by_text("Save")
+    submit_by_text("Save")
     time.sleep(3); drain()
     t = text()
     check("CellData" in t, f"Cell value saved (typed={typed})")
@@ -1257,7 +1344,7 @@ if start_example("spreadsheet"):
     t = text()
     persists = "CellData" in t
     check(persists, f"Multi-user: cell persistence (persists={persists})")
-    # Note: persistence depends on on_update effects firing through ops path
+    # The store write happens in the server update for SaveCell.
     check(errors() == "0", f"Zero errors ({error_list()})")
 stop_server(); print()
 
@@ -1268,8 +1355,51 @@ if start_example("ai_chat"):
     t = text()
     check("AI" in t or "Chat" in t or "chat" in t.lower(), f"UI renders")
     h = html()
-    check("data-beacon-event-input" in h, "Input field present")
-    check("data-beacon-event-click" in h, "Send button present")
+    check("data-beacon-on-input" in h, "Input field present")
+    check("data-beacon-on-click" in h, "Send button present")
+    type_input("input[data-beacon-on-input]", "hello cdp")
+    clear_cdp_events()
+    click_button("Send")
+    check(
+        wait_for_js('(document.getElementById("beacon-app")?.textContent || "").includes("Server stream received: hello cdp. Beacon keeps")', timeout_seconds=15),
+        "Server stream drips the response to the browser",
+    )
+    check(
+        wait_for_js('Array.from(document.querySelectorAll("button")).some(function(b){return b.textContent.trim()==="Send" && !b.disabled})', timeout_seconds=15),
+        "Send button is enabled again after the stream finishes",
+    )
+    check_model_ws_update("AI chat prompt")
+    check(errors() == "0", f"Zero errors ({error_list()})")
+stop_server(); print()
+
+# == 10b. Privacy Demo ==
+print("-- 10b: Privacy Demo --")
+if start_example("privacy_demo"):
+    navigate()
+    t = text()
+    check("Privacy Demo" in t, "SSR: title renders")
+    check("Total: $48.60" in t, "SSR: derived total renders")
+    secrets = ["sk_live_secret_do_not_leak_this", "postgres://user:pass@localhost/db"]
+    check(all(s not in str(html()) for s in secrets), "Server secrets not present in DOM")
+    bundle_text = evl_async("""
+      (async () => {
+        const src = Array.from(document.scripts).map(s => s.src).find(s => s.includes('beacon_client_'));
+        return src ? await fetch(src).then(r => r.text()) : '';
+      })()
+    """)
+    check(len(str(bundle_text)) > 0, "Client bundle fetched")
+    check(all(s not in str(bundle_text) for s in secrets), "Server secrets not present in client bundle")
+    clear_cdp_events()
+    click_button("Add Item")
+    t = text()
+    check("Items: 3" in t and "Total: $54.00" in t, "Add item updates the derived totals")
+    check_model_ws_update("Privacy demo add item")
+    clear_cdp_events()
+    click_button("Clear")
+    t = text()
+    check("Items: 0" in t and "Total: $0.00" in t, "Clear empties the cart")
+    check_model_ws_update("Privacy demo clear")
+    check(all(s not in str(html()) for s in secrets), "Server secrets still absent after updates")
     check(errors() == "0", f"Zero errors ({error_list()})")
 stop_server(); print()
 
@@ -1302,6 +1432,11 @@ if start_example("middleware_demo", module="app"):
     time.sleep(1); drain()
     admin_status = evl('window.__admin_status || 0')
     check(str(admin_status) == "403", f"Admin blocked without header (status={admin_status})")
+    api_post = evl_async("""
+      fetch('/api/items', {method: 'POST'})
+        .then(r => r.status + ':' + r.headers.get('allow') + ':' + r.headers.get('x-api-version'))
+    """)
+    check(str(api_post) == "405:GET, HEAD:v1", f"API write blocked with allow header ({api_post})")
     clear_browser_errors()
     check(errors() == "0", f"Zero errors ({error_list()})")
 stop_server(); print()
@@ -1320,11 +1455,11 @@ if start_example("domains", module="app"):
     check("Write tests" in t, "Item 2 shown")
     # Toggle an item
     h_before = html()
-    click("[data-beacon-event-click]")
+    click("[data-beacon-on-click]")
     time.sleep(1); drain()
     # Add an item
     type_input('input[type="text"]', "New item")
-    click_by_text("Add")
+    submit_by_text("Add")
     t = text()
     check("New item" in t or "Items" in t, "Item added or list updated")
     check(errors() == "0", f"Zero errors ({error_list()})")
@@ -1345,12 +1480,12 @@ if start_example("multi_kanban", module="app"):
     check("Build UI" in t, "Card 3 shown")
     # Add a card
     type_input('input[type="text"]', "Deploy")
-    click_by_text("Add Card")
+    submit_by_text("Add Card")
     t = text()
     check("Deploy" in t, "New card added")
     # Delete a card (click x button)
     h = html()
-    check("data-beacon-event-dragstart" in h, "Drag handlers present")
+    check("data-beacon-on-dragstart" in h, "Drag handlers present")
     check(errors() == "0", f"Zero errors ({error_list()})")
 stop_server(); print()
 
@@ -1367,7 +1502,7 @@ if start_example("multi_todo", module="app"):
     check("2 items remaining" in t, "Remaining count (1 completed, 2 active)")
     # Add a todo
     type_input('input[type="text"]', "Write docs")
-    click_by_text("Add")
+    submit_by_text("Add")
     t = text()
     check("Write docs" in t, "New todo added")
     check("3 items remaining" in t, "Remaining count updated")
@@ -1649,12 +1784,13 @@ if start_example("routed", module="main"):
     check_history_go(1, "/stats", "Stats", "Explicit routed app history forward to stats")
 
     check_dom_conformance("Explicit routed app")
+    check(errors() == "0", f"Zero errors ({error_list()})")
 
+    # The browser logs the 404 document load itself as a console error, so
+    # the zero-errors check runs before this deliberate unknown route.
     navigate("/nonexistent")
     body_text = evl('document.body?.textContent || ""')
     check("Not Found" in str(body_text), "SSR: 404 page renders")
-
-    check(errors() == "0", f"Zero errors ({error_list()})")
 stop_server(); print()
 
 # == 19. Local First Form ==

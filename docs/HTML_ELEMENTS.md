@@ -1,90 +1,190 @@
 # HTML Elements Reference
 
-Import: `import beacon/html` for elements, `import beacon` for event handlers.
+A view is built from four modules, following Lustre's layout:
 
-## Elements
+```gleam
+import beacon/attribute
+import beacon/element.{type Element}
+import beacon/event
+import beacon/html
+```
 
-All take `(attrs: List(Attr), children: List(Node(msg)))`.
+SVG elements are in `beacon/svg` (see [SVG.md](SVG.md)).
 
-**Block:** `div`, `span`, `p`, `h1`-`h6`, `nav`, `header`, `footer`, `main`, `section`, `article`, `aside`
+## Elements (`beacon/html`)
 
-**Interactive:** `button`, `a`, `form`, `label`, `textarea`, `select`, `option`
+Elements take `(attributes: List(Attribute(msg)), children: List(Element(msg)))`.
 
-**Lists:** `ul`, `ol`, `li`
+**Sections:** `div`, `span`, `p`, `h1`-`h6`, `nav`, `header`, `footer`, `main`, `section`, `article`, `aside`, `address`, `hgroup`, `search`
 
-**Table:** `table`, `thead`, `tbody`, `tr`, `td`, `th`
+**Forms:** `button`, `a`, `form`, `label`, `textarea`, `select`, `option`, `optgroup`, `fieldset`, `legend`, `datalist`, `output`, `progress`, `meter`
 
-**Inline:** `strong`, `em`, `pre`, `code`
+**Lists:** `ul`, `ol`, `li`, `dl`, `dt`, `dd`, `menu`
 
-**Void (no children):** `input(attrs)`, `br()`, `hr()`, `img(attrs)`
+**Tables:** `table`, `caption`, `colgroup`, `thead`, `tbody`, `tfoot`, `tr`, `td`, `th`
 
-**Custom:** `html.element("canvas", attrs, children)`
+**Inline text:** `strong`, `em`, `b`, `i`, `u`, `s`, `small`, `mark`, `sub`, `sup`, `abbr`, `cite`, `q`, `dfn`, `kbd`, `samp`, `var`, `time`, `data`, `bdi`, `bdo`, `ruby`, `rt`, `rp`, `del`, `ins`
 
-**Text:** `html.text("content")`
+**Blocks:** `pre`, `code`, `blockquote`, `figure`, `figcaption`, `details`, `summary`, `dialog`
 
-## Attribute Helpers
+**Embedded:** `canvas`, `video`, `audio`, `picture`, `iframe`, `object`, `map`, `noscript`, `template`, `slot`
 
-| Function | HTML |
-|----------|------|
-| `html.class("x")` | `class="x"` |
-| `html.id("x")` | `id="x"` |
-| `html.type_("text")` | `type="text"` |
-| `html.value("x")` | `value="x"` |
-| `html.placeholder("x")` | `placeholder="x"` |
-| `html.href("/about")` | `href="/about"` |
-| `html.src_("/img.png")` | `src="/img.png"` |
-| `html.name("field")` | `name="field"` |
-| `html.style("color:red")` | `style="color:red"` |
-| `html.disabled()` | `disabled="true"` |
-| `html.checked()` | `checked="true"` |
-| `html.attribute("k","v")` | `k="v"` (custom) |
+**Void elements** take only attributes: `input`, `br`, `hr`, `img`, `source`, `track`, `wbr`, `col`, `area`, `embed`
 
-## Event Handlers
+**Text:** `html.text("content")`, escaped when rendered.
 
-Defined in `beacon` (not `beacon/html`):
-
-| Function | Event | Callback |
-|----------|-------|----------|
-| `on_click(Msg)` | click | Simple message |
-| `on_input(fn(String) -> Msg)` | input | Receives value |
-| `on_submit(Msg)` | submit | Simple message |
-| `on_change(fn(String) -> Msg)` | change | Receives value |
-| `on_keydown(fn(String) -> Msg)` | keydown | Receives key name |
-| `on_mousedown(fn(String) -> Msg)` | mousedown | Receives "x,y" |
-| `on_mouseup(fn(String) -> Msg)` | mouseup | Pointer coordinates as `"x,y"`, or the full drag trail as semicolon-separated `"x,y;x,y;..."` after `on_mousedown` + `on_mousemove` |
-| `on_mousemove(fn(String) -> Msg)` | mousemove | Receives "x,y" |
-| `on_dragstart(fn(String) -> Msg)` | dragstart | Receives drag-id |
-| `on_dragover(Msg)` | dragover | Simple (preventDefault) |
-| `on_drop(fn(String) -> Msg)` | drop | Receives drag-id |
-
-## Special Elements
+## Element Helpers (`beacon/element`)
 
 | Function | Description |
 |----------|-------------|
-| `element.none()` | Returns an empty node that renders nothing |
-| `element.raw_html(html)` | Injects a raw HTML string without escaping |
-
-**`element.none()`** is used for conditional rendering:
+| `element.element(tag, attributes, children)` | Any tag. A tag with characters outside `a-z A-Z 0-9 - _ : .` crashes. |
+| `element.text(content)` | Escaped text |
+| `element.none()` | Renders nothing; use it for conditional content |
+| `element.keyed(key, child)` | Gives `child` an identity (`data-beacon-key`) so the browser keeps or replaces its DOM node by key instead of by position |
+| `element.memo(key, deps, child)` | The browser skips the subtree while `deps` are unchanged |
+| `element.map(element, f)` | Changes the message type, for child modules |
+| `element.unsafe_raw_html(html)` | Inserts HTML without escaping or the URL policy |
+| `element.to_string(element)` | Renders to an HTML string |
 
 ```gleam
-case show {
-  True -> element.text("visible")
+case model.show_details {
+  True -> html.p([], [html.text(model.details)])
   False -> element.none()
 }
 ```
 
-**`element.raw_html(html)`** injects pre-sanitized HTML directly into the DOM. **WARNING:** the caller must sanitize the input to prevent XSS -- this function performs no escaping. Use it for content that has already been sanitized, such as rendered markdown output.
+Key list items whose order can change, so focus and input state stay with
+the right item:
+
+```gleam
+html.ul([], list.map(model.items, fn(item) {
+  element.keyed(item.id, html.li([], [html.text(item.title)]))
+}))
+```
+
+**`element.unsafe_raw_html(html)`** never escapes. Pass it only HTML you
+produced or sanitized yourself, such as rendered markdown output, never text
+a user controls.
+
+## Attributes (`beacon/attribute`)
+
+| Function | HTML |
+|----------|------|
+| `attribute.class("x")` | `class="x"` |
+| `attribute.classes([#("active", True), #("hidden", False)])` | `class="active"` |
+| `attribute.id("x")` | `id="x"` |
+| `attribute.name("field")` | `name="field"` |
+| `attribute.type_("text")` | `type="text"` |
+| `attribute.value("x")` | `value="x"` |
+| `attribute.placeholder("x")` | `placeholder="x"` |
+| `attribute.title("x")`, `alt`, `role`, `target`, `rel`, `method`, `for` | the attribute of the same name |
+| `attribute.min("0")`, `max`, `step` | the attribute of the same name |
+| `attribute.rows(3)`, `cols`, `tabindex` | integer attributes |
+| `attribute.data("testid", "x")` | `data-testid="x"` |
+| `attribute.aria("label", "x")` | `aria-label="x"` |
+| `attribute.style("color", "red")` | `style="color:red"` (several are joined) |
+| `attribute.styles([#("color", "red"), #("margin", "0")])` | `style="color:red;margin:0"` |
+| `attribute.disabled(True)`, `checked`, `selected`, `readonly`, `required`, `autofocus` | boolean attributes: present when `True`, absent when `False` |
+| `attribute.draggable(True)` | `draggable="true"` (`"false"` for `False`) |
+| `attribute.boolean("hidden", True)` | any boolean attribute |
+| `attribute.attribute("k", "v")` | `k="v"` |
+| `attribute.none()` | nothing |
+
+`attribute.attribute(name, value)` crashes on an inline event name such as
+`onclick` or a name with characters outside `a-z A-Z 0-9 - _ : .`: use
+`beacon/event` for handlers.
+
+### URL attributes
+
+`attribute.href`, `src`, `action`, `formaction`, `poster` and `cite` (and the
+same names through `attribute.attribute`, plus `xlink:href`) go through the
+URL policy. Relative URLs, `http:`, `https:`, `mailto:` and `tel:` are
+allowed, and `src` also accepts `data:image/png`, `gif`, `jpeg` and `webp`.
+Any other value, such as `javascript:alert(1)`, drops the attribute and logs
+a warning. See [SECURITY.md](SECURITY.md#url-policy).
+
+### Client hooks
+
+| Function | LiveView | Description |
+|----------|----------|-------------|
+| `attribute.ignore_updates()` | `phx-update="ignore"` | The browser does not touch the element's children after the first render |
+| `attribute.hook("Chart")` | `phx-hook` | Attaches a JavaScript hook registered with `Beacon.hooks` |
+| `attribute.watch(["data-points"])` | | Attribute changes that call the hook's `updated` callback |
+
+## Events (`beacon/event`)
+
+| Function | Event | Message |
+|----------|-------|---------|
+| `event.on_click(msg)` | click | `msg` |
+| `event.on_double_click(msg)` | dblclick | `msg` |
+| `event.on_mouse_down(msg)`, `on_mouse_up`, `on_mouse_enter`, `on_mouse_leave`, `on_mouse_over`, `on_mouse_out` | mouse events | `msg` |
+| `event.on_input(fn(String) -> msg)` | input | `event.target.value` |
+| `event.on_change(fn(String) -> msg)` | change | `event.target.value` |
+| `event.on_check(fn(Bool) -> msg)` | change | `event.target.checked` |
+| `event.on_submit(fn(List(#(String, String))) -> msg)` | submit | The form's string fields; the browser's submission is prevented |
+| `event.on_keydown(fn(String) -> msg)`, `on_keyup`, `on_keypress` | key events | `event.key` |
+| `event.on_focus(msg)`, `on_blur` | focus, blur | `msg` |
+| `event.on_drag_start(msg)`, `on_drag_end` | dragstart, dragend | `msg` |
+| `event.on_drag_over(msg)` | dragover | `msg`; the default is prevented so the element accepts drops |
+| `event.on_drop(msg)` | drop | `msg`; the default is prevented |
+
+### Custom events
+
+`event.on(name, decoder)` listens for any DOM event and decodes the event
+object with a `gleam/dynamic/decode` decoder, as Lustre does. The decoder runs
+in the browser; a decode failure is logged with `console.warn` and the event
+is dropped.
+
+```gleam
+event.on("pointermove", {
+  use #(x, y) <- decode.then(event.mouse_position())
+  decode.success(PointerMoved(x:, y:))
+})
+```
+
+Payload decoders: `event.value()`, `event.checked()`, `event.key()`,
+`event.mouse_position()` (`#(offsetX, offsetY)`) and `event.form_data()`.
+
+### Modifiers
+
+| Function | Description |
+|----------|-------------|
+| `event.prevent_default(handler)` | Calls `preventDefault()` |
+| `event.stop_propagation(handler)` | Calls `stopPropagation()` |
+| `event.debounce(handler, ms)` | Dispatches the latest event once it has stopped firing for `ms` |
+| `event.throttle(handler, ms)` | Dispatches at most one event every `ms` |
+
+```gleam
+html.input([event.on_input(Search) |> event.debounce(300)])
+```
+
+Every message constructor that client code can build is accepted from the
+browser; any other message is refused by the server. See
+[SECURITY.md](SECURITY.md#events-from-the-browser).
 
 ## Example: Login Form
 
 ```gleam
-fn view(model: Model) -> beacon.Node(Msg) {
-  html.form([beacon.on_submit(Submit)], [
-    html.label([], [html.text("Email")]),
-    html.input([html.type_("email"), beacon.on_input(SetEmail)]),
-    html.label([], [html.text("Password")]),
-    html.input([html.type_("password"), beacon.on_input(SetPassword)]),
-    html.button([html.type_("submit")], [html.text("Log in")]),
+pub fn view(model: Model) -> Element(Msg) {
+  html.form([event.on_submit(Submitted)], [
+    html.label([attribute.for("email")], [html.text("Email")]),
+    html.input([
+      attribute.id("email"),
+      attribute.name("email"),
+      attribute.type_("email"),
+      attribute.value(model.email),
+      event.on_input(SetEmail),
+    ]),
+    html.label([attribute.for("password")], [html.text("Password")]),
+    html.input([
+      attribute.id("password"),
+      attribute.name("password"),
+      attribute.type_("password"),
+    ]),
+    html.button([attribute.type_("submit")], [html.text("Log in")]),
   ])
 }
 ```
+
+`Submitted` receives `[#("email", ...), #("password", ...)]` from the form at
+the moment it is submitted.

@@ -1,17 +1,19 @@
-/// Builds an app's client bundle: the app's client-visible Model, Msg, view
-/// (and update, without Server state) compiled to JavaScript together with
-/// the Beacon client runtime, written to `priv/static` under a content hash.
+/// Builds an app's client bundle: the code the app's view (and a `simple`
+/// app's update, and a Local layer) reaches, compiled to JavaScript together
+/// with the Beacon client runtime, written to `priv/static` under a content
+/// hash.
 ///
 /// The build writes a JavaScript-target Gleam project to
 /// `build/beacon_client_app`:
 ///
-/// - `src/app.gleam`: the app module's client-visible source.
-/// - The client-visible part of each user module it imports.
+/// - Each user module with reached definitions, at its own module path,
+///   holding only those definitions (see `beacon/build/reach`), plus the
+///   JavaScript FFI files their externals load.
 /// - The Beacon modules those import (`beacon/element`, `beacon/html`, ...),
-///   copied from Beacon's sources, and generated `beacon` and `beacon/log`
-///   modules (see `client_shim`).
-/// - The client runtime: `beacon_client_ffi.mjs`, the `beacon_client/*.mjs`
-///   modules and `beacon_client/handler.gleam`.
+///   copied from Beacon's sources, and a generated `beacon/log` (see
+///   `client_shim`).
+/// - The client runtime: `beacon_client_ffi.mjs` and the
+///   `beacon_client/*.mjs` modules.
 /// - `src/beacon_app_entry.gleam`, the interface the runtime calls.
 /// - `gleam.toml`, pinning every package the sources import to the exact
 ///   version in the app's `manifest.toml`.
@@ -26,7 +28,6 @@ import beacon/build/discovery.{type AppModule}
 import beacon/build/files
 import beacon/build/program
 import beacon/build/project_toml.{type LockedPackage}
-import beacon/build/shape.{type ClientApp}
 import beacon/build/sources
 import beacon/log
 import gleam/dict.{type Dict}
@@ -70,19 +71,12 @@ pub fn build(
   beacon_root: String,
   app: AppModule,
   analysis: Analysis,
-  client: ClientApp,
 ) -> Result(Bundle, String) {
   log.info(
     "beacon.build.client_bundle",
     "Building client bundle for " <> app.path,
   )
-  use project_files <- result.try(project_files(
-    src_dir,
-    beacon_root,
-    app,
-    analysis,
-    client,
-  ))
+  use project_files <- result.try(project_files(src_dir, beacon_root, analysis))
   use dependencies <- result.try(dependencies(project, project_files))
   let dir = files.join(project, client_dir)
   use Nil <- result.try(write_project(dir, project_files, dependencies))
@@ -128,89 +122,81 @@ pub fn publish(static: String, contents: String) -> Result(Bundle, String) {
   Ok(Bundle(filename:, path:))
 }
 
-/// The esbuild entry: exposes the generated entry module to the runtime as
-/// `window.BeaconApp`, then starts the runtime.
+/// The esbuild entry: starts the runtime with the generated entry module.
 const entry =
-  "import { initClientAfterBoot } from './build/dev/javascript/beacon_client_app/beacon_client_ffi.mjs';
+  "import { start } from './build/dev/javascript/beacon_client_app/beacon_client_ffi.mjs';
 import * as App from './build/dev/javascript/beacon_client_app/beacon_app_entry.mjs';
-window.BeaconApp = App;
-initClientAfterBoot();
+start(App);
 "
 
 fn project_files(
   src_dir: String,
   beacon_root: String,
-  app: AppModule,
   analysis: Analysis,
-  client: ClientApp,
 ) -> Result(List(ProjectFile), String) {
-  use externals <- result.try(sources.client_externals(
-    src_dir,
-    app.path,
-    client.source,
-  ))
-  use beacon_module <- result.try(client_shim.beacon_module(beacon_root))
-  use entry_module <- result.try(client_entry.generate(
-    analysis,
-    client.has_update,
-  ))
+  use entry_module <- result.try(client_entry.generate(analysis))
+  use ffi <- result.try(
+    analysis.client
+    |> list.flat_map(fn(emitted) { emitted.ffi_files })
+    |> list.unique
+    |> list.try_map(fn(path) {
+      use text <- result.map(files.read(files.join(src_dir, path)))
+      #("src/" <> path, text)
+    }),
+  )
   use framework <- result.try(
     sources.framework_closure(beacon_root, [
-      client.source,
-      beacon_module,
       entry_module,
-      ..list.map(externals, fn(s) { s.2 })
+      ..list.map(analysis.client, fn(emitted) { emitted.source })
     ]),
   )
   use runtime <- result.try(runtime_files(beacon_root))
   let project_files =
     list.flatten([
-      [#(module_file(client_entry.app_module), client.source)],
-      list.map(externals, fn(s) { #(module_file(s.1), s.2) }),
-      list.map(framework, fn(s) { #(module_file(s.1), s.2) }),
+      list.map(analysis.client, fn(emitted) {
+        #(module_file(emitted.path), emitted.source)
+      }),
+      ffi,
+      list.map(framework, fn(s) { #(module_file(s.0), s.1) }),
       [
-        #(module_file("beacon"), beacon_module),
         #(module_file("beacon/log"), client_shim.log_module),
-        #(module_file("beacon_app_entry"), entry_module),
+        #(module_file(client_entry.module_path), entry_module),
       ],
       runtime,
     ])
   use Nil <- result.try(unique_paths(project_files))
+  log.debug(
+    "beacon.build.client_bundle",
+    "Client project: "
+      <> string.inspect(list.length(analysis.client))
+      <> " app modules, "
+      <> string.inspect(list.length(ffi))
+      <> " FFI files, "
+      <> string.inspect(list.length(framework))
+      <> " framework modules",
+  )
   Ok(project_files)
 }
 
-/// The client runtime from `beacon_root/beacon_client/src`: the FFI module,
-/// every module in `beacon_client/`.
+/// The client runtime from `beacon_root/beacon_client/src`: the FFI module
+/// and every `.mjs` module in `beacon_client/`.
 fn runtime_files(beacon_root: String) -> Result(List(ProjectFile), String) {
   let runtime_src = files.join(beacon_root, "beacon_client/src")
   let package_dir = files.join(runtime_src, "beacon_client")
   use entries <- result.try(files.list_directory(package_dir))
-  let wanted =
-    list.filter(entries, fn(entry) {
-      string.ends_with(entry, ".mjs") || entry == "handler.gleam"
-    })
   use package_files <- result.try(
-    list.try_map(wanted, fn(entry) {
+    entries
+    |> list.filter(string.ends_with(_, ".mjs"))
+    |> list.sort(string.compare)
+    |> list.try_map(fn(entry) {
       files.read(files.join(package_dir, entry))
       |> result.map(fn(text) { #("src/beacon_client/" <> entry, text) })
     }),
   )
-  use ffi <- result.try(
+  use ffi <- result.map(
     files.read(files.join(runtime_src, "beacon_client_ffi.mjs")),
   )
-  case
-    list.any(package_files, fn(f) { f.0 == "src/beacon_client/handler.gleam" })
-  {
-    True -> Ok([#("src/beacon_client_ffi.mjs", ffi), ..package_files])
-    False ->
-      Error(
-        "The Beacon client runtime at "
-        <> package_dir
-        <> " has no handler.gleam. The Beacon sources at "
-        <> beacon_root
-        <> " are incomplete.",
-      )
-  }
+  [#("src/beacon_client_ffi.mjs", ffi), ..package_files]
 }
 
 /// Two sources for one path means a user module shadows a module the build

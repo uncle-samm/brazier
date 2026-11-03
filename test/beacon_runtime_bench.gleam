@@ -14,9 +14,9 @@
 //// This module is not a test (no `_test` suffix) so gleeunit never runs it.
 
 import beacon/effect
-import beacon/element
 import beacon/error
 import beacon/runtime
+import beacon/test_ctx
 import beacon/transport
 import gleam/erlang/process
 import gleam/int
@@ -42,7 +42,7 @@ const iterations = 2000
 
 fn bench_config() -> runtime.RuntimeConfig(BenchModel, BenchMsg) {
   runtime.RuntimeConfig(
-    init: fn() {
+    init: fn(_ctx) {
       #(
         BenchModel(
           count: 0,
@@ -59,33 +59,26 @@ fn bench_config() -> runtime.RuntimeConfig(BenchModel, BenchMsg) {
         Nothing -> #(model, effect.none())
       }
     },
-    view: fn(model: BenchModel) {
-      element.el("div", [], [element.text(int.to_string(model.count))])
-    },
-    decode_event: option.Some(fn(_name, handler_id, _data, _path) {
+    decode_event: fn(_name, handler_id, _data, _path) {
       case handler_id {
         "bump" -> Ok(Bump)
         "nothing" -> Ok(Nothing)
         _ -> Error(error.RuntimeError(reason: "unknown handler " <> handler_id))
       }
-    }),
-    serialize_model: option.Some(fn(model: BenchModel) {
+    },
+    encode_model: fn(model: BenchModel) {
       json.object([
         #("count", json.int(model.count)),
         #("items", json.array(model.items, json.string)),
       ])
       |> json.to_string
-    }),
-    deserialize_model: option.None,
-    route_patterns: [],
-    on_route_change: option.None,
-    on_route_leave: option.None,
+    },
+    route: option.None,
+    restore_model: option.None,
     dynamic_subscriptions: option.None,
     on_notify: option.None,
     on_notification: option.None,
-    init_from_request: option.None,
     secret_key: "bench-secret-key-that-is-long-enough-for-hmac",
-    dev_mode: False,
   )
 }
 
@@ -127,7 +120,7 @@ fn await_ack(
 }
 
 fn run_scenario(name: String, handler_id: String) -> Nil {
-  let assert Ok(rt) = runtime.start(bench_config())
+  let assert Ok(rt) = runtime.start(bench_config(), test_ctx.root())
   let transport_subject = process.new_subject()
   let selector = process.new_selector() |> process.select(transport_subject)
   process.send(

@@ -1,15 +1,23 @@
-/// Multiplayer Snake — demonstrates:
-/// - Server-push via effect.every() (game tick at ~150ms)
-/// - Arrow key input (on_keydown)
-/// - Shared store for game state (all players see same board)
-/// - Per-connection state (each player has their own snake)
-/// - Collision detection (walls, self)
+/// Snake, demonstrating:
+/// - server push with `effect.every`: the game ticks on the server and the
+///   browser only renders;
+/// - keyboard input filtered in Local state: arrow keys reach the server,
+///   other keys and the name draft never leave the browser;
+/// - a high-score table shared by every session, kept in a `beacon/store`
+///   list and re-read when any session records a score.
 import beacon
-import beacon/effect
+import beacon/attribute
+import beacon/effect.{type Effect}
+import beacon/element.{type Element}
+import beacon/event
 import beacon/html
-import beacon/store
+import beacon/local
+import beacon/log
+import beacon/store.{type ListStore}
+import beacon/svg
 import gleam/int
 import gleam/list
+import gleam/order
 import gleam/string
 
 // --- Types ---
@@ -25,348 +33,484 @@ pub type Direction {
   Right
 }
 
-pub type GameState {
+pub type Phase {
+  NameEntry
   Playing
   GameOver
 }
 
+pub type HighScore {
+  HighScore(name: String, score: Int)
+}
+
+/// Synced to the browser.
 pub type Model {
   Model(
+    phase: Phase,
+    player_name: String,
+    /// Head first.
     snake: List(Point),
-    direction: Direction,
+    /// The direction the snake moved on the last tick.
+    moved: Direction,
+    /// The direction it moves on the next tick.
+    heading: Direction,
     food: Point,
     score: Int,
-    game_state: GameState,
-    grid_width: Int,
-    grid_height: Int,
-    player_name: String,
-    name_input: String,
-    has_name: Bool,
-    high_score_pending: Bool,
+    high_scores: List(HighScore),
   )
+}
+
+/// Client-only.
+pub type Local {
+  Local(name_draft: String)
 }
 
 pub type Msg {
+  NameChanged(String)
+  StartGame(String)
+  KeyPressed(String)
   Tick
-  ChangeDirection(Direction)
   RestartGame
-  UpdateNameInput(String)
-  SetName
-  HighScoreUpdated
+  /// A session (this one included) recorded a score.
+  ScoresChanged
 }
 
-const grid_w = 20
+const grid_width = 20
 
-const grid_h = 15
+const grid_height = 15
 
 const cell_size = 25
 
-// --- Init ---
+const tick_ms = 150
 
-pub fn init() -> Model {
-  Model(
-    snake: [Point(x: 10, y: 7)],
-    direction: Right,
-    food: Point(x: 15, y: 7),
-    score: 0,
-    game_state: Playing,
-    grid_width: grid_w,
-    grid_height: grid_h,
-    player_name: "",
-    name_input: "",
-    has_name: False,
-    high_score_pending: False,
+const max_name_length = 20
+
+const shown_scores = 5
+
+const scores_key = "scores"
+
+fn start_snake() -> List(Point) {
+  [Point(x: 10, y: 7)]
+}
+
+// --- High scores ---
+
+fn read_high_scores(scores: ListStore(HighScore)) -> List(HighScore) {
+  store.get_all(scores, scores_key)
+  |> list.sort(fn(a, b) { order.reverse(int.compare)(a.score, b.score) })
+  |> list.take(shown_scores)
+}
+
+// --- Init and update (server) ---
+
+fn init(scores: ListStore(HighScore)) -> #(Model, Effect(Msg)) {
+  let snake = start_snake()
+  #(
+    Model(
+      phase: NameEntry,
+      player_name: "",
+      snake:,
+      moved: Right,
+      heading: Right,
+      food: Point(x: 15, y: 7),
+      score: 0,
+      high_scores: read_high_scores(scores),
+    ),
+    effect.none(),
   )
 }
 
-// --- Update ---
-
-pub fn update(
+fn update(
+  scores: ListStore(HighScore),
   model: Model,
-  _local: Nil,
-  _server: Nil,
   msg: Msg,
-) -> #(Model, Nil, Nil) {
-  let model = case msg {
-    Tick -> {
-      case model.game_state {
-        GameOver -> model
-        Playing -> advance_snake(model)
+) -> #(Model, Effect(Msg)) {
+  case msg {
+    StartGame(name) -> start_game(model, string.trim(name))
+    KeyPressed(key) ->
+      case model.phase, direction_for_key(key) {
+        Playing, Ok(direction) -> #(steer(model, direction), effect.none())
+        // A late key press after the game ended.
+        NameEntry, Ok(_) | GameOver, Ok(_) -> #(model, effect.none())
+        _, Error(Nil) -> {
+          // `update_local` forwards only arrow keys.
+          log.warning("snake", "Ignored a forwarded non-arrow key " <> key)
+          #(model, effect.none())
+        }
       }
-    }
-
-    ChangeDirection(dir) -> {
-      // Prevent 180-degree turns
-      let valid = case model.direction, dir {
-        Up, Down | Down, Up | Left, Right | Right, Left -> False
-        _, _ -> True
+    Tick ->
+      case model.phase {
+        Playing -> advance(scores, model)
+        NameEntry | GameOver -> #(model, effect.none())
       }
-      case valid {
-        True -> Model(..model, direction: dir)
-        False -> model
+    RestartGame ->
+      case model.phase {
+        GameOver -> {
+          log.info("snake", model.player_name <> " restarted")
+          // The timer from `StartGame` is still running.
+          #(new_round(model), effect.none())
+        }
+        NameEntry | Playing -> {
+          log.warning("snake", "Ignored a restart while the game is not over")
+          #(model, effect.none())
+        }
       }
-    }
-
-    RestartGame -> {
-      let new_snake = [Point(x: 10, y: 7)]
-      let new_food = next_food(new_snake, model.score + 1)
-      // Don't start a new timer — the existing one from SetName still runs.
-      // Just reset the game state. The Tick handler checks game_state.
-      Model(
-        ..model,
-        snake: new_snake,
-        direction: Right,
-        food: new_food,
-        score: 0,
-        game_state: Playing,
-        high_score_pending: False,
-      )
-    }
-
-    UpdateNameInput(text) -> Model(..model, name_input: text)
-
-    SetName -> {
-      let name = string.trim(model.name_input)
-      case string.is_empty(name) {
-        True -> model
-        False -> Model(..model, player_name: name, has_name: True)
-      }
-    }
-
-    HighScoreUpdated -> Model(..model, high_score_pending: False)
+    ScoresChanged -> #(
+      Model(..model, high_scores: read_high_scores(scores)),
+      effect.none(),
+    )
+    // `update_local` handles this in the browser and never forwards it.
+    NameChanged(_) -> #(model, effect.none())
   }
-  #(model, Nil, Nil)
 }
 
-fn advance_snake(model: Model) -> Model {
-  let assert [head, ..] = model.snake
-  let new_head = case model.direction {
-    Up -> Point(x: head.x, y: head.y - 1)
-    Down -> Point(x: head.x, y: head.y + 1)
-    Left -> Point(x: head.x - 1, y: head.y)
-    Right -> Point(x: head.x + 1, y: head.y)
-  }
-
-  // Wall collision
+fn start_game(model: Model, name: String) -> #(Model, Effect(Msg)) {
   case
-    new_head.x < 0
-    || new_head.x >= model.grid_width
-    || new_head.y < 0
-    || new_head.y >= model.grid_height
+    model.phase,
+    string.is_empty(name),
+    string.length(name) > max_name_length
   {
-    True -> Model(..model, game_state: GameOver, high_score_pending: True)
+    NameEntry, False, False -> {
+      log.info("snake", name <> " started playing")
+      // The only transition out of NameEntry, so this starts one timer per
+      // session.
+      #(
+        Model(..new_round(model), player_name: name),
+        effect.every(tick_ms, fn() { Tick }),
+      )
+    }
+    NameEntry, True, _ -> {
+      log.warning("snake", "Rejected an empty player name")
+      #(model, effect.none())
+    }
+    NameEntry, _, True -> {
+      log.warning(
+        "snake",
+        "Rejected a player name of "
+          <> int.to_string(string.length(name))
+          <> " characters (max "
+          <> int.to_string(max_name_length)
+          <> ")",
+      )
+      #(model, effect.none())
+    }
+    Playing, _, _ | GameOver, _, _ -> {
+      log.warning("snake", "Ignored a second StartGame")
+      #(model, effect.none())
+    }
+  }
+}
+
+fn new_round(model: Model) -> Model {
+  let snake = start_snake()
+  Model(
+    ..model,
+    phase: Playing,
+    snake:,
+    moved: Right,
+    heading: Right,
+    food: Point(x: 15, y: 7),
+    score: 0,
+  )
+}
+
+fn direction_for_key(key: String) -> Result(Direction, Nil) {
+  case key {
+    "ArrowUp" -> Ok(Up)
+    "ArrowDown" -> Ok(Down)
+    "ArrowLeft" -> Ok(Left)
+    "ArrowRight" -> Ok(Right)
+    _ -> Error(Nil)
+  }
+}
+
+/// Turn, unless that would reverse into the snake. The check is against
+/// the last move rather than the queued heading, so two quick presses
+/// within one tick cannot reverse it either.
+fn steer(model: Model, direction: Direction) -> Model {
+  case model.moved, direction {
+    Up, Down | Down, Up | Left, Right | Right, Left -> model
+    _, _ -> Model(..model, heading: direction)
+  }
+}
+
+fn advance(
+  scores: ListStore(HighScore),
+  model: Model,
+) -> #(Model, Effect(Msg)) {
+  // Invariant: the snake starts with one point and only ever grows.
+  let assert [head, ..] = model.snake
+  let next = case model.heading {
+    Up -> Point(..head, y: head.y - 1)
+    Down -> Point(..head, y: head.y + 1)
+    Left -> Point(..head, x: head.x - 1)
+    Right -> Point(..head, x: head.x + 1)
+  }
+  let ate = next == model.food
+  let body = case ate {
+    True -> model.snake
+    False -> drop_last(model.snake)
+  }
+  let hit_wall =
+    next.x < 0 || next.x >= grid_width || next.y < 0 || next.y >= grid_height
+  case hit_wall || list.contains(body, next) {
+    True -> game_over(scores, model)
     False -> {
-      // Self collision
-      case list.contains(model.snake, new_head) {
-        True -> Model(..model, game_state: GameOver, high_score_pending: True)
-        False -> {
-          // Ate food?
-          let ate = new_head == model.food
-          let new_snake = case ate {
-            True -> [new_head, ..model.snake]
-            False -> [new_head, ..drop_last(model.snake)]
+      let snake = [next, ..body]
+      let model = Model(..model, snake:, moved: model.heading)
+      case ate {
+        False -> #(model, effect.none())
+        True -> {
+          let model = Model(..model, score: model.score + 10)
+          case free_cells(snake) {
+            // The snake fills the board.
+            [] -> game_over(scores, model)
+            free -> #(Model(..model, food: pick(free)), effect.none())
           }
-          let new_score = case ate {
-            True -> model.score + 10
-            False -> model.score
-          }
-          let new_food = case ate {
-            True -> next_food(new_snake, new_score)
-            False -> model.food
-          }
-          Model(..model, snake: new_snake, food: new_food, score: new_score)
         }
       }
     }
   }
+}
+
+fn game_over(
+  scores: ListStore(HighScore),
+  model: Model,
+) -> #(Model, Effect(Msg)) {
+  log.info(
+    "snake",
+    model.player_name <> " scored " <> int.to_string(model.score),
+  )
+  let entry = HighScore(name: model.player_name, score: model.score)
+  // The store broadcasts on its topic, which every session (this one
+  // included) turns into `ScoresChanged`.
+  #(
+    Model(..model, phase: GameOver),
+    effect.from(fn(_dispatch) { store.append(scores, scores_key, entry) }),
+  )
 }
 
 fn drop_last(items: List(a)) -> List(a) {
-  case items {
-    [] -> []
-    [_] -> []
-    [x, ..rest] -> [x, ..drop_last(rest)]
-  }
+  list.take(items, list.length(items) - 1)
 }
 
-fn next_food(snake: List(Point), seed: Int) -> Point {
-  let x = { seed * 7 + 3 } % grid_w
-  let y = { seed * 11 + 5 } % grid_h
-  let p = Point(x: x, y: y)
-  case list.contains(snake, p) {
-    True -> next_food(snake, seed + 1)
-    False -> p
-  }
+fn free_cells(snake: List(Point)) -> List(Point) {
+  list.repeat(Nil, grid_height)
+  |> list.index_map(fn(_, y) {
+    list.repeat(Nil, grid_width)
+    |> list.index_map(fn(_, x) { Point(x:, y:) })
+  })
+  |> list.flatten
+  |> list.filter(fn(point) { !list.contains(snake, point) })
 }
 
-fn make_on_update(
-  high_scores: store.ListStore(String),
-) -> fn(#(Model, Nil, Nil), Msg) -> effect.Effect(Msg) {
-  fn(state: #(Model, Nil, Nil), msg: Msg) -> effect.Effect(Msg) {
-    let model = state.0
-    case msg, model.high_score_pending {
-      SetName, _ ->
-        case model.has_name {
-          True -> effect.every(150, fn() { Tick })
-          False -> effect.none()
-        }
-      Tick, True ->
-        effect.from(fn(dispatch) {
-          let entry = model.player_name <> ": " <> int.to_string(model.score)
-          store.append(high_scores, "scores", entry)
-          dispatch(HighScoreUpdated)
-        })
-      _, _ -> effect.none()
-    }
+fn pick(points: List(Point)) -> Point {
+  // Invariant: the caller passes a non-empty list, so the index is in range.
+  let assert Ok(point) =
+    list.drop(points, int.random(list.length(points))) |> list.first
+  point
+}
+
+fn sync(model: Model) -> Model {
+  model
+}
+
+// --- Local (browser) ---
+
+pub fn init_local(_model: Model) -> Local {
+  Local(name_draft: "")
+}
+
+pub fn update_local(
+  _model: Model,
+  local: Local,
+  msg: Msg,
+) -> local.Update(Local) {
+  case msg {
+    NameChanged(text) -> local.handled(Local(name_draft: text))
+    StartGame(name) ->
+      case string.trim(name) {
+        "" -> local.handled(local)
+        _ -> local.forward(local)
+      }
+    KeyPressed(key) ->
+      case direction_for_key(key) {
+        Ok(_) -> local.forward(local)
+        Error(Nil) -> local.handled(local)
+      }
+    Tick | RestartGame | ScoresChanged -> local.forward(local)
   }
 }
 
 // --- View ---
 
-pub fn view(model: Model, _local: Nil) -> beacon.Node(Msg) {
-  case model.has_name {
-    False -> view_name_entry(model)
-    True -> view_game(model)
-  }
-}
-
-fn view_name_entry(model: Model) -> beacon.Node(Msg) {
+pub fn view(model: Model, local: Local) -> Element(Msg) {
   html.div(
     [
-      html.style(
-        "font-family:system-ui;max-width:600px;margin:2rem auto;text-align:center",
-      ),
+      attribute.styles([
+        #("font-family", "system-ui"),
+        #("max-width", "600px"),
+        #("margin", "2rem auto"),
+        #("padding", "0 1rem"),
+      ]),
     ],
     [
-      html.h1([], [html.text("Multiplayer Snake")]),
-      html.p([], [html.text("Enter your name:")]),
-      html.div([html.style("display:flex;gap:8px;justify-content:center")], [
-        html.input([
-          html.type_("text"),
-          html.placeholder("Your name..."),
-          html.value(model.name_input),
-          beacon.on_input(UpdateNameInput),
-        ]),
-        html.button([beacon.on_click(SetName)], [html.text("Play")]),
-      ]),
+      case model.phase {
+        NameEntry -> view_name_entry(local)
+        Playing | GameOver -> view_game(model)
+      },
+      view_high_scores(model.high_scores),
     ],
   )
 }
 
-fn view_game(model: Model) -> beacon.Node(Msg) {
-  let w = int.to_string(grid_w * cell_size)
-  let h = int.to_string(grid_h * cell_size)
+fn view_name_entry(local: Local) -> Element(Msg) {
+  html.div([attribute.style("text-align", "center")], [
+    html.h1([], [html.text("Snake")]),
+    html.form(
+      [
+        event.on_submit(fn(_fields) { StartGame(local.name_draft) }),
+        attribute.styles([
+          #("display", "flex"),
+          #("gap", "8px"),
+          #("justify-content", "center"),
+        ]),
+      ],
+      [
+        html.input([
+          attribute.type_("text"),
+          attribute.placeholder("Your name..."),
+          attribute.aria("label", "Your name"),
+          attribute.value(local.name_draft),
+          event.on_input(NameChanged),
+        ]),
+        html.button([attribute.type_("submit")], [html.text("Play")]),
+      ],
+    ),
+  ])
+}
+
+fn view_game(model: Model) -> Element(Msg) {
+  let width = int.to_string(grid_width * cell_size)
+  let height = int.to_string(grid_height * cell_size)
   html.div(
     [
-      html.style("font-family:system-ui;max-width:600px;margin:2rem auto"),
-      beacon.on_keydown(fn(key) {
-        case key {
-          "ArrowUp" -> ChangeDirection(Up)
-          "ArrowDown" -> ChangeDirection(Down)
-          "ArrowLeft" -> ChangeDirection(Left)
-          "ArrowRight" -> ChangeDirection(Right)
-          _ -> Tick
-        }
-      }),
-      html.attribute("tabindex", "0"),
+      event.on_keydown(KeyPressed),
+      attribute.tabindex(0),
+      attribute.autofocus(True),
+      attribute.data("board", "true"),
+      attribute.style("outline", "none"),
     ],
     [
-      html.h1([], [html.text("Snake — " <> model.player_name)]),
+      html.h1([], [html.text("Snake: " <> model.player_name)]),
       html.p([], [
-        html.text(
-          "Score: " <> int.to_string(model.score) <> " | Use arrow keys",
-        ),
+        html.text("Score: "),
+        html.span([attribute.id("score")], [
+          html.text(int.to_string(model.score)),
+        ]),
+        html.text(" | Click the board, then use the arrow keys"),
       ]),
-      // Game board
-      html.element(
-        "svg",
+      svg.svg(
         [
-          html.attribute("viewBox", "0 0 " <> w <> " " <> h),
-          html.attribute("width", w),
-          html.attribute("height", h),
-          html.style(
-            "border:2px solid #333;border-radius:4px;background:#1a1a2e;display:block",
-          ),
+          svg.viewbox("0 0 " <> width <> " " <> height),
+          svg.width(width),
+          svg.height(height),
+          attribute.styles([
+            #("border", "2px solid #333"),
+            #("border-radius", "4px"),
+            #("background", "#1a1a2e"),
+            #("display", "block"),
+          ]),
         ],
         list.flatten([
-          // Food
-          [render_cell(model.food, "#ff4444", cell_size)],
-          // Snake
-          list.index_map(model.snake, fn(p, i) {
-            let color = case i {
+          [render_cell(model.food, "#ff4444")],
+          list.index_map(model.snake, fn(point, i) {
+            render_cell(point, case i {
               0 -> "#44ff44"
               _ -> "#22cc22"
-            }
-            render_cell(p, color, cell_size)
+            })
           }),
-          // Game over overlay
-          case model.game_state {
+          case model.phase {
             GameOver -> [
-              html.element(
-                "text",
+              svg.text(
                 [
-                  html.attribute("x", int.to_string(grid_w * cell_size / 2)),
-                  html.attribute("y", int.to_string(grid_h * cell_size / 2)),
-                  html.attribute("text-anchor", "middle"),
-                  html.attribute("fill", "white"),
-                  html.attribute("font-size", "32"),
+                  svg.x(int.to_string(grid_width * cell_size / 2)),
+                  svg.y(int.to_string(grid_height * cell_size / 2)),
+                  attribute.attribute("text-anchor", "middle"),
+                  attribute.attribute("font-size", "32"),
+                  svg.fill("white"),
                 ],
                 [html.text("GAME OVER")],
               ),
             ]
-            Playing -> []
+            NameEntry | Playing -> []
           },
         ]),
       ),
-      case model.game_state {
+      case model.phase {
         GameOver ->
           html.button(
             [
-              beacon.on_click(RestartGame),
-              html.style("margin-top:1rem;padding:8px 16px;font-size:16px"),
+              event.on_click(RestartGame),
+              attribute.styles([
+                #("margin-top", "1rem"),
+                #("padding", "8px 16px"),
+                #("font-size", "16px"),
+              ]),
             ],
             [html.text("Play Again")],
           )
-        Playing -> html.text("")
+        NameEntry | Playing -> element.none()
       },
     ],
   )
 }
 
-fn render_cell(p: Point, color: String, size: Int) -> beacon.Node(Msg) {
-  html.element(
-    "rect",
-    [
-      html.attribute("x", int.to_string(p.x * size + 1)),
-      html.attribute("y", int.to_string(p.y * size + 1)),
-      html.attribute("width", int.to_string(size - 2)),
-      html.attribute("height", int.to_string(size - 2)),
-      html.attribute("fill", color),
-      html.attribute("rx", "3"),
-    ],
-    [],
-  )
+fn render_cell(point: Point, colour: String) -> Element(Msg) {
+  svg.rect([
+    svg.x(int.to_string(point.x * cell_size + 1)),
+    svg.y(int.to_string(point.y * cell_size + 1)),
+    svg.width(int.to_string(cell_size - 2)),
+    svg.height(int.to_string(cell_size - 2)),
+    svg.rx("3"),
+    svg.fill(colour),
+  ])
+}
+
+fn view_high_scores(high_scores: List(HighScore)) -> Element(Msg) {
+  html.div([attribute.style("margin-top", "1.5rem")], [
+    html.h2([attribute.style("font-size", "1.1rem")], [
+      html.text("High scores"),
+    ]),
+    case high_scores {
+      [] ->
+        html.p([attribute.style("color", "#999")], [html.text("No scores yet")])
+      _ ->
+        html.ol(
+          [attribute.id("high-scores")],
+          list.map(high_scores, fn(entry) {
+            html.li([], [
+              html.text(entry.name <> ": " <> int.to_string(entry.score)),
+            ])
+          }),
+        )
+    },
+  ])
 }
 
 // --- Start ---
 
 pub fn main() {
-  start()
-}
-
-pub fn start() {
-  let high_scores = store.new_list("snake_scores")
-
-  beacon.app(
-    fn() { #(init(), effect.none()) },
-    beacon.no_local,
-    beacon.no_server,
-    update,
-    view,
+  let scores = store.new_list("snake_scores")
+  beacon.full_application(
+    init: fn(_ctx) { init(scores) },
+    update: fn(model, msg) { update(scores, model, msg) },
+    sync:,
+    local: local.layer(init: init_local, update: update_local),
+    view:,
   )
-  |> beacon.on_update(make_on_update(high_scores))
-  |> beacon.title("Multiplayer Snake")
-  |> beacon.subscriptions(fn(_model) { ["store:snake_scores"] })
-  |> beacon.on_notify(fn(_topic) { HighScoreUpdated })
+  |> beacon.title(fn(_model) { "Snake" })
+  |> beacon.subscriptions(fn(_model) { [store.list_topic(scores)] })
+  |> beacon.on_notify(fn(_topic) { ScoresChanged })
   |> beacon.start(8080)
 }

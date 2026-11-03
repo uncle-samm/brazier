@@ -1,14 +1,14 @@
 /// Test application configurations for simulation testing.
 /// Each function starts a real Beacon app on an OS-assigned port (port 0);
 /// read the bound port from the returned `App.port`.
+import beacon/app_config_fixture
 import beacon/application
+import beacon/attribute
 import beacon/effect
-import beacon/element
 import beacon/error
-import beacon/middleware
+import beacon/html
 import beacon/transport
 import gleam/int
-import gleam/option
 
 /// Simple counter app — accepts "inc" events, renders "count:N".
 pub type CounterModel {
@@ -40,43 +40,30 @@ pub fn start_counter_app_with_limits(
 ) -> Result(application.App, error.BeaconError) {
   let config =
     application.AppConfig(
-      port: 0,
-      init: fn() { #(CounterModel(count: 0), effect.none()) },
-      update: fn(model: CounterModel, _msg) {
-        #(CounterModel(count: model.count + 1), effect.none())
-      },
-      view: fn(model: CounterModel) {
-        element.el("div", [element.attr("id", "app")], [
-          element.text("count:" <> int.to_string(model.count)),
-        ])
-      },
-      decode_event: option.Some(fn(_name, _handler_id, _data, _path) {
-        // Accept ALL handler IDs — simulation tests send various IDs
-        // (h0=mousedown, h1=mouseup, h2=mousemove, inc, etc.)
-        Ok(CounterInc)
-      }),
-      secret_key: "sim-test-secret-key-long-enough-for-hmac!!",
-      title: "Sim Counter",
-      serialize_model: option.Some(fn(model: CounterModel) {
-        "{\"count\":" <> int.to_string(model.count) <> "}"
-      }),
-      deserialize_model: option.None,
-      middlewares: [middleware.secure_headers()],
-      static_dir: option.None,
-      route_patterns: [],
-      on_route_change: option.None,
-      on_route_leave: option.None,
-      dynamic_subscriptions: option.None,
-      on_notify: option.None,
-      on_notification: option.None,
+      ..app_config_fixture.new(
+        port: 0,
+        init: fn(_ctx) { #(CounterModel(count: 0), effect.none()) },
+        update: fn(model: CounterModel, _msg) {
+          #(CounterModel(count: model.count + 1), effect.none())
+        },
+        view: fn(model: CounterModel) {
+          html.div([attribute.id("app")], [
+            html.text("count:" <> int.to_string(model.count)),
+          ])
+        },
+        encode_model: fn(model: CounterModel) {
+          "{\"count\":" <> int.to_string(model.count) <> "}"
+        },
+        decode_event: fn(_name, _handler_id, _data, _path) {
+          // Accept ALL handler IDs — simulation tests send various IDs
+          // (h0=mousedown, h1=mouseup, h2=mousemove, inc, etc.)
+          Ok(CounterInc)
+        },
+      ),
+      title: fn(_model) { "Sim Counter" },
       security_limits: limits,
-      head_html: option.None,
-      api_handler: option.None,
-      ws_auth: option.None,
-      init_from_request: option.None,
-      dev_mode: False,
     )
-  application.start_advanced(config)
+  application.start(config)
 }
 
 /// Ticker app — uses effect.every to auto-increment on a timer.
@@ -94,41 +81,26 @@ pub fn start_ticker_app(
 ) -> Result(application.App, error.BeaconError) {
   let config =
     application.AppConfig(
-      port: 0,
-      init: fn() {
-        #(TickerModel(tick: 0), effect.every(interval_ms, fn() { Tick }))
-      },
-      update: fn(model: TickerModel, _msg) {
-        #(TickerModel(tick: model.tick + 1), effect.none())
-      },
-      view: fn(model: TickerModel) {
-        element.el("div", [element.attr("id", "app")], [
-          element.text("tick:" <> int.to_string(model.tick)),
-        ])
-      },
-      decode_event: option.Some(fn(_name, _handler_id, _data, _path) {
-        Ok(Tick)
-      }),
-      secret_key: "sim-ticker-secret-key-long-enough-for-hmac!!",
-      title: "Sim Ticker",
-      serialize_model: option.Some(fn(model: TickerModel) {
-        "{\"tick\":" <> int.to_string(model.tick) <> "}"
-      }),
-      deserialize_model: option.None,
-      middlewares: [middleware.secure_headers()],
-      static_dir: option.None,
-      route_patterns: [],
-      on_route_change: option.None,
-      on_route_leave: option.None,
-      dynamic_subscriptions: option.None,
-      on_notify: option.None,
-      on_notification: option.None,
+      ..app_config_fixture.new(
+        port: 0,
+        init: fn(_ctx) {
+          #(TickerModel(tick: 0), effect.every(interval_ms, fn() { Tick }))
+        },
+        update: fn(model: TickerModel, _msg) {
+          #(TickerModel(tick: model.tick + 1), effect.none())
+        },
+        view: fn(model: TickerModel) {
+          html.div([attribute.id("app")], [
+            html.text("tick:" <> int.to_string(model.tick)),
+          ])
+        },
+        encode_model: fn(model: TickerModel) {
+          "{\"tick\":" <> int.to_string(model.tick) <> "}"
+        },
+        decode_event: fn(_name, _handler_id, _data, _path) { Ok(Tick) },
+      ),
+      title: fn(_model) { "Sim Ticker" },
       security_limits: sim_security_limits(),
-      head_html: option.None,
-      api_handler: option.None,
-      ws_auth: option.None,
-      init_from_request: option.None,
-      dev_mode: False,
     )
-  application.start_advanced(config)
+  application.start(config)
 }

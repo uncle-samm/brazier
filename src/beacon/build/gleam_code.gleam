@@ -58,6 +58,9 @@ pub type TypeExpr {
   TNamed(module: Option(String), name: String, params: List(TypeExpr))
   TTuple(elements: List(TypeExpr))
   TFn(params: List(TypeExpr), return: TypeExpr)
+  /// `_`: a type the compiler infers. Used where the generated code wraps a
+  /// user function whose parameter types it does not need to name.
+  THole
 }
 
 pub type Expr {
@@ -314,6 +317,7 @@ fn validate_type(type_: TypeExpr) -> Result(Nil, String) {
       use Nil <- result.try(list.try_each(params, validate_type))
       validate_type(return)
     }
+    THole -> Ok(Nil)
   }
 }
 
@@ -446,6 +450,7 @@ fn type_modules(acc: Set(String), type_: TypeExpr) -> Set(String) {
     TTuple(elements) -> list.fold(elements, acc, type_modules)
     TFn(params, return) ->
       type_modules(list.fold(params, acc, type_modules), return)
+    THole -> acc
   }
 }
 
@@ -546,6 +551,7 @@ pub fn render_type(type_: TypeExpr) -> String {
       <> string.join(list.map(params, render_type), ", ")
       <> ") -> "
       <> render_type(return)
+    THole -> "_"
   }
 }
 

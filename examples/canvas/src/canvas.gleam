@@ -1,426 +1,446 @@
-/// Collaborative Canvas — demonstrates:
-/// - Pure update + on_update pattern (LOCAL events for instant drawing)
-/// - Shared store for strokes (multi-user concurrent drawing)
-/// - Dynamic PubSub subscriptions
-/// - SVG rendering with real-time updates
-/// - Mouse events (mousedown, mousemove, mouseup)
-///
-/// LOCAL events (zero server traffic):
-///   StartDrawing, MoveCursor, StopDrawing
-///
-/// MODEL events (synced to server):
-///   SetColor, ClearCanvas, StrokesUpdated
+/// Collaborative canvas, demonstrating:
+/// - a pointer trail in Local state: `mousemove` is decoded with
+///   `event.mouse_position`, throttled, and handled in the browser, so a
+///   stroke costs no traffic while it is drawn;
+/// - a finished stroke forwarded to the server in one message, which the
+///   view builds from Local state;
+/// - strokes shared by every session in a `beacon/store` list, re-read when
+///   any session draws or clears;
+/// - SVG rendering with `beacon/svg`.
 import beacon
-import beacon/effect
-import beacon/element
+import beacon/attribute
+import beacon/effect.{type Effect}
+import beacon/element.{type Element}
+import beacon/event
 import beacon/html
+import beacon/local
 import beacon/log
-import beacon/pubsub
-import beacon/store
+import beacon/store.{type ListStore}
+import beacon/svg
+import gleam/dynamic/decode
+import gleam/float
 import gleam/int
 import gleam/list
-import gleam/result
+import gleam/option.{type Option, None, Some}
 import gleam/string
 
 // --- Types ---
 
+pub type Point {
+  Point(x: Int, y: Int)
+}
+
+/// One pen-down to pen-up trail.
 pub type Stroke {
-  Stroke(x1: Int, y1: Int, x2: Int, y2: Int, color: String)
+  Stroke(colour: String, points: List(Point))
 }
 
+/// Synced to the browser. The server holds nothing else, so it is also the
+/// server state.
 pub type Model {
-  Model(strokes: List(Stroke), color: String)
+  Model(
+    strokes: List(Stroke),
+    /// How many `PenUp` messages from this session the server has handled,
+    /// accepted or rejected.
+    pen_ups: Int,
+  )
 }
 
+/// A stroke sent to the server. `number` is the value `Model.pen_ups` takes
+/// once the server has handled it.
+pub type Sent {
+  Sent(number: Int, stroke: Stroke)
+}
+
+/// Client-only.
 pub type Local {
   Local(
-    drawing: Bool,
-    cursor_x: Int,
-    cursor_y: Int,
-    pending_strokes: List(Stroke),
+    colour: String,
+    /// The stroke being drawn, newest point first.
+    drawing: Option(Stroke),
+    /// Sent strokes the server has not handled yet, newest first. The view
+    /// draws them, so a stroke does not blink out while the server's update
+    /// is in flight.
+    sent: List(Sent),
   )
 }
 
 pub type Msg {
-  StartDrawing(String)
-  MoveCursor(String)
-  StopDrawing(String)
-  SetColor(String)
+  PenDown(Point)
+  PenMoved(Point)
+  /// The finished stroke, oldest point first.
+  PenUp(Stroke)
+  ColourPicked(String)
   ClearCanvas
-  StrokesUpdated
-  /// Received from on_update after reading shared store — sets authoritative strokes.
-  SetStrokes(List(Stroke))
+  /// A session (this one included) drew or cleared.
+  StrokesChanged
 }
 
-// --- Init ---
+const width = 760
 
-pub fn init() -> Model {
-  Model(strokes: [], color: "#000000")
+const height = 500
+
+const palette = [
+  "#000000", "#ff0000", "#0000ff", "#00aa00", "#ff8800", "#8800ff",
+]
+
+/// About 60 samples a second while the pointer moves.
+const move_throttle_ms = 16
+
+const max_points_per_stroke = 2000
+
+const max_strokes = 2000
+
+const strokes_key = "canvas"
+
+// --- Server ---
+
+fn read_strokes(strokes: ListStore(Stroke)) -> List(Stroke) {
+  store.get_all(strokes, strokes_key)
 }
 
-pub fn init_local(_model: Model) -> Local {
-  Local(drawing: False, cursor_x: 0, cursor_y: 0, pending_strokes: [])
+fn init(strokes: ListStore(Stroke)) -> #(Model, Effect(Msg)) {
+  #(Model(strokes: read_strokes(strokes), pen_ups: 0), effect.none())
 }
 
-// --- Update (pure — no stores, compiles to JS) ---
-
-pub fn update(
+fn update(
+  strokes: ListStore(Stroke),
   model: Model,
-  local: Local,
-  _server: Nil,
   msg: Msg,
-) -> #(Model, Local, Nil) {
-  let #(model, local) = case msg {
-    StartDrawing(coords) -> {
-      case parse_coords(coords) {
-        Ok(#(x, y)) -> #(
-          model,
-          Local(..local, drawing: True, cursor_x: x, cursor_y: y),
-        )
-        Error(reason) -> {
-          log.warning("canvas", "Invalid start-drawing coordinates: " <> reason)
-          #(model, local)
-        }
-      }
-    }
-
-    MoveCursor(coords) -> {
-      case parse_coords(coords) {
-        Ok(#(x, y)) -> {
-          case local.drawing {
-            True -> {
-              let stroke =
-                Stroke(
-                  x1: local.cursor_x,
-                  y1: local.cursor_y,
-                  x2: x,
-                  y2: y,
-                  color: model.color,
-                )
-              #(
-                model,
-                Local(..local, cursor_x: x, cursor_y: y, pending_strokes: [
-                  stroke,
-                  ..local.pending_strokes
-                ]),
-              )
-            }
-            False -> #(model, Local(..local, cursor_x: x, cursor_y: y))
-          }
-        }
-        Error(reason) -> {
-          log.warning("canvas", "Invalid cursor coordinates: " <> reason)
-          #(model, local)
-        }
-      }
-    }
-    StopDrawing(coords) -> {
-      case parse_stroke_trail(coords, model.color) {
-        Ok(trail_strokes) -> {
-          let committed_strokes = case local.pending_strokes {
-            [] -> trail_strokes
-            pending -> list.reverse(pending)
-          }
-          let committed = list.append(model.strokes, committed_strokes)
+) -> #(Model, Effect(Msg)) {
+  case msg {
+    PenUp(stroke) -> {
+      let model = Model(..model, pen_ups: model.pen_ups + 1)
+      case validate_stroke(stroke, list.length(model.strokes)) {
+        Ok(stroke) -> {
+          log.info(
+            "canvas",
+            "Stroke of "
+              <> int.to_string(list.length(stroke.points))
+              <> " points in "
+              <> stroke.colour,
+          )
+          // Shown at once; `StrokesChanged` re-reads the store, other
+          // sessions' strokes included.
           #(
-            Model(..model, strokes: committed),
-            Local(..local, drawing: False, pending_strokes: []),
+            Model(..model, strokes: list.append(model.strokes, [stroke])),
+            effect.from(fn(_dispatch) {
+              store.append(strokes, strokes_key, stroke)
+            }),
           )
         }
         Error(reason) -> {
-          log.warning("canvas", "Invalid stop-drawing coordinates: " <> reason)
-          #(model, Local(..local, drawing: False, pending_strokes: []))
+          log.warning("canvas", "Rejected a stroke: " <> reason)
+          #(model, effect.none())
         }
       }
     }
-
-    SetColor(c) -> #(Model(..model, color: c), local)
-
-    ClearCanvas -> #(Model(..model, strokes: []), local)
-
-    StrokesUpdated -> #(model, local)
-
-    SetStrokes(strokes) -> {
-      // Only update if strokes actually changed (avoid feedback loops)
-      case list.length(strokes) == list.length(model.strokes) {
-        True -> #(model, local)
-        False -> #(Model(..model, strokes: strokes), local)
-      }
+    ClearCanvas -> {
+      log.info("canvas", "Canvas cleared")
+      #(
+        Model(..model, strokes: []),
+        effect.from(fn(_dispatch) { store.delete_all(strokes, strokes_key) }),
+      )
     }
+    StrokesChanged -> #(
+      Model(..model, strokes: read_strokes(strokes)),
+      effect.none(),
+    )
+    // `update_local` handles these in the browser and never forwards them.
+    PenDown(_) | PenMoved(_) | ColourPicked(_) -> #(model, effect.none())
   }
-  #(model, local, Nil)
 }
 
-// --- Side Effects (server only — store writes) ---
+/// The browser builds strokes, so the server checks every field.
+fn validate_stroke(stroke: Stroke, existing: Int) -> Result(Stroke, String) {
+  let point_count = list.length(stroke.points)
+  case
+    list.contains(palette, stroke.colour),
+    point_count,
+    list.find(stroke.points, fn(p) { !in_bounds(p) })
+  {
+    _, _, _ if existing >= max_strokes ->
+      Error("the canvas holds " <> int.to_string(max_strokes) <> " strokes")
+    False, _, _ -> Error("colour " <> string.inspect(stroke.colour))
+    True, 0, _ -> Error("no points")
+    True, n, _ if n > max_points_per_stroke ->
+      Error(
+        int.to_string(n)
+        <> " points (max "
+        <> int.to_string(max_points_per_stroke)
+        <> ")",
+      )
+    True, _, Ok(p) ->
+      Error(
+        "point ("
+        <> int.to_string(p.x)
+        <> ","
+        <> int.to_string(p.y)
+        <> ") outside the canvas",
+      )
+    True, _, Error(Nil) -> Ok(stroke)
+  }
+}
 
-fn make_on_update(
-  stroke_store: store.ListStore(Stroke),
-) -> fn(#(Model, Local, Nil), Msg) -> effect.Effect(Msg) {
-  fn(state: #(Model, Local, Nil), msg: Msg) -> effect.Effect(Msg) {
-    let #(_model, _local, _server) = state
-    case msg {
-      StopDrawing(_) -> {
-        let #(model, _local, _server) = state
-        // Only append NEW strokes to the store (not the full list).
-        // Compare store length vs model length to find the delta.
-        // This ensures the diff detects "append" instead of "replace".
-        effect.from(fn(_dispatch) {
-          let store_count = list.length(store.get_all(stroke_store, "canvas"))
-          let model_count = list.length(model.strokes)
-          case model_count > store_count {
-            True -> {
-              // New strokes = tail of model.strokes beyond what's in the store
-              let new_strokes = list.drop(model.strokes, store_count)
-              store.append_many(stroke_store, "canvas", new_strokes)
-              pubsub.broadcast("store:canvas_strokes", Nil)
-            }
-            False -> Nil
-          }
-        })
+fn in_bounds(point: Point) -> Bool {
+  point.x >= 0 && point.x <= width && point.y >= 0 && point.y <= height
+}
+
+fn sync(model: Model) -> Model {
+  model
+}
+
+// --- Local (browser) ---
+
+pub fn init_local(_model: Model) -> Local {
+  Local(colour: "#000000", drawing: None, sent: [])
+}
+
+pub fn update_local(
+  model: Model,
+  local: Local,
+  msg: Msg,
+) -> local.Update(Local) {
+  case msg {
+    PenDown(point) ->
+      local.handled(
+        Local(
+          ..local,
+          drawing: Some(Stroke(colour: local.colour, points: [point])),
+          sent: awaiting(model, local),
+        ),
+      )
+    PenMoved(point) ->
+      case local.drawing {
+        Some(stroke) ->
+          local.handled(
+            Local(
+              ..local,
+              drawing: Some(Stroke(..stroke, points: [point, ..stroke.points])),
+            ),
+          )
+        None -> local.handled(local)
       }
-      ClearCanvas ->
-        effect.from(fn(_dispatch) {
-          store.delete_all_notify(stroke_store, "canvas", "canvas:")
-        })
-      StrokesUpdated -> {
-        // Reload strokes from store (another user drew something).
-        // Only dispatch if store has MORE strokes than our model (avoids feedback).
-        let #(model, _local, _server) = state
-        let store_strokes = store.get_all(stroke_store, "canvas")
-        case list.length(store_strokes) > list.length(model.strokes) {
-          True ->
-            effect.from(fn(dispatch) { dispatch(SetStrokes(store_strokes)) })
-          False -> effect.none()
-        }
-      }
-      _ -> effect.none()
+    // The view attaches `PenUp` only while drawing.
+    PenUp(stroke) -> {
+      let still_awaiting = awaiting(model, local)
+      // The awaiting strokes hold the numbers after the server's count, so
+      // this one follows them. Counting from the server's number keeps the
+      // numbering right even if the server handled a PenUp this layer never
+      // saw.
+      let number = model.pen_ups + list.length(still_awaiting) + 1
+      local.forward(
+        Local(..local, drawing: None, sent: [
+          Sent(number:, stroke:),
+          ..still_awaiting
+        ]),
+      )
     }
+    ColourPicked(colour) -> local.handled(Local(..local, colour:))
+    ClearCanvas -> local.forward(Local(..local, drawing: None))
+    StrokesChanged -> local.forward(local)
   }
 }
 
 // --- View ---
 
-pub fn view(model: Model, local: Local) -> beacon.Node(Msg) {
-  let all_strokes = list.append(model.strokes, local.pending_strokes)
+pub fn view(model: Model, local: Local) -> Element(Msg) {
+  let finishing = case local.drawing {
+    Some(stroke) -> [
+      event.on_mouse_up(PenUp(finished(stroke))),
+      event.on_mouse_leave(PenUp(finished(stroke))),
+    ]
+    None -> []
+  }
+  let in_progress = case local.drawing {
+    Some(stroke) -> [stroke]
+    None -> []
+  }
   html.div(
     [
-      html.style(
-        "font-family:system-ui;max-width:800px;margin:2rem auto;padding:0 1rem",
-      ),
+      attribute.styles([
+        #("font-family", "system-ui"),
+        #("max-width", "800px"),
+        #("margin", "2rem auto"),
+        #("padding", "0 1rem"),
+      ]),
     ],
     [
       html.h1([], [html.text("Collaborative Canvas")]),
-      html.p([html.style("color:#666;margin-bottom:1rem")], [
-        html.text(
-          "Draw together! Open multiple tabs. Strokes: "
-          <> int.to_string(list.length(all_strokes)),
-        ),
-      ]),
-      // Color picker
+      html.p(
+        [attribute.styles([#("color", "#666"), #("margin-bottom", "1rem")])],
+        [
+          html.text(
+            "Draw together in several tabs. Strokes: "
+            <> int.to_string(list.length(model.strokes)),
+          ),
+        ],
+      ),
       html.div(
         [
-          html.style(
-            "margin-bottom:1rem;display:flex;gap:8px;align-items:center",
-          ),
+          attribute.styles([
+            #("margin-bottom", "1rem"),
+            #("display", "flex"),
+            #("gap", "8px"),
+            #("align-items", "center"),
+          ]),
         ],
-        [
-          color_button("#000000", model.color),
-          color_button("#ff0000", model.color),
-          color_button("#0000ff", model.color),
-          color_button("#00aa00", model.color),
-          color_button("#ff8800", model.color),
-          color_button("#8800ff", model.color),
-          html.button(
-            [
-              beacon.on_click(ClearCanvas),
-              html.style(
-                "margin-left:auto;padding:6px 16px;background:#f44336;color:white;border:none;border-radius:4px;cursor:pointer",
-              ),
-            ],
-            [html.text("Clear")],
-          ),
-        ],
-      ),
-      // SVG Canvas
-      element.el(
-        "svg",
-        [
-          html.attribute("width", "760"),
-          html.attribute("height", "500"),
-          html.attribute("viewBox", "0 0 760 500"),
-          html.style(
-            "border:2px solid #ddd;border-radius:8px;background:#fafafa;cursor:crosshair;display:block",
-          ),
-          beacon.on_mousedown(StartDrawing),
-          beacon.on_mousemove(MoveCursor),
-          beacon.on_mouseup(StopDrawing),
-        ],
-        list.map(all_strokes, render_stroke),
-      ),
-      // Status
-      html.div([html.style("margin-top:0.5rem;font-size:0.85rem;color:#999")], [
-        html.text("Color: "),
-        element.el(
-          "span",
+        list.append(
+          list.map(palette, fn(colour) { colour_button(colour, local.colour) }),
           [
-            html.style(
-              "display:inline-block;width:16px;height:16px;background:"
-              <> model.color
-              <> ";border-radius:3px;vertical-align:middle",
+            html.button(
+              [
+                event.on_click(ClearCanvas),
+                attribute.styles([
+                  #("margin-left", "auto"),
+                  #("padding", "6px 16px"),
+                  #("background", "#f44336"),
+                  #("color", "white"),
+                  #("border", "none"),
+                  #("border-radius", "4px"),
+                  #("cursor", "pointer"),
+                ]),
+              ],
+              [html.text("Clear")],
             ),
           ],
-          [],
         ),
-        html.text(
-          " | "
-          <> case local.drawing {
-            True ->
-              "Drawing at ("
-              <> int.to_string(local.cursor_x)
-              <> ","
-              <> int.to_string(local.cursor_y)
-              <> ")"
-            False -> "Click and drag to draw"
-          },
-        ),
-      ]),
+      ),
+      svg.svg(
+        [
+          attribute.data("canvas", ""),
+          svg.width(int.to_string(width)),
+          svg.height(int.to_string(height)),
+          svg.viewbox(
+            "0 0 " <> int.to_string(width) <> " " <> int.to_string(height),
+          ),
+          attribute.styles([
+            #("border", "2px solid #ddd"),
+            #("border-radius", "8px"),
+            #("background", "#fafafa"),
+            #("cursor", "crosshair"),
+            #("display", "block"),
+          ]),
+          // Prevented so a drag draws instead of selecting text.
+          event.on("mousedown", decode.map(position(), PenDown))
+            |> event.prevent_default,
+          event.on("mousemove", decode.map(position(), PenMoved))
+            |> event.throttle(move_throttle_ms),
+          ..finishing
+        ],
+        // Strokes ignore the pointer, so `offsetX` and `offsetY` are always
+        // relative to the canvas.
+        [
+          svg.g(
+            [attribute.attribute("pointer-events", "none")],
+            list.map(
+              list.flatten([
+                model.strokes,
+                awaiting(model, local)
+                  |> list.reverse
+                  |> list.map(fn(sent) { sent.stroke }),
+                in_progress,
+              ]),
+              render_stroke,
+            ),
+          ),
+        ],
+      ),
+      html.div(
+        [
+          attribute.styles([
+            #("margin-top", "0.5rem"),
+            #("font-size", "0.85rem"),
+            #("color", "#999"),
+          ]),
+        ],
+        [
+          html.text(case local.drawing, list.length(model.strokes) {
+            _, count if count >= max_strokes ->
+              "The canvas is full. Clear it to draw more."
+            Some(stroke), _ ->
+              "Drawing, "
+              <> int.to_string(list.length(stroke.points))
+              <> " points"
+            None, _ -> "Click and drag to draw"
+          }),
+        ],
+      ),
     ],
   )
 }
 
-fn render_stroke(stroke: Stroke) -> beacon.Node(Msg) {
-  element.el(
-    "line",
-    [
-      html.attribute("x1", int.to_string(stroke.x1)),
-      html.attribute("y1", int.to_string(stroke.y1)),
-      html.attribute("x2", int.to_string(stroke.x2)),
-      html.attribute("y2", int.to_string(stroke.y2)),
-      html.attribute("stroke", stroke.color),
-      html.attribute("stroke-width", "3"),
-      html.attribute("stroke-linecap", "round"),
-    ],
-    [],
-  )
+/// `#(offsetX, offsetY)` rounded to whole pixels.
+fn position() -> decode.Decoder(Point) {
+  use #(x, y) <- decode.then(event.mouse_position())
+  decode.success(Point(x: float.round(x), y: float.round(y)))
 }
 
-fn color_button(color: String, selected: String) -> beacon.Node(Msg) {
-  let border = case color == selected {
+/// Sent strokes the server has not handled yet, newest first. Once it has,
+/// the model holds the stroke, or the server rejected it, or a clear
+/// removed it.
+fn awaiting(model: Model, local: Local) -> List(Sent) {
+  list.filter(local.sent, fn(sent) { sent.number > model.pen_ups })
+}
+
+fn finished(stroke: Stroke) -> Stroke {
+  Stroke(..stroke, points: list.reverse(stroke.points))
+}
+
+fn render_stroke(stroke: Stroke) -> Element(Msg) {
+  // A single point is drawn as a dot: a zero-length line with round caps.
+  let points = case stroke.points {
+    [only] -> [only, only]
+    points -> points
+  }
+  svg.polyline([
+    svg.points(
+      list.map(points, fn(p) { int.to_string(p.x) <> "," <> int.to_string(p.y) })
+      |> string.join(" "),
+    ),
+    svg.fill("none"),
+    svg.stroke(stroke.colour),
+    svg.stroke_width("3"),
+    svg.stroke_linecap("round"),
+    svg.stroke_linejoin("round"),
+  ])
+}
+
+fn colour_button(colour: String, selected: String) -> Element(Msg) {
+  let border = case colour == selected {
     True -> "3px solid #333"
     False -> "1px solid #ccc"
   }
   html.button(
     [
-      beacon.on_click(SetColor(color)),
-      html.style(
-        "width:32px;height:32px;background:"
-        <> color
-        <> ";border:"
-        <> border
-        <> ";border-radius:4px;cursor:pointer",
-      ),
+      event.on_click(ColourPicked(colour)),
+      attribute.aria("label", "Colour " <> colour),
+      attribute.styles([
+        #("width", "32px"),
+        #("height", "32px"),
+        #("background", colour),
+        #("border", border),
+        #("border-radius", "4px"),
+        #("cursor", "pointer"),
+      ]),
     ],
     [],
   )
 }
 
-fn parse_coords(coords: String) -> Result(#(Int, Int), String) {
-  case string.split(coords, ",") {
-    [x_str, y_str] -> {
-      case int.parse(x_str), int.parse(y_str) {
-        Ok(x), Ok(y) -> Ok(#(x, y))
-        Error(_), Ok(_) -> Error("invalid x value `" <> x_str <> "`")
-        Ok(_), Error(_) -> Error("invalid y value `" <> y_str <> "`")
-        Error(_), Error(_) ->
-          Error(
-            "invalid x value `" <> x_str <> "` and y value `" <> y_str <> "`",
-          )
-      }
-    }
-    _ -> Error("expected `x,y`, got `" <> coords <> "`")
-  }
-}
-
-fn parse_stroke_trail(
-  coords: String,
-  color: String,
-) -> Result(List(Stroke), String) {
-  string.split(coords, ";")
-  |> parse_points([])
-  |> result.map(strokes_from_points(_, color))
-}
-
-fn parse_points(
-  chunks: List(String),
-  parsed: List(#(Int, Int)),
-) -> Result(List(#(Int, Int)), String) {
-  case chunks {
-    [] -> Ok(list.reverse(parsed))
-    [chunk, ..rest] -> {
-      case parse_coords(chunk) {
-        Ok(point) -> parse_points(rest, [point, ..parsed])
-        Error(reason) -> Error(reason)
-      }
-    }
-  }
-}
-
-fn strokes_from_points(points: List(#(Int, Int)), color: String) -> List(Stroke) {
-  case points {
-    [first, second, ..rest] ->
-      strokes_from_points_loop(first, [second, ..rest], color, [])
-    _ -> []
-  }
-}
-
-fn strokes_from_points_loop(
-  previous: #(Int, Int),
-  points: List(#(Int, Int)),
-  color: String,
-  strokes: List(Stroke),
-) -> List(Stroke) {
-  case points {
-    [] -> list.reverse(strokes)
-    [point, ..rest] -> {
-      let #(x1, y1) = previous
-      let #(x2, y2) = point
-      let next_strokes = case x1 == x2 && y1 == y2 {
-        True -> strokes
-        False -> [
-          Stroke(x1: x1, y1: y1, x2: x2, y2: y2, color: color),
-          ..strokes
-        ]
-      }
-      strokes_from_points_loop(point, rest, color, next_strokes)
-    }
-  }
-}
-
 // --- Start ---
 
-pub fn start() {
-  let stroke_store = store.new_list("canvas_strokes")
-
-  // Init reads from shared store — new sessions see existing strokes
-  let init_from_store = fn() {
-    let strokes = store.get_all(stroke_store, "canvas")
-    Model(strokes: strokes, color: "#000000")
-  }
-
-  beacon.app(
-    fn() { #(init_from_store(), effect.none()) },
-    init_local,
-    beacon.no_server,
-    update,
-    view,
-  )
-  |> beacon.title("Collaborative Canvas")
-  |> beacon.on_update(make_on_update(stroke_store))
-  |> beacon.subscriptions(fn(_model) { ["store:canvas_strokes"] })
-  |> beacon.on_notify(fn(_topic) { StrokesUpdated })
-  |> beacon.start(8080)
-}
-
 pub fn main() {
-  start()
+  let strokes = store.new_list("canvas_strokes")
+  beacon.full_application(
+    init: fn(_ctx) { init(strokes) },
+    update: fn(model, msg) { update(strokes, model, msg) },
+    sync:,
+    local: local.layer(init: init_local, update: update_local),
+    view:,
+  )
+  |> beacon.title(fn(_model) { "Collaborative Canvas" })
+  |> beacon.subscriptions(fn(_model) { [store.list_topic(strokes)] })
+  |> beacon.on_notify(fn(_topic) { StrokesChanged })
+  |> beacon.start(8080)
 }

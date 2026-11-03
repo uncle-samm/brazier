@@ -2,15 +2,20 @@ import beacon/auth
 import beacon/cookie
 import beacon/effect
 import beacon/element
-import beacon/route
+import beacon/html
+import beacon/internal/context.{type Context}
 import beacon/session
 import beacon/ssr
 import gleam/bit_array
 import gleam/crypto
+import gleam/erlang/process.{type Subject}
 import gleam/http/request
 import gleam/json
+import gleam/list
 import gleam/option
 import gleam/string
+import gleam/uri.{type Uri}
+import simplifile
 
 // --- Test helpers ---
 
@@ -19,35 +24,79 @@ pub type TestModel {
 }
 
 pub type TestMsg {
-  NoOp
+  SetName(String)
 }
 
-fn test_init() -> #(TestModel, effect.Effect(TestMsg)) {
-  #(TestModel(name: "World"), effect.none())
+const test_secret = "test-secret-key-at-least-32-chars-long!!"
+
+fn test_view(model: TestModel) -> element.Element(TestMsg) {
+  html.div([], [html.h1([], [html.text("Hello, " <> model.name <> "!")])])
 }
 
-fn test_view(model: TestModel) -> element.Node(TestMsg) {
-  element.el("div", [], [
-    element.el("h1", [], [element.text("Hello, " <> model.name <> "!")]),
-  ])
+fn test_update(
+  _model: TestModel,
+  msg: TestMsg,
+) -> #(TestModel, effect.Effect(TestMsg)) {
+  case msg {
+    SetName(name) -> #(TestModel(name: name), effect.none())
+  }
 }
 
 fn test_config() -> ssr.SsrConfig(TestModel, TestMsg) {
   ssr.SsrConfig(
-    init: test_init,
+    init: fn(_ctx) { #(TestModel(name: "World"), effect.none()) },
+    update: test_update,
+    route: option.None,
     view: test_view,
-    secret_key: "test-secret-key-at-least-32-chars-long!!",
-    title: "Test Page",
+    title: fn(_model) { "Test Page" },
+    secret_key: test_secret,
     head_html: option.None,
     dev_mode: False,
-    serialize_model: option.None,
+    recovery_encoder: option.None,
   )
+}
+
+/// A router that knows "/" and "/about"; the route message renames the model
+/// after the page, so the rendered HTML shows that update ran.
+fn routed_config() -> ssr.SsrConfig(TestModel, TestMsg) {
+  ssr.SsrConfig(
+    ..test_config(),
+    init: fn(_ctx) { #(TestModel(name: "default"), effect.none()) },
+    route: option.Some(fn(page: Uri) {
+      case page.path {
+        "/" -> Ok(SetName("home"))
+        "/about" -> Ok(SetName("about"))
+        _ -> Error(Nil)
+      }
+    }),
+  )
+}
+
+/// An init that reports every call, to prove when the dead render runs it.
+fn reporting_config(
+  calls: Subject(Context),
+) -> ssr.SsrConfig(TestModel, TestMsg) {
+  ssr.SsrConfig(..routed_config(), init: fn(ctx) {
+    process.send(calls, ctx)
+    #(TestModel(name: "default"), effect.none())
+  })
+}
+
+fn render(config: ssr.SsrConfig(TestModel, TestMsg)) -> ssr.RenderedPage {
+  ssr.render_page(config, request.new())
+}
+
+fn render_path(
+  config: ssr.SsrConfig(TestModel, TestMsg),
+  path: String,
+) -> ssr.RenderedPage {
+  ssr.render_page(config, request.new() |> request.set_path(path))
 }
 
 // --- Tests ---
 
 pub fn render_page_produces_html_test() {
-  let page = ssr.render_page(test_config())
+  let page = render(test_config())
   // Verify doctype is at the very start of the HTML string
   let assert True = string.starts_with(page.html, "<!DOCTYPE html>")
   // Verify ORDER: <!DOCTYPE html> comes before <html> comes before </html>
@@ -56,61 +105,273 @@ pub fn render_page_produces_html_test() {
   let assert Ok(html_close_pos) = string_index_of(page.html, "</html>")
   let assert True = doctype_pos < html_open_pos
   let assert True = html_open_pos < html_close_pos
+  let assert 200 = page.status
 }
 
 pub fn render_page_includes_view_content_test() {
-  let page = ssr.render_page(test_config())
+  let page = render(test_config())
   let assert True = str_contains(page.html, "Hello, World!")
-  // Verify "Hello, World!" appears AFTER id="beacon-app" (content is inside the app root)
+  // "Hello, World!" appears AFTER id="beacon-app" (inside the app root)
   let assert Ok(app_pos) = string_index_of(page.html, "id=\"beacon-app\"")
   let assert Ok(content_pos) = string_index_of(page.html, "Hello, World!")
   let assert True = app_pos < content_pos
+  let assert True = str_contains(page.html, "<h1>Hello, World!</h1>")
 }
 
 pub fn render_page_includes_title_test() {
-  let page = ssr.render_page(test_config())
+  let page = render(test_config())
   let assert True = str_contains(page.html, "<title>Test Page</title>")
 }
 
+pub fn render_page_title_is_computed_from_the_rendered_state_test() {
+  let config =
+    ssr.SsrConfig(..routed_config(), title: fn(model: TestModel) {
+      "Page " <> model.name
+    })
+  let page = render_path(config, "/about")
+  let assert True = str_contains(page.html, "<title>Page about</title>")
+}
+
+pub fn render_page_escapes_the_title_test() {
+  let config =
+    ssr.SsrConfig(..test_config(), title: fn(_model) { "</title><script>" })
+  let page = render(config)
+  let assert False = str_contains(page.html, "</title><script>")
+}
+
 pub fn render_page_includes_script_tag_test() {
-  let page = ssr.render_page(test_config())
-  // Script tag should reference beacon_client (hashed or plain)
-  let assert True = str_contains(page.html, "<script src=\"/beacon_client")
-  let assert True = str_contains(page.html, "data-beacon-auto")
+  let page = render(test_config())
+  let assert Ok(bundle) = ssr.client_bundle_name(ssr.client_assets_dir())
+  let assert True =
+    str_contains(page.html, "<script src=\"/" <> bundle <> "\"></script>")
 }
 
-pub fn choose_client_assets_dir_prefers_local_manifest_test() {
-  let assert "priv/static" =
-    ssr.choose_client_assets_dir(True, "priv/static", "fallback/static")
+// --- The client bundle named by the manifest ---
+
+const bundle = "beacon_client_0123456789abcdef.js"
+
+@external(erlang, "beacon_test_ffi", "unique_ref")
+fn unique_ref() -> String
+
+/// A fresh assets directory with `manifest` as its manifest (when given) and
+/// the files in `bundles`.
+fn assets_dir(
+  manifest: option.Option(String),
+  bundles: List(String),
+) -> String {
+  let dir = "/tmp/beacon_ssr_assets_" <> unique_ref()
+  let assert Ok(Nil) = simplifile.create_directory_all(dir)
+  case manifest {
+    option.Some(text) -> {
+      let assert Ok(Nil) =
+        simplifile.write(dir <> "/beacon_client.manifest", text)
+      Nil
+    }
+    option.None -> Nil
+  }
+  list.each(bundles, fn(name) {
+    let assert Ok(Nil) = simplifile.write(dir <> "/" <> name, "start(App);")
+  })
+  dir
 }
 
-pub fn choose_client_assets_dir_falls_back_when_missing_test() {
-  let assert "fallback/static" =
-    ssr.choose_client_assets_dir(False, "priv/static", "fallback/static")
+pub fn client_assets_dir_is_the_apps_priv_static_test() {
+  let assert "priv/static" = ssr.client_assets_dir()
 }
 
-pub fn render_page_includes_beacon_app_root_test() {
-  let page = ssr.render_page(test_config())
-  let assert True = str_contains(page.html, "id=\"beacon-app\"")
+pub fn client_bundle_name_reads_the_manifest_test() {
+  let dir = assets_dir(option.Some(bundle <> "\n"), [bundle])
+  let assert Ok(name) = ssr.client_bundle_name(dir)
+  let assert True = name == bundle
+}
+
+pub fn client_bundle_name_without_manifest_is_an_error_test() {
+  let dir = assets_dir(option.None, [bundle])
+  let assert Error(reason) = ssr.client_bundle_name(dir)
+  let assert True = str_contains(reason, "beacon_client.manifest")
+  let assert True = str_contains(reason, "gleam run -m beacon/build")
+}
+
+pub fn client_bundle_name_refuses_a_name_that_is_not_build_output_test() {
+  let dir = assets_dir(option.Some("../secret.js"), ["../secret.js"])
+  let assert Error(reason) = ssr.client_bundle_name(dir)
+  let assert True = str_contains(reason, "invalid bundle")
+  let dir = assets_dir(option.Some(""), [])
+  let assert Error(_) = ssr.client_bundle_name(dir)
+}
+
+pub fn client_bundle_name_refuses_a_missing_bundle_test() {
+  let dir = assets_dir(option.Some(bundle), [])
+  let assert Error(reason) = ssr.client_bundle_name(dir)
+  let assert True = str_contains(reason, "does not exist")
 }
 
 pub fn render_page_sets_session_token_without_dom_exposure_test() {
-  let page = ssr.render_page(test_config())
+  let page = render(test_config())
   let assert False = str_contains(page.html, "data-beacon-token=\"")
-  // Verify the token is actually valid by verifying it with the same secret
+  // The token verifies with the same secret
   let assert Ok(_ts) =
-    ssr.verify_session_token(
-      ssr.join_token_for(page, ""),
-      "test-secret-key-at-least-32-chars-long!!",
-      3600,
-    )
+    ssr.verify_session_token(ssr.join_token_for(page, ""), test_secret, 3600)
 }
 
-pub fn render_page_view_inside_app_root_test() {
-  let page = ssr.render_page(test_config())
-  // The view HTML should be inside the beacon-app div
+// --- Routing and the dead-render context ---
+
+pub fn render_page_applies_the_route_message_test() {
+  let page = render_path(routed_config(), "/about")
+  let assert 200 = page.status
+  let assert True = str_contains(page.html, "Hello, about!")
+  let home = render_path(routed_config(), "/")
+  let assert True = str_contains(home.html, "Hello, home!")
+}
+
+pub fn render_page_without_router_renders_every_path_test() {
+  let page = render_path(test_config(), "/anything/at/all")
+  let assert 200 = page.status
+  let assert True = str_contains(page.html, "Hello, World!")
+}
+
+pub fn render_page_unknown_route_is_a_static_404_test() {
+  let page = render_path(routed_config(), "/missing")
+  let assert 404 = page.status
+  let assert True = str_contains(page.html, "Page Not Found")
   let assert True = str_contains(page.html, "id=\"beacon-app\"")
-  let assert True = str_contains(page.html, "<h1>Hello, World!</h1>")
+  // No client script: the browser opens no session for an error page.
+  let assert False = str_contains(page.html, "<script")
+  let assert False = str_contains(page.html, "Hello, default!")
+  let assert Ok(resp) = ssr.to_response(page)
+  let assert 404 = resp.status
+}
+
+pub fn render_page_unknown_route_does_not_run_init_test() {
+  let calls = process.new_subject()
+  let page = render_path(reporting_config(calls), "/missing")
+  let assert 404 = page.status
+  let assert Error(Nil) = process.receive(calls, 0)
+}
+
+pub fn render_page_bad_percent_encoding_is_a_static_400_test() {
+  let calls = process.new_subject()
+  let page = render_path(reporting_config(calls), "/%zz")
+  let assert 400 = page.status
+  let assert True = str_contains(page.html, "Bad Request")
+  let assert False = str_contains(page.html, "<script")
+  let assert Error(Nil) = process.receive(calls, 0)
+  let assert Ok(resp) = ssr.to_response(page)
+  let assert 400 = resp.status
+}
+
+pub fn render_page_bad_query_encoding_is_a_static_400_test() {
+  let page =
+    ssr.render_page(
+      test_config(),
+      request.Request(..request.new(), query: option.Some("a=%zz")),
+    )
+  let assert 400 = page.status
+  let assert False = str_contains(page.html, "Hello, World!")
+}
+
+pub fn render_page_gives_init_a_dead_render_context_test() {
+  let calls = process.new_subject()
+  let req =
+    request.new()
+    |> request.set_path("/about")
+    |> request.set_header("cookie", "theme=dark; beacon_session=session-a")
+  let page = ssr.render_page(reporting_config(calls), req)
+  let assert 200 = page.status
+  let assert Ok(ctx) = process.receive(calls, 0)
+  let assert False = context.is_connected(ctx)
+  let assert "/about" = context.uri(ctx).path
+  let assert Ok("dark") = context.cookie(ctx, "theme")
+  let assert Error(Nil) = context.cookie(ctx, "missing")
+  let assert Ok(_fingerprint) = context.session_id(ctx)
+  // init runs exactly once per dead render.
+  let assert Error(Nil) = process.receive(calls, 0)
+}
+
+pub fn render_page_without_session_cookie_has_no_session_id_test() {
+  let calls = process.new_subject()
+  let page = render_path(reporting_config(calls), "/")
+  let assert 200 = page.status
+  let assert Ok(ctx) = process.receive(calls, 0)
+  let assert Error(Nil) = context.session_id(ctx)
+}
+
+pub fn render_page_does_not_run_init_effects_test() {
+  let ran = process.new_subject()
+  let config =
+    ssr.SsrConfig(..test_config(), init: fn(_ctx) {
+      #(
+        TestModel(name: "World"),
+        effect.from(fn(_dispatch) { process.send(ran, Nil) }),
+      )
+    })
+  let page = render(config)
+  let assert 200 = page.status
+  let assert Error(Nil) = process.receive(ran, 50)
+}
+
+pub fn recovery_model_is_stored_in_signed_cookie_token_test() {
+  let config =
+    ssr.SsrConfig(
+      ..test_config(),
+      init: fn(_ctx) { #(TestModel(name: "VisibleState"), effect.none()) },
+      title: fn(_model) { "Cookie State Test" },
+      recovery_encoder: option.Some(fn(_model: TestModel) {
+        "SecretCookieState"
+      }),
+    )
+  let page = render(config)
+  let assert Ok(_) =
+    ssr.verify_session_token(ssr.join_token_for(page, ""), test_secret, 3600)
+  let assert False = str_contains(page.html, "SecretCookieState")
+}
+
+// --- head_html tests ---
+
+pub fn head_html_none_renders_no_extra_content_test() {
+  let page = render(test_config())
+  // No <style> block (removed hardcoded demo styles)
+  let assert True = does_not_contain(page.html, "<style>")
+  // head_html is None, so no extra content between </title> and </head>
+  let assert True = str_contains(page.html, "</title></head>")
+}
+
+pub fn head_html_injects_stylesheet_link_test() {
+  let config =
+    ssr.SsrConfig(
+      ..test_config(),
+      title: fn(_model) { "CSS Test" },
+      head_html: option.Some(
+        "<link rel=\"stylesheet\" href=\"/static/styles.css\">",
+      ),
+    )
+  let page = render(config)
+  let assert True =
+    str_contains(
+      page.html,
+      "<link rel=\"stylesheet\" href=\"/static/styles.css\">",
+    )
+  // The link tag is in the head section (after title, before </head>)
+  let assert Ok(title_pos) = string_index_of(page.html, "</title>")
+  let assert Ok(link_pos) =
+    string_index_of(page.html, "<link rel=\"stylesheet\"")
+  let assert Ok(head_close_pos) = string_index_of(page.html, "</head>")
+  let assert True = title_pos < link_pos
+  let assert True = link_pos < head_close_pos
+}
+
+pub fn head_html_multiple_tags_test() {
+  let config =
+    ssr.SsrConfig(
+      ..test_config(),
+      title: fn(_model) { "Multi Head Test" },
+      head_html: option.Some(
+        "<link rel=\"stylesheet\" href=\"/a.css\"><meta name=\"theme-color\" content=\"#000\">",
+      ),
+    )
+  let page = render(config)
+  let assert True = str_contains(page.html, "href=\"/a.css\"")
+  let assert True = str_contains(page.html, "theme-color")
 }
 
 // --- Session token tests ---
@@ -124,7 +385,7 @@ pub fn verify_valid_token_test() {
   let secret = "my-secret-key-for-testing-purposes!!"
   let token = ssr.create_session_token(secret)
   let assert Ok(ts) = ssr.verify_session_token(token, secret, 3600)
-  // Assert the timestamp is recent — within the last 60 seconds
+  // The timestamp is recent: within the last 60 seconds
   let now = current_system_time_seconds()
   let age = now - ts
   let assert True = age >= 0
@@ -140,7 +401,7 @@ pub fn verify_token_wrong_secret_test() {
 pub fn verify_expired_token_test() {
   let secret = "my-secret-key-for-testing-purposes!!"
   let token = ssr.create_session_token(secret)
-  // Use max_age of -1 seconds — token is already "expired"
+  // max_age of -1 seconds: the token is already "expired"
   let assert Error("Session token expired") =
     ssr.verify_session_token(token, secret, -1)
 }
@@ -148,79 +409,15 @@ pub fn verify_expired_token_test() {
 pub fn verify_tampered_token_test() {
   let secret = "my-secret-key-for-testing-purposes!!"
   let token = ssr.create_session_token(secret)
-  // Tamper with the token
   let tampered = token <> "x"
   let assert Error(_) = ssr.verify_session_token(tampered, secret, 3600)
-}
-
-pub fn render_page_for_path_renders_route_specific_html_test() {
-  // Test that different paths produce different SSR content
-  // Using the existing TestModel/TestMsg types with a route-aware update
-  let config =
-    ssr.SsrConfig(
-      init: fn() { #(TestModel(name: "default"), effect.none()) },
-      view: test_view,
-      secret_key: "test-secret-key-at-least-32-chars-long!!",
-      title: "Route Test",
-      head_html: option.None,
-      dev_mode: False,
-      serialize_model: option.None,
-    )
-  let patterns = [route.pattern("/"), route.pattern("/about")]
-  let on_route_change =
-    option.Some(fn(r: route.Route) -> TestMsg {
-      // We can't actually change the model here since TestMsg is NoOp,
-      // but we verify the function is called
-      let _ = r
-      NoOp
-    })
-  let update = fn(model: TestModel, _msg: TestMsg) { #(model, effect.none()) }
-
-  let page =
-    ssr.render_page_for_path(
-      config,
-      "/about",
-      patterns,
-      on_route_change,
-      update,
-    )
-  // Should contain the view HTML
-  let assert True = str_contains(page.html, "Hello, default!")
-  // Should have a session token
-  let assert True = string_length(ssr.join_token_for(page, "")) > 10
-}
-
-pub fn render_page_for_path_unmatched_route_renders_static_not_found_test() {
-  let config =
-    ssr.SsrConfig(
-      init: fn() { #(TestModel(name: "default"), effect.none()) },
-      view: test_view,
-      secret_key: "test-secret-key-at-least-32-chars-long!!",
-      title: "Route Test",
-      head_html: option.None,
-      dev_mode: False,
-      serialize_model: option.None,
-    )
-  let page =
-    ssr.render_page_for_path(
-      config,
-      "/missing",
-      [route.pattern("/")],
-      option.Some(fn(_r: route.Route) -> TestMsg { NoOp }),
-      fn(model: TestModel, _msg: TestMsg) { #(model, effect.none()) },
-    )
-
-  let assert True = str_contains(page.html, "Page Not Found")
-  let assert True = str_contains(page.html, "id=\"beacon-app\"")
-  let assert False = str_contains(page.html, "data-beacon-auto")
-  let assert False = str_contains(page.html, "Hello, default!")
 }
 
 /// The join token goes into a Set-Cookie header; a token outside the
 /// cookie-octet set is refused instead of being written as an injection.
 pub fn to_response_rejects_a_token_that_is_not_a_cookie_value_test() {
   let page =
-    ssr.RenderedPage(..ssr.render_page(test_config()), sign_join_token: fn(_) {
+    ssr.RenderedPage(..render(test_config()), sign_join_token: fn(_) {
       "tok; Domain=evil.example"
     })
   let assert Error(cookie.InvalidValue(_)) = ssr.to_response(page)
@@ -231,7 +428,7 @@ pub fn to_response_rejects_a_token_that_is_not_a_cookie_value_test() {
 }
 
 pub fn join_tokens_are_valid_cookie_values_test() {
-  let page = ssr.render_page(test_config())
+  let page = render(test_config())
   let assert Ok(Nil) =
     cookie.validate(
       ssr.session_cookie_name,
@@ -247,40 +444,19 @@ pub fn join_tokens_are_valid_cookie_values_test() {
 }
 
 pub fn to_response_returns_200_test() {
-  let page = ssr.render_page(test_config())
+  let page = render(test_config())
   let assert Ok(resp) = ssr.to_response(page)
   let assert 200 = resp.status
 }
 
 pub fn to_response_sets_httponly_session_cookie_test() {
-  let page = ssr.render_page(test_config())
+  let page = render(test_config())
   let assert Ok(resp) = ssr.to_response(page)
   let assert Ok(cookie_header) = find_header(resp.headers, "set-cookie")
   let assert True = str_contains(cookie_header, ssr.session_cookie_name <> "=")
   let assert True = str_contains(cookie_header, "HttpOnly")
   let assert True = str_contains(cookie_header, "SameSite=Lax")
   let assert True = str_contains(cookie_header, "Max-Age=86400")
-}
-
-pub fn serialized_model_is_stored_in_signed_cookie_token_test() {
-  let config =
-    ssr.SsrConfig(
-      init: fn() { #(TestModel(name: "VisibleState"), effect.none()) },
-      view: test_view,
-      secret_key: "test-secret-key-at-least-32-chars-long!!",
-      title: "Cookie State Test",
-      head_html: option.None,
-      dev_mode: False,
-      serialize_model: option.Some(fn(_model: TestModel) { "SecretCookieState" }),
-    )
-  let page = ssr.render_page(config)
-  let assert Ok(_) =
-    ssr.verify_session_token(
-      ssr.join_token_for(page, ""),
-      "test-secret-key-at-least-32-chars-long!!",
-      3600,
-    )
-  let assert False = str_contains(page.html, "SecretCookieState")
 }
 
 // --- Join token (v2) tests: unhappy paths first ---
@@ -528,11 +704,11 @@ pub fn to_response_for_request_binds_token_to_session_test() {
     ssr.SsrConfig(
       ..test_config(),
       secret_key: join_secret,
-      serialize_model: option.Some(fn(m: TestModel) {
+      recovery_encoder: option.Some(fn(m: TestModel) {
         "{\"name\":\"" <> m.name <> "\"}"
       }),
     )
-  let page = ssr.render_page(config)
+  let page = render(config)
   let req =
     request.new() |> request.set_header("cookie", "beacon_session=session-a")
   let assert Ok(resp) = ssr.to_response_for_request(page, req)
@@ -557,9 +733,9 @@ pub fn join_token_omits_model_over_cookie_budget_test() {
     ssr.SsrConfig(
       ..test_config(),
       secret_key: join_secret,
-      serialize_model: option.Some(fn(_m: TestModel) { "\"" <> big <> "\"" }),
+      recovery_encoder: option.Some(fn(_m: TestModel) { "\"" <> big <> "\"" }),
     )
-  let token = ssr.join_token_for(ssr.render_page(config), "")
+  let token = ssr.join_token_for(render(config), "")
   let assert True = string_length(token) <= 3800
   let assert Ok(ssr.JoinToken(model_json: option.None, ..)) =
     ssr.verify_join_token(token, join_secret, "", current_system_time_seconds())
@@ -567,7 +743,7 @@ pub fn join_token_omits_model_over_cookie_budget_test() {
 
 pub fn join_token_carries_no_model_without_serializer_test() {
   let config = ssr.SsrConfig(..test_config(), secret_key: join_secret)
-  let token = ssr.join_token_for(ssr.render_page(config), "")
+  let token = ssr.join_token_for(render(config), "")
   let assert Ok(ssr.JoinToken(model_json: option.None, ..)) =
     ssr.verify_join_token(token, join_secret, "", current_system_time_seconds())
 }
@@ -594,62 +770,6 @@ fn cookie_value(set_cookie: String, name: String) -> String {
     Ok(#(value, _)) -> value
     Error(Nil) -> rest
   }
-}
-
-// --- head_html tests ---
-
-pub fn head_html_none_renders_no_extra_content_test() {
-  let page = ssr.render_page(test_config())
-  // No <style> block (removed hardcoded demo styles)
-  let assert True = does_not_contain(page.html, "<style>")
-  // head_html is None, so no extra content between </title> and </head>
-  let assert True = str_contains(page.html, "</title></head>")
-}
-
-pub fn head_html_injects_stylesheet_link_test() {
-  let config =
-    ssr.SsrConfig(
-      init: test_init,
-      view: test_view,
-      secret_key: "test-secret-key-at-least-32-chars-long!!",
-      title: "CSS Test",
-      head_html: option.Some(
-        "<link rel=\"stylesheet\" href=\"/static/styles.css\">",
-      ),
-      dev_mode: False,
-      serialize_model: option.None,
-    )
-  let page = ssr.render_page(config)
-  let assert True =
-    str_contains(
-      page.html,
-      "<link rel=\"stylesheet\" href=\"/static/styles.css\">",
-    )
-  // The link tag should be in the head section (after title, before </head>)
-  let assert Ok(title_pos) = string_index_of(page.html, "</title>")
-  let assert Ok(link_pos) =
-    string_index_of(page.html, "<link rel=\"stylesheet\"")
-  let assert Ok(head_close_pos) = string_index_of(page.html, "</head>")
-  let assert True = title_pos < link_pos
-  let assert True = link_pos < head_close_pos
-}
-
-pub fn head_html_multiple_tags_test() {
-  let config =
-    ssr.SsrConfig(
-      init: test_init,
-      view: test_view,
-      secret_key: "test-secret-key-at-least-32-chars-long!!",
-      title: "Multi Head Test",
-      head_html: option.Some(
-        "<link rel=\"stylesheet\" href=\"/a.css\"><meta name=\"theme-color\" content=\"#000\">",
-      ),
-      dev_mode: False,
-      serialize_model: option.None,
-    )
-  let page = ssr.render_page(config)
-  let assert True = str_contains(page.html, "href=\"/a.css\"")
-  let assert True = str_contains(page.html, "theme-color")
 }
 
 // --- Helpers ---

@@ -1,16 +1,18 @@
 /// End-to-end auth workspace flow over real HTTP and WebSocket sockets.
 /// This test composes API routes, HttpOnly cookies, CSRF, ws_auth, ws_init,
 /// route-aware SSR, and server-private state in one app shape.
-import beacon
+import beacon/app_config_fixture
 import beacon/application
+import beacon/attribute
 import beacon/cookie
 import beacon/effect
+import beacon/element
 import beacon/error
+import beacon/event
 import beacon/form
 import beacon/html
-import beacon/route
+import beacon/internal/context.{type Context}
 import beacon/session
-import beacon/transport
 import beacon/transport/http as transport_http
 import beacon/transport/server.{type Connection, type ResponseBody, Bytes}
 import gleam/bit_array
@@ -24,6 +26,7 @@ import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/string
+import gleam/uri.{type Uri}
 
 const login_csrf = "auth-flow-login-csrf"
 
@@ -55,8 +58,7 @@ pub fn full_auth_cookie_csrf_ws_flow_test() {
   let store = session.new_store("auth_flow_" <> int.to_string(port))
   let csrf_store =
     form.create_csrf_store("auth_flow_csrf_" <> int.to_string(port))
-  let assert Ok(_app) =
-    application.start_advanced(test_config(port, store, csrf_store))
+  let assert Ok(_app) = application.start(test_config(port, store, csrf_store))
   process.sleep(150)
 
   let base = "http://localhost:" <> int.to_string(port)
@@ -151,44 +153,67 @@ pub fn full_auth_cookie_csrf_ws_flow_test() {
     ws_connect_with_headers("localhost", port, [#("cookie", session_cookie)])
 }
 
+const known_paths = ["/", "/login", "/app", "/settings", "/admin"]
+
 fn test_config(
   port: Int,
   store: session.SessionStore,
   csrf_store: form.CsrfStore,
 ) -> application.AppConfig(#(Model, Server), Msg) {
   application.AppConfig(
-    port: port,
-    init: fn() { #(#(init_model(), init_server()), effect.none()) },
-    update: update,
-    view: view,
-    decode_event: Some(fn(_name, handler_id, _data, _path) {
-      case handler_id {
-        "refresh" -> Ok(Refresh)
-        _ -> Error(error.RuntimeError(reason: "unknown handler"))
+    ..app_config_fixture.new(
+      port: port,
+      init: auth_init(store),
+      update: update,
+      view: view,
+      encode_model: serialize_public_model,
+      decode_event: fn(_name, handler_id, _data, _path) {
+        case handler_id {
+          "refresh" -> Ok(Refresh)
+          _ -> Error(error.RuntimeError(reason: "unknown handler"))
+        }
+      },
+    ),
+    secret_key: "auth-flow-secret-key-long-enough-for-hmac!!",
+    title: fn(_state) { "Auth Flow" },
+    middlewares: [],
+    route: Some(fn(page: Uri) {
+      case list.contains(known_paths, page.path) {
+        True -> Ok(RouteChanged(page.path))
+        False -> Error(Nil)
       }
     }),
-    secret_key: "auth-flow-secret-key-long-enough-for-hmac!!",
-    title: "Auth Flow",
-    serialize_model: Some(serialize_public_model),
-    deserialize_model: None,
-    middlewares: [],
-    static_dir: None,
-    route_patterns: list.map(
-      ["/", "/login", "/app", "/settings", "/admin"],
-      route.pattern,
-    ),
-    on_route_change: Some(fn(r: route.Route) { RouteChanged(r.path) }),
-    on_route_leave: None,
-    dynamic_subscriptions: None,
-    on_notify: None,
-    on_notification: None,
-    security_limits: transport.default_security_limits(),
-    head_html: None,
     api_handler: Some(api_handler(store, csrf_store)),
     ws_auth: Some(ws_auth(store)),
-    init_from_request: Some(init_from_request(store)),
-    dev_mode: False,
   )
+}
+
+/// Init reads the HttpOnly session cookie from the request context, for
+/// both the SSR render and the connected (WebSocket) runtime.
+fn auth_init(
+  store: session.SessionStore,
+) -> fn(Context) -> #(#(Model, Server), effect.Effect(Msg)) {
+  fn(ctx: Context) {
+    let path = context.uri(ctx).path
+    let session = case context.cookie(ctx, "beacon_session") {
+      Ok(session_id) -> session.get(store, session_id)
+      Error(Nil) -> None
+    }
+    let model = case session {
+      Some(sess) ->
+        Model(
+          route: path,
+          authenticated: True,
+          user: session_value(sess, "user_id", ""),
+          role: session_value(sess, "role", ""),
+          display_name: session_value(sess, "display_name", ""),
+          csrf_token: session_value(sess, "csrf_token", ""),
+          status: "Session loaded",
+        )
+      None -> Model(..init_model(), route: path)
+    }
+    #(#(model, init_server()), effect.none())
+  }
 }
 
 fn init_model() -> Model {
@@ -248,38 +273,41 @@ fn update(
   }
 }
 
-fn view(combined: #(Model, Server)) -> beacon.Node(Msg) {
+fn view(combined: #(Model, Server)) -> element.Element(Msg) {
   let #(model, _server) = combined
-  html.main([html.attribute("data-testid", "auth-flow-root")], [
+  html.main([attribute.attribute("data-testid", "auth-flow-root")], [
     html.h1([], [html.text("Auth Flow")]),
     case model.authenticated {
       False ->
-        html.section([html.attribute("data-testid", "login-panel")], [
+        html.section([attribute.attribute("data-testid", "login-panel")], [
           html.h2([], [html.text("Sign in")]),
           html.form(
             [
-              html.attribute("method", "post"),
-              html.attribute("action", "/api/login"),
+              attribute.attribute("method", "post"),
+              attribute.attribute("action", "/api/login"),
             ],
             [
               html.input([
-                html.type_("hidden"),
-                html.name("csrf"),
-                html.value(login_csrf),
+                attribute.type_("hidden"),
+                attribute.name("csrf"),
+                attribute.value(login_csrf),
               ]),
-              html.input([html.name("username"), html.value("ada")]),
-              html.button([html.type_("submit")], [html.text("Sign in")]),
+              html.input([attribute.name("username"), attribute.value("ada")]),
+              html.button([attribute.type_("submit")], [html.text("Sign in")]),
             ],
           ),
         ])
       True ->
-        html.section([html.attribute("data-testid", "workspace")], [
+        html.section([attribute.attribute("data-testid", "workspace")], [
           html.h2([], [html.text("Workspace")]),
           html.p([], [html.text(model.display_name)]),
           html.p([], [html.text(model.role)]),
           html.p([], [html.text(model.status)]),
           html.button(
-            [beacon.on_click(Refresh), html.attribute("data-testid", "refresh")],
+            [
+              event.on_click(Refresh),
+              attribute.attribute("data-testid", "refresh"),
+            ],
             [
               html.text("Refresh"),
             ],
@@ -430,27 +458,6 @@ fn ws_auth(
       Ok(_) -> Ok(Nil)
       Error(_) -> Error("unauthorized")
     }
-  }
-}
-
-fn init_from_request(
-  store: session.SessionStore,
-) -> fn(Request(Connection)) -> #(#(Model, Server), effect.Effect(Msg)) {
-  fn(req: Request(Connection)) {
-    let model = case session_from_request(req, store) {
-      Ok(sess) ->
-        Model(
-          route: req.path,
-          authenticated: True,
-          user: session_value(sess, "user_id", ""),
-          role: session_value(sess, "role", ""),
-          display_name: session_value(sess, "display_name", ""),
-          csrf_token: session_value(sess, "csrf_token", ""),
-          status: "Session loaded",
-        )
-      Error(_) -> Model(..init_model(), route: req.path)
-    }
-    #(#(model, init_server()), effect.none())
   }
 }
 

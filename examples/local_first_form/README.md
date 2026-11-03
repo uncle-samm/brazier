@@ -1,16 +1,21 @@
 # Local First Form
 
-Focused example for Beacon's `Model` + `Local` split.
+Focused example for Beacon's Model + Local split, built with
+`beacon.full_application` and `local.layer`.
 
 It exercises:
 
-- Draft input, filter selection, and dropdown state in `Local`
-- Submit/save state in `Model`
-- Instant client rendering for local-only interactions
-- Server-authoritative update only when the form is submitted
+- Draft input, filter selection and the options menu in `Local`:
+  `update_local` returns `local.handled`, so they render in the browser
+  with no server traffic
+- Submit forwards the form's fields (`event.on_submit`) with
+  `local.forward`; the server validates them and saves them in the `Model`
+- Server-side validation: a missing field, an over-long query or an
+  unknown filter is rejected with a logged warning
 
 ```sh
 cd examples/local_first_form
+gleam run -m beacon/build   # after changing the source
 gleam run -m local_first_form
 ```
 

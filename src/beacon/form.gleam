@@ -2,7 +2,9 @@
 /// Provides form field binding, validation, and CSRF protection.
 ///
 /// Reference: LiveView form handling, Livewire form validation.
-import beacon/element.{type Attr, type Node}
+import beacon/attribute.{type Attribute}
+import beacon/element.{type Element}
+import beacon/html
 import beacon/log
 import gleam/bit_array
 import gleam/crypto
@@ -211,60 +213,50 @@ pub fn validate(form: Form, validators: List(fn(Form) -> Form)) -> Form {
   list.fold(validators, clear_errors(form), fn(f, validator) { validator(f) })
 }
 
-/// Render a password input field.
+/// Render a password input field. Pass the listener in `attrs`, for example
+/// `event.on_input(PasswordChanged)`.
 pub fn password_input(
   form: Form,
   name: String,
-  attrs: List(Attr),
-) -> Node(msg) {
+  attrs: List(Attribute(msg)),
+) -> Element(msg) {
   let value = get_value(form, name)
   let base_attrs = [
-    element.attr("type", "password"),
-    element.attr("name", name),
-    element.attr("value", value),
-    element.on("input", name),
+    attribute.type_("password"),
+    attribute.name(name),
+    attribute.value(value),
   ]
-  let all_attrs = list.append(base_attrs, attrs)
-  element.el("input", all_attrs, [])
+  html.input(list.append(base_attrs, attrs))
 }
 
-/// Render a textarea field.
-pub fn textarea(form: Form, name: String, attrs: List(Attr)) -> Node(msg) {
+/// Render a textarea field. Pass the listener in `attrs`.
+pub fn textarea(
+  form: Form,
+  name: String,
+  attrs: List(Attribute(msg)),
+) -> Element(msg) {
   let value = get_value(form, name)
-  let base_attrs = [
-    element.attr("name", name),
-    element.on("input", name),
-  ]
-  let all_attrs = list.append(base_attrs, attrs)
-  element.el("textarea", all_attrs, [element.text(value)])
+  html.textarea(list.append([attribute.name(name)], attrs), [html.text(value)])
 }
 
-/// Render a select dropdown.
+/// Render a select dropdown of `#(value, label)` options. Pass the listener
+/// in `attrs`, for example `event.on_change(Picked)`.
 pub fn select(
   form: Form,
   name: String,
   options: List(#(String, String)),
-  attrs: List(Attr),
-) -> Node(msg) {
+  attrs: List(Attribute(msg)),
+) -> Element(msg) {
   let current = get_value(form, name)
-  let base_attrs = [
-    element.attr("name", name),
-    element.on("change", name),
-  ]
-  let all_attrs = list.append(base_attrs, attrs)
   let option_nodes =
     list.map(options, fn(opt) {
       let #(value, label) = opt
-      let selected_attrs = case value == current {
-        True -> [
-          element.attr("value", value),
-          element.attr("selected", "selected"),
-        ]
-        False -> [element.attr("value", value)]
-      }
-      element.el("option", selected_attrs, [element.text(label)])
+      html.option(
+        [attribute.value(value), attribute.selected(value == current)],
+        [html.text(label)],
+      )
     })
-  element.el("select", all_attrs, option_nodes)
+  html.select(list.append([attribute.name(name)], attrs), option_nodes)
 }
 
 /// Generate a CSRF token: 256 bits from the OS CSPRNG, hex-encoded. (The
@@ -337,29 +329,28 @@ fn csrf_consume(
 ) -> Result(Nil, String)
 
 /// Render a hidden CSRF input field.
-pub fn csrf_field(form: Form) -> Node(msg) {
-  element.el(
-    "input",
-    [
-      element.attr("type", "hidden"),
-      element.attr("name", "_csrf_token"),
-      element.attr("value", form.csrf_token),
-    ],
-    [],
-  )
+pub fn csrf_field(form: Form) -> Element(msg) {
+  html.input([
+    attribute.type_("hidden"),
+    attribute.name("_csrf_token"),
+    attribute.value(form.csrf_token),
+  ])
 }
 
-/// Render a text input field with error display.
-pub fn text_input(form: Form, name: String, attrs: List(Attr)) -> Node(msg) {
+/// Render a text input field with error display. Pass the listener in
+/// `attrs`, for example `event.on_input(NameChanged)`.
+pub fn text_input(
+  form: Form,
+  name: String,
+  attrs: List(Attribute(msg)),
+) -> Element(msg) {
   let value = get_value(form, name)
   let base_attrs = [
-    element.attr("type", "text"),
-    element.attr("name", name),
-    element.attr("value", value),
-    element.on("input", name),
+    attribute.type_("text"),
+    attribute.name(name),
+    attribute.value(value),
   ]
-  let all_attrs = list.append(base_attrs, attrs)
-  let input = element.el("input", all_attrs, [])
+  let input = html.input(list.append(base_attrs, attrs))
 
   case get_field(form, name) {
     Ok(field) -> {
@@ -368,14 +359,9 @@ pub fn text_input(form: Form, name: String, attrs: List(Attr)) -> Node(msg) {
         errors -> {
           let error_nodes =
             list.map(errors, fn(err) {
-              element.el("span", [element.attr("class", "field-error")], [
-                element.text(err),
-              ])
+              html.span([attribute.class("field-error")], [html.text(err)])
             })
-          element.el("div", [element.attr("class", "field-group")], [
-            input,
-            ..error_nodes
-          ])
+          html.div([attribute.class("field-group")], [input, ..error_nodes])
         }
       }
     }

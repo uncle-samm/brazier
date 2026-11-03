@@ -1,176 +1,196 @@
-/// Middleware Demo — demonstrates route-scoped middleware.
-/// Shows: only(), except(), at(), methods(), group()
+/// Middleware Demo: route-scoped HTTP middleware around a `beacon.simple`
+/// counter. Shows `group`, `only`, `except`, `at` and `methods`.
 ///
 /// Routes:
-///   /           → main page (public)
-///   /admin/*    → requires X-Admin header (protected by middleware)
-///   /api/*      → adds X-Api-Version header
-///   /healthz    → health check endpoint (exact match)
+///   /           -> main page (public)
+///   /admin/*    -> requires the `x-admin: true` header
+///   /api/*      -> adds `x-api-version`; POST and PUT are refused
+///   /healthz    -> health check (exact match)
 import beacon
-import beacon/effect
+import beacon/api
+import beacon/attribute
+import beacon/element.{type Element}
+import beacon/event
 import beacon/html
+import beacon/log
 import beacon/middleware
-import beacon/transport/server.{type Connection, type ResponseBody, Bytes}
-import gleam/bytes_tree
 import gleam/http
 import gleam/http/request
 import gleam/http/response
 import gleam/int
 
 pub type Model {
-  Model(count: Int, page: String)
+  Model(count: Int)
 }
 
 pub type Msg {
   Increment
   Decrement
-  Navigate(String)
 }
 
-pub fn init() -> #(Model, effect.Effect(Msg)) {
-  #(Model(count: 0, page: "home"), effect.none())
+fn init(_ctx: beacon.Context) -> Model {
+  Model(count: 0)
 }
 
-pub fn update(
-  model: Model,
-  _local: Nil,
-  _server: Nil,
-  msg: Msg,
-) -> #(Model, Nil, Nil) {
-  let model = case msg {
-    Increment -> Model(..model, count: model.count + 1)
-    Decrement -> Model(..model, count: model.count - 1)
-    Navigate(page) -> Model(..model, page: page)
+pub fn update(model: Model, msg: Msg) -> Model {
+  case msg {
+    Increment -> Model(count: model.count + 1)
+    Decrement -> Model(count: model.count - 1)
   }
-  #(model, Nil, Nil)
 }
 
-pub fn view(model: Model, _local: Nil) -> beacon.Node(Msg) {
+pub fn view(model: Model) -> Element(Msg) {
   html.div(
     [
-      html.style(
-        "font-family:system-ui;max-width:700px;margin:2rem auto;padding:0 1rem",
-      ),
+      attribute.styles([
+        #("font-family", "system-ui"),
+        #("max-width", "700px"),
+        #("margin", "2rem auto"),
+        #("padding", "0 1rem"),
+      ]),
     ],
     [
       html.h1([], [html.text("Middleware Demo")]),
-      html.p([html.style("color:#666")], [
+      html.p([attribute.style("color", "#666")], [
         html.text(
-          "Route-scoped middleware: only(), except(), at(), methods(), group()",
+          "Route-scoped middleware: group(), only(), except(), at(), methods()",
         ),
       ]),
-      // Counter
       html.div(
         [
-          html.style(
-            "margin:1.5rem 0;padding:1rem;background:#f5f5f5;border-radius:8px",
-          ),
+          attribute.styles([
+            #("margin", "1.5rem 0"),
+            #("padding", "1rem"),
+            #("background", "#f5f5f5"),
+            #("border-radius", "8px"),
+          ]),
         ],
         [
           html.h2([], [html.text("Counter: " <> int.to_string(model.count))]),
           html.button(
             [
-              beacon.on_click(Decrement),
-              html.style(
-                "padding:8px 16px;margin-right:8px;border:none;border-radius:4px;cursor:pointer",
-              ),
+              event.on_click(Decrement),
+              attribute.aria("label", "Decrement"),
+              attribute.styles(button_styles),
+              attribute.style("margin-right", "8px"),
             ],
             [html.text("-")],
           ),
           html.button(
             [
-              beacon.on_click(Increment),
-              html.style(
-                "padding:8px 16px;border:none;border-radius:4px;cursor:pointer",
-              ),
+              event.on_click(Increment),
+              attribute.aria("label", "Increment"),
+              attribute.styles(button_styles),
             ],
             [html.text("+")],
           ),
         ],
       ),
-      // Middleware info
-      html.div([html.style("margin-top:1.5rem")], [
+      html.div([attribute.style("margin-top", "1.5rem")], [
         html.h2([], [html.text("Active Middleware")]),
         html.ul([], [
-          html.li([], [html.text("Logger — global, all requests")]),
           html.li([], [
-            html.text("Admin auth — only /admin/* (checks X-Admin header)"),
+            html.text("Secure headers: on by default, every response"),
           ]),
           html.li([], [
-            html.text("API versioning — only /api/* (adds X-Api-Version)"),
+            html.text(
+              "Request id and logger: group(); the logger skips /healthz with except()",
+            ),
           ]),
-          html.li([], [html.text("POST rate limit — only POST/PUT methods")]),
-          html.li([], [html.text("Health check — exact match /healthz")]),
+          html.li([], [
+            html.text("Health check: at(\"/healthz\"), exact path, JSON"),
+          ]),
+          html.li([], [
+            html.text("Admin auth: only(\"/admin\"), needs x-admin: true"),
+          ]),
+          html.li([], [
+            html.text("API versioning: only(\"/api\"), adds x-api-version"),
+          ]),
+          html.li([], [
+            html.text("Write blocking: methods([Post, Put]) under /api, 405"),
+          ]),
         ]),
       ]),
     ],
   )
 }
 
-/// Simple admin auth — checks for X-Admin header.
-/// In production you'd check a real session/token.
+const button_styles = [
+  #("padding", "8px 16px"),
+  #("border", "none"),
+  #("border-radius", "4px"),
+  #("cursor", "pointer"),
+]
+
+/// Admin auth for the demo: checks for an `x-admin: true` header.
+/// A real app checks a session or token.
 fn require_admin() -> middleware.Middleware {
-  fn(
-    req: request.Request(Connection),
-    next: fn(request.Request(Connection)) -> response.Response(ResponseBody),
-  ) -> response.Response(ResponseBody) {
+  fn(req: api.Request, next: fn(api.Request) -> api.Response) -> api.Response {
     case request.get_header(req, "x-admin") {
       Ok("true") -> next(req)
-      _ ->
-        response.new(403)
-        |> response.set_body(
-          Bytes(bytes_tree.from_string("Forbidden: admin access required")),
+      Ok(value) -> {
+        log.warning(
+          "middleware_demo",
+          "Refused " <> req.path <> ": x-admin is " <> value <> ", not true",
         )
+        forbidden()
+      }
+      Error(Nil) -> {
+        log.warning(
+          "middleware_demo",
+          "Refused " <> req.path <> ": no x-admin header",
+        )
+        forbidden()
+      }
     }
   }
 }
 
-/// API versioning middleware — adds version header.
+fn forbidden() -> api.Response {
+  api.text(403, "Forbidden: admin access required")
+}
+
+/// Adds the API version header to every /api response.
 fn api_version() -> middleware.Middleware {
-  fn(
-    req: request.Request(Connection),
-    next: fn(request.Request(Connection)) -> response.Response(ResponseBody),
-  ) -> response.Response(ResponseBody) {
-    let resp = next(req)
-    response.set_header(resp, "x-api-version", "v1")
+  fn(req: api.Request, next: fn(api.Request) -> api.Response) -> api.Response {
+    next(req)
+    |> response.set_header("x-api-version", "v1")
   }
 }
 
-/// Health check handler — returns 200 OK with status.
+/// Answers the health check without reaching the app.
 fn health_handler() -> middleware.Middleware {
-  fn(
-    _req: request.Request(Connection),
-    _next: fn(request.Request(Connection)) -> response.Response(ResponseBody),
-  ) -> response.Response(ResponseBody) {
-    response.new(200)
-    |> response.set_header("content-type", "application/json")
-    |> response.set_body(Bytes(bytes_tree.from_string("{\"status\":\"ok\"}")))
+  fn(_req: api.Request, _next: fn(api.Request) -> api.Response) -> api.Response {
+    api.json(200, "{\"status\":\"ok\"}")
   }
 }
 
-/// Simple POST blocker for demo.
+/// Refuses the request; scoped to POST and PUT by `middleware.methods`.
 fn block_writes() -> middleware.Middleware {
-  fn(
-    _req: request.Request(Connection),
-    _next: fn(request.Request(Connection)) -> response.Response(ResponseBody),
-  ) -> response.Response(ResponseBody) {
-    response.new(405)
-    |> response.set_body(Bytes(bytes_tree.from_string("Method not allowed")))
+  fn(req: api.Request, _next: fn(api.Request) -> api.Response) -> api.Response {
+    log.warning(
+      "middleware_demo",
+      "Refused " <> http.method_to_string(req.method) <> " " <> req.path,
+    )
+    api.text(405, "Method not allowed")
+    |> response.set_header("allow", "GET, HEAD")
   }
 }
 
 pub fn main() {
-  beacon.app(init, beacon.no_local, beacon.no_server, update, view)
-  |> beacon.title("Middleware Demo")
-  // Global: logger on all requests
-  |> beacon.with_middleware(middleware.logger())
-  // /healthz: intercepts and returns JSON (exact path match)
+  beacon.simple(init:, update:, view:)
+  |> beacon.title(fn(_model) { "Middleware Demo" })
+  // Secure headers are already on by default; these run after them.
+  |> beacon.with_middleware(
+    middleware.group([
+      middleware.request_id(),
+      // Health probes are frequent, so they stay out of the request log.
+      middleware.except("/healthz", middleware.logger()),
+    ]),
+  )
   |> beacon.with_middleware(middleware.at("/healthz", health_handler()))
-  // /admin/*: requires X-Admin header
   |> beacon.with_middleware(middleware.only("/admin", require_admin()))
-  // /api/*: adds version header
   |> beacon.with_middleware(middleware.only("/api", api_version()))
-  // POST/PUT on /api: blocked (demo of method + path combo)
   |> beacon.with_middleware(middleware.only(
     "/api",
     middleware.methods([http.Post, http.Put], block_writes()),

@@ -1,402 +1,339 @@
 # Beacon Architecture
 
-Full-stack Gleam web framework running on BEAM. One OTP process per session,
-server-authoritative state with client-side local execution. No templates,
-no macros — pure function calls for views, build-time AST analysis via Glance.
-
-## Core Layers
-
-### 1. Transport (`src/beacon/transport.gleam`)
-
-WebSocket via Beacon's gen_tcp server, one BEAM actor per connection.
-
-**Wire protocol:**
-- 6 `ClientMessage` variants: `ClientEvent`, `ClientHeartbeat`, `ClientJoin`, `ClientNavigate`, `ClientRequestSync`, `ClientEventBatch`
-- 8 `ServerMessage` variants: `ServerMount`, `ServerHeartbeatAck`, `ServerError`, `ServerModelSync`, `ServerPatch`, `ServerNavigate`, `ServerHardNavigate`, `ServerReload`
-
-**Security (`SecurityLimits`):**
-- Per-connection rate limiting: 50 events/sec (configurable)
-- Message size cap: 64KB (configurable)
-- Global connection cap: 10,000 (configurable)
-- Origin validation on WebSocket upgrade
-- Optional `ws_auth` hook — runs before upgrade, rejects with 401
-
-**`TransportConfig`** ties it together: port, on_connect/on_event/on_disconnect callbacks,
-optional SSR factory, middleware pipeline, static file config, runtime factory for
-per-connection runtime spawning, optional API route handler (for custom route handling before SSR),
-and security limits.
-
-### 2. Runtime (`src/beacon/runtime.gleam`)
-
-MVU loop as OTP actor. One per user session.
-
-**`RuntimeConfig`** defines an app:
-- `init: fn() -> #(model, Effect(msg))`
-- `update: fn(model, msg) -> #(model, Effect(msg))`
-- `view: fn(model) -> Node(msg)`
-- `decode_event` from app config or generated `beacon_codec.decode_event/4`
-- Optional `serialize_model`/`deserialize_model` for state recovery
-- Route patterns + `on_route_change` callback
-- Dynamic subscriptions: `fn(model) -> List(String)` with `on_notify` handler
-
-**`RuntimeState`** tracks:
-- Current model, connections map, event clock (monotonic, for ordering)
-- Optional client handler metadata; not a server-side event decoder
-- `CachedModelState`: either `FullModelCache` or `SubstateCache` (per-field JSON caching)
-- PubSub listener subject and current subscriptions
-
-State recovery uses HMAC-SHA256 signed session tokens stored in an HttpOnly SSR cookie.
-On WebSocket reconnect, the token restores model state without re-running init.
-
-### 3. View Layer
-
-**`element.gleam`** — The VDOM node types:
-- `TextNode(content)` — text content
-- `ElementNode(tag, attributes, children)` — HTML element
-- `MemoNode(key, deps, child)` — memoized subtree (skips re-render when deps match)
-- `NoneNode` — empty node for conditional rendering
-- `RawHtml(html)` — raw HTML content (pre-sanitized only)
-- `Attr`: `HtmlAttr(name, value)` or `EventAttr(event_name, handler_id)`
-
-**`html.gleam`** — 54 element helpers and attribute builders (`div`, `span`, `p`, `h1`-`h6`, `ul`, `li`,
-`button`, `input`, `form`, `table`, `canvas`, `select`, `option`, etc.).
-
-**`view.gleam`** — Converts a `Node` tree into a `Rendered` struct by splitting
-static HTML from dynamic text content. Static parts are sent once on mount;
-subsequent updates send only changed dynamic values.
-
-### 4. Diffing and Patching
-
-Three diffing layers, each operating at a different granularity:
-
-**Template-level (`template/rendered.gleam` + `template/analyzer.gleam`):**
-- `Rendered` struct: fingerprint + statics list + dynamics list
-- Fingerprint-based change detection — if fingerprints match, only dynamic diffs sent
-- `analyzer.gleam`: Glance AST analysis classifying view expressions as `Static` or `Dynamic(dependencies)`
-
-**VDOM (`diff.gleam`):**
-- Tree diff producing 8 `Patch` variants: `ReplaceText`, `ReplaceNode`, `InsertChild`, `RemoveChild`, `SetAttribute`, `RemoveAttribute`, `SetEvent`, `RemoveEvent`
-- Each patch carries a path (`List(Int)`) for targeting
-- `MemoNode` comparison skips subtrees when deps are equal
-
-**JSON Patch (`patch.gleam`):**
-- RFC 6902-inspired ops for state deltas: `replace`, `append`, `remove`
-- `diff(old_json, new_json) -> ops_json` — implemented in Erlang FFI
-- `apply_ops(model_json, ops_json) -> Result(String, String)`
-- Used by the runtime to send `ServerPatch` instead of full `ServerModelSync` when changes are small
-
-**Substate tracking (`runtime.gleam` `CachedModelState`):**
-- `SubstateCache` tracks per-field JSON strings independently
-- Only changed substates trigger re-serialization and diffing
-- Uses `FullModelCache` for models without substates
-
-### 5. Routing (`src/beacon/route.gleam`)
-
-Routing is explicit and uses the same app/runtime path as every other Beacon app.
-There is no filesystem route discovery, generated route dispatcher, or separate
-router startup mode.
-
-**`route.gleam`:** `Route` type with path, segments, params dict, query dict.
-`RoutePattern` for registered patterns. `match_path` does segment-by-segment
-matching with `:param` extraction.
-
-**App integration:** `beacon.route_pages([...])` registers explicit `route.page`
-manifest entries. Each page entry contains a pattern, the message to send on
-initial SSR or client-side navigation, and a typed render function used by
-`route.dispatch_view`. Route-aware SSR runs the same update path before rendering
-first paint, so hydrated state matches the HTML. There is one public route API:
-`route_pages`.
-
-**Route mini-apps:** `route.page_model` lets a page module own a child `Model`,
-`Msg`, `update`, and `view` while the root app embeds that child state and wraps
-child messages. `route.update_model` handles the select-update-replace loop.
-`route.update_server_model` does the same for `Server state`, updating the
-embedded child `Model` and private child `Server` together. Client bundle
-generation sanitizes imported route modules before copying them into the JS
-project, so route-local `Server`, `init_server`, `update_server`, and `server_`
-constants do not ship. This keeps route-local state explicit in Gleam types
-without creating a second router runtime or filesystem discovery step.
-
-### 6. SSR (`src/beacon/ssr.gleam`)
-
-LiveView's two-phase mount: dead render (HTTP) then live mount (WebSocket).
-
-**Dead render:** `render_page(SsrConfig) -> RenderedPage`
-1. Run `init()` to get initial model
-2. Call `view(model)` to get Node tree
-3. Render Node tree to HTML string via `element.to_string`
-4. Sign a session token (HMAC-SHA256) containing model identity/state
-5. Wrap in full HTML document with client JS bundle injected
-
-**Live mount:** On WebSocket connect, the browser sends `ClientJoin("", path)`.
-Runtime reads the HttpOnly join cookie from the upgrade request, deserializes
-model state when available (or re-runs init), and sends `ServerModelSync`.
-
-**Route-aware SSR:** `ssr_factory` in `TransportConfig` maps URL paths to different
-HTML, enabling per-route dead renders.
-
-### 7. Effects (`src/beacon/effect.gleam`)
-
-Effects are data, not actions. `Effect(msg)` is an opaque list of callbacks.
-
-- `none()` — no effects
-- `from(fn(dispatch) -> Nil)` — synchronous effect
-- `background(fn(dispatch) -> Nil)` — spawns a new BEAM process
-- `every(interval_ms, fn(dispatch) -> Nil)` — repeating timer
-- `after(delay_ms, fn() -> msg)` — delayed message
-- `batch(List(Effect))` — combine multiple effects
-- `map(Effect(a), fn(a) -> b)` — transform message type
-
-Spawned background work, delayed messages, repeating timers, and dynamic PubSub
-listeners are runtime-owned. Runtime shutdown stops live effect processes and
-listener subscriptions so reconnect churn does not leak work.
-
-### 8. Generated Event And Render Contract
-
-Live events require a generated `decode_event` contract. The runtime
-does not render `view` on live join or normal model updates; the browser renders
-from model sync/patch state and sends an encoded Msg envelope for server
-authority.
-
-The handler registry is client-side metadata in generated apps:
-
-1. Browser render starts a registry for DOM event attributes
-2. During render: `on_click(Increment)` calls `register_simple(msg)`, returns handler ID (`"h0"`, `"h1"`, ...)
-3. Browser events resolve the handler ID to a typed `Msg`
-4. Generated `encode_msg` serializes the `Msg` into `data.__beacon_msg`
-5. Server `beacon_codec.decode_event/4` decodes that envelope and runs `update`
-
-If generated `beacon_codec.decode_event/4` is not available for a public app,
-startup fails. The low-level `application.AppConfig.decode_event` field remains
-only for advanced non-browser transports. There is no server-rendered
-handler-registry event path.
-
-Generated `beacon_codec.render_model/1` is also part of the startup contract for
-public apps. SSR uses this generated renderer when the app is started through
-the public Beacon builder, so first paint and post-hydration rendering are tied
-to the same generated contract. The build also writes
-`build/beacon_contract.json` with Model, Local, Server, client message,
-component message, skipped server state, and generated codec details.
-
-Apps may define `pub type ClientMsg` to explicitly allow only a subset of
-top-level `Msg` variants to originate from the browser. Variants excluded from
-`ClientMsg` can still be produced by server effects or server-side update code,
-but generated browser events will not decode into them.
-
-Two handler types: `simple` (fixed Msg) and `parameterized` (callback that receives event data string).
-Uses process dictionary for storage since view runs synchronously in a single BEAM process.
-Stack-based for nested component renders.
-
-### 9. Client Runtime (`beacon_client/`)
-
-The browser-side JavaScript follows one rendering model:
-
-**SSR first render:** HTTP requests receive fully rendered HTML for first paint,
-SEO, and accessibility. On WebSocket join, the server sends authoritative
-`ServerModelSync` for hydration and must not remount the SSR HTML.
-
-**Client-state live rendering:** After hydration, normal model updates are
-`ServerPatch` or `ServerModelSync`; the server does not use repeated HTML mount
-messages for ordinary live updates. The client decodes model JSON, runs the
-generated `view`, and updates the DOM locally.
-
-**Local-only state:** When user code has a `Local` state and
-`msg_affects_model(msg)` returns `False`, the client runs `update` and renders
-immediately without WebSocket traffic. This covers UI-only state such as
-dropdowns, focused editor state, and input drafts.
-
-The build analyzer reports one state shape for every app: `Model`,
-`Model + Local`, `Model + Server`, or `Model + Local + Server`. It also
-classifies messages as `LOCAL`, `MODEL`, or `MODEL+LOCAL`. `LOCAL` messages are
-purely client-side. `MODEL` messages and `MODEL+LOCAL` messages still go through
-the server-authoritative update path; the local part can update the browser
-immediately, but the model part is confirmed by server patch/sync.
-
-When a message affects `Model`, the client can optimistically render its local
-result, but the server remains authoritative. Client-sent patch ops are hints
-only; server state comes from the server-side `update`.
-
-Generated client code is required for normal apps:
-- `initClient()` waits for `ServerModelSync` to get authoritative model
-- On event: runs `update` locally for instant DOM update
-- If model changed: sends event to server, awaits `ServerModelSync`/`ServerPatch`
-- If only local state changed: no server traffic (zero latency)
-- If patch application fails: sends `ClientRequestSync`; server replies with
-  `ServerModelSync` and no post-mount HTML
-- RAF-throttled rendering — multiple events batch into one DOM update per frame
-
-If Beacon cannot generate the client renderer/model codec for an app shape, app
-startup fails with a structured error instead of serving a degraded runtime.
-
-**Client-side protections:**
-- Rate limiting: 30 events/sec
-- Reconnect with exponential backoff + jitter
-- Cached model JSON for patch diffing
-
-Files: `beacon_client.gleam` (Gleam types), `beacon_client_ffi.mjs` (JS runtime),
-`beacon_client/patch.mjs` (client-side JSON diff/apply).
-
-## Supporting Modules
-
-### State Management
-- **`state.gleam`** — Dirty-var tracking: `compute_dirty_fields(old, new, field_checks) -> DirtySet`. Computed vars with caching and dependency tracking.
-- **`substate.gleam`** — Substates as OTP actors: `SubstateConfig(name, initial, update)`. Messages: `GetState`, `UpdateState`, `SetState`, `ShutdownSubstate`.
-- **`state_manager.gleam`** — ETS-backed state storage for cross-process access.
-
-### Application Layer
-- **`beacon.gleam`** — Top-level API. `AppBuilder` with one constructor: `app(init, init_local, init_server, update, view)`. `beacon.no_local` and `beacon.no_server` supply `Nil` state when an app does not need Local or Server. Event helpers: `on_click`, `on_input`, `on_submit`, `on_submit_local`, `on_change`, `on_mousedown`, `on_mouseup`, `on_mousemove`, `on_keydown`, `on_dragstart`, `on_dragover`, `on_drop`. Configuration: `title`, `secret_key`, `static_dir`, `route_pages`, `security_limits`. Starts with `beacon.start(port)`.
-- **`application.gleam`** — OTP application with supervision tree. `AppConfig` wraps all config. Supervisor manages transport, state manager, per-connection runtimes.
-- **`component.gleam`** — Composable MVU units: `Component(init, update, view, to_parent)` with message mapping.
-- **`config.gleam`** — Environment-based configuration: `get_env`, `get_env_or`, `get_env_int`, `port()`.
-
-### HTTP and Middleware
-- **`middleware.gleam`** — `Middleware` type: `fn(Request, fn(Request) -> Response) -> Response`. Combinators: `pipeline`, `only`, `except`, `at`, `methods`. Built-in: `logger`, `secure_headers`, `cors`, `rate_limit`, `compress`.
-- **`static.gleam`** — Static file serving: `StaticConfig(directory, prefix, max_age)`. MIME types, cache headers, directory traversal prevention.
-
-### PubSub and Stores
-- **`pubsub.gleam`** — A port of Phoenix.PubSub's `pg` adapter: `subscribe(topic)`, `unsubscribe(topic)`, `broadcast(topic, message)` reaches every connected node; `local_broadcast` and `direct_broadcast` target one node. See `docs/CLUSTERING.md`.
-- **`store.gleam`** — ETS-backed shared stores: `Store` (key-value) and `ListStore` (bag-type). Auto-broadcast via PubSub on mutation (`put`, `delete`, `push`). Use `beacon.watch(store, fn() -> msg)` to subscribe. Stores from `store.new` are node-local; `store.open` with `Replicated(config)` replicates one across the cluster as an add-wins LWW CRDT (see `docs/CLUSTERING.md`).
-- **`session.gleam`** — Cookie-based sessions stored in ETS with TTL.
-- **`cookie.gleam`** — Cookie parsing and setting utilities (parse, get, set, delete with secure defaults).
-
-### Build Tooling
-- **`build.gleam`** — Client JS codegen: `gleam run -m beacon/build src/<entry>.gleam`. Beacon validates the full SSR + generated client-state contract before writing `src/beacon_codec.gleam` or `build/beacon_contract.json`; codec-only or base-client builds are not a public app path. `build_base_client()` remains as a legacy name, but it delegates to the full app build and exits on failure so missing `decode_event` / `render_model` cannot be hidden.
-- **`build/analyzer.gleam`** — Glance-based source analysis for codegen. Extracts `Model`, optional `Local`, optional private `Server`, primary `Msg`, message impacts (`LOCAL`, `MODEL`, `MODEL+LOCAL`), model fields, and event handlers from the entry module or imported client-visible modules.
-- **`lint.gleam`** — Custom Glance-based linter enforcing engineering principles: no `todo`/`panic`, no silent catch-alls, logging requirements.
-
-### Error Handling and Logging
-- **`error.gleam`** — 9 error variants: `TransportError`, `CodecError`, `RuntimeError`, `DiffError`, `RenderError`, `RouterError`, `EffectError`, `SessionError`, `ConfigError`. Each carries a `reason` string (plus `raw` for codec errors).
-- **`log.gleam`** — Structured logging with module context. Levels: `error`, `warning`, `info`, `debug`.
-
-### Additional
-- **`auth.gleam`** — Authentication middleware hooks.
-- **`form.gleam`** — Form validation helpers.
-- **`upload.gleam`** — File upload handling.
-- **`rate_limit.gleam`** — Per-IP rate limiting (used by middleware).
-- **`debug.gleam`** — Debug utilities.
-- **`dev.gleam`** — Development mode helpers (auto-reload).
-- **`error_page.gleam`** — Error page rendering.
-- **`stress.gleam`** — Load testing utilities.
-
-## Wire Protocol Detail
-
-### Client -> Server
-| Message | Fields | Purpose |
-|---------|--------|---------|
-| `ClientEvent` | name, handler_id, data, target_path, clock, ops | DOM event; ops are untrusted client hints |
-| `ClientHeartbeat` | — | Keep-alive |
-| `ClientJoin` | token, path | Live hydration request; browser recovery token is read from HttpOnly cookie |
-| `ClientNavigate` | path | SPA navigation |
-| `ClientRequestSync` | - | Full model resync request after client patch failure |
-| `ClientEventBatch` | events: List(ClientMessage) | Bounded explicit batch for non-browser clients; generated browser clients do not replay local-only events |
-
-### Server -> Client
-| Message | Fields | Purpose |
-|---------|--------|---------|
-| `ServerMount` | payload (HTML) | Reserved remount message; normal apps use SSR HTML plus `ServerModelSync` |
-| `ServerHeartbeatAck` | — | Heartbeat response |
-| `ServerError` | reason | Error notification |
-| `ServerModelSync` | model_json, version, ack_clock | Full authoritative model state |
-| `ServerPatch` | ops_json, version, ack_clock | Incremental model delta (JSON Patch ops) |
-| `ServerNavigate` | path | Server-initiated redirect |
-| `ServerReload` | — | Dev mode: trigger browser reload |
-
-Event clocking: `ClientEvent.clock` is monotonic. `ServerModelSync.ack_clock` acknowledges
-which client events have been processed, enabling optimistic update reconciliation.
-
-## Dependencies (from gleam.toml)
-
-| Package | Version | Purpose |
-|---------|---------|---------|
-| gleam_stdlib | >= 0.44.0 | Standard library |
-| gleam_erlang | >= 1.3.0 | BEAM interop, process spawning |
-| gleam_otp | >= 1.2.0 | Actors, supervisors, subjects |
-| gleam_http | >= 4.3.0 | HTTP types (Request, Response) |
-| gleam_json | >= 3.1.0 | JSON encoding/decoding |
-| gleam_crypto | >= 1.5.1 | HMAC-SHA256 session signing |
-| glance | >= 6.0.0 | Gleam AST parser (codegen + linting) |
-| logging | >= 1.3.0 | Structured logging |
-| simplifile | >= 2.4.0 | File system access |
-| gleeunit | >= 1.0.0 | Test runner (dev only) |
-
-No dependency on wisp, lustre, or glance_printer. Beacon implements its own
-Element type, view helpers, middleware, and routing.
+Beacon is a full-stack Gleam web framework on the BEAM. An app is an MVU loop
+that runs on the server, one runtime process per WebSocket connection. The
+server renders the first page as HTML (LiveView's dead render); after the
+WebSocket joins, the browser renders the view itself from the model the
+server sends. Views are plain Gleam functions: no templates and no macros.
+A build step reads the app's source with Glance, generates the wire codecs,
+and compiles only the code the browser needs to JavaScript.
+
+## The App
+
+`beacon.gleam` is the public entry point. An app is built with one of three
+constructors and started with `beacon.start(app, port)`:
+
+| Constructor | `update` runs | State |
+|---|---|---|
+| `beacon.simple(init:, update:, view:)` | in the browser and on the server | `model` |
+| `beacon.application(init:, update:, view:)` | on the server, with effects | `model` |
+| `beacon.full_application(init:, update:, sync:, local:, view:)` | on the server, with effects | server `state`, synced `model`, browser `local` |
+
+- **`init(Context)`** receives the request context (`beacon.uri`,
+  `beacon.cookie`, `beacon.is_connected`, `beacon.session_id`). It runs twice:
+  once for the HTML render and once for the connected mount. Effects returned
+  on the HTML render are dropped.
+- **`sync(state) -> model`** (full application) chooses what the browser
+  receives. The rest of `state` never leaves the server.
+- **`local`** is `local.none()` or `local.layer(init:, update:)`. Local state
+  lives only in the browser. Its `update` returns `local.handled(local)` to
+  keep the message in the browser, or `local.forward(local)` to also send it
+  to the server.
+- **`simple`**'s `update` is compiled to JavaScript. The browser applies it
+  at once and still sends the message. The server stays authoritative: its
+  `model_sync` replaces the browser's prediction, and the client logs a
+  mismatch.
+
+Builder functions add the rest: `with_router`, `title`, `subscriptions`,
+`on_notify`, `on_notification`, `head_html`, `api_routes`, `ws_auth`,
+`security_limits`, `secret_key`, `with_middleware`, `static_dir`, `dev_mode`
+and `with_state_recovery`.
+
+`beacon.start` checks for the build artifacts (`priv/static/beacon_client.manifest`
+must name a bundle that exists, and the generated `beacon_codec` module must
+load), composes the app with its `sync` and local layer into an
+`application.AppConfig`, and starts the listener. It does not read
+environment variables; apps read them with `beacon/config` (`config.port()`,
+`config.secret_key()`, `config.is_production()`). Without
+`beacon.secret_key`, start generates a random key and logs a warning.
+
+## Request Lifecycle
+
+```
+GET /path ──► middleware ──► api_routes? ──► static? ──► SSR (dead render)
+                                                          │ init(ctx) → route msg → view → HTML
+                                                          │ + join-token cookie + <script bundle>
+browser loads bundle ──► WS /ws?path=/path ──► ws_auth? ──► runtime process
+                                                          │ init(ctx) → route msg
+                                                          │ ◄── join
+                                                          │ ──► model_sync (full model JSON)
+click ──► decoder → Msg → update_local / simple update → re-render
+      ──► event {data: encode_msg(msg), clock} ──► decode_event → update
+                                                          │ ──► patch (JSON Patch of the model)
+```
+
+### 1. Dead render (`ssr.gleam`)
+
+On HTTP GET, after middleware, API routes and static files, `ssr.gleam`:
+
+1. checks the URL's percent-encoding (`internal/uri_check`, 400 on failure);
+2. runs `init(ctx)` and, with a router, `update` with the route message for
+   the URL (404 when `parse` rejects it);
+3. renders `view` to HTML with `internal/render` and the `beacon.title`;
+4. sets a signed HttpOnly join-token cookie (Phoenix.Token style: purpose,
+   version, issue time, expiry and the browser-session fingerprint, signed
+   with HMAC); with `with_state_recovery` the token carries the model;
+5. returns the page shell: `<div id="beacon-app">` with the HTML and the
+   bundle named in `beacon_client.manifest`.
+
+### 2. Live mount (`runtime.gleam`)
+
+`application.gleam` spawns one runtime actor per WebSocket connection
+(`runtime.connect_transport_per_connection`). The runtime runs `init(ctx)`
+and the route message again, performs their effects, and answers the
+client's `join` with a `model_sync` of the encoded model. With state
+recovery, a verified join token restores the model instead of running
+`init`.
+
+### 3. Events
+
+The browser decodes a DOM event into a `Msg`, applies it locally, and sends
+it as `{"__beacon_msg": ...}` encoded by the generated `encode_msg`. The
+runtime decodes it with the generated `beacon_codec.decode_event`, runs
+`update`, performs the effects, encodes the model and sends a `patch` with
+the JSON Patch from the previous model (`patch.gleam`), or nothing when the
+model did not change.
+
+`decode_event` accepts only the constructors that client code can build.
+Anything else is refused: the runtime logs a warning, sends an `error`, and
+acknowledges the event clock so the browser drops its prediction. See
+[SECURITY.md](SECURITY.md#events-from-the-browser).
+
+### 4. Navigation (`router.gleam`)
+
+`beacon.with_router(parse:, on_change:)` makes the route part of the model.
+A same-origin link click or the back button sends `navigate`; the runtime
+parses the path and runs `update(model, on_change(route))`. `router.push` and
+`router.replace` are effects that change the URL and run the same path;
+`router.redirect` makes the browser load a page. A path the app does not route
+is answered with `hard_navigate`, so the 404 comes from a real HTTP response.
+See [ROUTING.md](ROUTING.md).
+
+## Server Runtime (`runtime.gleam`)
+
+The runtime is an OTP actor. Its `RuntimeConfig` holds `init`, `update`,
+`encode_model`, `decode_event`, `restore_model`, `route`,
+`dynamic_subscriptions` (with `on_notify` and `on_notification`) and the
+secret key.
+
+- **Versioning.** One `revision` counter, incremented exactly when the
+  client-visible model JSON changes. A `patch` carries the revision it
+  produces; a `model_sync` carries the current one. The client applies a
+  non-empty patch only at `current + 1`, ignores stale ones and sends
+  `request_sync` on a gap or on any patch it cannot apply.
+- **Event clocks.** Every event carries a monotonic `clock`; `ack_clock` on
+  `patch` and `model_sync` is the highest clock that connection sent which the
+  server has processed (LiveView 1.1 event clocking).
+- **Effects** (`effect.gleam`) are data: `none`, `from`, `background`,
+  `after`, `every`, `batch`, `map`, `keyed` and `cancellable`/`cancel`.
+  Timers, background processes and PubSub listeners belong to the runtime and
+  stop when it stops. See [EFFECTS.md](EFFECTS.md).
+- **Subscriptions.** `beacon.subscriptions(fn(model) -> List(topic))` is
+  re-evaluated after each update; the runtime joins and leaves PubSub topics
+  to match, and `on_notify`/`on_notification` turn broadcasts into messages.
+
+## Client Runtime (`beacon_client/`)
+
+`beacon_client_ffi.mjs` is the only hand-written JavaScript in the browser.
+It owns the WebSocket, event delegation and DOM morphing.
+`beacon_client/patch.mjs` holds the JSON Patch, version classification,
+send budget and reconnect backoff, mirroring `patch.gleam`.
+
+The app's own code reaches the runtime through the generated entry module
+`beacon_app_entry` (`build/client_entry.gleam`). The runtime checks these
+exports at startup: `decode_model`, `init_local`, `render`, `lookup_handler`,
+`run_handler`, `handler_options`, `event_names`, `update_local`,
+`encode_msg`, `same_model` and `is_simple`. A `simple` app also exports
+`update`.
+
+- **Rendering.** `render(model, local)` returns the HTML and the handler
+  table from `internal/render.gleam`, the same target-neutral module SSR
+  uses. Handlers are keyed by event name and position id (`"0.1"`); keyed
+  and memo nodes are transparent, so server and browser agree on ids. The DOM
+  is morphed toward the new HTML; `data-beacon-key` gives a node identity.
+- **Events.** One capture listener per event name matches elements carrying
+  `data-beacon-on-<name>`. Handler options apply prevent-default,
+  stop-propagation, debounce and throttle. The decoder runs against the real
+  event; a decode failure is a `console.warn` and the event is dropped.
+- **Before hydration** there is no handler table. Events on marked elements
+  are queued with a snapshot of their fields and replayed after the first
+  `model_sync`.
+- **Connection.** Heartbeats every 30 s, a client send budget, reconnect
+  with exponential backoff and jitter. Close code 4401 (session revoked)
+  stops reconnecting.
+
+## Build (`build.gleam`, `build/`)
+
+`gleam run -m beacon/build` (or `gleam run -m beacon/dev`, which rebuilds and
+hot-reloads on change) runs, from the app project:
+
+1. **Discovery** (`discovery`, `sources`, `app_call`): find the app module,
+   whose `pub fn main` reaches a `beacon.simple`, `beacon.application` or
+   `beacon.full_application` call, and the user modules it imports.
+2. **Analysis** (`analyzer`, `field_type`): read the constructor call, the
+   synced `Model` and the `Msg` type.
+3. **Reachability** (`reach`): walk from `view`, a `simple` app's `update`,
+   and the Local layer's `init` and `update`, following references to user
+   functions, constants, types and constructors with scope tracking. A
+   reference to a Beacon module outside the client allowlist
+   (`beacon/attribute`, `element`, `event`, `html`, `local`, `log`, `svg`)
+   fails the build, naming the call site. The Msg constructors reached are the
+   ones `decode_event` will accept.
+4. **Contract** (`contract`): write `build/beacon_contract.json`, listing
+   what crosses the wire and what code reaches the browser.
+5. **Server codec** (`server_codec`, `codec_gen`, `gleam_code`): generate
+   `src/beacon_codec.gleam` (`encode_model`, `decode_model`, `decode_event`)
+   and compile the project. A codec that does not compile is deleted.
+6. **Client bundle** (`client_bundle`, `client_entry`, `client_shim`): write a
+   JavaScript-target project to `build/beacon_client_app` holding only the
+   reached definitions (sliced out of their files, with imports regenerated),
+   the Beacon client modules, a JavaScript `beacon/log`, the runtime and
+   `beacon_app_entry.gleam`, with packages pinned to `manifest.toml`. Compile
+   it, bundle it with the pinned esbuild, and write
+   `priv/static/beacon_client_<hash>.js` and the manifest. A failure deletes
+   the manifest, so `beacon.start` refuses stale artifacts.
+
+`gleam run -m beacon/build/runtime_bundle` rebuilds the repository's
+prebuilt runtime bundle from `beacon_client/src`.
+
+## Wire Protocol
+
+JSON text frames over `/ws`. Full examples are in
+[WIRE_PROTOCOL.md](WIRE_PROTOCOL.md).
+
+### Client to server (`transport.ClientMessage`)
+
+| `type` | Variant | Fields | Purpose |
+|---|---|---|---|
+| `join` | `ClientJoin` | token, path | Live mount; the recovery token comes from the HttpOnly cookie |
+| `event` | `ClientEvent` | name, handler_id, data, target_path, clock, ops | A forwarded Msg in `data`; `ops` are untrusted hints |
+| `event_batch` | `ClientEventBatch` | events | A bounded batch of events |
+| `navigate` | `ClientNavigate` | path | Client navigation |
+| `request_sync` | `ClientRequestSync` | | Ask for a full `model_sync` |
+| `heartbeat` | `ClientHeartbeat` | | Keep-alive |
+
+### Server to client (`transport.ServerMessage`)
+
+| `type` | Variant | Fields | Purpose |
+|---|---|---|---|
+| `model_sync` | `ServerModelSync` | model, version, ack_clock | The full model |
+| `patch` | `ServerPatch` | ops, version, ack_clock | JSON Patch of the model |
+| `navigate` | `ServerNavigate`, `ServerReplaceNavigate` | path, replace | `router.push` / `router.replace` |
+| `hard_navigate` | `ServerHardNavigate` | path | `router.redirect`, or an unrouted path |
+| `error` | `ServerError` | reason | A refused event or other error |
+| `heartbeat_ack` | `ServerHeartbeatAck` | | Heartbeat reply |
+| `reload` | `ServerReload` | | Dev mode: reload the page |
+| `mount` | `ServerMount` | payload | Not sent to browser clients; the client logs and ignores it |
+
+## Transport (`transport.gleam`, `transport/`)
+
+Beacon has its own HTTP/1.1 and WebSocket server on `gen_tcp`
+(`transport/server.gleam`, `http.gleam`, `ws.gleam`, `client.gleam` and the
+`beacon_http_*` Erlang modules), with one process per connection.
+`transport.SecurityLimits` bounds everything that comes from the network:
+message size (64 KB), events per second (50), connections (10,000 total, per
+IP for HTTP and WebSocket), header counts and sizes, body size and read
+timeouts, keep-alive, WebSocket ping/pong and idle timeouts, the outbound
+queue, and decode errors. Forwarding headers are honoured only from
+`trusted_proxies`. The WebSocket upgrade checks the origin and runs the
+optional `ws_auth` hook, which is rechecked every
+`ws_auth_recheck_interval_ms`. See [SECURITY.md](SECURITY.md).
+
+## Modules
+
+### View
+
+| Module | Contents |
+|---|---|
+| `element` | `Element(msg)`: `element`, `text`, `none`, `keyed`, `memo`, `map`, `unsafe_raw_html`, `to_string` |
+| `html`, `svg` | Element helpers ([HTML_ELEMENTS.md](HTML_ELEMENTS.md), [SVG.md](SVG.md)) |
+| `attribute` | Attributes; URL attributes go through `internal/url` |
+| `event` | Listeners holding a `Decoder(msg)`; payload decoders; modifiers |
+| `local` | The Local layer |
+| `internal/render` | Target-neutral rendering to HTML plus the handler table |
+| `internal/url` | The URL policy for `href`, `src` and the other URL attributes |
+
+### Server
+
+| Module | Contents |
+|---|---|
+| `application` | Builds the runtime and SSR configs and starts the listener, optionally supervised |
+| `runtime` | The MVU actor |
+| `ssr` | Dead render, page shell, join token |
+| `transport`, `transport/*` | HTTP/WebSocket server and wire protocol |
+| `effect` | Effects |
+| `router` | `segments`, `query`, `push`, `replace`, `redirect` |
+| `patch` | JSON Patch diff and apply (Erlang FFI) |
+| `api` | Typed handlers for `beacon.api_routes` |
+| `middleware` | HTTP middleware pipeline ([MIDDLEWARE.md](MIDDLEWARE.md)) |
+| `static` | Static files with traversal prevention |
+| `cookie`, `session`, `auth` | Cookies, server-side sessions, login/logout and session-bound WebSockets |
+| `form`, `upload` | Form helpers and CSRF; bounded multipart uploads with content sniffing |
+| `rate_limit`, `ip` | Fixed-window rate limiting; trusted-proxy client addresses |
+| `pubsub`, `presence` | Ports of Phoenix.PubSub (pg adapter) and Phoenix.Tracker |
+| `store`, `store/*` | ETS stores that broadcast on change; replicated stores as an add-wins LWW CRDT |
+| `state_manager` | ETS storage behind stores |
+| `cluster` | Node discovery and reconnection ([CLUSTERING.md](CLUSTERING.md)) |
+| `telemetry` | Events through the Erlang `telemetry` library ([TELEMETRY.md](TELEMETRY.md)) |
+| `config` | `port`, `secret_key`, `is_production` from the environment |
+| `error`, `error_page`, `log` | Error types, error pages, structured logging |
+| `notification` | Typed PubSub payloads for `on_notification` |
+| `debug` | Runtime statistics |
+
+### Tooling
+
+| Module | Contents |
+|---|---|
+| `build`, `build/*` | The build pipeline above |
+| `dev` | Build, run, rebuild and hot-reload on change |
+| `lint` | Glance-based linter for the engineering principles (`gleam run -m beacon/lint`) |
+
+## Dependencies
+
+| Package | Purpose |
+|---|---|
+| gleam_stdlib, gleam_erlang, gleam_otp | Standard library, processes, actors and supervisors |
+| gleam_http | Request and Response types |
+| gleam_json | JSON encoding and decoding |
+| gleam_crypto | HMAC signing, random secrets |
+| glance, glexer | Gleam parsing for the build and the linter |
+| tom | `gleam.toml` and `manifest.toml` for the build |
+| logging | Logging backend |
+| simplifile | File access |
+| telemetry | Telemetry events |
+| gleeunit | Tests (dev only) |
+
+Beacon does not depend on Lustre, Wisp or Mist; it follows their designs
+(see below) with its own element type, middleware and server.
 
 ## Project Structure
 
 ```
 src/
-  beacon.gleam                  # Top-level API (AppBuilder, event helpers)
-  beacon/
-    transport.gleam             # Transport orchestration, WS lifecycle, connection state
-    transport/
-      server.gleam            # HTTP/1.1 + WebSocket server on gen_tcp
-      http.gleam              # HTTP request parsing, response writing
-      ws.gleam                # WebSocket upgrade + frame encode/decode
-    runtime.gleam               # MVU loop, OTP actor, state management
-    element.gleam               # Node/Attr types, to_string
-    html.gleam                  # HTML element helpers
-    svg.gleam                   # SVG element helpers and attributes
-    view.gleam                  # Node -> Rendered splitting
-    diff.gleam                  # VDOM tree diffing
-    patch.gleam                 # JSON Patch for state deltas
-    ssr.gleam                   # Dead render + session tokens
-    effect.gleam                # Effect system
-    handler.gleam               # Auto event decoding registry
-    component.gleam             # Composable MVU units
-    route.gleam                 # Route/RoutePattern types
-    template/
-      rendered.gleam            # Rendered struct (statics/dynamics/fingerprint)
-      analyzer.gleam            # Glance AST static/dynamic classifier
-    build.gleam                 # Client JS build tool
-    build/
-      analyzer.gleam            # Source analysis for codegen
-    state.gleam                 # Dirty-var tracking, computed vars
-    substate.gleam              # Substates as OTP actors
-    state_manager.gleam         # ETS-backed state storage
-    middleware.gleam             # HTTP middleware pipeline
-    pubsub.gleam                # Erlang pg-based pub/sub
-    store.gleam                 # ETS-backed shared stores
-    session.gleam               # Cookie-based sessions
-    static.gleam                # Static file serving
-    application.gleam           # OTP supervision tree
-    config.gleam                # Environment configuration
-    error.gleam                 # 9 error variants
-    log.gleam                   # Structured logging
-    lint.gleam                  # Custom Glance-based linter
-    auth.gleam                  # Authentication
-    form.gleam                  # Form validation
-    upload.gleam                # File uploads
-    rate_limit.gleam            # Per-IP rate limiting
-    debug.gleam                 # Debug utilities
-    dev.gleam                   # Dev mode (auto-reload)
-    error_page.gleam            # Error page rendering
-    stress.gleam                # Load testing
-  beacon_*_ffi.erl (28 files)  # Erlang FFI modules
-beacon_client/
-  src/
-    beacon_client.gleam         # Client Gleam types
-    beacon_client_ffi.mjs       # Client JS runtime (WS, events, morphing)
-    beacon_client/patch.mjs     # Client-side JSON diff/apply
-examples/                       # 19 example apps (counter, chat, kanban, snake, etc.)
-test/                           # Tests mirroring src structure
+  beacon.gleam            # Public API: constructors, builders, start
+  beacon/                 # Modules above
+    build/                # Build pipeline
+    internal/             # render, url, uri_check, context
+    presence/, store/     # Presence and replicated-store internals
+    transport/            # HTTP/WebSocket server
+  beacon_*.erl            # Erlang FFI and OTP processes
+beacon_client/src/
+  beacon_client_ffi.mjs   # Browser runtime
+  beacon_client/patch.mjs # JSON Patch, versions, send budget, backoff
+examples/                 # 24 apps, each built with `gleam run -m beacon/build`
+test/                     # Unit, runtime, integration, build and cluster tests
+test_all_cdp.py           # Browser tests over the examples (see TESTING.md)
 ```
 
-47 Gleam modules + 29 Erlang FFI files + 4 client JS/Gleam files.
+## Design Sources
 
-## Design Patterns Implemented
-
-| Pattern | Source | Where in Beacon |
-|---------|--------|-----------------|
-| MVU (Model-View-Update) | Elm, Lustre | `runtime.gleam`, `effect.gleam` |
-| Static/dynamic splitting | LiveView Rendered struct | `view.gleam`, `template/rendered.gleam` |
-| Fingerprint-based diffing | LiveView | `template/rendered.gleam` |
-| Dead render + live mount | LiveView two-phase mount | `ssr.gleam` |
-| Event clocking | LiveView 1.1 | `ClientEvent.clock`, `ServerModelSync.ack_clock` |
-| Dirty-var tracking | Reflex.dev | `state.gleam`, `CachedModelState` |
-| Substates as actors | Reflex.dev | `substate.gleam` |
-| Computed var caching | Reflex.dev | `state.gleam` |
-| Build-time codegen | Squirrel | `build.gleam`, `build/analyzer.gleam` |
-| Handler registry | Beacon original | `handler.gleam` (auto-decode from view) |
-| Client-side local execution | Beacon original | `beacon_client_ffi.mjs`, Model/Local split |
-| JSON Patch state sync | RFC 6902 | `patch.gleam`, `ServerPatch` |
+| Pattern | Source | Where |
+|---|---|---|
+| MVU, effects as data, element/attribute/event layout | Elm, Lustre | `runtime`, `effect`, `element`, `event` |
+| Dead render, then live mount | LiveView | `ssr`, `runtime` |
+| Route as model, `handle_params` | LiveView | `with_router`, `router` |
+| Event clocks and acknowledgements | LiveView 1.1 | `clock`, `ack_clock` |
+| Signed join tokens | Phoenix.Token | `ssr` |
+| PubSub, presence | Phoenix.PubSub, Phoenix.Tracker | `pubsub`, `presence` |
+| Codegen from source analysis | Squirrel | `build` |
+| Model JSON patches | RFC 6902, RFC 6901 | `patch`, `patch.mjs` |

@@ -1,15 +1,32 @@
-/// AI Chat — demonstrates:
-/// - Server-side streaming without exposing secrets to the client
-/// - Smooth character-by-character streaming (text buffered, dripped to client)
-/// - Multi-turn conversation with full history
-/// - effect.from for spawning async work that dispatches to the runtime
+/// AI Chat: a server-side stream dripped to the browser.
+///
+/// - `effect.background` runs the stream in a process owned by the session,
+///   so it stops when the session ends.
+/// - The stream dispatches `CharDelta`, `StreamDone` and `StreamError`.
+///   No view handler produces them, so the browser cannot send them.
+/// - The session's usage counters are server-only: `sync` sends only the
+///   Model.
+/// - The response is deterministic, so CI needs no API key or service.
 import beacon
-import beacon/effect
+import beacon/attribute
+import beacon/effect.{type Effect}
+import beacon/element.{type Element}
+import beacon/event
 import beacon/html
+import beacon/local
 import beacon/log
 import gleam/erlang/process
+import gleam/int
 import gleam/list
 import gleam/string
+
+const max_prompt_length = 2000
+
+/// The server refuses prompts once the conversation has this many messages.
+const max_messages = 100
+
+/// How long the dripper waits for the next chunk before failing the stream.
+const chunk_timeout_ms = 5000
 
 // --- Types ---
 
@@ -22,38 +39,59 @@ pub type Role {
   Assistant
 }
 
+/// Synced to the browser.
 pub type Model {
   Model(
     messages: List(ChatMessage),
     input_text: String,
     is_streaming: Bool,
     streaming_text: String,
+    notice: String,
   )
+}
+
+/// What the server holds per session. Only `model` is synced.
+pub type Session {
+  Session(model: Model, prompts: Int, characters_streamed: Int)
 }
 
 pub type Msg {
   UpdateInput(String)
   SendPrompt
-  /// A single character from the drip-feed
+  /// A few characters from the drip-feed. Server only.
   CharDelta(String)
+  /// Server only.
   StreamDone
+  /// Server only.
   StreamError(String)
+}
+
+/// What the fetcher sends to the dripper.
+type Chunk {
+  Text(String)
+  Finished
+  Failed(String)
 }
 
 // --- Init ---
 
-pub fn init() -> #(Model, effect.Effect(Msg)) {
+fn init(_ctx: beacon.Context) -> #(Session, Effect(Msg)) {
   #(
-    Model(
-      messages: [
-        ChatMessage(
-          role: Assistant,
-          content: "Hello! This example streams a deterministic server-side response so CI can test effect dispatch without external services.",
-        ),
-      ],
-      input_text: "",
-      is_streaming: False,
-      streaming_text: "",
+    Session(
+      model: Model(
+        messages: [
+          ChatMessage(
+            role: Assistant,
+            content: "Hello! This example streams a deterministic server-side response so CI can test effect dispatch without external services.",
+          ),
+        ],
+        input_text: "",
+        is_streaming: False,
+        streaming_text: "",
+        notice: "",
+      ),
+      prompts: 0,
+      characters_streamed: 0,
     ),
     effect.none(),
   )
@@ -61,219 +99,263 @@ pub fn init() -> #(Model, effect.Effect(Msg)) {
 
 // --- Update ---
 
-pub fn update(
-  model: Model,
-  _local: Nil,
-  _server: Nil,
-  msg: Msg,
-) -> #(Model, Nil, Nil) {
-  let model = case msg {
-    UpdateInput(text) -> Model(..model, input_text: text)
+fn update(session: Session, msg: Msg) -> #(Session, Effect(Msg)) {
+  let model = session.model
+  case msg {
+    UpdateInput(text) ->
+      case string.length(text) > max_prompt_length {
+        True -> {
+          log.warning(
+            "ai_chat",
+            "Refusing input of "
+              <> int.to_string(string.length(text))
+              <> " characters (limit "
+              <> int.to_string(max_prompt_length)
+              <> ")",
+          )
+          #(
+            with_model(
+              session,
+              Model(
+                ..model,
+                notice: "Messages are limited to "
+                  <> int.to_string(max_prompt_length)
+                  <> " characters",
+              ),
+            ),
+            effect.none(),
+          )
+        }
+        False -> #(
+          with_model(session, Model(..model, input_text: text, notice: "")),
+          effect.none(),
+        )
+      }
 
-    SendPrompt -> {
-      let text = string.trim(model.input_text)
-      case string.is_empty(text) || model.is_streaming {
-        True -> model
-        False -> {
-          let user_msg = ChatMessage(role: User, content: text)
-          let new_messages = list.append(model.messages, [user_msg])
+    SendPrompt -> send_prompt(session)
+
+    CharDelta(chunk) -> {
+      assert_streaming(model, "CharDelta")
+      #(
+        Session(
+          ..session,
+          model: Model(..model, streaming_text: model.streaming_text <> chunk),
+          characters_streamed: session.characters_streamed
+            + string.length(chunk),
+        ),
+        effect.none(),
+      )
+    }
+
+    StreamDone -> {
+      assert_streaming(model, "StreamDone")
+      log.info(
+        "ai_chat",
+        "Stream finished; session usage: "
+          <> int.to_string(session.prompts)
+          <> " prompts, "
+          <> int.to_string(session.characters_streamed)
+          <> " characters",
+      )
+      #(
+        with_model(
+          session,
+          finish_stream(model, ChatMessage(Assistant, model.streaming_text)),
+        ),
+        effect.none(),
+      )
+    }
+
+    StreamError(reason) -> {
+      assert_streaming(model, "StreamError")
+      log.error("ai_chat", "Stream failed: " <> reason)
+      #(
+        with_model(
+          session,
+          finish_stream(model, ChatMessage(Assistant, "Error: " <> reason)),
+        ),
+        effect.none(),
+      )
+    }
+  }
+}
+
+fn send_prompt(session: Session) -> #(Session, Effect(Msg)) {
+  let model = session.model
+  let text = string.trim(model.input_text)
+  case
+    string.is_empty(text),
+    model.is_streaming,
+    list.length(model.messages) >= max_messages
+  {
+    True, _, _ -> {
+      log.debug("ai_chat", "Ignoring an empty prompt")
+      #(session, effect.none())
+    }
+    _, True, _ -> {
+      log.warning("ai_chat", "Refusing a prompt while a stream is running")
+      #(session, effect.none())
+    }
+    _, _, True -> {
+      log.warning(
+        "ai_chat",
+        "Refusing a prompt: the conversation has reached "
+          <> int.to_string(max_messages)
+          <> " messages",
+      )
+      #(
+        with_model(
+          session,
           Model(
-            messages: new_messages,
+            ..model,
+            notice: "This conversation is full. Reload to start a new one.",
+          ),
+        ),
+        effect.none(),
+      )
+    }
+    False, False, False -> {
+      let messages = list.append(model.messages, [ChatMessage(User, text)])
+      log.info(
+        "ai_chat",
+        "Starting stream for prompt " <> int.to_string(session.prompts + 1),
+      )
+      #(
+        Session(
+          ..session,
+          model: Model(
+            messages:,
             input_text: "",
             is_streaming: True,
             streaming_text: "",
-          )
-        }
-      }
-    }
-
-    CharDelta(ch) -> Model(..model, streaming_text: model.streaming_text <> ch)
-
-    StreamDone -> {
-      let ai_msg = ChatMessage(role: Assistant, content: model.streaming_text)
-      Model(
-        ..model,
-        messages: list.append(model.messages, [ai_msg]),
-        is_streaming: False,
-        streaming_text: "",
-      )
-    }
-
-    StreamError(err) -> {
-      let error_msg = ChatMessage(role: Assistant, content: "Error: " <> err)
-      Model(
-        ..model,
-        messages: list.append(model.messages, [error_msg]),
-        is_streaming: False,
-        streaming_text: "",
+            notice: "",
+          ),
+          prompts: session.prompts + 1,
+        ),
+        start_streaming(text),
       )
     }
   }
-  #(model, Nil, Nil)
 }
 
-fn after_update(state: #(Model, Nil, Nil), msg: Msg) -> effect.Effect(Msg) {
-  let model = state.0
-  case msg, model.is_streaming {
-    SendPrompt, True -> start_streaming(model.messages)
-    _, _ -> effect.none()
-  }
+fn with_model(session: Session, model: Model) -> Session {
+  Session(..session, model:)
 }
 
-// --- AI Streaming with Character Drip ---
-
-fn start_streaming(messages: List(ChatMessage)) -> effect.Effect(Msg) {
-  effect.from(fn(dispatch) {
-    // Spawn dripper process — it creates its own Subject, spawns the fetcher,
-    // and drips characters to the runtime via dispatch.
-    let _ =
-      process.spawn(fn() {
-        // Subject created inside the dripper process — belongs to this process
-        let char_subject = process.new_subject()
-
-        // Spawn fetcher that sends token chunks to our subject
-        let _ = process.spawn(fn() { fetch_ai_stream(messages, char_subject) })
-
-        // Drip characters to the runtime
-        drip_characters(char_subject, dispatch, "")
-      })
-    Nil
-  })
+fn finish_stream(model: Model, reply: ChatMessage) -> Model {
+  Model(
+    ..model,
+    messages: list.append(model.messages, [reply]),
+    is_streaming: False,
+    streaming_text: "",
+  )
 }
 
-/// Builds a deterministic stream and sends it to the subject.
-/// Sends "" (empty string) when done, or an error string prefixed with "ERR:".
-fn fetch_ai_stream(
-  messages: List(ChatMessage),
-  subject: process.Subject(String),
-) -> Nil {
-  let prompt = latest_user_text(messages, "your message")
-  let response =
-    "Server stream received: "
-    <> prompt
-    <> ". Beacon keeps this work on the server and sends state updates to the client."
-
-  log.info("ai_chat", "Starting deterministic response stream")
-  process.send(subject, response)
-  sleep(20)
-  process.send(subject, "")
+/// Only the stream started by `send_prompt` dispatches stream messages, and
+/// `send_prompt` refuses a second prompt while one runs, so a stream message
+/// always arrives while `is_streaming` is True.
+fn assert_streaming(model: Model, message: String) -> Nil {
+  let assert True = model.is_streaming
+    as { message <> " arrived while no stream was running" }
   Nil
 }
 
-/// Reads token chunks from the subject and dispatches small character batches
-/// with delays for a smooth typing effect.
-fn drip_characters(
-  subject: process.Subject(String),
+fn sync(session: Session) -> Model {
+  session.model
+}
+
+// --- Streaming ---
+
+fn start_streaming(prompt: String) -> Effect(Msg) {
+  effect.background(fn(dispatch) {
+    // The subject belongs to this process, so the fetcher sends to it and
+    // this process drips the characters to the runtime.
+    let chunks = process.new_subject()
+    process.spawn(fn() { fetch_stream(prompt, chunks) })
+    drip(chunks, dispatch, "")
+  })
+}
+
+/// Builds the deterministic response and sends it in one chunk.
+fn fetch_stream(prompt: String, chunks: process.Subject(Chunk)) -> Nil {
+  log.info("ai_chat", "Fetching the deterministic response")
+  process.send(
+    chunks,
+    Text(
+      "Server stream received: "
+      <> prompt
+      <> ". Beacon keeps this work on the server and sends state updates to the client.",
+    ),
+  )
+  process.sleep(20)
+  process.send(chunks, Finished)
+}
+
+/// Dispatches the buffer three graphemes at a time, then waits for the next
+/// chunk.
+fn drip(
+  chunks: process.Subject(Chunk),
   dispatch: fn(Msg) -> Nil,
   buffer: String,
 ) -> Nil {
-  // If buffer has characters, drip a small batch (3-5 chars)
   case string.is_empty(buffer) {
     False -> {
-      let #(batch, rest) = take_graphemes(buffer, 3)
+      let #(batch, rest) = take_graphemes(buffer, 3, "")
       dispatch(CharDelta(batch))
-      sleep(30)
-      drip_characters(subject, dispatch, rest)
+      process.sleep(30)
+      drip(chunks, dispatch, rest)
     }
-    True -> {
-      // Buffer empty — try to get more from the subject
-      let selector =
-        process.new_selector()
-        |> process.select(subject)
-      case process.selector_receive(selector, 5000) {
-        Ok(chunk) -> {
-          case chunk {
-            "" -> {
-              dispatch(StreamDone)
-              Nil
-            }
-            _ -> {
-              case string.starts_with(chunk, "ERR:") {
-                True -> {
-                  let err = string.drop_start(chunk, 4)
-                  dispatch(StreamError(err))
-                  Nil
-                }
-                False -> drip_characters(subject, dispatch, chunk)
-              }
-            }
-          }
-        }
-        Error(_) -> {
-          dispatch(StreamDone)
-          Nil
-        }
-      }
-    }
-  }
-}
-
-/// Take up to n graphemes from a string, return #(taken, rest).
-fn take_graphemes(s: String, n: Int) -> #(String, String) {
-  take_graphemes_loop(s, n, "")
-}
-
-fn take_graphemes_loop(
-  s: String,
-  remaining: Int,
-  acc: String,
-) -> #(String, String) {
-  case remaining <= 0 {
-    True -> #(acc, s)
-    False ->
-      case string.pop_grapheme(s) {
-        Ok(#(ch, rest)) -> take_graphemes_loop(rest, remaining - 1, acc <> ch)
-        Error(_) -> {
-          log.debug("ai_chat", "Reached end of string while taking graphemes")
-          #(acc, "")
-        }
+    True ->
+      case process.receive(chunks, chunk_timeout_ms) {
+        Ok(Text(text)) -> drip(chunks, dispatch, text)
+        Ok(Finished) -> dispatch(StreamDone)
+        Ok(Failed(reason)) -> dispatch(StreamError(reason))
+        Error(Nil) ->
+          dispatch(StreamError(
+            "no chunk within " <> int.to_string(chunk_timeout_ms) <> " ms",
+          ))
       }
   }
 }
 
-fn latest_user_text(messages: List(ChatMessage), default_text: String) -> String {
-  case messages {
-    [] -> default_text
-    [message, ..rest] -> {
-      let next = case message.role {
-        User -> message.content
-        Assistant -> default_text
-      }
-      latest_user_text(rest, next)
-    }
+/// Up to `n` graphemes from `s`, and the rest.
+fn take_graphemes(s: String, n: Int, acc: String) -> #(String, String) {
+  case n <= 0, string.pop_grapheme(s) {
+    True, _ -> #(acc, s)
+    False, Ok(#(grapheme, rest)) -> take_graphemes(rest, n - 1, acc <> grapheme)
+    // The string is used up before `n` graphemes.
+    False, Error(Nil) -> #(acc, "")
   }
-}
-
-@external(erlang, "timer", "sleep")
-fn sleep(ms: Int) -> Nil
-
-// --- Start ---
-
-pub fn main() {
-  beacon.app(init, beacon.no_local, beacon.no_server, update, view)
-  |> beacon.on_update(after_update)
-  |> beacon.title("Beacon AI Chat")
-  |> beacon.start(8080)
 }
 
 // --- View ---
 
-pub fn view(model: Model, _local: Nil) -> beacon.Node(Msg) {
+pub fn view(model: Model, _local: Nil) -> Element(Msg) {
   html.div(
     [
-      html.style(
-        "font-family:system-ui;max-width:600px;margin:2rem auto;padding:0 1rem",
-      ),
+      attribute.styles([
+        #("font-family", "system-ui"),
+        #("max-width", "600px"),
+        #("margin", "2rem auto"),
+        #("padding", "0 1rem"),
+      ]),
     ],
     [
-      html.h1([html.style("margin-bottom:1rem")], [
+      html.h1([attribute.styles([#("margin-bottom", "1rem")])], [
         html.text("Beacon AI Chat"),
       ]),
       html.div(
         [
-          html.style(
-            "border:1px solid #e0e0e0;border-radius:8px;padding:1rem;min-height:300px;max-height:500px;overflow-y:auto;margin-bottom:1rem;background:#fafafa",
-          ),
+          attribute.styles([
+            #("border", "1px solid #e0e0e0"),
+            #("border-radius", "8px"),
+            #("padding", "1rem"),
+            #("min-height", "300px"),
+            #("max-height", "500px"),
+            #("overflow-y", "auto"),
+            #("margin-bottom", "1rem"),
+            #("background", "#fafafa"),
+          ]),
         ],
         list.append(
           list.map(model.messages, view_message),
@@ -283,27 +365,37 @@ pub fn view(model: Model, _local: Nil) -> beacon.Node(Msg) {
           },
         ),
       ),
-      html.div([html.style("display:flex;gap:8px")], [
+      html.div([attribute.styles([#("display", "flex"), #("gap", "8px")])], [
         html.input([
-          html.type_("text"),
-          html.placeholder("Ask me anything..."),
-          html.value(model.input_text),
-          beacon.on_input(UpdateInput),
-          html.style(
-            "flex:1;padding:10px;border:1px solid #ddd;border-radius:8px;font-size:14px",
-          ),
+          attribute.type_("text"),
+          attribute.placeholder("Ask me anything..."),
+          attribute.value(model.input_text),
+          event.on_input(UpdateInput),
+          attribute.styles([
+            #("flex", "1"),
+            #("padding", "10px"),
+            #("border", "1px solid #ddd"),
+            #("border-radius", "8px"),
+            #("font-size", "14px"),
+          ]),
         ]),
         html.button(
           [
-            beacon.on_click(SendPrompt),
-            html.style(
-              "padding:10px 20px;background:"
-              <> case model.is_streaming {
+            event.on_click(SendPrompt),
+            attribute.disabled(model.is_streaming),
+            attribute.styles([
+              #("padding", "10px 20px"),
+              #("background", case model.is_streaming {
                 True -> "#ccc"
                 False -> "#1976d2"
-              }
-              <> ";color:white;border:none;border-radius:8px;cursor:pointer;font-size:14px;font-weight:500",
-            ),
+              }),
+              #("color", "white"),
+              #("border", "none"),
+              #("border-radius", "8px"),
+              #("cursor", "pointer"),
+              #("font-size", "14px"),
+              #("font-weight", "500"),
+            ]),
           ],
           [
             html.text(case model.is_streaming {
@@ -313,65 +405,83 @@ pub fn view(model: Model, _local: Nil) -> beacon.Node(Msg) {
           ],
         ),
       ]),
+      case model.notice {
+        "" -> element.none()
+        notice ->
+          html.p(
+            [
+              attribute.data("testid", "chat-notice"),
+              attribute.styles([#("color", "#b3261e")]),
+            ],
+            [html.text(notice)],
+          )
+      },
     ],
   )
 }
 
-fn view_message(msg: ChatMessage) -> beacon.Node(Msg) {
-  let #(bg, align, label) = case msg.role {
+fn view_message(message: ChatMessage) -> Element(Msg) {
+  let #(background, align, label) = case message.role {
     User -> #("#e3f2fd", "flex-end", "You")
     Assistant -> #("#f5f5f5", "flex-start", "AI")
   }
+  bubble(background, align, label, message.content)
+}
+
+fn view_streaming(text: String) -> Element(Msg) {
+  bubble("#f5f5f5", "flex-start", "AI", case string.is_empty(text) {
+    True -> "Thinking..."
+    False -> text <> "▊"
+  })
+}
+
+fn bubble(
+  background: String,
+  align: String,
+  label: String,
+  content: String,
+) -> Element(Msg) {
   html.div(
     [
-      html.style(
-        "display:flex;flex-direction:column;align-items:"
-        <> align
-        <> ";margin-bottom:0.75rem",
-      ),
+      attribute.styles([
+        #("display", "flex"),
+        #("flex-direction", "column"),
+        #("align-items", align),
+        #("margin-bottom", "0.75rem"),
+      ]),
     ],
     [
-      html.div([html.style("font-size:0.75rem;color:#888;margin-bottom:2px")], [
-        html.text(label),
-      ]),
       html.div(
         [
-          html.style(
-            "background:"
-            <> bg
-            <> ";padding:8px 14px;border-radius:12px;max-width:80%;white-space:pre-wrap;line-height:1.4",
-          ),
+          attribute.styles([
+            #("font-size", "0.75rem"),
+            #("color", "#888"),
+            #("margin-bottom", "2px"),
+          ]),
         ],
-        [html.text(msg.content)],
+        [html.text(label)],
+      ),
+      html.div(
+        [
+          attribute.styles([
+            #("background", background),
+            #("padding", "8px 14px"),
+            #("border-radius", "12px"),
+            #("max-width", "80%"),
+            #("white-space", "pre-wrap"),
+            #("line-height", "1.4"),
+          ]),
+        ],
+        [html.text(content)],
       ),
     ],
   )
 }
 
-fn view_streaming(text: String) -> beacon.Node(Msg) {
-  html.div(
-    [
-      html.style(
-        "display:flex;flex-direction:column;align-items:flex-start;margin-bottom:0.75rem",
-      ),
-    ],
-    [
-      html.div([html.style("font-size:0.75rem;color:#888;margin-bottom:2px")], [
-        html.text("AI"),
-      ]),
-      html.div(
-        [
-          html.style(
-            "background:#f5f5f5;padding:8px 14px;border-radius:12px;max-width:80%;white-space:pre-wrap;line-height:1.4",
-          ),
-        ],
-        [
-          html.text(case string.is_empty(text) {
-            True -> "Thinking..."
-            False -> text <> "▊"
-          }),
-        ],
-      ),
-    ],
-  )
+// --- Start ---
+
+pub fn main() {
+  beacon.full_application(init:, update:, sync:, local: local.none(), view:)
+  |> beacon.title(fn(_model) { "Beacon AI Chat" })
+  |> beacon.start(8080)
 }

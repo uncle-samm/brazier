@@ -1,19 +1,29 @@
 # Privacy Demo
 
-Demonstrates Beacon's server-side privacy features — keeping secrets out of the client JS bundle.
+Shows how `beacon.full_application` keeps secrets on the server.
 
 ## Features
 
-- `server_` prefix on constants — `server_api_key` and `server_db_url` are stripped from the client bundle
-- `pub type Server` — holds API keys and request counts, accessible in `update` but not `view`
-- Computed fields — `subtotal`, `total`, and `item_count` are derived from `Model` and synced to the client automatically
-- Client-safe constants — `app_title` is referenced by `view` and included in the bundle
+- Each session holds an API key, a database URL and a request count next
+  to its Model. `sync` hands only the Model to the browser, so the rest is
+  never encoded.
+- The build compiles for the browser only what `view` reaches. The secret
+  constants are reached from `init` alone, so they are not in the client
+  bundle. Names play no part: `api_key` needs no `server_` prefix.
+- The `app_title` constant is reached from `view`, so it is in the bundle.
+- The subtotal, tax and total are not stored. `view` derives them from the
+  Model, and those functions are compiled to JavaScript with it.
+- `update` runs only on the server. It counts requests in the session and
+  logs each one.
 
 ## Run
 
 ```bash
 cd examples/privacy_demo
-gleam run
+gleam run -m beacon/build   # after changing the source
+gleam run -m privacy_demo
 ```
 
-Open http://localhost:8080 -- add and clear items to see computed values update.
+Open http://localhost:8080. Add and clear items to see the totals change.
+Search the `beacon_client_*.js` bundle for `sk_live` or `postgres:` to
+check that the secrets are absent.

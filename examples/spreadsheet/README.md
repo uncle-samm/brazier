@@ -1,19 +1,28 @@
 # Spreadsheet
 
-Editable grid (10x5) with click-to-select, click-to-edit, and multi-user sync.
+An editable 10x5 grid shared by every open tab, built with
+`beacon.full_application` and a `local.layer`.
 
 ## Features
 
-- 50-cell grid with column/row headers (A-E, 1-10)
-- Local editing state (selection and edit buffer are client-side)
-- Enter to confirm, Escape to cancel edits
-- Multi-user: edits in one tab sync to others via shared store
+- Click a cell to select it and click again to edit it. Enter (or the
+  Save button) saves and Escape cancels.
+- The selection and the edit buffer are Local state, kept in the browser.
+  Clicking and typing send nothing to the server; only a saved cell does.
+- Each cell is its own `beacon/store` entry (`A1`, `B2`, ...), so two tabs
+  editing different cells never overwrite each other.
+- When any session saves, the store broadcasts on its topic. Every session
+  subscribes to that topic and re-reads the grid.
+- The server rejects saves outside the grid, and values over 1000
+  characters, and logs a warning for each.
 
 ## Run
 
 ```bash
 cd examples/spreadsheet
+gleam run -m beacon/build   # after changing the source
 gleam run
 ```
 
-Open http://localhost:8080 -- click a cell to select, click again to edit, press Enter to save.
+Open http://localhost:8080 in two tabs, edit a cell in one, and watch it
+appear in the other.

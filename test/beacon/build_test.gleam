@@ -1,43 +1,12 @@
-/// Build system tests: command line, source collection and generated
-/// imports, plus analyzer inputs for codec generation.
+/// Build system tests: command line, source collection and external
+/// programs.
 import beacon/build
-import beacon/build/analyzer
-import beacon/build/client_entry
 import beacon/build/discovery
 import beacon/build/program
-import beacon/build/server_codec
 import beacon/build/sources
 import gleam/list
 import gleam/string
 import simplifile
-
-// === Codec Generation Correctness Tests ===
-// These verify the analyzer produces the right inputs for codec generation.
-// Note: Basic model field detection is tested in build_codec_test.gleam
-// (standard_app_codec_fields_test). Tests here cover complementary aspects.
-
-pub fn codec_field_types_correct_test() {
-  let source =
-    "
-pub type Model { Model(count: Int, name: String, active: Bool, rate: Float) }
-pub type Msg { Inc }
-pub fn update(model: Model, msg: Msg) -> Model {
-  case msg { Inc -> model }
-}
-pub fn view(model: Model) { model }
-"
-  let assert Ok(analysis) = analyzer.analyze(source)
-  let find = fn(name) {
-    case list.find(analysis.model_fields, fn(f) { f.name == name }) {
-      Ok(f) -> f.type_name
-      Error(_) -> ""
-    }
-  }
-  let assert True = find("count") == "Int"
-  let assert True = find("name") == "String"
-  let assert True = find("active") == "Bool"
-  let assert True = find("rate") == "Float"
-}
 
 // === Command line ===
 
@@ -99,8 +68,25 @@ pub fn app_externals_recurses_through_user_modules_test() {
       source: app_source,
     )
   let assert Ok(sources) = sources.app_externals(src, app)
-  let assert [#("models", "types/models", _), #("enums", "types/enums", _)] =
-    sources
+  let assert [#("types/models", _), #("types/enums", _)] = sources
+}
+
+pub fn app_externals_excludes_the_app_and_unimported_siblings_test() {
+  let src = "build/beacon_test_app_externals_siblings/src"
+  let app_source = "import helper\nimport gleam/int\npub fn main() { 1 }\n"
+  fresh_tree(src, [
+    #("app.gleam", app_source),
+    // The helper imports the app back; the app is still not an external.
+    #("helper.gleam", "import app\npub fn x() { app.main() }\n"),
+    #("unrelated.gleam", "pub const secret = \"s\"\n"),
+  ])
+  let app =
+    discovery.AppModule(
+      path: src <> "/app.gleam",
+      module_path: "app",
+      source: app_source,
+    )
+  let assert Ok([#("helper", _)]) = sources.app_externals(src, app)
 }
 
 pub fn app_externals_reports_unparsable_user_module_test() {
@@ -117,265 +103,25 @@ pub fn app_externals_reports_unparsable_user_module_test() {
   let assert True = string.contains(reason, "broken.gleam")
 }
 
-pub fn client_externals_skip_server_only_modules_test() {
-  let src = "build/beacon_test_client_externals/src"
-  let source =
-    "import app/server_state.{type ServerState}
-
-pub type Model {
-  Model(count: Int)
-}
-
-fn server_page(state: #(Model, Nil, ServerState)) {
-  let #(model, _local, _server) = state
-  model
-}
-
-pub fn view(model: Model) {
-  model
-}
-"
-  fresh_tree(src, [
-    #("app.gleam", source),
-    #(
-      "app/server_state.gleam",
-      "import agent/manager\n\npub type ServerState {\n  ServerState(manager: manager.Manager)\n}\n",
-    ),
-    #(
-      "agent/manager.gleam",
-      "pub type Manager {\n  Manager(secret: String)\n}\n",
-    ),
-  ])
-  let assert Ok(client_source) = analyzer.extract_client_source(source)
-  let assert Ok(sources) =
-    sources.client_externals(src, src <> "/app.gleam", client_source)
-  let module_paths = list.map(sources, fn(source) { source.1 })
-  let assert False = list.contains(module_paths, "app/server_state")
-  let assert False = list.contains(module_paths, "agent/manager")
-}
-
-pub fn framework_closure_recurses_through_beacon_modules_test() {
-  let source =
-    "
-import beacon/application
-
-pub type Model { Model }
-pub type Msg { Ping }
-
-pub fn update(model: Model, msg: Msg) -> Model { model }
-pub fn view(model: Model) { model }
-"
+pub fn framework_closure_follows_beacon_imports_test() {
+  let source = "import beacon/html\nimport gleam/int\npub fn x() { 1 }\n"
   let assert Ok(sources) = sources.framework_closure(".", [source])
-  let module_paths = list.map(sources, fn(s) { s.1 })
-  let assert True = list.contains(module_paths, "beacon/application")
-  let assert True = list.contains(module_paths, "beacon/route")
-  // The shimmed modules are generated for the client, never copied.
-  let assert False = list.contains(module_paths, "beacon")
+  let module_paths = list.map(sources, fn(s) { s.0 })
+  let assert True = list.contains(module_paths, "beacon/html")
+  let assert True = list.contains(module_paths, "beacon/element")
+  let assert True = list.contains(module_paths, "beacon/attribute")
+  let assert True = list.contains(module_paths, "beacon/internal/render")
+  // The shimmed module is generated for the client, never copied, and
+  // nothing outside the import graph is pulled in.
   let assert False = list.contains(module_paths, "beacon/log")
+  let assert False = list.contains(module_paths, "beacon/runtime")
+  let assert False = list.contains(module_paths, "gleam/int")
 }
 
-// === Generated imports ===
-
-const nested_app_source =
-  "
-import server_state
-import types/models
-
-pub type Model { Model(service: models.ThreadService) }
-pub type Msg { Ping }
-pub fn update(model: Model, msg: Msg) -> Model { model }
-pub fn view(model: Model) { model }
-"
-
-fn nested_analysis() -> analyzer.Analysis {
-  let server_source =
-    "
-import types/enums
-
-pub type ServerState {
-  ServerState(status: enums.AgentRunStatus)
-}
-"
-  let models_source =
-    "
-import types/enums
-
-pub type ThreadService {
-  ThreadService(status: enums.AgentRunStatus)
-}
-"
-  let enums_source =
-    "
-pub type AgentRunStatus {
-  Pending
-  Running
-}
-"
-  let assert Ok(analysis) =
-    analyzer.analyze_multi(nested_app_source, [
-      #("server_state", "app/server_state", server_source),
-      #("models", "types/models", models_source),
-      #("enums", "types/enums", enums_source),
-    ])
-  analysis
-}
-
-pub fn server_codec_imports_nested_type_modules_test() {
-  let assert Ok(codec) = server_codec.generate(nested_analysis(), "app/main")
-  let assert True = string.contains(codec, "import app/main")
-  let assert True = string.contains(codec, "import types/models")
-  let assert True = string.contains(codec, "import types/enums")
-}
-
-pub fn client_entry_imports_nested_type_modules_test() {
-  let assert Ok(entry) = client_entry.generate(nested_analysis(), True)
-  let assert True = string.contains(entry, "import types/models")
-  let assert True = string.contains(entry, "import types/enums")
-  let assert False = string.contains(entry, "server_state")
-}
-
-// Note: Server field exclusion is tested in build_codec_test.gleam
-// (server_state_excludes_server_from_model_fields_test,
-//  server_fields_tracked_separately_test).
-
-pub fn codec_computed_fields_have_correct_types_test() {
-  let source =
-    "
-pub type Model { Model(count: Int, items: List(Int)) }
-pub type Msg { Inc }
-
-pub fn doubled(model: Model) -> Int { model.count * 2 }
-pub fn label(model: Model) -> String { \"label\" }
-pub fn total_items(model: Model) -> Int { 0 }
-
-pub fn update(model: Model, msg: Msg) -> Model {
-  case msg { Inc -> model }
-}
-pub fn view(model: Model) { model }
-"
-  let assert Ok(analysis) = analyzer.analyze(source)
-  // 3 computed fields detected
-  let assert True = list.length(analysis.computed_fields) == 3
-  // Verify each has the right return type
-  let find_type = fn(name) {
-    case list.find(analysis.computed_fields, fn(c) { c.name == name }) {
-      Ok(c) -> c.return_type
-      Error(_) -> ""
-    }
-  }
-  let assert True = find_type("doubled") == "Int"
-  let assert True = find_type("label") == "String"
-  let assert True = find_type("total_items") == "Int"
-}
-
-pub fn codec_nested_custom_types_detected_test() {
-  let source =
-    "
-pub type Item { Item(name: String, price: Int) }
-pub type Model { Model(items: List(Item), count: Int) }
-pub type Msg { Inc }
-pub fn update(model: Model, msg: Msg) -> Model {
-  case msg { Inc -> model }
-}
-pub fn view(model: Model) { model }
-"
-  let assert Ok(analysis) = analyzer.analyze(source)
-  // Item should be in custom_types (has fields, used by Model)
-  let type_names = list.map(analysis.custom_types, fn(ct) { ct.name })
-  let assert True = list.contains(type_names, "Item")
-  // Item should have 2 fields
-  let assert Ok(item_type) =
-    list.find(analysis.custom_types, fn(ct) { ct.name == "Item" })
-  let assert True = list.length(item_type.fields) == 2
-}
-
-pub fn codec_enum_types_detected_test() {
-  let source =
-    "
-pub type Status { Active Inactive Pending }
-pub type Model { Model(status: Status, count: Int) }
-pub type Msg { Inc }
-pub fn update(model: Model, msg: Msg) -> Model {
-  case msg { Inc -> model }
-}
-pub fn view(model: Model) { model }
-"
-  let assert Ok(analysis) = analyzer.analyze(source)
-  let assert True = list.length(analysis.enum_types) == 1
-  let assert Ok(et) = list.first(analysis.enum_types)
-  let assert True = et.name == "Status"
-  let assert True = list.length(et.variants) == 3
-  let assert True = list.contains(et.variants, "Active")
-  let assert True = list.contains(et.variants, "Inactive")
-  let assert True = list.contains(et.variants, "Pending")
-}
-
-pub fn extract_produces_valid_gleam_source_test() {
-  // The extracted source should be parseable by Glance (valid Gleam syntax)
-  let source =
-    "
-import gleam/int
-
-pub type Model { Model(count: Int) }
-pub type Msg { Increment }
-
-const max = 100
-
-pub fn update(model: Model, msg: Msg) -> Model {
-  case msg { Increment -> Model(count: model.count + 1) }
-}
-pub fn view(model: Model) { max }
-"
-  let assert Ok(extracted) = analyzer.extract_client_source(source)
-  // The extracted source must contain valid Gleam constructs
-  let assert True = string.contains(extracted, "pub type Model")
-  let assert True = string.contains(extracted, "pub type Msg")
-  let assert True = string.contains(extracted, "pub fn view")
-  // And the constant referenced by view
-  let assert True = string.contains(extracted, "max")
-  // Must NOT contain update (it takes Model + Msg, not just Model)
-  // Actually update IS extracted (client needs it for local events)
-  let assert True = string.contains(extracted, "pub fn update")
-}
-
-pub fn msg_variant_classification_accuracy_test() {
-  // Verify that model-affecting vs local-only classification is correct
-  let source =
-    "
-pub type Model { Model(count: Int) }
-pub type Local { Local(input: String) }
-pub type Msg {
-  Increment
-  Decrement
-  Reset
-  SetInput(String)
-}
-
-pub fn update(model: Model, local: Local, msg: Msg) -> #(Model, Local) {
-  case msg {
-    Increment -> #(Model(count: model.count + 1), local)
-    Decrement -> #(Model(count: model.count - 1), local)
-    Reset -> #(Model(count: 0), local)
-    SetInput(text) -> #(model, Local(input: text))
-  }
-}
-
-pub fn view(model: Model, local: Local) { model }
-"
-  let assert Ok(analysis) = analyzer.analyze(source)
-  let assert True = list.length(analysis.msg_variants) == 4
-  // Increment, Decrement, Reset all modify model
-  let find = fn(name) {
-    case list.find(analysis.msg_variants, fn(v) { v.name == name }) {
-      Ok(v) -> v.affects_model
-      Error(_) -> False
-    }
-  }
-  let assert True = find("Increment")
-  let assert True = find("Decrement")
-  let assert True = find("Reset")
-  // SetInput only modifies local
-  let assert False = find("SetInput")
+pub fn framework_closure_missing_module_is_an_error_test() {
+  let source = "import beacon/no_such_module\n"
+  let assert Error(reason) = sources.framework_closure(".", [source])
+  let assert True = string.contains(reason, "no_such_module")
 }
 
 // === External programs ===

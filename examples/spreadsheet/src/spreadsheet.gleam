@@ -1,393 +1,376 @@
-/// Spreadsheet — demonstrates:
-/// - Large model (200 cells), single-cell edits
-/// - Click-to-edit UI with LOCAL editing state
-/// - Grid rendering with column/row headers
-/// - Multi-user: edit cell in tab A → updates in tab B
-/// - Patch patterns: replace on full cell list per edit
+/// Spreadsheet, demonstrating:
+/// - a grid shared by every session, one `beacon/store` entry per cell, so
+///   edits to different cells never overwrite each other;
+/// - selection and the edit buffer in Local state: clicking and typing
+///   never reach the server, only a saved cell does;
+/// - a PubSub subscription that re-reads the grid when any session saves.
 import beacon
-import beacon/effect
-import beacon/element
+import beacon/attribute
+import beacon/effect.{type Effect}
+import beacon/element.{type Element}
+import beacon/event
 import beacon/html
+import beacon/local
 import beacon/log
-import beacon/pubsub
-import beacon/store
+import beacon/store.{type Store}
 import gleam/int
 import gleam/list
+import gleam/option.{type Option, None, Some}
 import gleam/string
 
 // --- Types ---
 
-pub type Cell {
-  Cell(row: Int, col: Int, value: String)
-}
-
+/// Synced to the browser: `num_rows` rows of one value per column.
 pub type Model {
-  Model(
-    cells: List(Cell),
-    selected_row: Int,
-    selected_col: Int,
-    editing: Bool,
-    edit_buffer: String,
-  )
+  Model(rows: List(List(String)))
 }
 
+pub type Position {
+  Position(row: Int, col: Int)
+}
+
+/// Client-only.
 pub type Local {
-  Local
+  Local(selected: Option(Position), editing: Bool, buffer: String)
 }
 
 pub type Msg {
-  SelectCell(String)
-  StartEdit
-  UpdateBuffer(String)
-  ConfirmEdit(String)
-  CancelEdit
-  CellsUpdated
-  SetCells(List(Cell))
+  /// Select a cell, or start editing it when it is already selected.
+  CellClicked(row: Int, col: Int)
+  BufferChanged(String)
+  KeyPressed(String)
+  SaveCell(row: Int, col: Int, value: String)
+  /// A session saved a cell.
+  CellsChanged
 }
 
 const num_rows = 10
 
-const num_cols = 5
+const max_value_length = 1000
 
-fn col_name(col: Int) -> String {
-  case col {
-    0 -> "A"
-    1 -> "B"
-    2 -> "C"
-    3 -> "D"
-    4 -> "E"
-    _ -> "?"
-  }
+/// The column names, in order; the grid has one column per name.
+const columns = ["A", "B", "C", "D", "E"]
+
+/// "A1" for row 0, column 0. Also the cell's store key.
+fn cell_name(row: Int, col: Int) -> String {
+  // Invariant: `col` comes from `columns` (the view) or was bounds-checked
+  // by `in_grid` (the server).
+  let assert Ok(column) = list.drop(columns, col) |> list.first
+  column <> int.to_string(row + 1)
 }
 
-fn cell_key(row: Int, col: Int) -> String {
-  col_name(col) <> int.to_string(row + 1)
+fn in_grid(row: Int, col: Int) -> Bool {
+  row >= 0 && row < num_rows && col >= 0 && col < list.length(columns)
 }
 
-fn default_cells() -> List(Cell) {
-  list.flat_map(list.repeat(Nil, num_rows), fn(_) { [] })
-  |> fn(_) { build_cells(0, 0, []) }
+fn cell_value(model: Model, position: Position) -> String {
+  // Invariant: `read_grid` always builds a full grid, and positions come
+  // from the view's own indices.
+  let assert Ok(values) = list.drop(model.rows, position.row) |> list.first
+  let assert Ok(value) = list.drop(values, position.col) |> list.first
+  value
 }
 
-fn build_cells(row: Int, col: Int, acc: List(Cell)) -> List(Cell) {
-  case row >= num_rows {
-    True -> list.reverse(acc)
-    False ->
-      case col >= num_cols {
-        True -> build_cells(row + 1, 0, acc)
-        False ->
-          build_cells(row, col + 1, [Cell(row: row, col: col, value: ""), ..acc])
-      }
-  }
-}
+// --- Shared grid ---
 
-fn parse_cell_key(key: String) -> Result(#(Int, Int), String) {
-  case column_index(string.slice(key, 0, 1)) {
-    Ok(col) -> {
-      let row_text = string.drop_start(key, 1)
-      case int.parse(row_text) {
-        Ok(n) -> Ok(#(n - 1, col))
-        Error(_) ->
-          Error("invalid row `" <> row_text <> "` in key `" <> key <> "`")
-      }
-    }
-    Error(reason) -> Error(reason <> " in key `" <> key <> "`")
-  }
-}
-
-fn column_index(column: String) -> Result(Int, String) {
-  case column {
-    "A" -> Ok(0)
-    "B" -> Ok(1)
-    "C" -> Ok(2)
-    "D" -> Ok(3)
-    "E" -> Ok(4)
-    _ -> Error("invalid column `" <> column <> "`")
-  }
-}
-
-fn get_cell_value(cells: List(Cell), row: Int, col: Int) -> String {
-  case list.find(cells, fn(c) { c.row == row && c.col == col }) {
-    Ok(cell) -> cell.value
-    Error(_) -> {
-      log.warning(
-        "spreadsheet",
-        "Cell not found at row "
-          <> int.to_string(row)
-          <> ", col "
-          <> int.to_string(col),
-      )
-      ""
-    }
-  }
-}
-
-// --- Init ---
-
-pub fn init() -> Model {
+fn read_grid(cells: Store(String)) -> Model {
   Model(
-    cells: default_cells(),
-    selected_row: -1,
-    selected_col: -1,
-    editing: False,
-    edit_buffer: "",
+    rows: list.index_map(list.repeat(Nil, num_rows), fn(_, row) {
+      list.index_map(columns, fn(_, col) {
+        case store.get(cells, cell_name(row, col)) {
+          Ok(value) -> value
+          // A cell nobody has written yet is empty.
+          Error(Nil) -> ""
+        }
+      })
+    }),
   )
 }
 
-pub fn init_local(_model: Model) -> Local {
-  Local
+// --- Init and update (server) ---
+
+fn init(cells: Store(String)) -> #(Model, Effect(Msg)) {
+  #(read_grid(cells), effect.none())
 }
 
-// --- Update ---
-
-pub fn update(
+fn update(
+  cells: Store(String),
   model: Model,
-  local: Local,
-  _server: Nil,
   msg: Msg,
-) -> #(Model, Local, Nil) {
-  let #(model, local) = case msg {
-    SelectCell(key) -> {
-      case parse_cell_key(key) {
-        Ok(#(row, col)) -> {
-          let value = get_cell_value(model.cells, row, col)
-          #(
-            Model(
-              ..model,
-              selected_row: row,
-              selected_col: col,
-              editing: False,
-              edit_buffer: value,
-            ),
-            local,
-          )
-        }
-        Error(reason) -> {
-          log.warning("spreadsheet", "Invalid selected cell: " <> reason)
-          #(model, local)
-        }
-      }
-    }
-
-    StartEdit -> #(Model(..model, editing: True), local)
-
-    UpdateBuffer(text) -> #(Model(..model, edit_buffer: text), local)
-
-    ConfirmEdit(value) -> {
-      case model.selected_row >= 0 && model.selected_col >= 0 {
-        True -> {
-          let new_cells =
-            list.map(model.cells, fn(c) {
-              case c.row == model.selected_row && c.col == model.selected_col {
-                True -> Cell(..c, value: value)
-                False -> c
-              }
-            })
-          #(Model(..model, cells: new_cells, editing: False), local)
-        }
-        False -> #(Model(..model, editing: False), local)
-      }
-    }
-
-    CancelEdit -> {
-      case model.selected_row >= 0 && model.selected_col >= 0 {
-        True -> {
-          let value =
-            get_cell_value(model.cells, model.selected_row, model.selected_col)
-          #(Model(..model, editing: False, edit_buffer: value), local)
-        }
-        False -> {
+) -> #(Model, Effect(Msg)) {
+  case msg {
+    SaveCell(row:, col:, value:) ->
+      case in_grid(row, col), string.length(value) > max_value_length {
+        False, _ -> {
           log.warning(
             "spreadsheet",
-            "CancelEdit received without selected cell",
+            "Rejected a save outside the grid at row "
+              <> int.to_string(row)
+              <> ", column "
+              <> int.to_string(col),
           )
-          #(Model(..model, editing: False, edit_buffer: ""), local)
+          #(model, effect.none())
+        }
+        True, True -> {
+          log.warning(
+            "spreadsheet",
+            "Rejected a "
+              <> int.to_string(string.length(value))
+              <> "-character value for "
+              <> cell_name(row, col)
+              <> " (max "
+              <> int.to_string(max_value_length)
+              <> ")",
+          )
+          #(model, effect.none())
+        }
+        True, False -> {
+          let name = cell_name(row, col)
+          log.info("spreadsheet", "Saving " <> name)
+          // The store broadcasts on its topic, which every session (this
+          // one included) turns into `CellsChanged`.
+          #(model, effect.from(fn(_dispatch) { store.put(cells, name, value) }))
         }
       }
-    }
-
-    CellsUpdated -> #(model, local)
-
-    SetCells(cells) -> #(Model(..model, cells: cells), local)
+    CellsChanged -> #(read_grid(cells), effect.none())
+    // `update_local` handles these in the browser and never forwards them.
+    CellClicked(..) | BufferChanged(_) | KeyPressed(_) -> #(
+      model,
+      effect.none(),
+    )
   }
-  #(model, local, Nil)
 }
 
-// --- Side Effects ---
+fn sync(model: Model) -> Model {
+  model
+}
 
-fn make_on_update(
-  cell_store: store.ListStore(Cell),
-) -> fn(#(Model, Local, Nil), Msg) -> effect.Effect(Msg) {
-  fn(state: #(Model, Local, Nil), msg: Msg) -> effect.Effect(Msg) {
-    let #(model, _local, _server) = state
-    case msg {
-      ConfirmEdit(_) ->
-        effect.from(fn(_dispatch) {
-          store.delete_all(cell_store, "cells")
-          store.append_many(cell_store, "cells", model.cells)
-          pubsub.broadcast("spreadsheet:cells", Nil)
-        })
-      CellsUpdated -> {
-        let store_cells = store.get_all(cell_store, "cells")
-        case store_cells {
-          [] -> effect.none()
-          _ -> effect.from(fn(dispatch) { dispatch(SetCells(store_cells)) })
-        }
+// --- Local (browser) ---
+
+pub fn init_local(_model: Model) -> Local {
+  Local(selected: None, editing: False, buffer: "")
+}
+
+pub fn update_local(
+  model: Model,
+  local: Local,
+  msg: Msg,
+) -> local.Update(Local) {
+  case msg {
+    CellClicked(row:, col:) -> {
+      let position = Position(row:, col:)
+      case local.selected == Some(position) {
+        True ->
+          local.handled(
+            Local(..local, editing: True, buffer: cell_value(model, position)),
+          )
+        False ->
+          local.handled(Local(
+            selected: Some(position),
+            editing: False,
+            buffer: "",
+          ))
       }
-      _ -> effect.none()
     }
+    BufferChanged(text) -> local.handled(Local(..local, buffer: text))
+    KeyPressed("Escape") -> local.handled(Local(..local, editing: False))
+    KeyPressed(_) -> local.handled(local)
+    SaveCell(..) -> local.forward(Local(..local, editing: False))
+    CellsChanged -> local.forward(local)
   }
 }
 
 // --- View ---
 
-pub fn view(model: Model, _local: Local) -> beacon.Node(Msg) {
+pub fn view(model: Model, local: Local) -> Element(Msg) {
   html.div(
     [
-      html.style(
-        "font-family:system-ui;max-width:900px;margin:2rem auto;padding:0 1rem",
-      ),
+      attribute.styles([
+        #("font-family", "system-ui"),
+        #("max-width", "900px"),
+        #("margin", "2rem auto"),
+        #("padding", "0 1rem"),
+      ]),
     ],
     [
       html.h1([], [html.text("Spreadsheet")]),
-      html.p([html.style("color:#666;margin-bottom:1rem")], [
-        html.text(
-          "Click a cell to select, click again to edit. Press Enter to confirm.",
-        ),
-      ]),
-      // Grid
-      html.div(
-        [html.style("border:1px solid #ccc;border-radius:4px;overflow:auto")],
+      html.p(
+        [attribute.styles([#("color", "#666"), #("margin-bottom", "1rem")])],
         [
-          // Header row
-          element.el(
-            "table",
+          html.text(
+            "Click a cell to select, click again to edit. Enter saves, Escape cancels.",
+          ),
+        ],
+      ),
+      html.div(
+        [
+          attribute.styles([
+            #("border", "1px solid #ccc"),
+            #("border-radius", "4px"),
+            #("overflow", "auto"),
+          ]),
+        ],
+        [
+          html.table(
             [
-              html.style("border-collapse:collapse;width:100%"),
-              html.attribute("data-grid", "true"),
+              attribute.styles([
+                #("border-collapse", "collapse"),
+                #("width", "100%"),
+              ]),
+              attribute.data("grid", "true"),
             ],
             [
-              element.el("thead", [], [
-                element.el("tr", [], [
-                  element.el(
-                    "th",
-                    [
-                      html.style(
-                        "width:40px;padding:8px;background:#f5f5f5;border:1px solid #ddd",
-                      ),
-                    ],
-                    [],
-                  ),
-                  ..list.map(list.repeat(Nil, num_cols), fn(_) { Nil })
-                  |> list.index_map(fn(_x, i) {
-                    element.el(
-                      "th",
+              html.thead([], [
+                html.tr([], [
+                  html.th([attribute.styles(header_style())], []),
+                  ..list.map(columns, fn(column) {
+                    html.th(
                       [
-                        html.style(
-                          "padding:8px;background:#f5f5f5;border:1px solid #ddd;min-width:80px;font-weight:600;color:#555",
-                        ),
+                        attribute.styles(header_style()),
+                        attribute.style("min-width", "80px"),
                       ],
-                      [element.text(col_name(i))],
+                      [html.text(column)],
                     )
                   })
                 ]),
               ]),
-              element.el("tbody", [], render_rows(model)),
+              html.tbody(
+                [],
+                list.index_map(model.rows, fn(values, row) {
+                  render_row(local, values, row)
+                }),
+              ),
             ],
           ),
         ],
       ),
-      // Status
-      html.div([html.style("margin-top:0.5rem;font-size:0.85rem;color:#999")], [
-        html.text(case model.selected_row >= 0 {
-          True ->
-            "Selected: "
-            <> cell_key(model.selected_row, model.selected_col)
-            <> case model.editing {
-              True -> " (editing)"
-              False -> ""
-            }
-          False -> "Click a cell to select"
-        }),
-      ]),
+      html.div(
+        [
+          attribute.styles([
+            #("margin-top", "0.5rem"),
+            #("font-size", "0.85rem"),
+            #("color", "#999"),
+          ]),
+        ],
+        [
+          html.text(case local.selected {
+            Some(Position(row:, col:)) ->
+              "Selected: "
+              <> cell_name(row, col)
+              <> case local.editing {
+                True -> " (editing)"
+                False -> ""
+              }
+            None -> "Click a cell to select"
+          }),
+        ],
+      ),
     ],
   )
 }
 
-fn render_rows(model: Model) -> List(beacon.Node(Msg)) {
-  list.repeat(Nil, num_rows)
-  |> list.index_map(fn(_x, row) { render_row(model, row) })
+fn header_style() -> List(#(String, String)) {
+  [
+    #("padding", "8px"),
+    #("background", "#f5f5f5"),
+    #("border", "1px solid #ddd"),
+    #("font-weight", "600"),
+    #("color", "#555"),
+  ]
 }
 
-fn render_row(model: Model, row: Int) -> beacon.Node(Msg) {
-  element.el("tr", [], [
-    element.el(
-      "td",
+fn render_row(local: Local, values: List(String), row: Int) -> Element(Msg) {
+  html.tr([], [
+    html.td(
       [
-        html.style(
-          "padding:4px 8px;background:#f5f5f5;border:1px solid #ddd;text-align:center;font-weight:600;color:#555;font-size:13px",
-        ),
+        attribute.styles([
+          #("padding", "4px 8px"),
+          #("background", "#f5f5f5"),
+          #("border", "1px solid #ddd"),
+          #("text-align", "center"),
+          #("font-weight", "600"),
+          #("color", "#555"),
+          #("font-size", "13px"),
+        ]),
       ],
-      [element.text(int.to_string(row + 1))],
+      [html.text(int.to_string(row + 1))],
     ),
-    ..list.repeat(Nil, num_cols)
-    |> list.index_map(fn(_x, col) { render_cell(model, row, col) })
+    ..list.index_map(values, fn(value, col) {
+      render_cell(local, Position(row:, col:), value)
+    })
   ])
 }
 
-fn render_cell(model: Model, row: Int, col: Int) -> beacon.Node(Msg) {
-  let is_selected = row == model.selected_row && col == model.selected_col
-  let is_editing = is_selected && model.editing
-  let value = get_cell_value(model.cells, row, col)
-  let key = cell_key(row, col)
-
+fn render_cell(
+  local: Local,
+  position: Position,
+  value: String,
+) -> Element(Msg) {
+  let Position(row:, col:) = position
+  let is_selected = local.selected == Some(position)
   let border = case is_selected {
-    True -> "border:2px solid #2196F3"
-    False -> "border:1px solid #ddd"
+    True -> "2px solid #2196F3"
+    False -> "1px solid #ddd"
   }
-
-  case is_editing {
+  case is_selected && local.editing {
     True ->
-      element.el("td", [html.style(border <> ";padding:0")], [
-        html.input([
-          html.type_("text"),
-          html.value(model.edit_buffer),
-          beacon.on_input(UpdateBuffer),
-          beacon.on_keydown(fn(k) {
-            case k {
-              "Enter" -> ConfirmEdit(model.edit_buffer)
-              "Escape" -> CancelEdit
-              _ -> UpdateBuffer(model.edit_buffer)
-            }
-          }),
-          html.style(
-            "width:calc(100% - 48px);padding:4px 8px;border:none;outline:none;font-size:13px;box-sizing:border-box",
-          ),
-        ]),
-        html.button(
+      html.td([attribute.styles([#("border", border), #("padding", "0")])], [
+        html.form(
           [
-            beacon.on_click(ConfirmEdit(model.edit_buffer)),
-            html.style(
-              "width:48px;padding:4px;border:0;border-left:1px solid #ddd;background:#eef5ff;cursor:pointer;font-size:12px",
+            event.on_submit(fn(_fields) {
+              SaveCell(row:, col:, value: local.buffer)
+            }),
+            attribute.style("display", "flex"),
+          ],
+          [
+            html.input([
+              attribute.type_("text"),
+              attribute.value(local.buffer),
+              attribute.aria("label", "Edit " <> cell_name(row, col)),
+              attribute.autofocus(True),
+              event.on_input(BufferChanged),
+              event.on_keydown(KeyPressed),
+              attribute.styles([
+                #("flex", "1"),
+                #("min-width", "0"),
+                #("padding", "4px 8px"),
+                #("border", "none"),
+                #("outline", "none"),
+                #("font-size", "13px"),
+              ]),
+            ]),
+            html.button(
+              [
+                attribute.type_("submit"),
+                attribute.styles([
+                  #("width", "48px"),
+                  #("padding", "4px"),
+                  #("border", "0"),
+                  #("border-left", "1px solid #ddd"),
+                  #("background", "#eef5ff"),
+                  #("cursor", "pointer"),
+                  #("font-size", "12px"),
+                ]),
+              ],
+              [html.text("Save")],
             ),
           ],
-          [html.text("Save")],
         ),
       ])
     False ->
-      element.el(
-        "td",
+      html.td(
         [
-          html.style(
-            border
-            <> ";padding:4px 8px;cursor:pointer;min-height:24px;font-size:13px",
-          ),
-          beacon.on_click(case is_selected {
-            True -> StartEdit
-            False -> SelectCell(key)
-          }),
+          event.on_click(CellClicked(row:, col:)),
+          attribute.data("cell", cell_name(row, col)),
+          attribute.styles([
+            #("border", border),
+            #("padding", "4px 8px"),
+            #("cursor", "pointer"),
+            #("height", "24px"),
+            #("font-size", "13px"),
+          ]),
         ],
-        [element.text(value)],
+        [html.text(value)],
       )
   }
 }
@@ -395,35 +378,16 @@ fn render_cell(model: Model, row: Int, col: Int) -> beacon.Node(Msg) {
 // --- Start ---
 
 pub fn main() {
-  start()
-}
-
-pub fn start() {
-  let cell_store = store.new_list("spreadsheet_cells")
-
-  let init_from_store = fn() {
-    Model(
-      cells: case store.get_all(cell_store, "cells") {
-        [] -> default_cells()
-        stored -> stored
-      },
-      selected_row: -1,
-      selected_col: -1,
-      editing: False,
-      edit_buffer: "",
-    )
-  }
-
-  beacon.app(
-    fn() { #(init_from_store(), effect.none()) },
-    init_local,
-    beacon.no_server,
-    update,
-    view,
+  let cells = store.new("spreadsheet_cells")
+  beacon.full_application(
+    init: fn(_ctx) { init(cells) },
+    update: fn(model, msg) { update(cells, model, msg) },
+    sync:,
+    local: local.layer(init: init_local, update: update_local),
+    view:,
   )
-  |> beacon.title("Spreadsheet")
-  |> beacon.on_update(make_on_update(cell_store))
-  |> beacon.subscriptions(fn(_model) { ["spreadsheet:cells"] })
-  |> beacon.on_notify(fn(_topic) { CellsUpdated })
+  |> beacon.title(fn(_model) { "Spreadsheet" })
+  |> beacon.subscriptions(fn(_model) { [store.topic(cells)] })
+  |> beacon.on_notify(fn(_topic) { CellsChanged })
   |> beacon.start(8080)
 }

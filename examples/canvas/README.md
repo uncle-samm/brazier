@@ -1,19 +1,35 @@
 # Collaborative Canvas
 
-Multi-user drawing canvas with real-time sync across tabs.
+A shared drawing canvas built with `beacon.full_application` and a
+`local.layer`. Strokes drawn in one tab appear in every other tab.
 
 ## Features
 
-- Mouse events (mousedown, mousemove, mouseup) for freehand drawing
-- Local state for instant drawing, shared store for multi-user sync
-- SVG rendering of strokes with color picker
-- PubSub notifications when other users draw
+- Drawing runs in the browser. `PenDown`, `PenMoved` and `ColourPicked`
+  are handled by the Local layer and never reach the server, so drawing
+  sends no frames. The pointer position comes from `event.mouse_position()`,
+  and moves are sampled with `event.throttle` at about 60 a second.
+- Only the finished stroke is sent: one `PenUp` on mouseup, or when the
+  pointer leaves the canvas.
+- The server checks every stroke the browser builds: the colour must be in
+  the palette, and the stroke needs at least one point, at most 2000 points,
+  and every point inside the canvas. The canvas holds at most 2000 strokes.
+  A rejected stroke is logged as a warning.
+- A sent stroke stays on screen while the server handles it. The server
+  counts the `PenUp` messages it has handled for the session, and the
+  browser drops a sent stroke once that count reaches it, whether the
+  stroke was accepted or rejected.
+- Accepted strokes are appended to a `beacon/store` list. Every session
+  re-reads the list when it changes, and Clear empties it for everyone.
+- Strokes are drawn with `beacon/svg`. A single click draws a dot.
 
 ## Run
 
 ```bash
 cd examples/canvas
+gleam run -m beacon/build   # after changing the source
 gleam run
 ```
 
-Open http://localhost:8080 in multiple tabs -- draw in one tab and see strokes appear in the other.
+Open http://localhost:8080 in two tabs, draw in one, and the strokes
+appear in the other.

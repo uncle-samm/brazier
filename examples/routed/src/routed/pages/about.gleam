@@ -1,20 +1,12 @@
-import beacon
+import beacon/element.{type Element}
 import beacon/html
-import beacon/route
 
-pub fn page(
-  on_enter: fn(route.Route) -> msg,
-  render: fn(model, route.Route) -> beacon.Node(msg),
-) -> route.Page(model, msg) {
-  route.page("/about", on_enter, render)
-}
-
-pub fn view() -> beacon.Node(msg) {
+pub fn view() -> Element(msg) {
   html.section([], [
     html.h1([], [html.text("About")]),
     html.p([], [
       html.text(
-        "This page is imported explicitly from routed/pages/about. Beacon does not scan the filesystem for routes.",
+        "This page is imported explicitly from routed/pages/about. Beacon does not scan the filesystem for routes: the app's Route type and parse function are the only route declaration.",
       ),
     ]),
   ])

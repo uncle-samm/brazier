@@ -540,3 +540,72 @@ The smaller choices follow the recommendations:
 - Internal modules are listed now and moved during the rename.
 - Pre-hydration events are queued and replayed.
 - Live components are deferred.
+
+## Implementation notes
+
+Where the code forced a choice the design did not make, WS7 picked the option closest to the design's intent. Each choice is listed here.
+
+### Public API
+
+- **`attribute.styles(List(#(String, String)))`.** Added next to `attribute.style`, as in Lustre, because the examples set many properties at once.
+- **`api.Request` and `api.Response`.** These are aliases for `request.Request(Connection)` and `response.Response(ResponseBody)`, as `wisp.Request` and `wisp.Response` are. `beacon.api_routes`, `beacon.ws_auth` and the examples use them. They are the same types `middleware.Middleware` takes, so no example imports `beacon/transport/server`. `beacon/transport` itself stays public, because the middleware and auth APIs still expose its types.
+- **`Context.session_id` returns `Result(String, Nil)`, not `String`.** Without a session cookie there is no id. An app that needs a per-tab key makes its own: `cart` uses a random id.
+- **`beacon.title(fn(model) -> String)` is used only for SSR.** The client does not update `document.title`.
+- **`init` has no error channel.** `init_from_session` crashes the session when the store is unavailable, through a helper that logs first, with no guest fallback. The cheap fix would be `init: fn(Context) -> Result(model, InitError)`, with an `Error` answered as a 503 on SSR and a close on the WebSocket. That would change three constructor signatures, so it is left for WS10 to decide.
+- **Unknown route at start.** A `with_router` parse error on the first request is a 404 SSR response. Bad percent-encoding is a 400.
+- **Default middleware.** `[middleware.secure_headers()]` is on unless replaced.
+- **`beacon.start` reads no environment variables.** Reading `PORT` or `SECRET_KEY` inside `start` would hide configuration in the framework. Apps call `config.port()` and `config.secret_key()` themselves, and both return a `Result`. The docs show this with `let assert` and a reason.
+- **Examples need `-m <module>`.** An example's entry module is the module that calls a constructor, and it is not always named after the package (`app`, `main`, `todo_app`). Each README says which module to run.
+
+### Analyzer and codegen
+
+- The analyzer finds the app from the constructor call, and requires `view` to be `pub`. For `simple`, `update` must be `pub` too, because the generated JS entry imports it.
+- A Msg constructor with a framework-typed field (`Context`, `Effect`, a store) is a build error naming the field. Such a value cannot cross the wire.
+- The allowlist is the closure of Msg constructors reachable from `view` (and the local layer's view-side update), not every constructor of the Msg type. The analyzer also walks the Model's type closure, so the codec never encodes a server-only type.
+- The JS entry wraps handlers in generic functions instead of generating one per handler.
+- `decode_event` returns `Result(msg, String)`. The runtime wraps the String in its own error type and logs it.
+
+### Client runtime
+
+- **Synchronous render.** The client renders after each event, without `requestAnimationFrame` batching, as Lustre does in its default mode. `docs/PROGRESS.md` line 3105 still mentions rAF.
+- **`stop_propagation` among Beacon handlers.** It works between Beacon handlers on ancestor elements. Delegation is at the root, so it cannot stop a native listener that a page adds elsewhere.
+- **Debounce.** A debounced event decodes when it fires, not when the timer ends. The decoder sees the real event object, which the browser may recycle later.
+- **Packaging.** `beacon_client/` is a plain JS directory, not a Gleam package. `start(App)` replaces auto-boot, so the generated entry decides when to start.
+- **Held server state.** Only a `simple` app holds server patches while its own events are unacknowledged. Held patches still advance the patch cache, so the next diff applies. `application` apps render server state as it arrives.
+- **Focused inputs.** A focused input keeps what the user typed until the server acknowledges the event (LiveView's rule). A focused control that the morph replaces is refocused by `name`.
+- **Autofocus.** The client honours `autofocus` after each render, because a morph does not trigger the browser's own autofocus.
+- **Mount frame.** The client logs a server `mount` frame as an unsupported error rather than ignoring it silently.
+- **Follow-up: build id.** A tab opened before a rebuild can receive a `model_sync` from a new Model shape. A build-id handshake is left for WS10.
+
+### Server and runtime
+
+- The SSR fallback to `priv/static` was removed. When the build manifest is missing, the server answers with a static 500 page and logs the path it looked for.
+- Store writes before `beacon.start` crash, because the store's process does not exist yet. Examples seed shared state as constants replayed on read (see `kanban`'s `starting_board`), not with startup writes.
+- `beacon.start` returns an `Error` when it fails, but `gleam run` still exits 0 when `main` drops the result, as the examples do. Making `start` crash, or documenting `let assert`, is a WS10 follow-up.
+
+### Examples
+
+- **`triple_counter`** is a `full_application`, not `simple`, because it persists counts and `simple` has no effects.
+- **Shared state.** `todo`, `triple_counter`, `cart`, `kanban` and the snake high scores use append-only store logs, replayed on read. `spreadsheet` stores one key per cell. The store has no atomic read-modify-write, so a read-then-write would lose concurrent updates.
+- **`dashboard`** reads VM metrics through its own FFI, not `beacon/debug`, which is internal.
+- **`kanban`.** The server remembers the dragged card between `DragStart` and `DropOn`, because a drop event cannot carry it.
+- **`pong`** runs its loop on a keyed `effect.after`, so pressing Start twice keeps one loop.
+- **`canvas`** derives stroke numbering from pen-up events instead of a counter.
+- **`chat`** uses `beacon/presence`. This argues for keeping `presence` public.
+- **`privacy_demo`** drops computed fields and the `server_` naming convention. Privacy now comes from reachability, so the demo shows a Session field that never reaches the bundle.
+- **`ai_chat`** streams with `effect.background`. A stream that sends no chunk for 5 s ends with `StreamError`, and a `notice` field shows refusals.
+- **`routed_workspace`** keeps the `Route` in the Model and validates params in `parse`.
+- **`route_server_workspace`** folds the separate server update into one page `update(model, server, msg)`.
+- **Pages keyed by route.** `routed`, `routed_workspace` and `route_server_workspace` wrap the page in `element.keyed(href(route), ...)`. Without a key, the morph reuses one page's nodes for the next page by position. Focus and input state carry over, and the moved nodes show up as layout shift. ROUTING.md documents the pattern. A follow-up could have the client key the root on navigation by itself.
+- **`auth_workspace` WebSocket auth.** `auth.protect_ws` refuses guest sockets. On a page that guests may open, a revoked or missing session would then make the client reconnect forever. The example wraps `protect_ws` in a `ws_auth` that sends a signed-in request through `protect_ws`, connects a request with no live signed-in session as a guest, and refuses the socket when the store is unavailable. An `auth.allow_guests_ws` helper in `beacon/auth` (owned by ws8b) would remove the wrapper.
+
+### Tooling
+
+- Test log capture for my modules lives in `test/beacon_own_log_capture_ffi.erl`. It forwards only the events the calling process logs, so tests running in parallel do not see each other's lines. WS8a's `beacon_log_capture_ffi.erl` is unchanged.
+- `test_all_cdp.py` finds buttons by text, because handler ids are positional and internal. Forms are submitted through their submit button.
+- `test_all_cdp.py` ignores the browser's automatic `/favicon.ico` 404, because the examples ship no favicon. Every other failed request is still an error, reported with its URL. A layout-shift failure reports its `sources` so the shifted node is named.
+- **Step 11 docs.** `STATE_MANAGEMENT.md` is on the step 11 list but belongs to ws8b, so WS7 did not rewrite it. GETTING_STARTED, ROUTING, EFFECTS, HTML_ELEMENTS, SECURITY and ARCHITECTURE were rewritten.
+
+### Candidates for `internal_modules`
+
+These modules are public now but have no documented use outside Beacon: `presence` (although `chat` uses it), `store/crdt`, `hlc` and `replicated`. `beacon_middleware_ffi.erl` is dead code, and so is a `data-beacon-auto` check left in `transport`.

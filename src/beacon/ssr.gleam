@@ -12,12 +12,14 @@
 /// Phoenix.Token (sign/verify with max_age), Leptos SSR modes.
 import beacon/cookie
 import beacon/effect.{type Effect}
-import beacon/element.{type Node}
+import beacon/element.{type Element}
 import beacon/error_page
-import beacon/handler
+import beacon/internal/context
+import beacon/internal/render
+import beacon/internal/uri_check
 import beacon/log
-import beacon/route
 import beacon/session
+import beacon/static
 import beacon/transport/server.{type ResponseBody, Bytes}
 import gleam/bit_array
 import gleam/bytes_tree
@@ -28,30 +30,39 @@ import gleam/http/response.{type Response}
 import gleam/int
 import gleam/json
 import gleam/option.{type Option, None, Some}
+import gleam/result
 import gleam/string
+import gleam/uri.{type Uri}
 import simplifile
 
-/// Configuration for server-side rendering.
-pub type SsrConfig(model, msg) {
+/// Configuration for server-side rendering. `beacon.start` builds this from
+/// the app; the functions are the app's own, already composed with its
+/// `sync` and local layer.
+pub type SsrConfig(state, msg) {
   SsrConfig(
-    /// Initialize the model (same as RuntimeConfig.init).
-    init: fn() -> #(model, Effect(msg)),
-    /// The view function (same as RuntimeConfig.view).
-    view: fn(model) -> Node(msg),
-    /// Secret key for signing session tokens.
+    /// The app's `init`, run with a dead-render context.
+    init: fn(context.Context) -> #(state, Effect(msg)),
+    /// The app's server `update`, used to apply the route message.
+    update: fn(state, msg) -> #(state, Effect(msg)),
+    /// `parse` composed with `on_change`, when the app has a router.
+    route: Option(fn(Uri) -> Result(msg, Nil)),
+    /// Render the page body from the server state.
+    view: fn(state) -> Element(msg),
+    /// The document title for the server state.
+    title: fn(state) -> String,
+    /// Secret key for signing join tokens.
     secret_key: String,
-    /// Application title for the HTML page.
-    title: String,
     /// Optional: extra HTML to inject into `<head>` (stylesheets, meta tags, etc.).
     /// Rendered raw — caller is responsible for valid HTML.
     /// Example: `"<link rel=\"stylesheet\" href=\"/static/styles.css\">"`.
     head_html: Option(String),
     /// Enable framework-owned client tracing.
     dev_mode: Bool,
-    /// Optional model serializer. When set, the join token carries the
-    /// client-visible model JSON (see `client_visible_model_encoder`) so the
-    /// runtime can recover state on reconnect.
-    serialize_model: Option(fn(model) -> String),
+    /// The client-visible model encoder, set only when the app opted into
+    /// state recovery (`beacon.with_state_recovery`). The join token then
+    /// carries the same JSON the client receives in model_sync, so it never
+    /// holds more than the wire protocol does.
+    recovery_encoder: Option(fn(state) -> String),
   )
 }
 
@@ -134,156 +145,180 @@ pub type RenderedPage {
     sign_join_token: fn(String) -> String,
     /// Whether the session cookie should include the Secure attribute.
     cookie_secure: Bool,
+    /// HTTP status: 200 for a rendered route, 404 for an unknown route,
+    /// 400 for a URL whose percent-encoding does not decode.
+    status: Int,
   )
 }
 
-/// Render the initial page for an HTTP request.
-/// This is the "dead render" — produces full HTML without WebSocket.
+/// Render the page for an HTTP request (the "dead render").
 ///
-/// Steps (following LiveView's pattern):
-/// 1. Run init() to get the initial model
-/// 2. Call view(model) to get the Element tree
-/// 3. Render Element tree to HTML string
-/// 4. Sign a session token containing model identity info
-/// 5. Wrap in full HTML document with JS client injected
-pub fn render_page(config: SsrConfig(model, msg)) -> RenderedPage {
-  log.debug("beacon.ssr", "Rendering dead page")
-
-  // Step 1: Initialize model
-  let #(model, _initial_effects) = config.init()
-  // Note: initial effects are NOT executed during dead render.
-  // They will run when the WebSocket connects (live mount).
-  // This matches LiveView's behavior: expensive data loading
-  // can be deferred to the live mount phase.
-
-  // Step 2: Render view through the generated renderer when available.
-  let view_html = render_view_html(config, model)
-
-  // Step 3: Prepare the join-token signer (model JSON encoded once)
-  let signer = join_token_signer(config, Some(model))
-
-  // Step 4: Build full HTML document
-  let html =
-    build_html_document(
-      config.title,
-      view_html,
-      config.head_html,
-      config.dev_mode,
-      True,
-    )
-
-  log.debug("beacon.ssr", "Dead render complete")
-  RenderedPage(
-    html: html,
-    sign_join_token: signer,
-    cookie_secure: !config.dev_mode,
-  )
-}
-
-/// Render a page for a specific URL path (route-aware SSR).
-/// Runs init, then dispatches on_route_change if routes are configured.
-/// This ensures each URL gets route-specific SSR HTML.
-pub fn render_page_for_path(
-  config: SsrConfig(model, msg),
-  path: String,
-  route_patterns: List(route.RoutePattern),
-  on_route_change: Option(fn(route.Route) -> msg),
-  update: fn(model, msg) -> #(model, Effect(msg)),
+/// Following LiveView's two-phase mount:
+/// 1. Check the URL's percent-encoding (400 when it does not decode).
+/// 2. Resolve the route, when the app has a router (404 when unknown).
+/// 3. Run `init` with a context whose `is_connected` is False. Its effects
+///    are not run: they run on the connected mount.
+/// 4. Apply the route message through `update` (effects dropped likewise).
+/// 5. Render `view` and wrap it in the HTML document with the client script.
+pub fn render_page(
+  config: SsrConfig(state, msg),
+  req: Request(body),
 ) -> RenderedPage {
-  log.debug("beacon.ssr", "Rendering for path: " <> path)
-
-  // Step 1: Initialize model
-  let #(model, _effects) = config.init()
-
-  // Step 2: Apply route change if configured
-  case on_route_change {
-    Some(make_msg) ->
-      case route.match_path(route_patterns, path) {
-        Some(matched_route) -> {
-          let msg = make_msg(matched_route)
-          let #(model, _effects) = update(model, msg)
-          render_page_for_model(config, path, model)
+  let page_uri = request.to_uri(req)
+  let path = describe_uri(page_uri)
+  log.debug("beacon.ssr", "Dead render for " <> path)
+  case uri_check.check(page_uri) {
+    Error(reason) -> {
+      log.warning(
+        "beacon.ssr",
+        "Refusing dead render for " <> path <> " (400): " <> reason,
+      )
+      render_error_page(
+        config,
+        400,
+        "Bad Request",
+        error_page.error_page(
+          400,
+          "Bad Request",
+          "The page address is not valid.",
+        ),
+      )
+    }
+    Ok(Nil) ->
+      case resolve_route(config.route, page_uri) {
+        Error(Nil) -> {
+          log.warning("beacon.ssr", "No route for " <> path <> " (404)")
+          render_error_page(config, 404, "Not Found", error_page.not_found())
         }
-        None -> render_unmatched_route(config, path)
+        Ok(route_msg) -> {
+          let ctx =
+            context.new(
+              uri: page_uri,
+              cookies: cookie.parse(req),
+              is_connected: False,
+              session_id: session_id_for_request(req),
+            )
+          let #(state, init_effects) = config.init(ctx)
+          drop_effects(init_effects, "init", path)
+          let state = case route_msg {
+            None -> state
+            Some(msg) -> {
+              let #(routed, route_effects) = config.update(state, msg)
+              drop_effects(route_effects, "route update", path)
+              routed
+            }
+          }
+          render_state(config, state, path)
+        }
       }
-    None -> render_page_for_model(config, path, model)
   }
 }
 
-fn render_unmatched_route(config: SsrConfig(model, msg), path: String) {
-  log.warning("beacon.ssr", "No route matched during SSR for path: " <> path)
-  render_not_found_page(config)
+/// Ok(None) when the app has no router; Ok(Some(msg)) for a known route.
+fn resolve_route(
+  route: Option(fn(Uri) -> Result(msg, Nil)),
+  page_uri: Uri,
+) -> Result(Option(msg), Nil) {
+  case route {
+    None -> Ok(None)
+    Some(parse) -> parse(page_uri) |> result.map(Some)
+  }
 }
 
-fn render_page_for_model(
-  config: SsrConfig(model, msg),
-  path: String,
-  model: model,
-) -> RenderedPage {
-  let view_html = render_view_html(config, model)
-
-  let signer = join_token_signer(config, Some(model))
-
-  // Step 5: Build HTML
-  let html =
-    build_html_document(
-      config.title,
-      view_html,
-      config.head_html,
-      config.dev_mode,
-      True,
-    )
-
-  log.debug("beacon.ssr", "Render complete for: " <> path)
-  RenderedPage(
-    html: html,
-    sign_join_token: signer,
-    cookie_secure: !config.dev_mode,
-  )
-}
-
-fn render_view_html(config: SsrConfig(model, msg), model: model) -> String {
-  handler.start_render()
-  let view_html = case try_load_codec_renderer() {
-    Ok(render) -> {
+/// Dead-render effects are not run (LiveView runs `mount` twice for the
+/// same reason: work that needs a live connection belongs to the connected
+/// mount, which runs `init` again with `is_connected` True).
+fn drop_effects(effects: Effect(msg), stage: String, path: String) -> Nil {
+  case effect.is_none(effects) {
+    True -> Nil
+    False ->
       log.debug(
         "beacon.ssr",
-        "Rendering via generated beacon_codec.render_model/1",
+        "Not running " <> stage <> " effects during the dead render of " <> path,
       )
-      render(model)
-    }
-    Error(_) -> {
-      log.debug("beacon.ssr", "Rendering via configured direct SSR view")
-      let view_tree = config.view(model)
-      element.to_string(view_tree)
-    }
   }
-  // SSR only pops the render stack here; the client re-registers handlers on
-  // hydration. WS7 deletes beacon/handler.
-  // lint:allow-discard the SSR handler registry is not needed after render
-  let _view_registry = handler.finish_render()
-  view_html
 }
 
-@external(erlang, "beacon_runtime_ffi", "try_load_codec_renderer")
-fn try_load_codec_renderer() -> Result(fn(model) -> String, Nil)
+fn render_state(
+  config: SsrConfig(state, msg),
+  state: state,
+  path: String,
+) -> RenderedPage {
+  let view_html = element.to_string(config.view(state))
+  let model_json = case config.recovery_encoder {
+    Some(encode) -> Some(encode(state))
+    None -> None
+  }
+  case client_bundle_name(client_assets_dir()) {
+    Ok(bundle) -> {
+      let html =
+        build_html_document(
+          config.title(state),
+          view_html,
+          config.head_html,
+          config.dev_mode,
+          Some(bundle),
+        )
+      log.debug("beacon.ssr", "Dead render complete for " <> path)
+      RenderedPage(
+        html: html,
+        sign_join_token: join_token_signer(config.secret_key, model_json),
+        cookie_secure: !config.dev_mode,
+        status: 200,
+      )
+    }
+    // A page whose script cannot load is not interactive: serve a static
+    // 500 instead. `beacon.start` checks the bundle at startup, so this
+    // means it was removed or damaged while the server was running.
+    Error(reason) -> {
+      log.error(
+        "beacon.ssr",
+        "Refusing dead render for " <> path <> " (500): " <> reason,
+      )
+      render_error_page(
+        config,
+        500,
+        "Internal Server Error",
+        error_page.error_page(
+          500,
+          "Internal Server Error",
+          "The page cannot be served right now.",
+        ),
+      )
+    }
+  }
+}
 
-fn render_not_found_page(config: SsrConfig(model, msg)) -> RenderedPage {
-  let view_html = error_page.not_found() |> element.to_string
+/// A static error page: no client script, so the browser does not open a
+/// session for a page the app cannot render.
+fn render_error_page(
+  config: SsrConfig(state, msg),
+  status: Int,
+  title: String,
+  page: Element(msg),
+) -> RenderedPage {
   let html =
     build_html_document(
-      config.title,
-      view_html,
+      title,
+      element.to_string(page),
       config.head_html,
       config.dev_mode,
-      False,
+      None,
     )
-
   RenderedPage(
     html: html,
-    sign_join_token: join_token_signer(config, None),
+    sign_join_token: join_token_signer(config.secret_key, None),
     cookie_secure: !config.dev_mode,
+    status: status,
   )
+}
+
+/// Path and query for logs.
+fn describe_uri(page_uri: Uri) -> String {
+  case page_uri.query {
+    Some(query) -> page_uri.path <> "?" <> query
+    None -> page_uri.path
+  }
 }
 
 /// Convert a RenderedPage to an HTTP response whose join token is not bound
@@ -311,7 +346,7 @@ fn page_response(
   page: RenderedPage,
   fingerprint: String,
 ) -> Result(Response(ResponseBody), cookie.CookieError) {
-  response.new(200)
+  response.new(page.status)
   |> response.set_header("content-type", "text/html; charset=utf-8")
   |> response.set_body(Bytes(bytes_tree.from_string(page.html)))
   |> cookie.set(
@@ -340,11 +375,19 @@ fn session_cookie_options(secure: Bool) -> cookie.CookieOptions {
 /// hex SHA-256 of its `beacon_session` cookie, or "" when there is none.
 /// The raw session id never enters a token.
 pub fn session_fingerprint(req: Request(body)) -> String {
-  case session.id_from_request(req, session_identity_cookie_name) {
-    Ok(session_id) -> fingerprint_session_id(session_id)
+  case session_id_for_request(req) {
+    Ok(fingerprint) -> fingerprint
     // No (or an empty) session cookie: the token is unbound.
     Error(Nil) -> ""
   }
+}
+
+/// The session identity `init` sees (`beacon.session_id`): the
+/// fingerprint of the request's `beacon_session` cookie, or Error(Nil)
+/// when the request has none.
+pub fn session_id_for_request(req: Request(body)) -> Result(String, Nil) {
+  session.id_from_request(req, session_identity_cookie_name)
+  |> result.map(fingerprint_session_id)
 }
 
 /// Lowercase hex SHA-256 of a session id. Delegates to
@@ -354,39 +397,13 @@ pub fn fingerprint_session_id(session_id: String) -> String {
   session.binding_fingerprint(session_id)
 }
 
-/// The encoder whose output the client already receives in model_sync:
-/// the generated `beacon_codec.encode_model` (which excludes Server state)
-/// when present, otherwise the configured encoder. The join token only ever
-/// carries this JSON, so it never holds more than the wire protocol does.
-pub fn client_visible_model_encoder(
-  configured: Option(fn(model) -> String),
-) -> Option(fn(model) -> String) {
-  case try_load_codec_encoder() {
-    Ok(encode) -> Some(encode)
-    Error(Nil) -> configured
-  }
-}
-
-@external(erlang, "beacon_runtime_ffi", "try_load_codec_encoder")
-fn try_load_codec_encoder() -> Result(fn(model) -> String, Nil)
-
 /// Build the per-response join-token signer for a rendered page. The model
-/// is encoded once, here; each call signs with a fresh issue time.
-/// The model is only embedded when the app configured a model serializer
-/// (it opted into state recovery).
+/// JSON is encoded once, by the caller; each call signs with a fresh issue
+/// time. `model_json` is None unless the app opted into state recovery.
 fn join_token_signer(
-  config: SsrConfig(model, msg),
-  model: Option(model),
+  secret_key: String,
+  model_json: Option(String),
 ) -> fn(String) -> String {
-  let model_json = case model, config.serialize_model {
-    Some(m), Some(_) ->
-      case client_visible_model_encoder(config.serialize_model) {
-        Some(encode) -> Some(encode(m))
-        None -> None
-      }
-    _, _ -> None
-  }
-  let secret_key = config.secret_key
   fn(fingerprint) {
     sign_join_token_within_budget(
       secret_key,
@@ -606,26 +623,22 @@ pub fn verify_session_token(
   }
 }
 
-/// Build a full HTML document with the view and JS client.
+/// Build a full HTML document with the view and, for a live page, the
+/// script tag of the client bundle named `bundle`.
 fn build_html_document(
   title: String,
   view_html: String,
   head_html: Option(String),
   dev_mode: Bool,
-  include_client: Bool,
+  bundle: Option(String),
 ) -> String {
   let extra_head = case head_html {
     Some(html) -> html
     None -> ""
   }
-  let client_script = case include_client {
-    True ->
-      string.concat([
-        "<script src=\"/",
-        client_js_filename(),
-        "\" data-beacon-auto></script>",
-      ])
-    False -> ""
+  let client_script = case bundle {
+    Some(name) -> "<script src=\"/" <> name <> "\"></script>"
+    None -> ""
   }
   string.concat([
     "<!DOCTYPE html>",
@@ -633,7 +646,7 @@ fn build_html_document(
     "<meta charset=\"utf-8\">",
     "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">",
     "<title>",
-    escape_html(title),
+    render.escape_html(title),
     "</title>",
     extra_head,
     "</head><body>",
@@ -650,83 +663,62 @@ fn build_html_document(
   ])
 }
 
-/// Choose the directory that contains Beacon client assets.
-/// Prefer the consuming app's `priv/static` when it has a manifest; otherwise
-/// use Beacon's own packaged priv dir for repo/dependency installs.
-pub fn choose_client_assets_dir(
-  has_local_manifest: Bool,
-  local_dir: String,
-  beacon_dir: String,
-) -> String {
-  case has_local_manifest {
-    True -> local_dir
-    False -> beacon_dir
-  }
-}
-
-/// Resolve the directory that contains Beacon client assets.
+/// The directory holding the app's client bundle and its manifest: the
+/// app's own `priv/static`, written by `gleam run -m beacon/build`. The
+/// runtime bundle in Beacon's own `priv` starts no app, so it is never
+/// served in its place.
 pub fn client_assets_dir() -> String {
-  case simplifile.is_file("priv/static/beacon_client.manifest") {
-    Ok(True) ->
-      choose_client_assets_dir(True, "priv/static", beacon_priv_path("static"))
+  "priv/static"
+}
+
+/// The bundle file named by `beacon_client.manifest` in `assets_dir`. The
+/// name must be exact build output (`static.is_client_bundle_name`), and
+/// the file must exist.
+pub fn client_bundle_name(assets_dir: String) -> Result(String, String) {
+  let manifest_path = assets_dir <> "/beacon_client.manifest"
+  let hint = " Run `gleam run -m beacon/build`."
+  use contents <- result.try(
+    simplifile.read(manifest_path)
+    |> result.map_error(fn(err) {
+      "Cannot read "
+      <> manifest_path
+      <> " ("
+      <> simplifile.describe_error(err)
+      <> ")."
+      <> hint
+    }),
+  )
+  let name = string.trim(contents)
+  use Nil <- result.try(case static.is_client_bundle_name(name) {
+    True -> Ok(Nil)
+    False ->
+      Error(
+        manifest_path
+        <> " names an invalid bundle "
+        <> string.inspect(name)
+        <> "."
+        <> hint,
+      )
+  })
+  case simplifile.is_file(assets_dir <> "/" <> name) {
+    Ok(True) -> Ok(name)
     Ok(False) ->
-      choose_client_assets_dir(False, "priv/static", beacon_priv_path("static"))
-    Error(err) -> {
-      log.error(
-        "beacon.ssr",
-        "Failed to inspect local client manifest: " <> string.inspect(err),
+      Error(
+        manifest_path <> " names " <> name <> ", which does not exist." <> hint,
       )
-      beacon_priv_path("static")
-    }
-  }
-}
-
-/// Get the current client JS filename from the build manifest.
-/// The manifest is created by `gleam run -m beacon/build`.
-fn client_js_filename() -> String {
-  let manifest_path = client_assets_dir() <> "/beacon_client.manifest"
-  case simplifile.read(manifest_path) {
-    Ok(name) -> string.trim(name)
-    Error(err) -> {
-      log.error(
-        "beacon.ssr",
-        "FATAL: No beacon_client.manifest at "
-          <> manifest_path
-          <> ": "
-          <> string.inspect(err)
-          <> " — client JS not built. Run `gleam run -m beacon/build`.",
+    Error(err) ->
+      Error(
+        "Cannot check "
+        <> assets_dir
+        <> "/"
+        <> name
+        <> " ("
+        <> simplifile.describe_error(err)
+        <> ")."
+        <> hint,
       )
-      "MISSING_CLIENT_JS_RUN_BEACON_BUILD"
-    }
   }
 }
-
-/// Resolve a path relative to Beacon's priv directory.
-/// Uses `code:priv_dir(beacon)` for correct resolution from consuming apps.
-pub fn beacon_priv_path(relative: String) -> String {
-  case ffi_priv_dir() {
-    Ok(dir) -> dir <> "/" <> relative
-    Error(reason) -> {
-      log.error("beacon.ssr", "Failed to resolve Beacon priv dir: " <> reason)
-      "MISSING_BEACON_PRIV/" <> relative
-    }
-  }
-}
-
-@external(erlang, "beacon_ssr_ffi", "priv_dir")
-fn ffi_priv_dir() -> Result(String, String)
-
-/// Escape HTML special characters in text content.
-fn escape_html(text: String) -> String {
-  text
-  |> do_replace("&", "&amp;")
-  |> do_replace("<", "&lt;")
-  |> do_replace(">", "&gt;")
-  |> do_replace("\"", "&quot;")
-}
-
-@external(erlang, "beacon_element_ffi", "string_replace")
-fn do_replace(subject: String, pattern: String, replacement: String) -> String
 
 @external(erlang, "beacon_ssr_ffi", "system_time_seconds")
 fn erlang_system_time_seconds() -> Int

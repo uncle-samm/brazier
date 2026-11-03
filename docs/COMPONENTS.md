@@ -1,60 +1,133 @@
 # Components
 
-Components are encapsulated MVU units with their own model, message type, and lifecycle.
+Beacon has no component type. A reusable piece of UI is a plain Gleam module with its own `Model`, `Msg`, `update` and `view`, nested inside a parent the way Elm and Lustre nest modules:
 
-## The Component Type
+- the parent keeps the child's model in a field of its own model;
+- the parent has one message constructor that wraps the child's messages;
+- the parent's `view` wraps the child's view with `element.map`;
+- the parent's `update` forwards the wrapped message and wraps the child's effects with `effect.map`.
+
+The child's state lives in the parent's state, so it is synced, kept on the server, or both, exactly like the rest of the parent's state. The runtime does not own child state. Stateful, runtime-owned live components (LiveView's `live_component`) are not supported.
+
+## The child module
 
 ```gleam
-pub type Component(model, msg, parent_msg) {
-  Component(
-    init: fn() -> #(model, Effect(msg)),
-    update: fn(model, msg) -> #(model, Effect(msg)),
-    view: fn(model) -> Node(msg),
-    to_parent: fn(msg) -> parent_msg,
-  )
+// src/my_app/counter.gleam
+import beacon/effect.{type Effect}
+import beacon/element.{type Element}
+import beacon/event
+import beacon/html
+import gleam/int
+
+pub type Model {
+  Model(count: Int)
 }
-```
 
-## Creating a Component
-
-Use `component.new(init, update, view, to_parent)`:
-
-```gleam
-let counter = component.new(
-  init: fn() { #(0, effect.none()) },
-  update: fn(count, msg) { case msg {
-    Increment -> #(count + 1, effect.none())
-    Decrement -> #(count - 1, effect.none())
-  }},
-  view: fn(count) { html.div([], [
-    html.button([beacon.on_click(Decrement)], [html.text("-")]),
-    html.button([beacon.on_click(Increment)], [html.text("+")]),
-  ])},
-  to_parent: fn(msg) { CounterMsg(msg) },
-)
-```
-
-## Rendering and Updating
-
-Use `component.render(comp, model)` in the parent's view -- it maps messages through `to_parent`:
-
-```gleam
-fn view(model: ParentModel) -> Node(ParentMsg) {
-  html.div([], [component.render(counter, model.counter_state)])
+pub type Msg {
+  Increment
+  Decrement
 }
-```
 
-Use `component.update_component` in the parent's update to delegate:
+pub fn init() -> Model {
+  Model(count: 0)
+}
 
-```gleam
-case msg {
-  CounterMsg(child_msg) -> {
-    let #(new_counter, eff) =
-      component.update_component(counter, model.counter_state, child_msg)
-    #(ParentModel(..model, counter_state: new_counter), eff)
+pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
+  case msg {
+    Increment -> #(Model(count: model.count + 1), effect.none())
+    Decrement -> #(Model(count: model.count - 1), effect.none())
   }
 }
-```
-## Message Mapping
 
-`component.map_node(node, fn)` transforms messages in a `Node` tree. This is the mechanism underlying `render` -- equivalent to Lustre's `element.map`.
+pub fn view(model: Model) -> Element(Msg) {
+  html.div([], [
+    html.button([event.on_click(Decrement)], [html.text("-")]),
+    html.text(int.to_string(model.count)),
+    html.button([event.on_click(Increment)], [html.text("+")]),
+  ])
+}
+```
+
+A child used from a `beacon.simple` app has `update: fn(Model, Msg) -> Model` instead, and the parent calls it without `effect.map`.
+
+## Nesting it in a parent
+
+```gleam
+// src/my_app.gleam
+import beacon
+import beacon/effect.{type Effect}
+import beacon/element.{type Element}
+import beacon/html
+import my_app/counter
+
+pub type Model {
+  Model(left: counter.Model, right: counter.Model)
+}
+
+pub type Msg {
+  LeftMsg(counter.Msg)
+  RightMsg(counter.Msg)
+}
+
+pub fn init(_ctx: beacon.Context) -> #(Model, Effect(Msg)) {
+  #(Model(left: counter.init(), right: counter.init()), effect.none())
+}
+
+pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
+  case msg {
+    LeftMsg(child_msg) -> {
+      let #(left, eff) = counter.update(model.left, child_msg)
+      #(Model(..model, left: left), effect.map(eff, LeftMsg))
+    }
+    RightMsg(child_msg) -> {
+      let #(right, eff) = counter.update(model.right, child_msg)
+      #(Model(..model, right: right), effect.map(eff, RightMsg))
+    }
+  }
+}
+
+pub fn view(model: Model) -> Element(Msg) {
+  html.div([], [
+    element.map(counter.view(model.left), LeftMsg),
+    element.map(counter.view(model.right), RightMsg),
+  ])
+}
+
+pub fn main() {
+  beacon.application(init:, update:, view:)
+  |> beacon.start(8080)
+}
+```
+
+`element.map` rewrites every event handler in the child's tree, so a click on the left `+` button reaches the parent's `update` as `LeftMsg(counter.Increment)`. `attribute.map` does the same for a single attribute. `effect.map` wraps every message the child's effect dispatches, including messages from timers and background work, so `effect.after(1000, fn() { counter.Increment })` returned by the child arrives as `LeftMsg(counter.Increment)`.
+
+## What the build does with child modules
+
+The build follows references from `view` (see `docs/ARCHITECTURE.md`). The child's `view`, and its `Msg` and `Model` types, are compiled into the client bundle because the parent's `view` reaches them. The child's `update` is compiled only for a `beacon.simple` app.
+
+The server accepts a child message only when the constructors that build it are reachable from `view`. `element.map(counter.view(model.left), LeftMsg)` counts as a use of `LeftMsg`, and `event.on_click(Increment)` inside `counter.view` counts as a use of `counter.Increment`. A child message that only an effect produces (for example a `Loaded(data)` dispatched by `effect.from`) is never accepted from the browser.
+
+## Communicating with the parent
+
+A child that needs to tell its parent something returns that information from `update` instead of sending a message upwards. Lustre and Elm use the same pattern:
+
+```gleam
+pub type OutMsg {
+  Submitted(String)
+}
+
+pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg), List(OutMsg))
+```
+
+The parent pattern-matches the returned list in its own `update`.
+
+## Migrating from `beacon/component`
+
+| Old | New |
+|---|---|
+| `component.new(init, update, view, to_parent)` | a module with `init`, `update` and `view` |
+| `component.render(comp, model)` | `element.map(child.view(model), ToParent)` |
+| `component.update_component(comp, model, msg)` | `child.update(model, msg)` plus `effect.map(eff, ToParent)` |
+| `component.map_node(node, f)` | `element.map(element, f)` |
+
+`test/beacon/child_module_test.gleam` runs this pattern through the runtime.

@@ -6,10 +6,10 @@
 //// Synchronisation uses monitors and selectors only — no sleeps.
 
 import beacon/effect
-import beacon/element
 import beacon/error
 import beacon/pubsub
 import beacon/runtime
+import beacon/test_ctx
 import gleam/erlang/process.{type Pid, type Subject}
 import gleam/int
 import gleam/list
@@ -254,7 +254,7 @@ fn lifecycle_config(
   topic: String,
 ) -> runtime.RuntimeConfig(LifeModel, LifeMsg) {
   runtime.RuntimeConfig(
-    init: fn() {
+    init: fn(_ctx) {
       #(
         LifeModel(ticks: 0),
         effect.batch([
@@ -277,21 +277,16 @@ fn lifecycle_config(
         LifeNotified -> #(model, effect.none())
       }
     },
-    view: fn(model) { element.text(int.to_string(model.ticks)) },
-    decode_event: option.Some(fn(_, _, _, _) {
+    decode_event: fn(_, _, _, _) {
       Error(error.RuntimeError(reason: "lifecycle test decodes no events"))
-    }),
-    serialize_model: option.None,
-    deserialize_model: option.None,
-    route_patterns: [],
-    on_route_change: option.None,
-    on_route_leave: option.None,
+    },
+    encode_model: fn(model: LifeModel) { int.to_string(model.ticks) },
+    route: option.None,
+    restore_model: option.None,
     dynamic_subscriptions: option.Some(fn(_model) { [topic] }),
     on_notify: option.Some(fn(_topic) { LifeNotified }),
     on_notification: option.None,
-    init_from_request: option.None,
     secret_key: "",
-    dev_mode: False,
   )
 }
 
@@ -304,7 +299,8 @@ fn start_lifecycle_runtime(
 ) -> #(Subject(runtime.RuntimeMessage(LifeMsg)), Pid, List(Pid)) {
   pubsub.start()
   let reports = process.new_subject()
-  let assert Ok(subject) = runtime.start(lifecycle_config(reports, topic))
+  let assert Ok(subject) =
+    runtime.start(lifecycle_config(reports, topic), test_ctx.root())
   let assert Ok(runtime_pid) = process.subject_owner(subject)
   process.unlink(runtime_pid)
   // The timer reports on every tick, the worker once. The worker is the

@@ -6,19 +6,18 @@
 //// by seeing the barrier's reply arrive first.
 
 import beacon/effect
-import beacon/element
 import beacon/error
 import beacon/pubsub
-import beacon/route
 import beacon/runtime
+import beacon/test_ctx
 import beacon/transport
 import gleam/erlang/process.{type Subject}
 import gleam/int
 import gleam/json
 import gleam/list
 import gleam/option.{None, Some}
-import gleam/pair
 import gleam/string
+import gleam/uri.{type Uri}
 
 pub type Model {
   Model(count: Int, blob: String, path: String)
@@ -72,32 +71,34 @@ fn update(m: Model, msg: Msg) -> #(Model, effect.Effect(Msg)) {
 
 fn config() -> runtime.RuntimeConfig(Model, Msg) {
   runtime.RuntimeConfig(
-    init: fn() { #(Model(count: 0, blob: "", path: ""), effect.none()) },
+    init: fn(_ctx) { #(Model(count: 0, blob: "", path: ""), effect.none()) },
     update: update,
-    view: fn(m: Model) { element.text(int.to_string(m.count)) },
-    decode_event: Some(decode),
-    serialize_model: Some(model_json),
-    deserialize_model: None,
-    route_patterns: [],
-    on_route_change: None,
-    on_route_leave: None,
+    decode_event: decode,
+    encode_model: model_json,
+    route: None,
+    restore_model: None,
     dynamic_subscriptions: None,
     on_notify: None,
     on_notification: None,
-    init_from_request: None,
     secret_key: secret,
-    dev_mode: False,
   )
 }
 
+/// Every path is a route; each time `update` applies a route message it
+/// reports the path to `proof`. `runtime.start` applies one for the start
+/// context's "/". (The router itself is a pure parse the runtime may call
+/// just to compare routes, so the proof sits in `update`.)
 fn route_config(proof: Subject(String)) -> runtime.RuntimeConfig(Model, Msg) {
   runtime.RuntimeConfig(
     ..config(),
-    route_patterns: [route.pattern("/"), route.pattern("/a")],
-    on_route_change: Some(fn(r: route.Route) {
-      process.send(proof, r.path)
-      RouteTo(r.path)
-    }),
+    update: fn(m: Model, msg: Msg) {
+      case msg {
+        RouteTo(path) -> process.send(proof, path)
+        Inc | Noop | SetBlob(_) -> Nil
+      }
+      update(m, msg)
+    },
+    route: Some(fn(page: Uri) { Ok(RouteTo(page.path)) }),
   )
 }
 
@@ -170,7 +171,7 @@ fn assert_nothing_pending(subject: Subject(transport.InternalMessage)) -> Nil {
 // --- messages before join (unhappy paths) ---
 
 pub fn event_before_join_is_rejected_and_not_applied_test() {
-  let assert Ok(rt) = runtime.start(config())
+  let assert Ok(rt) = runtime.start(config(), test_ctx.root())
   let s = connect(rt, "c")
   event(rt, "c", "inc", 1)
   let assert transport.SendError(reason: "event received before join") = next(s)
@@ -181,7 +182,7 @@ pub fn event_before_join_is_rejected_and_not_applied_test() {
 }
 
 pub fn batch_before_join_is_rejected_test() {
-  let assert Ok(rt) = runtime.start(config())
+  let assert Ok(rt) = runtime.start(config(), test_ctx.root())
   let s = connect(rt, "c")
   process.send(
     rt,
@@ -195,7 +196,8 @@ pub fn batch_before_join_is_rejected_test() {
 
 pub fn navigation_before_join_is_rejected_test() {
   let proof = process.new_subject()
-  let assert Ok(rt) = runtime.start(route_config(proof))
+  let assert Ok(rt) = runtime.start(route_config(proof), test_ctx.root())
+  let assert Ok("/") = process.receive(proof, 1000)
   let s = connect(rt, "c")
   process.send(rt, runtime.ClientNavigated(conn_id: "c", path: "/a"))
   let assert transport.SendError(reason: "navigation received before join") =
@@ -204,14 +206,14 @@ pub fn navigation_before_join_is_rejected_test() {
 }
 
 pub fn sync_before_join_is_rejected_test() {
-  let assert Ok(rt) = runtime.start(config())
+  let assert Ok(rt) = runtime.start(config(), test_ctx.root())
   let s = connect(rt, "c")
   let assert transport.SendError(reason: "sync request received before join") =
     barrier(rt, "c", s)
 }
 
 pub fn join_from_unregistered_connection_does_not_join_test() {
-  let assert Ok(rt) = runtime.start(config())
+  let assert Ok(rt) = runtime.start(config(), test_ctx.root())
   process.send(rt, runtime.ClientJoined(conn_id: "ghost", token: "", path: ""))
   let s = connect(rt, "ghost")
   event(rt, "ghost", "inc", 1)
@@ -219,7 +221,7 @@ pub fn join_from_unregistered_connection_does_not_join_test() {
 }
 
 pub fn reregistered_connection_must_join_again_test() {
-  let assert Ok(rt) = runtime.start(config())
+  let assert Ok(rt) = runtime.start(config(), test_ctx.root())
   let s1 = join(rt, "c", "")
   let assert transport.SendModelSync(..) = next(s1)
   let s2 = connect(rt, "c")
@@ -235,11 +237,9 @@ pub fn rejoin_is_full_resync_and_never_resets_state_test() {
   let cfg =
     runtime.RuntimeConfig(
       ..config(),
-      deserialize_model: Some(fn(_json) {
-        Ok(Model(count: 99, blob: "", path: ""))
-      }),
+      restore_model: Some(fn(_json) { Ok(Model(count: 99, blob: "", path: "")) }),
     )
-  let assert Ok(rt) = runtime.start(cfg)
+  let assert Ok(rt) = runtime.start(cfg, test_ctx.root())
   let s = join(rt, "c", "")
   let assert transport.SendModelSync(version: 0, ack_clock: 0, ..) = next(s)
   event(rt, "c", "inc", 1)
@@ -267,7 +267,7 @@ pub fn rejoin_is_full_resync_and_never_resets_state_test() {
 // --- versioning ---
 
 pub fn unchanged_event_sends_ack_only_patch_test() {
-  let assert Ok(rt) = runtime.start(config())
+  let assert Ok(rt) = runtime.start(config(), test_ctx.root())
   let s = join(rt, "c", "")
   let assert transport.SendModelSync(version: 0, ..) = next(s)
   event(rt, "c", "noop", 1)
@@ -283,7 +283,7 @@ pub fn unchanged_event_sends_ack_only_patch_test() {
 }
 
 pub fn decode_failure_reports_error_then_acks_test() {
-  let assert Ok(rt) = runtime.start(config())
+  let assert Ok(rt) = runtime.start(config(), test_ctx.root())
   let s = join(rt, "c", "")
   let assert transport.SendModelSync(..) = next(s)
   event(rt, "c", "bogus", 4)
@@ -294,7 +294,7 @@ pub fn decode_failure_reports_error_then_acks_test() {
 }
 
 pub fn non_monotonic_clock_never_lowers_ack_test() {
-  let assert Ok(rt) = runtime.start(config())
+  let assert Ok(rt) = runtime.start(config(), test_ctx.root())
   let s = join(rt, "c", "")
   let assert transport.SendModelSync(..) = next(s)
   event(rt, "c", "inc", 5)
@@ -304,7 +304,7 @@ pub fn non_monotonic_clock_never_lowers_ack_test() {
 }
 
 pub fn revision_is_shared_and_acks_are_per_connection_test() {
-  let assert Ok(rt) = runtime.start(config())
+  let assert Ok(rt) = runtime.start(config(), test_ctx.root())
   let a = join(rt, "a", "")
   let assert transport.SendModelSync(version: 0, ..) = next(a)
   let b = join(rt, "b", "")
@@ -331,7 +331,7 @@ pub fn revision_is_shared_and_acks_are_per_connection_test() {
 
 pub fn navigation_bumps_revision_only_when_model_changes_test() {
   let proof = process.new_subject()
-  let assert Ok(rt) = runtime.start(route_config(proof))
+  let assert Ok(rt) = runtime.start(route_config(proof), test_ctx.root())
   let a = join(rt, "a", "/")
   let assert Ok("/") = process.receive(proof, 1000)
   let assert transport.SendModelSync(model_json: json, version: 0, ..) = next(a)
@@ -358,7 +358,7 @@ pub fn navigation_bumps_revision_only_when_model_changes_test() {
 
 pub fn join_does_not_rerun_route_handlers_for_same_route_test() {
   let proof = process.new_subject()
-  let assert Ok(rt) = runtime.start(route_config(proof))
+  let assert Ok(rt) = runtime.start(route_config(proof), test_ctx.root())
   let a = join(rt, "a", "/")
   let assert transport.SendModelSync(..) = next(a)
   let assert Ok("/") = process.receive(proof, 0)
@@ -383,7 +383,7 @@ pub fn join_does_not_rerun_route_handlers_for_same_route_test() {
 // --- model size limit ---
 
 pub fn model_over_limit_fails_loudly_and_resyncs_after_shrinking_test() {
-  let assert Ok(rt) = runtime.start(config())
+  let assert Ok(rt) = runtime.start(config(), test_ctx.root())
   let s = join(rt, "c", "")
   let assert transport.SendModelSync(version: 0, ..) = next(s)
 
@@ -413,17 +413,10 @@ pub fn model_over_limit_fails_loudly_and_resyncs_after_shrinking_test() {
   let assert transport.SendModelSync(version: 1, ack_clock: 0, ..) = next(late)
 }
 
-pub fn missing_model_encoder_is_reported_on_join_test() {
-  let assert Ok(rt) =
-    runtime.start(runtime.RuntimeConfig(..config(), serialize_model: None))
-  let s = join(rt, "c", "")
-  let assert transport.SendError(reason: "Model encoder missing") = next(s)
-}
-
 // --- batches ---
 
 pub fn batch_with_failing_last_event_still_broadcasts_test() {
-  let assert Ok(rt) = runtime.start(config())
+  let assert Ok(rt) = runtime.start(config(), test_ctx.root())
   let s = join(rt, "c", "")
   let assert transport.SendModelSync(..) = next(s)
   process.send(
@@ -441,7 +434,7 @@ pub fn batch_with_failing_last_event_still_broadcasts_test() {
 }
 
 pub fn unchanged_batch_sends_ack_only_patch_test() {
-  let assert Ok(rt) = runtime.start(config())
+  let assert Ok(rt) = runtime.start(config(), test_ctx.root())
   let s = join(rt, "c", "")
   let assert transport.SendModelSync(..) = next(s)
   process.send(
@@ -456,7 +449,7 @@ pub fn unchanged_batch_sends_ack_only_patch_test() {
 }
 
 pub fn empty_batch_sends_nothing_test() {
-  let assert Ok(rt) = runtime.start(config())
+  let assert Ok(rt) = runtime.start(config(), test_ctx.root())
   let s = join(rt, "c", "")
   let assert transport.SendModelSync(..) = next(s)
   process.send(rt, runtime.ClientEventBatchReceived(conn_id: "c", events: []))
@@ -466,7 +459,7 @@ pub fn empty_batch_sends_nothing_test() {
 // --- disconnect ---
 
 pub fn disconnect_removes_connection_from_broadcasts_test() {
-  let assert Ok(rt) = runtime.start(config())
+  let assert Ok(rt) = runtime.start(config(), test_ctx.root())
   let a = join(rt, "a", "")
   let assert transport.SendModelSync(..) = next(a)
   let b = join(rt, "b", "")
@@ -497,7 +490,7 @@ pub fn join_reconciles_dynamic_subscriptions_test() {
   let cfg =
     runtime.RuntimeConfig(
       ..config(),
-      deserialize_model: Some(fn(json) {
+      restore_model: Some(fn(json) {
         case json {
           "recovered" -> Ok(Model(count: 5, blob: "", path: ""))
           _ -> Error("unexpected model json")
@@ -510,7 +503,7 @@ pub fn join_reconciles_dynamic_subscriptions_test() {
       }),
       on_notify: Some(fn(_topic) { Noop }),
     )
-  let assert Ok(rt) = runtime.start(cfg)
+  let assert Ok(rt) = runtime.start(cfg, test_ctx.root())
   let token =
     runtime.create_state_token(
       Model(count: 5, blob: "", path: ""),
@@ -550,116 +543,28 @@ fn wait_until(condition: fn() -> Bool, attempts: Int) -> Bool {
   }
 }
 
-// --- substate codecs ---
+// --- snapshot diffs ---
 
-fn encode_n(m: Model) -> String {
-  "{\"n\":" <> int.to_string(m.count) <> "}"
-}
-
-fn encode_flat(m: Model) -> String {
-  "{\"path\":\"" <> m.path <> "\"}"
-}
-
-pub fn resolve_substate_codecs_rejects_missing_encoder_test() {
-  let assert Error(error.ConfigError(reason: reason)) =
-    runtime.resolve_substate_codecs(
-      Ok(["a", "b"]),
-      fn(name) {
-        case name {
-          "a" -> Ok(encode_n)
-          _ -> Error(Nil)
-        }
-      },
-      fn() { Ok(encode_flat) },
-    )
-  let assert True = string.contains(reason, "without encoders: b")
-}
-
-pub fn resolve_substate_codecs_rejects_missing_flat_encoder_test() {
-  let assert Error(error.ConfigError(reason: reason)) =
-    runtime.resolve_substate_codecs(Ok(["a"]), fn(_name) { Ok(encode_n) }, fn() {
-      Error(Nil)
-    })
-  let assert True = string.contains(reason, "encode_flat_fields")
-}
-
-pub fn resolve_substate_codecs_rejects_duplicate_names_test() {
-  let assert Error(error.ConfigError(..)) =
-    runtime.resolve_substate_codecs(
-      Ok(["a", "a"]),
-      fn(_name) { Ok(encode_n) },
-      fn() { Ok(encode_flat) },
-    )
-}
-
-pub fn resolve_substate_codecs_without_substates_test() {
-  let assert Ok(runtime.NoSubstates) =
-    runtime.resolve_substate_codecs(
-      Error(Nil),
-      fn(_name) { Ok(encode_n) },
-      fn() { Ok(encode_flat) },
-    )
-  let assert Ok(runtime.NoSubstates) =
-    runtime.resolve_substate_codecs(Ok([]), fn(_name) { Ok(encode_n) }, fn() {
-      Ok(encode_flat)
-    })
-}
-
-pub fn resolve_substate_codecs_keeps_declared_order_test() {
-  let assert Ok(runtime.Substates(encoders: encoders, ..)) =
-    runtime.resolve_substate_codecs(
-      Ok(["b", "a"]),
-      fn(_name) { Ok(encode_n) },
-      fn() { Ok(encode_flat) },
-    )
-  let assert ["b", "a"] = list.map(encoders, pair.first)
-}
-
-pub fn substate_diff_skips_unchanged_and_escapes_names_test() {
-  let codecs =
-    runtime.Substates(
-      encoders: [#("a/b~", encode_n), #("c", fn(_m: Model) { "{\"k\":1}" })],
-      flat: encode_flat,
-    )
-  let snap = fn(count, path) {
-    runtime.encode_snapshot(
-      model_json,
-      codecs,
-      Model(count: count, blob: "", path: path),
-    )
-  }
+pub fn snapshot_diff_of_equal_json_is_unchanged_test() {
+  let json = model_json(Model(0, "", "/"))
   let assert runtime.Unchanged =
-    runtime.diff_snapshot(snap(0, "/"), snap(0, "/"))
-
-  let assert runtime.Changed(ops) =
-    runtime.diff_snapshot(snap(0, "/"), snap(1, "/"))
-  let assert True = string.contains(ops, "\"/a~1b~0/n\"")
-  let assert False = string.contains(ops, "/c")
-  let assert False = string.contains(ops, "/path")
-
-  let assert runtime.Changed(both) =
-    runtime.diff_snapshot(snap(0, "/"), snap(1, "/x"))
-  let assert True = string.contains(both, "\"/a~1b~0/n\"")
-  let assert True = string.contains(both, "\"/path\"")
+    runtime.diff_snapshot(runtime.FullModelCache(json), json)
 }
 
-pub fn snapshot_diff_without_usable_cache_is_resync_test() {
-  let full =
-    runtime.encode_snapshot(model_json, runtime.NoSubstates, Model(0, "", ""))
-  let codecs =
-    runtime.Substates(encoders: [#("a", encode_n)], flat: encode_flat)
-  let sub = runtime.encode_snapshot(model_json, codecs, Model(0, "", ""))
-  let assert runtime.Resync = runtime.diff_snapshot(runtime.NoCache, full)
-  let assert runtime.Resync = runtime.diff_snapshot(runtime.NoCache, sub)
-  let assert runtime.Resync = runtime.diff_snapshot(full, sub)
-  let assert runtime.Resync = runtime.diff_snapshot(sub, full)
-  // Snapshots from different substate name sets are not diffable.
-  let other_codecs =
-    runtime.Substates(encoders: [#("b", encode_n)], flat: encode_flat)
-  let other =
-    runtime.encode_snapshot(model_json, other_codecs, Model(0, "", ""))
-  let assert runtime.Resync = runtime.diff_snapshot(sub, other)
-  let assert runtime.Unchanged = runtime.diff_snapshot(full, full)
+pub fn snapshot_diff_reports_only_changed_fields_test() {
+  let assert runtime.Changed(ops) =
+    runtime.diff_snapshot(
+      runtime.FullModelCache(model_json(Model(0, "", "/"))),
+      model_json(Model(1, "", "/")),
+    )
+  let assert True = string.contains(ops, "\"/count\"")
+  let assert False = string.contains(ops, "/path")
+  let assert False = string.contains(ops, "/blob")
+}
+
+pub fn snapshot_diff_without_cache_is_resync_test() {
+  let assert runtime.Resync =
+    runtime.diff_snapshot(runtime.NoCache, model_json(Model(0, "", "")))
 }
 
 // --- client replay of server frames (server and client versioning agree) ---
@@ -697,7 +602,7 @@ fn wire(message: transport.InternalMessage) -> String {
 /// barrier model_sync (model JSON and revision), which is not in the frames.
 fn record_session() -> #(List(String), String, Int) {
   let proof = process.new_subject()
-  let assert Ok(rt) = runtime.start(route_config(proof))
+  let assert Ok(rt) = runtime.start(route_config(proof), test_ctx.root())
   let a = join(rt, "a", "/")
   let assert Ok("/") = process.receive(proof, 1000)
   let f0 = next(a)
@@ -822,10 +727,14 @@ pub fn client_replay_of_server_frames_matches_final_sync_test() {
   let assert True = string.contains(output, "9 replayed frames")
 }
 
-/// The browser runtime itself (close codes, backoff, heartbeats, outbound
-/// pacing, server errors, revision handling) driven by a fake socket and
-/// clock. The harness exits non-zero on any failed scenario.
+/// The browser runtime itself (startup checks, the socket URL, close codes,
+/// backoff, heartbeats, outbound pacing, server errors, revision handling,
+/// event delegation with prevent-default, stop-propagation, debounce and
+/// throttle, decoder failures, submit form data, pre-hydration replay,
+/// `simple` prediction, the focused-input lock, autofocus and server navigation)
+/// driven by a fake socket, clock and DOM. The harness exits non-zero on any failed
+/// scenario.
 pub fn client_runtime_behaviour_harness_test() {
   let assert Ok(output) = run_node("beacon_client/test/ffi_harness.mjs", "")
-  let assert True = string.contains(output, "ffi harness ok: 11 scenarios")
+  let assert True = string.contains(output, "ffi harness ok: 30 scenarios")
 }

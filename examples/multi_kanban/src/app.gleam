@@ -1,208 +1,260 @@
-/// Multi-file Kanban — demonstrates external enum + record types from domain module.
-/// Card and Column types live in domains/board.gleam.
+/// Multi-file Kanban, demonstrating:
+/// - `beacon.simple` with model and message types from another module
+///   (`domains/board.gleam`): the build generates their codecs and compiles
+///   `update`, imports included, to JavaScript;
+/// - drag and drop on a simple app. `update` runs in the browser first, so a
+///   moved card lands instantly, and the server, which stays authoritative,
+///   runs the same `update`;
+/// - a throttled `dragover`: the default is still prevented on every event,
+///   so the column stays a drop target, but at most four messages a second
+///   reach `update`.
+///
+/// The board belongs to one session; see the `kanban` example for a board
+/// shared between sessions.
 import beacon
-import beacon/effect
+import beacon/attribute
+import beacon/element.{type Element}
+import beacon/event
 import beacon/html
 import beacon/log
 import domains/board
 import gleam/int
 import gleam/list
+import gleam/option.{type Option, None, Some}
 import gleam/string
 
 pub type Model {
-  Model(cards: List(board.Card), next_id: Int, input: String, dragging_id: Int)
-}
-
-pub type Msg {
-  SetInput(String)
-  AddCard
-  StartDrag(String)
-  DropOnColumn(String)
-  DragOverColumn
-  DeleteCard(Int)
-}
-
-pub fn init() -> #(Model, effect.Effect(Msg)) {
-  #(
-    Model(
-      cards: [
-        board.Card(id: 1, title: "Design API", column: board.Todo),
-        board.Card(id: 2, title: "Write tests", column: board.Doing),
-        board.Card(id: 3, title: "Build UI", column: board.Todo),
-      ],
-      next_id: 4,
-      input: "",
-      dragging_id: -1,
-    ),
-    effect.none(),
+  Model(
+    cards: List(board.Card),
+    next_id: Int,
+    draft: String,
+    dragging: Option(Int),
+    over: Option(board.Column),
   )
 }
 
-pub fn update(
-  model: Model,
-  _local: Nil,
-  _server: Nil,
-  msg: Msg,
-) -> #(Model, Nil, Nil) {
-  let model = case msg {
-    SetInput(text) -> Model(..model, input: text)
-    AddCard -> {
-      let title = string.trim(model.input)
-      case string.is_empty(title) {
-        True -> model
-        False -> {
-          let card =
-            board.Card(id: model.next_id, title: title, column: board.Todo)
-          Model(
-            ..model,
-            cards: list.append(model.cards, [card]),
-            next_id: model.next_id + 1,
-            input: "",
-          )
-        }
-      }
-    }
-    StartDrag(id_str) ->
-      case int.parse(id_str) {
-        Ok(id) -> Model(..model, dragging_id: id)
-        Error(_) -> {
-          log.warning("multi_kanban", "Invalid card id for drag: " <> id_str)
-          model
-        }
-      }
-    DropOnColumn(col_str) ->
-      case model.dragging_id >= 0 {
-        False -> model
-        True -> {
-          let col = column_from_string(col_str)
-          let new_cards =
-            list.map(model.cards, fn(c) {
-              case c.id == model.dragging_id {
-                True -> board.Card(..c, column: col)
-                False -> c
-              }
-            })
-          Model(..model, cards: new_cards, dragging_id: -1)
-        }
-      }
-    DragOverColumn -> model
+pub type Msg {
+  DraftChanged(String)
+  AddCard
+  DeleteCard(Int)
+  DragStart(Int)
+  DragOver(board.Column)
+  DropOn(board.Column)
+  DragEnd
+}
+
+const max_title_length = 100
+
+const columns = [board.Todo, board.Doing, board.Done]
+
+fn init(_ctx: beacon.Context) -> Model {
+  Model(
+    cards: [
+      board.Card(id: 1, title: "Design API", column: board.Todo),
+      board.Card(id: 2, title: "Write tests", column: board.Doing),
+      board.Card(id: 3, title: "Build UI", column: board.Todo),
+    ],
+    next_id: 4,
+    draft: "",
+    dragging: None,
+    over: None,
+  )
+}
+
+/// Runs in the browser and on the server, so it is pure apart from logging.
+pub fn update(model: Model, msg: Msg) -> Model {
+  case msg {
+    DraftChanged(text) -> Model(..model, draft: text)
+    AddCard -> add_card(model)
     DeleteCard(id) ->
       Model(
         ..model,
-        cards: list.filter(model.cards, fn(c) { c.id != id }),
-        dragging_id: -1,
+        cards: list.filter(model.cards, fn(card) { card.id != id }),
+      )
+    DragStart(id) -> Model(..model, dragging: Some(id), over: None)
+    DragOver(column) -> Model(..model, over: Some(column))
+    DropOn(column) ->
+      case model.dragging {
+        None -> {
+          log.warning(
+            "multi_kanban",
+            "Ignored a drop on " <> column_slug(column) <> " with no drag",
+          )
+          Model(..model, over: None)
+        }
+        Some(id) ->
+          Model(
+            ..model,
+            cards: list.map(model.cards, fn(card) {
+              case card.id == id {
+                True -> board.Card(..card, column:)
+                False -> card
+              }
+            }),
+            dragging: None,
+            over: None,
+          )
+      }
+    DragEnd -> Model(..model, dragging: None, over: None)
+  }
+}
+
+fn add_card(model: Model) -> Model {
+  let title = string.trim(model.draft)
+  case string.is_empty(title), string.length(title) > max_title_length {
+    True, _ -> model
+    _, True -> {
+      log.warning(
+        "multi_kanban",
+        "Rejected a card title of "
+          <> int.to_string(string.length(title))
+          <> " characters (max "
+          <> int.to_string(max_title_length)
+          <> ")",
+      )
+      model
+    }
+    False, False ->
+      Model(
+        ..model,
+        cards: list.append(model.cards, [
+          board.Card(id: model.next_id, title:, column: board.Todo),
+        ]),
+        next_id: model.next_id + 1,
+        draft: "",
       )
   }
-  #(model, Nil, Nil)
 }
 
-fn column_from_string(s: String) -> board.Column {
-  case s {
-    "doing" -> board.Doing
-    "done" -> board.Done
-    _ -> board.Todo
-  }
-}
-
-fn column_to_string(c: board.Column) -> String {
-  case c {
+fn column_slug(column: board.Column) -> String {
+  case column {
     board.Todo -> "todo"
     board.Doing -> "doing"
     board.Done -> "done"
   }
 }
 
-fn column_label(c: board.Column) -> String {
-  case c {
+fn column_label(column: board.Column) -> String {
+  case column {
     board.Todo -> "Todo"
     board.Doing -> "In Progress"
     board.Done -> "Done"
   }
 }
 
-fn column_color(c: board.Column) -> String {
-  case c {
+fn column_colour(column: board.Column) -> String {
+  case column {
     board.Todo -> "#e3f2fd"
     board.Doing -> "#fff3e0"
     board.Done -> "#e8f5e9"
   }
 }
 
-pub fn view(model: Model, _local: Nil) -> beacon.Node(Msg) {
+pub fn view(model: Model) -> Element(Msg) {
   html.div(
     [
-      html.style(
-        "font-family:system-ui;max-width:900px;margin:2rem auto;padding:0 1rem",
-      ),
+      attribute.styles([
+        #("font-family", "system-ui"),
+        #("max-width", "900px"),
+        #("margin", "2rem auto"),
+        #("padding", "0 1rem"),
+      ]),
     ],
     [
       html.h1([], [html.text("Multi-File Kanban")]),
-      html.p([html.style("color:#666;margin-bottom:1rem")], [
-        html.text(
-          "Drag cards between columns. Card/Column types from domains/board.gleam",
-        ),
-      ]),
-      // Add card form
-      html.div([html.style("display:flex;gap:8px;margin-bottom:1.5rem")], [
-        html.input([
-          html.type_("text"),
-          html.placeholder("New card..."),
-          html.value(model.input),
-          beacon.on_input(SetInput),
-          html.style(
-            "flex:1;padding:10px;border:1px solid #ddd;border-radius:6px",
+      html.p(
+        [attribute.styles([#("color", "#666"), #("margin-bottom", "1rem")])],
+        [
+          html.text(
+            "Drag cards between columns. The Card and Column types come from domains/board.gleam.",
           ),
-        ]),
-        html.button(
-          [
-            beacon.on_click(AddCard),
-            html.style(
-              "padding:10px 20px;background:#4CAF50;color:white;border:none;border-radius:6px;cursor:pointer",
-            ),
-          ],
-          [html.text("Add Card")],
-        ),
-      ]),
-      // Columns
+        ],
+      ),
+      html.form(
+        [
+          event.on_submit(fn(_fields) { AddCard }),
+          attribute.styles([
+            #("display", "flex"),
+            #("gap", "8px"),
+            #("margin-bottom", "1.5rem"),
+          ]),
+        ],
+        [
+          html.input([
+            attribute.type_("text"),
+            attribute.placeholder("New card..."),
+            attribute.aria("label", "New card title"),
+            attribute.value(model.draft),
+            event.on_input(DraftChanged),
+            attribute.styles([
+              #("flex", "1"),
+              #("padding", "10px"),
+              #("border", "1px solid #ddd"),
+              #("border-radius", "6px"),
+            ]),
+          ]),
+          html.button(
+            [
+              attribute.type_("submit"),
+              attribute.styles([
+                #("padding", "10px 20px"),
+                #("background", "#4CAF50"),
+                #("color", "white"),
+                #("border", "none"),
+                #("border-radius", "6px"),
+                #("cursor", "pointer"),
+              ]),
+            ],
+            [html.text("Add Card")],
+          ),
+        ],
+      ),
       html.div(
         [
-          html.style(
-            "display:grid;grid-template-columns:repeat(3,1fr);gap:1rem",
-          ),
+          attribute.styles([
+            #("display", "grid"),
+            #("grid-template-columns", "repeat(3,1fr)"),
+            #("gap", "1rem"),
+          ]),
         ],
-        [
-          render_column(model, board.Todo),
-          render_column(model, board.Doing),
-          render_column(model, board.Done),
-        ],
+        list.map(columns, fn(column) { render_column(model, column) }),
       ),
     ],
   )
 }
 
-fn render_column(model: Model, col: board.Column) -> beacon.Node(Msg) {
-  let cards = list.filter(model.cards, fn(c) { c.column == col })
-  let col_str = column_to_string(col)
+fn render_column(model: Model, column: board.Column) -> Element(Msg) {
+  let cards = list.filter(model.cards, fn(card) { card.column == column })
+  let outline = case model.dragging, model.over == Some(column) {
+    Some(_), True -> "2px dashed #2196F3"
+    _, _ -> "2px solid transparent"
+  }
   html.div(
     [
-      html.style(
-        "background:"
-        <> column_color(col)
-        <> ";border-radius:12px;padding:1rem;min-height:200px",
-      ),
-      beacon.on_dragover(DragOverColumn),
-      beacon.on_drop(fn(_) { DropOnColumn(col_str) }),
+      event.on_drag_over(DragOver(column)) |> event.throttle(250),
+      event.on_drop(DropOn(column)),
+      attribute.data("column", column_slug(column)),
+      attribute.styles([
+        #("background", column_colour(column)),
+        #("border-radius", "12px"),
+        #("padding", "1rem"),
+        #("min-height", "200px"),
+        #("outline", outline),
+      ]),
     ],
     [
       html.h3(
         [
-          html.style(
-            "margin:0 0 1rem;color:#555;font-size:0.9rem;text-transform:uppercase",
-          ),
+          attribute.styles([
+            #("margin", "0 0 1rem"),
+            #("color", "#555"),
+            #("font-size", "0.9rem"),
+            #("text-transform", "uppercase"),
+          ]),
         ],
         [
           html.text(
-            column_label(col)
+            column_label(column)
             <> " ("
             <> int.to_string(list.length(cards))
             <> ")",
@@ -210,29 +262,58 @@ fn render_column(model: Model, col: board.Column) -> beacon.Node(Msg) {
         ],
       ),
       html.div(
-        [html.style("display:flex;flex-direction:column;gap:8px")],
-        list.map(cards, render_card),
+        [
+          attribute.styles([
+            #("display", "flex"),
+            #("flex-direction", "column"),
+            #("gap", "8px"),
+          ]),
+        ],
+        list.map(cards, fn(card) {
+          element.keyed(
+            int.to_string(card.id),
+            render_card(card, model.dragging == Some(card.id)),
+          )
+        }),
       ),
     ],
   )
 }
 
-fn render_card(card: board.Card) -> beacon.Node(Msg) {
+fn render_card(card: board.Card, is_dragging: Bool) -> Element(Msg) {
+  let opacity = case is_dragging {
+    True -> "0.4"
+    False -> "1"
+  }
   html.div(
     [
-      html.attribute("draggable", "true"),
-      beacon.on_dragstart(StartDrag),
-      html.attribute("data-drag-id", int.to_string(card.id)),
-      html.style(
-        "background:white;padding:12px;border-radius:8px;border:1px solid #e0e0e0;cursor:grab;display:flex;justify-content:space-between",
-      ),
+      attribute.draggable(True),
+      attribute.data("card", int.to_string(card.id)),
+      event.on_drag_start(DragStart(card.id)),
+      event.on_drag_end(DragEnd),
+      attribute.styles([
+        #("background", "white"),
+        #("padding", "12px"),
+        #("border-radius", "8px"),
+        #("border", "1px solid #e0e0e0"),
+        #("cursor", "grab"),
+        #("display", "flex"),
+        #("justify-content", "space-between"),
+        #("opacity", opacity),
+      ]),
     ],
     [
       html.span([], [html.text(card.title)]),
       html.button(
         [
-          beacon.on_click(DeleteCard(card.id)),
-          html.style("background:none;border:none;color:#bbb;cursor:pointer"),
+          event.on_click(DeleteCard(card.id)),
+          attribute.aria("label", "Delete " <> card.title),
+          attribute.styles([
+            #("background", "none"),
+            #("border", "none"),
+            #("color", "#bbb"),
+            #("cursor", "pointer"),
+          ]),
         ],
         [html.text("x")],
       ),
@@ -241,7 +322,7 @@ fn render_card(card: board.Card) -> beacon.Node(Msg) {
 }
 
 pub fn main() {
-  beacon.app(init, beacon.no_local, beacon.no_server, update, view)
-  |> beacon.title("Multi-File Kanban")
+  beacon.simple(init:, update:, view:)
+  |> beacon.title(fn(_model) { "Multi-File Kanban" })
   |> beacon.start(8080)
 }

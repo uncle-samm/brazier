@@ -1,10 +1,17 @@
-/// Pong — demonstrates:
-/// - pure update with on_update for the server-side game loop
-/// - effect.background for scheduled ticks
-/// - All game logic runs on the server
+/// Pong, demonstrating:
+/// - `beacon.application`: every message runs on the server, and the browser
+///   only renders;
+/// - a game loop of keyed `effect.after` timers. Each tick schedules the next
+///   one while the game runs, so pausing stops the loop. The key makes the
+///   timer single-flight: a Start inside a pending tick's window replaces
+///   that tick instead of running a second loop.
 import beacon
-import beacon/effect
+import beacon/attribute
+import beacon/effect.{type Effect}
+import beacon/element.{type Element}
+import beacon/event
 import beacon/html
+import beacon/log
 import gleam/int
 
 const width = 600
@@ -18,6 +25,11 @@ const paddle_w = 10
 const paddle_speed = 8
 
 const ball_size = 10
+
+/// About 60 frames a second.
+const tick_ms = 16
+
+const tick_key = "pong_tick"
 
 pub type Model {
   Model(
@@ -43,7 +55,7 @@ pub type Msg {
   PauseGame
 }
 
-pub fn init() -> #(Model, effect.Effect(Msg)) {
+fn init(_ctx: beacon.Context) -> #(Model, Effect(Msg)) {
   #(
     Model(
       left_y: height / 2,
@@ -60,68 +72,77 @@ pub fn init() -> #(Model, effect.Effect(Msg)) {
   )
 }
 
-pub fn update(
-  model: Model,
-  _local: Nil,
-  _server: Nil,
-  msg: Msg,
-) -> #(Model, Nil, Nil) {
-  let model = case msg {
-    LeftUp ->
-      Model(..model, left_y: int.max(paddle_h / 2, model.left_y - paddle_speed))
-    LeftDown ->
+fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
+  case msg {
+    LeftUp -> #(
+      Model(..model, left_y: int.max(paddle_h / 2, model.left_y - paddle_speed)),
+      effect.none(),
+    )
+    LeftDown -> #(
       Model(
         ..model,
         left_y: int.min(height - paddle_h / 2, model.left_y + paddle_speed),
-      )
-    RightUp ->
+      ),
+      effect.none(),
+    )
+    RightUp -> #(
       Model(
         ..model,
         right_y: int.max(paddle_h / 2, model.right_y - paddle_speed),
-      )
-    RightDown ->
+      ),
+      effect.none(),
+    )
+    RightDown -> #(
       Model(
         ..model,
         right_y: int.min(height - paddle_h / 2, model.right_y + paddle_speed),
-      )
-    StartGame -> {
-      Model(
-        ..model,
-        running: True,
-        ball_x: width / 2,
-        ball_y: height / 2,
-        ball_dx: 4,
-        ball_dy: 2,
-      )
-    }
-    PauseGame -> Model(..model, running: False)
+      ),
+      effect.none(),
+    )
+    StartGame ->
+      case model.running {
+        True -> {
+          log.warning("pong", "Ignored a Start while the game is running")
+          #(model, effect.none())
+        }
+        False -> {
+          log.info("pong", "Game started")
+          #(
+            Model(
+              ..model,
+              running: True,
+              ball_x: width / 2,
+              ball_y: height / 2,
+              ball_dx: 4,
+              ball_dy: 2,
+            ),
+            next_tick(),
+          )
+        }
+      }
+    PauseGame ->
+      case model.running {
+        True -> {
+          log.info("pong", "Game paused")
+          // The pending tick arrives while paused and schedules no other.
+          #(Model(..model, running: False), effect.none())
+        }
+        False -> {
+          log.warning("pong", "Ignored a Pause while the game is paused")
+          #(model, effect.none())
+        }
+      }
     Tick ->
       case model.running {
-        False -> model
-        True -> advance_ball(model)
+        True -> #(advance_ball(model), next_tick())
+        // The tick scheduled before a pause.
+        False -> #(model, effect.none())
       }
-  }
-  #(model, Nil, Nil)
-}
-
-fn after_update(state: #(Model, Nil, Nil), msg: Msg) -> effect.Effect(Msg) {
-  let model = state.0
-  case msg {
-    StartGame -> tick_effect()
-    Tick ->
-      case model.running {
-        True -> tick_effect()
-        False -> effect.none()
-      }
-    _ -> effect.none()
   }
 }
 
-fn tick_effect() -> effect.Effect(Msg) {
-  effect.background(fn(dispatch) {
-    sleep(16)
-    dispatch(Tick)
-  })
+fn next_tick() -> Effect(Msg) {
+  effect.keyed(tick_key, effect.after(tick_ms, fn() { Tick }))
 }
 
 fn advance_ball(model: Model) -> Model {
@@ -149,7 +170,8 @@ fn advance_ball(model: Model) -> Model {
     False -> #(dx, nx)
   }
   case nx {
-    x if x <= 0 ->
+    x if x <= 0 -> {
+      log.info("pong", "P2 scored")
       Model(
         ..model,
         right_score: model.right_score + 1,
@@ -158,7 +180,9 @@ fn advance_ball(model: Model) -> Model {
         ball_dx: 4,
         ball_dy: 2,
       )
-    x if x >= width ->
+    }
+    x if x >= width -> {
+      log.info("pong", "P1 scored")
       Model(
         ..model,
         left_score: model.left_score + 1,
@@ -167,117 +191,139 @@ fn advance_ball(model: Model) -> Model {
         ball_dx: -4,
         ball_dy: 2,
       )
+    }
     _ -> Model(..model, ball_x: nx, ball_y: new_y, ball_dx: dx, ball_dy: new_dy)
   }
 }
 
-@external(erlang, "timer", "sleep")
-fn sleep(ms: Int) -> Nil
-
-pub fn view(model: Model, _local: Nil) -> beacon.Node(Msg) {
-  html.div([html.class("pong-game")], [
-    html.h1([], [html.text("Beacon Pong")]),
-    html.div([html.class("pong-score")], [
-      html.text(
-        int.to_string(model.left_score)
-        <> " - "
-        <> int.to_string(model.right_score),
+pub fn view(model: Model) -> Element(Msg) {
+  html.div(
+    [
+      attribute.class("pong-game"),
+      attribute.styles([
+        #("font-family", "system-ui"),
+        #("text-align", "center"),
+      ]),
+    ],
+    [
+      html.h1([], [html.text("Beacon Pong")]),
+      html.div(
+        [
+          attribute.class("pong-score"),
+          attribute.styles([#("font-size", "2rem"), #("margin", "0.5rem")]),
+        ],
+        [
+          html.text(
+            int.to_string(model.left_score)
+            <> " - "
+            <> int.to_string(model.right_score),
+          ),
+        ],
       ),
-    ]),
-    html.div(
-      [
-        html.style(
-          "position:relative;width:"
-          <> int.to_string(width)
-          <> "px;height:"
-          <> int.to_string(height)
-          <> "px;background:#111;margin:0 auto;overflow:hidden",
-        ),
-      ],
-      [
-        rect(0, model.left_y - paddle_h / 2, paddle_w, paddle_h, "#4ecdc4"),
-        rect(
-          width - paddle_w,
-          model.right_y - paddle_h / 2,
-          paddle_w,
-          paddle_h,
-          "#ff6b6b",
-        ),
-        ball_rect(
-          model.ball_x - ball_size / 2,
-          model.ball_y - ball_size / 2,
-          ball_size,
-          ball_size,
-        ),
-      ],
-    ),
-    html.div([html.class("pong-controls")], [
-      html.div([], [
-        html.strong([], [html.text("P1")]),
-        html.button([beacon.on_click(LeftUp)], [html.text("Up")]),
-        html.button([beacon.on_click(LeftDown)], [html.text("Down")]),
+      html.div(
+        [
+          attribute.styles([
+            #("position", "relative"),
+            #("width", px(width)),
+            #("height", px(height)),
+            #("background", "#111"),
+            #("margin", "0 auto"),
+            #("overflow", "hidden"),
+          ]),
+        ],
+        [
+          block(
+            [],
+            0,
+            model.left_y - paddle_h / 2,
+            paddle_w,
+            paddle_h,
+            "#4ecdc4",
+          ),
+          block(
+            [],
+            width - paddle_w,
+            model.right_y - paddle_h / 2,
+            paddle_w,
+            paddle_h,
+            "#ff6b6b",
+          ),
+          block(
+            [attribute.data("testid", "pong-ball")],
+            model.ball_x - ball_size / 2,
+            model.ball_y - ball_size / 2,
+            ball_size,
+            ball_size,
+            "#fff",
+          ),
+        ],
+      ),
+      html.div(
+        [
+          attribute.class("pong-controls"),
+          attribute.styles([
+            #("display", "flex"),
+            #("justify-content", "space-between"),
+            #("width", px(width)),
+            #("margin", "1rem auto"),
+          ]),
+        ],
+        [
+          html.div([], [
+            html.strong([], [html.text("P1 ")]),
+            html.button([event.on_click(LeftUp)], [html.text("Up")]),
+            html.button([event.on_click(LeftDown)], [html.text("Down")]),
+          ]),
+          html.div([], [
+            case model.running {
+              True ->
+                html.button([event.on_click(PauseGame)], [html.text("Pause")])
+              False ->
+                html.button([event.on_click(StartGame)], [html.text("Start")])
+            },
+          ]),
+          html.div([], [
+            html.strong([], [html.text("P2 ")]),
+            html.button([event.on_click(RightUp)], [html.text("Up")]),
+            html.button([event.on_click(RightDown)], [html.text("Down")]),
+          ]),
+        ],
+      ),
+      html.p([], [html.text("All game logic runs on the server.")]),
+    ],
+  )
+}
+
+fn block(
+  attributes: List(attribute.Attribute(Msg)),
+  x: Int,
+  y: Int,
+  w: Int,
+  h: Int,
+  colour: String,
+) -> Element(Msg) {
+  html.div(
+    [
+      attribute.styles([
+        #("position", "absolute"),
+        #("left", px(x)),
+        #("top", px(y)),
+        #("width", px(w)),
+        #("height", px(h)),
+        #("background", colour),
       ]),
-      html.div([], [
-        case model.running {
-          True ->
-            html.button([beacon.on_click(PauseGame)], [html.text("Pause")])
-          False ->
-            html.button([beacon.on_click(StartGame)], [html.text("Start")])
-        },
-      ]),
-      html.div([], [
-        html.strong([], [html.text("P2")]),
-        html.button([beacon.on_click(RightUp)], [html.text("Up")]),
-        html.button([beacon.on_click(RightDown)], [html.text("Down")]),
-      ]),
-    ]),
-    html.p([], [html.text("All game logic runs on the server.")]),
-  ])
+      ..attributes
+    ],
+    [],
+  )
+}
+
+fn px(value: Int) -> String {
+  int.to_string(value) <> "px"
 }
 
 pub fn main() {
-  beacon.app(init, beacon.no_local, beacon.no_server, update, view)
-  |> beacon.title("Beacon Pong")
-  |> beacon.on_update(after_update)
+  beacon.application(init:, update:, view:)
+  |> beacon.title(fn(_model) { "Beacon Pong" })
   |> beacon.start(8080)
-}
-
-fn rect(x: Int, y: Int, w: Int, h: Int, color: String) -> beacon.Node(Msg) {
-  html.div(
-    [
-      html.style(
-        "position:absolute;left:"
-        <> int.to_string(x)
-        <> "px;top:"
-        <> int.to_string(y)
-        <> "px;width:"
-        <> int.to_string(w)
-        <> "px;height:"
-        <> int.to_string(h)
-        <> "px;background:"
-        <> color,
-      ),
-    ],
-    [],
-  )
-}
-
-fn ball_rect(x: Int, y: Int, w: Int, h: Int) -> beacon.Node(Msg) {
-  html.div(
-    [
-      html.attribute("data-testid", "pong-ball"),
-      html.style(
-        "position:absolute;left:"
-        <> int.to_string(x)
-        <> "px;top:"
-        <> int.to_string(y)
-        <> "px;width:"
-        <> int.to_string(w)
-        <> "px;height:"
-        <> int.to_string(h)
-        <> "px;background:#fff",
-      ),
-    ],
-    [],
-  )
 }
