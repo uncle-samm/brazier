@@ -115,12 +115,22 @@ pub type RuntimeMessage(msg) {
   /// for none) and `session_fingerprint` identifies the browser session the
   /// connection belongs to (see `ssr.session_fingerprint`); the token only
   /// verifies for the session it was issued to.
+  ///
+  /// A token that does not verify, a token model that does not restore,
+  /// and a missing token while state recovery is enabled refuse the join:
+  /// the connection gets an `error` frame and stays unjoined.
   ClientJoinedWithSession(
     conn_id: transport.ConnectionId,
     token: String,
     path: String,
     session_fingerprint: String,
   )
+  /// A join on the connection of a runtime started by
+  /// `start_and_connect_with_request`. Its join token was read from the
+  /// upgrade request's cookie and checked before the runtime started (a
+  /// bad one refused the connection), and a recovered model is already in
+  /// place, so the join uses no token.
+  ClientJoinedVerified(conn_id: transport.ConnectionId, path: String)
   /// A client event was received — decode to user message and run update.
   ClientEventReceived(
     conn_id: transport.ConnectionId,
@@ -275,20 +285,40 @@ pub fn start(
     "beacon.runtime",
     "Starting a runtime outside the transport for " <> context.uri(ctx).path,
   )
-  start_for(config, ctx, no_connection)
+  start_for(config, ctx, no_connection, None)
 }
 
 /// The `connection_id` telemetry label of work no connection caused (an
 /// effect's message, a runtime started outside the transport).
 const no_connection = "none"
 
-/// `start`, with the connection the mount span is reported for.
+/// State recovery signs and verifies join tokens with the secret key, so
+/// an empty key with recovery enabled is a configuration error: every
+/// join would be refused.
+fn check_recovery_config(
+  config: RuntimeConfig(model, msg),
+) -> Result(Nil, error.BeaconError) {
+  case config.restore_model, config.secret_key {
+    Some(_), "" -> {
+      let reason =
+        "state recovery is enabled but the secret key is empty, so no join token can verify"
+      log.error("beacon.runtime", "Refusing to start a runtime: " <> reason)
+      Error(error.ConfigError(reason: reason))
+    }
+    _, _ -> Ok(Nil)
+  }
+}
+
+/// `start`, with the connection the mount span is reported for and the
+/// model recovered from the connection's join token, if any.
 fn start_for(
   config: RuntimeConfig(model, msg),
   ctx: Context,
   connection_id: String,
+  recovered: Option(model),
 ) -> Result(Subject(RuntimeMessage(msg)), error.BeaconError) {
   let page_uri = context.uri(ctx)
+  use Nil <- result.try(check_recovery_config(config))
   case uri_check.check(page_uri) {
     Error(reason) -> {
       log.error(
@@ -306,7 +336,7 @@ fn start_for(
         transport.page_route,
         "mount",
         connection_id,
-        fn() { start_actor(config, ctx, page_uri, connection_id) },
+        fn() { start_actor(config, ctx, page_uri, connection_id, recovered) },
       )
   }
 }
@@ -325,9 +355,25 @@ fn start_actor(
   ctx: Context,
   page_uri: Uri,
   connection_id: String,
+  recovered: Option(model),
 ) -> Result(Subject(RuntimeMessage(msg)), error.BeaconError) {
   let started_at = monotonic_time()
   use mounted <- result.try(mount(config, ctx, page_uri, connection_id))
+  // `init` and the initial route still run (their effects and route
+  // message stand); the recovered model replaces the state they built,
+  // before presence, subscriptions and effect messages first see it.
+  let mounted = case recovered {
+    None -> mounted
+    Some(model) -> {
+      log.info(
+        "beacon.runtime",
+        "Starting connection "
+          <> connection_id
+          <> " from the model recovered from its join token",
+      )
+      Mounted(..mounted, model: model)
+    }
+  }
   spawn_actor(config, mounted, page_uri, started_at, connection_id)
 }
 
@@ -710,16 +756,23 @@ fn handle_message(
     }
 
     ClientJoined(conn_id, token, path) ->
-      actor.continue(handle_join(state, conn_id, token, path, ""))
+      actor.continue(handle_join(
+        state,
+        conn_id,
+        VerifyAtJoin(token: token, session_fingerprint: ""),
+        path,
+      ))
 
     ClientJoinedWithSession(conn_id, token, path, session_fingerprint) ->
       actor.continue(handle_join(
         state,
         conn_id,
-        token,
+        VerifyAtJoin(token: token, session_fingerprint: session_fingerprint),
         path,
-        session_fingerprint,
       ))
+
+    ClientJoinedVerified(conn_id, path) ->
+      actor.continue(handle_join(state, conn_id, VerifiedAtStart, path))
 
     ClientEventReceived(
       conn_id,
@@ -915,11 +968,34 @@ fn reject_before_join(
   state
 }
 
+/// How a join's token is checked.
+type JoinToken {
+  /// Verify `token` at the join: a runtime started without the upgrade
+  /// request (`start`, `start_and_connect`), where the join message
+  /// carries the token.
+  VerifyAtJoin(token: String, session_fingerprint: String)
+  /// The token came from the upgrade request's cookie and was checked
+  /// before the runtime started (`start_and_connect_with_request`).
+  VerifiedAtStart
+}
+
+/// The HTTP status of a connection refused for its join token. The socket
+/// closes with 4400 (`error.init_close_code`), and the browser reloads the
+/// page, whose server render issues a fresh token.
+///
+/// Reference: LiveView answers a join whose session token does not verify
+/// with a "stale" or "unauthorized" join error, and its client reloads the
+/// page (knowledge of `Phoenix.LiveView.Channel` and the JS client, not
+/// code read here).
+pub const join_token_refused_status = 400
+
 /// Join (or rejoin) a connection.
 ///
-/// - First join of the runtime: the join token is verified (signature,
-///   purpose, expiry, session binding) and, when it carries a model and a
-///   deserializer is configured, the model is recovered from it.
+/// - First join of a connection: its join token is checked (see
+///   `check_join_token`). A token that fails the check refuses the join
+///   loudly: the refusal is logged, the connection gets an `error` frame
+///   ("join refused") and stays unjoined. The session never continues with
+///   the server model in place of a token it could not use.
 /// - Repeated join on an already-joined connection: an explicit, logged
 ///   rejoin. The token is not used; the connection gets a full model_sync.
 /// - `on_change` runs only when the joined path's route message differs
@@ -929,9 +1005,8 @@ fn reject_before_join(
 fn handle_join(
   state: RuntimeState(model, msg),
   conn_id: transport.ConnectionId,
-  token: String,
+  join_token: JoinToken,
   path: String,
-  session_fingerprint: String,
 ) -> RuntimeState(model, msg) {
   case dict.has_key(state.connections, conn_id) {
     False -> {
@@ -942,7 +1017,7 @@ fn handle_join(
       state
     }
     True -> {
-      let state = case set.contains(state.joined, conn_id) {
+      let checked = case set.contains(state.joined, conn_id) {
         True -> {
           log.info(
             "beacon.runtime",
@@ -952,126 +1027,183 @@ fn handle_join(
               <> path
               <> " — full resync, join token not used",
           )
-          RuntimeState(..state, joined: set.delete(state.joined, conn_id))
+          Ok(RuntimeState(..state, joined: set.delete(state.joined, conn_id)))
         }
         False -> {
           log.info(
             "beacon.runtime",
             "Client joined: " <> conn_id <> " path: " <> path,
           )
-          recover_from_join_token(state, conn_id, token, session_fingerprint)
+          recover_at_join(state, conn_id, join_token)
         }
       }
-      // Route changes are broadcast to the OTHER joined connections; the
-      // joiner is not joined yet and gets the result in its model_sync.
-      let state = route_join(state, conn_id, path)
-      // If the cache is unusable, the other joined connections may be stale
-      // too: resync everyone, not just the joiner.
-      let stale_others = case state.cached_model {
-        NoCache -> set.to_list(state.joined)
-        _ -> []
+      case checked {
+        Error(reason) -> {
+          log.warning(
+            "beacon.runtime",
+            "Join from " <> conn_id <> " refused: " <> reason,
+          )
+          send_to_conn_id(
+            state,
+            conn_id,
+            transport.SendError(reason: join_refused_reason),
+          )
+          state
+        }
+        Ok(state) -> accept_join(state, conn_id, path)
       }
-      let state =
-        RuntimeState(
-          ..state,
-          joined: set.insert(state.joined, conn_id),
-          accepted_first_join: True,
-          client_acks: case dict.has_key(state.client_acks, conn_id) {
-            True -> state.client_acks
-            False -> dict.insert(state.client_acks, conn_id, 0)
-          },
-        )
-      let state =
-        send_model_sync_to(state, [conn_id, ..stale_others], "join_model_sync")
-      reconcile_subscriptions(state)
     }
   }
 }
 
-/// Verify the join token and recover the model from it when allowed.
-/// Every failure is logged and the join proceeds with the server model.
-fn recover_from_join_token(
+/// The `error` frame reason of a join refused for its token. The cause is
+/// only logged.
+const join_refused_reason = "join refused"
+
+fn accept_join(
   state: RuntimeState(model, msg),
   conn_id: transport.ConnectionId,
+  path: String,
+) -> RuntimeState(model, msg) {
+  // Route changes are broadcast to the OTHER joined connections; the
+  // joiner is not joined yet and gets the result in its model_sync.
+  let state = route_join(state, conn_id, path)
+  // If the cache is unusable, the other joined connections may be stale
+  // too: resync everyone, not just the joiner.
+  let stale_others = case state.cached_model {
+    NoCache -> set.to_list(state.joined)
+    _ -> []
+  }
+  let state =
+    RuntimeState(
+      ..state,
+      joined: set.insert(state.joined, conn_id),
+      accepted_first_join: True,
+      client_acks: case dict.has_key(state.client_acks, conn_id) {
+        True -> state.client_acks
+        False -> dict.insert(state.client_acks, conn_id, 0)
+      },
+    )
+  let state =
+    send_model_sync_to(state, [conn_id, ..stale_others], "join_model_sync")
+  reconcile_subscriptions(state)
+}
+
+/// Check the token of a connection's first join and, on the runtime's
+/// first join, put the model it recovers in place.
+fn recover_at_join(
+  state: RuntimeState(model, msg),
+  conn_id: transport.ConnectionId,
+  join_token: JoinToken,
+) -> Result(RuntimeState(model, msg), String) {
+  case join_token {
+    VerifiedAtStart -> {
+      log.debug(
+        "beacon.runtime",
+        "Join token of " <> conn_id <> " was checked when its runtime started",
+      )
+      Ok(state)
+    }
+    VerifyAtJoin(token, session_fingerprint) -> {
+      let restore = case state.accepted_first_join {
+        // A second connection joining a live runtime must not replace the
+        // model the first one is looking at; its token is still checked.
+        True -> None
+        False -> state.restore_model
+      }
+      use recovered <- result.map(check_join_token(
+        restore,
+        option.is_some(state.restore_model),
+        state.secret_key,
+        token,
+        session_fingerprint,
+        conn_id,
+      ))
+      case recovered {
+        Some(model) -> RuntimeState(..state, model: model)
+        None -> state
+      }
+    }
+  }
+}
+
+/// Check a join token. `Ok(Some(model))` is the model recovered from it,
+/// `Ok(None)` a token with nothing to recover (or none, without state
+/// recovery), and `Error(reason)` a join that must be refused:
+///
+/// - a token that does not verify: malformed, signed with another key (an
+///   older server process with a generated secret), expired, or issued to
+///   another browser session;
+/// - a token whose model `restore` refuses (the model's shape changed);
+/// - no token while state recovery is enabled: the server render always
+///   sets the cookie, so its absence means the browser did not keep it.
+///
+/// `restore` is `None` when no model is to be recovered (recovery disabled,
+/// or the runtime already joined a connection); `recovery_enabled` says
+/// whether the app opted into state recovery at all.
+fn check_join_token(
+  restore: Option(fn(String) -> Result(model, String)),
+  recovery_enabled: Bool,
+  secret_key: String,
   token: String,
   session_fingerprint: String,
-) -> RuntimeState(model, msg) {
-  case token {
-    "" -> {
+  conn_id: transport.ConnectionId,
+) -> Result(Option(model), String) {
+  case token, recovery_enabled {
+    "", False -> {
       log.debug("beacon.runtime", "No join token for " <> conn_id)
-      state
+      Ok(None)
     }
-    _ ->
-      case
+    "", True ->
+      Error(
+        "state recovery is enabled and the join carries no join token (the "
+        <> ssr.session_cookie_name
+        <> " cookie is missing)",
+      )
+    _, _ -> {
+      use verified <- result.try(
         ssr.verify_join_token(
           token,
-          state.secret_key,
+          secret_key,
           session_fingerprint,
           system_time_seconds(),
         )
-      {
-        Error(err) -> {
-          log.warning(
+        |> result.map_error(fn(err) {
+          "the join token does not verify: "
+          <> ssr.describe_join_token_error(err)
+        }),
+      )
+      case restore, verified.model_json {
+        None, _ -> {
+          log.debug(
             "beacon.runtime",
             "Join token from "
               <> conn_id
-              <> " rejected: "
-              <> ssr.describe_join_token_error(err)
-              <> " — joining with the server model",
+              <> " verified; no model is recovered for this join",
           )
-          state
+          Ok(None)
         }
-        Ok(verified) ->
-          case state.accepted_first_join, verified.model_json {
-            True, _ -> {
-              log.debug(
+        Some(_), None -> {
+          log.debug(
+            "beacon.runtime",
+            "Join token from " <> conn_id <> " carries no model",
+          )
+          Ok(None)
+        }
+        Some(restore), Some(model_json) ->
+          case restore(model_json) {
+            Ok(model) -> {
+              log.info(
                 "beacon.runtime",
-                "Join token from "
-                  <> conn_id
-                  <> " verified; runtime already has a joined model, not recovering",
+                "State recovered from the join token for " <> conn_id,
               )
-              state
+              Ok(Some(model))
             }
-            False, None -> {
-              log.debug(
-                "beacon.runtime",
-                "Join token from " <> conn_id <> " carries no model",
-              )
-              state
-            }
-            False, Some(model_json) ->
-              case state.restore_model {
-                None -> {
-                  log.debug(
-                    "beacon.runtime",
-                    "Join token carries a model but state recovery is not enabled",
-                  )
-                  state
-                }
-                Some(restore) ->
-                  case restore(model_json) {
-                    Ok(model) -> {
-                      log.info(
-                        "beacon.runtime",
-                        "State recovered from join token for " <> conn_id,
-                      )
-                      RuntimeState(..state, model: model)
-                    }
-                    Error(reason) -> {
-                      log.warning(
-                        "beacon.runtime",
-                        "Join token model could not be restored for "
-                          <> conn_id
-                          <> ": "
-                          <> reason
-                          <> " — joining with the server model",
-                      )
-                      state
-                    }
-                  }
-              }
+            Error(reason) ->
+              Error("the join token's model does not restore: " <> reason)
           }
       }
+    }
   }
 }
 
@@ -2061,7 +2193,7 @@ pub fn connect_transport_with_ssr(
       process.send(runtime, ClientConnected(conn_id: conn_id, subject: subject))
     },
     on_event: fn(conn_id, client_msg) {
-      forward_client_message_with_request(runtime, conn_id, None, client_msg)
+      forward_client_message(runtime, conn_id, False, client_msg)
     },
     on_disconnect: fn(conn_id) {
       process.send(runtime, ClientDisconnected(conn_id: conn_id))
@@ -2091,7 +2223,7 @@ pub fn start_and_connect(
   error.BeaconError,
 ) {
   log.info("beacon.runtime", "Starting runtime connection for " <> conn_id)
-  spawn_and_connect(config, ctx, conn_id, transport_subject, None)
+  spawn_and_connect(config, ctx, conn_id, transport_subject, False, None)
 }
 
 /// Start a per-connection runtime for a WebSocket upgrade request. The
@@ -2099,6 +2231,14 @@ pub fn start_and_connect(
 /// is the upgrade request's URL with that page path and query, so `init`
 /// sees the same URL as the dead render. A missing or invalid `path`
 /// refuses the connection.
+///
+/// The join token is read from the request's HttpOnly cookie and checked
+/// before `init` runs (see `check_join_token`). A token that fails the
+/// check refuses the connection with
+/// `error.InitRejected(error.refuse(join_token_refused_status, _))`, so
+/// the socket closes with 4400 and the browser reloads the page for a
+/// fresh token. A model recovered from the token replaces the state `init`
+/// built before the runtime starts.
 pub fn start_and_connect_with_request(
   config: RuntimeConfig(model, msg),
   conn_id: transport.ConnectionId,
@@ -2116,8 +2256,51 @@ pub fn start_and_connect_with_request(
       )
       Error(error.RuntimeError(reason: reason))
     }
-    Ok(ctx) ->
-      spawn_and_connect(config, ctx, conn_id, transport_subject, Some(req))
+    Ok(ctx) -> {
+      use Nil <- result.try(check_recovery_config(config))
+      case
+        check_join_token(
+          config.restore_model,
+          option.is_some(config.restore_model),
+          config.secret_key,
+          join_token_cookie(req),
+          ssr.session_fingerprint(req),
+          conn_id,
+        )
+      {
+        Error(reason) -> {
+          log.warning(
+            "beacon.runtime",
+            "Refusing connection "
+              <> conn_id
+              <> " for "
+              <> describe_uri(context.uri(ctx))
+              <> ": "
+              <> reason
+              <> " (close "
+              <> int.to_string(
+              error.init_close_code_base + join_token_refused_status,
+            )
+              <> ": the browser reloads the page for a fresh token)",
+          )
+          Error(
+            error.InitRejected(error.refuse(
+              join_token_refused_status,
+              "join token refused: " <> reason,
+            )),
+          )
+        }
+        Ok(recovered) ->
+          spawn_and_connect(
+            config,
+            ctx,
+            conn_id,
+            transport_subject,
+            True,
+            recovered,
+          )
+      }
+    }
   }
 }
 
@@ -2172,13 +2355,14 @@ fn spawn_and_connect(
   ctx: Context,
   conn_id: transport.ConnectionId,
   transport_subject: process.Subject(transport.InternalMessage),
-  req: Option(request.Request(server.Connection)),
+  token_checked: Bool,
+  recovered: Option(model),
 ) -> Result(
   #(fn(transport.ConnectionId, transport.ClientMessage) -> Nil, fn() -> Nil),
   error.BeaconError,
 ) {
   log.info("beacon.runtime", "Spawning runtime for " <> conn_id)
-  case start_for(config, ctx, conn_id) {
+  case start_for(config, ctx, conn_id, recovered) {
     Ok(runtime_subject) -> {
       // Register this connection with the new runtime
       process.send(
@@ -2187,10 +2371,10 @@ fn spawn_and_connect(
       )
       // Return per-connection event and shutdown handlers
       let on_event = fn(_cid: transport.ConnectionId, client_msg) {
-        forward_client_message_with_request(
+        forward_client_message(
           runtime_subject,
           conn_id,
-          req,
+          token_checked,
           client_msg,
         )
       }
@@ -2214,12 +2398,14 @@ fn spawn_and_connect(
 
 /// Forward a client message to a runtime actor.
 /// Translates transport.ClientMessage variants into RuntimeMessage variants.
-/// With the upgrade request available, the join token is read from the
-/// HttpOnly join-token cookie and bound to the request's browser session.
-fn forward_client_message_with_request(
+/// With `token_checked`, the connection's join token came from the upgrade
+/// request's HttpOnly cookie and was checked before its runtime started,
+/// so a join carries no token (the token in the client's join message is
+/// ignored: the browser client sends an empty one).
+fn forward_client_message(
   runtime_subject: Subject(RuntimeMessage(msg)),
   conn_id: transport.ConnectionId,
-  req: Option(request.Request(server.Connection)),
+  token_checked: Bool,
   client_msg: transport.ClientMessage,
 ) -> Nil {
   case client_msg {
@@ -2237,18 +2423,13 @@ fn forward_client_message_with_request(
         ),
       )
     transport.ClientJoin(token, path) ->
-      case req {
-        Some(http_req) ->
+      case token_checked {
+        True ->
           process.send(
             runtime_subject,
-            ClientJoinedWithSession(
-              conn_id: conn_id,
-              token: join_token_cookie(http_req),
-              path: path,
-              session_fingerprint: ssr.session_fingerprint(http_req),
-            ),
+            ClientJoinedVerified(conn_id: conn_id, path: path),
           )
-        None ->
+        False ->
           process.send(
             runtime_subject,
             ClientJoined(conn_id: conn_id, token: token, path: path),

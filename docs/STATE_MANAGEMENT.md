@@ -141,9 +141,23 @@ state is the model, pass `function.identity`.
 - The token is signed with the app's secret key. Recovery after a restart or
   on another node needs the same `beacon.secret_key` on every node (see
   [DEPLOYMENT.md](DEPLOYMENT.md#secret-key)).
-- A token whose model does not decode is logged as a warning, and the session
-  continues with the state `init` returned.
-- Without `with_state_recovery` the session starts from `init`.
+- The join token is checked before `init` runs. A token that does not verify
+  (malformed, signed with another key, older than 24 hours, or issued to
+  another browser session), a token whose model `restore` cannot decode, and
+  a missing token while recovery is enabled refuse the connection. The
+  refusal is logged as a warning, the WebSocket closes with **4400**, and the
+  browser reloads the page, whose server render issues a fresh token (at most
+  3 reloads per tab within 60 seconds, then the page shows an error state).
+  The session never continues from `init`'s state in place of a token it
+  could not use. LiveView does the same with a stale session token: it
+  refuses the join and the client reloads.
+- An open tab whose server was restarted without a fixed `beacon.secret_key`
+  therefore reloads once on reconnect: the new process generated a new key.
+- Recovery with an empty secret key is a configuration error: the runtime
+  refuses to start.
+- Without `with_state_recovery` the session starts from `init`. A missing
+  token is then fine, but a token that does not verify still refuses the
+  connection the same way.
 
 ## Local State (Zero Traffic)
 

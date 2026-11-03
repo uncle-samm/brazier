@@ -10,6 +10,7 @@ import beacon/effect
 import beacon/error
 import beacon/pubsub
 import beacon/runtime
+import beacon/ssr
 import beacon/test_ctx
 import beacon/transport
 import gleam/erlang/process.{type Subject}
@@ -242,7 +243,14 @@ pub fn rejoin_is_full_resync_and_never_resets_state_test() {
       restore_model: Some(fn(_json) { Ok(Model(count: 99, blob: "", path: "")) }),
     )
   let assert Ok(rt) = runtime.start(cfg, test_ctx.root())
-  let s = join(rt, "c", "")
+  // With state recovery every first join carries a token; this one has no
+  // model, so the session starts from init.
+  let s = connect(rt, "c")
+  let modelless = ssr.sign_join_token(secret, "", None, now_seconds())
+  process.send(
+    rt,
+    runtime.ClientJoined(conn_id: "c", token: modelless, path: ""),
+  )
   let assert transport.SendModelSync(version: 0, ack_clock: 0, ..) = next(s)
   event(rt, "c", "inc", 1)
   let assert transport.SendPatch(version: 1, ack_clock: 1, ..) = next(s)
@@ -573,6 +581,9 @@ type MillisecondUnit {
 
 @external(erlang, "erlang", "monotonic_time")
 fn monotonic_time(unit: MillisecondUnit) -> Int
+
+@external(erlang, "beacon_ssr_ffi", "system_time_seconds")
+fn now_seconds() -> Int
 
 // --- snapshot diffs ---
 

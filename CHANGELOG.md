@@ -54,6 +54,11 @@ with its own changelog, so they are not listed here.
   clear the cookie when the session store fails.
 - (WS8a) `cluster.new` takes `secret_key`. Presence `members`, `list` and
   `get_by_key` return a `Result`.
+- (WS10b) A join token that does not verify, a token model that `restore`
+  cannot decode, and a missing token while state recovery is enabled refuse
+  the connection before `init` runs: the socket closes with 4400 and the
+  browser reloads the page. The session no longer continues from `init`'s
+  state. State recovery with an empty secret key fails the runtime's start.
 
 ### Added
 

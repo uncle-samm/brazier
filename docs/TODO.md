@@ -48,10 +48,6 @@ The docs describe the current behaviour; each item is a code change.
 - **Issue:** `beacon.title` is computed only for the HTML render
   (`ssr.gleam:308`); a client navigation leaves `document.title` unchanged.
   - **Files:** `src/beacon/ssr.gleam`, `beacon_client/`
-- **Issue:** a join token whose model does not decode is logged and the
-  session continues with the state `init` returned (`runtime.gleam:920-929`),
-  a silent degradation for the user.
-  - **Files:** `src/beacon/runtime.gleam`
 - **Issue:** `transport/http.read_body` returns `Result(BitArray, String)`
   and is internal (`transport/http.gleam:508`); the public way to read a body
   is `api.read_text` / `api.read_form`. Older docs pointed users at
@@ -72,3 +68,15 @@ The docs describe the current behaviour; each item is a code change.
 ## Resolved Issues
 
 <!-- Move resolved issues here with full resolution details -->
+
+- **Issue:** a join token whose model does not decode was logged and the
+  session continued with the state `init` returned (`runtime.gleam:920-929`),
+  a silent degradation for the user.
+  - **Files:** `src/beacon/runtime.gleam`
+  - **Resolution:** (WS10b) `runtime.check_join_token` refuses a token that
+    does not verify, a model `restore` refuses, and a missing token with
+    state recovery enabled. On the session path the check runs before
+    `init`, and the refusal closes the socket with 4400, so the browser
+    reloads for a fresh token, as LiveView does with a stale session token.
+    A join on a runtime without the upgrade request gets an `error` frame
+    ("join refused") and stays unjoined. `runtime_test` covers each case.
