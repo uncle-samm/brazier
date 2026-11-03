@@ -1,19 +1,31 @@
 # Shopping Cart
 
-Product catalog with add-to-cart, quantity controls, and computed totals.
+A product catalog with a per-tab cart and stock shared by every shopper,
+built with `beacon.full_application`.
 
 ## Features
 
-- Computed/derived values in view (subtotal, tax, total -- not stored in model)
-- Add, remove, increment, decrement cart items with stock tracking
-- Multi-user shared product stock via store and PubSub
-- Two-column layout: product list and cart summary
+- Derived values in the view: subtotal, tax and total are not stored
+- Add, remove, increment and decrement cart items
+- Stock shared by every session, kept in a `beacon/store` list as an
+  append-only log of takes and returns. Every session replays the same log
+  in the same order, so when two shoppers race for the last unit exactly
+  one of them gets it
+- Server-only state: the session's random cart id is part of the server
+  state and `sync` leaves it out, so it never reaches the browser
+- The store broadcasts on its topic; every session re-reads the log
+  (`beacon.subscriptions` and `beacon.on_notify`)
+
+A closed tab's cart keeps its units off the shelf until the server
+restarts; a real shop would expire reservations.
 
 ## Run
 
 ```bash
 cd examples/cart
+gleam run -m beacon/build   # after changing the source
 gleam run
 ```
 
-Open http://localhost:8080 -- add products to your cart and see live subtotal/tax/total.
+Open http://localhost:8080 in two tabs and add products in each: the stock
+changes in both, the cart only in its own tab.

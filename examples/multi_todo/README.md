@@ -1,19 +1,25 @@
 # Multi-File Todo
 
-Todo app with TodoItem and Filter types defined in a separate domain module.
+A per-session todo list built with `beacon.full_application`, with its
+`TodoItem` and `Filter` types defined in a separate domain module.
 
 ## Features
 
-- External types from `domains/task.gleam` (TodoItem, Filter enum: All/Active/Completed)
-- Local state for filter selection (zero server traffic)
-- Add, toggle, delete, and clear completed todos
-- Codec generation handles types imported from other modules
+- External types from `src/domains/task.gleam` (`TodoItem`, and the `Filter`
+  enum All/Active/Completed); the codegen follows them across modules
+- The draft and the filter live in the Local layer: typing and filtering
+  never reach the server
+- Add, toggle, delete and clear completed todos; the list is held by the
+  session's server process
+- The server rejects empty or over-long todos and changes to unknown todos,
+  with a logged warning
 
 ## Run
 
 ```bash
 cd examples/multi_todo
+gleam run -m beacon/build   # after changing the source
 gleam run
 ```
 
-Open http://localhost:8080 -- manage todos with filter tabs. Types come from `src/domains/task.gleam`.
+Open http://localhost:8080 and manage todos with the filter buttons.
