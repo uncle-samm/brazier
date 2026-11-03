@@ -1,21 +1,30 @@
 # Routed
 
-Explicit routing with `beacon.route_pages`.
+Explicit routing with `beacon.with_router`.
 
 ## Features
 
-- Four routes: `/` (counter), `/about` (static), `/settings` (form), `/stats` (state isolation)
-- One Beacon app owns the route state and renders the selected page
-- Route declarations live in explicitly imported page modules
-- The root app still owns `Model` and `Msg`; page modules are generic view/route helpers
-- SSR first paint, then generated client rendering from Beacon state updates
-- No filesystem route discovery or alternate router runtime path
+- One `Route` type and one `parse` function over `router.segments` are the
+  only route declaration: `/` (counter), `/about` (static), `/settings`
+  (form) and `/stats` (route changes seen). Any other path is a 404.
+- Beacon runs `update(model, RouteChanged(route))` after `init`, before the
+  first render, and on every client navigation, so the route lives in the
+  Model. Nav links and the back and forward buttons change the page
+  without a reload.
+- The home page is a nested component with its own Model, Msg, update and
+  view; the root maps its messages with `element.map(Home)`.
+- The other pages are plain view modules, imported explicitly. Beacon does
+  not scan the filesystem for routes.
+- `beacon.application`: `update` runs on the server, so the home page's
+  "Server-authoritative updates" counts the events the server handled.
 
 ## Run
 
 ```bash
 cd examples/routed
+gleam run -m beacon/build   # after changing the source
 gleam run -m main
 ```
 
-Open http://localhost:8080 -- navigate between /, /about, /settings, and /stats.
+Open http://localhost:8080 and move between /, /about, /settings and
+/stats.
