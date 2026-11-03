@@ -1,10 +1,15 @@
-.PHONY: build test browser-canonical browser-canonical-desktop browser-canonical-mobile browser-all browser-all-desktop browser-all-mobile browser-all-shard browser-all-docker-shards push tag publish release
+.PHONY: build test test-flake browser-canonical browser-canonical-desktop browser-canonical-mobile browser-all browser-all-desktop browser-all-mobile browser-all-shard browser-all-docker-shards push tag publish release
 
 build:
 	gleam build
 
 test:
 	gleam test
+
+# gleam test FLAKE_RUNS times (default 5) under FLAKE_BUSY busy loops
+# (default 8); fails if any run fails.
+test-flake:
+	sh scripts/flake_gate.sh
 
 browser-canonical:
 	sh scripts/run_canonical_cdp.sh
