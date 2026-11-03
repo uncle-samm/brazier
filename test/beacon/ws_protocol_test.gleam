@@ -6,6 +6,7 @@
 /// runtime factory, so the handler pid, the runtime subject, every decoded
 /// event and the `on_close` callback are observable.
 import beacon/auth
+import beacon/await
 import beacon/error
 import beacon/session
 import beacon/sim/test_app
@@ -92,9 +93,6 @@ fn unmasked_frame(fin: Int, opcode: Int, payload: BitArray) -> BitArray
 
 @external(erlang, "beacon_ws_test_ffi", "expect_closed")
 fn expect_closed(socket: RawSocket, timeout: Int) -> Result(Int, String)
-
-@external(erlang, "beacon_ws_test_ffi", "process_count")
-fn process_count() -> Int
 
 @external(erlang, "beacon_ws_test_ffi", "all_processes")
 fn all_processes() -> List(Pid)
@@ -238,17 +236,55 @@ fn await_closed(observer: Subject(Observed), conn_id: String) -> Bool {
   }
 }
 
-/// Collect the events received within `ms`.
-fn drain_events(
+/// Wait for `on_close` of every connection in `conn_ids`, in any order.
+fn await_all_closed(
   observer: Subject(Observed),
-  ms: Int,
-  acc: List(transport.ClientMessage),
-) -> List(transport.ClientMessage) {
-  case process.receive(observer, ms) {
-    Ok(GotEvent(_, msg)) -> drain_events(observer, ms, [msg, ..acc])
-    Ok(_other) -> drain_events(observer, ms, acc)
-    Error(Nil) -> list.reverse(acc)
+  conn_ids: List(String),
+) -> Nil {
+  case conn_ids {
+    [] -> Nil
+    _ -> {
+      let assert ClosedConn(closed) =
+        await.expect(
+          observer,
+          "on_close for " <> string.join(conn_ids, ", "),
+          matching: fn(observed) {
+            case observed {
+              ClosedConn(cid) -> list.contains(conn_ids, cid)
+              _ -> False
+            }
+          },
+        )
+      await_all_closed(observer, list.filter(conn_ids, fn(c) { c != closed }))
+    }
   }
+}
+
+/// The next event the handler dispatched. The handler sends every
+/// observation from its own process, so events arrive in dispatch order:
+/// the first event after a rejection proves the rejection dispatched none.
+fn next_event(observer: Subject(Observed)) -> transport.ClientMessage {
+  let assert GotEvent(_, msg) =
+    await.expect(observer, "a dispatched event", matching: fn(observed) {
+      case observed {
+        GotEvent(..) -> True
+        _ -> False
+      }
+    })
+  msg
+}
+
+/// Every event already in this process's mailbox, without waiting. Use it
+/// once the handler is down: a dead process has no sends in flight.
+fn events_in_mailbox(
+  observer: Subject(Observed),
+) -> List(transport.ClientMessage) {
+  list.filter_map(await.drain(observer), fn(observed) {
+    case observed {
+      GotEvent(_, msg) -> Ok(msg)
+      _ -> Error(Nil)
+    }
+  })
 }
 
 fn send_text(socket: RawSocket, text: String) -> Nil {
@@ -270,20 +306,6 @@ fn recv_text(socket: RawSocket) -> String {
   }
 }
 
-fn wait_until(check: fn() -> Bool, timeout_ms: Int) -> Bool {
-  case check() {
-    True -> True
-    False ->
-      case timeout_ms <= 0 {
-        True -> False
-        False -> {
-          process.sleep(10)
-          wait_until(check, timeout_ms - 10)
-        }
-      }
-  }
-}
-
 fn assert_closed_with(probe: Probe, server: Server, code: Int) -> Nil {
   let assert Ok(got) = expect_closed(probe.socket, 5000)
   case got == code {
@@ -298,7 +320,7 @@ fn assert_closed_with(probe: Probe, server: Server, code: Int) -> Nil {
   }
   // Teardown: handler process gone, runtime told to stop.
   let assert True = await_closed(server.observer, probe.conn_id)
-  let assert True = wait_until(fn() { !process.is_alive(probe.handler) }, 2000)
+  await.expect_down(probe.handler, "WebSocket handler " <> probe.conn_id)
   raw_close(probe.socket)
 }
 
@@ -499,10 +521,10 @@ pub fn many_frames_in_one_tcp_segment_are_all_processed_test() {
       masked_frame(1, 1, <<event_json("three"):utf8>>),
     ])
   let assert Ok(Nil) = raw_send(probe.socket, frames)
-  let events = drain_events(server.observer, 300, [])
   let ids =
-    list.map(events, fn(e) {
-      let assert transport.ClientEvent(handler_id: id, ..) = e
+    list.map([1, 2, 3], fn(_) {
+      let assert transport.ClientEvent(handler_id: id, ..) =
+        next_event(server.observer)
       id
     })
   let assert ["one", "two", "three"] = ids
@@ -634,8 +656,10 @@ pub fn per_ip_slot_uses_forwarded_client_behind_trusted_proxy_test() {
   let assert 1 = ws.get_ip_slot_count(port <> "|203.0.113.7")
   let assert 0 = ws.get_ip_slot_count(port <> "|" <> host)
   raw_close(probe.socket)
-  let assert True =
-    wait_until(fn() { ws.get_ip_slot_count(port <> "|203.0.113.7") == 0 }, 2000)
+  // cleanup_connection releases the slot (a synchronous pg leave) before it
+  // calls on_close, so once on_close has run the count is final.
+  let assert True = await_closed(server.observer, probe.conn_id)
+  let assert 0 = ws.get_ip_slot_count(port <> "|203.0.113.7")
 }
 
 /// Regression: a direct client could pick its own per-IP bucket by sending
@@ -707,12 +731,15 @@ pub fn per_ip_cap_rejects_with_429_and_releases_slots_test() {
   let assert 2 = ws.get_ip_slot_count(slot)
   // Closing one connection frees its slot for a new one.
   raw_close(first.socket)
+  // The slot is released before on_close runs, so the count is final.
   let assert True = await_closed(server.observer, first.conn_id)
-  let assert True = wait_until(fn() { ws.get_ip_slot_count(slot) == 1 }, 2000)
+  let assert 1 = ws.get_ip_slot_count(slot)
   let fourth = open(server)
+  let assert 2 = ws.get_ip_slot_count(slot)
   raw_close(second.socket)
   raw_close(fourth.socket)
-  let assert True = wait_until(fn() { ws.get_ip_slot_count(slot) == 0 }, 2000)
+  await_all_closed(server.observer, [second.conn_id, fourth.conn_id])
+  let assert 0 = ws.get_ip_slot_count(slot)
 }
 
 // --- Liveness ---
@@ -767,18 +794,21 @@ pub fn missing_pong_tears_down_real_runtime_test() {
   let before = all_processes()
   let #(socket, head) = raw_upgrade(port, upgrade_headers(port))
   let assert "101" = status_of(head)
-  // Let the per-connection runtime (and its listener) start.
-  process.sleep(100)
+  // The handler arms its ping timer only after the runtime factory has
+  // returned, so the first ping proves the runtime and whatever it starts
+  // up front are running.
+  let assert Ok(#(9, _ping)) = raw_recv_frame(socket, await.deadline_ms)
   let spawned =
     list.filter(all_processes(), fn(p) { !list.contains(before, p) })
   let assert True = spawned != []
-  let assert Ok(1000) = expect_closed(socket, 5000)
+  let assert Ok(1000) = expect_closed(socket, await.deadline_ms)
   raw_close(socket)
   // Handler, runtime and every helper the connection started are gone. The
   // acceptor pool is started with the listener (before the snapshot) and
   // keeps accepting, so nothing spawned for this connection survives.
-  let assert True =
-    wait_until(fn() { list.all(spawned, fn(p) { !process.is_alive(p) }) }, 3000)
+  list.each(spawned, fn(p) {
+    await.expect_down(p, "process spawned for the timed-out connection")
+  })
 }
 
 fn start_counter_app(limits: transport.SecurityLimits) -> Int {
@@ -802,7 +832,8 @@ pub fn heartbeats_count_as_activity_test() {
   let server = start_server(limits, None)
   let probe = open(server)
   // 4 heartbeats 550ms apart (under the 2/s heartbeat rate limit) span
-  // well past the idle timeout.
+  // well past the idle timeout. The sleep is the thing under test: wall
+  // clock time must pass the idle timeout while only heartbeats arrive.
   list.each(list.repeat(Nil, 4), fn(_) {
     send_text(probe.socket, "{\"type\":\"heartbeat\"}")
     let assert "{\"type\":\"heartbeat_ack\"}" = recv_text(probe.socket)
@@ -840,7 +871,7 @@ pub fn slow_reader_is_closed_by_send_timeout_test() {
     process.send(runtime, transport.SendModelSync(big, 1, 0))
   })
   let assert True = await_closed(server.observer, conn_id)
-  let assert True = wait_until(fn() { !process.is_alive(handler) }, 2000)
+  await.expect_down(handler, "slow reader's WebSocket handler")
   raw_close(socket)
 }
 
@@ -886,11 +917,11 @@ pub fn batch_of_100_events_counts_as_100_test() {
   send_text(probe.socket, batch_json(100))
   let assert "{\"type\":\"error\",\"reason\":\"Rate limited\"}" =
     recv_text(probe.socket)
-  let assert [] = drain_events(server.observer, 200, [])
-  // The rejected batch consumed no budget: one event still fits.
+  // The rejected batch consumed no budget: one event still fits, and it is
+  // the first event dispatched, so the batch dispatched nothing.
   send_text(probe.socket, event_json("after"))
-  let assert [transport.ClientEvent(handler_id: "after", ..)] =
-    drain_events(server.observer, 200, [])
+  let assert transport.ClientEvent(handler_id: "after", ..) =
+    next_event(server.observer)
   raw_close(probe.socket)
 }
 
@@ -902,9 +933,13 @@ pub fn batches_share_the_per_second_budget_test() {
   // 30 + 30 > 50: the first batch is dispatched, the second is rejected.
   let assert "{\"type\":\"error\",\"reason\":\"Rate limited\"}" =
     recv_text(probe.socket)
-  let assert [transport.ClientEventBatch(events)] =
-    drain_events(server.observer, 200, [])
+  let assert transport.ClientEventBatch(events) = next_event(server.observer)
   let assert 30 = list.length(events)
+  // 20 of the 50 remain: a single event is dispatched next, so the rejected
+  // second batch dispatched nothing.
+  send_text(probe.socket, event_json("after"))
+  let assert transport.ClientEvent(handler_id: "after", ..) =
+    next_event(server.observer)
   raw_close(probe.socket)
 }
 
@@ -916,7 +951,10 @@ pub fn oversized_batch_is_rejected_test() {
   send_text(probe.socket, batch_json(101))
   let assert "{\"type\":\"error\",\"reason\":\"Batch too large\"}" =
     recv_text(probe.socket)
-  let assert [] = drain_events(server.observer, 200, [])
+  // The next event is the first dispatched: the oversized batch sent none.
+  send_text(probe.socket, event_json("after"))
+  let assert transport.ClientEvent(handler_id: "after", ..) =
+    next_event(server.observer)
   raw_close(probe.socket)
 }
 
@@ -957,14 +995,15 @@ pub fn rate_violation_flood_closes_1008_test() {
     send_text(probe.socket, event_json("e"))
   })
   let assert Ok(1008) = expect_closed(probe.socket, 5000)
-  // Collect the accepted events while waiting for the close notification,
-  // then any stragglers delivered after it.
+  // The handler dispatches events and then runs on_close from the same
+  // process, so all 5 accepted events arrive before the close notification.
   let #(before_close, closed) =
     events_until_closed(server.observer, probe.conn_id, [])
   let assert True = closed
-  let after_close = drain_events(server.observer, 100, [])
-  let assert 5 = list.length(before_close) + list.length(after_close)
-  let assert True = wait_until(fn() { !process.is_alive(probe.handler) }, 2000)
+  let assert 5 = list.length(before_close)
+  // Once the handler is down it has nothing in flight: no event follows.
+  await.expect_down(probe.handler, "rate-violating WebSocket handler")
+  let assert [] = events_in_mailbox(server.observer)
   raw_close(probe.socket)
 }
 
@@ -1029,6 +1068,9 @@ pub fn expired_session_gets_401_test() {
       ),
     )
   let assert Ok(sess) = auth.login(store, "user-1")
+  // The sleep is the thing under test: the idle TTL is wall-clock time and
+  // the store has no clock to advance. Sleeping twice the TTL cannot race,
+  // since a slow scheduler only makes the session older.
   process.sleep(80)
   let server = session_auth_server(store)
   let #(socket, head) =
@@ -1042,8 +1084,8 @@ pub fn logout_closes_live_socket_4401_test() {
   let assert Ok(sess) = auth.login(store, "user-1")
   let server = session_auth_server(store)
   let probe = open_with(server, cookie_headers(server.port, sess.id))
-  let assert True =
-    wait_until(fn() { session.bound_process_count(store, sess.id) == 1 }, 1000)
+  // ws_auth binds the handler (a synchronous pg join) before the 101.
+  let assert 1 = session.bound_process_count(store, sess.id)
   let assert Ok(Nil) = auth.logout(store, sess.id)
   assert_closed_with(probe, server, 4401)
 }
@@ -1053,11 +1095,8 @@ pub fn old_session_id_is_unusable_after_login_rotation_test() {
   let assert Ok(anonymous) = auth.login(store, "guest")
   let server = session_auth_server(store)
   let probe = open_with(server, cookie_headers(server.port, anonymous.id))
-  let assert True =
-    wait_until(
-      fn() { session.bound_process_count(store, anonymous.id) == 1 },
-      1000,
-    )
+  // ws_auth binds the handler (a synchronous pg join) before the 101.
+  let assert 1 = session.bound_process_count(store, anonymous.id)
   let assert Ok(fresh) =
     auth.login_rotating(store, Some(anonymous.id), "user-1")
   // The socket bound to the old id is closed...
@@ -1077,8 +1116,13 @@ pub fn failed_auth_recheck_closes_4401_test() {
   // notice the session is gone.
   let store = session.new_store("ws2_ws_recheck")
   let assert Ok(sess) = auth.login(store, "user-1")
+  // Every run of the check is reported, so the test waits for a re-check
+  // instead of sleeping past the interval and hoping one ran.
+  let checks = process.new_subject()
   let check = fn(req: Request(Connection)) {
-    case session.id_from_request(req, auth.default_session_cookie_name) {
+    let result = case
+      session.id_from_request(req, auth.default_session_cookie_name)
+    {
       Ok(id) ->
         case session.get(store, id) {
           Some(_) -> Ok(Nil)
@@ -1086,6 +1130,8 @@ pub fn failed_auth_recheck_closes_4401_test() {
         }
       Error(Nil) -> Error("no cookie")
     }
+    process.send(checks, result)
+    result
   }
   let server =
     start_server(
@@ -1096,8 +1142,10 @@ pub fn failed_auth_recheck_closes_4401_test() {
       Some(check),
     )
   let probe = open_with(server, cookie_headers(server.port, sess.id))
-  // Still valid across a re-check.
-  process.sleep(150)
+  // The upgrade ran the check once; the next run is the periodic re-check,
+  // and the connection survives it.
+  let assert Ok(Ok(Nil)) = process.receive(checks, await.deadline_ms)
+  let assert Ok(Ok(Nil)) = process.receive(checks, await.deadline_ms)
   let assert True = process.is_alive(probe.handler)
   session.delete(store, sess.id)
   assert_closed_with(probe, server, 4401)
@@ -1237,27 +1285,14 @@ pub fn ws_load_no_process_leak_test() {
   let sockets = 50
   let events = 40
   let port = start_counter_app(test_app.sim_security_limits())
-  process.sleep(100)
-  let baseline = process_count()
+  // One connection before the snapshot starts anything created lazily on
+  // first use (the node-wide per-IP slot scope), so the snapshot holds every
+  // process that legitimately outlives a connection.
+  let _warm_up = load_client(port, 1)
+  let before = all_processes()
   let started = monotonic_us()
   let latencies =
-    run_parallel(sockets, fn(_i) {
-      let #(socket, head) = raw_upgrade(port, upgrade_headers(port))
-      let assert "101" = status_of(head)
-      send_text(socket, "{\"type\":\"join\",\"token\":\"\",\"path\":\"/\"}")
-      let _mount = recv_text(socket)
-      let samples =
-        list.map(list.repeat(Nil, events), fn(_) {
-          let t0 = monotonic_us()
-          send_text(socket, event_json("inc"))
-          let _reply = recv_text(socket)
-          monotonic_us() - t0
-        })
-      let assert Ok(Nil) = raw_send(socket, masked_frame(1, 8, <<1000:16>>))
-      let assert Ok(1000) = expect_closed(socket, 5000)
-      raw_close(socket)
-      samples
-    })
+    run_parallel(sockets, fn(_i) { load_client(port, events) })
     |> list.flatten
   let elapsed_us = int.max(monotonic_us() - started, 1)
   let total = sockets * events
@@ -1279,8 +1314,34 @@ pub fn ws_load_no_process_leak_test() {
     <> int.to_string(p99)
     <> "us",
   )
-  // Handlers, runtimes and listeners have all exited.
-  let assert True = wait_until(fn() { process_count() <= baseline }, 5000)
+  // Handlers, runtimes, listeners and the client workers all exit: every
+  // process started during the run must go down. Counting pids, not a
+  // node-wide total, so an unrelated process exiting cannot hide a leak.
+  let started_during_run =
+    list.filter(all_processes(), fn(p) { !list.contains(before, p) })
+  list.each(started_during_run, fn(p) {
+    await.expect_down(p, "process started during the WebSocket load run")
+  })
+}
+
+/// One client: upgrade, join, `events` round-trips, clean close. Returns
+/// each round-trip's latency in microseconds.
+fn load_client(port: Int, events: Int) -> List(Int) {
+  let #(socket, head) = raw_upgrade(port, upgrade_headers(port))
+  let assert "101" = status_of(head)
+  send_text(socket, "{\"type\":\"join\",\"token\":\"\",\"path\":\"/\"}")
+  let _mount = recv_text(socket)
+  let samples =
+    list.map(list.repeat(Nil, events), fn(_) {
+      let t0 = monotonic_us()
+      send_text(socket, event_json("inc"))
+      let _reply = recv_text(socket)
+      monotonic_us() - t0
+    })
+  let assert Ok(Nil) = raw_send(socket, masked_frame(1, 8, <<1000:16>>))
+  let assert Ok(1000) = expect_closed(socket, await.deadline_ms)
+  raw_close(socket)
+  samples
 }
 
 fn percentile(sorted: List(Int), total: Int, pct: Int) -> Int {
