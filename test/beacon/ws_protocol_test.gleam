@@ -12,7 +12,6 @@ import beacon/session
 import beacon/sim/test_app
 import beacon/transport
 import beacon/transport/server.{type Connection}
-import beacon/transport/ws
 import gleam/bit_array
 import gleam/erlang/process.{type Pid, type Subject}
 import gleam/http/request.{type Request}
@@ -36,7 +35,7 @@ type Observed {
 }
 
 type Server {
-  Server(port: Int, observer: Subject(Observed))
+  Server(port: Int, observer: Subject(Observed), listener: server.Listener)
 }
 
 type Probe {
@@ -145,10 +144,20 @@ fn start_server(
       api_handler: None,
     )
   case transport.start_listener(config) {
-    Ok(listener) -> Server(port: server.get_port(listener), observer: observer)
+    Ok(listener) ->
+      Server(
+        port: server.get_port(listener),
+        observer: observer,
+        listener: listener,
+      )
     Error(err) ->
       panic as { "could not start transport: " <> string.inspect(err) }
   }
+}
+
+/// Live WebSockets the listener counts against `ip`'s per-IP cap.
+fn ws_slots(test_server: Server, ip: String) -> Int {
+  server.get_ws_connection_count_for_ip(test_server.listener, ip)
 }
 
 fn host_header(port: Int) -> String {
@@ -652,14 +661,13 @@ pub fn per_ip_slot_uses_forwarded_client_behind_trusted_proxy_test() {
   let headers =
     with_header(upgrade_headers(server.port), "X-Forwarded-For", "203.0.113.7")
   let probe = open_with(server, headers)
-  let port = int.to_string(server.port)
-  let assert 1 = ws.get_ip_slot_count(port <> "|203.0.113.7")
-  let assert 0 = ws.get_ip_slot_count(port <> "|" <> host)
+  let assert 1 = ws_slots(server, "203.0.113.7")
+  let assert 0 = ws_slots(server, host)
   raw_close(probe.socket)
-  // cleanup_connection releases the slot (a synchronous pg leave) before it
-  // calls on_close, so once on_close has run the count is final.
+  // cleanup_connection releases the slot (a synchronous ETS update) before
+  // it calls on_close, so once on_close has run the count is final.
   let assert True = await_closed(server.observer, probe.conn_id)
-  let assert 0 = ws.get_ip_slot_count(port <> "|203.0.113.7")
+  let assert 0 = ws_slots(server, "203.0.113.7")
 }
 
 /// Regression: a direct client could pick its own per-IP bucket by sending
@@ -669,9 +677,8 @@ pub fn per_ip_slot_ignores_spoofed_forwarded_for_test() {
   let headers =
     with_header(upgrade_headers(server.port), "X-Forwarded-For", "198.51.100.9")
   let probe = open_with(server, headers)
-  let port = int.to_string(server.port)
-  let assert 1 = ws.get_ip_slot_count(port <> "|" <> host)
-  let assert 0 = ws.get_ip_slot_count(port <> "|198.51.100.9")
+  let assert 1 = ws_slots(server, host)
+  let assert 0 = ws_slots(server, "198.51.100.9")
   raw_close(probe.socket)
 }
 
@@ -720,26 +727,60 @@ pub fn per_ip_cap_rejects_with_429_and_releases_slots_test() {
   let limits =
     transport.SecurityLimits(..test_limits(), max_ws_connections_per_ip: 2)
   let server = start_server(limits, None)
-  let slot = int.to_string(server.port) <> "|" <> host
   let first = open(server)
   let second = open(server)
-  let assert 2 = ws.get_ip_slot_count(slot)
+  let assert 2 = ws_slots(server, host)
   let #(third, head) = raw_upgrade(server.port, upgrade_headers(server.port))
   let assert "429" = status_of(head)
   raw_close(third)
   // A rejection must not leak a slot.
-  let assert 2 = ws.get_ip_slot_count(slot)
+  let assert 2 = ws_slots(server, host)
   // Closing one connection frees its slot for a new one.
   raw_close(first.socket)
   // The slot is released before on_close runs, so the count is final.
   let assert True = await_closed(server.observer, first.conn_id)
-  let assert 1 = ws.get_ip_slot_count(slot)
+  let assert 1 = ws_slots(server, host)
   let fourth = open(server)
-  let assert 2 = ws.get_ip_slot_count(slot)
+  let assert 2 = ws_slots(server, host)
   raw_close(second.socket)
   raw_close(fourth.socket)
   await_all_closed(server.observer, [second.conn_id, fourth.conn_id])
-  let assert 0 = ws.get_ip_slot_count(slot)
+  let assert 0 = ws_slots(server, host)
+}
+
+/// A handler killed while it holds a slot never runs its cleanup; the
+/// listener's connection owner releases the slot on the handler's exit.
+pub fn killed_handler_releases_its_slot_test() {
+  let limits =
+    transport.SecurityLimits(..test_limits(), max_ws_connections_per_ip: 1)
+  let test_server = start_server(limits, None)
+  let probe = open(test_server)
+  let assert 1 = ws_slots(test_server, host)
+  let assert Ok(owner) = server.get_connection_owner(test_server.listener)
+  let watch = await.watch_exit(owner, probe.handler)
+  process.kill(probe.handler)
+  await.expect_info(watch, owner, "the connection owner handling the kill")
+  let assert 0 = ws_slots(test_server, host)
+  // The freed slot admits a new connection under the cap of one.
+  let next = open(test_server)
+  let assert 1 = ws_slots(test_server, host)
+  raw_close(probe.socket)
+  raw_close(next.socket)
+}
+
+/// Each listener counts its own WebSockets: a cap reached on one does not
+/// refuse an upgrade on another in the same VM.
+pub fn listeners_count_slots_apart_test() {
+  let limits =
+    transport.SecurityLimits(..test_limits(), max_ws_connections_per_ip: 1)
+  let first = start_server(limits, None)
+  let second = start_server(limits, None)
+  let a = open(first)
+  let b = open(second)
+  let assert 1 = ws_slots(first, host)
+  let assert 1 = ws_slots(second, host)
+  raw_close(a.socket)
+  raw_close(b.socket)
 }
 
 // --- Liveness ---

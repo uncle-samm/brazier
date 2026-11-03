@@ -138,6 +138,12 @@ with its own changelog, so they are not listed here.
   `middleware.compress` passes a file body through uncompressed.
 - (WS10b) A request under the static prefix that names no file answers 404.
   It used to fall through to the page and answer 200 `text/html`.
+- (WS10b) The per-IP WebSocket slots are kept by the listener's connection
+  owner (`beacon_http_conns`), which releases a slot when its handler exits
+  for any reason. They used to live in a `beacon_ws_pg` pg scope that the
+  first upgrade started outside any supervisor. With it go the
+  `local_port_unavailable` upgrade outcome and `ws.get_ip_slot_count`; tests
+  read `server.get_ws_connection_count_for_ip`.
 
 ### Fixed
 

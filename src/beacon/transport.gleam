@@ -447,8 +447,6 @@ pub type ConnectionState {
     reassembly: ws.Reassembly,
     /// Peer IP address, for logs.
     peer_ip: String,
-    /// Per-IP slot this connection holds (released on cleanup).
-    slot_key: String,
     /// The original upgrade request (for periodic `ws_auth` re-checks).
     request: Request(Connection),
     /// The configured `ws_auth`, re-run every `ws_auth_recheck_interval_ms`.
@@ -1579,7 +1577,7 @@ fn cleanup_connection(state: ConnectionState) -> Nil {
   cancel_timer(state.pong_timer)
   cancel_timer(state.idle_timer)
   cancel_timer(state.auth_timer)
-  ws.release_ip_slot(state.slot_key)
+  ws.release_ip_slot()
   let conn_count = connection_tracker_decrement()
   log.debug(
     "beacon.transport",
@@ -1699,7 +1697,7 @@ fn ws_loop_inner(
 
 /// Identity of an admitted connection, carried from admission to startup.
 type Admission {
-  Admission(conn_id: ConnectionId, peer_ip: String, slot_key: String)
+  Admission(conn_id: ConnectionId, peer_ip: String)
 }
 
 /// Start a WebSocket connection on an already-upgraded socket.
@@ -1758,7 +1756,6 @@ fn start_ws_connection(
           buffer: <<>>,
           reassembly: ws.create_reassembly(),
           peer_ip: admission.peer_ip,
-          slot_key: admission.slot_key,
           request: req,
           ws_auth: config.ws_auth,
           last_activity_ms: now,
@@ -1835,7 +1832,7 @@ fn start_ws_connection(
         close_label,
         conn_id,
       )
-      ws.release_ip_slot(admission.slot_key)
+      ws.release_ip_slot()
       let conn_count = connection_tracker_decrement()
       log.debug(
         "beacon.transport",
@@ -2061,10 +2058,6 @@ pub fn origin_allowed_for_host(
   origin_allowed(origin, "http", request_host, [])
 }
 
-/// Handle a WebSocket upgrade request on a raw socket.
-/// Admission order: limits sanity, global cap, per-IP cap, origin, auth,
-/// then RFC 6455 handshake validation. Every rejection is logged with the
-/// connection id and peer address and releases what was acquired.
 /// How a WebSocket upgrade request ended: upgraded (the 101 was written
 /// and the connection starts) or refused with a fixed snake_case label,
 /// the `result` of the `[beacon, ws, upgrade]` span.
@@ -2080,6 +2073,10 @@ fn upgrade_outcome_label(outcome: UpgradeOutcome) -> String {
   }
 }
 
+/// Handle a WebSocket upgrade request on a raw socket.
+/// Admission order: global cap, per-IP cap, origin, auth, then RFC 6455
+/// handshake validation. Every rejection is logged with the connection id
+/// and peer address and releases what was acquired.
 fn handle_ws_request(
   socket: Socket,
   req: Request(Connection),
@@ -2120,7 +2117,7 @@ fn admit_ws_request(
         socket,
         conn_id,
         peer_ip,
-        None,
+        False,
         503,
         "Too many connections",
         "global connection limit reached ("
@@ -2129,32 +2126,9 @@ fn admit_ws_request(
           <> int.to_string(limits.max_connections)
           <> ")",
       )
-    False ->
-      // Slots are scoped by the port the socket was accepted on (not the
-      // configured port, which is 0 for OS-assigned listeners) so two
-      // listeners in one VM never share per-IP counts.
-      case server.get_local_port(socket) {
-        Error(reason) ->
-          reject_ws_request(
-            "local_port_unavailable",
-            socket,
-            conn_id,
-            peer_ip,
-            None,
-            500,
-            "Server error",
-            "could not read local port: " <> reason,
-          )
-        Ok(local_port) ->
-          acquire_ws_slot(
-            socket,
-            req,
-            config,
-            conn_id,
-            peer_ip,
-            int.to_string(local_port) <> "|" <> peer_ip,
-          )
-      }
+    // The slots belong to this listener's connection owner, so two
+    // listeners in one VM never share per-IP counts.
+    False -> acquire_ws_slot(socket, req, config, conn_id, peer_ip)
   }
 }
 
@@ -2164,17 +2138,16 @@ fn acquire_ws_slot(
   config: TransportConfig,
   conn_id: ConnectionId,
   peer_ip: String,
-  slot_key: String,
 ) -> UpgradeOutcome {
   let limits = config.security_limits
-  case ws.acquire_ip_slot(slot_key, limits.max_ws_connections_per_ip) {
+  case ws.acquire_ip_slot(peer_ip, limits.max_ws_connections_per_ip) {
     Error(count) ->
       reject_ws_request(
         "rejected_ip_limit",
         socket,
         conn_id,
         peer_ip,
-        None,
+        False,
         429,
         "Too many connections from this address",
         "per-IP WebSocket limit reached (" <> int.to_string(count) <> ")",
@@ -2184,7 +2157,7 @@ fn acquire_ws_slot(
         socket,
         req,
         config,
-        Admission(conn_id: conn_id, peer_ip: peer_ip, slot_key: slot_key),
+        Admission(conn_id: conn_id, peer_ip: peer_ip),
       )
   }
 }
@@ -2201,7 +2174,7 @@ fn authorize_ws_request(
       socket,
       admission.conn_id,
       admission.peer_ip,
-      Some(admission.slot_key),
+      True,
       status,
       body,
       reason,
@@ -2278,7 +2251,7 @@ fn upgrade_ws_request(
           <> reason,
       )
       server.close(socket)
-      ws.release_ip_slot(admission.slot_key)
+      ws.release_ip_slot()
       release_connection_slot("upgrade write failed")
       Refused("upgrade_write_failed")
     }
@@ -2300,7 +2273,7 @@ fn reject_unsupported_version(
       <> ") status 426: "
       <> description,
   )
-  ws.release_ip_slot(admission.slot_key)
+  ws.release_ip_slot()
   release_connection_slot("unsupported WebSocket version")
   let resp =
     response.new(426)
@@ -2329,7 +2302,7 @@ fn reject_ws_request(
   socket: Socket,
   conn_id: ConnectionId,
   peer_ip: String,
-  slot_key: Option(String),
+  holds_slot: Bool,
   status: Int,
   body: String,
   reason: String,
@@ -2345,9 +2318,9 @@ fn reject_ws_request(
       <> ": "
       <> reason,
   )
-  case slot_key {
-    Some(key) -> ws.release_ip_slot(key)
-    None -> Nil
+  case holds_slot {
+    True -> ws.release_ip_slot()
+    False -> Nil
   }
   release_connection_slot("WebSocket request rejected")
   transport_http.write_error(socket, status, body)

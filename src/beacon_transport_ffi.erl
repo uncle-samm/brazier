@@ -30,9 +30,6 @@
     ws_decode_key/1,
     ws_set_send_timeout/2,
     ws_peer_ip/1,
-    ws_acquire_ip_slot/2,
-    ws_release_ip_slot/1,
-    ws_ip_slot_count/1,
     ws_now_ms/0,
     ws_classify_message/1,
     ws_mailbox_len/0
@@ -806,47 +803,8 @@ ws_peer_ip(Socket) ->
         {error, Reason} -> {error, format_reason(Reason)}
     end.
 
-%% --- Per-IP WebSocket slots ---
-%% The calling process joins the pg group {beacon_ws_ip, SlotKey}, where
-%% SlotKey identifies a listener and a peer IP. pg removes a member
-%% automatically when it exits, so a crashed handler can never leak a slot.
-%% Join-then-count is race free: two concurrent joins may both see the other
-%% and both be rejected, but the cap can never be exceeded.
--define(WS_PG_SCOPE, beacon_ws_pg).
-
-ensure_ws_pg() ->
-    case pg:start(?WS_PG_SCOPE) of
-        {ok, _Pid} -> ok;
-        {error, {already_started, _Pid}} -> ok
-    end.
-
-%% Returns {ok, Count} when the slot was taken, {error, Count} when the cap
-%% would be exceeded (the caller has already been removed from the group).
-ws_acquire_ip_slot(SlotKey, Max) when is_binary(SlotKey), is_integer(Max), Max > 0 ->
-    ensure_ws_pg(),
-    Group = {beacon_ws_ip, SlotKey},
-    ok = pg:join(?WS_PG_SCOPE, Group, self()),
-    Count = length(pg:get_local_members(?WS_PG_SCOPE, Group)),
-    case Count > Max of
-        true ->
-            ok = pg:leave(?WS_PG_SCOPE, Group, self()),
-            {error, Count - 1};
-        false ->
-            {ok, Count}
-    end.
-
-%% Release the calling process's slot. Idempotent: returns true when a slot
-%% was held, false when it had already been released.
-ws_release_ip_slot(SlotKey) when is_binary(SlotKey) ->
-    ensure_ws_pg(),
-    case pg:leave(?WS_PG_SCOPE, {beacon_ws_ip, SlotKey}, self()) of
-        ok -> true;
-        not_joined -> false
-    end.
-
-ws_ip_slot_count(SlotKey) when is_binary(SlotKey) ->
-    ensure_ws_pg(),
-    length(pg:get_local_members(?WS_PG_SCOPE, {beacon_ws_ip, SlotKey})).
+%% Per-IP WebSocket slots are kept by the listener's connection owner; see
+%% beacon_http_conns:ws_acquire_self/2.
 
 %% Monotonic clock in milliseconds (liveness bookkeeping).
 ws_now_ms() ->

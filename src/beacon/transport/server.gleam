@@ -363,6 +363,16 @@ pub fn get_connection_count_for_ip(
   ffi_conns_count_for_ip(listener.conns, address)
 }
 
+/// Number of live WebSockets on this listener from one client IP: the
+/// address the per-IP WebSocket cap counts, which behind a trusted proxy is
+/// the forwarded client.
+pub fn get_ws_connection_count_for_ip(
+  listener: Listener,
+  address: String,
+) -> Int {
+  ffi_conns_ws_count_for_ip(listener.conns, address)
+}
+
 /// Pids of the live connection handler processes.
 pub fn get_connection_pids(listener: Listener) -> List(process.Pid) {
   ffi_conns_children(listener.conns)
@@ -510,6 +520,9 @@ fn ffi_conns_count(name: ConnsName) -> Int
 
 @external(erlang, "beacon_http_conns", "count_for_ip_text")
 fn ffi_conns_count_for_ip(name: ConnsName, address: String) -> Result(Int, Nil)
+
+@external(erlang, "beacon_http_conns", "ws_count_for_ip")
+fn ffi_conns_ws_count_for_ip(name: ConnsName, address: String) -> Int
 
 @external(erlang, "beacon_http_conns", "children")
 fn ffi_conns_children(name: ConnsName) -> List(process.Pid)
