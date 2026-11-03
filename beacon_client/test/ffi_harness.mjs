@@ -26,8 +26,8 @@ copyFileSync(join(SRC, "beacon_client", "patch.mjs"), join(WORK, "beacon_client"
 const clock = { now: 0 };
 let timers = [];
 let timerSeq = 0;
-function addTimer(fn, ms, interval, frame = false) {
-  const t = { id: ++timerSeq, at: clock.now + Math.max(0, ms || 0), fn, interval, frame };
+function addTimer(fn, ms, interval) {
+  const t = { id: ++timerSeq, at: clock.now + Math.max(0, ms || 0), fn, interval };
   timers.push(t);
   return t.id;
 }
@@ -38,7 +38,11 @@ globalThis.setTimeout = (fn, ms) => addTimer(fn, ms, null);
 globalThis.clearTimeout = removeTimer;
 globalThis.setInterval = (fn, ms) => addTimer(fn, ms, ms);
 globalThis.clearInterval = removeTimer;
-globalThis.requestAnimationFrame = (fn) => addTimer(fn, 16, null, true);
+// The client renders when an event is handled, never on an animation frame
+// (frames do not run in background tabs).
+globalThis.requestAnimationFrame = () => {
+  throw new Error("the client must not wait for an animation frame");
+};
 Object.defineProperty(globalThis, "performance", {
   configurable: true,
   value: { now: () => clock.now, mark() {}, measure() {} },
@@ -58,9 +62,8 @@ function advance(ms) {
 function pendingTimeouts() {
   return timers.filter((t) => !t.interval);
 }
-// Reconnect timers are the pending timeouts that are not render frames.
 function reconnectTimers() {
-  return pendingTimeouts().filter((t) => !t.frame);
+  return pendingTimeouts();
 }
 
 // --- fake WebSocket ---
@@ -381,6 +384,8 @@ let renders = 0;
 // spec.view(model, local) returns { html, handlers }, each handler being
 // { name, id, decode(event) -> Result, prevent, stop, debounce, throttle }.
 // spec.simple adds spec.update; spec.state.crash makes update_local throw.
+// spec.initLocal and spec.updateLocal(model, local, msg) -> [local, forward]
+// replace the default Local layer (null local, forward unless msg.local).
 function makeApp(spec = {}) {
   const view = spec.view || (() => ({ html: "", handlers: [] }));
   const app = {
@@ -390,7 +395,7 @@ function makeApp(spec = {}) {
       decoded.push(value);
       return ok(value);
     },
-    init_local: () => null,
+    init_local: (model) => (spec.initLocal ? spec.initLocal(model) : null),
     render(model, local) {
       renders++;
       const out = view(model, local);
@@ -402,6 +407,7 @@ function makeApp(spec = {}) {
     event_names: (table) => ({ toArray: () => [...new Set([...table.values()].map((h) => h.name))] }),
     update_local(model, local, msg) {
       if (spec.state && spec.state.crash) throw new Error("boom");
+      if (spec.updateLocal) return spec.updateLocal(model, local, msg);
       return [local, msg.local !== true];
     },
     encode_msg: (msg) => JSON.stringify({ __beacon_msg: msg }),
@@ -770,8 +776,7 @@ scenario("a click runs its decoder and sends the encoded Msg with the position i
   const rendersBefore = renders;
   fire(el('[data-beacon-on-click="0.1"]'), "click");
   assert.equal(s.events().length, 2, "a Msg the Local layer handles is not sent");
-  advance(16);
-  assert.equal(renders, rendersBefore + 1, "a local Msg re-renders on the next frame");
+  assert.equal(renders, rendersBefore + 1, "a local Msg re-renders before the event returns");
   const stale = new FakeElement("i");
   stale.setAttribute("data-beacon-on-click", "9.9");
   root.appendChild(stale);
@@ -889,6 +894,64 @@ scenario("submit events carry the form's fields as detail.formData", async () =>
   const submitted = fire(el("form[data-beacon-on-submit]"), "submit", { submitter: el('[name="go"]') });
   assert.equal(submitted.defaultPrevented, true);
   assert.deepEqual(s.msgs(), [{ fields: [["title", "hello"], ["go", "1"]] }]);
+});
+
+scenario("each event renders before it returns, so the next one runs current handlers", async () => {
+  // The submit handler closes over the draft, as `on_submit(fn(_) { Add(local.draft) })` does.
+  const view = (_model, local) => ({
+    html:
+      '<form data-beacon-on-submit="0"><input name="draft" value="' + local.draft + '" data-beacon-on-input="0.0">' +
+      (local.removed ? "" : '<button data-beacon-on-click="0.1">x</button>') +
+      "</form>",
+    handlers: [
+      { name: "input", id: "0.0", decode: (e) => ok({ draft: e.target.value }) },
+      { name: "submit", id: "0", prevent: true, decode: () => ok({ add: local.draft }) },
+      { name: "click", id: "0.1", decode: () => ok({ removeButton: true }) },
+    ],
+  });
+  const updateLocal = (_model, local, msg) => {
+    if (msg.draft !== undefined) return [{ ...local, draft: msg.draft }, false];
+    if (msg.removeButton) return [{ ...local, removed: true }, false];
+    return [local, true];
+  };
+  const spec = { view, updateLocal, initLocal: () => ({ draft: "", removed: false }) };
+  await loadRuntime(spec);
+  const s = sockets[0];
+  s.open();
+  sync(s, 0, {});
+  const input = el('[name="draft"]');
+  document.activeElement = input;
+  for (const typed of ["m", "mi", "milk"]) {
+    const before = renders;
+    input.value = typed;
+    fire(input, "input");
+    assert.equal(renders, before + 1, "a handled input renders before the event returns");
+    assert.equal(input.value, typed, "the focused input keeps what was typed");
+  }
+  fire(el("form[data-beacon-on-submit]"), "submit");
+  assert.deepEqual(s.msgs(), [{ add: "milk" }], "the submit right after the input sees its draft");
+
+  // Unhappy path: an event on an element the last render removed is ignored.
+  const button = el('[data-beacon-on-click="0.1"]');
+  fire(button, "click");
+  assert.equal(root.querySelector('[data-beacon-on-click="0.1"]'), null, "the click's render removed the button");
+  const rendersAfterRemoval = renders;
+  fire(button, "click");
+  assert.equal(renders, rendersAfterRemoval, "a click on the removed button does nothing");
+  assert.deepEqual(s.msgs(), [{ add: "milk" }]);
+  assert.equal(errorsMatching("invariant").length, 0);
+
+  // Replayed early events render one by one too: the replayed submit sees
+  // the draft of the replayed input before it, not the server-rendered page's.
+  await loadRuntime({ ...spec, ssr: view(null, { draft: "", removed: false }).html });
+  const early = sockets[0];
+  early.open();
+  const earlyInput = el('[name="draft"]');
+  earlyInput.value = "eggs";
+  fire(earlyInput, "input");
+  fire(el("form[data-beacon-on-submit]"), "submit");
+  sync(early, 0, {});
+  assert.deepEqual(early.msgs(), [{ add: "eggs" }]);
 });
 
 // --- pre-hydration events ---

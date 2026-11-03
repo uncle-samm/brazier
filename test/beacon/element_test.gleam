@@ -97,6 +97,28 @@ pub fn repeated_style_attributes_are_joined_test() {
     element.to_string(node)
 }
 
+pub fn styles_renders_declarations_in_order_test() {
+  let node =
+    html.div(
+      [
+        attribute.styles([#("color", "red"), #("margin", "0")]),
+        attribute.style("padding", "1px"),
+      ],
+      [],
+    )
+  let assert "<div style=\"color:red;margin:0;padding:1px\"></div>" =
+    element.to_string(node)
+}
+
+pub fn styles_with_no_declarations_adds_no_attribute_test() {
+  let assert "<div></div>" =
+    element.to_string(html.div([attribute.styles([])], []))
+  let assert "<div style=\"color:red\"></div>" =
+    element.to_string(
+      html.div([attribute.styles([]), attribute.style("color", "red")], []),
+    )
+}
+
 pub fn classes_includes_only_enabled_names_test() {
   let node =
     html.div(

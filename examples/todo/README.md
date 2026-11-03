@@ -1,19 +1,27 @@
 # Todo App
 
-Full-featured todo list with filters, shared store, and local filter state.
+A shared todo list built with `beacon.full_application`.
 
 ## Features
 
-- CRUD: add, toggle, delete, clear completed
-- Local filter state (All/Active/Completed) with zero server traffic
-- Derived "items left" counter computed in view, not stored in model
-- Multi-user sync via shared store and PubSub
+- Add, toggle, delete and clear completed todos
+- The draft and the filter (All/Active/Completed) live in the Local layer:
+  typing and filtering never reach the server
+- One list for every session, kept in a `beacon/store` list as an
+  append-only change log, so concurrent sessions never overwrite each other
+- The store broadcasts on its topic; every session subscribes to it and
+  re-reads the log (`beacon.subscriptions` and `beacon.on_notify`)
+- "items left" is derived in the view, not stored in the model
+- The server rejects empty or over-long todos and changes to unknown todos,
+  with a logged warning
 
 ## Run
 
 ```bash
 cd examples/todo
+gleam run -m beacon/build   # after changing the source
 gleam run
 ```
 
-Open http://localhost:8080 -- add todos, toggle them, filter by status, open multiple tabs.
+Open http://localhost:8080, add and toggle todos, filter them, and open a
+second tab to see changes arrive.

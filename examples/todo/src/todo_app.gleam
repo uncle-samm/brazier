@@ -1,16 +1,21 @@
-/// Todo App — demonstrates:
-/// - Form input with validation (reject empty)
-/// - CRUD operations (add, toggle, delete, clear completed)
-/// - LOCAL filter state (All/Active/Completed, zero server traffic)
-/// - Derived values in view (items left counter, NOT stored in model)
-/// - Multi-user via shared store
-/// - Patch patterns: append (add), replace (toggle/delete)
+/// Todo App, demonstrating:
+/// - a draft and a filter kept in Local state (no server traffic while
+///   typing or filtering);
+/// - a shared todo list for every session, kept in a `beacon/store` list as
+///   an append-only change log, so concurrent sessions never overwrite each
+///   other's changes;
+/// - a PubSub subscription that re-reads the log when another session
+///   changes it;
+/// - derived values in the view ("items left" is not stored).
 import beacon
-import beacon/effect
+import beacon/attribute
+import beacon/effect.{type Effect}
+import beacon/element.{type Element}
+import beacon/event
 import beacon/html
+import beacon/local
 import beacon/log
-import beacon/pubsub
-import beacon/store
+import beacon/store.{type ListStore}
 import gleam/int
 import gleam/list
 import gleam/string
@@ -21,219 +26,262 @@ pub type Todo {
   Todo(id: Int, text: String, completed: Bool)
 }
 
+/// Synced to the browser.
 pub type Model {
-  Model(todos: List(Todo), input_text: String, next_id: Int)
+  Model(todos: List(Todo))
 }
 
+pub type Filter {
+  All
+  Active
+  Completed
+}
+
+/// Client-only.
 pub type Local {
-  Local(
-    /// "all", "active", or "completed"
-    filter: String,
-  )
+  Local(draft: String, filter: Filter)
 }
 
 pub type Msg {
-  AddTodo
-  ToggleTodo(String)
-  DeleteTodo(String)
-  SetInput(String)
-  SetFilter(String)
+  DraftChanged(String)
+  SetFilter(Filter)
+  AddTodo(String)
+  ToggleTodo(Int)
+  DeleteTodo(Int)
   ClearCompleted
-  TodosUpdated
-  SetTodos(List(Todo))
+  /// Another session (or this one) changed the shared log.
+  TodosChanged
 }
 
-// --- Init ---
-
-pub fn init() -> Model {
-  Model(todos: [], input_text: "", next_id: 1)
+/// One entry of the shared change log. A todo's id is the log position of
+/// its `Added` change, which is the same for every reader because a local
+/// list store returns values in insertion order. Server-only: the log is
+/// never sent to the browser.
+pub type Change {
+  Added(text: String)
+  Toggled(id: Int)
+  Deleted(id: Int)
+  ClearedCompleted
 }
+
+const log_key = "todos"
+
+const max_todo_length = 200
+
+// --- Shared log ---
+
+fn replay(changes: List(Change)) -> List(Todo) {
+  let #(reversed, _position) =
+    list.fold(changes, #([], 0), fn(acc, change) {
+      let #(todos, position) = acc
+      let todos = case change {
+        Added(text) -> [Todo(id: position, text:, completed: False), ..todos]
+        Toggled(id) ->
+          list.map(todos, fn(t) {
+            case t.id == id {
+              True -> Todo(..t, completed: !t.completed)
+              False -> t
+            }
+          })
+        Deleted(id) -> list.filter(todos, fn(t) { t.id != id })
+        ClearedCompleted -> list.filter(todos, fn(t) { !t.completed })
+      }
+      #(todos, position + 1)
+    })
+  list.reverse(reversed)
+}
+
+fn read_todos(changes: ListStore(Change)) -> List(Todo) {
+  replay(store.get_all(changes, log_key))
+}
+
+/// Append a change; the store broadcasts on its topic, which every session
+/// (this one included) turns into `TodosChanged`.
+fn record(changes: ListStore(Change), change: Change) -> Effect(Msg) {
+  effect.from(fn(_dispatch) { store.append(changes, log_key, change) })
+}
+
+// --- Init and update (server) ---
+
+fn init(changes: ListStore(Change)) -> #(Model, Effect(Msg)) {
+  #(Model(todos: read_todos(changes)), effect.none())
+}
+
+fn update(
+  changes: ListStore(Change),
+  model: Model,
+  msg: Msg,
+) -> #(Model, Effect(Msg)) {
+  case msg {
+    AddTodo(text) -> {
+      let text = string.trim(text)
+      case string.is_empty(text), string.length(text) > max_todo_length {
+        True, _ -> {
+          log.warning("todo_app", "Rejected an empty todo")
+          #(model, effect.none())
+        }
+        _, True -> {
+          log.warning(
+            "todo_app",
+            "Rejected a todo of "
+              <> int.to_string(string.length(text))
+              <> " characters (max "
+              <> int.to_string(max_todo_length)
+              <> ")",
+          )
+          #(model, effect.none())
+        }
+        False, False -> #(model, record(changes, Added(text)))
+      }
+    }
+    ToggleTodo(id) -> change_existing(changes, model, id, Toggled(id), "toggle")
+    DeleteTodo(id) -> change_existing(changes, model, id, Deleted(id), "delete")
+    ClearCompleted -> #(model, record(changes, ClearedCompleted))
+    TodosChanged -> #(Model(todos: read_todos(changes)), effect.none())
+    // `update_local` handles these in the browser and never forwards them.
+    DraftChanged(_) | SetFilter(_) -> #(model, effect.none())
+  }
+}
+
+fn change_existing(
+  changes: ListStore(Change),
+  model: Model,
+  id: Int,
+  change: Change,
+  action: String,
+) -> #(Model, Effect(Msg)) {
+  case list.any(model.todos, fn(t) { t.id == id }) {
+    True -> #(model, record(changes, change))
+    False -> {
+      log.warning(
+        "todo_app",
+        "Ignored " <> action <> " of unknown todo " <> int.to_string(id),
+      )
+      #(model, effect.none())
+    }
+  }
+}
+
+// --- Local (browser) ---
 
 pub fn init_local(_model: Model) -> Local {
-  Local(filter: "all")
+  Local(draft: "", filter: All)
 }
 
-// --- Update (pure — compiles to JS) ---
-
-pub fn update(
-  model: Model,
+pub fn update_local(
+  _model: Model,
   local: Local,
-  _server: Nil,
   msg: Msg,
-) -> #(Model, Local, Nil) {
-  let #(model, local) = case msg {
-    SetInput(text) -> #(Model(..model, input_text: text), local)
-
-    SetFilter(f) -> #(model, Local(filter: f))
-
-    AddTodo -> {
-      let title = string.trim(model.input_text)
-      case string.is_empty(title) {
-        True -> #(model, local)
-        False -> {
-          let new_todo = Todo(id: model.next_id, text: title, completed: False)
-          #(
-            Model(
-              todos: list.append(model.todos, [new_todo]),
-              input_text: "",
-              next_id: model.next_id + 1,
-            ),
-            local,
-          )
-        }
+) -> local.Update(Local) {
+  case msg {
+    DraftChanged(text) -> local.handled(Local(..local, draft: text))
+    SetFilter(filter) -> local.handled(Local(..local, filter:))
+    AddTodo(text) ->
+      case string.trim(text) {
+        "" -> local.handled(local)
+        _ -> local.forward(Local(..local, draft: ""))
       }
-    }
-
-    ToggleTodo(id_str) -> {
-      case int.parse(id_str) {
-        Ok(id) -> {
-          let new_todos =
-            list.map(model.todos, fn(t) {
-              case t.id == id {
-                True -> Todo(..t, completed: !t.completed)
-                False -> t
-              }
-            })
-          #(Model(..model, todos: new_todos), local)
-        }
-        Error(_) -> {
-          log.warning("todo_app", "Invalid todo id for toggle: " <> id_str)
-          #(model, local)
-        }
-      }
-    }
-
-    DeleteTodo(id_str) -> {
-      case int.parse(id_str) {
-        Ok(id) -> {
-          let new_todos = list.filter(model.todos, fn(t) { t.id != id })
-          #(Model(..model, todos: new_todos), local)
-        }
-        Error(_) -> {
-          log.warning("todo_app", "Invalid todo id for delete: " <> id_str)
-          #(model, local)
-        }
-      }
-    }
-
-    ClearCompleted -> {
-      let new_todos = list.filter(model.todos, fn(t) { !t.completed })
-      #(Model(..model, todos: new_todos), local)
-    }
-
-    TodosUpdated -> #(model, local)
-
-    SetTodos(todos) -> {
-      let next_id = case
-        list.fold(todos, 0, fn(max, t) {
-          case t.id > max {
-            True -> t.id
-            False -> max
-          }
-        })
-      {
-        0 -> model.next_id
-        max -> max + 1
-      }
-      #(Model(..model, todos: todos, next_id: next_id), local)
-    }
+    ToggleTodo(_) | DeleteTodo(_) | ClearCompleted | TodosChanged ->
+      local.forward(local)
   }
-  #(model, local, Nil)
 }
 
-// --- Side Effects ---
-
-fn make_on_update(
-  todo_store: store.ListStore(Todo),
-) -> fn(#(Model, Local, Nil), Msg) -> effect.Effect(Msg) {
-  fn(state: #(Model, Local, Nil), msg: Msg) -> effect.Effect(Msg) {
-    let #(model, _local, _server) = state
-    case msg {
-      AddTodo | ToggleTodo(_) | DeleteTodo(_) | ClearCompleted -> {
-        effect.from(fn(_dispatch) {
-          let store_count = list.length(store.get_all(todo_store, "todos"))
-          let model_count = list.length(model.todos)
-          case model_count != store_count || model_count == 0 {
-            True -> {
-              store.delete_all(todo_store, "todos")
-              store.append_many(todo_store, "todos", model.todos)
-              pubsub.broadcast("todo:updated", Nil)
-            }
-            False -> {
-              store.delete_all(todo_store, "todos")
-              store.append_many(todo_store, "todos", model.todos)
-              pubsub.broadcast("todo:updated", Nil)
-            }
-          }
-        })
-      }
-      TodosUpdated -> {
-        let store_todos = store.get_all(todo_store, "todos")
-        case list.length(store_todos) != list.length(model.todos) {
-          True -> effect.from(fn(dispatch) { dispatch(SetTodos(store_todos)) })
-          False -> effect.none()
-        }
-      }
-      _ -> effect.none()
-    }
-  }
+fn sync(model: Model) -> Model {
+  model
 }
 
 // --- View ---
 
-pub fn view(model: Model, local: Local) -> beacon.Node(Msg) {
-  let filtered_todos = case local.filter {
-    "active" -> list.filter(model.todos, fn(t) { !t.completed })
-    "completed" -> list.filter(model.todos, fn(t) { t.completed })
-    _ -> model.todos
+pub fn view(model: Model, local: Local) -> Element(Msg) {
+  let visible = case local.filter {
+    All -> model.todos
+    Active -> list.filter(model.todos, fn(t) { !t.completed })
+    Completed -> list.filter(model.todos, fn(t) { t.completed })
   }
-  let active_count =
-    list.length(list.filter(model.todos, fn(t) { !t.completed }))
+  let active_count = list.count(model.todos, fn(t) { !t.completed })
   let has_completed = list.any(model.todos, fn(t) { t.completed })
 
   html.div(
     [
-      html.style(
-        "font-family:system-ui;max-width:500px;margin:2rem auto;padding:0 1rem",
-      ),
+      attribute.styles([
+        #("font-family", "system-ui"),
+        #("max-width", "500px"),
+        #("margin", "2rem auto"),
+        #("padding", "0 1rem"),
+      ]),
     ],
     [
       html.h1([], [html.text("Todo App")]),
-      // Input form
-      html.div([html.style("display:flex;gap:8px;margin-bottom:1rem")], [
-        html.input([
-          html.type_("text"),
-          html.placeholder("What needs to be done?"),
-          html.value(model.input_text),
-          beacon.on_input(SetInput),
-          html.style(
-            "flex:1;padding:10px;border:1px solid #ddd;border-radius:6px;font-size:14px",
+      html.form(
+        [
+          event.on_submit(fn(_fields) { AddTodo(local.draft) }),
+          attribute.styles([
+            #("display", "flex"),
+            #("gap", "8px"),
+            #("margin-bottom", "1rem"),
+          ]),
+        ],
+        [
+          html.input([
+            attribute.type_("text"),
+            attribute.placeholder("What needs to be done?"),
+            attribute.value(local.draft),
+            event.on_input(DraftChanged),
+            attribute.styles([
+              #("flex", "1"),
+              #("padding", "10px"),
+              #("border", "1px solid #ddd"),
+              #("border-radius", "6px"),
+              #("font-size", "14px"),
+            ]),
+          ]),
+          html.button(
+            [
+              attribute.type_("submit"),
+              attribute.styles([
+                #("padding", "10px 20px"),
+                #("background", "#4CAF50"),
+                #("color", "white"),
+                #("border", "none"),
+                #("border-radius", "6px"),
+                #("cursor", "pointer"),
+              ]),
+            ],
+            [html.text("Add")],
           ),
-        ]),
-        html.button(
-          [
-            beacon.on_click(AddTodo),
-            html.style(
-              "padding:10px 20px;background:#4CAF50;color:white;border:none;border-radius:6px;cursor:pointer",
-            ),
-          ],
-          [html.text("Add")],
-        ),
-      ]),
-      // Filter buttons
-      html.div([html.style("display:flex;gap:8px;margin-bottom:1rem")], [
-        filter_button("all", "All", local.filter),
-        filter_button("active", "Active", local.filter),
-        filter_button("completed", "Completed", local.filter),
-      ]),
-      // Todo list
-      html.div([], list.map(filtered_todos, fn(t) { render_todo(t) })),
-      // Footer
+        ],
+      ),
       html.div(
         [
-          html.style(
-            "display:flex;justify-content:space-between;margin-top:1rem;padding-top:0.5rem;border-top:1px solid #eee;color:#666;font-size:14px",
-          ),
+          attribute.styles([
+            #("display", "flex"),
+            #("gap", "8px"),
+            #("margin-bottom", "1rem"),
+          ]),
+        ],
+        [
+          filter_button(All, "All", local.filter),
+          filter_button(Active, "Active", local.filter),
+          filter_button(Completed, "Completed", local.filter),
+        ],
+      ),
+      html.div(
+        [],
+        list.map(visible, fn(t) {
+          element.keyed(int.to_string(t.id), render_todo(t))
+        }),
+      ),
+      html.div(
+        [
+          attribute.styles([
+            #("display", "flex"),
+            #("justify-content", "space-between"),
+            #("margin-top", "1rem"),
+            #("padding-top", "0.5rem"),
+            #("border-top", "1px solid #eee"),
+            #("color", "#666"),
+            #("font-size", "14px"),
+          ]),
         ],
         [
           html.span([], [
@@ -251,14 +299,19 @@ pub fn view(model: Model, local: Local) -> beacon.Node(Msg) {
             True ->
               html.button(
                 [
-                  beacon.on_click(ClearCompleted),
-                  html.style(
-                    "background:none;border:1px solid #ddd;border-radius:4px;padding:4px 12px;cursor:pointer;color:#666",
-                  ),
+                  event.on_click(ClearCompleted),
+                  attribute.styles([
+                    #("background", "none"),
+                    #("border", "1px solid #ddd"),
+                    #("border-radius", "4px"),
+                    #("padding", "4px 12px"),
+                    #("cursor", "pointer"),
+                    #("color", "#666"),
+                  ]),
                 ],
                 [html.text("Clear completed")],
               )
-            False -> html.text("")
+            False -> element.none()
           },
         ],
       ),
@@ -266,40 +319,61 @@ pub fn view(model: Model, local: Local) -> beacon.Node(Msg) {
   )
 }
 
-fn render_todo(item: Todo) -> beacon.Node(Msg) {
-  let style = case item.completed {
-    True -> "text-decoration:line-through;color:#999"
-    False -> "color:#333"
+fn render_todo(item: Todo) -> Element(Msg) {
+  let text_style = case item.completed {
+    True -> [#("text-decoration", "line-through"), #("color", "#999")]
+    False -> [#("color", "#333")]
+  }
+  let toggle_background = case item.completed {
+    True -> "#4CAF50"
+    False -> "white"
   }
   html.div(
     [
-      html.style(
-        "display:flex;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid #f0f0f0",
-      ),
+      attribute.styles([
+        #("display", "flex"),
+        #("align-items", "center"),
+        #("gap", "8px"),
+        #("padding", "8px 0"),
+        #("border-bottom", "1px solid #f0f0f0"),
+      ]),
     ],
     [
       html.button(
         [
-          beacon.on_click(ToggleTodo(int.to_string(item.id))),
-          html.style(
-            "width:24px;height:24px;border:2px solid #ccc;border-radius:50%;cursor:pointer;background:"
-            <> case item.completed {
-              True -> "#4CAF50"
-              False -> "white"
-            },
-          ),
+          event.on_click(ToggleTodo(item.id)),
+          attribute.aria("label", "Toggle " <> item.text),
+          attribute.styles([
+            #("width", "24px"),
+            #("height", "24px"),
+            #("border", "2px solid #ccc"),
+            #("border-radius", "50%"),
+            #("cursor", "pointer"),
+            #("background", toggle_background),
+          ]),
         ],
         [],
       ),
-      html.span([html.style(style <> ";flex:1;font-size:14px")], [
-        html.text(item.text),
-      ]),
+      html.span(
+        [
+          attribute.styles(text_style),
+          attribute.styles([#("flex", "1"), #("font-size", "14px")]),
+        ],
+        [
+          html.text(item.text),
+        ],
+      ),
       html.button(
         [
-          beacon.on_click(DeleteTodo(int.to_string(item.id))),
-          html.style(
-            "background:none;border:none;color:#e57373;cursor:pointer;font-size:18px",
-          ),
+          event.on_click(DeleteTodo(item.id)),
+          attribute.aria("label", "Delete " <> item.text),
+          attribute.styles([
+            #("background", "none"),
+            #("border", "none"),
+            #("color", "#e57373"),
+            #("cursor", "pointer"),
+            #("font-size", "18px"),
+          ]),
         ],
         [html.text("x")],
       ),
@@ -308,21 +382,32 @@ fn render_todo(item: Todo) -> beacon.Node(Msg) {
 }
 
 fn filter_button(
-  value: String,
+  filter: Filter,
   label: String,
-  current: String,
-) -> beacon.Node(Msg) {
-  let bg = case value == current {
-    True -> "background:#e3f2fd;border-color:#2196F3;color:#2196F3"
-    False -> "background:white;border-color:#ddd;color:#666"
+  current: Filter,
+) -> Element(Msg) {
+  let colours = case filter == current {
+    True -> [
+      #("background", "#e3f2fd"),
+      #("border-color", "#2196F3"),
+      #("color", "#2196F3"),
+    ]
+    False -> [
+      #("background", "white"),
+      #("border-color", "#ddd"),
+      #("color", "#666"),
+    ]
   }
   html.button(
     [
-      beacon.on_click(SetFilter(value)),
-      html.style(
-        "padding:6px 16px;border:1px solid;border-radius:4px;cursor:pointer;"
-        <> bg,
-      ),
+      event.on_click(SetFilter(filter)),
+      attribute.styles([
+        #("padding", "6px 16px"),
+        #("border", "1px solid"),
+        #("border-radius", "4px"),
+        #("cursor", "pointer"),
+        ..colours
+      ]),
     ],
     [html.text(label)],
   )
@@ -331,38 +416,16 @@ fn filter_button(
 // --- Start ---
 
 pub fn main() {
-  start()
-}
-
-pub fn start() {
-  let todo_store = store.new_list("todo_items")
-
-  let init_from_store = fn() {
-    let todos = store.get_all(todo_store, "todos")
-    let max_id =
-      list.fold(todos, 0, fn(acc, t: Todo) {
-        case t.id > acc {
-          True -> t.id
-          False -> acc
-        }
-      })
-    let next_id = case max_id {
-      0 -> 1
-      n -> n + 1
-    }
-    Model(todos: todos, input_text: "", next_id: next_id)
-  }
-
-  beacon.app(
-    fn() { #(init_from_store(), effect.none()) },
-    init_local,
-    beacon.no_server,
-    update,
-    view,
+  let changes = store.new_list("todo_changes")
+  beacon.full_application(
+    init: fn(_ctx) { init(changes) },
+    update: fn(model, msg) { update(changes, model, msg) },
+    sync:,
+    local: local.layer(init: init_local, update: update_local),
+    view:,
   )
-  |> beacon.title("Todo App")
-  |> beacon.on_update(make_on_update(todo_store))
-  |> beacon.subscriptions(fn(_model) { ["todo:updated"] })
-  |> beacon.on_notify(fn(_topic) { TodosUpdated })
+  |> beacon.title(fn(_model) { "Todo App" })
+  |> beacon.subscriptions(fn(_model) { [store.list_topic(changes)] })
+  |> beacon.on_notify(fn(_topic) { TodosChanged })
   |> beacon.start(8080)
 }

@@ -1,17 +1,22 @@
-/// Counter with Local state — demonstrates Model + Local architecture.
-/// - Model.count is server state (shared, synced)
-/// - Local.input and Local.menu_open are client state (instant, per-tab)
+/// Counter with Local state: the Model + Local architecture.
+/// - `Model.count` is synced: the server holds it and the browser renders it.
+/// - `Local.input` and `Local.menu_open` are client-only: they change at once
+///   in the browser and are never sent to the server.
 import beacon
-import beacon/effect
+import beacon/attribute
+import beacon/effect.{type Effect}
+import beacon/element.{type Element}
+import beacon/event
 import beacon/html
+import beacon/local
 import gleam/int
 
-/// Server state — shared across users, synced via server.
+/// Synced state, held by the server.
 pub type Model {
   Model(count: Int)
 }
 
-/// Client state — instant, per-tab, never touches the server.
+/// Client-only state, per tab.
 pub type Local {
   Local(input: String, menu_open: Bool)
 }
@@ -23,7 +28,7 @@ pub type Msg {
   ToggleMenu
 }
 
-pub fn init() -> #(Model, effect.Effect(Msg)) {
+fn init(_ctx: beacon.Context) -> #(Model, Effect(Msg)) {
   #(Model(count: 0), effect.none())
 }
 
@@ -31,55 +36,66 @@ pub fn init_local(_model: Model) -> Local {
   Local(input: "", menu_open: False)
 }
 
-pub fn update(
-  model: Model,
-  local: Local,
-  _server: Nil,
-  msg: Msg,
-) -> #(Model, Local, Nil) {
-  let #(model, local) = case msg {
-    // These change Model → will sync with server when client-side execution is enabled
-    Increment -> #(Model(count: model.count + 1), local)
-    Decrement -> #(Model(count: model.count - 1), local)
-    // These only change Local → instant, zero server traffic
-    SetInput(text) -> #(model, Local(..local, input: text))
-    ToggleMenu -> #(model, Local(..local, menu_open: !local.menu_open))
+/// Runs in the browser. Local messages are handled here and never reach the
+/// server; the counter messages are forwarded to `update`.
+pub fn update_local(_model: Model, local: Local, msg: Msg) -> local.Update(Local) {
+  case msg {
+    SetInput(text) -> local.handled(Local(..local, input: text))
+    ToggleMenu -> local.handled(Local(..local, menu_open: !local.menu_open))
+    Increment | Decrement -> local.forward(local)
   }
-  #(model, local, Nil)
 }
 
-pub fn view(model: Model, local: Local) -> beacon.Node(Msg) {
-  html.div([html.class("counter-local")], [
+/// Runs on the server for forwarded messages.
+fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
+  case msg {
+    Increment -> #(Model(count: model.count + 1), effect.none())
+    Decrement -> #(Model(count: model.count - 1), effect.none())
+    // `update_local` handles these in the browser and never forwards them.
+    SetInput(_) | ToggleMenu -> #(model, effect.none())
+  }
+}
+
+fn sync(model: Model) -> Model {
+  model
+}
+
+pub fn view(model: Model, local: Local) -> Element(Msg) {
+  html.div([attribute.class("counter-local")], [
     html.h1([], [html.text("Counter with Local State")]),
-    // Server state
-    html.div([html.class("server-state")], [
+    html.div([attribute.class("server-state")], [
       html.p([], [html.text("Count (server): " <> int.to_string(model.count))]),
-      html.button([beacon.on_click(Decrement)], [html.text("-")]),
-      html.button([beacon.on_click(Increment)], [html.text("+")]),
+      html.button([event.on_click(Decrement)], [html.text("-")]),
+      html.button([event.on_click(Increment)], [html.text("+")]),
     ]),
-    // Local state — these would be instant with client-side execution
-    html.div([html.class("local-state")], [
+    html.div([attribute.class("local-state")], [
       html.p([], [html.text("Input (local): " <> local.input)]),
       html.input([
-        html.type_("text"),
-        html.placeholder("Type here (local state)..."),
-        html.value(local.input),
-        beacon.on_input(SetInput),
+        attribute.type_("text"),
+        attribute.placeholder("Type here (local state)..."),
+        attribute.value(local.input),
+        event.on_input(SetInput),
       ]),
-      html.button([beacon.on_click(ToggleMenu)], [html.text("Toggle Menu")]),
+      html.button([event.on_click(ToggleMenu)], [html.text("Toggle Menu")]),
       case local.menu_open {
         True ->
-          html.div([html.class("dropdown")], [
+          html.div([attribute.class("dropdown")], [
             html.p([], [html.text("Menu is open! (local state)")]),
           ])
-        False -> html.span([], [])
+        False -> element.none()
       },
     ]),
   ])
 }
 
 pub fn main() {
-  beacon.app(init, init_local, beacon.no_server, update, view)
-  |> beacon.title("Counter with Local State")
+  beacon.full_application(
+    init:,
+    update:,
+    sync:,
+    local: local.layer(init: init_local, update: update_local),
+    view:,
+  )
+  |> beacon.title(fn(_model) { "Counter with Local State" })
   |> beacon.start(8080)
 }

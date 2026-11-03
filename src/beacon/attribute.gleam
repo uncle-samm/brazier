@@ -211,6 +211,20 @@ pub fn style(property: String, value: String) -> Attribute(msg) {
   attribute("style", property <> ":" <> value)
 }
 
+/// Several inline style declarations as one `style` attribute, in order.
+/// An empty list adds no attribute. Like `style`, it joins with any other
+/// `style` attributes on the same element.
+pub fn styles(properties: List(#(String, String))) -> Attribute(msg) {
+  case properties {
+    [] -> none()
+    _ ->
+      properties
+      |> list.map(fn(pair) { pair.0 <> ":" <> pair.1 })
+      |> string.join(";")
+      |> attribute("style", _)
+  }
+}
+
 pub fn disabled(on: Bool) -> Attribute(msg) {
   boolean("disabled", on)
 }

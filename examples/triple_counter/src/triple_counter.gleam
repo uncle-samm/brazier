@@ -1,217 +1,215 @@
-/// Triple Counter — three counters in one app demonstrating all three state layers:
+/// Triple Counter: three counters, one per state layer.
 ///
-/// 1. SHARED counter — all users see the same count, synced via store+PubSub
-/// 2. SERVER counter — per-user, server-rendered, each tab has its own
-/// 3. LOCAL counter  — per-user, client-only, zero server traffic
+/// 1. Shared: every session sees the same count, kept in a `beacon/store`
+///    list and announced on the store's PubSub topic.
+/// 2. Server: per tab, held by the tab's server process.
+/// 3. Local: per tab, held in the browser; no server traffic.
 ///
-/// Open multiple tabs to see the difference.
+/// The shared counter needs effects (store writes), so this is a
+/// `full_application`, not a `simple` app.
 import beacon
-import beacon/effect
+import beacon/attribute
+import beacon/effect.{type Effect}
+import beacon/element.{type Element}
+import beacon/event
 import beacon/html
-import beacon/pubsub
-import beacon/store
+import beacon/local
+import beacon/store.{type ListStore}
 import gleam/int
+import gleam/list
 
-/// Server state — per-connection (each tab gets its own via per-connection runtime).
-/// The shared_count is pulled from the shared store on every render.
+/// Synced to the browser.
 pub type Model {
   Model(
-    /// Per-user server counter (each tab independent)
+    /// Per tab, server-held.
     my_count: Int,
-    /// Shared counter (read from store, same for everyone)
+    /// The same for every session; re-read from the store on change.
     shared_count: Int,
   )
 }
 
-/// Client state — instant, never touches the server.
+/// Client-only.
 pub type Local {
-  Local(
-    /// Per-user local counter (instant, zero traffic)
-    local_count: Int,
-  )
+  Local(local_count: Int)
 }
 
 pub type Msg {
-  // Shared — writes to store, all users see the update
   SharedIncrement
   SharedDecrement
-  SharedUpdated
-  SetSharedCount(Int)
-  // Server — per-user, server-rendered
+  /// The store changed (from this session or another).
+  SharedChanged
   MyIncrement
   MyDecrement
-  // Local — instant, zero server traffic
   LocalIncrement
   LocalDecrement
 }
 
-pub fn make_init(shared: store.Store(Int)) -> fn() -> Model {
-  fn() {
-    let shared_count = case store.get(shared, "count") {
-      Ok(n) -> n
-      Error(Nil) -> 0
-    }
-    Model(my_count: 0, shared_count: shared_count)
+const deltas_key = "deltas"
+
+// --- Shared counter ---
+
+/// The shared count is the fold of every +1/-1 ever appended, never going
+/// below zero. Appends never overwrite each other, so concurrent clicks in
+/// different sessions are all counted.
+fn shared_count(deltas: ListStore(Int)) -> Int {
+  store.get_all(deltas, deltas_key)
+  |> list.fold(0, fn(count, delta) { int.max(0, count + delta) })
+}
+
+fn add_shared(deltas: ListStore(Int), delta: Int) -> Effect(Msg) {
+  effect.from(fn(_dispatch) { store.append(deltas, deltas_key, delta) })
+}
+
+// --- Init and update (server) ---
+
+fn init(deltas: ListStore(Int)) -> #(Model, Effect(Msg)) {
+  #(Model(my_count: 0, shared_count: shared_count(deltas)), effect.none())
+}
+
+fn update(
+  deltas: ListStore(Int),
+  model: Model,
+  msg: Msg,
+) -> #(Model, Effect(Msg)) {
+  case msg {
+    SharedIncrement -> #(model, add_shared(deltas, 1))
+    SharedDecrement -> #(model, add_shared(deltas, -1))
+    SharedChanged -> #(
+      Model(..model, shared_count: shared_count(deltas)),
+      effect.none(),
+    )
+    MyIncrement -> #(
+      Model(..model, my_count: model.my_count + 1),
+      effect.none(),
+    )
+    MyDecrement -> #(
+      Model(..model, my_count: model.my_count - 1),
+      effect.none(),
+    )
+    // `update_local` handles these in the browser and never forwards them.
+    LocalIncrement | LocalDecrement -> #(model, effect.none())
   }
 }
+
+// --- Local (browser) ---
 
 pub fn init_local(_model: Model) -> Local {
   Local(local_count: 0)
 }
 
-pub fn update(
-  model: Model,
+pub fn update_local(
+  _model: Model,
   local: Local,
-  _server: Nil,
   msg: Msg,
-) -> #(Model, Local, Nil) {
-  let #(model, local) = case msg {
-    // === SHARED: update the public model; on_update writes the store ===
-    SharedIncrement -> #(
-      Model(..model, shared_count: model.shared_count + 1),
-      local,
-    )
-    SharedDecrement -> #(
-      Model(..model, shared_count: int.max(0, model.shared_count - 1)),
-      local,
-    )
-    SharedUpdated -> #(model, local)
-    SetSharedCount(count) -> #(Model(..model, shared_count: count), local)
-
-    // === SERVER: per-user, each tab independent ===
-    MyIncrement -> #(Model(..model, my_count: model.my_count + 1), local)
-    MyDecrement -> #(Model(..model, my_count: model.my_count - 1), local)
-
-    // === LOCAL: instant, zero server traffic ===
-    LocalIncrement -> #(model, Local(local_count: local.local_count + 1))
-    LocalDecrement -> #(model, Local(local_count: local.local_count - 1))
-  }
-  #(model, local, Nil)
-}
-
-fn make_on_update(
-  shared: store.Store(Int),
-) -> fn(#(Model, Local, Nil), Msg) -> effect.Effect(Msg) {
-  fn(state: #(Model, Local, Nil), msg: Msg) -> effect.Effect(Msg) {
-    let #(model, _local, _server) = state
-    case msg {
-      SharedIncrement | SharedDecrement ->
-        effect.from(fn(_dispatch) {
-          store.put(shared, "count", model.shared_count)
-          pubsub.broadcast("store:shared_counter", Nil)
-        })
-      SharedUpdated ->
-        effect.from(fn(dispatch) {
-          let current = case store.get(shared, "count") {
-            Ok(n) -> n
-            Error(Nil) -> 0
-          }
-          dispatch(SetSharedCount(current))
-        })
-      _ -> effect.none()
-    }
+) -> local.Update(Local) {
+  case msg {
+    LocalIncrement -> local.handled(Local(local_count: local.local_count + 1))
+    LocalDecrement -> local.handled(Local(local_count: local.local_count - 1))
+    SharedIncrement
+    | SharedDecrement
+    | SharedChanged
+    | MyIncrement
+    | MyDecrement -> local.forward(local)
   }
 }
 
-pub fn view(model: Model, local: Local) -> beacon.Node(Msg) {
+fn sync(model: Model) -> Model {
+  model
+}
+
+// --- View ---
+
+pub fn view(model: Model, local: Local) -> Element(Msg) {
   html.div(
-    [html.style("font-family:system-ui;max-width:600px;margin:2rem auto")],
+    [
+      attribute.styles([
+        #("font-family", "system-ui"),
+        #("max-width", "600px"),
+        #("margin", "2rem auto"),
+      ]),
+    ],
     [
       html.h1([], [html.text("Triple Counter")]),
-      html.p([html.style("color:#666")], [
-        html.text("Open multiple tabs to see the difference!"),
+      html.p([attribute.style("color", "#666")], [
+        html.text("Open several tabs to see the difference."),
       ]),
-      // === SHARED COUNTER ===
-      html.div(
-        [
-          html.style(
-            "background:#e8f5e9;padding:1rem;margin:1rem 0;border-radius:8px",
-          ),
-        ],
-        [
-          html.h2([], [html.text("Shared Counter")]),
-          html.p([html.style("color:#2e7d32")], [
-            html.text(
-              "All tabs see the same number. Click in one tab → updates everywhere.",
-            ),
-          ]),
-          html.div([html.style("font-size:2rem;text-align:center")], [
-            html.button([beacon.on_click(SharedDecrement)], [html.text(" - ")]),
-            html.strong([], [
-              html.text(" " <> int.to_string(model.shared_count) <> " "),
-            ]),
-            html.button([beacon.on_click(SharedIncrement)], [html.text(" + ")]),
-          ]),
-        ],
+      counter_panel(
+        title: "Shared Counter",
+        note: "Every tab sees the same number.",
+        background: "#e8f5e9",
+        colour: "#2e7d32",
+        count: model.shared_count,
+        decrement: SharedDecrement,
+        increment: SharedIncrement,
       ),
-      // === SERVER COUNTER ===
-      html.div(
-        [
-          html.style(
-            "background:#e3f2fd;padding:1rem;margin:1rem 0;border-radius:8px",
-          ),
-        ],
-        [
-          html.h2([], [html.text("Server Counter (per-tab)")]),
-          html.p([html.style("color:#1565c0")], [
-            html.text(
-              "Each tab has its own count. Server-rendered, per-connection.",
-            ),
-          ]),
-          html.div([html.style("font-size:2rem;text-align:center")], [
-            html.button([beacon.on_click(MyDecrement)], [html.text(" - ")]),
-            html.strong([], [
-              html.text(" " <> int.to_string(model.my_count) <> " "),
-            ]),
-            html.button([beacon.on_click(MyIncrement)], [html.text(" + ")]),
-          ]),
-        ],
+      counter_panel(
+        title: "Server Counter (per tab)",
+        note: "Each tab has its own count, held by its server process.",
+        background: "#e3f2fd",
+        colour: "#1565c0",
+        count: model.my_count,
+        decrement: MyDecrement,
+        increment: MyIncrement,
       ),
-      // === LOCAL COUNTER ===
+      counter_panel(
+        title: "Local Counter (instant)",
+        note: "Per tab, in the browser only. No server traffic.",
+        background: "#fce4ec",
+        colour: "#c62828",
+        count: local.local_count,
+        decrement: LocalDecrement,
+        increment: LocalIncrement,
+      ),
+    ],
+  )
+}
+
+fn counter_panel(
+  title title: String,
+  note note: String,
+  background background: String,
+  colour colour: String,
+  count count: Int,
+  decrement decrement: Msg,
+  increment increment: Msg,
+) -> Element(Msg) {
+  html.div(
+    [
+      attribute.styles([
+        #("background", background),
+        #("padding", "1rem"),
+        #("margin", "1rem 0"),
+        #("border-radius", "8px"),
+      ]),
+    ],
+    [
+      html.h2([], [html.text(title)]),
+      html.p([attribute.style("color", colour)], [html.text(note)]),
       html.div(
+        [attribute.styles([#("font-size", "2rem"), #("text-align", "center")])],
         [
-          html.style(
-            "background:#fce4ec;padding:1rem;margin:1rem 0;border-radius:8px",
-          ),
-        ],
-        [
-          html.h2([], [html.text("Local Counter (instant)")]),
-          html.p([html.style("color:#c62828")], [
-            html.text(
-              "Instant updates. Zero server traffic. Per-tab, client-only.",
-            ),
-          ]),
-          html.div([html.style("font-size:2rem;text-align:center")], [
-            html.button([beacon.on_click(LocalDecrement)], [html.text(" - ")]),
-            html.strong([], [
-              html.text(" " <> int.to_string(local.local_count) <> " "),
-            ]),
-            html.button([beacon.on_click(LocalIncrement)], [html.text(" + ")]),
-          ]),
+          html.button([event.on_click(decrement)], [html.text(" - ")]),
+          html.strong([], [html.text(" " <> int.to_string(count) <> " ")]),
+          html.button([event.on_click(increment)], [html.text(" + ")]),
         ],
       ),
     ],
   )
 }
 
+// --- Start ---
+
 pub fn main() {
-  start()
-}
-
-pub fn start() {
-  let shared = store.new("shared_counter")
-  store.put(shared, "count", 0)
-
-  beacon.app(
-    fn() { #(make_init(shared)(), effect.none()) },
-    init_local,
-    beacon.no_server,
-    update,
-    view,
+  let deltas = store.new_list("shared_counter")
+  beacon.full_application(
+    init: fn(_ctx) { init(deltas) },
+    update: fn(model, msg) { update(deltas, model, msg) },
+    sync:,
+    local: local.layer(init: init_local, update: update_local),
+    view:,
   )
-  |> beacon.title("Triple Counter")
-  |> beacon.on_update(make_on_update(shared))
-  |> beacon.subscriptions(fn(_model) { ["store:shared_counter"] })
-  |> beacon.on_notify(fn(_topic) { SharedUpdated })
+  |> beacon.title(fn(_model) { "Triple Counter" })
+  |> beacon.subscriptions(fn(_model) { [store.list_topic(deltas)] })
+  |> beacon.on_notify(fn(_topic) { SharedChanged })
   |> beacon.start(8080)
 }

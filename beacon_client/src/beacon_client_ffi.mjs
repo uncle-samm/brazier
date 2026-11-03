@@ -118,6 +118,8 @@ let clientLocal = null;
 let clientInitialized = false;
 // Set when the app's client code crashed; events are then dropped loudly.
 let clientFailed = false;
+// Set when a dispatched message changed the client state since the last
+// render; see renderIfDispatched.
 let renderPending = false;
 // The JSON of the last authoritative model, which patches apply to.
 let clientModelJson = null;
@@ -286,12 +288,23 @@ function renderNow() {
   measure("render", "render-start", "render-end");
 }
 
-// Batches the renders of several events into one per animation frame. The
-// state is current immediately; only the DOM waits.
-function scheduleRender() {
-  if (renderPending) return;
-  renderPending = true;
-  requestAnimationFrame(renderNow);
+// Every entry point that dispatches messages (a DOM event, a replayed early
+// event, a debounce timer, a route change) renders once when it is done, as
+// Lustre does for user events. Handlers are closures over the state of the
+// render that produced them, so the next event must find the handlers of the
+// state the previous one left, and a focused input must be rendered with the
+// value it was just given before the user types again. Waiting for an
+// animation frame broke both: frames do not run in a background tab, and an
+// event inside the same frame ran a stale handler.
+function renderIfDispatched() {
+  if (renderPending) renderNow();
+}
+
+// Invariant: no entry point leaves a dispatched message unrendered.
+function assertRendered(where) {
+  if (renderPending) {
+    throw new Error("[beacon] invariant violated: a dispatched message was not rendered before " + where);
+  }
 }
 
 // === Event delegation ===
@@ -332,7 +345,9 @@ function onDomEvent(event) {
     enqueueEarlyEvent(name, event, found);
     return;
   }
+  assertRendered("a " + name + " event");
   runHandlers(name, event, found.map((f) => f.id), event, false);
+  renderIfDispatched();
 }
 
 // Run the handlers for `ids` (innermost first) against `payload`: the DOM
@@ -407,7 +422,9 @@ function scheduleDebounced(name, id, msg, ms) {
   const entry = { name, id, msg, seq: ++debounceSeq, timer: null };
   entry.timer = setTimeout(() => {
     debounced.delete(key);
+    assertRendered("a debounced " + name + " message");
     dispatchMsg(name, id, msg);
+    renderIfDispatched();
   }, ms);
   debounced.set(key, entry);
   trace("event.debounced", { name, id, ms });
@@ -446,7 +463,8 @@ function dispatchMsg(name, id, msg) {
     console.error("[beacon] The app's client update crashed on a " + name + " event (element " + id + "); the client stops handling events. Reload the page.", e);
     return;
   }
-  scheduleRender();
+  // The entry point that dispatched this renders once it is done.
+  renderPending = true;
   if (!forward) {
     trace("event.local", { name, id });
     return;
@@ -499,7 +517,11 @@ function flushPendingEarlyEvents() {
   if (!clientInitialized || pendingEarlyEvents.length === 0) return;
   const queued = pendingEarlyEvents;
   pendingEarlyEvents = [];
-  for (const entry of queued) runHandlers(entry.name, entry.snapshot, entry.ids, null, true);
+  for (const entry of queued) {
+    runHandlers(entry.name, entry.snapshot, entry.ids, null, true);
+    // The next replayed event runs the handlers of the state this one left.
+    renderIfDispatched();
+  }
   console.log("[beacon] Replayed " + queued.length + " event(s) from before hydration");
   trace("early_event.flush", { count: queued.length });
 }
@@ -564,7 +586,6 @@ function adoptAuthoritativeModel(modelStr) {
     clientInitialized = true;
     console.log("[beacon] Client ready (from model_sync)");
   }
-  // Render synchronously: requestAnimationFrame may not fire in a background tab.
   renderNow();
   return null;
 }
@@ -1012,6 +1033,7 @@ function isLocalPath(path) {
 // messages) before the navigate message, and resets throttling.
 function leaveRoute(path) {
   flushDebounced();
+  renderIfDispatched();
   throttled.clear();
   trace("route.leave", { path });
 }
