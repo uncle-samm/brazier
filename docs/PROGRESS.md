@@ -171,7 +171,7 @@
 - [ ] WS9 Test quality + performance (follow-ups: from WS8a, `test/beacon_effect_test_ffi.erl` `await_pg_empty` now polls every 5 ms, so use an event instead; `sim_1000_connections_test` failed once under synthetic CPU starvation, so review its threshold together with the perf thresholds; run the suite under CPU stress as a flake gate): replace sleeps with synchronization, meaningful assertions, client JS tests in CI, HTTP/WS/runtime load tests and benchmarks with recorded baselines and regression thresholds
 
 **Phase 4 — Docs, hygiene, rename, final audits**
-- [ ] WS10 Docs that compile, LICENSE, remove stale committed builds/stray files, archive old PROGRESS notes, honest CHANGELOG, publish script
+- [ ] WS10 (split: WS10a docs/hygiene running 2026-11-03; WS10b source follow-ups after WS8c) Docs that compile, LICENSE, remove stale committed builds/stray files, archive old PROGRESS notes, honest CHANGELOG, publish script
   - Follow-ups collected from WS1–WS6:
     - SECURITY.md: WebSocket limits, Origin rules, close codes incl. 4401.
     - DEPLOYMENT.md: `ws_allowed_origins`, `X-Forwarded-Proto` and trusted proxies, per-IP caps behind a proxy, the env-var table (PORT/BEACON_ENV are not read by `beacon.start`), and remove the nonexistent `GET /health` claim (also GETTING_STARTED ~497).
@@ -193,6 +193,11 @@
 - [ ] Final verification: build (zero warnings), tests, all examples, CDP browser suite, perf baselines
 
 **Decisions (Milestone 117, coordinator):**
+- 2026-11-03, WS10 was split so its docs and hygiene work runs now, beside WS8c and WS9.
+  - WS10a (started 2026-11-03) owns the docs that neither of those touches: LICENSE, scripts, CHANGELOG, a docs-compile and link check, and copying the archived PROGRESS.
+  - WS10b, after WS8c merges, takes the source-side WS10 follow-ups and the docs WS8c owns (WIRE_PROTOCOL close codes, CLUSTERING, TELEMETRY, ERROR_HANDLING, ARCHITECTURE).
+  - The licence is MIT because `gleam.toml` already declares `licences = ["MIT"]`.
+  - WS10a copies Milestones 1–116 into `docs/archive/`, and the coordinator cuts PROGRESS.md, because the coordinator is the only writer of that file.
 - 2026-11-03, WS8b part 2's source follow-ups became their own workstream, WS8c, which runs beside WS9 with disjoint files.
   - WS8c owns `src/**` and `beacon_client/src/**`, except `src/beacon/lint.gleam` and the lint FFI.
   - WS9 owns `test/**`, `beacon_client/test/**`, `test_all_cdp.py`, benchmarks, CI and scripts. WS9 records any source hook it needs rather than editing a WS8c file.
