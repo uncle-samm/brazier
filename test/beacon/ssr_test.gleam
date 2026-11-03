@@ -11,9 +11,11 @@ import gleam/crypto
 import gleam/erlang/process.{type Subject}
 import gleam/http/request
 import gleam/json
+import gleam/list
 import gleam/option
 import gleam/string
 import gleam/uri.{type Uri}
+import simplifile
 
 // --- Test helpers ---
 
@@ -139,19 +141,69 @@ pub fn render_page_escapes_the_title_test() {
 
 pub fn render_page_includes_script_tag_test() {
   let page = render(test_config())
-  // Script tag should reference beacon_client (hashed or plain)
-  let assert True = str_contains(page.html, "<script src=\"/beacon_client")
-  let assert True = str_contains(page.html, "data-beacon-auto")
+  let assert Ok(bundle) = ssr.client_bundle_name(ssr.client_assets_dir())
+  let assert True =
+    str_contains(page.html, "<script src=\"/" <> bundle <> "\"></script>")
 }
 
-pub fn choose_client_assets_dir_prefers_local_manifest_test() {
-  let assert "priv/static" =
-    ssr.choose_client_assets_dir(True, "priv/static", "fallback/static")
+// --- The client bundle named by the manifest ---
+
+const bundle = "beacon_client_0123456789abcdef.js"
+
+@external(erlang, "beacon_test_ffi", "unique_ref")
+fn unique_ref() -> String
+
+/// A fresh assets directory with `manifest` as its manifest (when given) and
+/// the files in `bundles`.
+fn assets_dir(
+  manifest: option.Option(String),
+  bundles: List(String),
+) -> String {
+  let dir = "/tmp/beacon_ssr_assets_" <> unique_ref()
+  let assert Ok(Nil) = simplifile.create_directory_all(dir)
+  case manifest {
+    option.Some(text) -> {
+      let assert Ok(Nil) =
+        simplifile.write(dir <> "/beacon_client.manifest", text)
+      Nil
+    }
+    option.None -> Nil
+  }
+  list.each(bundles, fn(name) {
+    let assert Ok(Nil) = simplifile.write(dir <> "/" <> name, "start(App);")
+  })
+  dir
 }
 
-pub fn choose_client_assets_dir_falls_back_when_missing_test() {
-  let assert "fallback/static" =
-    ssr.choose_client_assets_dir(False, "priv/static", "fallback/static")
+pub fn client_assets_dir_is_the_apps_priv_static_test() {
+  let assert "priv/static" = ssr.client_assets_dir()
+}
+
+pub fn client_bundle_name_reads_the_manifest_test() {
+  let dir = assets_dir(option.Some(bundle <> "\n"), [bundle])
+  let assert Ok(name) = ssr.client_bundle_name(dir)
+  let assert True = name == bundle
+}
+
+pub fn client_bundle_name_without_manifest_is_an_error_test() {
+  let dir = assets_dir(option.None, [bundle])
+  let assert Error(reason) = ssr.client_bundle_name(dir)
+  let assert True = str_contains(reason, "beacon_client.manifest")
+  let assert True = str_contains(reason, "gleam run -m beacon/build")
+}
+
+pub fn client_bundle_name_refuses_a_name_that_is_not_build_output_test() {
+  let dir = assets_dir(option.Some("../secret.js"), ["../secret.js"])
+  let assert Error(reason) = ssr.client_bundle_name(dir)
+  let assert True = str_contains(reason, "invalid bundle")
+  let dir = assets_dir(option.Some(""), [])
+  let assert Error(_) = ssr.client_bundle_name(dir)
+}
+
+pub fn client_bundle_name_refuses_a_missing_bundle_test() {
+  let dir = assets_dir(option.Some(bundle), [])
+  let assert Error(reason) = ssr.client_bundle_name(dir)
+  let assert True = str_contains(reason, "does not exist")
 }
 
 pub fn render_page_sets_session_token_without_dom_exposure_test() {
@@ -184,7 +236,7 @@ pub fn render_page_unknown_route_is_a_static_404_test() {
   let assert True = str_contains(page.html, "Page Not Found")
   let assert True = str_contains(page.html, "id=\"beacon-app\"")
   // No client script: the browser opens no session for an error page.
-  let assert False = str_contains(page.html, "data-beacon-auto")
+  let assert False = str_contains(page.html, "<script")
   let assert False = str_contains(page.html, "Hello, default!")
   let assert Ok(resp) = ssr.to_response(page)
   let assert 404 = resp.status
@@ -202,7 +254,7 @@ pub fn render_page_bad_percent_encoding_is_a_static_400_test() {
   let page = render_path(reporting_config(calls), "/%zz")
   let assert 400 = page.status
   let assert True = str_contains(page.html, "Bad Request")
-  let assert False = str_contains(page.html, "data-beacon-auto")
+  let assert False = str_contains(page.html, "<script")
   let assert Error(Nil) = process.receive(calls, 0)
   let assert Ok(resp) = ssr.to_response(page)
   let assert 400 = resp.status

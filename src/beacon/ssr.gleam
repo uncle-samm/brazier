@@ -19,6 +19,7 @@ import beacon/internal/render
 import beacon/internal/uri_check
 import beacon/log
 import beacon/session
+import beacon/static
 import beacon/transport/server.{type ResponseBody, Bytes}
 import gleam/bit_array
 import gleam/bytes_tree
@@ -248,21 +249,44 @@ fn render_state(
     Some(encode) -> Some(encode(state))
     None -> None
   }
-  let html =
-    build_html_document(
-      config.title(state),
-      view_html,
-      config.head_html,
-      config.dev_mode,
-      True,
-    )
-  log.debug("beacon.ssr", "Dead render complete for " <> path)
-  RenderedPage(
-    html: html,
-    sign_join_token: join_token_signer(config.secret_key, model_json),
-    cookie_secure: !config.dev_mode,
-    status: 200,
-  )
+  case client_bundle_name(client_assets_dir()) {
+    Ok(bundle) -> {
+      let html =
+        build_html_document(
+          config.title(state),
+          view_html,
+          config.head_html,
+          config.dev_mode,
+          Some(bundle),
+        )
+      log.debug("beacon.ssr", "Dead render complete for " <> path)
+      RenderedPage(
+        html: html,
+        sign_join_token: join_token_signer(config.secret_key, model_json),
+        cookie_secure: !config.dev_mode,
+        status: 200,
+      )
+    }
+    // A page whose script cannot load is not interactive: serve a static
+    // 500 instead. `beacon.start` checks the bundle at startup, so this
+    // means it was removed or damaged while the server was running.
+    Error(reason) -> {
+      log.error(
+        "beacon.ssr",
+        "Refusing dead render for " <> path <> " (500): " <> reason,
+      )
+      render_error_page(
+        config,
+        500,
+        "Internal Server Error",
+        error_page.error_page(
+          500,
+          "Internal Server Error",
+          "The page cannot be served right now.",
+        ),
+      )
+    }
+  }
 }
 
 /// A static error page: no client script, so the browser does not open a
@@ -279,7 +303,7 @@ fn render_error_page(
       element.to_string(page),
       config.head_html,
       config.dev_mode,
-      False,
+      None,
     )
   RenderedPage(
     html: html,
@@ -599,26 +623,22 @@ pub fn verify_session_token(
   }
 }
 
-/// Build a full HTML document with the view and JS client.
+/// Build a full HTML document with the view and, for a live page, the
+/// script tag of the client bundle named `bundle`.
 fn build_html_document(
   title: String,
   view_html: String,
   head_html: Option(String),
   dev_mode: Bool,
-  include_client: Bool,
+  bundle: Option(String),
 ) -> String {
   let extra_head = case head_html {
     Some(html) -> html
     None -> ""
   }
-  let client_script = case include_client {
-    True ->
-      string.concat([
-        "<script src=\"/",
-        client_js_filename(),
-        "\" data-beacon-auto></script>",
-      ])
-    False -> ""
+  let client_script = case bundle {
+    Some(name) -> "<script src=\"/" <> name <> "\"></script>"
+    None -> ""
   }
   string.concat([
     "<!DOCTYPE html>",
@@ -643,71 +663,62 @@ fn build_html_document(
   ])
 }
 
-/// Choose the directory that contains Beacon client assets.
-/// Prefer the consuming app's `priv/static` when it has a manifest; otherwise
-/// use Beacon's own packaged priv dir for repo/dependency installs.
-pub fn choose_client_assets_dir(
-  has_local_manifest: Bool,
-  local_dir: String,
-  beacon_dir: String,
-) -> String {
-  case has_local_manifest {
-    True -> local_dir
-    False -> beacon_dir
-  }
-}
-
-/// Resolve the directory that contains Beacon client assets.
+/// The directory holding the app's client bundle and its manifest: the
+/// app's own `priv/static`, written by `gleam run -m beacon/build`. The
+/// runtime bundle in Beacon's own `priv` starts no app, so it is never
+/// served in its place.
 pub fn client_assets_dir() -> String {
-  case simplifile.is_file("priv/static/beacon_client.manifest") {
-    Ok(True) ->
-      choose_client_assets_dir(True, "priv/static", beacon_priv_path("static"))
+  "priv/static"
+}
+
+/// The bundle file named by `beacon_client.manifest` in `assets_dir`. The
+/// name must be exact build output (`static.is_client_bundle_name`), and
+/// the file must exist.
+pub fn client_bundle_name(assets_dir: String) -> Result(String, String) {
+  let manifest_path = assets_dir <> "/beacon_client.manifest"
+  let hint = " Run `gleam run -m beacon/build`."
+  use contents <- result.try(
+    simplifile.read(manifest_path)
+    |> result.map_error(fn(err) {
+      "Cannot read "
+      <> manifest_path
+      <> " ("
+      <> simplifile.describe_error(err)
+      <> ")."
+      <> hint
+    }),
+  )
+  let name = string.trim(contents)
+  use Nil <- result.try(case static.is_client_bundle_name(name) {
+    True -> Ok(Nil)
+    False ->
+      Error(
+        manifest_path
+        <> " names an invalid bundle "
+        <> string.inspect(name)
+        <> "."
+        <> hint,
+      )
+  })
+  case simplifile.is_file(assets_dir <> "/" <> name) {
+    Ok(True) -> Ok(name)
     Ok(False) ->
-      choose_client_assets_dir(False, "priv/static", beacon_priv_path("static"))
-    Error(err) -> {
-      log.error(
-        "beacon.ssr",
-        "Failed to inspect local client manifest: " <> string.inspect(err),
+      Error(
+        manifest_path <> " names " <> name <> ", which does not exist." <> hint,
       )
-      beacon_priv_path("static")
-    }
-  }
-}
-
-/// Get the current client JS filename from the build manifest.
-/// The manifest is created by `gleam run -m beacon/build`.
-fn client_js_filename() -> String {
-  let manifest_path = client_assets_dir() <> "/beacon_client.manifest"
-  case simplifile.read(manifest_path) {
-    Ok(name) -> string.trim(name)
-    Error(err) -> {
-      log.error(
-        "beacon.ssr",
-        "FATAL: No beacon_client.manifest at "
-          <> manifest_path
-          <> ": "
-          <> string.inspect(err)
-          <> " — client JS not built. Run `gleam run -m beacon/build`.",
+    Error(err) ->
+      Error(
+        "Cannot check "
+        <> assets_dir
+        <> "/"
+        <> name
+        <> " ("
+        <> simplifile.describe_error(err)
+        <> ")."
+        <> hint,
       )
-      "MISSING_CLIENT_JS_RUN_BEACON_BUILD"
-    }
   }
 }
-
-/// Resolve a path relative to Beacon's priv directory.
-/// Uses `code:priv_dir(beacon)` for correct resolution from consuming apps.
-pub fn beacon_priv_path(relative: String) -> String {
-  case ffi_priv_dir() {
-    Ok(dir) -> dir <> "/" <> relative
-    Error(reason) -> {
-      log.error("beacon.ssr", "Failed to resolve Beacon priv dir: " <> reason)
-      "MISSING_BEACON_PRIV/" <> relative
-    }
-  }
-}
-
-@external(erlang, "beacon_ssr_ffi", "priv_dir")
-fn ffi_priv_dir() -> Result(String, String)
 
 @external(erlang, "beacon_ssr_ffi", "system_time_seconds")
 fn erlang_system_time_seconds() -> Int
