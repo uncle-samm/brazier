@@ -1,4 +1,4 @@
-.PHONY: build test test-client test-flake browser-canonical browser-canonical-desktop browser-canonical-mobile browser-all browser-all-desktop browser-all-mobile browser-all-shard browser-all-docker-shards push tag publish release
+.PHONY: build test test-client test-flake bench bench-check bench-baseline browser-canonical browser-canonical-desktop browser-canonical-mobile browser-all browser-all-desktop browser-all-mobile browser-all-shard browser-all-docker-shards push tag publish release
 
 build:
 	gleam build
@@ -17,6 +17,22 @@ test-client:
 # (default 8); fails if any run fails.
 test-flake:
 	sh scripts/flake_gate.sh
+
+# Benchmarks (docs/PERFORMANCE.md). Never part of gleam test.
+# bench: one run, printed and written to build/bench/latest.json.
+bench:
+	gleam run -m beacon_bench
+
+# bench-check: BEACON_BENCH_RUNS runs (default 3) against
+# bench/baselines.json; exits non-zero on a regression beyond a metric's
+# tolerance, a missing or new metric, or a different machine.
+bench-check:
+	gleam run -m beacon_bench_check
+
+# bench-baseline: BEACON_BENCH_RUNS runs (default 5) on an idle machine,
+# written to bench/baselines.json.
+bench-baseline:
+	gleam run -m beacon_bench_baseline
 
 browser-canonical:
 	sh scripts/run_canonical_cdp.sh

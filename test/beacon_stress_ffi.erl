@@ -4,7 +4,7 @@
 %% the join must be answered, every event must be acknowledged by a patch
 %% carrying its clock, and the close handshake must echo 1000. Nothing
 %% sleeps: each step waits for the server's answer, bounded by a deadline.
--export([connect_and_join/4, close_handshake/2, monotonic_us/0]).
+-export([connect_and_join/4, timed_events/4, close_handshake/2, monotonic_us/0]).
 
 monotonic_us() ->
     erlang:monotonic_time(microsecond).
@@ -53,6 +53,33 @@ join(Socket, Host, Events, Deadline) ->
 events(_Socket, Buffer, Events, Clock, _Deadline) when Clock > Events ->
     {ok, Buffer, Events};
 events(Socket, Buffer, Events, Clock, Deadline) ->
+    case event(Socket, Buffer, Clock, Deadline) of
+        {ok, Buffer1} -> events(Socket, Buffer1, Events, Clock + 1, Deadline);
+        {error, Reason} -> {error, Reason}
+    end.
+
+%% Send events FirstClock .. FirstClock + Events - 1 on a joined Conn, one
+%% at a time, timing each from its send to its acknowledging patch.
+%% {ok, {Conn, LatenciesUs}} (in send order) | {error, Reason}.
+timed_events({Socket, Buffer}, FirstClock, Events, TimeoutMs) ->
+    Deadline = erlang:monotonic_time(millisecond) + TimeoutMs,
+    timed_events(Socket, Buffer, FirstClock, FirstClock + Events, Deadline, []).
+
+timed_events(Socket, Buffer, Clock, End, _Deadline, Acc) when Clock =:= End ->
+    {ok, {{Socket, Buffer}, lists:reverse(Acc)}};
+timed_events(Socket, Buffer, Clock, End, Deadline, Acc) ->
+    Start = monotonic_us(),
+    case event(Socket, Buffer, Clock, Deadline) of
+        {ok, Buffer1} ->
+            Latency = monotonic_us() - Start,
+            timed_events(Socket, Buffer1, Clock + 1, End, Deadline, [Latency | Acc]);
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+%% One event, answered by a patch carrying its clock.
+%% {ok, Buffer} | {error, Reason}.
+event(Socket, Buffer, Clock, Deadline) ->
     ClockBin = integer_to_binary(Clock),
     Event = <<"{\"type\":\"event\",\"name\":\"click\",\"handler_id\":\"inc\",",
               "\"data\":\"\",\"target_path\":\"/\",\"clock\":", ClockBin/binary, "}">>,
@@ -64,7 +91,7 @@ events(Socket, Buffer, Events, Clock, Deadline) ->
                     case {binary:match(Reply, <<"\"type\":\"patch\"">>),
                           binary:match(Reply, Ack)} of
                         {{_, _}, {_, _}} ->
-                            events(Socket, Buffer1, Events, Clock + 1, Deadline);
+                            {ok, Buffer1};
                         _ ->
                             {error, <<"event ", ClockBin/binary,
                                       " was answered by ", Reply/binary>>}
