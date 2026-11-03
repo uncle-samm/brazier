@@ -8,7 +8,7 @@ on:
 
 jobs:
   gleam:
-    name: Gleam build, test, lint
+    name: Gleam format, build, test, lint, docs
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -17,12 +17,15 @@ jobs:
       - name: Run build, tests, and lint
         run: docker run --rm --shm-size=1g beacon-ci
 
-  browser-all-desktop:
-    name: Browser all desktop shard ${{ matrix.shard }}/23
+  # Every example in both viewport profiles (test_all_cdp.py --viewport):
+  # mobile adds the horizontal-overflow checks and touch emulation.
+  browser-all:
+    name: Browser all ${{ matrix.viewport }} shard ${{ matrix.shard }}/23
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
+        viewport: [desktop, mobile]
         shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
     steps:
       - uses: actions/checkout@v4
@@ -32,7 +35,7 @@ jobs:
         run: |
           docker run --rm \
             --shm-size=1g \
-            -e BEACON_CDP_VIEWPORTS=desktop \
+            -e BEACON_CDP_VIEWPORTS=${{ matrix.viewport }} \
             -e BEACON_CDP_SHARD=${{ matrix.shard }}/23 \
             beacon-ci \
             make browser-all-shard
