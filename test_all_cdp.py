@@ -484,8 +484,14 @@ def wait_for_path_and_text(path, text_fragment, timeout_seconds=8):
 
 def check_history_go(delta, path, text_fragment, label):
     clear_cdp_events()
-    evl(f"history.go({delta})")
-    check(wait_for_path_and_text(path, text_fragment), f"{label}: URL and view restore {path}")
+    before = str(evl("location.pathname"))
+    check(before != path, f"{label}: starts away from {path} (at {before})")
+    went = evl(f'history.go({delta}); "ok"')
+    check(went == "ok", f"{label}: history.go({delta}) evaluated ({went})")
+    restored = wait_for_path_and_text(path, text_fragment)
+    after = str(evl("location.pathname"))
+    length = str(evl("history.length"))
+    check(restored, f"{label}: URL and view restore {path} (from {before}, now {after}, history.length {length})")
     check(websocket_type_count("Sent", "navigate") >= 1, f"{label}: popstate sends navigate")
     check(
         websocket_type_count("Received", "mount") >= 1
