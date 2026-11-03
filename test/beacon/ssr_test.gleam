@@ -436,9 +436,13 @@ pub fn head_html_multiple_tags_test() {
 
 // --- Session token tests ---
 
-pub fn create_session_token_not_empty_test() {
-  let token = ssr.create_session_token("my-secret-key-for-testing-purposes!!")
-  let assert True = string_length(token) > 10
+pub fn create_session_token_is_a_signed_message_without_the_secret_test() {
+  let secret = "my-secret-key-for-testing-purposes!!"
+  let token = ssr.create_session_token(secret)
+  // gleam/crypto.sign_message: protected header, payload, signature.
+  let assert [header, payload, signature] = string.split(token, ".")
+  let assert True = header != "" && payload != "" && signature != ""
+  let assert False = string.contains(token, secret)
 }
 
 pub fn verify_valid_token_test() {
