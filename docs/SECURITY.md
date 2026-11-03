@@ -83,7 +83,7 @@ Override defaults via the builder:
 import beacon
 import beacon/transport
 
-beacon.app(init, beacon.no_local, beacon.no_server, update, view)
+beacon.simple(init:, update:, view:)
 |> beacon.security_limits(transport.SecurityLimits(
   ..transport.default_security_limits(),
   max_connections: 5000,
@@ -134,9 +134,21 @@ HTTP responses are validated immediately before serialization. Header names must
 
 ## HTML Attribute Validation
 
-Beacon escapes text and attribute values during SSR. Generic custom attribute names are validated before rendering and cannot be inline event attributes such as `onclick`; use Beacon event helpers instead. Event handler IDs are rendered as escaped attribute values.
+Beacon escapes text and attribute values during SSR. `attribute.attribute(name, value)` crashes on an inline event attribute name such as `onclick`, or a name with characters outside `a-z A-Z 0-9 - _ : .`: attribute names come from application code, so such a name is a bug in the view. Use `beacon/event` for event handlers. Event handler IDs are rendered as escaped attribute values.
 
-`element.raw_html` and `head_html` are trusted-only escape hatches for already-sanitized HTML. Do not pass user input to them.
+### URL Policy
+
+Attributes the browser treats as a URL (`href`, `src`, `action`, `formaction`, `poster`, `cite`, `xlink:href`) are checked when the attribute is built and again when it is rendered, on the server and in the browser bundle, which runs the same code. Allowed values:
+
+- relative URLs (no scheme before the first `/`, `?` or `#`);
+- `http:`, `https:`, `mailto:` and `tel:`;
+- in `src` only, `data:image/png`, `data:image/gif`, `data:image/jpeg` and `data:image/webp`. `data:image/svg+xml` is never allowed, because an SVG document can run script.
+
+Any other value (`javascript:`, `vbscript:`, `data:text/html`, ...) drops the attribute and logs a warning naming it, as React does for `javascript:` URLs. The scheme is read the way a browser reads it: tabs and newlines are removed anywhere, leading and trailing whitespace and control characters are stripped, and case is ignored, so `" JaVa\tScRiPt:"` is refused too.
+
+### Escape Hatches
+
+`element.unsafe_raw_html` and `beacon.head_html` insert trusted HTML without escaping or the URL policy. Do not pass user input to them.
 
 ## Build And Dev Command Execution
 
@@ -172,13 +184,13 @@ the formerly built-in dev secret with a `ConfigError` before any process is
 started or port bound. The key is never logged. `config.secret_key()` reads
 `SECRET_KEY` and applies the same check; there is no default.
 
-`beacon.app` generates a random per-process key when none is set, and warns at
+`beacon.start` generates a random per-process key when none is set, and warns at
 startup: tokens then die on restart and differ between nodes. Set an explicit
 key for production (generate one with `openssl rand -base64 48`):
 
 ```gleam
 let assert Ok(secret) = config.secret_key() as "SECRET_KEY must be set"
-beacon.app(init, beacon.no_local, beacon.no_server, update, view)
+beacon.simple(init:, update:, view:)
 |> beacon.secret_key(secret)
 |> beacon.start(8080)
 ```
@@ -203,17 +215,47 @@ cookie with `HttpOnly`, `Secure`, `SameSite=Lax`, and path `/`.
 session and a cryptographically random session-bound CSRF token. Return that
 CSRF token in the login response body and require it on state-changing API
 routes with `auth.protect_api_with_csrf()` or `auth.csrf_authenticated()`. Do
-not store the CSRF token in a cookie.
+not store the CSRF token in a cookie. Use the `_rotating` variants when the
+request may already carry a session id, so the old id is deleted and cannot
+be replayed (session fixation); when it cannot be deleted, no new session is
+created.
 
-Use `auth.protect_ws(store, config)` for WebSocket upgrades that should share
-the same session policy. Use `auth.dev_session_config()` only for localhost
-HTTP development, where the `Secure` cookie attribute would prevent the browser
-from storing the cookie.
+Use `auth.dev_session_config()` only for localhost HTTP development, where the
+`Secure` cookie attribute would prevent the browser from storing the cookie.
 
-The login and logout helpers return `Result(_, cookie.CookieError)`. The
-cookie config is checked before a session is created, so an invalid
-`SessionConfig` never leaves an orphan session; `auth.login_route()` and
-`auth.logout_route()` answer 500 and log the error.
+### Store and cookie failures
+
+- `auth.login`, `login_rotating`, `create_login` and `create_login_rotating`
+  return `Result(_, auth.SessionError)`. A store that cannot answer is
+  `SessionStoreUnavailable(reason)`, logged as an error by `beacon/auth`.
+- The response helpers (`login_response`, `login_json_response`,
+  `logout_response`) return `Result(_, auth.ResponseError)`: `StoreFailed` or
+  `CookieRejected`. The cookie config is checked before a session is created,
+  so an invalid `SessionConfig` never leaves an orphan session.
+- `logout_response` builds no response when the store fails: clearing the
+  cookie would tell the user they signed out while the session may still
+  exist. Answer 503 and keep the cookie.
+- `auth.login_route()` and `auth.logout_route()` answer 503 (with
+  `Retry-After`) on `StoreFailed` and 500 on `CookieRejected`.
+- An `init` that reads the session through `beacon.cookie(ctx, name)` treats
+  a missing, unknown or expired session as a guest, and crashes the request
+  when the store cannot answer. It never renders a guest page for a session
+  it could not check. See [GETTING_STARTED.md](GETTING_STARTED.md#signed-in-first-render).
+
+### WebSocket sessions
+
+`auth.protect_ws(store, config)` accepts an upgrade only for a live session
+with a user, and binds the socket's process to that session. Logout, session
+rotation or expiry closes the socket at once with close code 4401, and the
+check is repeated every `ws_auth_recheck_interval_ms`. On 4401 the browser
+logs an error, never reconnects with the revoked session, and reloads the
+page.
+
+`protect_ws` refuses guests. An app that serves a guest page must accept
+guest sockets in its own `ws_auth` and pass signed-in requests to
+`protect_ws` (see `examples/auth_workspace`). The server then still decides
+per event: a guest socket can send only messages its page's `view` produces,
+and `update` must refuse signed-in actions from a guest.
 
 ## Cookies
 
@@ -286,4 +328,16 @@ The runtime tracks serialized model size. Models exceeding 1MB trigger a warning
 
 ## WebSocket Authentication
 
-Optional custom auth can be added via the transport config's `ws_auth` field. When set, the function runs before the WebSocket upgrade and can reject connections with HTTP 401.
+`beacon.ws_auth(fn(api.Request) -> Result(Nil, String))` runs before the WebSocket upgrade and again every `ws_auth_recheck_interval_ms`. `Error(reason)` rejects the upgrade with HTTP 401, or closes a live socket with 4401. For Beacon sessions use `auth.protect_ws` (see Application Session Auth).
+
+## Events From the Browser
+
+The server decodes every event with the generated `beacon_codec.decode_event`. The accepted messages are exactly the `Msg` constructors that client code (what `view`, a Local layer and a `simple` app's `update` reach) can build, as found by the build. Any other message is refused before `update` runs: the server logs a warning, answers with an error, and the browser drops its optimistic state. Messages that only effects, subscriptions or the router produce cannot be sent from the browser.
+
+An accepted message is still only a request: `update` runs on the server and must check that the session may perform it (for example, that a guest is not sending a signed-in action). With `beacon.simple` the browser runs `update` first for instant feedback, but the server runs it too and its model wins; a mismatch is logged in the browser.
+
+## Client Bundle Privacy
+
+The build compiles to JavaScript only the code the browser runs: what `view` reaches, plus `init_local` and `update_local` of a `local.layer`, plus `update` for `beacon.simple`. Each reached definition is sliced out of its source file and its imports regenerated, so a function, constant, type or import that the browser does not reach never appears in the bundle. A reference from browser code into a server-only Beacon module (for example `beacon/store`, `beacon/effect` or `beacon/session`) fails the build with the call site.
+
+At runtime, a `full_application` sends the browser only what `sync(state)` returns. Keep secrets, session ids and private records in the server state outside the synced model; `examples/privacy_demo` and `examples/route_server_workspace` show the pattern.

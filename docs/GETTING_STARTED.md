@@ -1,6 +1,9 @@
 # Getting Started with Beacon
 
-Beacon is a full-stack Gleam web framework that runs on BEAM with client-side local execution.
+Beacon is a full-stack Gleam web framework on the BEAM. Each browser tab is
+one server process running a Model-View-Update loop; the browser receives the
+model over a WebSocket and renders it with JavaScript compiled from your
+`view`.
 
 ## Quick Start
 
@@ -22,7 +25,8 @@ gleam add beacon
 ```gleam
 // src/my_app.gleam
 import beacon
-import beacon/effect
+import beacon/element.{type Element}
+import beacon/event
 import beacon/html
 import gleam/int
 
@@ -35,34 +39,29 @@ pub type Msg {
   Decrement
 }
 
-pub fn init() -> #(Model, effect.Effect(Msg)) {
-  #(Model(count: 0), effect.none())
+fn init(_ctx: beacon.Context) -> Model {
+  Model(count: 0)
 }
 
-pub fn update(
-  model: Model,
-  _local: Nil,
-  _server: Nil,
-  msg: Msg,
-) -> #(Model, Nil, Nil) {
+pub fn update(model: Model, msg: Msg) -> Model {
   case msg {
-    Increment -> #(Model(count: model.count + 1), Nil, Nil)
-    Decrement -> #(Model(count: model.count - 1), Nil, Nil)
+    Increment -> Model(count: model.count + 1)
+    Decrement -> Model(count: model.count - 1)
   }
 }
 
-pub fn view(model: Model, _local: Nil) -> beacon.Node(Msg) {
+pub fn view(model: Model) -> Element(Msg) {
   html.div([], [
     html.h1([], [html.text("Counter")]),
-    html.button([beacon.on_click(Decrement)], [html.text("-")]),
+    html.button([event.on_click(Decrement)], [html.text("-")]),
     html.text(" " <> int.to_string(model.count) <> " "),
-    html.button([beacon.on_click(Increment)], [html.text("+")]),
+    html.button([event.on_click(Increment)], [html.text("+")]),
   ])
 }
 
 pub fn main() {
-  beacon.app(init, beacon.no_local, beacon.no_server, update, view)
-  |> beacon.title("My Counter")
+  beacon.simple(init:, update:, view:)
+  |> beacon.title(fn(_model) { "My Counter" })
   |> beacon.start(8080)
 }
 ```
@@ -86,163 +85,160 @@ gleam run
 
 Open http://localhost:8080 in your browser.
 
-## Key Concepts
+## Three Constructors
 
-### Model-View-Update (MVU)
+Pick the smallest constructor that fits the app. All three take labelled
+arguments and return an `App` that the builder functions below configure.
 
-Beacon uses the MVU architecture:
-- **Model** — your app's state
-- **View** — renders the Model to HTML
-- **Update** — handles messages and returns new Model
+| Constructor | `init` | `update` | `view` | Use when |
+|---|---|---|---|---|
+| `beacon.simple(init:, update:, view:)` | `fn(Context) -> model` | `fn(model, msg) -> model` | `fn(model) -> Element(msg)` | The update is pure and safe to run in the browser |
+| `beacon.application(init:, update:, view:)` | `fn(Context) -> #(model, Effect(msg))` | `fn(model, msg) -> #(model, Effect(msg))` | `fn(model) -> Element(msg)` | The update needs effects or must stay on the server |
+| `beacon.full_application(init:, update:, sync:, local:, view:)` | `fn(Context) -> #(state, Effect(msg))` | `fn(state, msg) -> #(state, Effect(msg))` | `fn(model, local) -> Element(msg)` | The server keeps private state, or the browser keeps per-tab state |
 
-### One App State Shape
+### `simple`
 
-Beacon apps are one MVU app with up to three named state areas:
+The build compiles `update` to JavaScript, so an event updates the page at
+once. The server runs the same `update` and stays authoritative: when its
+model differs from the browser's, the server's model wins and the browser
+logs the mismatch. Keep `update` pure; it cannot return effects.
 
-1. **Model** — server-authoritative UI state. It is rendered on the server for
-   first paint, then synchronized as JSON patches/syncs.
-2. **Local** — optional per-tab client state. Use `pub type Local` for dropdowns,
-   drafts, focus state, and other interactions that should not touch the server.
-3. **Server** — optional private server state. Use `pub type Server` for session
-   IDs, database handles, audit keys, and anything that must not enter the
-   client bundle.
+### `application`
 
-Shared state via `store` is separate from per-session app state and is used when
-multiple users should see the same data.
+`update` runs only on the server and returns effects (see
+[EFFECTS.md](EFFECTS.md)). The browser sends each event and renders the model
+the server sends back.
 
-Beacon does one full server render for first paint. After the WebSocket joins,
-normal updates are model sync/patch messages and the browser renders from the
-generated client code. If the generated client renderer cannot be built, startup
-fails instead of serving a degraded app.
+### `full_application`
 
-Live events use a generated event decoder contract. Generated clients
-resolve DOM handlers in the browser, encode the typed `Msg`, and the server
-decodes that envelope before running the authoritative update. If the generated
-contract cannot be built, startup fails; Beacon does not render `view` on the
-server to decode events after SSR.
-
-For privileged/internal server messages, add a `ClientMsg` type containing only
-the `Msg` variants that may come from browser events:
+The server holds a `state` that can be larger than the model the browser
+sees. `sync(state) -> model` chooses what is sent; everything else stays on
+the server. `local` adds client-only state per tab:
 
 ```gleam
-pub type Msg {
-  Increment
-  AdminReset
+pub type Local {
+  Local(input: String, menu_open: Bool)
 }
 
-pub type ClientMsg {
-  Increment
+pub fn init_local(_model: Model) -> Local {
+  Local(input: "", menu_open: False)
+}
+
+/// Runs in the browser.
+pub fn update_local(_model: Model, local: Local, msg: Msg) -> local.Update(Local) {
+  case msg {
+    SetInput(text) -> local.handled(Local(..local, input: text))
+    ToggleMenu -> local.handled(Local(..local, menu_open: !local.menu_open))
+    Increment | Decrement -> local.forward(local)
+  }
+}
+
+pub fn main() {
+  beacon.full_application(
+    init:,
+    update:,
+    sync:,
+    local: local.layer(init: init_local, update: update_local),
+    view:,
+  )
+  |> beacon.start(8080)
 }
 ```
 
-The generated contract will decode browser events into `Increment` only;
-`AdminReset` remains server/internal.
+- `local.handled(local)` applies the new local state and keeps the message in
+  the browser: no traffic.
+- `local.forward(local)` applies it and also sends the message to the
+  server's `update`.
+- `local.none()` means no client-only state; `view` then receives `Nil` as
+  its second argument.
 
-The public API uses one constructor:
-`beacon.app(init, init_local, init_server, update, view)`. Use
-`beacon.no_local` or `beacon.no_server` when a state area is absent.
+`init_local` runs once in the browser with the first synced model.
+`examples/counter_local` is the complete version of this app.
 
-### Local State (Zero Traffic)
+### The `Context`
+
+`init` receives a `beacon.Context` describing the request:
+
+- `beacon.uri(ctx)`: the requested URL.
+- `beacon.cookie(ctx, name)`: a request cookie, `Result(String, Nil)`.
+- `beacon.is_connected(ctx)`: `False` on the HTML render, `True` on the
+  WebSocket mount.
+- `beacon.session_id(ctx)`: the Beacon session id, `Result(String, Nil)`.
+
+`init` runs twice: once for the HTML render and once when the WebSocket
+connects. Effects returned from the HTML render are dropped, so a timer or a
+subscription starts once, on the connected mount.
+
+### Events
+
+Event handlers live in `beacon/event`:
 
 ```gleam
-pub type Model { Model(count: Int) }
-pub type Local { Local(input: String) }
-pub type Msg {
-  Increment        // → changes Model → syncs with server
-  SetInput(String) // → changes Local → instant, zero traffic
-}
-
-beacon.app(init, init_local, beacon.no_server, update, view)
-```
-
-`init_local(model)` receives the initial `Model`, so the first client-only values
-can be derived from server-known state without exposing `Server`.
-
-For submit boundaries that depend on current browser draft values, prefer the
-snapshot helper:
-
-```gleam
-html.form([beacon.on_submit_local(fn(fields_json) { Save(fields_json) })], [
-  html.input([html.name("title"), beacon.on_input(SetTitle)]),
+html.input([attribute.value(model.name), event.on_input(SetName)])
+html.form([event.on_submit(Submitted)], [
+  html.input([attribute.name("title")]),
+  html.button([attribute.type_("submit")], [html.text("Save")]),
 ])
 ```
 
-`on_submit_local` sends a live form snapshot as JSON event data. This avoids the
-stale-handler bug caused by closing over server-side Local in
-`on_submit(Save(local.draft))`.
+`event.on_submit(fn(List(#(String, String))) -> msg)` prevents the browser's
+form submission and delivers the form's current fields. Every message
+constructor that `view` can produce is accepted from the browser; any other
+message is refused as a forged event.
 
-### Routing
+## Routing
 
 ```gleam
-fn pages() -> List(route.Page(#(Model, Nil, Nil), Msg)) {
-  [
-    route.page("/", fn(r) { RouteChanged(r.path) }, fn(_state, _route) { home_view() }),
-    route.page("/about", fn(r) { RouteChanged(r.path) }, fn(_state, _route) { about_view() }),
-    route.page("/blog/:slug", fn(r) { RouteChanged(r.path) }, fn(state, route) {
-      let #(model, _local, _server) = state
-      blog_view(model, route)
-    }),
-  ]
+fn parse_route(uri: Uri) -> Result(Route, Nil) {
+  case router.segments(uri) {
+    [] -> Ok(HomePage)
+    ["users", id] -> Ok(UserPage(id:))
+    _ -> Error(Nil)
+  }
 }
 
-pub fn view(model: Model, _local: Nil) -> beacon.Node(Msg) {
-  let assert Ok(page) = route.dispatch_view(pages(), #(model, Nil, Nil), model.path)
-  page
-}
-
-beacon.app(init, beacon.no_local, beacon.no_server, update, view)
-|> beacon.route_pages(pages())
+beacon.application(init:, update:, view:)
+|> beacon.with_router(parse: parse_route, on_change: RouteChanged)
 |> beacon.start(8080)
 ```
 
-Route modules can also own their own state:
+Beacon dispatches `on_change(route)` after `init` and on every client
+navigation, answers URLs `parse` rejects with 404, and intercepts same-origin
+links. `router.push`, `router.replace` and `router.redirect` navigate from
+`update`. See [ROUTING.md](ROUTING.md).
 
-```gleam
-pub type Model {
-  Model(path: String, home: home.Model)
-}
+## Shared State (Stores)
 
-pub type Msg {
-  RouteChanged(String)
-  Home(home.Msg)
-}
-
-pub fn update(model: Model, _local: Nil, _server: Nil, msg: Msg) -> #(Model, Nil, Nil) {
-  case msg {
-    RouteChanged(path) -> #(Model(..model, path: path), Nil, Nil)
-    Home(child_msg) -> {
-      let model = route.update_model(
-        model,
-        child_msg,
-        fn(model) { model.home },
-        fn(model, home) { Model(..model, home: home) },
-        home.update,
-      )
-      #(model, Nil, Nil)
-    }
-  }
-}
-```
-
-### Shared State (Stores)
+Per-session state lives in the model. State that several sessions share
+lives in a `beacon/store`, and sessions subscribe to its topic:
 
 ```gleam
 let shared = store.new("counter")
-store.put(shared, "count", 0)
 
-beacon.app(init, init_local, beacon.no_server, update, view)
+beacon.application(init:, update:, view:)
 |> beacon.subscriptions(fn(_model) { [store.topic(shared)] })
-|> beacon.on_notify(fn(_topic) { CounterUpdated })
+|> beacon.on_notify(fn(_topic) { CounterChanged })
 |> beacon.start(8080)
 ```
 
-### API Routes
+Write to the store from an effect, so the write runs on the server:
+
+```gleam
+Increment -> #(model, effect.from(fn(_dispatch) { store.put(shared, "count", model.count + 1) }))
+```
+
+`subscriptions(fn(state) -> List(String))` is evaluated after each update, so
+a session can join and leave topics as its state changes.
+`beacon.broadcast(topic)` notifies subscribers without a store write. See
+[STATE_MANAGEMENT.md](STATE_MANAGEMENT.md).
+
+## API Routes
 
 ```gleam
 import beacon/api
 import gleam/json
 
-beacon.app(init, beacon.no_local, beacon.no_server, update, view)
+beacon.application(init:, update:, view:)
 |> beacon.api_routes(api.routes([
   api.get("/api/status", fn(_req) {
     api.json_value(200, json.object([#("ok", json.bool(True))]))
@@ -252,89 +248,91 @@ beacon.app(init, beacon.no_local, beacon.no_server, update, view)
 |> beacon.start(8080)
 ```
 
-API routes run **before** SSR/static file routing. Unknown method/path combinations fall through to normal page rendering.
+API routes run **before** page rendering and static files. A method and path
+that no route matches falls through to normal page rendering.
 
-For request bodies, prefer the high-level helpers:
+For request bodies, use the size-limited helpers:
 
 ```gleam
-fn handle_login(req) {
+fn handle_greeting(req: api.Request) -> api.Response {
   case api.read_form(req, 4096) {
-    Ok(fields) -> {
+    Ok(fields) ->
       case api.form_field(fields, "username") {
         Ok(username) -> api.text(200, "hello " <> username)
         Error(reason) -> api.text(400, reason)
       }
-    }
     Error(reason) -> api.text(400, reason)
   }
 }
 ```
 
-Use `api.read_text(req, max_bytes)` for raw UTF-8 bodies. For fully custom
-matching, pass a raw `fn(req) -> Option(Response(ResponseBody))` to
-`beacon.api_routes`.
+Use `api.read_text(req, max_bytes)` for raw UTF-8 bodies. For custom matching,
+pass any `fn(api.Request) -> Option(api.Response)` to `beacon.api_routes`.
 
-### Advanced: Custom Head HTML
+## Custom Head HTML
 
 ```gleam
-beacon.app(init, beacon.no_local, beacon.no_server, update, view)
+beacon.application(init:, update:, view:)
 |> beacon.head_html("<link rel='stylesheet' href='/styles.css'>")
 |> beacon.start(8080)
 ```
 
-`beacon.head_html(html_string)` injects trusted content into the `<head>` of the
-SSR page. Use it for static stylesheets, meta tags, or fonts. Do not pass user
+`beacon.head_html(html_string)` injects trusted content into the `<head>` of
+the HTML render. Use it for stylesheets, meta tags or fonts. Never pass user
 input to `head_html`.
 
-### Cookies
+## Cookies
+
+In `init`, read a cookie with `beacon.cookie(ctx, name)`. In API handlers and
+middleware, use `beacon/cookie`:
 
 ```gleam
 import beacon/cookie
 
-// Read cookies from a request
+// Read a cookie from a request.
 let token = cookie.get(req, "session_token")
 
-// Set a cookie on a response (secure defaults: HttpOnly, Secure, SameSite=Lax)
-response.new(200)
-|> cookie.set_default("session", token)
+// Set a cookie with secure defaults: HttpOnly, Secure, SameSite=Lax, path "/".
+let resp = api.text(200, "ok") |> cookie.set_default("session", token)
 
-// Set with custom options
-response.new(200)
-|> cookie.set("session", token, cookie.CookieOptions(
-  max_age: Some(86400),
-  path: "/",
-  http_only: True,
-  secure: False,  // False for local development
-  same_site: "Lax",
-))
+// Set a cookie with custom options.
+let resp =
+  api.text(200, "ok")
+  |> cookie.set("theme", "dark", cookie.CookieOptions(
+    ..cookie.default_options(),
+    http_only: False,
+  ))
 
-// Delete a cookie
-response.new(200)
-|> cookie.delete("session")
+// Delete a cookie set with the default options.
+let resp = api.text(200, "ok") |> cookie.delete("session")
 ```
 
-Shorthand: `beacon.get_cookie(req, "name")` is available on the main module.
+`cookie.set`, `cookie.set_default` and `cookie.delete` return
+`Result(Response, CookieError)`: a name, value or path outside the RFC 6265
+character sets is refused and logged, never sent.
 
-### Session Auth
+## Session Auth
 
-Use `beacon/auth` when your app wants the standard Beacon session shape: an
-opaque HttpOnly `beacon_session` cookie, a server-side session store, a readable
-CSRF token returned from login, and WebSocket auth that checks the same session.
+`beacon/auth` provides the standard session shape: an opaque HttpOnly
+`beacon_session` cookie, a server-side session store, a CSRF token returned
+from login, and WebSocket auth that checks the same session.
 
 ```gleam
 import beacon/api
 import beacon/auth
 import beacon/session
 
-let store = session.new_store("my_app_sessions")
-let auth_config = auth.default_session_config()
+pub fn main() {
+  let store = session.new_store("my_app_sessions")
+  let config = auth.default_session_config()
 
-beacon.app(init, beacon.no_local, init_server, update, view)
-|> beacon.api_routes(auth.session_routes(store, auth_config, authenticate_login))
-|> beacon.ws_auth(auth.protect_ws(store, auth_config))
-|> beacon.start(8080)
+  beacon.application(init: init(_, store, config), update:, view:)
+  |> beacon.api_routes(auth.session_routes(store, config, authenticate_login))
+  |> beacon.ws_auth(auth.protect_ws(store, config))
+  |> beacon.start(8080)
+}
 
-fn authenticate_login(req) {
+fn authenticate_login(req: api.Request) -> Result(String, String) {
   case api.read_form(req, 4096) {
     Ok(fields) -> api.form_field(fields, "username")
     Error(reason) -> Error(reason)
@@ -342,161 +340,145 @@ fn authenticate_login(req) {
 }
 ```
 
-For localhost HTTP development, use `auth.dev_session_config()` explicitly. The
-default config keeps the cookie `Secure`, `HttpOnly`, and `SameSite=Lax`.
+`session_routes` serves `POST /api/login`, `GET /api/me` and
+`POST /api/logout`. For localhost HTTP development, use
+`auth.dev_session_config()` explicitly; the default config keeps the cookie
+`Secure`, `HttpOnly` and `SameSite=Lax`.
 
-Use `auth.login_route`, `auth.current_user_route`, and `auth.logout_route` when
-you want the standard JSON/cookie behavior but custom route names. Use
-`auth.protect_api` and `auth.protect_api_with_csrf` for custom authenticated
-API handlers.
+For custom routes, use `auth.login_route`, `auth.current_user_route`,
+`auth.logout_route`, `auth.protect_api` and `auth.protect_api_with_csrf`.
+When you write the handlers yourself:
 
-### Advanced: WebSocket Authentication
+- `auth.login`, `auth.login_rotating`, `auth.create_login` and
+  `auth.create_login_rotating` return `Result(_, auth.SessionError)`. A store
+  failure is `SessionStoreUnavailable(reason)`; answer it with 503.
+- `auth.logout_response` returns `Result(Response, auth.ResponseError)`. On
+  `StoreFailed`, answer 503 and keep the cookie: the session may still exist,
+  so the browser must not believe it signed out.
 
-```gleam
-beacon.app(init, beacon.no_local, beacon.no_server, update, view)
-|> beacon.ws_auth(fn(req) {
-  case beacon.get_cookie(req, "session_token") {
-    Ok(token) -> validate_session(token)
-    Error(Nil) -> Error("No session cookie")
-  }
-})
-|> beacon.start(8080)
-```
+### Signed-in first render
 
-Runs before the WebSocket upgrade handshake. Return `Ok(Nil)` to allow, `Error(reason)` to reject with 401.
-
-If you are using standard Beacon sessions, prefer
-`auth.protect_ws(store, auth_config)` over a custom hook.
-
-### Request-Aware Server Init
-
-With `Server state`, the `init_server` function takes no arguments. Use
-`auth.init_from_session` when SSR should render a signed-in model on first
-paint:
+`init` reads the session cookie through the `Context`, so the HTML render is
+already signed in:
 
 ```gleam
-beacon.app(init, beacon.no_local, init_server, update, view)
-|> beacon.ws_auth(auth.protect_ws(store, auth_config))
-|> beacon.ws_init(auth.init_from_session(
-  store,
-  auth_config,
-  fn(_req) {
-    let #(model, _effect) = init()
-    #(model, Nil, init_server())
-  },
-  fn(req, sess, user_id) {
-    #(init_authenticated(req.path, sess, user_id), Nil, init_server())
-  },
-))
-|> beacon.start(8080)
-```
-
-Both branches must return the full combined state `#(Model, Local, Server)` —
-here `#(Model, Nil, Server)` because the app uses `beacon.no_local`. `init()`
-returns `#(Model, effect.Effect(Msg))`, so destructure it and drop the init
-effect; `ws_init` does not carry one. `init_authenticated` returns a bare
-`Model`.
-
-`beacon.ws_init` is the raw hook underneath this helper. When set, it replaces
-both `init` and `init_server` and returns the full combined state
-`#(Model, Local, Server)`, so keep it for request-aware initialization only.
-
-### Effects and Async
-
-For apps that need side effects (HTTP calls, database queries, timers):
-
-```gleam
-beacon.app(init, beacon.no_local, beacon.no_server, update, view)
-|> beacon.on_update(fn(model, msg) {
-  case msg {
-    Saved -> effect.from(fn(_) { persist(model) })
-    _ -> effect.none()
-  }
-})
-|> beacon.start(8080)
-```
-
-Keep `update` pure and deterministic. Put stores, PubSub, HTTP, env reads,
-random values, and other BEAM-only work in `on_update`; the build/linter will
-reject those calls inside client-visible `update`. Keep startup work in
-`init`'s returned effect and event-triggered server work in `on_update`.
-
-Available effects:
-- `effect.from(fn(dispatch) { ... })` -- run async work, dispatch messages back
-- `effect.background(fn(dispatch) { ... })` -- spawned process, won't block
-- `effect.every(ms, fn() { msg })` -- recurring timer
-- `effect.batch([effect1, effect2])` -- run multiple effects
-- `effect.none()` -- no side effect
-
-### Server-Only State
-
-Private state that never reaches the client. Add `pub type Server` when the app
-needs secrets, sessions, database handles, audit state, or other private values:
-
-```gleam
-beacon.app(init, beacon.no_local, init_server, update, view)
-|> beacon.start(8080)
-```
-
-- `init_server` returns server-only state (DB pools, API keys, etc.)
-- `update` receives `model`, `local`, and `server`, returning `#(model, local, server)`
-- `view` receives only `model` and `local` -- server state is invisible to the view
-- Server state is never serialized, never sent to client, never in JS bundle
-- Model updates ARE automatically pushed to the client via an auto-generated codec -- the build system generates `beacon_codec.gleam` for `Server state` apps too, encoding only Model fields (never Server)
-
-### Redirects
-
-Navigate the client to a new URL from the server. Redirects are effects, so
-they are returned from the `on_update` handler — `update` itself stays pure and
-returns only `#(model, local, server)`:
-
-```gleam
-fn after_update(state: #(Model, Nil, Nil), msg: Msg) -> effect.Effect(Msg) {
-  case msg {
-    LoginSuccess -> beacon.redirect("/dashboard")
-    Logout -> beacon.redirect("/login")
-    _ -> effect.none()
-  }
-}
-
-beacon.app(init, beacon.no_local, beacon.no_server, update, view)
-|> beacon.on_update(after_update)
-|> beacon.start(8080)
-```
-
-`beacon.hard_redirect(path)` triggers a full page reload via `window.location.href` instead of pushState. Use when the browser needs to make a real HTTP request (e.g., to receive a `Set-Cookie` header after login):
-
-```gleam
-fn after_update(state: #(Model, Nil, Nil), msg: Msg) -> effect.Effect(Msg) {
-  case msg {
-    LoginSuccess(token) -> beacon.hard_redirect("/api/auth/session/" <> token)
-    _ -> effect.none()
+fn init(ctx: beacon.Context, store, config: auth.SessionConfig) -> #(Model, Effect(Msg)) {
+  case beacon.cookie(ctx, config.cookie_name) {
+    Error(Nil) -> #(guest_model(), effect.none())
+    Ok(id) -> {
+      let fetched = session.fetch(store, id)
+      case fetched {
+        Ok(sess) -> #(signed_in_model(sess), effect.none())
+        Error(session.SessionNotFound) | Error(session.SessionExpired) ->
+          #(guest_model(), effect.none())
+        Error(err) -> {
+          log.error("my_app", "Session store unavailable: " <> session.store_error_to_string(err))
+          // init has no error channel, so the request crashes.
+          let assert Ok(sess) = fetched as "session store unavailable (logged above)"
+          #(signed_in_model(sess), effect.none())
+        }
+      }
+    }
   }
 }
 ```
 
-### Form Submission
+A cookie that names no live session renders the guest page. A store that
+cannot answer crashes the request rather than showing a signed-in user the
+guest page. `examples/auth_workspace` is the complete version.
+
+### WebSocket auth
+
+`beacon.ws_auth(fn(api.Request) -> Result(Nil, String))` runs before the
+WebSocket upgrade; `Error(reason)` rejects it with 401.
+`auth.protect_ws(store, config)` accepts only a live session and binds the
+socket to it: logout, session rotation or expiry closes the socket with code
+4401, and the browser reloads the page.
+
+`protect_ws` refuses guests. An app with a guest page must let guest sockets
+connect, or the guest page's reconnects are refused forever. Wrap it:
 
 ```gleam
-html.form([beacon.on_submit(FormSubmitted)], [
-  html.input([html.type_("text"), beacon.on_input(SetName)]),
-  html.button([html.type_("submit")], [html.text("Submit")]),
-])
+fn ws_auth(store, config) -> fn(api.Request) -> Result(Nil, String) {
+  let protect = auth.protect_ws(store, config)
+  fn(req: api.Request) {
+    case auth.current_user_from_request(req, store, config) {
+      Ok(_user) -> protect(req)
+      Error(auth.MissingSessionCookie)
+      | Error(auth.InvalidSession)
+      | Error(auth.MissingUser) -> Ok(Nil)
+      Error(reason) -> Error(auth.error_to_string(reason))
+    }
+  }
+}
 ```
 
-`on_submit` prevents the default form submission and sends the message to the server.
-Use `on_submit_local(fn(fields_json) { ... })` when the submit depends on the
-current form values rather than a fixed message.
+The server still checks every event: a guest's socket can send only messages
+that the guest page's `view` produces, and `update` must refuse signed-in
+actions from a guest.
+
+## Effects and Async
+
+With `application` and `full_application`, `init` and `update` return
+effects:
+
+```gleam
+fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
+  case msg {
+    Save -> #(Model(..model, saving: True), effect.from(fn(dispatch) {
+      dispatch(Saved(persist(model)))
+    }))
+    Saved(result) -> #(Model(..model, saving: False, result:), effect.none())
+  }
+}
+```
+
+- `effect.from(fn(dispatch) { ... })`: run work, dispatch messages back.
+- `effect.background(fn(dispatch) { ... })`: run in a spawned process.
+- `effect.every(ms, fn() { msg })` and `effect.after(ms, fn() { msg })`:
+  timers.
+- `effect.keyed`, `effect.cancellable` and `effect.cancel`: replace or stop
+  running effects.
+- `effect.batch([...])`, `effect.map(effect, f)`, `effect.none()`.
+
+See [EFFECTS.md](EFFECTS.md).
+
+### Navigation
+
+```gleam
+Saved(user) -> #(model, router.push("/users/" <> user.id))
+SignedIn -> #(model, router.redirect("/dashboard"))
+```
+
+`router.push` and `router.replace` change the URL without a page load and run
+`on_change`. `router.redirect` loads the page, so use it when the browser
+must make a real HTTP request, for example to receive a `Set-Cookie` header.
+All three take same-origin paths only.
 
 ## Production Deployment
 
-### Environment Variables
+### Configuration
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `PORT` | 8080 | Server port |
-| `SECRET_KEY` | dev default | Session signing key |
-| `BEACON_ENV` | development | Set to `production` for prod |
+`beacon.start(app, port)` uses the port it is given, and signs tokens with
+the key from `beacon.secret_key(key)`. Without one it generates a random key
+and logs a warning: tokens then stop working after a restart. Read both from
+the environment with `beacon/config`:
+
+| Function | Variable | Behaviour |
+|----------|----------|-----------|
+| `config.port()` | `PORT` | 8080 when unset; an error when not an integer in 0..65535 |
+| `config.secret_key()` | `SECRET_KEY` | An error when unset, shorter than the minimum, or the old built-in dev secret |
+| `config.is_production()` | `BEACON_ENV` | `True` for `production` or `prod` |
+
+```gleam
+pub fn main() {
+  let assert Ok(port) = config.port() as "PORT is valid (the error is logged)"
+  let assert Ok(key) = config.secret_key() as "SECRET_KEY is set and strong (the error is logged)"
+  beacon.simple(init:, update:, view:)
+  |> beacon.secret_key(key)
+  |> beacon.start(port)
+}
+```
 
 ### Docker
 
@@ -509,28 +491,26 @@ docker run -p 8080:8080 -e SECRET_KEY=your-secret my_app
 
 `GET /health` returns `{"status":"ok"}` with 200.
 
-## Build Tool
+See [DEPLOYMENT.md](DEPLOYMENT.md).
 
-Generate the server codec and compile your view and update code to JavaScript
-for the browser:
+## Build Tool
 
 ```bash
 gleam run -m beacon/build
 ```
 
-This writes `src/beacon_codec.gleam` and a content-hashed bundle like
-`priv/static/beacon_client_HASH.js`; local events then run in the browser with
-no server traffic. It finds the app module in `src/`; when more than one
-module could be the app, name it with
-`gleam run -m beacon/build -- src/my_app.gleam`. It needs `node` and `npx`. On any failure
-it prints the reason (file and location for parse errors, type and field for
-unsupported Model fields) and exits with status 1. Run it before `gleam run`
-and in every deployment; `beacon.start` never builds. See
-[DEPLOYMENT.md](DEPLOYMENT.md).
+The build finds the app module in `src/`, generates `src/beacon_codec.gleam`
+for the model, writes the event contract to `build/beacon_contract.json`, and
+compiles the client code to a content-hashed bundle like
+`priv/static/beacon_client_HASH.js`. When more than one module could be the
+app, name it: `gleam run -m beacon/build -- src/my_app.gleam`. It needs
+`node` and `npx`.
+
+On any failure it prints the reason (file and location for parse errors, type
+and field for an unsupported model field) and exits with status 1. Run it
+before `gleam run` and in every deployment; `beacon.start` never builds.
 
 ## Development Mode
-
-For a fast feedback loop during development:
 
 ```bash
 gleam run -m beacon/dev
@@ -538,35 +518,29 @@ gleam run -m beacon/dev
 
 Dev mode is the only place Beacon builds automatically:
 
-- Runs the build, then starts the app module's `main`. If the first build
+- It runs the build, then starts the app module's `main`. If the first build
   fails, dev mode exits with status 1.
-- Watches `src/` for `.gleam` changes with `fswatch` (macOS) or `inotifywait`
-  (Linux), or by polling every 500ms when neither is installed.
-- On each change, rebuilds and hot-loads the changed BEAM modules into the
-  running app, without restarting it.
+- It watches `src/` for `.gleam` changes with `fswatch` (macOS) or
+  `inotifywait` (Linux), or polls every 500ms when neither is installed.
+- On each change it rebuilds and hot-loads the changed BEAM modules into the
+  running app without restarting it.
 - A failed rebuild is logged and the app keeps running the last good build.
 - Connected browsers are not reloaded automatically yet; refresh the page to
   pick up client-side changes.
 
-For production, run `gleam run -m beacon/build` once, then `gleam run`.
-
 ## Server Privacy
 
-The build system automatically strips server-only code from the client JS bundle. Three mechanisms keep secrets server-side:
-
-1. **`server_` prefix** on constants — excluded from the client bundle
-2. **`pub type Server`** — private server-side state that never reaches the client
-3. **Server-module references** — code referencing `store`, `effect`, `pubsub`, `process` is automatically excluded
-
-Code referencing server-only modules (`store`, `effect`, `pubsub`, `process`) is automatically detected and excluded.
+The JavaScript bundle contains only the code the browser runs: what `view`
+reaches, plus `init_local` and `update_local` for a `local.layer`, plus
+`update` for `simple`. Anything else, such as server state, database calls,
+secrets and the functions that use them, is never compiled to JavaScript.
 
 ```gleam
-const server_api_key = "sk_live_secret_key"   // stripped from client JS
-const app_title = "My App"                     // included — used by view
+const signing_key = "sk_live_secret_key"   // not reached from view: stays on the server
+const app_title = "My App"                 // used by view: in the bundle
 ```
 
-The `Server` type is available in `update` but not `view`, so the compiler itself prevents accidental leaks.
-Imported route modules follow the same rule: route-local `Server`,
-`init_server`, `update_server`, and `server_` constants are stripped before the
-module is copied into the generated client bundle. Use
-`route.update_server_model` when a route mini-app owns private server state.
+With `full_application`, the browser receives only what `sync` returns, so
+private fields of the server state never leave the server. The build fails
+when browser code reaches a server-only module such as `beacon/store` or
+`beacon/effect`. See [SECURITY.md](SECURITY.md).

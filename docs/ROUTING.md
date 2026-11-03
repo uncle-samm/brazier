@@ -1,211 +1,224 @@
-# Explicit Routing
+# Routing
 
-Beacon no longer supports filesystem route discovery. Route files are ordinary
-Gleam modules that you import yourself, and every app starts through the same
-`beacon.app(...) |> beacon.start(...)` path.
+A Beacon app routes by URL with one `Route` type, one `parse` function and
+`beacon.with_router`. This is LiveView's `mount` plus `handle_params`: the
+route is part of the model, and `update` handles route changes like any other
+message. Beacon does not discover routes from the file system; every page is
+an explicit `case` branch.
 
-## Route-Aware Apps
-
-Use `beacon.route_pages` to declare accepted URL patterns, the message sent when
-each page is entered, and the typed page render function.
+## Declaring Routes
 
 ```gleam
 import beacon
-import beacon/effect
-import beacon/html
-import beacon/route
+import beacon/effect.{type Effect}
+import beacon/router
+import gleam/list
+import gleam/uri.{type Uri}
 
-pub type Model {
-  Model(path: String, project_id: String)
+pub type Route {
+  HomePage
+  UserPage(id: String)
+  SearchPage(query: String)
 }
 
 pub type Msg {
-  RouteChanged(route.Route)
+  RouteChanged(Route)
+  // ...
 }
 
-pub fn init() -> #(Model, effect.Effect(Msg)) {
-  #(Model(path: "/", project_id: ""), effect.none())
-}
-
-pub fn update(
-  model: Model,
-  _local: Nil,
-  _server: Nil,
-  msg: Msg,
-) -> #(Model, Nil, Nil) {
-  case msg {
-    RouteChanged(r) -> {
-      let project_id = case route.param(r, "id") {
-        Ok(id) -> id
-        Error(Nil) -> ""
+fn parse_route(uri: Uri) -> Result(Route, Nil) {
+  case router.segments(uri) {
+    [] -> Ok(HomePage)
+    ["users", id] -> Ok(UserPage(id:))
+    ["search"] ->
+      case list.key_find(router.query(uri), "q") {
+        Ok(query) -> Ok(SearchPage(query:))
+        Error(Nil) -> Ok(SearchPage(query: ""))
       }
-      #(Model(..model, path: r.path, project_id: project_id), Nil, Nil)
-    }
+    _ -> Error(Nil)
   }
 }
 
-pub fn view(model: Model, _local: Nil) -> beacon.Node(Msg) {
-  let assert Ok(page) =
-    route.dispatch_view(pages(), #(model, Nil, Nil), model.path)
-  page
-}
-
-fn pages() -> List(route.Page(#(Model, Nil, Nil), Msg)) {
-  [
-    route.page("/", RouteChanged, fn(_state, _route) { html.text("Home") }),
-    route.page("/settings", RouteChanged, fn(_state, _route) {
-      html.text("Settings")
-    }),
-    route.page("/projects/:id", RouteChanged, fn(state, _route) {
-      let #(model, _local, _server) = state
-      html.text("Project " <> model.project_id)
-    }),
-  ]
-}
-
 pub fn main() {
-  beacon.app(init, beacon.no_local, beacon.no_server, update, view)
-  |> beacon.route_pages(pages())
+  beacon.application(init:, update:, view:)
+  |> beacon.with_router(parse: parse_route, on_change: RouteChanged)
   |> beacon.start(8080)
 }
 ```
 
-The first request is still rendered on the server for SSR. After hydration,
-route changes and UI events use the same generated client renderer and
-server-authoritative state sync/patch protocol as every other Beacon app.
+- **`router.segments(uri)`** returns the percent-decoded path segments, with
+  empty and dot segments removed: `/users/J%C3%BCrgen/` becomes
+  `["users", "Jürgen"]`.
+- **`router.query(uri)`** returns the percent-decoded query parameters in
+  order: `?q=a%20b&page=2` becomes `[#("q", "a b"), #("page", "2")]`.
 
-## Organizing Route Code
+Beacon checks the URL's encoding before it calls `parse`, so both functions
+always succeed inside `parse`.
 
-You can split pages into modules for clarity, but the imports are explicit.
-Each module can expose a `page` constructor and normal view helpers. Keep the
-root app's public `Model` and `Msg` in the app module. Beacon does not scan the
-filesystem, generate a separate dispatcher module, or start a separate router
-runtime.
+## When `on_change` Runs
 
-```gleam
-import beacon/route
-import pages/dashboard
-import pages/settings
+Beacon runs `update(model, on_change(route))`:
 
-pub fn view(model: Model, _local: Nil) -> beacon.Node(Msg) {
-  let assert Ok(page) =
-    route.dispatch_view(pages(), #(model, Nil, Nil), model.path)
-  page
-}
+1. right after `init`, before the first render, for the requested URL, on both
+   the HTML render and the connected mount;
+2. on every client navigation: a same-origin link click, the back and forward
+   buttons, and `router.push` or `router.replace`.
 
-fn pages() -> List(route.Page(#(Model, Nil, Nil), Msg)) {
-  [
-    dashboard.page(RouteChanged, fn(state, _route) {
-      let #(model, _local, _server) = state
-      dashboard.view(model.count, Decrement, Increment)
-    }),
-    settings.page(RouteChanged, fn(state, _route) {
-      let #(model, _local, _server) = state
-      settings.view(model.name, SetName)
-    }),
-  ]
-}
-
-beacon.app(init, beacon.no_local, beacon.no_server, update, view)
-|> beacon.route_pages(pages())
-|> beacon.start(8080)
-```
-
-## Route Mini-Apps
-
-For larger pages, put the page's own `Model`, `Msg`, `update`, and `view` in the
-route module. The root app embeds that model and wraps route messages into the
-root `Msg`; there is still one Beacon app and one rendering path.
+`init` therefore never parses the URL itself. Put a placeholder route in the
+initial model; `on_change` replaces it before anything is rendered.
 
 ```gleam
-// pages/counter.gleam
-pub type Model {
-  Model(count: Int)
+fn init(_ctx: beacon.Context) -> #(Model, Effect(Msg)) {
+  #(Model(route: HomePage, users: []), effect.none())
 }
 
-pub type Msg {
-  Increment
-}
-
-pub fn init() -> Model {
-  Model(count: 0)
-}
-
-pub fn update(model: Model, msg: Msg) -> Model {
+fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
   case msg {
-    Increment -> Model(count: model.count + 1)
+    RouteChanged(UserPage(id:) as route) ->
+      #(Model(..model, route:), load_user(id))
+    RouteChanged(route) -> #(Model(..model, route:), effect.none())
+    // ...
   }
 }
-
-pub fn page(
-  on_enter: fn(route.Route) -> parent_msg,
-  select: fn(root_model) -> Model,
-  wrap: fn(Msg) -> parent_msg,
-) -> route.Page(root_model, parent_msg) {
-  route.page_model("/", on_enter, select, fn(model, _route) {
-    html.button([beacon.on_click(wrap(Increment))], [
-      html.text(int.to_string(model.count)),
-    ])
-  })
-}
 ```
 
+An effect returned for the route message runs as any other effect does: it
+is dropped on the HTML render and performed on the connected mount and on
+later navigations.
+
+## Unknown and Malformed URLs
+
+- A URL that `parse` rejects with `Error(Nil)` is answered with **404**.
+- A URL whose percent-encoding does not decode is answered with **400**.
+
+On a client navigation to such a URL, the server tells the browser to load
+the page, so the 404 or 400 comes from a real HTTP response.
+
+## Links
+
+Plain `<a href>` links to the same host navigate without a page load:
+
 ```gleam
-// main.gleam
+html.a([attribute.href("/users/7")], [html.text("Profile")])
+```
+
+The browser pushes a history entry and sends the new path over the
+WebSocket. A link opens a normal page load instead when it has a modifier key
+held, a `target` other than `_self`, a `download` attribute, or a
+`data-beacon-external` attribute. Links to other hosts are not intercepted.
+
+## Navigation Effects
+
+`update` navigates with effects from `beacon/router`:
+
+| Effect | LiveView | Behaviour |
+|---|---|---|
+| `router.push(path)` | `push_patch` | New history entry, no page load; `on_change` runs |
+| `router.replace(path)` | `push_patch(replace: true)` | Replaces the history entry, no page load; `on_change` runs |
+| `router.redirect(url)` | `redirect` | Full page load; ends the session |
+
+All three take same-origin paths only (`/users/7?tab=posts`, never `//host`,
+an absolute URL, `javascript:` or `data:`). Any other value is logged as an
+error and not sent. Use `redirect` when the browser must make a real HTTP
+request, for example to receive a `Set-Cookie` header after login.
+
+```gleam
+Saved(user) -> #(model, router.push("/users/" <> user.id))
+LoggedOut -> #(model, router.redirect("/login"))
+```
+
+## Pages as Child Modules
+
+A page with its own state and messages is a child module with its own
+`Model`, `Msg`, `update` and `view`. The parent keeps the child's model in a
+field, wraps its messages in one constructor, and maps the child's view and
+effects (see [COMPONENTS.md](COMPONENTS.md)):
+
+```gleam
+import routed/pages/home
+
 pub type Model {
-  Model(path: String, counter: counter.Model)
+  Model(route: Route, home: home.Model)
 }
 
 pub type Msg {
-  RouteChanged(String)
-  Counter(counter.Msg)
+  RouteChanged(Route)
+  Home(home.Msg)
 }
 
-pub fn update(model: Model, _local: Nil, _server: Nil, msg: Msg) -> #(Model, Nil, Nil) {
+fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
   case msg {
-    RouteChanged(path) -> #(Model(..model, path: path), Nil, Nil)
-    Counter(child_msg) -> {
-      let model = route.update_model(
-        model,
-        child_msg,
-        fn(model) { model.counter },
-        fn(model, counter) { Model(..model, counter: counter) },
-        counter.update,
-      )
-      #(model, Nil, Nil)
+    RouteChanged(route) -> #(Model(..model, route:), effect.none())
+    Home(child) -> {
+      let #(home, effect) = home.update(model.home, child)
+      #(Model(..model, home:), effect.map(effect, Home))
     }
   }
 }
 
-fn pages() -> List(route.Page(#(Model, Nil, Nil), Msg)) {
-  [
-    counter.page(
-      fn(r) { RouteChanged(r.path) },
-      fn(state) {
-        let #(model, _local, _server) = state
-        model.counter
-      },
-      Counter,
-    ),
-  ]
+pub fn view(model: Model) -> Element(Msg) {
+  element.keyed(href(model.route), case model.route {
+    HomePage -> home.view(model.home) |> element.map(Home)
+    AboutPage -> about.view()
+  })
 }
 ```
 
-For Local state, use the same pattern with
-`route.Page(#(Model, Local, Nil), Msg)` and select the route-local value from
-the tuple.
+A page without state is a plain function returning an `Element(msg)`.
 
-For `Server state`, the root app embeds route server state in its own
-`Server` and uses `route.update_server_model` to update the child model and
-child server value together. The route module may define `pub type Server`,
-`init_server`, and `update_server`, but the generated client bundle strips those
-declarations and any `server_` constants before JS compilation. Route render
-functions receive only the model value that your app's `view` receives, so pages
-cannot accidentally render `Server`.
+Key the page by its route with `element.keyed`. The browser updates the DOM
+by morphing the old tree into the new one, and without a key it reuses one
+page's nodes for the next page by position, carrying over focus and input
+state and moving reused nodes (which the browser reports as layout shift).
+A different key makes a route change replace the page's nodes.
 
-## Why
+The examples show the pattern at three sizes:
 
-Beacon has one rendering model: SSR for first paint, then client rendering from
-Beacon state. Removing filesystem route discovery keeps routing predictable,
-makes imports visible to Gleam and the build analyzer, and avoids a second app
-startup path with different behavior.
+- `examples/routed`: four pages in `src/routed/pages/`, one of them a nested
+  child module.
+- `examples/routed_workspace`: three routes in one module, with a `Local`
+  layer for panels, tabs and drafts.
+- `examples/route_server_workspace`: pages with private server state (below).
+
+## Private Server State per Page
+
+With `beacon.full_application`, the server keeps a state type that is larger
+than the model it sends. A page module can expose a public `Model` and a
+server-only record; the root state holds both, and `sync` returns only the
+model:
+
+```gleam
+pub type Session {
+  Session(model: Model, accounts: accounts.Server, settings: settings.Server)
+}
+
+fn sync(session: Session) -> Model {
+  session.model
+}
+
+pub fn main() {
+  beacon.full_application(init:, update:, sync:, local: local.none(), view:)
+  |> beacon.with_router(parse: parse_route, on_change: RouteChanged)
+  |> beacon.start(8080)
+}
+```
+
+The browser receives only what `sync` returns, and the build compiles to
+JavaScript only the code that `view` (and, for `simple`, `update`) reaches.
+Server records and the functions that use them never reach the browser. See
+[SECURITY.md](SECURITY.md).
+
+## Route-Dependent Titles
+
+`beacon.title(fn(model) { ... })` sets the document title on the HTML render,
+so it can depend on the route in the model:
+
+```gleam
+|> beacon.title(fn(model) {
+  case model.route {
+    HomePage -> "Home"
+    UserPage(id:) -> "User " <> id
+    SearchPage(..) -> "Search"
+  }
+})
+```
