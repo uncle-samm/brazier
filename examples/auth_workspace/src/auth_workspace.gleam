@@ -1,8 +1,14 @@
 /// Auth Workspace: cookie sessions, CSRF-protected API routes and a
 /// role-gated admin page.
 ///
-/// - `POST /api/login` creates a session (rotating any previous id) and sets
-///   the HttpOnly session cookie; `POST /api/logout` deletes it.
+/// - Every page load without one gets a random login CSRF token in an
+///   HttpOnly cookie (`issue_login_csrf`); the login form carries the same
+///   token in a hidden field, and `POST /api/login` refuses a form whose
+///   field does not match the cookie (a double-submit cookie).
+/// - `POST /api/login` creates a session (rotating any previous id), sets
+///   the HttpOnly session cookie and deletes the login CSRF cookie, so the
+///   next guest page gets a new token; `POST /api/logout` deletes the
+///   session.
 /// - `init` reads that cookie from the `Context`, on the HTML render and on
 ///   the connected mount, and loads the account from the session store.
 /// - A signed-in socket is bound to its session (`auth.allow_guests_ws`), so
@@ -16,17 +22,29 @@ import beacon/api
 import beacon/auth
 import beacon/cookie
 import beacon/effect.{type Effect}
+import beacon/error
 import beacon/local
 import beacon/log
+import beacon/middleware
 import beacon/router
 import beacon/session
 import gleam/dict
+import gleam/http
+import gleam/http/request
 import gleam/int
 import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
+import gleam/result
 import gleam/string
 import gleam/uri.{type Uri}
+
+/// The tab icon, inline so the browser does not request `/favicon.ico`.
+const favicon =
+  "<link rel=\"icon\" href=\"data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='7' fill='%23f59e0b'/></svg>\">"
+
+/// The cookie that holds this browser's login CSRF token.
+const login_csrf_cookie = "auth_workspace_login_csrf"
 
 const audit_key = "server-only-audit-key"
 
@@ -57,24 +75,83 @@ pub fn main() {
   let store = session.new_store("auth_workspace_sessions")
   let auth_config = auth.dev_session_config()
 
-  beacon.full_application(
-    init: init(store, auth_config),
-    update:,
-    sync:,
-    local: local.none(),
-    view: app.view,
-  )
-  |> beacon.with_router(parse: parse_route, on_change: app.RouteChanged)
-  |> beacon.title(fn(_model) { "Auth Workspace" })
-  |> beacon.secret_key("auth-workspace-session-secret-key-32-chars")
-  |> beacon.api_routes(api_handler(store, auth_config))
-  |> beacon.ws_auth(auth.allow_guests_ws(store, auth_config))
-  |> beacon.dev_mode(True)
-  |> beacon.start(8080)
+  let assert Ok(Nil) =
+    beacon.full_application(
+      init: init(store, auth_config),
+      update:,
+      sync:,
+      local: local.none(),
+      view: app.view,
+    )
+    |> beacon.with_router(parse: parse_route, on_change: app.RouteChanged)
+    |> beacon.title(fn(_model) { "Auth Workspace" })
+    |> beacon.secret_key("auth-workspace-session-secret-key-32-chars")
+    |> beacon.api_routes(api_handler(store, auth_config))
+    |> beacon.ws_auth(auth.allow_guests_ws(store, auth_config))
+    |> beacon.with_middleware(issue_login_csrf(auth_config))
+    |> beacon.dev_mode(True)
+    |> beacon.head_html(favicon)
+    |> beacon.start(8080)
+    as "beacon.start failed (it logs the error)"
 }
 
 fn parse_route(uri: Uri) -> Result(app.Route, Nil) {
   app.parse_route(router.segments(uri))
+}
+
+// ===== Login CSRF =====
+
+/// Give a browser its login CSRF token on the first page load that lacks
+/// one: a fresh random token in an HttpOnly cookie. The token is also
+/// added to the request handed on, so this page's `init` puts it in the
+/// login form, and the WebSocket mount reads the same cookie.
+///
+/// Only page routes (GET or HEAD of a path `app.parse_route` knows) get a
+/// token; API calls, assets and the WebSocket upgrade pass through.
+///
+/// Reference: Plug.CSRFProtection, which creates the token on first use and
+/// stores it in the browser's session cookie before anyone signs in, and the
+/// OWASP CSRF cheat sheet's double-submit cookie.
+fn issue_login_csrf(config: auth.SessionConfig) -> middleware.Middleware {
+  fn(req: api.Request, next: fn(api.Request) -> api.Response) -> api.Response {
+    let is_page = case req.method, page_route(req.path) {
+      http.Get, Ok(_) | http.Head, Ok(_) -> True
+      _, _ -> False
+    }
+    case is_page, cookie.get(req, login_csrf_cookie) {
+      True, Error(Nil) | True, Ok("") -> {
+        let token = session.generate_id()
+        let resp = next(request.set_cookie(req, login_csrf_cookie, token))
+        case cookie.set(resp, login_csrf_cookie, token, config.cookie_options) {
+          Ok(resp) -> {
+            log.debug(
+              "auth_workspace",
+              "Issued a login CSRF token on " <> req.path,
+            )
+            resp
+          }
+          Error(err) -> {
+            log.error(
+              "auth_workspace",
+              "Cannot set the login CSRF cookie: "
+                <> cookie.error_to_string(err),
+            )
+            api.text(500, "Internal Server Error")
+          }
+        }
+      }
+      _, _ -> next(req)
+    }
+  }
+}
+
+/// The route of a request path, decoded as Beacon decodes it before it
+/// calls `parse_route`. Middleware runs before Beacon validates the path, so
+/// a segment that does not decode is not a page here (Beacon refuses it).
+fn page_route(path: String) -> Result(app.Route, Nil) {
+  uri.path_segments(path)
+  |> list.try_map(uri.percent_decode)
+  |> result.try(app.parse_route)
 }
 
 // ===== Session lifecycle =====
@@ -88,30 +165,52 @@ fn init(
   store: session.SessionStore,
   config: auth.SessionConfig,
 ) -> fn(beacon.Context) -> Result(#(Session, Effect(Msg)), beacon.InitError) {
-  let guest =
-    Session(
-      model: app.guest_model(),
-      store:,
-      session_id: None,
-      audit_key:,
-      audit_entries: [],
-      denied_admin_events: 0,
-    )
   auth.init_from_session(
     store,
     config,
-    guest_init: fn(_ctx) {
+    guest_init: fn(ctx) {
+      use login_csrf <- result.try(login_csrf_from(ctx))
       log.debug("auth_workspace", "Rendering the guest page")
-      Ok(#(guest, effect.none()))
+      Ok(#(new_session(store, app.guest_model(login_csrf)), effect.none()))
     },
     authenticated_init: fn(ctx, sess, _user_id) {
-      Ok(#(restore(guest, sess, ctx), effect.none()))
+      Ok(#(restore(store, sess, ctx), effect.none()))
     },
   )
 }
 
+/// The guest page needs the browser's login CSRF token for its form.
+/// `issue_login_csrf` gives one to every page load, so only a browser that
+/// refuses cookies reaches `init` without it; it could not sign in anyway,
+/// so the page is refused (400) rather than shown with a form that fails.
+fn login_csrf_from(ctx: beacon.Context) -> Result(String, beacon.InitError) {
+  case beacon.cookie(ctx, login_csrf_cookie) {
+    Ok("") | Error(Nil) -> {
+      log.warning(
+        "auth_workspace",
+        "Guest page without a login CSRF cookie (connected: "
+          <> string.inspect(beacon.is_connected(ctx))
+          <> "); refusing it",
+      )
+      Error(error.refuse(400, "no " <> login_csrf_cookie <> " cookie"))
+    }
+    Ok(token) -> Ok(token)
+  }
+}
+
+fn new_session(store: session.SessionStore, model: Model) -> Session {
+  Session(
+    model:,
+    store:,
+    session_id: None,
+    audit_key:,
+    audit_entries: [],
+    denied_admin_events: 0,
+  )
+}
+
 fn restore(
-  guest: Session,
+  store: session.SessionStore,
   sess: session.Session,
   ctx: beacon.Context,
 ) -> Session {
@@ -125,8 +224,7 @@ fn restore(
       <> ")",
   )
   Session(
-    ..guest,
-    model: app.signed_in_model(account),
+    ..new_session(store, app.signed_in_model(account)),
     session_id: Some(sess.id),
     audit_entries: ["session-restored"],
   )
@@ -173,7 +271,7 @@ fn update(state: Session, msg: Msg) -> #(Session, Effect(Msg)) {
 
     // Only a signed-in page has these controls, so a guest sending one is
     // a forged event.
-    _, app.Guest -> {
+    _, app.Guest(..) -> {
       log.warning(
         "auth_workspace",
         "Ignoring " <> string.inspect(msg) <> " from a guest session",
@@ -333,19 +431,34 @@ fn handle_login(
       api.text(400, reason)
     }
     Ok(fields) ->
-      case api.form_field(fields, "csrf"), api.form_field(fields, "username") {
-        Ok(csrf), Ok(username) ->
-          case session.secure_compare(csrf, app.login_csrf_token) {
+      case
+        cookie.get(req, login_csrf_cookie),
+        api.form_field(fields, "csrf"),
+        api.form_field(fields, "username")
+      {
+        Error(Nil), _, _ | Ok(""), _, _ ->
+          refuse_login_csrf("no " <> login_csrf_cookie <> " cookie")
+        Ok(_), Error(_), _ -> refuse_login_csrf("no csrf field")
+        Ok(_), Ok(_), Error(reason) -> {
+          log.warning("auth_workspace", "Login form rejected: " <> reason)
+          api.text(400, reason)
+        }
+        Ok(expected), Ok(csrf), Ok(username) ->
+          case session.secure_compare(csrf, expected) {
             True -> start_session(req, store, config, normalize_user(username))
-            False -> refuse_login_csrf()
+            False ->
+              refuse_login_csrf(
+                "the csrf field does not match the "
+                <> login_csrf_cookie
+                <> " cookie",
+              )
           }
-        _, _ -> refuse_login_csrf()
       }
   }
 }
 
-fn refuse_login_csrf() -> api.Response {
-  log.warning("auth_workspace", "Login refused: missing or wrong CSRF field")
+fn refuse_login_csrf(reason: String) -> api.Response {
+  log.warning("auth_workspace", "Login refused: " <> reason)
   api.text(403, "Invalid login CSRF token")
 }
 
@@ -395,6 +508,13 @@ fn start_session(
               ]),
             )
             |> auth.with_session_cookie(sess, config)
+            // A login renews the token, as Phoenix's `renew_session` deletes
+            // the CSRF token: the next guest page gets a fresh one.
+            |> result.try(cookie.delete_with_options(
+              _,
+              login_csrf_cookie,
+              config.cookie_options,
+            ))
           case resp {
             Ok(resp) -> {
               log.info("auth_workspace", "Signed in " <> user)
@@ -403,8 +523,7 @@ fn start_session(
             Error(err) -> {
               log.error(
                 "auth_workspace",
-                "Login cannot set the session cookie: "
-                  <> cookie.error_to_string(err),
+                "Login cannot set its cookies: " <> cookie.error_to_string(err),
               )
               api.text(500, "Internal Server Error")
             }

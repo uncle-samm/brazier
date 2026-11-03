@@ -48,10 +48,6 @@ The docs describe the current behaviour; each item is a code change.
 - **Issue:** the `Dockerfile` HEALTHCHECK comment (`Dockerfile:66-67`) says
   Beacon has no built-in health route; `/health` exists.
   - **Files:** `Dockerfile`
-- **Issue:** `examples/auth_workspace` checks the login form against a
-  constant CSRF token (`auth_workspace/app.gleam:12`), so the login CSRF
-  check does not protect anything.
-  - **Files:** `examples/auth_workspace/src/auth_workspace/app.gleam`
 - **Issue:** several simulation tests allow leaked processes or failed
   connections (`sim_test.gleam:177`, `:247`, `:320`, `:377-379`), against
   TIGERSTYLE's zero-leak rule.

@@ -3,10 +3,16 @@
 Cookie sessions, CSRF-protected API routes and a role-gated page, on a
 `beacon.full_application` with `beacon.with_router`.
 
-- `POST /api/login` (a plain HTML form with a fixed login CSRF field)
-  creates a session with `auth.create_login_rotating`, deleting any session
-  id the browser already had, and sets the HttpOnly session cookie. The
-  JSON answer carries the session's CSRF token for API clients.
+- A page load without a login CSRF token gets a random one in the HttpOnly
+  `auth_workspace_login_csrf` cookie (a middleware), and the login form
+  carries the same token in a hidden field. `POST /api/login` answers 403
+  unless the field matches the cookie (a double-submit cookie, as in
+  Plug.CSRFProtection before sign-in).
+- `POST /api/login` (a plain HTML form) creates a session with
+  `auth.create_login_rotating`, deleting any session id the browser already
+  had, sets the HttpOnly session cookie and deletes the login CSRF cookie,
+  so the next guest page gets a new token. The JSON answer carries the
+  session's CSRF token for API clients.
 - `GET /api/me`, `POST /api/profile` and `POST /api/logout` use
   `auth.protect_api` and `auth.protect_api_with_csrf`. Logout deletes the
   session, and Beacon closes its live sockets.
@@ -31,7 +37,7 @@ Cookie sessions, CSRF-protected API routes and a role-gated page, on a
 
 ```sh
 cd examples/auth_workspace
-gleam run -m beacon/build   # after changing the source
+gleam run -m beacon/build   # first, and after every change
 gleam run -m auth_workspace
 ```
 
