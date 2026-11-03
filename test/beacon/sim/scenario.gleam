@@ -9,8 +9,11 @@ pub type Action {
   Connect
   /// Send join message. Normal apps respond with model_sync, not HTML mount.
   Join
-  /// Send a single event
+  /// Send a single event with clock 1
   SendEvent(handler_id: String, data: String)
+  /// Send a single event with an explicit clock. The server acknowledges
+  /// the highest clock it has seen in every patch and model sync.
+  SendEventWithClock(handler_id: String, data: String, clock: Int)
   /// Wait for a server response (patch, model_sync, etc.) — tracks type in metrics
   WaitForResponse(timeout_ms: Int)
   /// Wait and assert the response is a "patch" message
@@ -19,8 +22,9 @@ pub type Action {
   WaitForModelSync(timeout_ms: Int)
   /// Wait and assert the response contains expected string
   AssertResponseContains(timeout_ms: Int, expected: String)
-  /// Sleep for N milliseconds
-  Sleep(ms: Int)
+  /// Receive responses until one contains `expected`, all within
+  /// `timeout_ms`. Every response received is tracked in metrics.
+  ReceiveUntil(timeout_ms: Int, expected: String)
   /// Send a malformed WebSocket frame (fault injection)
   SendMalformed(payload: String)
   /// Graceful WebSocket close
@@ -86,21 +90,25 @@ pub fn connect_disconnect() -> Scenario {
     Connect,
     Join,
     WaitForResponse(5000),
-    Sleep(100),
     Disconnect,
   ])
 }
 
-/// Malformed frame scenario for resilience testing.
+/// Malformed frame scenario for resilience testing. The server answers
+/// each undecodable message with an error and keeps the connection open
+/// (below `ws_max_decode_errors`).
 pub fn malformed() -> Scenario {
+  let invalid = "{\"type\":\"error\",\"reason\":\"Invalid message\"}"
   Scenario(name: "malformed", actions: [
     Connect,
     Join,
-    WaitForResponse(5000),
+    WaitForModelSync(5000),
     SendMalformed("not json at all!!!"),
     SendMalformed("{\"type\":\"event\",\"name\":"),
     SendMalformed(""),
-    Sleep(500),
+    AssertResponseContains(5000, invalid),
+    AssertResponseContains(5000, invalid),
+    AssertResponseContains(5000, invalid),
     Disconnect,
   ])
 }
@@ -130,6 +138,9 @@ fn generate_strokes(total: Int, i: Int, acc: List(Action)) -> List(Action) {
   }
 }
 
+/// Above the largest clock the corrupt scenario sends (999999).
+const final_corrupt_clock = 1_000_000
+
 /// Corruption scenario — sends various types of bad data.
 pub fn corrupt() -> Scenario {
   Scenario(name: "corrupt", actions: [
@@ -158,9 +169,14 @@ pub fn corrupt() -> Scenario {
     SendMalformed(
       "{\"type\":\"event\",\"name\":\"click\",\"handler_id\":\"h0\",\"data\":\"{}\",\"target_path\":\"0\",\"clock\":-1}",
     ),
-    // Send a valid event to prove connection still works after all that
-    SendEvent("h0", "{}"),
-    WaitForResponse(5000),
+    // A valid event with a clock above every earlier one proves the
+    // connection still works after all that: the response that
+    // acknowledges it can only come after it was handled.
+    SendEventWithClock("h0", "{}", final_corrupt_clock),
+    ReceiveUntil(
+      5000,
+      "\"ack_clock\":" <> int.to_string(final_corrupt_clock) <> "}",
+    ),
     Disconnect,
   ])
 }
@@ -170,18 +186,6 @@ fn repeat_string(s: String, n: Int) -> String {
     True -> ""
     False -> s <> repeat_string(s, n - 1)
   }
-}
-
-/// Connection churn DoS scenario — rapid open/close cycles to starve legitimate clients.
-/// Uses full WebSocket handshake + immediate disconnect.
-pub fn connection_churn(cycles: Int) -> Scenario {
-  let churn_actions =
-    list.repeat([Connect, Sleep(50), Disconnect], cycles)
-    |> list.flatten
-  Scenario(
-    name: "churn(" <> int.to_string(cycles) <> ")",
-    actions: churn_actions,
-  )
 }
 
 /// Patch efficiency scenario: join gets model_sync, then N increments each with response tracking.
@@ -227,7 +231,7 @@ pub fn reconnect(n_before: Int) -> Scenario {
       [Connect, Join, WaitForResponse(5000)],
       events,
       [WaitForResponse(5000)],
-      [Disconnect, Sleep(500)],
+      [Disconnect],
       // Second session: reconnect, receive model_sync.
       [Connect, Join, WaitForResponse(5000)],
       [Disconnect],
@@ -235,19 +239,17 @@ pub fn reconnect(n_before: Int) -> Scenario {
   )
 }
 
-/// Server-push scenario: connect, join, sleep, check for multiple responses.
-pub fn server_push(wait_ms: Int) -> Scenario {
-  Scenario(name: "server_push(" <> int.to_string(wait_ms) <> ")", actions: [
-    Connect,
-    Join,
-    WaitForResponse(5000),
-    Sleep(wait_ms),
-    // After sleeping, there should be patches from server ticks
-    WaitForResponse(3000),
-    WaitForResponse(3000),
-    WaitForResponse(3000),
-    Disconnect,
-  ])
+/// Server-push scenario: connect, join, then receive `ticks` patches the
+/// client never asked for (pushed by the app's timer).
+pub fn server_push(ticks: Int) -> Scenario {
+  Scenario(
+    name: "server_push(" <> int.to_string(ticks) <> ")",
+    actions: list.flatten([
+      [Connect, Join, WaitForModelSync(5000)],
+      list.repeat(WaitForPatch(5000), ticks),
+      [Disconnect],
+    ]),
+  )
 }
 
 /// Combine two scenarios sequentially (for the second, skip Connect/Join).

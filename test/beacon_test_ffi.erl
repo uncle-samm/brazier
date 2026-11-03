@@ -1,9 +1,15 @@
 -module(beacon_test_ffi).
 -export([unique_ref/0, pd_put/2, pd_get/1, string_contains/2, do_crash/0, ensure_dir/1, suppress_logs/0, string_index_of/2, system_time_seconds/0, masked_ws_frame/2]).
 
-%% Returns a unique binary string.
+%% Returns a binary string unique across every running VM, not only this
+%% one. erlang:unique_integer alone restarts from the same values in each VM,
+%% so two `gleam test` runs at once (another worktree, the flake gate) would
+%% name the same /tmp directory and delete each other's files. The OS pid
+%% tells concurrent VMs apart.
 unique_ref() ->
-    erlang:integer_to_binary(erlang:unique_integer([positive])).
+    Pid = list_to_binary(os:getpid()),
+    N = erlang:integer_to_binary(erlang:unique_integer([positive])),
+    <<Pid/binary, "_", N/binary>>.
 
 %% Put a value in the process dictionary.
 pd_put(Key, Value) ->

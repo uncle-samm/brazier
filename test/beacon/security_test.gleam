@@ -3,6 +3,7 @@
 import beacon/ssr
 import beacon/transport
 import beacon/transport/http as transport_http
+import gleam/option.{None}
 import gleam/string
 
 // === Origin Validation Tests ===
@@ -54,11 +55,22 @@ pub fn token_expiration_capped_at_24h_test() {
   // CVE: callers could set max_age to years, keeping tokens alive forever
   // Fix: hard cap at 86400 seconds (24 hours)
   let secret = "test-secret-key-long-enough-32chars!!"
-  let token = ssr.create_session_token(secret)
-  // Token with max_age of 999999 (~11 days), but capped to 24h internally
-  // Verify the token is valid now (age 0 < 24h cap)
-  let assert Ok(_) = ssr.verify_session_token(token, secret, 999_999)
+  let now = system_time_seconds()
+  let hour = 3600
+  // A max_age of 999999 (~11 days) asked for, a token 25 hours old: the
+  // 24 h cap rejects it.
+  let stale = ssr.sign_join_token(secret, "", None, now - 25 * hour)
+  let assert Error("Session token expired") =
+    ssr.verify_session_token(stale, secret, 999_999)
+  // Inside the cap the same max_age accepts, and reports the issue time.
+  let issued_at = now - 23 * hour
+  let fresh = ssr.sign_join_token(secret, "", None, issued_at)
+  let assert Ok(verified_at) = ssr.verify_session_token(fresh, secret, 999_999)
+  assert verified_at == issued_at
 }
+
+@external(erlang, "beacon_ssr_ffi", "system_time_seconds")
+fn system_time_seconds() -> Int
 
 pub fn token_expired_rejected_test() {
   // Tokens with negative age should fail

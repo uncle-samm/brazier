@@ -1,6 +1,7 @@
 /// HTTP/1.1 server conformance and hardening tests over raw sockets:
 /// request-line forms, message framing (smuggling), header limits,
 /// keep-alive, HEAD, slow clients, crash isolation and supervision.
+import beacon/await
 import beacon/transport
 import beacon/transport/http as transport_http
 import beacon/transport/server.{type Connection, type Socket, Bytes}
@@ -561,7 +562,9 @@ pub fn slow_headers_get_408_test() {
   let listener = start_server(fast_limits())
   let socket = open(listener)
   send(socket, "GET / HTTP/1.1\r\nHost: x\r\n")
-  // Drip one header byte at a time; the deadline still expires.
+  // Drip one header byte at a time; the deadline still expires. The delays
+  // are the thing under test: a slow client is one that waits between
+  // bytes, and a slower scheduler only makes it slower.
   let assert Ok(Nil) = raw_sleep_then_send(socket, 100, <<"X":utf8>>)
   let assert Ok(Nil) = raw_sleep_then_send(socket, 100, <<"-":utf8>>)
   let assert Ok(#(408, _, _)) = raw_recv_response(socket, 2000, True)
@@ -624,7 +627,7 @@ pub fn handler_crash_is_500_and_releases_slot_test() {
     as "handler crash must answer 500"
   let assert Ok("close") = header(headers, "connection")
   assert_closed(socket)
-  let assert True = wait_for_count(listener, 0, 50)
+  await_count(listener, 0)
   // The listener keeps serving.
   let #(status, _, _) = exchange(listener, get("/"))
   let assert 200 = status
@@ -634,10 +637,10 @@ pub fn handler_crash_is_500_and_releases_slot_test() {
 pub fn killed_connection_process_releases_slot_test() {
   let listener = start_server(fast_limits())
   let socket = open(listener)
-  let assert True = wait_for_count(listener, 1, 50)
+  await_count(listener, 1)
   let assert [pid] = server.get_connection_pids(listener)
   raw_kill(pid)
-  let assert True = wait_for_count(listener, 0, 50)
+  await_count(listener, 0)
   raw_close(socket)
   server.stop(listener)
 }
@@ -649,7 +652,7 @@ pub fn per_ip_connection_cap_answers_503_test() {
     )
   let a = open(listener)
   let b = open(listener)
-  let assert True = wait_for_count(listener, 2, 50)
+  await_count(listener, 2)
   let c = open(listener)
   let assert Ok(#(503, headers, _)) = raw_recv_response(c, 2000, True)
     as "connection over the per-IP cap must get 503"
@@ -658,7 +661,7 @@ pub fn per_ip_connection_cap_answers_503_test() {
   raw_close(a)
   raw_close(b)
   // Slots free up again once the clients go away.
-  let assert True = wait_for_count(listener, 0, 100)
+  await_count(listener, 0)
   let #(status, _, _) = exchange(listener, get("/"))
   let assert 200 = status
   server.stop(listener)
@@ -668,7 +671,7 @@ pub fn global_connection_cap_answers_503_test() {
   let listener =
     start_server(transport.SecurityLimits(..fast_limits(), max_connections: 1))
   let a = open(listener)
-  let assert True = wait_for_count(listener, 1, 50)
+  await_count(listener, 1)
   let b = open(listener)
   let assert Ok(#(503, _, _)) = raw_recv_response(b, 2000, True)
     as "connection over the global cap must get 503"
@@ -681,8 +684,13 @@ pub fn killed_acceptor_is_restarted_test() {
   let listener = start_server(fast_limits())
   let before = raw_acceptor_pids(server.get_supervisor(listener))
   let assert [victim, ..] = before
+  let assert Ok(pool) =
+    raw_acceptor_pool(server.get_supervisor(listener), victim)
+  let restarts = await.watch_exit(pool, victim)
   raw_kill(victim)
-  process.sleep(50)
+  // The pool supervisor restarts a child while handling its 'EXIT'; once
+  // it has handled that message the replacement is in which_children.
+  await.expect_info(restarts, pool, "the acceptor pool to handle the kill")
   let after = raw_acceptor_pids(server.get_supervisor(listener))
   let assert True = list.length(after) == list.length(before)
   let assert False = list.contains(after, victim)
@@ -691,22 +699,19 @@ pub fn killed_acceptor_is_restarted_test() {
   server.stop(listener)
 }
 
-fn wait_for_count(
-  listener: server.Listener,
-  expected: Int,
-  attempts: Int,
-) -> Bool {
-  case server.get_connection_count(listener) == expected {
-    True -> True
-    False ->
-      case attempts {
-        0 -> False
-        _ -> {
-          process.sleep(20)
-          wait_for_count(listener, expected, attempts - 1)
-        }
-      }
-  }
+/// Return once the listener has exactly `expected` live connections. The
+/// connection owner takes a slot before the acceptor emits
+/// `[beacon, http, connection, accepted]` and releases it before it emits
+/// `closed`, so each of those events is a point to re-check the count.
+fn await_count(listener: server.Listener, expected: Int) -> Nil {
+  await.until_telemetry(
+    [
+      ["beacon", "http", "connection", "accepted"],
+      ["beacon", "http", "connection", "closed"],
+    ],
+    int.to_string(expected) <> " live connections",
+    fn() { server.get_connection_count(listener) == expected },
+  )
 }
 
 // --- FFI ---
@@ -719,6 +724,12 @@ fn raw_connect(port: Int) -> Result(Socket, String)
 
 @external(erlang, "beacon_http_raw_ffi", "send")
 fn raw_send(socket: Socket, data: BitArray) -> Result(Nil, String)
+
+@external(erlang, "beacon_http_raw_ffi", "acceptor_pool")
+fn raw_acceptor_pool(
+  listener_supervisor: process.Pid,
+  acceptor: process.Pid,
+) -> Result(process.Pid, Nil)
 
 @external(erlang, "beacon_http_raw_ffi", "sleep_then_send")
 fn raw_sleep_then_send(

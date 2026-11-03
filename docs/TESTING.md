@@ -1,44 +1,136 @@
 # Testing
 
-Run all tests: `gleam test`
-
-## Unit Testing Update Functions
-
-Test `update` as a pure function -- no framework needed:
-
-```gleam
-pub fn increment_test() {
-  let model = Model(count: 0)
-  let #(new_model, _effect) = update(model, Increment)
-  let assert Model(count: 1) = new_model
-}
+```sh
+gleam test          # unit, runtime, transport, sim, stress, cluster, client JS
+make test-client    # the client JS checks alone (fast loop)
+make test-flake     # gleam test 5 times under 8 busy loops
+make browser-all    # every example through Chrome DevTools Protocol
+make bench-check    # benchmarks against the committed baseline (not a test)
 ```
 
-## Runtime Tests
+A change is done when all of the following pass:
 
-Start a runtime actor, connect a fake transport subject, send messages, verify responses:
+- `gleam build --warnings-as-errors`
+- `gleam format --check src test`
+- `gleam test`
+- `gleam run -m beacon/lint`
+- the CDP suite
+
+CI runs the same steps (see [CI](#ci)).
+
+## Requirements
+
+`gleam test` needs **node** on `PATH`. The client runtime is tested by
+running it, so a missing node is a test failure, never a skip. Several
+tests depend on it:
+
+- `patch_test`: runs the client's patch application on server-made vectors
+  (`beacon_client/test/patch_vectors.mjs`) and its patch safety checks
+  (`patch_safety.mjs`).
+- `runtime_versioning_test`: runs the client sync state machine
+  (`sync_vectors.mjs`) and its FFI harness (`ffi_harness.mjs`).
+- `build_fixture_test`: also needs **npx**, which runs the pinned esbuild
+  (`esbuild@0.25.12` in `src/beacon/build/program.gleam`) exactly as
+  `beacon/build` does. The first run downloads it into the npx cache.
+
+`make test-client` runs `ffi_harness.mjs` and `patch_safety.mjs` directly.
+These are the client checks that need no Gleam-generated input. It is the
+quick loop when you are changing `beacon_client/src`, and it fails
+immediately, by name, when node is missing.
+
+The CDP suite needs Chrome and the project-local Python environment
+(`.venv`, with `websocket-client`).
+
+## Rules
+
+These follow CLAUDE.md, applied to tests.
+
+- **Assert the value, not the absence of a crash.** A test that only
+  checks `Ok(_)`, `True`, or that a call returned proves nothing about
+  behaviour. Assert the concrete result: the exact log line, the decoded
+  message, the count, the error variant. A log test captures the log
+  line and compares it. A token test checks the token's structure and
+  that the secret is not in it.
+- **Test the unhappy path.** For every accept test there is a refuse
+  test. A cap test must use input that only the cap rejects. For
+  example, the 24 h session-token cap is tested with a 25 h old token
+  and a max_age of 999_999, so it fails if the cap is removed.
+- **No sleeps.** Wait for the event the test expects (see below). A sleep
+  is allowed only when the passage of wall-clock time is the thing under
+  test, and it must carry a comment saying so. Those that remain are
+  listed under [Deliberate waits](#deliberate-waits).
+- **Bounded waits fail loudly.** Every wait has a deadline. When it
+  passes, the test crashes and says what it waited for and what arrived
+  instead.
+
+## Waiting for events: `beacon/await`
+
+`test/beacon/await.gleam` follows the ExUnit and LiveView test helpers. A
+passing test never waits a deadline out. The deadline
+(`await.deadline_ms`, 5000 ms) is generous enough that the flake gate's
+busy loops never trip it.
+
+| Helper | Use it to |
+|--------|-----------|
+| `barrier(subject)` / `barrier_pid(pid)` | Know an actor has handled every message sent to it before the call (a `sys:get_state` round trip, as LiveView's `render/1` does). Whatever it sent you is then already in your mailbox. |
+| `expect(subject, what, matching)` | `assert_receive`: block until a message matches; crash naming `what` and everything that arrived instead. |
+| `receive_matching(subject, within:, matching:)` | The same, returning `Error(skipped)` instead of crashing. |
+| `drain(subject)` / `settle(actor, subject)` | Everything already in the mailbox, after a barrier (`settle` is barrier + drain). Use it to assert that nothing *else* was sent. |
+| `await_down(pid, within:)` / `expect_down(pid, what)` | Wait on a monitor for a process to exit. Never poll `is_alive`. |
+| `watch_info(pid, atom)` + `expect_info` | Wait for an OTP process to receive and handle a timer tick (through the sys debug hook) instead of sleeping past its interval. |
+| `watch_exit(sup, child)` + `expect_info` | Wait for a supervisor to handle a child's exit, i.e. to have restarted it. |
+| `watch_pg_scope` + `expect_pg_leave` | Wait for pg to drop an exited member before reading group membership. |
+| `until_telemetry(events, what, condition)` | Re-check state that another process updates and then announces with a telemetry event (e.g. an HTTP slot released before `[beacon, http, connection, closed]`). |
+
+A bounded wait for *nothing* to arrive is still a time window. Use one
+only after a barrier proves that the work which could produce the
+message is done.
+
+Example: a runtime test, connected through a fake transport subject:
 
 ```gleam
-let assert Ok(subject) = runtime.start(counter_config())
+let assert Ok(rt) = runtime.start(config, test_ctx.root())
 let transport_subject = process.new_subject()
-process.send(subject, runtime.ClientConnected(
-  conn_id: "test", subject: transport_subject,
-))
-process.sleep(20)
-process.send(subject, runtime.ClientJoined(conn_id: "test", token: "", path: "/"))
-process.sleep(50)
-let selector = process.new_selector() |> process.select(transport_subject)
-let assert Ok(transport.SendModelSync(model_json: _, ..)) =
-  process.selector_receive(selector, 500)
+process.send(rt, runtime.ClientConnected(conn_id: "c1", subject: transport_subject))
+process.send(rt, runtime.ClientJoined(conn_id: "c1", token: "", path: "/"))
+let assert transport.SendModelSync(model_json:, ..) =
+  await.expect(transport_subject, "the join's model sync", fn(m) {
+    case m {
+      transport.SendModelSync(..) -> True
+      _ -> False
+    }
+  })
+assert string.contains(model_json, "\"count\":0")
 ```
 
-Send events with `runtime.ClientEventReceived` and check for `SendModelSync` or `SendPatch`. Regression tests must also assert that live join and normal post-mount updates do not send `SendMount`.
+Send events with `runtime.ClientEventReceived` and expect a `SendPatch` or
+`SendModelSync` that carries the event's clock. Regression tests must
+also assert that a live join and normal post-mount updates send no
+`SendMount`.
 
-Client-sent `ops` are untrusted. Runtime tests should send malicious ops and assert the server-computed update wins.
+Client-sent `ops` are untrusted. Runtime tests send malicious ops and
+assert that the server-computed update wins.
 
-## Transport Tests
+## Capturing logs: `beacon/log_capture`
 
-Verify encode/decode round-trips for the wire protocol:
+`log_capture.capture(fun)` runs `fun` and returns its result together with
+every log event the calling process emitted while it ran, as
+`Captured(level:, message:)`, in order. While it runs, it raises the
+primary logger level so that debug events are captured. `log_capture.has`
+checks for a level plus message fragments.
+
+```gleam
+let #(Nil, logs) = log_capture.capture(fn() { log.warning("my_mod", "slow") })
+assert logs == [Captured(level: "warning", message: "[my_mod] slow")]
+```
+
+The test runner (`test/beacon_test.gleam`) sets the logger to `critical`
+to keep output quiet. Do not call `log.configure()` in a test: it resets
+that level for every test that runs after it.
+
+## Transport tests
+
+Round-trip the wire protocol, including malformed and hostile input:
 
 ```gleam
 pub fn decode_heartbeat_test() {
@@ -47,147 +139,281 @@ pub fn decode_heartbeat_test() {
 }
 ```
 
-Security transport tests cover origin validation, rate limiting, WebSocket message/buffer caps, and HTTP pre-upgrade limits.
+The security transport tests cover:
 
-## Simulation Tests
+- origin validation;
+- rate limiting;
+- WebSocket message and buffer caps;
+- RFC 6455 frame validation;
+- HTTP pre-upgrade limits.
 
-Load test with real WebSocket connections using `beacon/sim`:
+## Simulation tests (`beacon/sim`)
+
+These tests drive real WebSocket connections against an app started on an
+OS-assigned port:
 
 ```gleam
-let port = test_app.unique_port()
-let assert Ok(_) = test_app.start_counter_app(port)
+let assert Ok(app) = test_app.start_counter_app()
 let mt = metrics.new()
+let watch = teardown.watch(app)
 let result = pool.run(pool.PoolConfig(
-  concurrency: 100, host: "localhost", port: port,
+  concurrency: 100, host: "localhost", port: app.port,
   scenario: scenario.counter(20), stagger_ms: 5, metrics: mt,
 ))
-report.assert_clean_passed(report.generate("test", result, ...))
+teardown.await_closed(watch, result.upgraded)
+let assert [] = result.failures
 ```
 
-Scenarios: `counter(n)`, `connect_disconnect()`, `malformed()`, `flood(n)`, `draw(n)`, `reconnect(n)`, `patch_efficiency(n)`, `server_push(ms)`, `corrupt()`.
+`teardown.await_closed` waits until the server has closed every connection
+the pool opened and every process those connections reported has exited.
+Leak snapshots taken after it measure cleanup that has finished, not
+cleanup that a sleep hoped had finished. See `run_measured` in
+`test/beacon/sim_test.gleam`.
 
-## Stress Tests
+The 1000-connection test requires all 1000 connections to succeed and all
+5000 events to be acknowledged, with no leaked processes.
 
-`beacon/stress` opens real WebSocket connections and can send real join/event
-frames on every connection. Use `events_per_connection` to test game-like or
-high-frequency model traffic, not only idle socket capacity.
+Scenarios:
 
-```gleam
-stress.StressConfig(
-  connections: 100,
-  host: "localhost",
-  port: 8080,
-  hold_duration_ms: 1000,
-  events_per_connection: 10,
-)
-```
+- `counter(n)`
+- `connect_disconnect()`
+- `malformed()`
+- `flood(n)`
+- `draw(n)`
+- `reconnect(n)`
+- `patch_efficiency(n)`
+- `server_push(ms)`
+- `corrupt()`
 
-Measured local baseline on May 8, 2026 with `examples/counter` running:
+## Stress tests (`beacon/stress`)
+
+`stress.run` opens N joined connections. On each it sends M events and
+waits for the patch acknowledging each one. It holds all connections open
+at the same moment, then runs the close handshake on every one. The
+result reports:
+
+- attempted, succeeded and failed connections, with a reason for each
+  failure;
+- `held`: connections open at once;
+- events acknowledged;
+- process count and memory, before the run and while everything was held.
+
+`test/beacon/stress_test.gleam` asserts on these values and on process
+identity, not on node-wide count deltas.
+
+Against a running server:
 
 ```sh
-gleam run -m counter              # in examples/counter
-gleam run -m beacon/stress        # in the repository root
+gleam run -m counter        # in examples/counter
+gleam run -m beacon/stress  # in the repository root; exits non-zero on any failure
 ```
 
-Result: 100/100 WebSocket connections succeeded, 1,000 event frames attempted,
-process count moved 44 -> 146 -> 46, memory delta was +1468KB, and final memory
-was reported around 47MB.
+## Flake gate
 
-## Example and CDP Tests (Browser)
+```sh
+make test-flake                       # 5 runs, 8 busy loops
+FLAKE_RUNS=10 FLAKE_BUSY=12 make test-flake
+```
 
-End-to-end tests run through Chrome DevTools Protocol. The repeatable entrypoints are:
+`scripts/flake_gate.sh` runs `gleam test` repeatedly while `yes >
+/dev/null` loops compete for every core, and fails if any run fails.
+
+- Each run's output is kept in `build/flake_gate/run_N.log`.
+- Failures print the assertion site, test name and value.
+- The busy loops are killed on exit, including on failure or Ctrl-C.
+
+A test that passes only on an idle machine is waiting on timing, not on an
+event. Fix the wait, not the deadline.
+
+If a failure shows `eaddrinuse`, first check for a concurrent run
+(`pgrep -f "gleam test"`, `pgrep -f test_all_cdp.py`) before treating it
+as a flake.
+
+**Known failure: a listener restart can hit `eaddrinuse`.** This is a
+source bug, not a test fault. `beacon_http_acceptors_sup` owns the listen
+socket and never closes it, so the runtime closes it when the process
+exits. With acceptors blocked in `accept`, that close can land after the
+parent supervisor has seen the exit and restarted the listener on the
+same port.
+
+- A standalone reproduction (no Beacon code: owner, 10 acceptors in
+  `accept`, stop, rebind on `DOWN`) failed 366 and 376 of 20000 rebinds
+  under 8 busy loops.
+- With an explicit `gen_tcp:close` before the owner exits, it failed 0
+  of 20000.
+- In the suite, the failed restart counts against the restart tolerance.
+  `app_tree_test`'s `wait_forever_crashes_when_the_tree_gives_up_test_`
+  then fails with an rpc `which_children` error, because the tree gave up
+  one crash early (1 of 5 flake runs, 2026-11-03).
+- The fix belongs in `src`: close the socket synchronously before the
+  owner exits.
+
+## Example and CDP tests (browser)
+
+End-to-end tests run every example in Chrome through the Chrome DevTools
+Protocol (`test_all_cdp.py`):
 
 ```sh
 make browser-canonical  # contract examples, desktop + mobile
-make browser-all        # every example slice in test_all_cdp.py
-```
-
-Use `make browser-canonical-desktop`, `make browser-canonical-mobile`,
-`make browser-all-desktop`, or `make browser-all-mobile` for a narrower
-viewport loop. You can also run one example directly:
-
-```sh
+make browser-all        # every example, desktop + mobile
+PYTHON_BIN=.venv/bin/python BEACON_CDP_VIEWPORTS=desktop sh scripts/run_all_cdp.sh
 PYTHONUNBUFFERED=1 .venv/bin/python test_all_cdp.py auth_workspace --viewport desktop
 ```
 
-The full browser matrix supports deterministic sharding for container-level CI
-parallelism:
+Narrower loops: `make browser-canonical-desktop`,
+`make browser-canonical-mobile`, `make browser-all-desktop`,
+`make browser-all-mobile`.
+
+### What a run does
+
+For each example:
+
+1. **Build.** It runs `gleam run -m beacon/build` in the example, so the
+   client bundle and `build/beacon_contract.json` exist and match the
+   source. A build failure or timeout (`BEACON_CDP_BUILD_TIMEOUT`, 300 s)
+   fails the example and prints the build output.
+2. **Start.** It starts the server and waits for its started line. If the
+   line does not come within `BEACON_CDP_SERVER_TIMEOUT` (90 s), or the
+   server dies, the example fails and the last 40 lines of server output
+   are printed.
+3. **Check.** It opens the page, acts on it, and asserts the concrete
+   values it acts on: totals, counts, cells, text. It also checks:
+   - the generated contract, and that normal updates cause no post-SSR
+     HTML mount;
+   - WebSocket frame types;
+   - DOM mutation buckets and layout shift;
+   - reconnect behaviour;
+   - mobile horizontal overflow;
+   - console and runtime errors from document start.
+4. **Stop.** It stops the server, scoped to the process group so
+   parallel shards do not kill each other's `gleam run`, and waits for
+   the port to be released.
+
+The script exits 1 if any check failed (an example that does not start
+counts as a failure) and 0 otherwise.
+
+### Waiting
+
+The harness uses Playwright's auto-wait model. After an action, a check
+re-evaluates its condition, reading CDP events in between, until it holds
+or `BEACON_CDP_WAIT_SECONDS` (default 10) passes. A passing check returns
+immediately.
+
+There are two deliberate windows:
+
+- `drain_quiet` (`BEACON_CDP_QUIET_SECONDS`, default 0.5) is for checks
+  that the browser sent *no* model event, which cannot be waited for. It
+  starts after the local update is visible.
+- Pong's "frozen while paused" check holds still for many ticks, because
+  the stillness is the thing under test.
+
+### Concurrency
+
+Before starting a run, check that no other run is using the ports
+(`pgrep -f test_all_cdp.py`; the CDP port is 9223 and the app port 8080).
+
+The full matrix shards deterministically. Use one container per shard so
+each shard has its own ports:
 
 ```sh
 BEACON_CDP_VIEWPORTS=desktop BEACON_CDP_SHARD=1/4 make browser-all-shard
-BEACON_CDP_VIEWPORTS=desktop BEACON_CDP_SHARD=2/4 make browser-all-shard
-BEACON_CDP_VIEWPORTS=desktop BEACON_CDP_SHARD=3/4 make browser-all-shard
-BEACON_CDP_VIEWPORTS=desktop BEACON_CDP_SHARD=4/4 make browser-all-shard
-```
-
-Use separate containers for parallel shards so each shard can use the default
-CDP and app ports inside its own network namespace. The local Docker runner
-builds `Dockerfile.ci`, creates the project-local `.venv` in the image, and
-runs one shard per container:
-
-```sh
 make browser-all-docker-shards
 BEACON_CDP_TOTAL_SHARDS=23 BEACON_CDP_VIEWPORTS=desktop BEACON_CDP_PARALLEL=5 make browser-all-docker-shards
 ```
 
-Useful Docker runner knobs:
+Docker runner knobs:
 
-- `BEACON_CDP_SHARDS="1,6,11"` runs a selected shard list from the configured
-  total. This is intended for multi-VM runners.
+- `BEACON_CDP_SHARDS="1,6,11"` runs a selected shard list from the
+  configured total (for multi-VM runners).
 - `BEACON_CDP_PREBUILD_EXAMPLES=1` bakes `gleam build` output for the root
-  package and every example into `Dockerfile.ci`, avoiding per-shard first
-  compile latency.
-- `BEACON_CDP_SKIP_DOCKER_BUILD=1` reuses an existing image and fails if it is
-  missing. Use this only for warmed images, such as forked Boxd workers.
-- `BEACON_CDP_SERVER_TIMEOUT=90` controls the per-example startup timeout in
-  seconds.
+  package and every example into the image, which avoids per-shard first
+  compiles.
+- `BEACON_CDP_SKIP_DOCKER_BUILD=1` reuses an existing image and fails if
+  it is missing. Use it only with warmed images, such as forked Boxd
+  workers.
+- `BEACON_CDP_KILL_PORT=1` kills whatever holds the app port. Use it only
+  when you are deliberately cleaning up a stuck local port.
 
-On the 10 CPU / 16 GB local development host, `BEACON_CDP_PARALLEL=5` is the
-measured stable setting. Higher local concurrency was faster but not reliable:
-10-way finished in 5:32 with shard failures, and 7-way finished in 7:29 with
-server startup timeouts under host pressure. CI can still run one shard per job
-because each job has its own runner/container budget.
+On the 10-CPU, 16 GB development host, `BEACON_CDP_PARALLEL=5` is the
+measured stable setting. Higher local parallelism ran faster but was
+unreliable:
 
-For Boxd-style VM fanout, prepare one base VM by syncing the repo, then build a
-warmed image once:
+- 10-way finished in 5:32, with shard failures;
+- 7-way finished in 7:29, with server startup timeouts.
 
-```sh
-BEACON_CDP_DOCKER_IMAGE=beacon-cdp:boxd BEACON_CDP_PREBUILD_EXAMPLES=1 \
-  BEACON_CDP_TOTAL_SHARDS=23 BEACON_CDP_SHARDS=1 BEACON_CDP_PARALLEL=1 \
-  sh scripts/run_cdp_shards_docker.sh
-```
+For Boxd-style VM fan-out:
 
-Fork the warmed VM and run non-overlapping shard lists with
-`BEACON_CDP_SKIP_DOCKER_BUILD=1`, for example:
+1. Build a warmed image once:
 
-```sh
-BEACON_CDP_DOCKER_IMAGE=beacon-cdp:boxd BEACON_CDP_SKIP_DOCKER_BUILD=1 \
-  BEACON_CDP_TOTAL_SHARDS=23 BEACON_CDP_SHARDS="1,6,11,16,21" \
-  BEACON_CDP_PARALLEL=2 sh scripts/run_cdp_shards_docker.sh
-```
+   ```sh
+   BEACON_CDP_DOCKER_IMAGE=beacon-cdp:boxd BEACON_CDP_PREBUILD_EXAMPLES=1 \
+     BEACON_CDP_TOTAL_SHARDS=23 BEACON_CDP_SHARDS=1 BEACON_CDP_PARALLEL=1 \
+     sh scripts/run_cdp_shards_docker.sh
+   ```
 
-The harness starts the app, opens the page, clicks controls, asserts DOM
-content, verifies each example's `build/beacon_contract.json`, prints the
-contract summary, records WebSocket frame types, tracks DOM mutation buckets,
-catches console/runtime errors from document start, and fails when an attempted
-example server dies or times out. Server shutdown is process-group scoped by
-default so parallel shards do not kill unrelated `gleam run` processes; set
-`BEACON_CDP_KILL_PORT=1` only when deliberately cleaning up a stuck local port.
+2. Fork the VM and run non-overlapping shard lists on each fork:
 
-Examples should double as integration coverage for counter, local-only state,
-server-state privacy, multi-file apps, routed apps, auth/API/cookie flow, patch
-resync, and large model/patch behavior.
+   ```sh
+   BEACON_CDP_DOCKER_IMAGE=beacon-cdp:boxd BEACON_CDP_SKIP_DOCKER_BUILD=1 \
+     BEACON_CDP_TOTAL_SHARDS=23 BEACON_CDP_SHARDS="1,6,11,16,21" \
+     BEACON_CDP_PARALLEL=2 sh scripts/run_cdp_shards_docker.sh
+   ```
 
-Measured full-browser baseline on May 8, 2026 after regenerating all example
-bundles:
+## Benchmarks
 
-```sh
-BEACON_CDP_VIEWPORTS=desktop PYTHONUNBUFFERED=1 scripts/run_all_cdp.sh
-BEACON_CDP_VIEWPORTS=mobile PYTHONUNBUFFERED=1 scripts/run_all_cdp.sh
-```
+Benchmarks are not tests and never run in `gleam test`. Use `make bench`,
+`make bench-check` and `make bench-baseline`. See
+[PERFORMANCE.md](PERFORMANCE.md) for the scenarios, the committed
+baseline and how tolerances are chosen.
 
-Results: desktop passed 415 checks with 0 failures; mobile passed 424 checks
-with 0 failures. The harness asserted generated contracts, no post-SSR HTML
-mounts for normal updates, WebSocket state updates, no empty-root flicker
-samples, bounded DOM mutation buckets, bounded layout shift, reconnect behavior,
-and mobile horizontal overflow on monitored examples.
+## CI
+
+`.github/workflows/ci.yml` builds `Dockerfile.ci` and runs two jobs:
+
+- **Gleam build, test, lint.** These steps run in order and stop at the
+  first failure:
+  1. `gleam format --check src test`
+  2. `node --version`
+  3. `make test-client`
+  4. `gleam build --warnings-as-errors`
+  5. `gleam test`
+  6. `gleam run -m beacon/lint`
+- **Browser all desktop.** 23 shards, each running
+  `make browser-all-shard` with `BEACON_CDP_VIEWPORTS=desktop`.
+
+The mobile viewport is not in CI. Run `make browser-all-mobile` locally
+before changing layout or the client.
+
+## Deliberate waits
+
+These are the waits that remain, and why.
+
+| Where | Wait | Why it stays |
+|-------|------|--------------|
+| `rate_limit_test` sweep | `process.sleep(1100)` | Rate-limit windows are wall-clock seconds; the window rolling over is under test. |
+| `ws_protocol_test` idle timeout | 4 × `process.sleep(550)` | Wall-clock time must pass the idle timeout while only heartbeats arrive. |
+| `ws_protocol_test` idle session | `process.sleep(80)` | The session idle TTL is wall-clock time, and the store has no clock to advance. |
+| `beacon/stress` | `hold_duration_ms` | Holding connections open is the load being measured (0 in tests). |
+| `beacon/sim` pool | `stagger_ms` | Connection pacing is part of the scenario. |
+| CDP `drain_quiet`, pong pause | see [Waiting](#waiting) | An absence, or stillness, is under test. |
+| `runtime_versioning_test` `wait_until` | poll, yielding 2 ms | Needs a source hook (below). |
+
+### Needs a source hook
+
+These waits cannot become event-driven from test code alone:
+
+- **Runtime PubSub subscription changes.** The runtime's PubSub listener
+  applies `SubscribeTo` and `UnsubscribeFrom` with an ETS insert or
+  delete. It is a plain receive loop with no sys barrier, and the change
+  sends no message and emits no telemetry, so `runtime_versioning_test`
+  polls. A fix needs either a telemetry event such as
+  `[beacon, subscription, changed]` or a synchronous acknowledgement.
+- **Client outbound queue.** The CDP "no model event was sent" checks use
+  a quiet window. A test hook under `__BEACON_ENABLE_TEST_HOOKS` would
+  replace it: `window.__beaconOutboundPendingForTest()`, returning the
+  queue length plus whether a pump timer is pending.
+- **Upload 413 ordering.** When an upload is refused early, the server
+  discards the unread body (bounded by the body read timeout) before it
+  writes the 413, so the refusal arrives about 0.5 s late. It should
+  write the refusal first, or close instead of discarding. The discard
+  should also end when the peer closes.

@@ -152,17 +152,28 @@ pub fn render_page_includes_script_tag_test() {
 
 const bundle = "beacon_client_0123456789abcdef.js"
 
-@external(erlang, "beacon_test_ffi", "unique_ref")
-fn unique_ref() -> String
-
-/// A fresh assets directory with `manifest` as its manifest (when given) and
-/// the files in `bundles`.
-fn assets_dir(
+/// Runs `run` on a fresh assets directory holding `manifest` as its manifest
+/// (when given) and the files in `bundles`, then deletes it.
+///
+/// The directory sits one level inside its own root, so a bundle named
+/// `../x` is written inside the root, not into /tmp. The root is named with
+/// random bytes, not `erlang:unique_integer`: that counter is unique only
+/// within one VM, so `gleam test` runs that are concurrent, or follow one
+/// another, compute the same names. A test then found an earlier run's
+/// manifest in "its" directory. `create_directory` (not `_all`) fails on a
+/// name that already exists, rather than writing into it.
+fn with_assets_dir(
   manifest: option.Option(String),
   bundles: List(String),
-) -> String {
-  let dir = "/tmp/beacon_ssr_assets_" <> unique_ref()
-  let assert Ok(Nil) = simplifile.create_directory_all(dir)
+  run: fn(String) -> a,
+) -> a {
+  let root =
+    "/tmp/beacon_ssr_assets_"
+    <> bit_array.base16_encode(crypto.strong_random_bytes(16))
+  let assert Ok(Nil) = simplifile.create_directory(root)
+    as "the assets root must not exist yet"
+  let dir = root <> "/static"
+  let assert Ok(Nil) = simplifile.create_directory(dir)
   case manifest {
     option.Some(text) -> {
       let assert Ok(Nil) =
@@ -174,7 +185,9 @@ fn assets_dir(
   list.each(bundles, fn(name) {
     let assert Ok(Nil) = simplifile.write(dir <> "/" <> name, "start(App);")
   })
-  dir
+  let result = run(dir)
+  let assert Ok(Nil) = simplifile.delete(root) as "assets root cleanup"
+  result
 }
 
 pub fn client_assets_dir_is_the_apps_priv_static_test() {
@@ -182,28 +195,30 @@ pub fn client_assets_dir_is_the_apps_priv_static_test() {
 }
 
 pub fn client_bundle_name_reads_the_manifest_test() {
-  let dir = assets_dir(option.Some(bundle <> "\n"), [bundle])
+  use dir <- with_assets_dir(option.Some(bundle <> "\n"), [bundle])
   let assert Ok(name) = ssr.client_bundle_name(dir)
   let assert True = name == bundle
 }
 
 pub fn client_bundle_name_without_manifest_is_an_error_test() {
-  let dir = assets_dir(option.None, [bundle])
+  use dir <- with_assets_dir(option.None, [bundle])
   let assert Error(reason) = ssr.client_bundle_name(dir)
   let assert True = str_contains(reason, "beacon_client.manifest")
   let assert True = str_contains(reason, "gleam run -m beacon/build")
 }
 
 pub fn client_bundle_name_refuses_a_name_that_is_not_build_output_test() {
-  let dir = assets_dir(option.Some("../secret.js"), ["../secret.js"])
-  let assert Error(reason) = ssr.client_bundle_name(dir)
-  let assert True = str_contains(reason, "invalid bundle")
-  let dir = assets_dir(option.Some(""), [])
+  {
+    use dir <- with_assets_dir(option.Some("../secret.js"), ["../secret.js"])
+    let assert Error(reason) = ssr.client_bundle_name(dir)
+    let assert True = str_contains(reason, "invalid bundle")
+  }
+  use dir <- with_assets_dir(option.Some(""), [])
   let assert Error(_) = ssr.client_bundle_name(dir)
 }
 
 pub fn client_bundle_name_refuses_a_missing_bundle_test() {
-  let dir = assets_dir(option.Some(bundle), [])
+  use dir <- with_assets_dir(option.Some(bundle), [])
   let assert Error(reason) = ssr.client_bundle_name(dir)
   let assert True = str_contains(reason, "does not exist")
 }
@@ -436,9 +451,13 @@ pub fn head_html_multiple_tags_test() {
 
 // --- Session token tests ---
 
-pub fn create_session_token_not_empty_test() {
-  let token = ssr.create_session_token("my-secret-key-for-testing-purposes!!")
-  let assert True = string_length(token) > 10
+pub fn create_session_token_is_a_signed_message_without_the_secret_test() {
+  let secret = "my-secret-key-for-testing-purposes!!"
+  let token = ssr.create_session_token(secret)
+  // gleam/crypto.sign_message: protected header, payload, signature.
+  let assert [header, payload, signature] = string.split(token, ".")
+  let assert True = header != "" && payload != "" && signature != ""
+  let assert False = string.contains(token, secret)
 }
 
 pub fn verify_valid_token_test() {

@@ -19,7 +19,6 @@ import beacon/transport/server.{type Connection, type ResponseBody, Bytes}
 import gleam/bit_array
 import gleam/bytes_tree
 import gleam/dict
-import gleam/erlang/process
 import gleam/http
 import gleam/http/request.{type Request}
 import gleam/http/response
@@ -55,12 +54,13 @@ type Msg {
 }
 
 pub fn full_auth_cookie_csrf_ws_flow_test() {
-  let port = 21_000 + unique_port_offset()
-  let store = session.new_store("auth_flow_" <> int.to_string(port))
-  let csrf_store =
-    form.create_csrf_store("auth_flow_csrf_" <> int.to_string(port))
-  let assert Ok(_app) = application.start(test_config(port, store, csrf_store))
-  process.sleep(150)
+  // Port 0: the OS picks a free port, and `application.start` returns
+  // only once the listener is bound, so the first request needs no wait.
+  let id = unique_ref()
+  let store = session.new_store("auth_flow_" <> id)
+  let csrf_store = form.create_csrf_store("auth_flow_csrf_" <> id)
+  let assert Ok(app) = application.start(test_config(0, store, csrf_store))
+  let port = app.port
 
   let base = "http://localhost:" <> int.to_string(port)
 
@@ -128,7 +128,8 @@ pub fn full_auth_cookie_csrf_ws_flow_test() {
   let assert 200 = profile_status
   let assert True = string.contains(profile_body, "\"ok\":true")
 
-  let assert Error(_) = ws_connect_with_headers("localhost", port, [])
+  let assert Error("upgrade_failed: 401" <> _) =
+    ws_connect_with_headers("localhost", port, [])
   let assert Ok(socket) =
     ws_connect_with_headers("localhost", port, [#("cookie", session_cookie)])
   let assert Ok(Nil) = ws_send(socket, "{\"type\":\"join\"}")
@@ -138,7 +139,7 @@ pub fn full_auth_cookie_csrf_ws_flow_test() {
   let assert True = string.contains(sync, "admin")
   let assert False = string.contains(sync, "server-private-key")
   let assert False = string.contains(sync, "\"type\":\"mount\"")
-  ws_close(socket)
+  let assert Ok(Nil) = ws_close_graceful(socket, 5000)
 
   let assert Ok(#(logout_status, logout_headers, logout_body)) =
     http_request(
@@ -150,8 +151,10 @@ pub fn full_auth_cookie_csrf_ws_flow_test() {
   let assert 200 = logout_status
   let assert True = string.contains(logout_body, "Logged out")
   let assert True = header_contains(logout_headers, "set-cookie", "Max-Age=0")
-  let assert Error(_) =
+  // After logout the old cookie no longer authenticates the upgrade.
+  let assert Error("upgrade_failed: 401" <> _) =
     ws_connect_with_headers("localhost", port, [#("cookie", session_cookie)])
+  let assert Ok(Nil) = application.stop(app)
 }
 
 const known_paths = ["/", "/login", "/app", "/settings", "/admin"]
@@ -589,15 +592,8 @@ fn json_field(body: String, name: String) -> Result(String, Nil) {
   }
 }
 
-fn unique_port_offset() -> Int {
-  abs(erlang_unique_pos()) % 500
-}
-
-@external(erlang, "erlang", "abs")
-fn abs(n: Int) -> Int
-
-@external(erlang, "erlang", "unique_integer")
-fn erlang_unique_pos() -> Int
+@external(erlang, "beacon_test_ffi", "unique_ref")
+fn unique_ref() -> String
 
 pub type TcpSocket
 
@@ -622,5 +618,5 @@ fn ws_send(socket: TcpSocket, payload: String) -> Result(Nil, String)
 @external(erlang, "beacon_http_client_ffi", "ws_recv")
 fn ws_recv(socket: TcpSocket, timeout: Int) -> Result(String, String)
 
-@external(erlang, "beacon_http_client_ffi", "ws_close")
-fn ws_close(socket: TcpSocket) -> Nil
+@external(erlang, "beacon_http_client_ffi", "ws_close_graceful")
+fn ws_close_graceful(socket: TcpSocket, timeout: Int) -> Result(Nil, String)
