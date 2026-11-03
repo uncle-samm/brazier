@@ -958,6 +958,74 @@ scenario("a simple app predicts its model and the server's model wins", async ()
   assert.equal(logsMatching("warn", "the server's model wins").length, 1);
 });
 
+scenario("patches held for a pending simple event still advance the cached model", async () => {
+  const update = (model, msg) => ({ count: model.count + msg.inc });
+  await loadRuntime({ simple: true, update, view: counterView });
+  const s = sockets[0];
+  s.open();
+  sync(s, 0, { count: 0 });
+  const button = el('[data-beacon-on-click="0.0"]');
+  fire(button, "click");
+  fire(button, "click");
+  advance(16);
+  assert.equal(button.textContent, "2", "both predictions render");
+  patch(s, 1, [{ op: "replace", path: "/count", value: 1 }], 1);
+  assert.equal(button.textContent, "2", "a patch that misses the second click does not undo it");
+  patch(s, 2, [{ op: "replace", path: "/count", value: 2 }], 2);
+  assert.equal(button.textContent, "2");
+  assert.equal(s.types().filter((t) => t === "request_sync").length, 0, "the held patch is a base, not a gap");
+  assert.equal(logsMatching("warn", "does not build on cached").length, 0);
+  assert.equal(logsMatching("warn", "the server's model wins").length, 0, "the confirmed prediction matches");
+  fire(button, "click");
+  fire(button, "click");
+  advance(16);
+  assert.equal(button.textContent, "4");
+  patch(s, 3, [{ op: "replace", path: "/count", value: 3 }], 3);
+  assert.equal(button.textContent, "4", "held");
+  patch(s, 3, [], 4);
+  assert.equal(button.textContent, "3", "an ack adopts the held model");
+  assert.equal(logsMatching("warn", "the server's model wins").length, 1, "the held model is checked against the prediction");
+  fire(button, "click");
+  advance(16);
+  sync(s, 5, { count: 10 }, 4);
+  assert.equal(button.textContent, "4", "a held model_sync does not undo the prediction");
+  patch(s, 5, [], 5);
+  assert.equal(button.textContent, "10", "the ack adopts the held model_sync");
+  assert.equal(s.types().filter((t) => t === "request_sync").length, 0);
+});
+
+scenario("a click while reconnecting is sent after the held join model_sync", async () => {
+  const update = (model, msg) => ({ count: model.count + msg.inc });
+  await loadRuntime({ simple: true, update, view: counterView });
+  const s = sockets[0];
+  s.open();
+  sync(s, 0, { count: 3 });
+  s.serverClose(1006);
+  fire(el('[data-beacon-on-click="0.0"]'), "click");
+  advance(reconnectDelay());
+  const s1 = sockets[1];
+  s1.open();
+  sync(s1, 0, { count: 3 }, 0);
+  assert.equal(el('[data-beacon-on-click="0.0"]').textContent, "4", "the join model_sync does not undo the click");
+  assert.equal(s1.types().filter((t) => t === "event").length, 1, "the queued click is sent once synced");
+  const ackClock = s1.sent.find((x) => x.msg.type === "event").msg.clock;
+  patch(s1, 1, [{ op: "replace", path: "/count", value: 4 }], ackClock);
+  assert.equal(el('[data-beacon-on-click="0.0"]').textContent, "4");
+  assert.equal(logsMatching("warn", "the server's model wins").length, 0);
+  // Unhappy path: a click sent but never acknowledged before the socket dies.
+  fire(el('[data-beacon-on-click="0.0"]'), "click");
+  advance(16);
+  assert.equal(el('[data-beacon-on-click="0.0"]').textContent, "5");
+  s1.serverClose(1006);
+  advance(reconnectDelay());
+  assert.equal(logsMatching("warn", "were not acknowledged").length, 1, "the lost prediction is reported");
+  const s2 = sockets[2];
+  s2.open();
+  sync(s2, 0, { count: 4 }, 0);
+  assert.equal(el('[data-beacon-on-click="0.0"]').textContent, "4", "the new connection's model wins");
+  assert.equal(s2.types().filter((t) => t === "event").length, 0, "a sent event is not resent");
+});
+
 scenario("a crash in the app's client update stops event handling loudly", async () => {
   const state = { crash: true };
   await loadRuntime({ view: counterView, state });

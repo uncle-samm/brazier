@@ -130,7 +130,6 @@ let predicted = false;
 // The clock of the latest queued event of a `simple` app; server state that
 // does not acknowledge it is held back so the prediction is not undone.
 let pendingModelEventClock = 0;
-let skippedAuthoritativeWhilePending = false;
 
 // Pre-hydration events: { name, ids, snapshot }.
 const MAX_PENDING_EARLY_EVENTS = 50;
@@ -511,25 +510,30 @@ function hasPendingModelEvent() {
   return pendingModelEventClock > latestAckClock;
 }
 
+// Server state that does not acknowledge a pending `simple` event is cached
+// but not rendered, so it cannot undo the prediction. The ack that covers the
+// event adopts the cached model (and checks the prediction against it).
 function shouldHoldServerState(ackClock, kind, version) {
   if (hasPendingModelEvent() && ackClock < pendingModelEventClock) {
-    skippedAuthoritativeWhilePending = true;
     trace(kind + ".held_for_pending_event", { version, ackClock, pendingModelEventClock });
     return true;
   }
   return false;
 }
 
-function needsFullSyncAfterHeldPatch(ackClock) {
-  return skippedAuthoritativeWhilePending && ackClock >= pendingModelEventClock;
+// The highest clock among queued events, 0 when none is queued.
+function queuedEventClock() {
+  let max = 0;
+  for (const msg of outbound.messages()) {
+    if (msg.type === "event") max = Math.max(max, msg.clock);
+    else if (msg.type === "event_batch") for (const e of msg.events) max = Math.max(max, e.clock || 0);
+  }
+  return max;
 }
 
 function markServerAckApplied(ackClock) {
   latestAckClock = Math.max(latestAckClock, ackClock);
-  if (latestAckClock >= pendingModelEventClock) {
-    pendingModelEventClock = 0;
-    skippedAuthoritativeWhilePending = false;
-  }
+  if (latestAckClock >= pendingModelEventClock) pendingModelEventClock = 0;
 }
 
 // Whether a focused form control keeps the value the user is typing: while a
@@ -577,6 +581,15 @@ function connect() {
     console.error("[beacon] Not connecting: the session was revoked (close 4401). Reload to sign in again.");
     return;
   }
+  // Events sent on the old socket are never acknowledged on this one, so
+  // only a still-queued event of a `simple` app keeps holding server state.
+  const queuedClock = simple ? queuedEventClock() : 0;
+  if (hasPendingModelEvent() && queuedClock < pendingModelEventClock) {
+    console.warn("[beacon] Events sent before the disconnect were not acknowledged; the new connection's model replaces their prediction");
+    trace("reconnect.unacked_prediction", { pendingModelEventClock, latestAckClock, queuedClock });
+  }
+  pendingModelEventClock = queuedClock;
+  predicted = queuedClock > 0;
   readyForServerEvents = false;
   socketJoined = false;
   modelSynced = false;
@@ -586,9 +599,6 @@ function connect() {
   syncRequestInFlight = false;
   syncGaveUp = false;
   consecutiveModelSyncFailures = 0;
-  pendingModelEventClock = 0;
-  skippedAuthoritativeWhilePending = false;
-  predicted = false;
   // The server counts its rate limit per connection, so a new socket starts
   // with a fresh budget. A queued request_sync is superseded by the join's
   // model_sync.
@@ -814,16 +824,22 @@ function handleModelSync(modelJson, version, ackClock) {
     trace("model_sync.stale", { version, currentModelVersion });
     return;
   }
-  if (shouldHoldServerState(ackClock, "model_sync", version)) return;
-
+  // A held model_sync is cached like a held patch; the connection is still
+  // synced, so queued events flow and the ack that covers them adopts it.
+  const held = shouldHoldServerState(ackClock, "model_sync", version);
+  if (held && !clientInitialized) {
+    throw new Error("[beacon] invariant violated: a simple event is pending before the client was initialized");
+  }
   let parsed;
   try {
     parsed = JSON.parse(modelJson);
-    markServerAckApplied(ackClock);
-    const failure = adoptAuthoritativeModel(modelJson);
-    if (failure !== null) {
-      modelSyncFailed(version, failure);
-      return;
+    if (!held) {
+      markServerAckApplied(ackClock);
+      const failure = adoptAuthoritativeModel(modelJson);
+      if (failure !== null) {
+        modelSyncFailed(version, failure);
+        return;
+      }
     }
   } catch (e) {
     modelSyncFailed(version, e && e.message ? e.message : String(e));
@@ -899,17 +915,25 @@ function handlePatch(opsJson, version, ackClock) {
       throw new Error("[beacon] invariant violated: unknown patch verdict " + verdict);
   }
 
-  if (shouldHoldServerState(ackClock, "patch", version)) return;
-  if (needsFullSyncAfterHeldPatch(ackClock)) {
-    requestFullSync("held_patch_base_mismatch");
-    return;
-  }
-
   let newModelJson;
   try {
     // applyOps never mutates its input, so a failure leaves the cache intact
     // until it is invalidated below.
     newModelJson = applyOps(clientModelJson, ops);
+  } catch (e) {
+    console.error("[beacon] Patch apply failed:", e);
+    invalidateModelCache();
+    requestFullSync("patch_apply_failed");
+    return;
+  }
+  // A held patch still advances the cached authoritative model, so the
+  // next patch builds on it; only adopting and rendering it waits.
+  if (shouldHoldServerState(ackClock, "patch", version)) {
+    clientModelJson = newModelJson;
+    currentModelVersion = version;
+    return;
+  }
+  try {
     markServerAckApplied(ackClock);
     const failure = adoptAuthoritativeModel(JSON.stringify(newModelJson));
     if (failure !== null) {
@@ -919,9 +943,9 @@ function handlePatch(opsJson, version, ackClock) {
       return;
     }
   } catch (e) {
-    console.error("[beacon] Patch apply failed:", e);
+    console.error("[beacon] Rendering patch v" + version + " failed:", e);
     invalidateModelCache();
-    requestFullSync("patch_apply_failed");
+    requestFullSync("patch_render_failed");
     return;
   }
   clientModelJson = newModelJson;
