@@ -2,8 +2,10 @@
 /// Unhappy paths first.
 import beacon/api
 import beacon/auth
+import beacon/await
 import beacon/log_capture
 import beacon/session
+import beacon/telemetry.{type Event}
 import beacon/transport/server.{type Connection, type ResponseBody, Bytes}
 import gleam/bytes_tree
 import gleam/dict
@@ -28,6 +30,12 @@ fn short_idle_store(name: String) -> session.SessionStore {
 }
 
 // --- Expiry ---
+
+// Expiry is wall-clock time and the LocalEts store has no clock to advance,
+// so these tests sleep past a lifetime: the sleep is the thing under test.
+// A sleep past a TTL cannot race (a slow scheduler only makes the session
+// older); a test that needs a session to stay alive gives every gap a wide
+// margin below the TTL instead.
 
 pub fn idle_expired_session_is_rejected_test() {
   let store = short_idle_store("sec_idle_expired")
@@ -72,29 +80,44 @@ pub fn absolute_lifetime_is_enforced_despite_activity_test() {
 }
 
 pub fn activity_extends_idle_lifetime_test() {
+  // 4 touches 150 ms apart span 600 ms, past the 400 ms idle TTL, and each
+  // gap leaves 250 ms of margin for a starved scheduler.
   let store =
     session.new_store_with_config(
       "sec_idle_extend",
       session.StoreConfig(
         absolute_ttl_ms: 60_000,
-        idle_ttl_ms: 150,
+        idle_ttl_ms: 400,
         sweep_interval_ms: 60_000,
       ),
     )
   let sess = session.create(store)
-  list.each(seq(1, 5), fn(_) {
-    sleep_ms(60)
+  let started = monotonic_ms()
+  list.each(seq(1, 4), fn(_) {
+    sleep_ms(150)
     let assert Some(_) = session.get(store, sess.id)
     Nil
   })
+  // The session outlived its idle TTL only because it was touched.
+  let assert True = monotonic_ms() - started > 400
 }
 
 pub fn sweep_removes_expired_sessions_test() {
-  let store = short_idle_store("sec_sweep_manual")
+  // The live session must survive from its creation to the sweep: a 500 ms
+  // idle TTL leaves that gap a wide margin, and 600 ms expires the others.
+  let store =
+    session.new_store_with_config(
+      "sec_sweep_manual",
+      session.StoreConfig(
+        absolute_ttl_ms: 60_000,
+        idle_ttl_ms: 500,
+        sweep_interval_ms: 60_000,
+      ),
+    )
   let _a = session.create(store)
   let _b = session.create(store)
   should.equal(session.count(store), 2)
-  sleep_ms(80)
+  sleep_ms(600)
   let live = session.create(store)
   should.equal(session.sweep_expired(store), Ok(2))
   should.equal(session.count(store), 1)
@@ -111,12 +134,43 @@ pub fn background_sweeper_removes_expired_sessions_test() {
         sweep_interval_ms: 20,
       ),
     )
+  let events = process.new_subject()
+  let handler_id = "sec_sweep_background_" <> int.to_string(unique_integer())
+  let assert Ok(Nil) = telemetry.start()
+  let assert Ok(Nil) =
+    telemetry.attach(handler_id, [["beacon", "session", "expired"]], fn(event) {
+      process.send(events, event)
+    })
   list.each(seq(1, 10), fn(_) {
     let _ = session.create(store)
     Nil
   })
-  sleep_ms(200)
-  should.equal(session.count(store), 0)
+  // The sweeper emits one expired event per row, after the row is deleted:
+  // each one is a point at which to look, instead of sleeping and hoping
+  // enough sweeps ran.
+  await_swept_empty(store, events)
+  let assert Ok(Nil) = telemetry.detach(handler_id)
+}
+
+/// Wait for expired events from the sweeper until the store is empty.
+fn await_swept_empty(
+  store: session.SessionStore,
+  events: process.Subject(Event),
+) -> Nil {
+  case session.count(store) {
+    0 -> Nil
+    remaining -> {
+      let _swept =
+        await.expect(
+          events,
+          "a sweep with " <> int.to_string(remaining) <> " sessions left",
+          matching: fn(event) {
+            telemetry.string(event, "reason") == Ok("sweep")
+          },
+        )
+      await_swept_empty(store, events)
+    }
+  }
 }
 
 // --- Writes never resurrect / never lose data ---
@@ -295,18 +349,25 @@ pub fn bindings_are_released_when_process_exits_test() {
   let ready = process.new_subject()
   // No application runs here: start the node-wide session scope.
   session.ensure_registry()
+  let watch = await.watch_pg_scope("beacon_session_pg")
   let pid =
     process.spawn(fn() {
       session.bind_current_process(store, sess.id)
       session.bind_current_process(store, sess.id)
-      process.send(ready, Nil)
-      sleep_ms(30)
+      let release = process.new_subject()
+      process.send(ready, release)
+      // Stay bound until the test has counted.
+      let assert Ok(Nil) = process.receive(release, await.deadline_ms)
+      Nil
     })
-  let assert Ok(Nil) = process.receive(ready, 1000)
+  let assert Ok(release) = process.receive(ready, 1000)
   // Idempotent: binding twice is one membership.
   should.equal(session.bound_process_count(store, sess.id), 1)
-  should.be_true(wait_until_dead(pid, 50))
-  sleep_ms(20)
+  process.send(release, Nil)
+  await.expect_down(pid, "the bound process")
+  // pg drops a member when it exits; once it says so the count is final.
+  await.expect_pg_leave(watch, pid, "the bound process")
+  await.unwatch_pg_scope(watch)
   should.equal(session.bound_process_count(store, sess.id), 0)
 }
 
@@ -486,16 +547,19 @@ fn seq(from: Int, to: Int) -> List(Int) {
   int.range(from: to, to: from - 1, with: [], run: fn(acc, i) { [i, ..acc] })
 }
 
-fn wait_until_dead(pid: process.Pid, attempts: Int) -> Bool {
-  case process.is_alive(pid), attempts {
-    False, _ -> True
-    True, 0 -> False
-    True, n -> {
-      sleep_ms(10)
-      wait_until_dead(pid, n - 1)
-    }
-  }
+@external(erlang, "erlang", "unique_integer")
+fn unique_integer() -> Int
+
+fn monotonic_ms() -> Int {
+  monotonic_time(Millisecond)
 }
+
+type MillisecondUnit {
+  Millisecond
+}
+
+@external(erlang, "erlang", "monotonic_time")
+fn monotonic_time(unit: MillisecondUnit) -> Int
 
 @external(erlang, "beacon_ws_test_ffi", "receive_revoked")
 fn receive_revoked(timeout_ms: Int) -> Result(#(String, String), Nil)

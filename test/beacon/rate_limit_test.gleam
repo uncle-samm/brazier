@@ -1,3 +1,4 @@
+import beacon/await
 import beacon/rate_limit
 import gleam/erlang/process
 import gleam/int
@@ -143,7 +144,9 @@ pub fn sweep_deletes_expired_windows_test() {
   let assert rate_limit.Allowed(..) = rate_limit.check(limiter, "a")
   let assert rate_limit.Allowed(..) = rate_limit.check(limiter, "b")
   // Let the 1s window roll over, then sweep. The periodic sweep may have
-  // removed some counters first, so only an upper bound is exact.
+  // removed some counters first, so only an upper bound is exact. The sleep
+  // is the thing under test: windows are wall-clock seconds, and sleeping
+  // past one cannot race, since a slow scheduler only makes it older.
   process.sleep(1100)
   let assert Ok(deleted) = rate_limit.sweep(limiter)
   let assert True = deleted <= 2
@@ -158,9 +161,16 @@ pub fn periodic_sweep_runs_without_being_asked_test() {
       "test_periodic_" <> unique_id(),
       rate_limit.RateLimitConfig(max_requests: 5, window_seconds: 1),
     )
+  let owner = rate_limit.owner(limiter)
+  let sweeps = await.watch_info(owner, "sweep")
   let assert rate_limit.Allowed(..) = rate_limit.check(limiter, "a")
-  let assert True =
-    wait_until(fn() { rate_limit.key_count(limiter) == Ok(0) }, 3500)
+  let assert Ok(1) = rate_limit.key_count(limiter)
+  // Sweeps are a second apart and the counter's window ends at most a
+  // second after the check, so the second periodic sweep after the check
+  // runs in a later window and deletes it.
+  await.expect_info(sweeps, owner, "the first periodic sweep")
+  await.expect_info(sweeps, owner, "the second periodic sweep")
+  let assert Ok(0) = rate_limit.key_count(limiter)
 }
 
 // --- Ownership ---
@@ -177,9 +187,8 @@ pub fn owner_stops_when_creator_exits_and_checks_fail_closed_test() {
       process.send(reply, limiter)
     })
   let assert Ok(limiter) = process.receive(reply, 2000)
-  let assert True = wait_until(fn() { !process.is_alive(creator) }, 2000)
-  let owner = rate_limit.owner(limiter)
-  let assert True = wait_until(fn() { !process.is_alive(owner) }, 2000)
+  await.expect_down(creator, "the limiter's creator")
+  await.expect_down(rate_limit.owner(limiter), "the limiter's owner")
   // The table is gone with its owner: requests are refused, not let through.
   let assert rate_limit.RateLimited = rate_limit.check(limiter, "x")
   let assert Error(Nil) = rate_limit.key_count(limiter)
@@ -215,20 +224,6 @@ pub fn concurrent_checks_count_exactly_test() {
     })
     |> int.sum
   let assert 500 = total
-}
-
-fn wait_until(condition: fn() -> Bool, timeout_ms: Int) -> Bool {
-  case condition() {
-    True -> True
-    False ->
-      case timeout_ms <= 0 {
-        True -> False
-        False -> {
-          process.sleep(20)
-          wait_until(condition, timeout_ms - 20)
-        }
-      }
-  }
 }
 
 fn unique_id() -> String {

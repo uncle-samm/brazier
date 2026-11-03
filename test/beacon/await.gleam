@@ -157,6 +157,91 @@ pub fn expect_down(pid: Pid, what: String) -> Nil {
   }
 }
 
+/// A watch on the plain messages one OTP process receives (see
+/// `watch_info`).
+pub type InfoWatch
+
+@external(erlang, "beacon_await_ffi", "watch_info")
+fn watch_info_ffi(pid: Pid, message: String) -> Result(InfoWatch, String)
+
+@external(erlang, "beacon_await_ffi", "next_info")
+fn next_info_ffi(watch: InfoWatch, timeout_ms: Int) -> Result(Nil, Nil)
+
+/// Watch for the sys-compliant process `pid` (a gen_server or gleam_otp
+/// actor) receiving the plain atom message `message`, such as a periodic
+/// timer tick, through the OTP sys debug hook. Use it to wait for a timer
+/// to fire instead of sleeping past its interval. The atom must exist.
+pub fn watch_info(pid: Pid, message: String) -> InfoWatch {
+  case watch_info_ffi(pid, message) {
+    Ok(watch) -> watch
+    Error(reason) ->
+      panic as {
+        "watch_info: cannot install a sys hook on "
+        <> string.inspect(pid)
+        <> ": "
+        <> reason
+      }
+  }
+}
+
+/// Return once the watched process has received and handled the next
+/// watched message. Crashes with `what` if none arrives by the deadline.
+pub fn expect_info(watch: InfoWatch, pid: Pid, what: String) -> Nil {
+  case next_info_ffi(watch, deadline_ms) {
+    Ok(Nil) -> barrier_pid(pid)
+    Error(Nil) ->
+      panic as {
+        "expected " <> what <> " within " <> int.to_string(deadline_ms) <> " ms"
+      }
+  }
+}
+
+/// A subscription to membership changes in a pg scope.
+pub type ScopeWatch
+
+@external(erlang, "beacon_await_ffi", "watch_pg_scope")
+fn watch_pg_scope_ffi(scope: String) -> Result(ScopeWatch, String)
+
+@external(erlang, "beacon_await_ffi", "next_pg_leave")
+fn next_pg_leave_ffi(
+  watch: ScopeWatch,
+  pid: Pid,
+  timeout_ms: Int,
+) -> Result(Nil, Nil)
+
+@external(erlang, "beacon_await_ffi", "unwatch_pg_scope")
+fn unwatch_pg_scope_ffi(watch: ScopeWatch) -> Nil
+
+/// Subscribe to joins and leaves in the running pg scope `scope`.
+pub fn watch_pg_scope(scope: String) -> ScopeWatch {
+  case watch_pg_scope_ffi(scope) {
+    Ok(watch) -> watch
+    Error(reason) -> panic as { "watch_pg_scope: " <> reason }
+  }
+}
+
+/// Return once pg has removed `pid` from a group of the watched scope, as
+/// it does when a member exits. Membership read afterwards is final.
+pub fn expect_pg_leave(watch: ScopeWatch, pid: Pid, what: String) -> Nil {
+  case next_pg_leave_ffi(watch, pid, deadline_ms) {
+    Ok(Nil) -> Nil
+    Error(Nil) ->
+      panic as {
+        what
+        <> " ("
+        <> string.inspect(pid)
+        <> ") did not leave its pg group within "
+        <> int.to_string(deadline_ms)
+        <> " ms"
+      }
+  }
+}
+
+/// End the subscription and drop its pending notices.
+pub fn unwatch_pg_scope(watch: ScopeWatch) -> Nil {
+  unwatch_pg_scope_ffi(watch)
+}
+
 @external(erlang, "erlang", "monotonic_time")
 fn monotonic_time(unit: MillisecondUnit) -> Int
 
