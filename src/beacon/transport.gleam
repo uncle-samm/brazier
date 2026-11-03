@@ -2409,9 +2409,14 @@ fn route_framework_request(
   case req.path {
     "/health" -> {
       transport_http.tag_route("/health")
-      response.new(200)
-      |> response.set_header("content-type", "application/json")
-      |> response.set_body(Bytes(bytes_tree.from_string("{\"status\":\"ok\"}")))
+      when_readable_method(req, fn() {
+        response.new(200)
+        |> response.set_header("content-type", "application/json")
+        |> response.set_header("cache-control", "no-store")
+        |> response.set_body(
+          Bytes(bytes_tree.from_string("{\"status\":\"ok\"}")),
+        )
+      })
     }
     "/beacon_client.js" -> {
       transport_http.tag_route("/beacon_client.js")
@@ -2449,8 +2454,9 @@ fn route_static_or_page(
         False -> page()
         True -> {
           // Tagged before the method check, so a 405 is reported on the
-          // static route too. A missed file is served as a page, which
-          // re-tags it (the last tag wins).
+          // static route too. A path under the prefix names a file or
+          // nothing: a miss is 404, never a page, so a missing script or
+          // stylesheet is not answered with HTML.
           transport_http.tag_route(static.route_pattern(static_cfg))
           when_readable_method(req, fn() {
             case
@@ -2461,7 +2467,13 @@ fn route_static_or_page(
               )
             {
               Ok(resp) -> resp
-              Error(Nil) -> page()
+              Error(Nil) -> {
+                log.debug(
+                  "beacon.transport",
+                  "404 for missing static file " <> req.path,
+                )
+                transport_http.create_error_response(404, "Not Found")
+              }
             }
           })
         }
@@ -2927,7 +2939,7 @@ fn default_page_html() -> Result(String, String) {
         <> "<div id=\"beacon-app\"></div>"
         <> "<script src=\"/"
         <> filename
-        <> "\" data-beacon-auto></script>"
+        <> "\"></script>"
         <> "</body></html>",
       )
   }

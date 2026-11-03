@@ -27,16 +27,6 @@ The docs describe the current behaviour; each item is a code change.
   `fswatch` nor `inotifywait` is installed (`dev.gleam:104-107`), against the
   no-fallbacks rule.
   - **Files:** `src/beacon/dev.gleam`
-- **Issue:** `middleware.body_parser(max_bytes)` passes through a request whose
-  `Content-Length` is missing or does not parse (`middleware.gleam:282`).
-  - **Files:** `src/beacon/middleware.gleam`
-- **Issue:** `middleware.Context` (`new_context`, `set_context`,
-  `get_context`, `middleware.gleam:519-538`) is carried by nothing; its doc
-  comment says it passes data to the handler.
-  - **Files:** `src/beacon/middleware.gleam`
-- **Issue:** `/health` answers every method, not only GET and HEAD
-  (`transport.gleam:2374`).
-  - **Files:** `src/beacon/transport.gleam`
 - **Issue:** `store.StoreError` aliases `state_manager.EtsError`
   (`store.gleam:44`), and `state_manager` is an internal module, so an app
   cannot match or describe the error without importing it.
@@ -72,3 +62,21 @@ The docs describe the current behaviour; each item is a code change.
 ## Resolved Issues
 
 <!-- Move resolved issues here with full resolution details -->
+
+- **Issue:** `middleware.body_parser(max_bytes)` passed through a request whose
+  `Content-Length` was missing or did not parse.
+  - **Resolution:** (Milestone 117, WS10b-T) `body_parser` applies the
+    listener's framing rule (`transport/http.declared_body_length`): a
+    repeated or non-decimal `Content-Length` is 400, `Transfer-Encoding` is
+    501 (400 with a `Content-Length`), over the limit is 413, and no header
+    means no body. Tests: `middleware_test.body_parser_rejects_*`.
+- **Issue:** `middleware.Context` (`new_context`, `set_context`,
+  `get_context`) was carried by nothing; its doc comment said it passed data
+  to the handler.
+  - **Resolution:** (Milestone 117, WS10b-T) removed, with its tests. Request
+    data reaches a handler through the request itself, as in Plug, where the
+    conn is the only carrier.
+- **Issue:** `/health` answered every method, not only GET and HEAD.
+  - **Resolution:** (Milestone 117, WS10b-T) other methods get 405 with
+    `allow: GET, HEAD`, and the answer carries `cache-control: no-store`.
+    Tests: `http_routes_test.health_*`.

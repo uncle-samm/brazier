@@ -6,13 +6,14 @@
 /// auth library. You plug in whatever auth you want.
 ///
 /// Reference: Wisp middleware, Phoenix plugs, Express middleware.
+import beacon/internal/http_status
 import beacon/ip
 import beacon/log
 import beacon/rate_limit
 import beacon/transport/client
-import beacon/transport/server.{type Connection, type ResponseBody, Bytes}
+import beacon/transport/http as transport_http
+import beacon/transport/server.{type Connection, type ResponseBody, Bytes, File}
 import gleam/bytes_tree
-import gleam/dict.{type Dict}
 import gleam/http
 import gleam/http/request.{type Request}
 import gleam/http/response.{type Response}
@@ -276,36 +277,42 @@ pub fn request_id() -> Middleware {
   }
 }
 
-/// Body parser middleware — reads request body up to a size limit.
-/// If the body exceeds `max_bytes`, returns 413 Payload Too Large.
-/// Passes the request through if body is within limits or has no body.
+/// Body limit middleware: refuses a request whose declared body is not
+/// acceptable before the handler runs. It reads no body.
+///
+/// The length is checked with the listener's own framing rules
+/// (`transport/http.declared_body_length`, RFC 9112 section 6):
+/// - a request with neither Content-Length nor Transfer-Encoding has an
+///   empty body and passes;
+/// - a Content-Length that is not 1-19 ASCII digits, or more than one, is
+///   answered with 400;
+/// - Transfer-Encoding is answered with 501 (400 with a Content-Length);
+/// - a length above `max_bytes` is answered with 413.
+///
+/// The listener applies the same rules with its own `max_body_bytes` before
+/// any middleware runs, so this middleware is a tighter limit for the
+/// routes it wraps.
+///
+/// Reference: Bandit (`Bandit.Headers.get_content_length`) and Cowboy answer
+/// a bad Content-Length with 400 and treat a missing one as an empty body;
+/// Plug.Parsers answers an oversized body with 413.
 pub fn body_parser(max_bytes: Int) -> Middleware {
+  // A negative limit is a programming error: no request could pass.
+  let assert True = max_bytes >= 0
   fn(
     req: Request(Connection),
     next: fn(Request(Connection)) -> Response(ResponseBody),
   ) -> Response(ResponseBody) {
-    // Check Content-Length header if present
-    case request.get_header(req, "content-length") {
-      Ok(length_str) -> {
-        case int.parse(length_str) {
-          Ok(length) if length > max_bytes -> {
-            log.warning(
-              "beacon.middleware",
-              "Request body too large: "
-                <> int.to_string(length)
-                <> " > "
-                <> int.to_string(max_bytes),
-            )
-            response.new(413)
-            |> response.set_header("content-type", "text/plain")
-            |> response.set_body(
-              Bytes(bytes_tree.from_string("Payload Too Large")),
-            )
-          }
-          _ -> next(req)
-        }
+    case transport_http.declared_body_length(req, max_bytes) {
+      Ok(_length) -> next(req)
+      // declared_body_length has logged the refusal with the path.
+      Error(transport_http.FramingError(status:, reason: _)) -> {
+        response.new(status)
+        |> response.set_header("content-type", "text/plain; charset=utf-8")
+        |> response.set_body(
+          Bytes(bytes_tree.from_string(http_status.reason_phrase(status))),
+        )
       }
-      Error(Nil) -> next(req)
     }
   }
 }
@@ -353,6 +360,11 @@ fn is_compressible(content_type: String) -> Bool {
 }
 
 /// Compress a response body with gzip.
+///
+/// A `File` body (a static file, sent with `file:sendfile`) is sent as it
+/// is: compressing it would mean reading the whole file into memory, which
+/// is what sendfile avoids. cowboy_compress_h makes the same choice for
+/// sendfile bodies.
 fn compress_response(resp: Response(ResponseBody)) -> Response(ResponseBody) {
   case resp.body {
     Bytes(body_tree) -> {
@@ -362,6 +374,13 @@ fn compress_response(resp: Response(ResponseBody)) -> Response(ResponseBody) {
       |> response.set_header("content-encoding", "gzip")
       |> response.set_header("vary", "Accept-Encoding")
       |> response.set_body(Bytes(bytes_tree.from_bit_array(compressed)))
+    }
+    File(path:, ..) -> {
+      log.debug(
+        "beacon.middleware",
+        "compress: sending file body " <> path <> " uncompressed",
+      )
+      resp
     }
   }
 }
@@ -514,25 +533,4 @@ pub fn group(middlewares: List(Middleware)) -> Middleware {
     let handler = pipeline(middlewares, next)
     handler(req)
   }
-}
-
-/// Request context — a dictionary that middleware can attach data to.
-/// This is how middleware passes information (e.g., authenticated user)
-/// to the application handler.
-pub type Context =
-  Dict(String, String)
-
-/// Create a new empty context.
-pub fn new_context() -> Context {
-  dict.new()
-}
-
-/// Set a value in the context.
-pub fn set_context(ctx: Context, key: String, value: String) -> Context {
-  dict.insert(ctx, key, value)
-}
-
-/// Get a value from the context.
-pub fn get_context(ctx: Context, key: String) -> Result(String, Nil) {
-  dict.get(ctx, key)
 }

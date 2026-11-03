@@ -1,8 +1,7 @@
 -module(beacon_transport_ffi).
 -export([
-    listen/2, accept/1, tcp_send/2, close/1,
+    listen/2, accept/1, tcp_send/2, send_file/4, close/1,
     controlling_process/2, set_active_once/1,
-    read_http_request/1, read_http_request_with_limits/4, read_body/2,
     ws_accept_key/1,
     ws_encode_text_frame/1, ws_encode_close_frame/0,
     classify_tcp_message/1
@@ -66,6 +65,46 @@ tcp_send(Socket, Data) ->
     case gen_tcp:send(Socket, Data) of
         ok -> {ok, nil};
         {error, Reason} -> {error, format_reason(Reason)}
+    end.
+
+%% Send Length bytes of the file at Path, from Offset, with file:sendfile/5
+%% (the kernel copies the file to the socket; the bytes never enter the
+%% BEAM heap). The response head is already on the wire with
+%% Content-Length: Length, so a file that shrank in between leaves the
+%% message short: that is an error, and the caller closes the connection.
+%% Reference: cowboy_http sendfile bodies, Plug.Conn.send_file/5.
+send_file(Socket, Path, Offset, Length)
+  when is_binary(Path), is_integer(Offset), Offset >= 0, is_integer(Length), Length >= 0 ->
+    case Length of
+        0 ->
+            {ok, nil};
+        _ ->
+            %% file:sendfile/5 takes a raw file; the file is opened per
+            %% response and closed before returning, so no descriptor
+            %% outlives the response.
+            case file:open(Path, [read, raw, binary]) of
+                {ok, Fd} ->
+                    Result = file:sendfile(Fd, Socket, Offset, Length, []),
+                    case file:close(Fd) of
+                        ok -> ok;
+                        {error, CloseReason} ->
+                            beacon_log_ffi:warning(<<"beacon.http">>, "closing ~ts failed: ~p",
+                                                   [Path, CloseReason])
+                    end,
+                    case Result of
+                        {ok, Length} ->
+                            {ok, nil};
+                        {ok, Sent} ->
+                            {error, iolist_to_binary(io_lib:format(
+                                "sendfile sent ~p of ~p bytes of ~ts (the file changed)",
+                                [Sent, Length, Path]))};
+                        {error, Reason} ->
+                            {error, format_reason(Reason)}
+                    end;
+                {error, Reason} ->
+                    {error, iolist_to_binary(io_lib:format("cannot open ~ts: ~p",
+                                                           [Path, Reason]))}
+            end
     end.
 
 close(Socket) ->
@@ -446,22 +485,6 @@ normalize_header_name(Name) when is_binary(Name) ->
 method_to_binary(Method) when is_atom(Method) -> atom_to_binary(Method, utf8);
 method_to_binary(Method) when is_binary(Method) -> Method.
 
-%% Legacy entry points kept for API compatibility. They use the same parser
-%% and return the old {Method, Path, Headers} shape with string reasons.
-read_http_request(Socket) ->
-    read_http_request_with_limits(Socket, 100, 65536, 5000).
-
-read_http_request_with_limits(Socket, MaxHeaders, MaxHeaderBytes, TimeoutMs) ->
-    case read_http_head(Socket, {head_limits, MaxHeaders, MaxHeaderBytes, 8192},
-                        {head_timing, TimeoutMs, shared_with_request_line}) of
-        {ok, {Method, Path, _Version, Headers}} -> {ok, {Method, Path, Headers}};
-        {error, Reason} -> {error, head_error_to_binary(Reason)}
-    end.
-
-head_error_to_binary(Reason) when is_atom(Reason) -> atom_to_binary(Reason, utf8);
-head_error_to_binary({Tag, Detail}) when is_atom(Tag), is_binary(Detail) ->
-    <<(atom_to_binary(Tag, utf8))/binary, ": ", Detail/binary>>.
-
 %% --- HTTP Request Body ---
 %% The connection handler registers the framing of the current request
 %% (validated Content-Length, deadlines) before calling the application.
@@ -590,10 +613,6 @@ maybe_send_continue(Socket, Ctx = #{expect_continue := true}) ->
     end;
 maybe_send_continue(_Socket, Ctx) ->
     {ok, Ctx}.
-
-%% Legacy raw body read: routed through the request context.
-read_body(Socket, Length) ->
-    http_body_read(Socket, Length).
 
 %% Run an application handler, converting a crash into an explicit error
 %% (logged with stacktrace) so the connection can answer 500 and close.

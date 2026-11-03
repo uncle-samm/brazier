@@ -57,10 +57,19 @@ pub type Connection {
   Connection(socket: Socket)
 }
 
-/// Response body type. Replaces mist.ResponseData.
+/// Response body type.
+///
+/// Reference: mist's `ResponseData` (`Bytes` and `File`), Plug's
+/// `send_file/5`.
 pub type ResponseBody {
   /// Bytes response body wrapping a BytesTree.
   Bytes(BytesTree)
+  /// `length` bytes of the file at `path`, starting at byte `offset`. The
+  /// listener writes them with `file:sendfile`, so they never enter the
+  /// BEAM heap. Content-Length is `length`. If the file holds fewer bytes
+  /// when it is sent, the response is cut short and the connection closed.
+  /// Static files are served this way (`beacon/static`).
+  File(path: String, offset: Int, length: Int)
 }
 
 /// Opaque socket type wrapping an Erlang gen_tcp socket (port).
@@ -147,7 +156,7 @@ pub fn send_close_frame(socket: Socket) -> Result(Nil, String) {
 /// never wait longer than the body read timeout or the total request
 /// deadline, and fails loudly when called outside an active request.
 /// Application code should normally use `beacon/transport/http.read_body`.
-@external(erlang, "beacon_transport_ffi", "read_body")
+@external(erlang, "beacon_transport_ffi", "http_body_read")
 pub fn read_body(socket: Socket, length: Int) -> Result(BitArray, String)
 
 // --- TCP Message Classification ---

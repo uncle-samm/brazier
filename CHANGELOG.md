@@ -131,6 +131,13 @@ with its own changelog, so they are not listed here.
   to `docs/archive/`.
 - (WS10) The release scripts are strict bash. `run_canonical_cdp.sh` is now
   `run_all_cdp.sh --canonical`.
+- (WS10b) Static files are sent with `file:sendfile` from a new
+  `server.File` response body, so a file is never read into memory to be
+  served. The ETag is still the content hash, now computed in 64 KiB chunks.
+  A FIFO, socket or device under the static directory is never opened.
+  `middleware.compress` passes a file body through uncompressed.
+- (WS10b) A request under the static prefix that names no file answers 404.
+  It used to fall through to the page and answer 200 `text/html`.
 
 ### Fixed
 
@@ -139,6 +146,13 @@ with its own changelog, so they are not listed here.
   listen socket now has an owner process of its own
   (`beacon_http_listen_socket`), which closes it synchronously before it
   exits. The acceptors no longer own it.
+- (WS10b) `middleware.body_parser` passed a request whose `Content-Length`
+  was missing or unparseable. It now applies the listener's framing rule:
+  400 for a repeated or non-decimal length, 501 for `Transfer-Encoding`, 413
+  over the limit.
+- (WS10b) `/health` answered every method. Methods other than GET and HEAD
+  get 405 with `allow: GET, HEAD`, and the answer is `cache-control:
+  no-store`.
 
 ### Removed
 
@@ -150,6 +164,12 @@ with its own changelog, so they are not listed here.
 - (WS7) The server-render fallback to `priv/static`.
 - (WS10) The expect-based `scripts/publish.sh`, which fed the Hex key to
   `gleam publish --yes` and answered its prompts automatically.
+- (WS10b) `middleware.Context`, `new_context`, `set_context` and
+  `get_context`, which nothing carried to a handler.
+- (WS10b) The unused request readers `transport/http.read_request` and
+  `read_request_with_limits` with their FFI, the dead
+  `beacon_middleware_ffi.erl`, and the `data-beacon-auto` attribute on the
+  default page, which nothing read.
 
 ### Security
 

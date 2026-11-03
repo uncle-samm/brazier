@@ -417,7 +417,7 @@ fn api_json(body: String) -> response.Response(ResponseBody) {
 }
 
 fn response_body(resp: response.Response(ResponseBody)) -> String {
-  let Bytes(tree) = resp.body
+  let assert Bytes(tree) = resp.body
   let assert Ok(body) = tree |> bytes_tree.to_bit_array |> bit_array.to_string
   body
 }

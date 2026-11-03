@@ -3,6 +3,7 @@ import beacon/transport/server.{type Connection, Bytes}
 import gleam/bytes_tree
 import gleam/http/request
 import gleam/http/response
+import gleam/list
 import gleam/string
 
 // --- Pipeline tests ---
@@ -182,6 +183,62 @@ pub fn body_parser_passes_no_content_length_test() {
   let assert 200 = resp.status
 }
 
+/// A refused request never reaches the handler.
+fn refusing_handler(_req) {
+  panic as "body_parser must not call the handler for a refused request"
+}
+
+pub fn body_parser_rejects_unparseable_content_length_test() {
+  let piped =
+    middleware.pipeline([middleware.body_parser(1000)], refusing_handler)
+  list.each(
+    ["abc", "-1", "+5", "1.0", " 5", "5 ", "", "12345678901234567890"],
+    fn(value) {
+      let resp =
+        piped(make_request_with_header("POST", "/api", "content-length", value))
+      let assert 400 = resp.status
+    },
+  )
+}
+
+pub fn body_parser_rejects_repeated_content_length_test() {
+  let piped =
+    middleware.pipeline([middleware.body_parser(1000)], refusing_handler)
+  let req =
+    make_request_with_header("POST", "/api", "content-length", "5")
+    |> request.prepend_header("content-length", "5")
+  let assert 400 = piped(req).status
+  let list_req =
+    make_request_with_header("POST", "/api", "content-length", "5, 5")
+  let assert 400 = piped(list_req).status
+}
+
+pub fn body_parser_rejects_transfer_encoding_test() {
+  let piped =
+    middleware.pipeline([middleware.body_parser(1000)], refusing_handler)
+  let chunked =
+    make_request_with_header("POST", "/api", "transfer-encoding", "chunked")
+  let assert 501 = piped(chunked).status
+  let both = chunked |> request.prepend_header("content-length", "5")
+  let assert 400 = piped(both).status
+}
+
+pub fn body_parser_accepts_length_at_the_limit_test() {
+  let handler = fn(_req) {
+    response.new(200)
+    |> response.set_body(Bytes(bytes_tree.from_string("ok")))
+  }
+  let piped = middleware.pipeline([middleware.body_parser(1000)], handler)
+  let at_limit =
+    make_request_with_header("POST", "/api", "content-length", "1000")
+  let assert 200 = piped(at_limit).status
+  let piped_refusing =
+    middleware.pipeline([middleware.body_parser(1000)], refusing_handler)
+  let over_limit =
+    make_request_with_header("POST", "/api", "content-length", "1001")
+  let assert 413 = piped_refusing(over_limit).status
+}
+
 // --- Compression tests ---
 
 pub fn compress_adds_gzip_header_test() {
@@ -223,26 +280,6 @@ pub fn compress_skips_binary_content_test() {
   let resp = piped(req)
   // Should NOT compress binary content
   let assert Error(Nil) = response.get_header(resp, "content-encoding")
-}
-
-// --- Context tests ---
-
-pub fn context_set_and_get_test() {
-  let ctx = middleware.new_context()
-  let ctx = middleware.set_context(ctx, "user_id", "123")
-  let assert Ok("123") = middleware.get_context(ctx, "user_id")
-}
-
-pub fn context_get_missing_test() {
-  let ctx = middleware.new_context()
-  let assert Error(Nil) = middleware.get_context(ctx, "nope")
-}
-
-pub fn context_overwrite_test() {
-  let ctx = middleware.new_context()
-  let ctx = middleware.set_context(ctx, "role", "user")
-  let ctx = middleware.set_context(ctx, "role", "admin")
-  let assert Ok("admin") = middleware.get_context(ctx, "role")
 }
 
 // --- Rate limit middleware test ---

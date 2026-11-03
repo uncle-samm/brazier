@@ -154,59 +154,6 @@ pub fn get_head_error_message(err: HeadError) -> String {
   }
 }
 
-// --- Legacy request reading (single request, string errors) ---
-
-@external(erlang, "beacon_transport_ffi", "read_http_request")
-fn ffi_read_http_request(
-  socket: server.Socket,
-) -> Result(#(String, String, List(#(String, String))), String)
-
-@external(erlang, "beacon_transport_ffi", "read_http_request_with_limits")
-fn ffi_read_http_request_with_limits(
-  socket: server.Socket,
-  max_headers: Int,
-  max_header_bytes: Int,
-  timeout_ms: Int,
-) -> Result(#(String, String, List(#(String, String))), String)
-
-/// Read and parse an HTTP request head with default limits.
-pub fn read_request(
-  socket: server.Socket,
-) -> Result(Request(server.Connection), String) {
-  log.debug("beacon.http", "Reading HTTP request")
-  case ffi_read_http_request(socket) {
-    Ok(parts) -> Ok(build_request(socket, parts))
-    Error(reason) -> {
-      log.warning("beacon.http", "Failed to read HTTP request: " <> reason)
-      Error(reason)
-    }
-  }
-}
-
-/// Read and parse an HTTP request head with explicit resource limits.
-pub fn read_request_with_limits(
-  socket: server.Socket,
-  max_headers: Int,
-  max_header_bytes: Int,
-  timeout_ms: Int,
-) -> Result(Request(server.Connection), String) {
-  log.debug("beacon.http", "Reading HTTP request with configured limits")
-  case
-    ffi_read_http_request_with_limits(
-      socket,
-      max_headers,
-      max_header_bytes,
-      timeout_ms,
-    )
-  {
-    Ok(parts) -> Ok(build_request(socket, parts))
-    Error(reason) -> {
-      log.warning("beacon.http", "HTTP request rejected: " <> reason)
-      Error(reason)
-    }
-  }
-}
-
 // --- Message framing (RFC 9112 section 6) ---
 
 /// The validated body framing of a request.
@@ -285,6 +232,34 @@ fn check_host(
     [], Http10 -> Ok(Nil)
     [], Http11 -> Error(FramingError(400, "missing Host header"))
     _, _ -> Error(FramingError(400, "multiple Host headers"))
+  }
+}
+
+/// The body length a request declares, checked by the same RFC 9112
+/// section 6 rules as `check_framing`: no Content-Length and no
+/// Transfer-Encoding is an empty body (0); one Content-Length of 1-19 ASCII
+/// digits is its value; anything else is a `FramingError` with the status
+/// to answer (400 for a bad, repeated or conflicting length, 501 for
+/// Transfer-Encoding, 413 above `max_body_bytes`). A refusal is logged here,
+/// with the path, so a caller only builds the answer.
+pub fn declared_body_length(
+  req: Request(server.Connection),
+  max_body_bytes: Int,
+) -> Result(Int, FramingError) {
+  case check_content_length(req, max_body_bytes) {
+    Ok(length) -> Ok(length)
+    Error(err) -> {
+      log.warning(
+        "beacon.http",
+        "Refused the declared body length on "
+          <> req.path
+          <> " ("
+          <> int.to_string(err.status)
+          <> "): "
+          <> err.reason,
+      )
+      Error(err)
+    }
   }
 }
 
@@ -685,8 +660,16 @@ fn method_label(method: http.Method) -> String {
 }
 
 fn response_body_bytes(resp: Response(server.ResponseBody)) -> Int {
-  let server.Bytes(body) = resp.body
-  bytes_tree.byte_size(body)
+  case resp.body {
+    server.Bytes(body) -> bytes_tree.byte_size(body)
+    server.File(length:, ..) -> length
+  }
+}
+
+/// What a response body puts on the wire after the head.
+type WireBody {
+  WireBytes(BitArray)
+  WireFile(path: String, offset: Int, length: Int)
 }
 
 // --- Responses ---
@@ -743,10 +726,19 @@ pub fn write_framed_response(
       Error(reason)
     }
     Ok(Nil) -> {
-      let body_bits = case resp.body {
-        server.Bytes(tree) -> bytes_tree.to_bit_array(tree)
+      let #(wire_body, body_size) = case resp.body {
+        server.Bytes(tree) -> {
+          let bits = bytes_tree.to_bit_array(tree)
+          #(WireBytes(bits), bit_array.byte_size(bits))
+        }
+        server.File(path:, offset:, length:) -> {
+          // A negative offset or length is a programming error in the
+          // handler that built the body.
+          let assert True = offset >= 0 && length >= 0
+            as "ResponseBody.File needs a non-negative offset and length"
+          #(WireFile(path:, offset:, length:), length)
+        }
       }
-      let body_size = bit_array.byte_size(body_bits)
       let status = resp.status
       let bodyless_status = status < 200 || status == 204 || status == 304
       let user_lengths = header_values_ci(resp.headers, "content-length")
@@ -828,11 +820,32 @@ pub fn write_framed_response(
         ])
         <> "\r\n"
       let send_body = !bodyless_status && !framing.head_request
-      let wire = case send_body {
-        True -> bit_array.append(<<header_str:utf8>>, body_bits)
-        False -> <<header_str:utf8>>
+      case send_body, wire_body {
+        True, WireBytes(bits) ->
+          server.send_bytes(socket, bit_array.append(<<header_str:utf8>>, bits))
+        True, WireFile(path:, offset:, length:) ->
+          case server.send_bytes(socket, <<header_str:utf8>>) {
+            Error(reason) -> Error(reason)
+            Ok(Nil) ->
+              case ffi_send_file(socket, path, offset, length) {
+                Ok(Nil) -> {
+                  log.debug(
+                    "beacon.http",
+                    "Sent " <> int.to_string(length) <> " bytes of " <> path,
+                  )
+                  Ok(Nil)
+                }
+                Error(reason) -> {
+                  log.error(
+                    "beacon.http",
+                    "sendfile of " <> path <> " failed: " <> reason,
+                  )
+                  Error(reason)
+                }
+              }
+          }
+        False, _ -> server.send_bytes(socket, <<header_str:utf8>>)
       }
-      server.send_bytes(socket, wire)
     }
   }
 }
@@ -927,6 +940,17 @@ fn ffi_linger_close(
   timeout_ms: Int,
   max_bytes: Int,
 ) -> LingerOutcome
+
+/// Send `length` bytes of the file at `path` from `offset` with
+/// `file:sendfile`. Fails when fewer bytes could be sent. The caller,
+/// `write_framed_response`, logs both outcomes.
+@external(erlang, "beacon_transport_ffi", "send_file")
+fn ffi_send_file(
+  socket: server.Socket,
+  path: String,
+  offset: Int,
+  length: Int,
+) -> Result(Nil, String)
 
 /// Validate one HTTP response header before serializing it to the wire.
 ///

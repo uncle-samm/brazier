@@ -74,9 +74,9 @@ chains middleware around a handler of your own, in the same order.
 | `rate_limit(limiter)` | Returns 429 (with `Retry-After`) when a client exceeds the configured rate. Keys on the socket peer IP; forwarding headers are ignored |
 | `rate_limit_behind_proxies(limiter, trusted)` | Like `rate_limit`, but the client is resolved through trusted proxies (right-most untrusted `Forwarded` / `X-Forwarded-For` hop). See SECURITY.md, Trusted Proxies |
 | `hsts(max_age_seconds, include_subdomains)` | Sets `Strict-Transport-Security`. Returns `Result` (negative max-age is an error). Use only behind HTTPS |
-| `compress()` | Gzip-compresses text responses when client sends `Accept-Encoding: gzip` |
+| `compress()` | Gzip-compresses text responses when client sends `Accept-Encoding: gzip`. A file body (a static file sent with `sendfile`) is passed through uncompressed |
 | `request_id()` | Generates a unique `x-request-id` response header |
-| `body_parser(max_bytes)` | Returns 413 if `Content-Length` exceeds `max_bytes`. A request without a `Content-Length` that parses as an integer passes through, so it is not a body limit: `api.read_text` and `api.read_form` enforce their own |
+| `body_parser(max_bytes)` | Applies the listener's framing rule with a tighter limit: 413 if `Content-Length` exceeds `max_bytes`, 400 if it is repeated or not a plain decimal integer, 501 for `Transfer-Encoding`, 400 for both. A request with neither header has no body and passes through |
 | `cors(config)` | Sets CORS headers; handles preflight OPTIONS with 204 |
 | `secure_headers_with_csp(csp)` | Like `secure_headers()` but applies a custom CSP policy string |
 
@@ -154,7 +154,3 @@ travels on the request: set a header with `request.set_header(req, name,
 value)` before calling `next`. `set_header` replaces any value the client sent
 under that name, so the handler can trust it only when that middleware runs on
 every path the handler serves.
-
-`middleware.Context` with `new_context`, `set_context` and `get_context` is a
-plain `Dict(String, String)`; nothing in the pipeline carries it from a
-middleware to a handler.

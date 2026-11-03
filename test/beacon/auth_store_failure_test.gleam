@@ -287,7 +287,7 @@ fn expect_unavailable(resp: Response(ResponseBody)) -> Nil {
 }
 
 fn body(resp: Response(ResponseBody)) -> String {
-  let Bytes(tree) = resp.body
+  let assert Bytes(tree) = resp.body
   let assert Ok(text) = tree |> bytes_tree.to_bit_array |> bit_array.to_string
   text
 }
