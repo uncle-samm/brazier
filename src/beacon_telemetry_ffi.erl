@@ -47,6 +47,7 @@
     session_event/2,
     pubsub_broadcast/3,
     pubsub_forward_overloaded/2,
+    subscription_changed/2,
     cluster_node/3,
     cluster_peer_rejected/2,
     cluster_connect_failed/2,
@@ -305,6 +306,14 @@ pubsub_broadcast(LocalSubscribers, RemoteNodes, Scope) ->
 pubsub_forward_overloaded(QueueLen, Shard) ->
     telemetry:execute([?PREFIX, pubsub, forward, overloaded], #{queue_len => QueueLen},
                       #{shard => Shard}).
+
+%% [beacon, subscription, changed]
+subscription_changed(Action, Subscriptions) ->
+    telemetry:execute([?PREFIX, subscription, changed], #{subscriptions => Subscriptions},
+                      #{action => subscription_action(Action)}).
+
+subscription_action(subscribe) -> subscribe;
+subscription_action(unsubscribe) -> unsubscribe.
 
 %% [beacon, cluster, node, up | down]
 cluster_node(Direction, Node, Reason) ->

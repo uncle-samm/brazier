@@ -275,6 +275,7 @@ fn documented() -> List(Documented) {
       "scope",
     ]),
     Plain(["pubsub", "forward", "overloaded"], ["queue_len"], ["shard"]),
+    Plain(["subscription", "changed"], ["subscriptions"], ["action"]),
     cluster(["cluster", "node", "up"]),
     cluster(["cluster", "node", "down"]),
     cluster(["cluster", "peer", "rejected"]),
@@ -390,6 +391,7 @@ fn emit_everything() -> Nil {
   )
   telemetry.pubsub_broadcast(3, 2, "cluster")
   telemetry.pubsub_forward_overloaded(10_001, 0)
+  telemetry.subscription_changed(telemetry.Subscribe, 1)
   telemetry.cluster_node(telemetry.NodeUp, "b@host", "connected")
   telemetry.cluster_node(telemetry.NodeDown, "b@host", "connection_closed")
   telemetry.cluster_peer_rejected("b@host", "secret_mismatch")

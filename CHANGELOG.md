@@ -104,6 +104,8 @@ with its own changelog, so they are not listed here.
   in the docs. It also compiles every Gleam sample in them with zero
   warnings, except samples marked as fragments.
 - (WS10) `make publish-dry-run`, and a release gate in `scripts/publish.sh`.
+- (WS10b) `[beacon, subscription, changed]` telemetry: a runtime's PubSub
+  listener joined or left a topic.
 
 ### Changed
 

@@ -2617,10 +2617,7 @@ fn start_pubsub_listener(
     // Subscribe to the initial topics BEFORE replying, so that once
     // `start` returns no broadcast to an initial topic can be missed.
     let topics = list.unique(topics)
-    list.each(topics, fn(t) {
-      log.info("beacon.subscription", "Subscribing to: " <> t)
-      pubsub.subscribe(t)
-    })
+    subscribe_initial(topics, 0)
     process.send(reply_subject, command_subject)
     log.info(
       "beacon.subscription",
@@ -2668,7 +2665,12 @@ fn listener_loop(listener: Listener(msg), subscriptions: List(String)) -> Nil {
         False -> {
           pubsub.subscribe(topic)
           log.debug("beacon.subscription", "Subscribed to: " <> topic)
-          listener_loop(listener, [topic, ..subscriptions])
+          let subscriptions = [topic, ..subscriptions]
+          telemetry.subscription_changed(
+            telemetry.Subscribe,
+            list.length(subscriptions),
+          )
+          listener_loop(listener, subscriptions)
         }
       }
     CommandReceived(UnsubscribeFrom(topic)) ->
@@ -2676,10 +2678,13 @@ fn listener_loop(listener: Listener(msg), subscriptions: List(String)) -> Nil {
         True -> {
           pubsub.unsubscribe(topic)
           log.debug("beacon.subscription", "Unsubscribed from: " <> topic)
-          listener_loop(
-            listener,
-            list.filter(subscriptions, fn(existing) { existing != topic }),
+          let subscriptions =
+            list.filter(subscriptions, fn(existing) { existing != topic })
+          telemetry.subscription_changed(
+            telemetry.Unsubscribe,
+            list.length(subscriptions),
           )
+          listener_loop(listener, subscriptions)
         }
         False -> {
           log.debug(
@@ -2725,11 +2730,29 @@ fn listener_loop(listener: Listener(msg), subscriptions: List(String)) -> Nil {
   }
 }
 
+/// Join the listener's initial topics, counting the subscriptions made.
+fn subscribe_initial(topics: List(String), subscribed: Int) -> Nil {
+  case topics {
+    [] -> Nil
+    [topic, ..rest] -> {
+      log.info("beacon.subscription", "Subscribing to: " <> topic)
+      pubsub.subscribe(topic)
+      telemetry.subscription_changed(telemetry.Subscribe, subscribed + 1)
+      subscribe_initial(rest, subscribed + 1)
+    }
+  }
+}
+
 fn unsubscribe_all(subscriptions: List(String)) -> Nil {
-  list.each(subscriptions, fn(topic) {
-    log.debug("beacon.subscription", "Unsubscribing on shutdown: " <> topic)
-    pubsub.unsubscribe(topic)
-  })
+  case subscriptions {
+    [] -> Nil
+    [topic, ..rest] -> {
+      log.debug("beacon.subscription", "Unsubscribing on shutdown: " <> topic)
+      pubsub.unsubscribe(topic)
+      telemetry.subscription_changed(telemetry.Unsubscribe, list.length(rest))
+      unsubscribe_all(rest)
+    }
+  }
 }
 
 @external(erlang, "beacon_subscription_ffi", "receive_with_commands")

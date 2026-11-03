@@ -525,12 +525,16 @@ pub fn join_reconciles_dynamic_subscriptions_test() {
   let assert transport.SendModelSync(model_json: json, ..) = next(s)
   let assert True = string.contains(json, "\"count\":5")
   wait_for_topics(computed, ["rv_join_topic_5"])
-  wait_until("the listener to join rv_join_topic_5", fn() {
-    pubsub.subscriber_count("rv_join_topic_5") == 1
-  })
-  wait_until("the listener to leave rv_join_topic_0", fn() {
-    pubsub.subscriber_count("rv_join_topic_0") == 0
-  })
+  await.until_telemetry(
+    [subscription_changed],
+    "the listener to join rv_join_topic_5",
+    fn() { pubsub.subscriber_count("rv_join_topic_5") == 1 },
+  )
+  await.until_telemetry(
+    [subscription_changed],
+    "the listener to leave rv_join_topic_0",
+    fn() { pubsub.subscriber_count("rv_join_topic_0") == 0 },
+  )
   process.send(rt, runtime.Shutdown)
 }
 
@@ -542,45 +546,8 @@ fn wait_for_topics(computed: Subject(List(String)), expected: List(String)) {
   }
 }
 
-/// Re-check a condition owned by another process until it holds, yielding
-/// between checks, and crash naming `what` at the shared deadline.
-///
-/// This is a poll, kept only because nothing observable marks the moment
-/// the runtime's PubSub listener applies a subscription change: it is a
-/// plain receive loop (no sys barrier), and pubsub.subscribe is an ETS
-/// insert in the listener itself, with no message or telemetry event.
-/// It needs a source hook to become event-driven (see docs/TESTING.md).
-fn wait_until(what: String, condition: fn() -> Bool) -> Nil {
-  poll_until(what, condition, monotonic_ms() + await.deadline_ms)
-}
-
-fn poll_until(what: String, condition: fn() -> Bool, deadline: Int) -> Nil {
-  case condition(), monotonic_ms() >= deadline {
-    True, _ -> Nil
-    False, True ->
-      panic as {
-        "timed out after "
-        <> int.to_string(await.deadline_ms)
-        <> " ms waiting for "
-        <> what
-      }
-    False, False -> {
-      let _ = process.receive(process.new_subject(), 2)
-      poll_until(what, condition, deadline)
-    }
-  }
-}
-
-fn monotonic_ms() -> Int {
-  monotonic_time(Millisecond)
-}
-
-type MillisecondUnit {
-  Millisecond
-}
-
-@external(erlang, "erlang", "monotonic_time")
-fn monotonic_time(unit: MillisecondUnit) -> Int
+/// The runtime's PubSub listener emits this after each pg join or leave.
+const subscription_changed = ["beacon", "subscription", "changed"]
 
 @external(erlang, "beacon_ssr_ffi", "system_time_seconds")
 fn now_seconds() -> Int

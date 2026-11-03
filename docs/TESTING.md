@@ -396,18 +396,11 @@ These are the waits that remain, and why.
 | `beacon/stress` | `hold_duration_ms` | Holding connections open is the load being measured (0 in tests). |
 | `beacon/sim` pool | `stagger_ms` | Connection pacing is part of the scenario. |
 | CDP `drain_quiet`, pong pause | see [Waiting](#waiting) | An absence, or stillness, is under test. |
-| `runtime_versioning_test` `wait_until` | poll, yielding 2 ms | Needs a source hook (below). |
 
 ### Needs a source hook
 
 These waits cannot become event-driven from test code alone:
 
-- **Runtime PubSub subscription changes.** The runtime's PubSub listener
-  applies `SubscribeTo` and `UnsubscribeFrom` with an ETS insert or
-  delete. It is a plain receive loop with no sys barrier, and the change
-  sends no message and emits no telemetry, so `runtime_versioning_test`
-  polls. A fix needs either a telemetry event such as
-  `[beacon, subscription, changed]` or a synchronous acknowledgement.
 - **Client outbound queue.** The CDP "no model event was sent" checks use
   a quiet window. A test hook under `__BEACON_ENABLE_TEST_HOOKS` would
   replace it: `window.__beaconOutboundPendingForTest()`, returning the

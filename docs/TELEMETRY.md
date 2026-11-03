@@ -141,6 +141,7 @@ measurements: `system_time` and `monotonic_time` on start, `duration` and
 | `[beacon, session, created \| revoked \| expired \| contention]` | `count` | `reason` | yes, `beacon/session` |
 | `[beacon, pubsub, broadcast]` | `local_subscribers`, `remote_nodes` | `scope`: `cluster`, `local` or `direct` | yes |
 | `[beacon, pubsub, forward, overloaded]` | `queue_len` | `shard` | yes, at most once per second per worker |
+| `[beacon, subscription, changed]` | `subscriptions` | `action`: `subscribe` or `unsubscribe` | yes, `beacon/runtime` |
 | `[beacon, cluster, node, up \| down]` | `count` | `node`, `reason` | yes |
 | `[beacon, cluster, peer, rejected]` | `count` | `node`, `reason` | yes |
 | `[beacon, cluster, connect, failed]` | `count` | `node`, `reason` | yes |
@@ -248,6 +249,13 @@ Notes on individual events:
   subscribers they have. `local_broadcast` reports `remote_nodes` 0, and a
   `direct_broadcast` to another node reports 0 local subscribers and 1
   remote node.
+- `[beacon, subscription, changed]`: a runtime's PubSub listener joined
+  or left one topic: the initial topics at start, a change in
+  `dynamic_subscriptions`' result after an update or join, and every
+  topic at shutdown. `subscriptions` is the listener's topic count after
+  the change. The event is emitted after the pg membership changed, so a
+  handler that reads `pubsub.subscriber_count` sees it. The topic is not
+  reported, since app topics often name a user or a document.
 - `[beacon, presence, untrack]`: `count` is the number of entries removed,
   so a process that exits with five entries emits one event with count 5.
 - `[beacon, presence, limit_exceeded]` fires for every refused track or
