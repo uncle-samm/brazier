@@ -400,10 +400,14 @@ fn start_app_server(
   listener
 }
 
+/// A fresh static directory. `unique` cannot name it: unique_integer
+/// restarts in every VM, so two concurrent `gleam test` runs would share the
+/// directory and one would delete it under the other. `create_directory`
+/// (not `_all`) fails on a name that already exists.
 fn static_dir() -> String {
-  let dir = "/tmp/beacon_http_telemetry_" <> unique("static")
-  let assert Ok(Nil) = simplifile.create_directory_all(dir)
-    as "test static directory must be creatable"
+  let dir = "/tmp/beacon_http_telemetry_static_" <> test_ffi_unique_ref()
+  let assert Ok(Nil) = simplifile.create_directory(dir)
+    as "test static directory must not exist yet"
   let assert Ok(Nil) = simplifile.write(dir <> "/app.css", "body{}")
     as "test static file must be writable"
   dir
@@ -623,6 +627,9 @@ type RawResponse =
 
 @external(erlang, "erlang", "unique_integer")
 fn unique_integer() -> Int
+
+@external(erlang, "beacon_test_ffi", "unique_ref")
+fn test_ffi_unique_ref() -> String
 
 @external(erlang, "beacon_telemetry_test_ffi", "rescue")
 fn rescue(run: fn() -> a) -> Result(a, #(String, dynamic.Dynamic))
