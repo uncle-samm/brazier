@@ -1,15 +1,17 @@
-/// Live Dashboard — demonstrates:
-/// - Server-push with effect.every() (no client events needed)
-/// - Real BEAM runtime metrics via beacon/debug
-/// - Auto-updating UI without any user interaction
-/// - Sparkline rendering with SVG
+/// Live Dashboard, demonstrating:
+/// - server push with `effect.every` (no client events needed);
+/// - real BEAM runtime metrics, read on the server only;
+/// - SVG sparklines rendered with `beacon/svg`.
 import beacon
-import beacon/debug
-import beacon/effect
+import beacon/attribute
+import beacon/effect.{type Effect}
+import beacon/element.{type Element}
 import beacon/html
+import beacon/svg
 import gleam/float
 import gleam/int
 import gleam/list
+import gleam/string
 
 // --- Types ---
 
@@ -18,7 +20,7 @@ pub type Model {
     process_count: Int,
     memory_mb: Float,
     uptime_seconds: Int,
-    /// History for sparklines (last 30 samples)
+    /// The last `max_history` samples, oldest first, for the sparklines.
     process_history: List(Int),
     memory_history: List(Float),
     tick_count: Int,
@@ -31,88 +33,98 @@ pub type Msg {
 
 const max_history = 30
 
-// --- Init ---
+const refresh_ms = 1000
 
-pub fn init() -> #(Model, effect.Effect(Msg)) {
-  let stats = debug.stats()
+// --- Runtime metrics (server only) ---
+
+@external(erlang, "dashboard_ffi", "process_count")
+fn process_count() -> Int
+
+@external(erlang, "dashboard_ffi", "memory_total")
+fn memory_total_bytes() -> Int
+
+@external(erlang, "dashboard_ffi", "uptime_seconds")
+fn uptime_seconds() -> Int
+
+fn memory_mb() -> Float {
+  int.to_float(memory_total_bytes()) /. 1_048_576.0
+}
+
+// --- Init and update (server) ---
+
+fn init(_ctx: beacon.Context) -> #(Model, Effect(Msg)) {
+  let processes = process_count()
+  let memory = memory_mb()
   #(
     Model(
-      process_count: stats.process_count,
-      memory_mb: int.to_float(stats.memory_bytes) /. 1_048_576.0,
-      uptime_seconds: stats.uptime_seconds,
-      process_history: [stats.process_count],
-      memory_history: [
-        int.to_float(stats.memory_bytes) /. 1_048_576.0,
-      ],
+      process_count: processes,
+      memory_mb: memory,
+      uptime_seconds: uptime_seconds(),
+      process_history: [processes],
+      memory_history: [memory],
       tick_count: 0,
     ),
-    // Start server-push timer — refreshes every second
-    effect.every(1000, fn() { RefreshStats }),
+    // Runs on the connected mount only; the HTML render drops it.
+    effect.every(refresh_ms, fn() { RefreshStats }),
   )
 }
 
-// --- Update ---
-
-pub fn update(
-  model: Model,
-  _local: Nil,
-  _server: Nil,
-  msg: Msg,
-) -> #(Model, Nil, Nil) {
-  let model = case msg {
+fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
+  case msg {
     RefreshStats -> {
-      let stats = debug.stats()
-      let mem = int.to_float(stats.memory_bytes) /. 1_048_576.0
-      let proc_history =
-        list.append(model.process_history, [stats.process_count])
-        |> take_last(max_history)
-      let mem_history =
-        list.append(model.memory_history, [mem])
-        |> take_last(max_history)
-      Model(
-        process_count: stats.process_count,
-        memory_mb: mem,
-        uptime_seconds: stats.uptime_seconds,
-        process_history: proc_history,
-        memory_history: mem_history,
-        tick_count: model.tick_count + 1,
+      let processes = process_count()
+      let memory = memory_mb()
+      #(
+        Model(
+          process_count: processes,
+          memory_mb: memory,
+          uptime_seconds: uptime_seconds(),
+          process_history: push_sample(model.process_history, processes),
+          memory_history: push_sample(model.memory_history, memory),
+          tick_count: model.tick_count + 1,
+        ),
+        effect.none(),
       )
     }
   }
-  #(model, Nil, Nil)
 }
 
-fn take_last(items: List(a), n: Int) -> List(a) {
-  let len = list.length(items)
-  case len > n {
-    True -> list.drop(items, len - n)
-    False -> items
-  }
+/// Append a sample, keeping the newest `max_history`.
+fn push_sample(history: List(a), sample: a) -> List(a) {
+  let history = list.append(history, [sample])
+  list.drop(history, int.max(0, list.length(history) - max_history))
 }
 
 // --- View ---
 
-pub fn view(model: Model, _local: Nil) -> beacon.Node(Msg) {
+pub fn view(model: Model) -> Element(Msg) {
   html.div(
     [
-      html.style(
-        "font-family:system-ui;max-width:800px;margin:2rem auto;padding:0 1rem",
-      ),
+      attribute.styles([
+        #("font-family", "system-ui"),
+        #("max-width", "800px"),
+        #("margin", "2rem auto"),
+        #("padding", "0 1rem"),
+      ]),
     ],
     [
       html.h1([], [html.text("Live Dashboard")]),
-      html.p([html.style("color:#666")], [
+      html.p([attribute.style("color", "#666")], [
         html.text(
-          "Auto-refreshes every second — no client interaction needed. Tick #"
-          <> int.to_string(model.tick_count),
+          "Auto-refreshes every second, with no client interaction. Tick #",
         ),
+        html.span([attribute.id("tick")], [
+          html.text(int.to_string(model.tick_count)),
+        ]),
       ]),
-      // Metric cards
       html.div(
         [
-          html.style(
-            "display:grid;grid-template-columns:repeat(3,1fr);gap:1rem;margin:1.5rem 0",
-          ),
+          attribute.styles([
+            #("display", "grid"),
+            #("grid-template-columns", "repeat(3,1fr)"),
+            #("gap", "1rem"),
+            #("margin", "1.5rem 0"),
+          ]),
         ],
         [
           metric_card(
@@ -122,19 +134,24 @@ pub fn view(model: Model, _local: Nil) -> beacon.Node(Msg) {
           ),
           metric_card(
             "Memory",
-            float_to_str(model.memory_mb, 1) <> " MB",
+            one_decimal(model.memory_mb) <> " MB",
             "#2196F3",
           ),
           metric_card("Uptime", format_uptime(model.uptime_seconds), "#FF9800"),
         ],
       ),
-      // Sparklines
       html.div(
-        [html.style("display:grid;grid-template-columns:1fr 1fr;gap:1rem")],
+        [
+          attribute.styles([
+            #("display", "grid"),
+            #("grid-template-columns", "1fr 1fr"),
+            #("gap", "1rem"),
+          ]),
+        ],
         [
           sparkline_card(
             "Process Count",
-            model.process_history |> list.map(int.to_float),
+            list.map(model.process_history, int.to_float),
             "#4CAF50",
           ),
           sparkline_card("Memory (MB)", model.memory_history, "#2196F3"),
@@ -144,24 +161,28 @@ pub fn view(model: Model, _local: Nil) -> beacon.Node(Msg) {
   )
 }
 
-fn metric_card(label: String, value: String, color: String) -> beacon.Node(Msg) {
+fn metric_card(label: String, value: String, colour: String) -> Element(Msg) {
   html.div(
     [
-      html.style(
-        "background:#f8f9fa;border-radius:8px;padding:1.5rem;border-left:4px solid "
-        <> color,
-      ),
+      attribute.styles([
+        #("background", "#f8f9fa"),
+        #("border-radius", "8px"),
+        #("padding", "1.5rem"),
+        #("border-left", "4px solid " <> colour),
+      ]),
     ],
     [
+      card_label(label),
       html.div(
-        [html.style("color:#666;font-size:0.85rem;margin-bottom:0.5rem")],
         [
-          html.text(label),
+          attribute.styles([
+            #("font-size", "1.8rem"),
+            #("font-weight", "bold"),
+            #("color", "#333"),
+          ]),
         ],
+        [html.text(value)],
       ),
-      html.div([html.style("font-size:1.8rem;font-weight:bold;color:#333")], [
-        html.text(value),
-      ]),
     ],
   )
 }
@@ -169,136 +190,95 @@ fn metric_card(label: String, value: String, color: String) -> beacon.Node(Msg) 
 fn sparkline_card(
   label: String,
   values: List(Float),
-  color: String,
-) -> beacon.Node(Msg) {
+  colour: String,
+) -> Element(Msg) {
   html.div(
     [
-      html.style("background:#f8f9fa;border-radius:8px;padding:1rem"),
+      attribute.styles([
+        #("background", "#f8f9fa"),
+        #("border-radius", "8px"),
+        #("padding", "1rem"),
+      ]),
     ],
-    [
-      html.div(
-        [html.style("color:#666;font-size:0.85rem;margin-bottom:0.5rem")],
-        [
-          html.text(label),
-        ],
-      ),
-      render_sparkline(values, color, 350, 60),
-    ],
+    [card_label(label), sparkline(values, colour, 350, 60)],
   )
 }
 
-fn render_sparkline(
+fn card_label(label: String) -> Element(Msg) {
+  html.div(
+    [
+      attribute.styles([
+        #("color", "#666"),
+        #("font-size", "0.85rem"),
+        #("margin-bottom", "0.5rem"),
+      ]),
+    ],
+    [html.text(label)],
+  )
+}
+
+/// A polyline scaled to fit `width` x `height`; fewer than two samples
+/// draw an empty chart.
+fn sparkline(
   values: List(Float),
-  color: String,
+  colour: String,
   width: Int,
   height: Int,
-) -> beacon.Node(Msg) {
+) -> Element(Msg) {
   let w = int.to_string(width)
   let h = int.to_string(height)
-  case values {
-    [] | [_] ->
-      html.element(
-        "svg",
-        [
-          html.attribute("viewBox", "0 0 " <> w <> " " <> h),
-          html.attribute("width", w),
-          html.attribute("height", h),
-        ],
-        [],
-      )
-    _ -> {
-      let min_val =
-        list.fold(values, 999_999_999.0, fn(acc, v) {
-          case v <. acc {
-            True -> v
-            False -> acc
-          }
-        })
-      let max_val =
-        list.fold(values, 0.0, fn(acc, v) {
-          case v >. acc {
-            True -> v
-            False -> acc
-          }
-        })
-      let range = case max_val -. min_val <. 1.0 {
-        True -> 1.0
-        False -> max_val -. min_val
-      }
-      let len = list.length(values)
-      let step = int.to_float(width) /. int.to_float(len - 1)
+  let line = case values {
+    [] | [_] -> []
+    [first, ..rest] -> {
+      let low = list.fold(rest, first, float.min)
+      let high = list.fold(rest, first, float.max)
+      // A flat series would divide by zero; draw it along the bottom.
+      let range = float.max(high -. low, 1.0)
+      let step = int.to_float(width) /. int.to_float(list.length(values) - 1)
       let points =
         list.index_map(values, fn(v, i) {
           let x = int.to_float(i) *. step
           let y =
             int.to_float(height)
-            -. { { v -. min_val } /. range *. int.to_float(height - 4) }
+            -. { v -. low }
+            /. range
+            *. int.to_float(height - 4)
             -. 2.0
-          float_to_str(x, 1) <> "," <> float_to_str(y, 1)
+          one_decimal(x) <> "," <> one_decimal(y)
         })
-      let points_str = string_join(points, " ")
-      html.element(
-        "svg",
-        [
-          html.attribute("viewBox", "0 0 " <> w <> " " <> h),
-          html.attribute("width", w),
-          html.attribute("height", h),
-        ],
-        [
-          html.element(
-            "polyline",
-            [
-              html.attribute("points", points_str),
-              html.attribute("fill", "none"),
-              html.attribute("stroke", color),
-              html.attribute("stroke-width", "2"),
-            ],
-            [],
-          ),
-        ],
-      )
+      [
+        svg.polyline([
+          svg.points(string.join(points, " ")),
+          svg.fill("none"),
+          svg.stroke(colour),
+          svg.stroke_width("2"),
+        ]),
+      ]
     }
   }
+  svg.svg(
+    [svg.viewbox("0 0 " <> w <> " " <> h), svg.width(w), svg.height(h)],
+    line,
+  )
 }
 
 fn format_uptime(seconds: Int) -> String {
-  let h = seconds / 3600
-  let m = { seconds % 3600 } / 60
-  let s = seconds % 60
-  int.to_string(h)
+  int.to_string(seconds / 3600)
   <> "h "
-  <> int.to_string(m)
+  <> int.to_string(seconds % 3600 / 60)
   <> "m "
-  <> int.to_string(s)
+  <> int.to_string(seconds % 60)
   <> "s"
 }
 
-fn float_to_str(f: Float, _decimals: Int) -> String {
-  let whole = float.truncate(f)
-  let frac = float.truncate({ f -. int.to_float(whole) } *. 10.0)
-  let frac = case frac < 0 {
-    True -> -frac
-    False -> frac
-  }
-  int.to_string(whole) <> "." <> int.to_string(frac)
-}
-
-fn string_join(items: List(String), sep: String) -> String {
-  case items {
-    [] -> ""
-    [x] -> x
-    [x, ..rest] -> x <> sep <> string_join(rest, sep)
-  }
+fn one_decimal(value: Float) -> String {
+  float.to_string(float.to_precision(value, 1))
 }
 
 // --- Start ---
 
 pub fn main() {
-  start()
-}
-
-pub fn start() {
-  beacon.app(init, beacon.no_local, beacon.no_server, update, view)
-  |> beacon.title("Live Dashboard")
+  beacon.application(init:, update:, view:)
+  |> beacon.title(fn(_model) { "Live Dashboard" })
   |> beacon.start(8080)
 }
