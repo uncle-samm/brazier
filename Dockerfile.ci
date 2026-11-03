@@ -68,6 +68,10 @@ RUN set -eu; \
       exit 1; \
     fi
 
-# Client JS checks first: a missing or broken node fails here, by name,
-# before the Gleam suite (whose node-driven tests would fail too).
-CMD ["sh", "-lc", "node --version && make test-client && gleam build && gleam test && gleam run -m beacon/lint"]
+# Formatting first (cheapest, and an unformatted tree is not reviewed).
+# Then the client JS checks: a missing or broken node fails here, by name,
+# before the Gleam suite (whose node-driven tests would fail too). Each
+# step must exit 0 for the next to run, and the job takes the first
+# non-zero exit. The build must be warning-free (CLAUDE.md, Definition of
+# Done), so warnings fail it.
+CMD ["sh", "-lc", "gleam format --check src test && node --version && make test-client && gleam build --warnings-as-errors && gleam test && gleam run -m beacon/lint"]
