@@ -4,6 +4,16 @@
 erl_crash.dump
 .DS_Store
 
+# Editor and tool scratch files
+*.swp
+*~
+.idea/
+.vscode/
+.playwright-mcp/
+__pycache__/
+*.pyc
+node_modules/
+
 # Example build artifacts
 /examples/*/build
 

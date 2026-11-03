@@ -11,6 +11,7 @@ The child's state lives in the parent's state, so it is synced, kept on the serv
 
 ## The child module
 
+<!-- docs-check: module my_app/counter -->
 ```gleam
 // src/my_app/counter.gleam
 import beacon/effect.{type Effect}
@@ -52,6 +53,7 @@ A child used from a `beacon.simple` app has `update: fn(Model, Msg) -> Model` in
 
 ## Nesting it in a parent
 
+<!-- docs-check: module my_app -->
 ```gleam
 // src/my_app.gleam
 import beacon
@@ -111,12 +113,31 @@ The server accepts a child message only when the constructors that build it are 
 
 A child that needs to tell its parent something returns that information from `update` instead of sending a message upwards. Lustre and Elm use the same pattern:
 
+<!-- docs-check: wrap
+import beacon/effect.{type Effect}
+
+pub type Model {
+  Model(draft: String)
+}
+
+pub type Msg {
+  Typed(String)
+  Submit
+}
+
+{{block}}
+-->
 ```gleam
 pub type OutMsg {
   Submitted(String)
 }
 
-pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg), List(OutMsg))
+pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg), List(OutMsg)) {
+  case msg {
+    Typed(text) -> #(Model(draft: text), effect.none(), [])
+    Submit -> #(Model(draft: ""), effect.none(), [Submitted(model.draft)])
+  }
+}
 ```
 
 The parent pattern-matches the returned list in its own `update`.

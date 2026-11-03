@@ -14,19 +14,44 @@ A process that crashes with a clear assertion message is easy to fix: you see th
 
 Every error must be explicitly handled or propagated. Never write:
 
-```gleam
-// BAD — error is invisible
-case do_thing() {
-  Ok(value) -> use(value)
-  Error(_) -> Nil
+<!-- docs-check: wrap
+import beacon/log
+import gleam/string
+
+pub type Thing {
+  Thing(name: String)
 }
 
-// GOOD — error is visible
-case do_thing() {
-  Ok(value) -> use(value)
-  Error(err) -> {
-    log.warning("module", "do_thing failed: " <> string.inspect(err))
-    Nil
+{{block}}
+
+fn do_thing(_id: String) -> Result(Thing, String) {
+  Ok(Thing(name: "thing"))
+}
+
+fn handle(thing: Thing) -> Nil {
+  log.debug("app.sync", "handled " <> thing.name)
+}
+-->
+```gleam
+// BAD: the error is invisible
+pub fn sync_quietly(id: String) -> Nil {
+  case do_thing(id) {
+    Ok(value) -> handle(value)
+    Error(_) -> Nil
+  }
+}
+
+// GOOD: the error is visible
+pub fn sync(id: String) -> Nil {
+  case do_thing(id) {
+    Ok(value) -> handle(value)
+    Error(err) -> {
+      log.warning(
+        "app.sync",
+        "do_thing(" <> id <> ") failed: " <> string.inspect(err),
+      )
+      Nil
+    }
   }
 }
 ```
@@ -40,6 +65,13 @@ If you catch yourself writing `Error(_) -> Nil`, stop. Either:
 
 All significant state transitions, errors, warnings, and decisions must be logged with structured context.
 
+<!-- docs-check: wrap
+import beacon/log
+
+pub fn levels() -> Nil {
+  {{block}}
+}
+-->
 ```gleam
 // Levels:
 log.error("module", "msg")    // Failures that need attention
@@ -58,15 +90,25 @@ Rules:
 
 If something "can't happen," assert it. When it does happen, you'll know immediately.
 
+<!-- docs-check: wrap
+import gleam/erlang/process.{type Subject}
+
+pub fn await_listener(reply_subject: Subject(Subject(String))) -> Subject(String) {
+  {{block}}
+  command_subject
+}
+-->
 ```gleam
 // Document WHY the assertion is safe
 // INVARIANT: The listener process was just spawned and MUST send its
 // command_subject within 5 seconds. Timeout = fatal configuration error.
 let assert Ok(command_subject) = process.receive(reply_subject, 5000)
+  as "listener did not send its command subject within 5s"
 ```
 
 Rules:
-- Every `let assert` must have a comment explaining the invariant
+- Every `let assert` must have a comment explaining the invariant, and an
+  `as "..."` message that names what failed
 - Use `let assert` only when the invariant is truly guaranteed by program logic
 - For runtime validation (user input, network data), use `Result` instead
 - Never use `todo` or `panic` in shipped code
@@ -75,17 +117,41 @@ Rules:
 
 A crash with a clear message is better than silent corruption:
 
-```gleam
-// BAD — continues with potentially corrupt state
-case validate(input) {
-  Ok(valid) -> process(valid)
-  Error(_) -> process(default_value)  // What if default is wrong?
+<!-- docs-check: wrap
+pub type Settings {
+  Settings(theme: String)
 }
 
-// GOOD — caller knows immediately
-case validate(input) {
-  Ok(valid) -> process(valid)
-  Error(err) -> Error(err)  // Propagate — let the caller decide
+const default_settings = Settings(theme: "light")
+
+{{block}}
+
+fn validate(input: String) -> Result(Settings, String) {
+  case input {
+    "dark" | "light" -> Ok(Settings(theme: input))
+    _ -> Error("unknown theme: " <> input)
+  }
+}
+
+fn apply(settings: Settings) -> Result(Settings, String) {
+  Ok(settings)
+}
+-->
+```gleam
+// BAD: continues with a value nobody chose
+pub fn load_quietly(input: String) -> Result(Settings, String) {
+  case validate(input) {
+    Ok(valid) -> apply(valid)
+    Error(_) -> apply(default_settings)  // what if the default is wrong?
+  }
+}
+
+// GOOD: the caller knows at once
+pub fn load(input: String) -> Result(Settings, String) {
+  case validate(input) {
+    Ok(valid) -> apply(valid)
+    Error(err) -> Error(err)  // propagate, and let the caller decide
+  }
 }
 ```
 
@@ -95,6 +161,7 @@ On the BEAM, crashes are cheap. Supervisors restart processes. A crashed process
 
 Error messages must contain enough information to diagnose the failure:
 
+<!-- docs-check: fragment two alternative expressions side by side, not a module -->
 ```gleam
 // BAD
 Error("Failed to save file")
@@ -103,8 +170,10 @@ Error("Failed to save file")
 Error("Failed to save " <> path <> ": " <> string.inspect(os_error))
 ```
 
-Custom error types should carry structured context:
+Custom error types should carry structured context, as Beacon's own
+`error.BeaconError` does:
 
+<!-- docs-check: fragment an excerpt of src/beacon/error.gleam, which has more constructors -->
 ```gleam
 pub type BeaconError {
   TransportError(reason: String)
@@ -130,27 +199,43 @@ Test what happens when things go wrong, not just when they go right:
 - What happens when 1000 connections hit the server simultaneously?
 - What happens when a process crashes during an update?
 
-Our simulation testing framework (`test/beacon/sim/`) exercises these scenarios:
-- **1000 concurrent connections** — all succeed, zero process leak
-- **Corrupt data** — partial JSON, binary noise, 10KB payloads, invalid handlers — server survives with zero process leak
-- **Rapid event flooding** — 500 events on a single connection
-- **Memory leak detection** — connect/disconnect 100 times, measure delta
+The simulation tests (`test/beacon/sim_test.gleam`, with the harness in
+`test/beacon/sim/`) open real WebSocket connections against a running app:
+
+- **Scale**: 10, 50, 100 and 1000 concurrent connections.
+- **Corrupt data**: partial JSON, binary noise, oversized payloads and
+  unknown handlers; the server must survive and leak no process.
+- **Flooding**: 500 events on one connection, past the per-connection rate
+  limit.
+- **Leaks**: 100 connect/disconnect cycles, measuring memory and process
+  counts before and after.
 
 ### 8. Zero Tolerance for Leaks
 
 If a test measures 0 leaked processes, assert exactly 0 — not "less than 10." If it ever leaks 1 process, that's a bug, and we want to know immediately:
 
+<!-- docs-check: wrap
+pub fn check_leaks(processes_leaked: Int) -> Nil {
+  {{block}}
+  Nil
+}
+-->
 ```gleam
-// BAD — tolerates up to 9 leaked processes
+// BAD: tolerates up to 9 leaked processes
 let assert True = processes_leaked < 10
 
-// GOOD — zero means zero
+// GOOD: zero means zero
 let assert True = processes_leaked == 0
 ```
 
+Not every simulation test meets this rule yet: some still allow a margin of
+leaked processes or failed connections. Each margin is a bug to remove, not
+a tolerance to copy.
+
 ## How We Enforce This
 
-1. **Custom linter** (`src/beacon/lint.gleam`) — scans AST for banned patterns
+1. **Custom linter** (`gleam run -m beacon/lint`, `src/beacon/lint.gleam`) — parses the source and reports `todo`, `panic`, catch-all branches that do not log, `let _ =` discards, degraded-path phrases, and public functions in key modules that never log
 2. **Simulation tests** (`test/beacon/sim/`) — real connections, fault injection, leak detection
 3. **Code review** — every `Error(_) -> Nil` is a red flag
 4. **CI** — `gleam build` (zero warnings) + `gleam test` (all pass) + linter (zero violations)
+5. **Docs that compile** (`scripts/check_docs.sh`) — every Gleam sample in the docs compiles with zero warnings, or is marked as a fragment with a reason

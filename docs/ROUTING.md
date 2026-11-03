@@ -8,6 +8,29 @@ an explicit `case` branch.
 
 ## Declaring Routes
 
+<!-- docs-check: wrap
+import beacon/element.{type Element}
+
+{{block}}
+
+pub type Model {
+  Model(route: Route)
+}
+
+fn init(_ctx: beacon.Context) -> Result(#(Model, Effect(Msg)), beacon.InitError) {
+  Ok(#(Model(route: HomePage), effect.none()))
+}
+
+fn update(_model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
+  case msg {
+    RouteChanged(route) -> #(Model(route:), effect.none())
+  }
+}
+
+fn view(_model: Model) -> Element(Msg) {
+  element.text("page")
+}
+-->
 ```gleam
 import beacon
 import beacon/effect.{type Effect}
@@ -67,6 +90,43 @@ Beacon runs `update(model, on_change(route))`:
 `init` therefore never parses the URL itself. Put a placeholder route in the
 initial model; `on_change` replaces it before anything is rendered.
 
+<!-- docs-check: wrap
+import beacon
+import beacon/effect.{type Effect}
+import beacon/element.{type Element}
+
+pub type Route {
+  HomePage
+  UserPage(id: String)
+}
+
+pub type User {
+  User(id: String, name: String)
+}
+
+pub type Model {
+  Model(route: Route, users: List(User))
+}
+
+pub type Msg {
+  RouteChanged(Route)
+}
+
+{{block}}
+
+fn load_user(_id: String) -> Effect(Msg) {
+  effect.none()
+}
+
+fn view(_model: Model) -> Element(Msg) {
+  element.text("page")
+}
+
+pub fn main() {
+  beacon.application(init:, update:, view:)
+  |> beacon.start(8080)
+}
+-->
 ```gleam
 fn init(_ctx: beacon.Context) -> Result(#(Model, Effect(Msg)), beacon.InitError) {
   Ok(#(Model(route: HomePage, users: []), effect.none()))
@@ -98,6 +158,15 @@ the page, so the 404 or 400 comes from a real HTTP response.
 
 Plain `<a href>` links to the same host navigate without a page load:
 
+<!-- docs-check: wrap
+import beacon/attribute
+import beacon/element.{type Element}
+import beacon/html
+
+pub fn profile_link() -> Element(msg) {
+  {{block}}
+}
+-->
 ```gleam
 html.a([attribute.href("/users/7")], [html.text("Profile")])
 ```
@@ -122,6 +191,29 @@ an absolute URL, `javascript:` or `data:`). Any other value is logged as an
 error and not sent. Use `redirect` when the browser must make a real HTTP
 request, for example to receive a `Set-Cookie` header after login.
 
+<!-- docs-check: wrap
+import beacon/effect.{type Effect}
+import beacon/router
+
+pub type User {
+  User(id: String)
+}
+
+pub type Model {
+  Model
+}
+
+pub type Msg {
+  Saved(User)
+  LoggedOut
+}
+
+pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
+  case msg {
+    {{block}}
+  }
+}
+-->
 ```gleam
 Saved(user) -> #(model, router.push("/users/" <> user.id))
 LoggedOut -> #(model, router.redirect("/login"))
@@ -132,9 +224,55 @@ LoggedOut -> #(model, router.redirect("/login"))
 A page with its own state and messages is a child module with its own
 `Model`, `Msg`, `update` and `view`. The parent keeps the child's model in a
 field, wraps its messages in one constructor, and maps the child's view and
-effects (see [COMPONENTS.md](COMPONENTS.md)):
+effects (see [COMPONENTS.md](COMPONENTS.md)). The child:
 
+<!-- docs-check: module routed/pages/home -->
 ```gleam
+import beacon/effect.{type Effect}
+import beacon/element.{type Element}
+import beacon/event
+import beacon/html
+import gleam/int
+
+pub type Model {
+  Model(visits: Int)
+}
+
+pub type Msg {
+  Visited
+}
+
+pub fn init() -> Model {
+  Model(visits: 0)
+}
+
+pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
+  case msg {
+    Visited -> #(Model(visits: model.visits + 1), effect.none())
+  }
+}
+
+pub fn view(model: Model) -> Element(Msg) {
+  html.button([event.on_click(Visited)], [
+    html.text("Visits: " <> int.to_string(model.visits)),
+  ])
+}
+```
+
+The parent:
+
+<!-- docs-check: wrap
+{{block}}
+
+pub type Route {
+  HomePage
+  AboutPage
+}
+-->
+```gleam
+import beacon/effect.{type Effect}
+import beacon/element.{type Element}
+import beacon/html
 import routed/pages/home
 
 pub type Model {
@@ -146,7 +284,7 @@ pub type Msg {
   Home(home.Msg)
 }
 
-fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
+pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
   case msg {
     RouteChanged(route) -> #(Model(..model, route:), effect.none())
     Home(child) -> {
@@ -157,14 +295,24 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
 }
 
 pub fn view(model: Model) -> Element(Msg) {
-  element.keyed(href(model.route), case model.route {
+  element.keyed(route_key(model.route), case model.route {
     HomePage -> home.view(model.home) |> element.map(Home)
-    AboutPage -> about.view()
+    AboutPage -> about_page()
   })
 }
-```
 
-A page without state is a plain function returning an `Element(msg)`.
+fn route_key(route: Route) -> String {
+  case route {
+    HomePage -> "/"
+    AboutPage -> "/about"
+  }
+}
+
+/// A page without state is a plain function returning an `Element(msg)`.
+fn about_page() -> Element(msg) {
+  html.p([], [html.text("About this app")])
+}
+```
 
 Key the page by its route with `element.keyed`. The browser updates the DOM
 by morphing the old tree into the new one, and without a key it reuses one
@@ -187,6 +335,7 @@ than the model it sends. A page module can expose a public `Model` and a
 server-only record; the root state holds both, and `sync` returns only the
 model:
 
+<!-- docs-check: fragment an excerpt of examples/route_server_workspace/src/main.gleam, whose page modules define accounts.Server and settings.Server -->
 ```gleam
 pub type Session {
   Session(model: Model, accounts: accounts.Server, settings: settings.Server)
@@ -211,8 +360,28 @@ Server records and the functions that use them never reach the browser. See
 ## Route-Dependent Titles
 
 `beacon.title(fn(model) { ... })` sets the document title on the HTML render,
-so it can depend on the route in the model:
+from the model after `on_change` has run, so it can depend on the route:
 
+<!-- docs-check: wrap
+import beacon
+
+pub type Route {
+  HomePage
+  UserPage(id: String)
+  SearchPage(query: String)
+}
+
+pub type Model {
+  Model(route: Route)
+}
+
+pub fn with_title(
+  app: beacon.App(Model, Model, Nil, msg),
+) -> beacon.App(Model, Model, Nil, msg) {
+  app
+  {{block}}
+}
+-->
 ```gleam
 |> beacon.title(fn(model) {
   case model.route {
@@ -222,3 +391,7 @@ so it can depend on the route in the model:
   }
 })
 ```
+
+The title is computed only for the HTML render. A client navigation does not
+change `document.title`; the title of the first page stays until the next
+full page load.

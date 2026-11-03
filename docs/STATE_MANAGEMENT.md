@@ -12,6 +12,14 @@ state through stores and PubSub:
 - **Stores, PubSub and presence**: state shared by every session (see
   below).
 
+State that must outlive a page load, such as who is signed in, belongs in a
+cookie session from `beacon/session`: the cookie holds only an id, and the
+data stays in a server-side store (`LocalEts` on one node, or `External`
+functions you supply for a cluster). See
+[GETTING_STARTED.md](GETTING_STARTED.md#session-auth) and
+[SECURITY.md](SECURITY.md). `beacon.session_id(ctx)` gives `init` a stable
+id for the browser session, for keying a store.
+
 Pick the constructor by the layers the app needs (the full table is in
 [GETTING_STARTED.md](GETTING_STARTED.md#three-constructors)):
 
@@ -28,6 +36,38 @@ Events go to the server, which runs `update`, re-renders and sends the
 browser what changed. With `simple` the browser also runs `update` at once,
 and the server's model wins when the two differ.
 
+<!-- docs-check: wrap
+import beacon
+import beacon/effect.{type Effect}
+import beacon/element.{type Element}
+import gleam/int
+
+pub fn main() {
+  {{block}}
+}
+
+pub type Model {
+  Model(count: Int)
+}
+
+pub type Msg {
+  Increment
+}
+
+fn init(_ctx: beacon.Context) -> Result(#(Model, Effect(Msg)), beacon.InitError) {
+  Ok(#(Model(count: 0), effect.none()))
+}
+
+fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
+  case msg {
+    Increment -> #(Model(count: model.count + 1), effect.none())
+  }
+}
+
+fn view(model: Model) -> Element(Msg) {
+  element.text(int.to_string(model.count))
+}
+-->
 ```gleam
 beacon.application(init:, update:, view:)
 |> beacon.start(8080)
@@ -39,7 +79,42 @@ With `full_application`, `update` works on a `state` that the browser never
 sees. `sync(state) -> model` runs after every update and chooses what is
 sent; secrets, tokens and bookkeeping stay in the state.
 
+<!-- docs-check: wrap
+import beacon/effect.{type Effect}
+import beacon/element.{type Element}
+import gleam/int
+
+pub type Model {
+  Model(count: Int)
+}
+
+pub type Msg {
+  Increment
+}
+
+fn init(_ctx: beacon.Context) -> Result(#(Session, Effect(Msg)), beacon.InitError) {
+  Ok(#(Session(model: Model(count: 0), api_key: "loaded on the server"), effect.none()))
+}
+
+fn update(session: Session, msg: Msg) -> #(Session, Effect(Msg)) {
+  case msg {
+    Increment -> #(
+      Session(..session, model: Model(count: session.model.count + 1)),
+      effect.none(),
+    )
+  }
+}
+
+fn view(model: Model, _local: Nil) -> Element(Msg) {
+  element.text(int.to_string(model.count))
+}
+
+{{block}}
+-->
 ```gleam
+import beacon
+import beacon/local
+
 pub type Session {
   Session(model: Model, api_key: String)
 }
@@ -48,14 +123,27 @@ fn sync(session: Session) -> Model {
   session.model
 }
 
-beacon.full_application(init:, update:, sync:, local: local.none(), view:)
-|> beacon.start(8080)
+pub fn main() {
+  beacon.full_application(init:, update:, sync:, local: local.none(), view:)
+  |> beacon.start(8080)
+}
 ```
 
-After a reconnect to a new server process, `beacon.with_state_recovery(restore:)`
-rebuilds the state: the page carries the model in its signed join token, and
-`restore(model)` returns the state. Anything that is not in the model must
-be rebuilt or reloaded by `restore`.
+### Recovering state after a reconnect
+
+When a browser reconnects and a new server process serves it (after a
+restart, or on another node), `init` runs again for it. `beacon.with_state_recovery(restore:)` replaces the state
+`init` returned: the page carries the model in its signed join token, and
+`restore(model)` returns the state. Anything that is not in the model must be
+rebuilt or reloaded by `restore`. For `simple` and `application`, where the
+state is the model, pass `function.identity`.
+
+- The token is signed with the app's secret key. Recovery after a restart or
+  on another node needs the same `beacon.secret_key` on every node (see
+  [DEPLOYMENT.md](DEPLOYMENT.md#secret-key)).
+- A token whose model does not decode is logged as a warning, and the session
+  continues with the state `init` returned.
+- Without `with_state_recovery` the session starts from `init`.
 
 ## Local State (Zero Traffic)
 
@@ -64,6 +152,60 @@ Its `update` runs in the browser for every event: `local.handled(local)`
 keeps the message in the browser (no traffic), and `local.forward(local)`
 also sends it to the server. `view` receives the model and the local state.
 
+<!-- docs-check: wrap
+import beacon
+import beacon/effect.{type Effect}
+import beacon/element.{type Element}
+import beacon/local
+import gleam/int
+
+pub type Model {
+  Model(count: Int)
+}
+
+pub type Local {
+  Local(menu_open: Bool)
+}
+
+pub type Msg {
+  Increment
+  ToggleMenu
+}
+
+fn init(_ctx: beacon.Context) -> Result(#(Model, Effect(Msg)), beacon.InitError) {
+  Ok(#(Model(count: 0), effect.none()))
+}
+
+fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
+  case msg {
+    Increment -> #(Model(count: model.count + 1), effect.none())
+    ToggleMenu -> #(model, effect.none())
+  }
+}
+
+fn sync(model: Model) -> Model {
+  model
+}
+
+fn init_local(_model: Model) -> Local {
+  Local(menu_open: False)
+}
+
+fn update_local(_model: Model, local: Local, msg: Msg) -> local.Update(Local) {
+  case msg {
+    ToggleMenu -> local.handled(Local(menu_open: !local.menu_open))
+    Increment -> local.forward(local)
+  }
+}
+
+fn view(model: Model, _local: Local) -> Element(Msg) {
+  element.text(int.to_string(model.count))
+}
+
+pub fn main() {
+  {{block}}
+}
+-->
 ```gleam
 beacon.full_application(
   init:,
@@ -83,10 +225,14 @@ ETS-backed stores visible to all connections. Auto-broadcasts via PubSub on muta
 
 ```gleam
 import beacon/store
-let s = store.new("settings")       // Create (or reuse) the store
-store.put(s, "theme", "dark")       // Set (auto-broadcasts)
-store.get(s, "theme")               // Ok("dark")
-store.delete(s, "theme")            // Remove (auto-broadcasts)
+
+pub fn theme_round_trip() -> Result(String, Nil) {
+  let s = store.new("settings")       // create (or reuse) the store
+  store.put(s, "theme", "dark")       // set (broadcasts)
+  let theme = store.get(s, "theme")   // Ok("dark")
+  store.delete(s, "theme")            // remove (broadcasts)
+  theme
+}
 ```
 
 `store.new` and `store.new_list` open a **local** store: each node has its
@@ -103,15 +249,33 @@ survives that process exiting.
 Store names are developer-chosen constants: 1-255 bytes of `[A-Za-z0-9_-]`
 (they become ETS table atoms; never derive a name from user input).
 `store.new` / `store.new_list` log and crash loudly on an invalid name; use
-`store.try_new` / `store.try_new_list` to get a typed
+`store.try_new` / `store.try_new_list` to get a
 `Result(_, store.StoreError)` instead:
 
+<!-- docs-check: wrap
+import beacon/log
+import beacon/store
+import gleam/string
+
+pub fn open_named(name: String) -> Nil {
+  {{block}}
+}
+
+fn use_store(s: store.Store(String)) -> Nil {
+  store.put(s, "opened", "yes")
+}
+-->
 ```gleam
 case store.try_new(name) {
   Ok(s) -> use_store(s)
-  Error(err) -> log.error("app", state_manager.describe_ets_error(err))
+  Error(err) -> log.error("app", "store " <> name <> ": " <> string.inspect(err))
 }
 ```
+
+`store.StoreError` is an alias of a type in an internal module, so an app
+cannot name its constructors (an invalid name, a table that exists with the
+other type, or a table owner that could not create the table) without
+importing that module.
 
 A `Store` and a `ListStore` with the same name are separate tables, but they
 share the PubSub topic `"store:" <> name`.
@@ -122,13 +286,21 @@ Any number of values per key (ETS `duplicate_bag`). Good for chat messages
 and logs: appending the same value twice stores it twice, and `get_all`
 returns values in insertion order.
 
+<!-- docs-check: wrap
+import beacon/store
+
+pub fn chat(room_id: String, msg: String, a: String, b: String) -> List(String) {
+  {{block}}
+  history
+}
+-->
 ```gleam
 let msgs = store.new_list("messages")
-store.append(msgs, "room1", msg)           // Add value
-store.get_all(msgs, "room1")               // All values for key, oldest first
-store.append_many(msgs, "room1", [a, b])   // Bulk insert, broadcasts once
-store.delete_all(msgs, "room1")            // Remove all for key
-store.append_notify(msgs, room_id, msg, "room:")  // Also broadcasts to "room:{room_id}"
+store.append(msgs, "room1", msg)                  // add a value
+let history = store.get_all(msgs, "room1")        // all values for the key, oldest first
+store.append_many(msgs, "room1", [a, b])          // bulk insert, broadcasts once
+store.delete_all(msgs, "room1")                   // remove every value for the key
+store.append_notify(msgs, room_id, msg, "room:")  // also broadcasts to "room:" <> room_id
 ```
 
 ### Reacting to Store Changes
@@ -136,8 +308,41 @@ store.append_notify(msgs, room_id, msg, "room:")  // Also broadcasts to "room:{r
 Mutations broadcast `Nil` on the store's topic. Subscribe to it with
 `beacon.subscriptions` and re-read the store in the handler:
 
+<!-- docs-check: wrap
+import beacon
+import beacon/effect.{type Effect}
+import beacon/element.{type Element}
+import beacon/store
+import gleam/int
+
+pub type Model {
+  Model(message_count: Int)
+}
+
+pub type Msg {
+  MessagesChanged
+}
+
+fn init(_ctx: beacon.Context) -> Result(#(Model, Effect(Msg)), beacon.InitError) {
+  Ok(#(Model(message_count: 0), effect.none()))
+}
+
+fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
+  case msg {
+    MessagesChanged -> #(model, effect.none())
+  }
+}
+
+fn view(model: Model) -> Element(Msg) {
+  element.text(int.to_string(model.message_count))
+}
+
+pub fn main() {
+  {{block}}
+}
+-->
 ```gleam
-let messages = store.new_list("messages")
+let messages: store.ListStore(String) = store.new_list("messages")
 
 beacon.application(init:, update:, view:)
 |> beacon.subscriptions(fn(_model) { [store.list_topic(messages)] })
@@ -158,15 +363,21 @@ the `Replicated` mode. Every other call (`get`, `put`, `append`,
 ```gleam
 import beacon/store
 import beacon/store/replicated
+import gleam/result
 
-let assert Ok(settings) =
-  store.open("settings", store.Replicated(replicated.default_config()))
-store.put(settings, "theme", "dark")   // applied here, then replicated
+pub fn open_shared() -> Result(store.ListStore(String), store.OpenError) {
+  use settings <- result.try(
+    store.open("settings", store.Replicated(replicated.default_config())),
+  )
+  store.put(settings, "theme", "dark")   // applied here, then replicated
 
-let assert Ok(chat) =
-  store.open_list("chat", store.Replicated(
-    replicated.Config(..replicated.default_config(), max_entries: 50_000),
-  ))
+  store.open_list(
+    "chat",
+    store.Replicated(
+      replicated.Config(..replicated.default_config(), max_entries: 50_000),
+    ),
+  )
+}
 ```
 
 - **Opt-in.** `Local` is the default mode, and `store.new` / `new_list`
@@ -206,9 +417,12 @@ for what a cluster needs and what happens during a netsplit.
 
 ```gleam
 import beacon/pubsub
-pubsub.subscribe("chat:lobby")
-pubsub.broadcast("chat:lobby", Nil)
-pubsub.unsubscribe("chat:lobby")
+
+pub fn lobby() -> Nil {
+  pubsub.subscribe("chat:lobby")
+  pubsub.broadcast("chat:lobby", Nil)
+  pubsub.unsubscribe("chat:lobby")
+}
 ```
 
 ## Dynamic Subscriptions
@@ -217,6 +431,37 @@ pubsub.unsubscribe("chat:lobby")
 topics from its state after every update. Beacon diffs the list against the
 previous one and subscribes or unsubscribes as needed.
 
+<!-- docs-check: wrap
+import beacon
+import beacon/effect.{type Effect}
+import beacon/element.{type Element}
+
+pub type Model {
+  Model(current_room: String)
+}
+
+pub type Msg {
+  RoomUpdated(String)
+}
+
+fn init(_ctx: beacon.Context) -> Result(#(Model, Effect(Msg)), beacon.InitError) {
+  Ok(#(Model(current_room: "lobby"), effect.none()))
+}
+
+fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
+  case msg {
+    RoomUpdated(_topic) -> #(model, effect.none())
+  }
+}
+
+fn view(model: Model) -> Element(Msg) {
+  element.text(model.current_room)
+}
+
+pub fn main() {
+  {{block}}
+}
+-->
 ```gleam
 beacon.application(init:, update:, view:)
 |> beacon.subscriptions(fn(model) { ["room:" <> model.current_room] })
@@ -251,8 +496,15 @@ the store in a function and call it from every route: creation is
 idempotent, so every call returns the same store. Subscribe to
 `store.topic(shared.cart())` to react to changes:
 
+<!-- docs-check: module shared -->
 ```gleam
-pub fn cart() { store.new("cart") }  // in shared.gleam
+// shared.gleam
+import beacon/store
+
+pub fn cart() -> store.Store(List(String)) {
+  store.new("cart")
+}
+
 // Route A: store.put(shared.cart(), "items", new_items)
 // Route B: store.get(shared.cart(), "items")
 ```

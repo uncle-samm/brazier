@@ -1,8 +1,8 @@
 # SVG
 
-Beacon provides SVG element and attribute helpers for rendering inline vector graphics in views. The `svg` root element automatically includes the SVG namespace (`xmlns`), so elements render correctly in the browser.
+Beacon provides SVG element and attribute helpers for rendering inline vector graphics in views. `svg.svg` adds the SVG namespace (`xmlns`) to the root element; the browser places it and every element inside it in the SVG namespace.
 
-Import with `import beacon/svg`.
+Import with `import beacon/svg`. `beacon/svg` is a client module, so `view` may use it.
 
 ## Element Functions
 
@@ -72,18 +72,21 @@ Import with `import beacon/svg`.
 | `stroke_opacity` | `stroke-opacity` |
 | `fill_rule` | `fill-rule` |
 | `clip_rule` | `clip-rule` |
-| `attribute` | any (generic escape hatch) |
+
+Other attributes, such as `class` or one with no helper, come from
+`beacon/attribute`; they work on SVG elements as on HTML ones.
 
 ## Example
 
 Render a simple triangle icon:
 
 ```gleam
-import beacon/html
+import beacon/attribute
+import beacon/element.{type Element}
 import beacon/svg
 
-fn icon_triangle() {
-  svg.svg([html.class("w-6 h-6"), svg.viewbox("0 0 24 24")], [
+pub fn icon_triangle() -> Element(msg) {
+  svg.svg([attribute.class("w-6 h-6"), svg.viewbox("0 0 24 24")], [
     svg.path([
       svg.d("M12 2L22 22H2Z"),
       svg.fill("none"),
@@ -95,4 +98,4 @@ fn icon_triangle() {
 }
 ```
 
-Use `svg.attribute(name, value)` for any SVG attribute not covered by the built-in helpers.
+Use `attribute.attribute(name, value)` for any SVG attribute not covered by the built-in helpers, for example `attribute.attribute("preserveAspectRatio", "none")`.

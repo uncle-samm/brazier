@@ -11,18 +11,28 @@ SKIP_DOCKER_BUILD="${BEACON_CDP_SKIP_DOCKER_BUILD:-0}"
 PREBUILD_EXAMPLES="${BEACON_CDP_PREBUILD_EXAMPLES:-0}"
 SERVER_TIMEOUT="${BEACON_CDP_SERVER_TIMEOUT:-90}"
 
+# Prints the host CPU count, or exits non-zero when it cannot be read. There
+# is no guessed default: set BEACON_CDP_PARALLEL on a host without nproc or
+# sysctl hw.ncpu.
 cpu_count() {
   if command -v nproc >/dev/null 2>&1; then
     nproc
   elif command -v sysctl >/dev/null 2>&1; then
-    sysctl -n hw.ncpu 2>/dev/null || echo 2
+    sysctl -n hw.ncpu
   else
-    echo 2
+    echo "cannot read the CPU count (no nproc or sysctl); set BEACON_CDP_PARALLEL" >&2
+    exit 1
   fi
 }
 
 default_parallel() {
   cpu="$(cpu_count)"
+  case "$cpu" in
+    ''|*[!0-9]*)
+      echo "CPU count '$cpu' is not an integer; set BEACON_CDP_PARALLEL" >&2
+      exit 1
+      ;;
+  esac
   half=$((cpu / 2))
   if [ "$half" -lt 1 ]; then half=1; fi
   if [ "$half" -gt "$SHARD_COUNT" ]; then half="$SHARD_COUNT"; fi
@@ -69,7 +79,13 @@ if [ "$SHARD_COUNT" -lt 1 ]; then
   exit 1
 fi
 
-PARALLEL="${BEACON_CDP_PARALLEL:-$(default_parallel)}"
+# Assign in two steps: a plain assignment from $(...) carries the
+# substitution's exit status, so set -e stops here if default_parallel fails.
+if [ -n "${BEACON_CDP_PARALLEL:-}" ]; then
+  PARALLEL="$BEACON_CDP_PARALLEL"
+else
+  PARALLEL="$(default_parallel)"
+fi
 
 case "$PARALLEL" in
   ''|*[!0-9]*)

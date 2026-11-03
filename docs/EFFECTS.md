@@ -10,22 +10,57 @@ on the server, so an effect may use stores, PubSub, HTTP, the environment,
 randomness and any other BEAM-only code.
 
 ```gleam
+import beacon
+import beacon/effect.{type Effect}
+import beacon/element.{type Element}
+import beacon/event
+import beacon/html
+import gleam/list
+
+pub type Model {
+  Model(loading: Bool, items: List(String))
+}
+
+pub type Msg {
+  ItemsLoaded(List(String))
+  Save(String)
+}
+
 fn init(_ctx: beacon.Context) -> Result(#(Model, Effect(Msg)), beacon.InitError) {
-  Ok(#(Model(loading: True, items: []), effect.background(fn(dispatch) {
-    dispatch(ItemsLoaded(load_items()))
-  })))
+  Ok(#(
+    Model(loading: True, items: []),
+    effect.background(fn(dispatch) { dispatch(ItemsLoaded(load_items())) }),
+  ))
 }
 
 fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
   case msg {
     ItemsLoaded(items) -> #(Model(loading: False, items:), effect.none())
-    Save(item) -> #(model, effect.from(fn(_dispatch) { db.save(item) }))
+    Save(item) -> #(model, effect.from(fn(_dispatch) { save_item(item) }))
   }
+}
+
+fn view(model: Model) -> Element(Msg) {
+  html.ul(
+    [],
+    list.map(model.items, fn(item) {
+      html.li([event.on_click(Save(item))], [html.text(item)])
+    }),
+  )
 }
 
 pub fn main() {
   beacon.application(init:, update:, view:)
   |> beacon.start(8080)
+}
+
+// The app's own database calls.
+fn load_items() -> List(String) {
+  ["first", "second"]
+}
+
+fn save_item(_item: String) -> Nil {
+  Nil
 }
 ```
 
@@ -60,6 +95,17 @@ new model is sent to the browser.
 
 **`effect.keyed(key, effect)`** -- Tag an effect with a stable key. Messages from an older generation of the same key are dropped by the runtime. For spawned effects (`background`, `every`, `after`) the key is also single-flight: performing a keyed spawned effect first stops the process previously started under that key. Re-keying a timer therefore replaces it and never consumes an extra timer slot:
 
+<!-- docs-check: wrap
+import beacon/effect.{type Effect}
+
+pub type Msg {
+  Poll
+}
+
+pub fn poller() -> Effect(Msg) {
+  {{block}}
+}
+-->
 ```gleam
 // Restarting the poller on every filter change keeps exactly one timer.
 effect.keyed("poll", effect.every(5000, fn() { Poll }))
@@ -94,8 +140,24 @@ Effects that spawn their own processes inside `effect.from` are not tracked; use
 All three take same-origin paths only (`/` but not `//`). Any other value is
 logged as an error and not sent.
 
+<!-- docs-check: wrap
+import beacon/effect.{type Effect}
+import beacon/router
+
+pub type Model {
+  Model
+}
+
+pub type Msg {
+  LoggedIn
+  LoggedOut
+  Refresh
+}
+
+{{block}}
+-->
 ```gleam
-fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
+pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
   case msg {
     LoggedIn -> #(model, router.push("/dashboard"))
     LoggedOut -> #(model, router.redirect("/login"))

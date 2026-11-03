@@ -1,4 +1,4 @@
-.PHONY: build test browser-canonical browser-canonical-desktop browser-canonical-mobile browser-all browser-all-desktop browser-all-mobile browser-all-shard browser-all-docker-shards push tag publish release
+.PHONY: build test browser-canonical browser-canonical-desktop browser-canonical-mobile browser-all browser-all-desktop browser-all-mobile browser-all-shard browser-all-docker-shards push tag publish publish-dry-run release
 
 build:
 	gleam build
@@ -31,12 +31,16 @@ browser-all-docker-shards:
 	sh scripts/run_cdp_shards_docker.sh
 
 push:
-	sh scripts/push.sh
+	bash scripts/push.sh
 
 tag:
-	sh scripts/tag.sh
+	bash scripts/tag.sh
 
 publish:
-	/usr/bin/expect scripts/publish.sh
+	bash scripts/publish.sh
 
-release: push tag publish
+publish-dry-run:
+	bash scripts/publish.sh --dry-run
+
+# The dry run gates the release before anything is pushed or tagged.
+release: publish-dry-run push tag publish

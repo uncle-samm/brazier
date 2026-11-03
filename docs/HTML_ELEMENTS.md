@@ -2,6 +2,7 @@
 
 A view is built from four modules, following Lustre's layout:
 
+<!-- docs-check: fragment an import list; each module is used by the samples below -->
 ```gleam
 import beacon/attribute
 import beacon/element.{type Element}
@@ -46,6 +47,29 @@ Elements take `(attributes: List(Attribute(msg)), children: List(Element(msg)))`
 | `element.unsafe_raw_html(html)` | Inserts HTML without escaping or the URL policy |
 | `element.to_string(element)` | Renders to an HTML string |
 
+<!-- docs-check: wrap
+import beacon/element.{type Element}
+import beacon/html
+
+pub type Item {
+  Item(id: String, title: String)
+}
+
+pub type Model {
+  Model(show_details: Bool, details: String, items: List(Item), email: String)
+}
+
+pub type Msg {
+  Search(String)
+  PointerMoved(x: Float, y: Float)
+  SetEmail(String)
+  Submitted(List(#(String, String)))
+}
+
+pub fn details(model: Model) -> Element(Msg) {
+  {{block}}
+}
+-->
 ```gleam
 case model.show_details {
   True -> html.p([], [html.text(model.details)])
@@ -56,6 +80,30 @@ case model.show_details {
 Key list items whose order can change, so focus and input state stay with
 the right item:
 
+<!-- docs-check: wrap
+import beacon/element.{type Element}
+import beacon/html
+import gleam/list
+
+pub type Item {
+  Item(id: String, title: String)
+}
+
+pub type Model {
+  Model(show_details: Bool, details: String, items: List(Item), email: String)
+}
+
+pub type Msg {
+  Search(String)
+  PointerMoved(x: Float, y: Float)
+  SetEmail(String)
+  Submitted(List(#(String, String)))
+}
+
+pub fn item_list(model: Model) -> Element(Msg) {
+  {{block}}
+}
+-->
 ```gleam
 html.ul([], list.map(model.items, fn(item) {
   element.keyed(item.id, html.li([], [html.text(item.title)]))
@@ -135,6 +183,30 @@ object with a `gleam/dynamic/decode` decoder, as Lustre does. The decoder runs
 in the browser; a decode failure is logged with `console.warn` and the event
 is dropped.
 
+<!-- docs-check: wrap
+import beacon/attribute
+import beacon/event
+import gleam/dynamic/decode
+
+pub type Item {
+  Item(id: String, title: String)
+}
+
+pub type Model {
+  Model(show_details: Bool, details: String, items: List(Item), email: String)
+}
+
+pub type Msg {
+  Search(String)
+  PointerMoved(x: Float, y: Float)
+  SetEmail(String)
+  Submitted(List(#(String, String)))
+}
+
+pub fn on_pointer_move(_model: Model) -> attribute.Attribute(Msg) {
+  {{block}}
+}
+-->
 ```gleam
 event.on("pointermove", {
   use #(x, y) <- decode.then(event.mouse_position())
@@ -154,6 +226,30 @@ Payload decoders: `event.value()`, `event.checked()`, `event.key()`,
 | `event.debounce(handler, ms)` | Dispatches the latest event once it has stopped firing for `ms` |
 | `event.throttle(handler, ms)` | Dispatches at most one event every `ms` |
 
+<!-- docs-check: wrap
+import beacon/element.{type Element}
+import beacon/event
+import beacon/html
+
+pub type Item {
+  Item(id: String, title: String)
+}
+
+pub type Model {
+  Model(show_details: Bool, details: String, items: List(Item), email: String)
+}
+
+pub type Msg {
+  Search(String)
+  PointerMoved(x: Float, y: Float)
+  SetEmail(String)
+  Submitted(List(#(String, String)))
+}
+
+pub fn search_box(_model: Model) -> Element(Msg) {
+  {{block}}
+}
+-->
 ```gleam
 html.input([event.on_input(Search) |> event.debounce(300)])
 ```
@@ -164,6 +260,29 @@ browser; any other message is refused by the server. See
 
 ## Example: Login Form
 
+<!-- docs-check: wrap
+import beacon/attribute
+import beacon/element.{type Element}
+import beacon/event
+import beacon/html
+
+pub type Item {
+  Item(id: String, title: String)
+}
+
+pub type Model {
+  Model(show_details: Bool, details: String, items: List(Item), email: String)
+}
+
+pub type Msg {
+  Search(String)
+  PointerMoved(x: Float, y: Float)
+  SetEmail(String)
+  Submitted(List(#(String, String)))
+}
+
+{{block}}
+-->
 ```gleam
 pub fn view(model: Model) -> Element(Msg) {
   html.form([event.on_submit(Submitted)], [
