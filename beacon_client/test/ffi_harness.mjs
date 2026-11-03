@@ -442,6 +442,9 @@ function makeApp(spec = {}) {
   return app;
 }
 
+const TEST_BUILD = "0123456789abcdef";
+const TEST_BUNDLE_URL = "http://localhost/beacon_client_" + TEST_BUILD + ".js";
+
 function freshGlobals(options = {}) {
   timers = [];
   sockets = [];
@@ -482,6 +485,10 @@ function freshGlobals(options = {}) {
   globalThis.document = {
     readyState: "complete",
     activeElement: null,
+    // The script being evaluated: the bundle the server rendered, unless a
+    // scenario loads it from another URL (scriptSrc) or from no script
+    // (scriptSrc: null).
+    currentScript: options.scriptSrc === null ? null : { src: options.scriptSrc ?? TEST_BUNDLE_URL },
     querySelector: (selector) => (selector === "#beacon-app" ? (options.noRoot ? null : root) : root.querySelector(selector)),
     addEventListener(name, fn, opt) {
       documentListeners.push({ name, fn, capture: opt === true || (typeof opt === "object" && opt.capture === true) });
@@ -490,6 +497,7 @@ function freshGlobals(options = {}) {
   };
   globalThis.window = {
     location: globalThis.location,
+    __BEACON_ENABLE_TEST_HOOKS: options.testHooks === true,
     addEventListener(name, fn) {
       windowListeners.push({ name, fn });
     },
@@ -542,6 +550,26 @@ function scenario(name, fn) {
 }
 
 // --- startup ---
+scenario("the outbound test hook reports the queue and a scheduled send, only when enabled", async () => {
+  await loadRuntime();
+  assert.equal(globalThis.window.__beaconOutboundPendingForTest, undefined, "no hook without __BEACON_ENABLE_TEST_HOOKS");
+  const runtime = await loadRuntime({ testHooks: true });
+  const pending = globalThis.window.__beaconOutboundPendingForTest;
+  const s = sockets[0];
+  s.open();
+  // Before the first model_sync, events wait in the queue.
+  for (let i = 1; i <= 3; i++) runtime.ws_send(JSON.stringify(event(i)));
+  assert.deepEqual(pending(), { queued: 3, scheduled: false });
+  sync(s, 0, {});
+  assert.deepEqual(pending(), { queued: 0, scheduled: false });
+  // Over the budget, the rest waits for a scheduled paced send.
+  for (let i = 4; i < 4 + 45; i++) runtime.ws_send(JSON.stringify(event(i)));
+  const owed = pending();
+  assert.ok(owed.queued > 0 && owed.scheduled === true, JSON.stringify(owed));
+  advance(2000);
+  assert.deepEqual(pending(), { queued: 0, scheduled: false });
+});
+
 scenario("a bundle without a complete generated app is reported and never connects", async () => {
   const runtime = await loadModule();
   runtime.start(undefined);
@@ -569,7 +597,7 @@ scenario("the socket URL carries the page path, on reconnect too", async () => {
   await loadRuntime({ path: "/items/3?q=a b" });
   assert.equal(sockets[0].url, "ws://localhost/ws?path=%2Fitems%2F3%3Fq%3Da%20b");
   sockets[0].open();
-  assert.deepEqual(sockets[0].sent[0].msg, { type: "join", token: "", path: "/items/3?q=a b" });
+  assert.deepEqual(sockets[0].sent[0].msg, { type: "join", token: "", path: "/items/3?q=a b", build: TEST_BUILD });
   sync(sockets[0], 0, {});
   sockets[0].deliver({ type: "navigate", path: "/other" });
   sockets[0].serverClose(1006);
@@ -577,7 +605,51 @@ scenario("the socket URL carries the page path, on reconnect too", async () => {
   assert.equal(sockets[1].url, "ws://localhost/ws?path=%2Fother");
 });
 
+scenario("the join carries the build id of the bundle URL, on reconnect too", async () => {
+  await loadRuntime({ scriptSrc: "https://cdn.example/assets/beacon_client_ABCDEF0123456789.js?v=1" });
+  assert.equal(logsMatching("warn", "carries no build id").length, 0);
+  sockets[0].open();
+  assert.equal(sockets[0].sent[0].msg.build, "ABCDEF0123456789");
+  sockets[0].serverClose(1006);
+  advance(reconnectDelay());
+  sockets[1].open();
+  assert.equal(sockets[1].sent[0].msg.build, "ABCDEF0123456789");
+});
+
+scenario("a bundle loaded from /beacon_client.js or no script joins without a build and warns once", async () => {
+  for (const scriptSrc of ["http://localhost/beacon_client.js", null]) {
+    await loadRuntime({ scriptSrc });
+    assert.equal(logsMatching("warn", "carries no build id").length, 1, String(scriptSrc));
+    sockets[0].open();
+    assert.deepEqual(sockets[0].sent[0].msg, { type: "join", token: "", path: "/" });
+    sockets[0].serverClose(1006);
+    advance(reconnectDelay());
+    sockets[1].open();
+    assert.equal("build" in sockets[1].sent[0].msg, false);
+    assert.equal(logsMatching("warn", "carries no build id").length, 1, "warned once, not per join");
+  }
+});
+
 // --- close codes ---
+scenario("4409 (stale build) reloads behind the reload guard", async () => {
+  const storage = new FakeStorage();
+  for (let i = 0; i < 3; i++) {
+    await loadRuntime({ storage, now: 2_000_000 + i * 1000 });
+    sockets[0].open();
+    sockets[0].serverClose(4409);
+    assert.equal(reloads, 1, `stale build ${i + 1} reloads`);
+    assert.equal(pendingTimeouts().length, 0, "no reconnect scheduled");
+  }
+  await loadRuntime({ storage, now: 2_003_000, ssr: "<p>stale</p>" });
+  sockets[0].open();
+  sockets[0].serverClose(4409);
+  assert.equal(reloads, 0, "the fourth stale build within 60s does not reload");
+  assert.ok(root.hasAttribute("data-beacon-error"));
+  assert.equal(errorsMatching("close 4409").length, 1);
+  advance(120000);
+  assert.equal(sockets.length, 1, "never reconnects");
+});
+
 scenario("4401 stops reconnecting, logs an error and reloads", async () => {
   await loadRuntime();
   const s = sockets[0];

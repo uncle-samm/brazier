@@ -17,6 +17,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import {
   applyOps,
+  buildIdFromScriptSrc,
   classifyModelSync,
   classifyPatch,
   closeAction,
@@ -30,6 +31,7 @@ import {
   splitEventBatch,
   CLIENT_SEND_BUDGET,
   CLIENT_SEND_WINDOW_MS,
+  CLOSE_STALE_BUILD,
   SERVER_MAX_BATCH_SIZE,
   SERVER_MAX_EVENTS_PER_SECOND,
   MAX_RELOADS,
@@ -104,7 +106,7 @@ check("closeAction rejects a code that is not an integer", () => {
   assert.throws(() => closeAction(4401.5));
 });
 check("4400 to 4499 reload the page", () => {
-  for (const code of [4400, 4401, 4403, 4404, 4499]) {
+  for (const code of [4400, 4401, 4403, 4404, CLOSE_STALE_BUILD, 4499]) {
     assert.equal(closeAction(code), "reload", String(code));
   }
 });
@@ -112,6 +114,37 @@ check("every other close code reconnects, 4500 to 4599 and 1011 included", () =>
   for (const code of [1000, 1001, 1002, 1003, 1006, 1007, 1008, 1009, 1011, 1013, 4000, 4399, 4500, 4503, 4599]) {
     assert.equal(closeAction(code), "reconnect", String(code));
   }
+});
+
+// --- build id ---
+check("buildIdFromScriptSrc rejects a src that is not a string", () => {
+  assert.throws(() => buildIdFromScriptSrc(42), /must be a string/);
+  assert.throws(() => buildIdFromScriptSrc({}), /must be a string/);
+});
+check("buildIdFromScriptSrc is null for any URL but a hashed bundle", () => {
+  for (const src of [
+    null,
+    undefined,
+    "",
+    "http://localhost/beacon_client.js",
+    "http://localhost/beacon_client_.js",
+    "http://localhost/beacon_client_0123456.js",
+    "http://localhost/beacon_client_" + "a".repeat(65) + ".js",
+    "http://localhost/beacon_client_0123456g.js",
+    "http://localhost/beacon_client_01234567.mjs",
+    "http://localhost/beacon_client_01234567.js/",
+    "http://localhost/other_beacon_client_01234567.js",
+    "http://localhost/x.js?beacon_client_01234567.js",
+    "http://localhost/x.js#/beacon_client_01234567.js",
+  ]) {
+    assert.equal(buildIdFromScriptSrc(src), null, String(src));
+  }
+});
+check("buildIdFromScriptSrc returns the hash of /beacon_client_<hash>.js", () => {
+  assert.equal(buildIdFromScriptSrc("http://localhost/beacon_client_01234567.js"), "01234567");
+  assert.equal(buildIdFromScriptSrc("https://cdn.example/a/b/beacon_client_ABCdef0123456789.js?v=2#x"), "ABCdef0123456789");
+  const longest = "f".repeat(64);
+  assert.equal(buildIdFromScriptSrc("/beacon_client_" + longest + ".js"), longest);
 });
 
 // --- reload guard ---

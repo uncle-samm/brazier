@@ -674,10 +674,17 @@ pub fn encode_server_message(msg: ServerMessage) -> String {
   }
 }
 
-/// Build a decoder for ClientMessage JSON.
+/// A decoded client message and, for a `join`, the build id it carries:
+/// the hash of the client bundle its page loaded (`beacon_client_<hash>.js`),
+/// `None` when the join names none. Only the transport reads the build id,
+/// so it is not part of `ClientJoin`.
+type ClientFrame =
+  #(ClientMessage, Option(String))
+
+/// Build a decoder for client message JSON.
 /// Uses the "type" field to determine which variant to decode.
 /// Follows Lustre's transport.server_message_decoder() pattern.
-fn client_message_decoder() -> decode.Decoder(ClientMessage) {
+fn client_frame_decoder() -> decode.Decoder(ClientFrame) {
   use msg_type <- decode.field("type", decode.string)
   case msg_type {
     "event" -> {
@@ -687,26 +694,34 @@ fn client_message_decoder() -> decode.Decoder(ClientMessage) {
       use target_path <- decode.field("target_path", decode.string)
       use clock <- decode.optional_field("clock", 0, decode.int)
       use ops <- decode.optional_field("ops", "", decode.string)
-      decode.success(ClientEvent(
-        name: name,
-        handler_id: handler_id,
-        data: data,
-        target_path: target_path,
-        clock: clock,
-        ops: ops,
+      decode.success(#(
+        ClientEvent(
+          name: name,
+          handler_id: handler_id,
+          data: data,
+          target_path: target_path,
+          clock: clock,
+          ops: ops,
+        ),
+        None,
       ))
     }
-    "heartbeat" -> decode.success(ClientHeartbeat)
+    "heartbeat" -> decode.success(#(ClientHeartbeat, None))
     "join" -> {
       use token <- decode.optional_field("token", "", decode.string)
       use path <- decode.optional_field("path", "/", decode.string)
-      decode.success(ClientJoin(token: token, path: path))
+      use build <- decode.optional_field(
+        "build",
+        None,
+        decode.map(decode.string, Some),
+      )
+      decode.success(#(ClientJoin(token: token, path: path), build))
     }
     "navigate" -> {
       use path <- decode.field("path", decode.string)
-      decode.success(ClientNavigate(path: path))
+      decode.success(#(ClientNavigate(path: path), None))
     }
-    "request_sync" -> decode.success(ClientRequestSync)
+    "request_sync" -> decode.success(#(ClientRequestSync, None))
     "event_batch" -> {
       // Decode array of events — each follows the "event" format
       let event_decoder = {
@@ -730,9 +745,9 @@ fn client_message_decoder() -> decode.Decoder(ClientMessage) {
         ))
       }
       use events <- decode.field("events", decode.list(event_decoder))
-      decode.success(ClientEventBatch(events: events))
+      decode.success(#(ClientEventBatch(events: events), None))
     }
-    _unknown -> decode.failure(ClientHeartbeat, "ClientMessage type")
+    _unknown -> decode.failure(#(ClientHeartbeat, None), "ClientMessage type")
   }
 }
 
@@ -740,10 +755,15 @@ fn client_message_decoder() -> decode.Decoder(ClientMessage) {
 pub fn decode_client_message(
   raw: String,
 ) -> Result(ClientMessage, error.BeaconError) {
-  case json.parse(raw, client_message_decoder()) {
-    Ok(msg) -> {
+  decode_client_frame(raw) |> result.map(fn(frame) { frame.0 })
+}
+
+/// Decode a JSON string from the client into a message and its build id.
+fn decode_client_frame(raw: String) -> Result(ClientFrame, error.BeaconError) {
+  case json.parse(raw, client_frame_decoder()) {
+    Ok(frame) -> {
       log.debug("beacon.transport", "Decoded client message")
-      Ok(msg)
+      Ok(frame)
     }
     Error(_json_err) -> {
       log.warning("beacon.transport", "Failed to decode client message")
@@ -1033,8 +1053,8 @@ fn handle_ws_text(state: ConnectionState, text: String) -> Next {
 /// Decode and dispatch a text message, applying heartbeat and event rate
 /// limits (each event of a batch counts) and decode error accounting.
 fn handle_ws_text_decode(state: ConnectionState, text: String) -> Next {
-  case decode_client_message(text) {
-    Ok(ClientHeartbeat) -> {
+  case decode_client_frame(text) {
+    Ok(#(ClientHeartbeat, _)) -> {
       let #(new_state, hb_limited) = check_heartbeat_rate(state)
       case hb_limited {
         True ->
@@ -1050,7 +1070,7 @@ fn handle_ws_text_decode(state: ConnectionState, text: String) -> Next {
         }
       }
     }
-    Ok(ClientEventBatch(events) as msg) -> {
+    Ok(#(ClientEventBatch(events) as msg, _)) -> {
       let batch_len = list.length(events)
       case batch_len > max_batch_size {
         True ->
@@ -1067,8 +1087,106 @@ fn handle_ws_text_decode(state: ConnectionState, text: String) -> Next {
         False -> dispatch_rate_limited(state, msg, int.max(batch_len, 1))
       }
     }
-    Ok(msg) -> dispatch_rate_limited(state, msg, 1)
+    Ok(#(ClientJoin(..) as msg, build)) -> {
+      use new_state <- admit_rate_limited(state, msg, 1)
+      case check_build(new_state, build) {
+        Ok(Nil) -> deliver(new_state, msg)
+        Error(stop) -> stop
+      }
+    }
+    Ok(#(msg, _)) -> dispatch_rate_limited(state, msg, 1)
     Error(_codec_error) -> record_decode_error(state, string.byte_size(text))
+  }
+}
+
+/// Refuse a join whose page runs an older client build; see
+/// `check_join_build`.
+fn check_build(
+  state: ConnectionState,
+  build: Option(String),
+) -> Result(Nil, Next) {
+  case check_join_build(ssr.client_assets_dir(), ctx(state), build) {
+    Ok(Nil) -> Ok(Nil)
+    Error(#(code, reason)) ->
+      Error(Stop(state, SendClose(code, reason), reason))
+  }
+}
+
+/// Check the build id a `join` carries against the client bundle the
+/// server serves now: the one `beacon_client.manifest` in `assets_dir`
+/// names, as the server-rendered page does. The manifest is read on every
+/// join, never cached, because `beacon/dev` rebuilds the bundle into a
+/// running server.
+///
+/// - The page's bundle is the current one: `Ok(Nil)`.
+/// - It is another one (the app was rebuilt since the page loaded):
+///   `Error(#(4409, "stale build"))`. The client reloads behind its reload
+///   guard and gets the new bundle, so it never decodes a model with a
+///   codec of another build.
+/// - The manifest cannot be read, or names no bundle that exists:
+///   `Error(#(1011, "internal error"))`, logged as an error. This is a
+///   broken deployment, so the join is not let through unchecked.
+/// - The join has no build id (its page loaded the client from the
+///   unversioned `/beacon_client.js`, or by some other URL): it cannot be
+///   checked. `Ok(Nil)`, logged as a warning on every such join.
+///
+/// `conn` names the connection in the log lines.
+/// Reference: Phoenix LiveView's `phx-track-static`. The client sends the
+/// URLs of the tracked assets its page loaded with the join, the server
+/// compares them with its current digests, and an outdated page is told to
+/// reload, with a counter in the client that stops a reload loop.
+pub fn check_join_build(
+  assets_dir: String,
+  conn: String,
+  build: Option(String),
+) -> Result(Nil, #(Int, String)) {
+  case build {
+    None -> {
+      log.warning(
+        "beacon.transport",
+        "Join from "
+          <> conn
+          <> " carries no build id: its page did not load the client from "
+          <> "/beacon_client_<hash>.js, so a page from an older build is not detected",
+      )
+      Ok(Nil)
+    }
+    Some(page_build) ->
+      case ssr.client_bundle_name(assets_dir) {
+        Error(reason) -> {
+          log.error(
+            "beacon.transport",
+            "Cannot check the build of the join from "
+              <> conn
+              <> ", closing with 1011: "
+              <> reason,
+          )
+          Error(#(ws.close_internal_error, "internal error"))
+        }
+        Ok(bundle) ->
+          case bundle == "beacon_client_" <> page_build <> ".js" {
+            True -> {
+              log.debug(
+                "beacon.transport",
+                "Join from " <> conn <> " is on the current build " <> bundle,
+              )
+              Ok(Nil)
+            }
+            False -> {
+              log.info(
+                "beacon.transport",
+                "Join from "
+                  <> conn
+                  <> " is from build "
+                  <> string.inspect(string.slice(page_build, 0, 64))
+                  <> ", the server serves "
+                  <> bundle
+                  <> ": closing with 4409 so the page reloads",
+              )
+              Error(#(ws.close_stale_build, "stale build"))
+            }
+          }
+      }
   }
 }
 
@@ -1077,6 +1195,28 @@ fn dispatch_rate_limited(
   state: ConnectionState,
   msg: ClientMessage,
   cost: Int,
+) -> Next {
+  use new_state <- admit_rate_limited(state, msg, cost)
+  deliver(new_state, msg)
+}
+
+/// Hand a message that passed every check to the runtime.
+fn deliver(state: ConnectionState, msg: ClientMessage) -> Next {
+  log.debug(
+    "beacon.transport",
+    "Event from " <> state.id <> ": " <> client_message_type(msg),
+  )
+  state.on_event(state.id, msg)
+  Continue(state)
+}
+
+/// Charge `cost` events against the rate limit: a message over it is a rate
+/// violation, one within it continues with `next`.
+fn admit_rate_limited(
+  state: ConnectionState,
+  msg: ClientMessage,
+  cost: Int,
+  next: fn(ConnectionState) -> Next,
 ) -> Next {
   let #(new_state, rate_limited) = check_rate_limit(state, cost)
   case rate_limited {
@@ -1093,14 +1233,7 @@ fn dispatch_rate_limited(
           <> " already this second)",
         Some("Rate limited"),
       )
-    False -> {
-      log.debug(
-        "beacon.transport",
-        "Event from " <> new_state.id <> ": " <> client_message_type(msg),
-      )
-      new_state.on_event(new_state.id, msg)
-      Continue(new_state)
-    }
+    False -> next(new_state)
   }
 }
 

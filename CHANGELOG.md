@@ -99,6 +99,15 @@ with its own changelog, so they are not listed here.
   in the docs. It also compiles every Gleam sample in them with zero
   warnings, except samples marked as fragments.
 - (WS10) `make publish-dry-run`, and a release gate in `scripts/publish.sh`.
+- (WS10b) A build-id handshake. The client's `join` carries the content hash
+  of the bundle its page loaded (`build`). A server that serves another
+  bundle closes with 4409 `stale build`, and the client reloads behind its
+  reload guard, so a page left open across a deploy never decodes a model
+  with the codec of another build. An unreadable client manifest at join
+  closes with 1011. A join without a build is let through with a warning.
+- (WS10b) `window.__beaconOutboundPendingForTest()` behind
+  `__BEACON_ENABLE_TEST_HOOKS`: the client's queued and scheduled sends, for
+  browser tests that wait on the client instead of a quiet period.
 
 ### Changed
 

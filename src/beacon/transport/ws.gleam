@@ -55,6 +55,12 @@ pub const close_try_again_later = 1013
 /// Clients must not blindly reconnect on this code; they must re-authenticate.
 pub const close_auth_revoked = 4401
 
+/// 4409: application code — the page's client bundle is not the one the
+/// server serves now (the app was rebuilt since the page loaded), so its
+/// model codec may not match the server's. The client reloads the page, as
+/// for every code from 4400 to 4499.
+pub const close_stale_build = 4409
+
 /// Maximum close reason length: control payload limit 125 minus the code.
 const max_close_reason_bytes = 123
 
