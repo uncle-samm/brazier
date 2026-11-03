@@ -13,6 +13,8 @@
 %%   {{ip, Ip}, N}                     live connections per peer IP
 %%   {{pid, Pid}, Ip, CountedPerIp}    slot owned by a handler pid
 %%   {port, Port}                      bound listen port (survives acceptor restarts)
+%%   {listen_socket, Socket}           the listen socket, published by its owner
+%%                                     beacon_http_listen_socket for the acceptors
 %% Slot removal uses ets:take/2 so a concurrent early release and 'EXIT'
 %% can never double-decrement.
 %%
@@ -23,8 +25,8 @@
 %%
 %% DRAIN. When this process terminates in an orderly way (its listener is
 %% stopped, or restarted because an earlier child of the application tree
-%% restarted), the acceptors have already stopped: the listen socket is
-%% closed and no connection is added. terminate/2 then sends every handler
+%% restarted), the acceptors have already stopped and the listen socket
+%% owner has closed the socket: no connection is added. terminate/2 then sends every handler
 %% {beacon_http_drain, self()} instead of an exit signal, and each handler
 %% finishes what it is doing (drain_requested/0, mark_draining/0):
 %%   * a WebSocket sends close 1001 (going away) and exits;
@@ -48,7 +50,7 @@
     start_connection/2, release_self/0, release_pid/2,
     drain_requested/0, mark_draining/0, is_drain_message/1, owner/0, owner_if_any/0,
     count_self/0, count/1, count_for_ip/2, count_for_ip_text/2, children/1,
-    get_port/1, set_port/2, forget_port/1
+    get_port/1, set_listen_socket/3, listen_socket/1, forget_port/1
 ]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 -export([connection_init/3]).
@@ -80,7 +82,11 @@ start_connection(Conns, Ip) ->
     gen_server:call(Conns, {start_connection, Ip}).
 
 get_port(Conns) -> gen_server:call(Conns, get_port).
-set_port(Conns, Port) -> gen_server:call(Conns, {set_port, Port}).
+%% Called by beacon_http_listen_socket once it has bound: records the bound
+%% port (reused by every later bind of this listener) and the socket.
+set_listen_socket(Conns, Socket, Port) -> gen_server:call(Conns, {set_listen_socket, Socket, Port}).
+%% The current listen socket, for the acceptors. {ok, Socket} | {error, no_listen_socket}.
+listen_socket(Conns) -> gen_server:call(Conns, listen_socket).
 count(Conns) -> gen_server:call(Conns, count).
 count_for_ip(Conns, Ip) -> gen_server:call(Conns, {count_for_ip, Ip}).
 children(Conns) -> gen_server:call(Conns, children).
@@ -259,14 +265,21 @@ handle_call({start_connection, Ip}, _From, State) ->
     end;
 handle_call(get_port, _From, State = #{tid := Tid}) ->
     {reply, ets:lookup_element(Tid, port, 2), State};
-handle_call({set_port, Port}, _From, State = #{tid := Tid}) when is_integer(Port), Port > 0 ->
-    true = ets:insert(Tid, {port, Port}),
+handle_call({set_listen_socket, Socket, Port}, _From, State = #{tid := Tid})
+        when is_integer(Port), Port > 0 ->
+    true = ets:insert(Tid, [{port, Port}, {listen_socket, Socket}]),
     Key = {?MODULE, bound_port, self_name()},
     case persistent_term:get(Key, undefined) of
         Port -> ok;
         _ -> persistent_term:put(Key, Port)
     end,
     {reply, ok, State};
+handle_call(listen_socket, _From, State = #{tid := Tid}) ->
+    Reply = case ets:lookup(Tid, listen_socket) of
+        [{listen_socket, Socket}] -> {ok, Socket};
+        [] -> {error, no_listen_socket}
+    end,
+    {reply, Reply, State};
 handle_call(count, _From, State = #{tid := Tid}) ->
     {reply, global_count(Tid), State};
 handle_call({count_for_ip, Ip}, _From, State = #{tid := Tid}) ->

@@ -132,6 +132,14 @@ with its own changelog, so they are not listed here.
 - (WS10) The release scripts are strict bash. `run_canonical_cdp.sh` is now
   `run_all_cdp.sh --canonical`.
 
+### Fixed
+
+- (WS10b) A listener restarted under load could fail to bind its port with
+  `eaddrinuse` and use up the restart tolerance of the application tree. The
+  listen socket now has an owner process of its own
+  (`beacon_http_listen_socket`), which closes it synchronously before it
+  exits. The acceptors no longer own it.
+
 ### Removed
 
 - (WS7) The legacy modules and their tests: `state`, `substate`, `diff`,
