@@ -291,6 +291,13 @@ the echo.
   A batch with more than 100 events is rejected with `Batch too large`, so a
   batch larger than `max_events_per_second` can never be accepted. Clients
   should cap batches at `max_events_per_second`.
+- The limit is not sent to the client. Like Phoenix channels, Beacon does
+  not advertise it: it is there for clients that do not pace themselves, and
+  an advertised number would not slow those down. The generated client paces
+  itself at 40 events per second against the default of 50 (see
+  [Client Connection Behaviour](#client-connection-behaviour)). A lower
+  `max_events_per_second` is allowed, and the listener logs a warning at
+  start, since a burst from an honest client is then rate limited.
 - Heartbeats are limited to 2 per second. Extra heartbeats are not acked and
   count as violations.
 - Each rejected message is one rate violation. More than

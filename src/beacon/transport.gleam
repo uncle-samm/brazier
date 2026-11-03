@@ -136,8 +136,8 @@ pub type InternalMessage {
 
 /// Configurable security limits for the transport layer.
 /// All fields have sensible defaults via `default_security_limits()`.
-/// `validate_security_limits` rejects nonsensical values; the WebSocket
-/// upgrade path refuses to run with invalid limits.
+/// `validate_security_limits` rejects nonsensical values; the listener
+/// refuses to start with invalid limits.
 pub type SecurityLimits {
   SecurityLimits(
     /// Maximum WebSocket message size in bytes. Default: 65536 (64KB).
@@ -3197,6 +3197,16 @@ pub fn supervised(
   }
 }
 
+/// The event rate the Beacon client paces itself for: it sends at most
+/// `CLIENT_SEND_BUDGET` (40) events per second so jitter cannot push a
+/// server window over this (`SERVER_MAX_EVENTS_PER_SECOND` in
+/// `beacon_client/patch.mjs`). The server does not advertise its
+/// `max_events_per_second`: the limit is there for clients that do not
+/// pace themselves, which an advertisement would not slow down, and
+/// LiveView and Phoenix channels advertise no rate limit either. A lower
+/// limit is allowed (a deployment may want it) and logged at start.
+const client_paced_events_per_second = 50
+
 /// Validate the configuration and build the per-connection handler.
 fn prepare_listener(
   config: TransportConfig,
@@ -3214,6 +3224,23 @@ fn prepare_listener(
           <> "Set ws_auth in TransportConfig to require authentication on upgrade.",
       )
     Some(_) -> Nil
+  }
+  case
+    config.security_limits.max_events_per_second
+    < client_paced_events_per_second
+  {
+    True ->
+      log.warning(
+        "beacon.transport",
+        "max_events_per_second is "
+          <> int.to_string(config.security_limits.max_events_per_second)
+          <> ", below the "
+          <> int.to_string(client_paced_events_per_second)
+          <> " the Beacon client paces itself for: a burst of events from an "
+          <> "honest client will be rate limited, and repeated bursts close "
+          <> "the socket with 1008",
+      )
+    False -> Nil
   }
   let static_check = case config.static_config {
     Some(static_cfg) -> static.validate_config(static_cfg)

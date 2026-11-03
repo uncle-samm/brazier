@@ -168,7 +168,7 @@ entry with a path, or one that does not parse, refuses to start.
 
 ## Rate Limiting
 
-**Per-connection (server-side, transport layer):** Each WebSocket connection counts events per 1-second window. An event over `max_events_per_second` (default 50) is dropped and answered with `{"type":"error","reason":"Rate limited"}`; heartbeats have their own limit of 2 per second. Repeated violations close the socket with 1008. See [WIRE_PROTOCOL.md](WIRE_PROTOCOL.md#rate-limiting-and-abuse).
+**Per-connection (server-side, transport layer):** Each WebSocket connection counts events per 1-second window. An event over `max_events_per_second` (default 50) is dropped and answered with `{"type":"error","reason":"Rate limited"}`; heartbeats have their own limit of 2 per second. Repeated violations close the socket with 1008. The limit is not advertised to the client; the generated client paces itself at 40 per second, and a `max_events_per_second` below 50 is logged as a warning when the listener starts. See [WIRE_PROTOCOL.md](WIRE_PROTOCOL.md#rate-limiting-and-abuse).
 
 **HTTP middleware:** The `middleware.rate_limit(limiter)` middleware returns HTTP 429 (with `Retry-After` set to the window length) when a client exceeds the configured request rate. It keys on the socket peer address and ignores `X-Forwarded-For` / `Forwarded`, so a client cannot get a fresh budget by inventing addresses. Behind a reverse proxy use `middleware.rate_limit_behind_proxies(limiter, trusted)` (see Trusted Proxies). A request whose peer address cannot be read gets 400.
 

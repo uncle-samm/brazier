@@ -9,7 +9,7 @@
 //// sleeps.
 
 import beacon/app_config_fixture
-import beacon/application.{type App}
+import beacon/application
 import beacon/cluster/log_capture
 import beacon/cluster/peer.{Timeout}
 import beacon/effect

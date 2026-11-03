@@ -144,6 +144,9 @@ with its own changelog, so they are not listed here.
   first upgrade started outside any supervisor. With it go the
   `local_port_unavailable` upgrade outcome and `ws.get_ip_slot_count`; tests
   read `server.get_ws_connection_count_for_ip`.
+- (WS10b) A `max_events_per_second` below 50, the rate the generated client
+  paces itself for, is logged as a warning when the listener starts. The
+  limit is still not advertised to the client, as in Phoenix channels.
 
 ### Fixed
 
