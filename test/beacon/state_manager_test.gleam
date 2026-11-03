@@ -3,13 +3,16 @@ import gleam/erlang/process
 import gleam/int
 
 pub fn start_test() {
-  let assert Ok(_manager) = state_manager.start_in_memory()
+  let assert Ok(manager) = state_manager.start_in_memory()
+  let assert 0 = state_manager.count(manager, 1000)
 }
+
+// No sleeps: `put` and `delete` are casts and `get`/`count` are calls, all
+// from this process, so the actor handles them in the order they were sent.
 
 pub fn put_and_get_test() {
   let assert Ok(manager) = state_manager.start_in_memory()
   state_manager.put(manager, "session_1", 42)
-  process.sleep(20)
   let assert Ok(42) = state_manager.get(manager, "session_1", 1000)
 }
 
@@ -21,10 +24,12 @@ pub fn get_nonexistent_test() {
 pub fn delete_test() {
   let assert Ok(manager) = state_manager.start_in_memory()
   state_manager.put(manager, "session_1", "data")
-  process.sleep(20)
+  state_manager.put(manager, "session_2", "kept")
   state_manager.delete(manager, "session_1")
-  process.sleep(20)
   let assert Error(Nil) = state_manager.get(manager, "session_1", 1000)
+  // Delete removes only its own session.
+  let assert Ok("kept") = state_manager.get(manager, "session_2", 1000)
+  let assert 1 = state_manager.count(manager, 1000)
 }
 
 pub fn count_test() {
@@ -32,16 +37,13 @@ pub fn count_test() {
   let assert 0 = state_manager.count(manager, 1000)
   state_manager.put(manager, "s1", "a")
   state_manager.put(manager, "s2", "b")
-  process.sleep(20)
   let assert 2 = state_manager.count(manager, 1000)
 }
 
 pub fn overwrite_test() {
   let assert Ok(manager) = state_manager.start_in_memory()
   state_manager.put(manager, "session_1", "old")
-  process.sleep(20)
   state_manager.put(manager, "session_1", "new")
-  process.sleep(20)
   let assert Ok("new") = state_manager.get(manager, "session_1", 1000)
   let assert 1 = state_manager.count(manager, 1000)
 }
@@ -51,7 +53,6 @@ pub fn multiple_sessions_test() {
   state_manager.put(manager, "s1", 100)
   state_manager.put(manager, "s2", 200)
   state_manager.put(manager, "s3", 300)
-  process.sleep(20)
   let assert Ok(100) = state_manager.get(manager, "s1", 1000)
   let assert Ok(200) = state_manager.get(manager, "s2", 1000)
   let assert Ok(300) = state_manager.get(manager, "s3", 1000)
@@ -60,7 +61,8 @@ pub fn multiple_sessions_test() {
 // --- ETS State Manager Tests ---
 
 pub fn ets_start_test() {
-  let _manager = state_manager.start_ets("beacon_test_ets_" <> unique_id())
+  let manager = state_manager.start_ets("beacon_test_ets_" <> unique_id())
+  let assert 0 = state_manager.ets_count(manager)
 }
 
 pub fn ets_start_twice_reuses_table_test() {

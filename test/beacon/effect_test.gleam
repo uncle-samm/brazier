@@ -1,3 +1,4 @@
+import beacon/await
 import beacon/effect
 import gleam/erlang/process
 import gleam/list
@@ -70,19 +71,23 @@ pub fn background_runs_in_separate_process_test() {
 
 pub fn background_does_not_block_test() {
   let subject = process.new_subject()
+  let gates = process.new_subject()
   let eff =
     effect.background(fn(dispatch) {
-      // Simulate slow work
-      process.sleep(50)
+      // The work cannot finish until the test opens the gate, which it only
+      // does after `perform` has returned. A blocking `perform` would never
+      // return, and the gate's deadline would fail the worker instead.
+      let gate = process.new_subject()
+      process.send(gates, gate)
+      let assert Ok(Nil) = process.receive(gate, await.deadline_ms)
       dispatch(99)
     })
   perform(eff, fn(n) { process.send(subject, n) })
-  // Should return immediately (not blocked by the 50ms sleep)
-  // Wait for the background process to finish
-  let selector =
-    process.new_selector()
-    |> process.select(subject)
-  let assert Ok(99) = process.selector_receive(selector, 1000)
+  // `perform` has returned while the work is still waiting on its gate.
+  let assert Ok(gate) = process.receive(gates, await.deadline_ms)
+  let assert Error(Nil) = process.receive(subject, 0)
+  process.send(gate, Nil)
+  let assert Ok(99) = process.receive(subject, await.deadline_ms)
 }
 
 pub fn background_is_not_none_test() {
@@ -158,9 +163,9 @@ pub fn every_self_heals_after_timers_die_test() {
     )
   let assert Error(Nil) = process.receive(blocked_subject, 150)
 
-  // Kill the fillers and let the scheduler mark them dead.
+  // Kill the fillers and wait on monitors until each one is dead.
   list.each(filler_pids, process.kill)
-  process.sleep(20)
+  list.each(filler_pids, await.expect_down(_, "filler timer"))
 
   // A new timer must now start: dead timers are pruned, freeing slots. Under
   // the old monotonic counter this stayed blocked forever and never ticked.
@@ -190,10 +195,15 @@ pub fn keyed_effect_dispatches_through_keyed_channel_test() {
 
 pub fn cancellable_effect_emits_no_message_after_cancel_test() {
   let subject = process.new_subject()
+  let started = process.new_subject()
   let #(eff, cancel_token) =
     effect.cancellable(
       effect.background(fn(dispatch) {
-        process.sleep(50)
+        // Dispatches only if it is ever let through its gate; cancel must
+        // kill it first.
+        let gate = process.new_subject()
+        process.send(started, #(process.self(), gate))
+        let assert Ok(Nil) = process.receive(gate, await.deadline_ms)
         dispatch(99)
       }),
     )
@@ -203,8 +213,13 @@ pub fn cancellable_effect_emits_no_message_after_cancel_test() {
       False -> Nil
     }
   })
+  let assert Ok(#(worker, gate)) = process.receive(started, await.deadline_ms)
   perform(effect.cancel(cancel_token), fn(_) { Nil })
-  let assert Error(Nil) = process.receive(subject, 200)
+  await.expect_down(worker, "cancelled background worker")
+  // Opening the gate now reaches nobody: the worker died before it could
+  // dispatch, so nothing was or will be sent.
+  process.send(gate, Nil)
+  let assert Error(Nil) = process.receive(subject, 0)
 }
 
 // --- Mutable ref helpers using process dictionary ---

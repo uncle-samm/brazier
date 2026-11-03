@@ -21,8 +21,9 @@ fn effect_guardian(worker: Pid) -> Result(Pid, Nil)
 @external(erlang, "beacon_effect_test_ffi", "pg_members")
 fn pg_members(topic: String) -> List(Pid)
 
-/// Wait on pg's group monitor until the topic is empty; returns the
-/// members still present at the deadline.
+/// Wait, on a debug hook in the owning registry partition, until the
+/// topic's dead subscribers are removed; returns the members still present
+/// at the deadline.
 @external(erlang, "beacon_effect_test_ffi", "await_pg_empty")
 fn await_pg_empty(topic: String, timeout_ms: Int) -> List(Pid)
 
