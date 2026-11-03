@@ -954,6 +954,43 @@ scenario("each event renders before it returns, so the next one runs current han
   assert.deepEqual(early.msgs(), [{ add: "eggs" }]);
 });
 
+scenario("an element that gains autofocus in a render is focused, once", async () => {
+  // Browsers honour autofocus only at page load, so the client focuses it.
+  const view = (_model, local) => ({
+    html:
+      '<button data-beacon-on-click="0">go</button>' +
+      (local.stage >= 1 ? '<div data-board="" tabindex="0" autofocus=""></div>' : "") +
+      (local.stage >= 2 ? '<input name="later">' : "") +
+      '<input name="name"' + (local.stage >= 3 ? ' autofocus=""' : "") + ">",
+    handlers: [{ name: "click", id: "0", decode: () => ok({ next: true }) }],
+  });
+  const updateLocal = (_model, local, msg) => (msg.next ? [{ ...local, stage: local.stage + 1 }, false] : [local, true]);
+  await loadRuntime({ view, updateLocal, initLocal: () => ({ stage: 0 }) });
+  const s = sockets[0];
+  s.open();
+  sync(s, 0, {});
+  assert.equal(root.querySelector("[autofocus]"), null);
+
+  // An inserted element with autofocus takes focus.
+  const button = el('[data-beacon-on-click="0"]');
+  document.activeElement = button;
+  fire(button, "click");
+  assert.equal(document.activeElement, el("[data-board]"), "the inserted board is focused");
+
+  // Unhappy path: an element that already had autofocus is not refocused.
+  const other = el('[name="name"]');
+  document.activeElement = other;
+  fire(button, "click");
+  assert.ok(el('[name="later"]'), "the render ran");
+  assert.equal(document.activeElement, other, "an unchanged autofocus leaves focus alone");
+
+  // An existing element that gains the attribute takes focus.
+  document.activeElement = button;
+  fire(button, "click");
+  assert.equal(document.activeElement, el('[name="name"]'), "the element that gained autofocus is focused");
+  assert.deepEqual(s.msgs(), [], "Local handled every click");
+});
+
 // --- pre-hydration events ---
 scenario("events before the first model_sync are snapshotted and replayed", async () => {
   const view = (model) => ({

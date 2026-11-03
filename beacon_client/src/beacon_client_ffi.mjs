@@ -1104,10 +1104,37 @@ function morphInnerHTML(container, html) {
 
   const t = document.createElement("template");
   t.innerHTML = html;
+  autofocusQueue = [];
   morphChildren(container, t.content);
   syncHooks(container);
   trace("morph", { childCount: container.childNodes.length });
 
+  restoreReplacedFocus(container, focused, focusedTag, focusedName, focusedValue, selStart, selEnd, locked);
+  focusAutofocused(container);
+}
+
+// Elements that gained `autofocus` during the current morph, in document
+// order. Browsers honour the attribute only while the page loads, so the
+// client focuses the element itself, as Lustre's reconciler does.
+let autofocusQueue = [];
+
+function queueAutofocus(node) {
+  if (node.nodeType !== 1) return;
+  if (node.hasAttribute("autofocus")) autofocusQueue.push(node);
+  for (const el of node.querySelectorAll("[autofocus]")) autofocusQueue.push(el);
+}
+
+// The last element to gain `autofocus` wins, as when several are focused in
+// turn.
+function focusAutofocused(container) {
+  const target = autofocusQueue[autofocusQueue.length - 1];
+  autofocusQueue = [];
+  if (!target || !container.contains(target)) return;
+  target.focus();
+  trace("morph.autofocus", { node: describeNode(target) });
+}
+
+function restoreReplacedFocus(container, focused, focusedTag, focusedName, focusedValue, selStart, selEnd, locked) {
   if (focusedTag !== "INPUT" && focusedTag !== "TEXTAREA" && focusedTag !== "SELECT") return;
   if (container.contains(focused) || !focusedName) return;
   // The focused control was replaced: focus its successor by name.
@@ -1128,7 +1155,7 @@ function morphInnerHTML(container, html) {
 function morphChildren(op, np) {
   let oc = op.firstChild, nc = np.firstChild;
   while (nc) {
-    if (!oc) { op.appendChild(nc.cloneNode(true)); trace("morph.append", { key: nodeKey(nc) }); nc = nc.nextSibling; continue; }
+    if (!oc) { queueAutofocus(op.appendChild(nc.cloneNode(true))); trace("morph.append", { key: nodeKey(nc) }); nc = nc.nextSibling; continue; }
     if (sameNode(oc, nc)) { morphNode(oc, nc); oc = oc.nextSibling; nc = nc.nextSibling; continue; }
     const m = findMatch(oc.nextSibling, nc);
     if (m) {
@@ -1145,7 +1172,7 @@ function morphChildren(op, np) {
       nc = nc.nextSibling;
       continue;
     }
-    op.insertBefore(nc.cloneNode(true), oc); trace("morph.insert", { key: nodeKey(nc) }); nc = nc.nextSibling;
+    queueAutofocus(op.insertBefore(nc.cloneNode(true), oc)); trace("morph.insert", { key: nodeKey(nc) }); nc = nc.nextSibling;
   }
   while (oc) { const nx = oc.nextSibling; unmountSubtree(oc); op.removeChild(oc); trace("morph.remove", { key: nodeKey(oc) }); oc = nx; }
 }
@@ -1203,6 +1230,7 @@ function formControlValuesDiffer(o, n) {
 }
 
 function morphAttributes(o, n) {
+  if (!o.hasAttribute("autofocus") && n.hasAttribute("autofocus")) autofocusQueue.push(o);
   for (let i = o.attributes.length - 1; i >= 0; i--) if (!n.hasAttribute(o.attributes[i].name)) o.removeAttribute(o.attributes[i].name);
   for (let i = 0; i < n.attributes.length; i++) { const nm = n.attributes[i].name, v = n.attributes[i].value; if (o.getAttribute(nm) !== v) o.setAttribute(nm, v); }
 }
