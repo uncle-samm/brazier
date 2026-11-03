@@ -150,6 +150,12 @@ with its own changelog, so they are not listed here.
   was missing or unparseable. It now applies the listener's framing rule:
   400 for a repeated or non-decimal length, 501 for `Transfer-Encoding`, 413
   over the limit.
+- (WS10b) A response to a request whose body the handler left unread was
+  held back until the server had discarded that body, so an early refusal
+  such as a 413 waited for a body the client never sent, up to the body read
+  timeout. The response is now written first, and a leftover of at most
+  64 KiB is discarded after it so the connection can be reused (the order
+  cowboy and Bandit use).
 - (WS10b) `/health` answered every method. Methods other than GET and HEAD
   get 405 with `allow: GET, HEAD`, and the answer is `cache-control:
   no-store`.
@@ -170,6 +176,9 @@ with its own changelog, so they are not listed here.
   `read_request_with_limits` with their FFI, the dead
   `beacon_middleware_ffi.erl`, and the `data-beacon-auto` attribute on the
   default page, which nothing read.
+- (WS10b) The per-upgrade check of the security limits, which the listener
+  already validates when it starts, and with it the `invalid_limits`
+  WebSocket upgrade outcome.
 
 ### Security
 

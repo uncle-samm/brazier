@@ -2086,20 +2086,11 @@ fn handle_ws_request(
   config: TransportConfig,
 ) -> UpgradeOutcome {
   let conn_id = generate_connection_id()
-  let limits = config.security_limits
-  case validate_security_limits(limits), ws_client_ip(socket, req, limits) {
-    Error(reason), _ ->
-      reject_ws_request(
-        "invalid_limits",
-        socket,
-        conn_id,
-        "unknown",
-        None,
-        500,
-        "Server misconfigured",
-        "invalid security limits: " <> reason,
-      )
-    Ok(Nil), Error(reason) -> {
+  // The limits were validated once, when the listener started
+  // (`prepare_listener` refuses to build a handler otherwise), and this
+  // function is reachable only through that handler.
+  case ws_client_ip(socket, req, config.security_limits) {
+    Error(reason) -> {
       // The peer is already gone: nobody to answer.
       log.warning(
         "beacon.transport",
@@ -2109,8 +2100,7 @@ fn handle_ws_request(
       release_connection_slot("peer gone before upgrade")
       Refused("peer_gone")
     }
-    Ok(Nil), Ok(peer_ip) ->
-      admit_ws_request(socket, req, config, conn_id, peer_ip)
+    Ok(peer_ip) -> admit_ws_request(socket, req, config, conn_id, peer_ip)
   }
 }
 
@@ -2731,7 +2721,9 @@ fn serve_http_request(
     True -> 0
     False -> max_discard_body_bytes
   }
-  let body = transport_http.finish_body(socket, discard_limit)
+  // Classified without reading: the response goes out first, and a small
+  // leftover body is discarded only after it (see `check_body`).
+  let body = transport_http.check_body(socket, discard_limit)
   case result {
     Error(_) -> {
       // run_handler already logged the crash with its stacktrace.
@@ -2745,7 +2737,7 @@ fn serve_http_request(
             "Failed to write 500 after handler crash: " <> reason,
           )
       }
-      transport_http.close_gracefully(socket)
+      close_after_response(socket, body)
     }
     Ok(resp) -> {
       let served = served + 1
@@ -2761,12 +2753,32 @@ fn serve_http_request(
         }
         Ok(Nil) ->
           case keep_alive {
-            True -> serve_requests(socket, config, handler, served)
-            False -> transport_http.close_gracefully(socket)
+            True ->
+              case transport_http.finish_body(socket, body) {
+                transport_http.BodyConsumed ->
+                  serve_requests(socket, config, handler, served)
+                // finish_body logged why the leftover could not be read.
+                transport_http.BodyDiscardable(_)
+                | transport_http.BodyUnread(_)
+                | transport_http.BodyFailed ->
+                  transport_http.close_gracefully(socket)
+              }
+            False -> close_after_response(socket, body)
           }
       }
     }
   }
+}
+
+/// End a connection whose response has been written: the body context is
+/// closed without reading the leftover, which `close_gracefully` drains
+/// until the peer closes or its linger bound is reached.
+fn close_after_response(
+  socket: Socket,
+  body: transport_http.BodyOutcome,
+) -> Nil {
+  transport_http.abandon_body(socket, body)
+  transport_http.close_gracefully(socket)
 }
 
 fn write_response_for(
@@ -2820,7 +2832,11 @@ fn decide_keep_alive(
       )
       False
     }
-    _, _, transport_http.BodyConsumed, True -> {
+    // A discardable leftover is read after the response (`finish_body`); it
+    // does not stop reuse unless that read fails.
+    _, _, transport_http.BodyConsumed, True
+    | _, _, transport_http.BodyDiscardable(_), True
+    -> {
       log.info(
         "beacon.transport",
         "Closing connection after "
@@ -2829,7 +2845,9 @@ fn decide_keep_alive(
       )
       False
     }
-    True, False, transport_http.BodyConsumed, False ->
+    True, False, transport_http.BodyConsumed, False
+    | True, False, transport_http.BodyDiscardable(_), False
+    ->
       case drain_requested() {
         True -> {
           log.info(

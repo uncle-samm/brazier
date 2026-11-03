@@ -420,30 +420,52 @@ pub fn begin_body(
 pub type BodyOutcome {
   /// The body was fully read (or empty): the connection can be reused.
   BodyConsumed
-  /// Bytes of the body were left unread.
+  /// Bytes of the body were left unread, few enough to read and drop after
+  /// the response so the connection can be reused (`finish_body`).
+  BodyDiscardable(remaining: Int)
+  /// More bytes of the body were left unread than are worth discarding.
   BodyUnread(remaining: Int)
   /// A body read failed; the connection position is unknown.
   BodyFailed
 }
 
-/// Finish the current request's body context, discarding up to
-/// `max_discard_bytes` of unread body so the connection can be reused
-/// (cowboy does the same). Larger leftovers are reported as unread.
-pub fn finish_body(
+/// Classify the current request's body after the handler ran, without
+/// reading from the socket: a leftover of at most `max_discard_bytes` is
+/// `BodyDiscardable`, a larger one `BodyUnread`.
+///
+/// The response is written before any leftover is discarded, so a refusal
+/// such as an early 413 is not held back until the body arrives or the
+/// read times out. Cowboy (`cowboy_http` skips the rest of the body after
+/// the stream has answered) and Bandit (`ensure_completed` after the
+/// response) order it the same way.
+pub fn check_body(
   socket: server.Socket,
   max_discard_bytes: Int,
 ) -> BodyOutcome {
-  let outcome = case ffi_body_state(socket) {
+  case ffi_body_state(socket) {
     Error(Nil) -> {
       log.error(
         "beacon.http",
-        "finish_body called without an active request body context",
+        "check_body called without an active request body context",
       )
       BodyFailed
     }
     Ok(#(_, True)) -> BodyFailed
     Ok(#(0, False)) -> BodyConsumed
     Ok(#(remaining, False)) if remaining <= max_discard_bytes ->
+      BodyDiscardable(remaining)
+    Ok(#(remaining, False)) -> BodyUnread(remaining)
+  }
+}
+
+/// End the current request's body context. A `BodyDiscardable` leftover is
+/// read and dropped first, bounded by the per-read timeout and the request
+/// deadline given to `begin_body`; a peer that closes ends the read at
+/// once. Returns `BodyConsumed` when the connection can serve another
+/// request. Called after the response was written.
+pub fn finish_body(socket: server.Socket, outcome: BodyOutcome) -> BodyOutcome {
+  let finished = case outcome {
+    BodyDiscardable(remaining) ->
       case server.read_body(socket, remaining) {
         Ok(_) -> {
           log.debug(
@@ -460,10 +482,25 @@ pub fn finish_body(
           BodyFailed
         }
       }
-    Ok(#(remaining, False)) -> BodyUnread(remaining)
+    BodyConsumed | BodyUnread(_) | BodyFailed -> outcome
   }
   ffi_body_end(socket)
-  outcome
+  finished
+}
+
+/// End the current request's body context without reading the leftover,
+/// because the connection is closing; `close_gracefully` drains what the
+/// peer still sends.
+pub fn abandon_body(socket: server.Socket, outcome: BodyOutcome) -> Nil {
+  let left = case outcome {
+    BodyDiscardable(remaining) | BodyUnread(remaining) -> remaining
+    BodyConsumed | BodyFailed -> 0
+  }
+  log.debug(
+    "beacon.http",
+    "Closing with " <> int.to_string(left) <> " request body bytes unread",
+  )
+  ffi_body_end(socket)
 }
 
 /// Read the request body.

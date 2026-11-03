@@ -1,6 +1,7 @@
 /// Built-in HTTP routes over a real listener: static files served with
 /// sendfile (body, ETag, HEAD, misses, non-regular files) and the /health
 /// endpoint's method handling.
+import beacon/middleware
 import beacon/static
 import beacon/transport
 import beacon/transport/server.{type Socket}
@@ -29,6 +30,13 @@ fn cleanup(dir: String) -> Nil {
 }
 
 fn start(dir: String) -> server.Listener {
+  start_with(dir, [])
+}
+
+fn start_with(
+  dir: String,
+  middlewares: List(middleware.Middleware),
+) -> server.Listener {
   let cfg =
     static.StaticConfig(directory: dir, prefix: "/static", max_age: 3600)
   let assert Ok(listener) =
@@ -38,7 +46,7 @@ fn start(dir: String) -> server.Listener {
       on_event: fn(_id, _msg) { Nil },
       on_disconnect: fn(_id) { Nil },
       page_html: None,
-      middlewares: [],
+      middlewares: middlewares,
       static_config: Some(cfg),
       runtime_factory: None,
       ws_auth: None,
@@ -147,6 +155,46 @@ pub fn static_fifo_is_not_opened_test() {
   let listener = start(dir)
   let resp = request(listener, "GET", "/static/pipe.txt", "")
   let assert 404 = resp.0
+  server.stop(listener)
+  cleanup(dir)
+}
+
+// --- Refusals before the body ---
+
+pub fn refusal_is_not_held_back_by_the_unsent_body_test() {
+  // Regression: the server discarded the unread body before writing the
+  // response, so a refusal waited for a body the client never sent, up to
+  // the body read timeout (30 s by default). Only the head is sent here,
+  // and the 413 must arrive within 1 s.
+  let dir = temp_dir("early_refusal")
+  let listener = start_with(dir, [middleware.body_parser(10)])
+  let assert Ok(socket) = raw_connect(server.get_port(listener))
+    as "test client must connect"
+  let head =
+    "POST /upload HTTP/1.1\r\nHost: test\r\nContent-Length: 5000\r\n\r\n"
+  let assert Ok(Nil) = raw_send(socket, <<head:utf8>>) as "send must succeed"
+  let assert Ok(#(413, _, _)) = raw_recv_response(socket, 1000, True)
+  raw_close(socket)
+  server.stop(listener)
+  cleanup(dir)
+}
+
+pub fn small_leftover_body_is_discarded_after_the_response_test() {
+  // The response goes out first; a leftover within the discard bound is
+  // read afterwards, so the connection still serves the next request.
+  let dir = temp_dir("leftover")
+  let assert Ok(Nil) = simplifile.write(dir <> "/a.txt", "a")
+  let listener = start(dir)
+  let assert Ok(socket) = raw_connect(server.get_port(listener))
+    as "test client must connect"
+  let first =
+    "GET /static/a.txt HTTP/1.1\r\nHost: test\r\nContent-Length: 4\r\n\r\nxxxx"
+  let assert Ok(Nil) = raw_send(socket, <<first:utf8>>) as "send must succeed"
+  let assert Ok(#(200, _, <<"a">>)) = raw_recv_response(socket, 2000, True)
+  let second = "GET /static/a.txt HTTP/1.1\r\nHost: test\r\n\r\n"
+  let assert Ok(Nil) = raw_send(socket, <<second:utf8>>) as "send must succeed"
+  let assert Ok(#(200, _, <<"a">>)) = raw_recv_response(socket, 2000, True)
+  raw_close(socket)
   server.stop(listener)
   cleanup(dir)
 }
