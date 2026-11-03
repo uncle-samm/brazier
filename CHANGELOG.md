@@ -148,6 +148,14 @@ with its own changelog, so they are not listed here.
   to `docs/archive/`.
 - (WS10) The release scripts are strict bash. `run_canonical_cdp.sh` is now
   `run_all_cdp.sh --canonical`.
+- (WS10b) Every example's `main` crashes when `beacon.start` returns an
+  error, so `gleam run` without `gleam run -m beacon/build` first exits with
+  status 1 and names the missing artifact; before, it exited 0 in silence.
+  The examples ship an inline SVG favicon, so the browser requests no
+  `/favicon.ico`.
+- (WS10b) The examples' generated `src/beacon_codec.gleam` and
+  `priv/static/` bundles are no longer tracked; build an example before its
+  first run.
 
 ### Removed
 
@@ -182,6 +190,9 @@ with its own changelog, so they are not listed here.
 - (WS7) `javascript:` URLs are filtered from URL attributes.
 - (WS8a) Cluster peers are checked with an HMAC hello/ack. A production node
   refuses to run without secure distribution.
+- (WS10b) `examples/auth_workspace` checks its login form against a random
+  per-browser token in an HttpOnly cookie (a double-submit cookie), renewed
+  at each login, instead of a constant that protected nothing.
 
 ## Before Milestone 117 (never released)
 
