@@ -292,6 +292,8 @@ pub fn bindings_are_released_when_process_exits_test() {
   let store = session.new_store("sec_binding_release")
   let sess = session.create(store)
   let ready = process.new_subject()
+  // No application runs here: start the node-wide session scope.
+  session.ensure_registry()
   let pid =
     process.spawn(fn() {
       session.bind_current_process(store, sess.id)
@@ -414,6 +416,8 @@ fn spawn_bound_watcher(
 ) -> #(process.Subject(Nil), process.Subject(Result(#(String, String), Nil))) {
   let ready = process.new_subject()
   let result = process.new_subject()
+  // No application runs here: start the node-wide session scope.
+  session.ensure_registry()
   let _pid =
     process.spawn(fn() {
       session.bind_current_process(store, session_id)

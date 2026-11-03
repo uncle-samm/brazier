@@ -55,6 +55,7 @@
 /// Reference: Lustre `application`/`simple`, LiveView mount.
 import beacon/api
 import beacon/application
+import beacon/cluster as beacon_cluster
 import beacon/effect.{type Effect}
 import beacon/element.{type Element}
 import beacon/error
@@ -140,6 +141,8 @@ pub opaque type App(state, model, local, msg) {
     api_handler: Option(fn(api.Request) -> Option(api.Response)),
     ws_auth: Option(fn(api.Request) -> Result(Nil, String)),
     dev_mode: Bool,
+    pubsub: pubsub.PubSubConfig,
+    cluster: Option(beacon_cluster.ClusterConfig),
   )
 }
 
@@ -228,6 +231,8 @@ fn new_app(
     api_handler: None,
     ws_auth: None,
     dev_mode: False,
+    pubsub: pubsub.default_config(),
+    cluster: None,
   )
 }
 
@@ -364,6 +369,27 @@ pub fn dev_mode(
   App(..app, dev_mode: enabled)
 }
 
+/// Configure PubSub (partitions, pool size, limits). Start from
+/// `pubsub.default_config()`. PubSub runs as the first child of the
+/// application's supervision tree.
+pub fn pubsub_config(
+  app: App(state, model, local, msg),
+  config: pubsub.PubSubConfig,
+) -> App(state, model, local, msg) {
+  App(..app, pubsub: config)
+}
+
+/// Join a cluster: the cluster manager (built with `cluster.new`) runs in
+/// the application's supervision tree right after PubSub, connecting to
+/// and checking peers. Start fails when the configuration or this node's
+/// distribution does not pass `cluster`'s checks.
+pub fn cluster(
+  app: App(state, model, local, msg),
+  config: beacon_cluster.ClusterConfig,
+) -> App(state, model, local, msg) {
+  App(..app, cluster: Some(config))
+}
+
 /// Recover the session after a reconnect to a new server process: the
 /// page carries the Model in a signed join token, and `restore` rebuilds
 /// the server state from it. For `simple` and `application`, where the
@@ -399,7 +425,9 @@ pub fn notification_payload(
 
 // ===== Start =====
 
-/// Start the app on `port` and block forever.
+/// Start the app on `port` under its supervision tree and block forever.
+/// If the tree gives up (a child keeps crashing), the calling process
+/// crashes with the reason instead of running on without it.
 ///
 /// The server codec and the client bundle are build artifacts of
 /// `gleam run -m beacon/build` (or `gleam run -m beacon/dev`); starting
@@ -420,7 +448,7 @@ pub fn start(
     }
     Ok(codec) -> {
       let config = to_config(app, codec, port)
-      case application.start(config) {
+      case application.start_supervised(config) {
         Ok(_app) -> {
           log.info(
             "beacon",
@@ -476,6 +504,8 @@ pub fn to_config(
     api_handler: app.api_handler,
     ws_auth: app.ws_auth,
     dev_mode: app.dev_mode,
+    pubsub: app.pubsub,
+    cluster: app.cluster,
   )
 }
 

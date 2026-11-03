@@ -31,6 +31,7 @@ import gleam/int
 import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
+import gleam/otp/supervision
 import gleam/result
 import gleam/string
 import simplifile
@@ -2813,6 +2814,45 @@ pub fn start(
 pub fn start_listener(
   config: TransportConfig,
 ) -> Result(server.Listener, error.BeaconError) {
+  use handler_fn <- result.try(prepare_listener(config))
+  case server.start(to_listener_options(config), handler_fn) {
+    Ok(listener) -> {
+      log.info(
+        "beacon.transport",
+        "Listening on port " <> int.to_string(server.get_port(listener)),
+      )
+      Ok(listener)
+    }
+    Error(reason) -> Error(bind_failed(config, reason))
+  }
+}
+
+/// A child specification that starts the listener under a supervisor (the
+/// application's root supervision tree). The configuration is checked when
+/// the specification is built, so a bad config fails before any process
+/// starts. A restarted listener binds the port of its first start again
+/// (with port 0, the port the OS assigned then).
+pub fn supervised(
+  config: TransportConfig,
+) -> Result(supervision.ChildSpecification(server.Listener), error.BeaconError) {
+  use handler_fn <- result.try(prepare_listener(config))
+  case server.supervised(to_listener_options(config), handler_fn) {
+    Ok(spec) -> {
+      log.debug(
+        "beacon.transport",
+        "Listener child specification built for port "
+          <> int.to_string(config.port),
+      )
+      Ok(spec)
+    }
+    Error(reason) -> Error(bind_failed(config, reason))
+  }
+}
+
+/// Validate the configuration and build the per-connection handler.
+fn prepare_listener(
+  config: TransportConfig,
+) -> Result(fn(Socket) -> Nil, error.BeaconError) {
   log.info(
     "beacon.transport",
     "Starting on port " <> int.to_string(config.port),
@@ -2832,41 +2872,32 @@ pub fn start_listener(
     None -> Ok(Nil)
   }
   case validate_security_limits(config.security_limits), static_check {
-    Error(reason), _ ->
+    Error(reason), _ -> {
+      log.error("beacon.transport", "Invalid security limits: " <> reason)
       Error(error.ConfigError(reason: "Invalid security limits: " <> reason))
-    _, Error(reason) ->
+    }
+    _, Error(reason) -> {
+      log.error("beacon.transport", "Invalid static config: " <> reason)
       Error(error.ConfigError(reason: "Invalid static config: " <> reason))
+    }
     Ok(Nil), Ok(Nil) -> {
       // Built once: middleware and routing closures are shared by every
       // connection instead of being rebuilt per request.
       let handler = create_handler(config)
-      let handler_fn = fn(socket: Socket) {
-        per_connection_handler(socket, config, handler)
-      }
-      case server.start(to_listener_options(config), handler_fn) {
-        Ok(listener) -> {
-          log.info(
-            "beacon.transport",
-            "Listening on port " <> int.to_string(server.get_port(listener)),
-          )
-          Ok(listener)
-        }
-        Error(reason) -> {
-          log.error(
-            "beacon.transport",
-            "Failed to start on port "
-              <> int.to_string(config.port)
-              <> ": "
-              <> reason,
-          )
-          Error(error.TransportError(
-            reason: "Failed to bind to port "
-            <> int.to_string(config.port)
-            <> ": "
-            <> reason,
-          ))
-        }
-      }
+      Ok(fn(socket: Socket) { per_connection_handler(socket, config, handler) })
     }
   }
+}
+
+fn bind_failed(config: TransportConfig, reason: String) -> error.BeaconError {
+  log.error(
+    "beacon.transport",
+    "Failed to start on port " <> int.to_string(config.port) <> ": " <> reason,
+  )
+  error.TransportError(
+    reason: "Failed to bind to port "
+    <> int.to_string(config.port)
+    <> ": "
+    <> reason,
+  )
 }

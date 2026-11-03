@@ -997,6 +997,9 @@ pub fn heartbeat_flood_closes_1008_test() {
 // --- Sessions over live sockets ---
 
 fn session_auth_server(store: session.SessionStore) -> Server {
+  // The listener runs without an application: start the node-wide session
+  // scope that ws_session_auth binds connections in.
+  session.ensure_registry()
   start_server(
     transport.SecurityLimits(..test_limits(), ws_auth_recheck_interval_ms: 100),
     Some(auth.ws_session_auth(store, auth.dev_session_config())),

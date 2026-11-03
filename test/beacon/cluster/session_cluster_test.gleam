@@ -25,6 +25,9 @@ const partial_partitions = ["-kernel", "prevent_overlapping_partitions", "false"
 
 fn start_store(p: Peer, name: String, db: Node) -> SessionStore {
   peer.on(p, fn() {
+    // No application runs on the peer: start the session scope it would
+    // own, so bindings on this node can be made and seen from here.
+    session.ensure_registry()
     let ext = backend(name, db)
     let assert Ok(store) =
       owned(fn() {

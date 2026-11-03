@@ -271,6 +271,14 @@ pub fn stop(listener: Listener) -> Nil {
     "Stopping listener on port " <> int.to_string(listener.port),
   )
   ffi_stop_supervisor(listener.supervisor)
+  release(listener)
+}
+
+/// Forget the remembered bound port of a listener that has stopped for
+/// good. A restarted listener rebinds the port it bound first (so a port-0
+/// listener keeps its port across restarts); once its parent tree has been
+/// stopped, that memory must go. `stop` calls this itself.
+pub fn release(listener: Listener) -> Nil {
   case ffi_conns_forget_port(listener.conns) {
     True ->
       log.debug(

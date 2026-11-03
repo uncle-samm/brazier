@@ -40,6 +40,14 @@
 ///   lookup finds the row past its lifetime, `"sweep"` from the sweeper.
 /// - `contention`: `"update"` when a write loses every compare-and-swap
 ///   attempt, `"rotate"` when the row changed during a rotation.
+/// - `revoked` with `"recheck"`: a node connected and the re-check found a
+///   locally bound session that no longer exists.
+///
+/// Live-connection registry: bindings live in the `beacon_session_pg` pg
+/// scope. `beacon.start` runs it in the root supervision tree
+/// (`registry_supervised`), before the HTTP listener, so a scope restart
+/// also restarts the listener and every socket binds again. Without
+/// `beacon.start`, call `ensure_registry` once before binding.
 ///
 /// Reference: OWASP Session Management Cheat Sheet; Phoenix
 /// `live_socket_id` disconnect broadcasts; Plug.Session stores.
@@ -55,6 +63,8 @@ import gleam/http/request.{type Request}
 import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
+import gleam/otp/actor
+import gleam/otp/supervision
 import gleam/result
 import gleam/string
 
@@ -264,9 +274,6 @@ pub fn start_store(
       ))
     }
   })
-  // Join the registry scope now, so the scope has synced with the other
-  // nodes before the first revocation needs their members.
-  ensure_registry()
   // The maintenance process monitors the owner (this process) and exits
   // when it dies, so its Pid does not need to be kept.
   start_maintenance(
@@ -846,6 +853,36 @@ pub fn binding_fingerprint(session_id: String) -> String {
 
 // === Live-connection binding ===
 
+/// Start the live-connection registry scope, not linked to the caller, when
+/// it is not running.
+///
+/// `beacon.start` owns the scope in its supervision tree; call this only to
+/// bind sessions without it (`application.start`, tests, embedding). A
+/// supervised start fails when the scope already runs unsupervised.
+pub fn ensure_registry() -> Nil {
+  ffi_ensure_registry()
+}
+
+/// A child specification that starts the registry scope linked to a
+/// supervisor. The root supervision tree uses it. Starting fails when the
+/// scope already runs (for example after `ensure_registry`).
+pub fn registry_supervised() -> supervision.ChildSpecification(Nil) {
+  supervision.worker(fn() {
+    case start_registry_link() {
+      Ok(pid) -> Ok(actor.Started(pid: pid, data: Nil))
+      Error(reason) -> {
+        log.error(module_name, "Session registry did not start: " <> reason)
+        Error(actor.InitFailed(reason))
+      }
+    }
+  })
+}
+
+/// Whether the registry scope is running on this node.
+pub fn registry_running() -> Bool {
+  ffi_registry_running()
+}
+
 /// Bind the calling process (a WebSocket handler) to a session.
 ///
 /// When the session is deleted, rotated, or expires (on any connected
@@ -1217,7 +1254,13 @@ fn ffi_binding_fingerprint(session_id: String) -> String
 fn constant_time_equal(a: String, b: String) -> Bool
 
 @external(erlang, "beacon_session_ffi", "ensure_registry")
-fn ensure_registry() -> Nil
+fn ffi_ensure_registry() -> Nil
+
+@external(erlang, "beacon_session_ffi", "start_registry_link")
+fn start_registry_link() -> Result(Pid, String)
+
+@external(erlang, "beacon_session_ffi", "registry_running")
+fn ffi_registry_running() -> Bool
 
 @external(erlang, "beacon_session_ffi", "bind_process")
 fn bind_process(namespace: String, session_id: String, pid: Pid) -> Int

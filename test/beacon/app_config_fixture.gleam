@@ -7,6 +7,7 @@ import beacon/element.{type Element}
 import beacon/error
 import beacon/internal/context.{type Context}
 import beacon/middleware
+import beacon/pubsub
 import beacon/transport
 import gleam/option
 
@@ -43,5 +44,7 @@ pub fn new(
     api_handler: option.None,
     ws_auth: option.None,
     dev_mode: False,
+    pubsub: pubsub.default_config(),
+    cluster: option.None,
   )
 }

@@ -1,11 +1,32 @@
 /// Beacon application: starts the HTTP/WebSocket listener with a runtime per
-/// connection and per-request server rendering, optionally under an OTP
-/// supervisor.
+/// connection and per-request server rendering.
+///
+/// `start_supervised` (what `beacon.start` uses) runs everything under one
+/// root supervisor with the `RestForOne` strategy, children in this order:
+///
+/// 1. PubSub (`pubsub.supervised`)
+/// 2. the cluster manager, when configured (`cluster.supervised`)
+/// 3. the session revocation scope (`session.registry_supervised`)
+/// 4. the HTTP/WebSocket listener (`transport.supervised`)
+///
+/// A child that crashes is restarted together with every child after it:
+/// a PubSub restart also restarts the cluster manager, the session scope
+/// and the listener (closing every connection, whose runtimes were linked
+/// to PubSub partitions anyway); a listener restart touches nothing before
+/// it. Past the restart tolerance the supervisor gives up and exits, which
+/// `wait_forever` turns into a crash of the main process.
+///
+/// `start` is the unsupervised form for embedding and tests: it makes sure
+/// PubSub and the session scope run on the node (unlinked, shared) and
+/// links only the listener to the caller.
 ///
 /// `beacon.start` builds an `AppConfig` from the app and the generated codec;
 /// tests build it directly with hand-written codecs.
 ///
-/// Reference: Phoenix application structure, Erlang/OTP supervisor pattern.
+/// Reference: Phoenix application structure (Phoenix.PubSub, the endpoint
+/// and Presence as ordered children of the application supervisor), OTP
+/// `rest_for_one` supervision.
+import beacon/cluster
 import beacon/config as beacon_config
 import beacon/effect.{type Effect}
 import beacon/element.{type Element}
@@ -16,9 +37,10 @@ import beacon/middleware
 import beacon/notification.{type Notification}
 import beacon/pubsub
 import beacon/runtime
+import beacon/session
 import beacon/ssr
-import beacon/state_manager
 import beacon/static
+import beacon/telemetry
 import beacon/transport
 import beacon/transport/server.{type Connection, type ResponseBody}
 import gleam/erlang/process
@@ -29,6 +51,7 @@ import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
 import gleam/otp/static_supervisor as supervisor
 import gleam/otp/supervision
+import gleam/result
 import gleam/string
 import gleam/uri.{type Uri}
 
@@ -84,39 +107,276 @@ pub type AppConfig(state, msg) {
     ws_auth: Option(fn(Request(Connection)) -> Result(Nil, String)),
     /// Enable framework-owned client tracing.
     dev_mode: Bool,
+    /// PubSub configuration (partitions, pool size, limits).
+    pubsub: pubsub.PubSubConfig,
+    /// Cluster membership, when the node joins a cluster.
+    cluster: Option(cluster.ClusterConfig),
   )
 }
 
 /// A running Beacon application.
 pub type App {
   App(
-    /// The supervisor PID.
+    /// The root supervisor PID (`start_supervised`), or the listener's
+    /// supervisor PID (`start`).
     supervisor_pid: process.Pid,
     /// The TCP port the application is listening on. When the configured
-    /// port is 0 this is the OS-assigned port.
+    /// port is 0 this is the OS-assigned port; a restarted listener binds
+    /// the same port again.
     port: Int,
+    /// The listener as it first started (its connection registry and
+    /// remembered port outlive restarts of the listener child).
+    listener: server.Listener,
   )
 }
 
-/// Start a Beacon application: every page request is rendered with
-/// `init(ctx)` (and the route), and every WebSocket connection gets its own
-/// runtime process. Refuses a weak secret key.
+/// How long `stop` waits for the tree to shut down (each child has its own
+/// shutdown timeout inside this bound).
+const stop_timeout_ms = 30_000
+
+/// Start a Beacon application without the root supervision tree: every
+/// page request is rendered with `init(ctx)` (and the route), and every
+/// WebSocket connection gets its own runtime process. Refuses a weak secret
+/// key.
+///
+/// PubSub, the cluster manager (when configured) and the session
+/// revocation scope are started unlinked if they are not running yet, and
+/// stay running after `stop`: they are shared by every app on the node.
+/// Only the listener is linked to the caller. Use `start_supervised` in
+/// production.
 pub fn start(config: AppConfig(state, msg)) -> Result(App, error.BeaconError) {
   log.configure()
   // A weak secret makes every signed join token forgeable: refuse to start.
-  case beacon_config.validate_secret_key(config.secret_key) {
-    Error(err) -> Error(err)
-    Ok(_) -> start_with_valid_secret(config)
+  use _ <- result.try(beacon_config.validate_secret_key(config.secret_key))
+  use Nil <- result.try(start_telemetry())
+  use Nil <- result.try(
+    pubsub.start_with(config.pubsub)
+    |> result.map_error(fn(reason) {
+      config_error("PubSub failed to start: " <> pubsub.describe(reason))
+    }),
+  )
+  use Nil <- result.try(case config.cluster {
+    None -> Ok(Nil)
+    Some(cluster_config) ->
+      cluster.start(cluster_config)
+      |> result.map_error(fn(reason) {
+        config_error(
+          "Cluster manager failed to start: " <> cluster.describe(reason),
+        )
+      })
+  })
+  session.ensure_registry()
+  log_starting(config, "unsupervised")
+  case transport.start_listener(transport_config(config)) {
+    Ok(listener) -> {
+      let port = server.get_port(listener)
+      log.info(
+        "beacon.application",
+        "Beacon application started (unsupervised) on port "
+          <> int.to_string(port),
+      )
+      Ok(App(
+        supervisor_pid: server.get_supervisor(listener),
+        port: port,
+        listener: listener,
+      ))
+    }
+    Error(err) -> {
+      log.error(
+        "beacon.application",
+        "Failed to start transport: " <> error.to_string(err),
+      )
+      Error(err)
+    }
   }
 }
 
-fn start_with_valid_secret(
+/// Start a Beacon application under the root supervision tree (see the
+/// module documentation for the children and their restart semantics).
+/// The root supervisor is linked to the caller. This is the production
+/// entry point; stop it with `stop`.
+///
+/// Refuses to start when PubSub, the cluster manager or the session scope
+/// already run on this node outside a tree: the tree must own them, or a
+/// crash of theirs would go unnoticed.
+pub fn start_supervised(
   config: AppConfig(state, msg),
 ) -> Result(App, error.BeaconError) {
-  pubsub.start()
+  log.configure()
+  // Refuse a weak secret before any process is started, so a failed start
+  // leaves nothing running.
+  use _ <- result.try(beacon_config.validate_secret_key(config.secret_key))
+  use Nil <- result.try(start_telemetry())
+  use Nil <- result.try(refuse_running_infrastructure())
+  use pubsub_child <- result.try(
+    pubsub.supervised(config.pubsub)
+    |> result.map_error(fn(reason) {
+      config_error("Invalid PubSub configuration: " <> pubsub.describe(reason))
+    }),
+  )
+  use cluster_child <- result.try(case config.cluster {
+    None -> Ok(None)
+    Some(cluster_config) ->
+      cluster.supervised(cluster_config)
+      |> result.map(Some)
+      |> result.map_error(fn(reason) {
+        config_error(
+          "Invalid cluster configuration: " <> cluster.describe(reason),
+        )
+      })
+  })
+  use listener_child <- result.try(
+    transport.supervised(transport_config(config)),
+  )
+  log_starting(config, "supervised")
+
+  // The listener reports its port to this process on its first start only:
+  // restarts must not leave messages in a mailbox nobody reads.
+  let first_start = process.new_subject()
+  let once = once_new()
+  let listener_child =
+    supervision.ChildSpecification(..listener_child, start: fn() {
+      case listener_child.start() {
+        Ok(started) -> {
+          case once_take(once) {
+            True -> process.send(first_start, started.data)
+            False ->
+              log.warning(
+                "beacon.application",
+                "Listener restarted on port "
+                  <> int.to_string(server.get_port(started.data)),
+              )
+          }
+          Ok(started)
+        }
+        Error(reason) -> Error(reason)
+      }
+    })
+
+  let builder =
+    supervisor.new(supervisor.RestForOne)
+    |> supervisor.add(pubsub_child)
+  let builder = case cluster_child {
+    Some(child) -> supervisor.add(builder, child)
+    None -> builder
+  }
+  let builder =
+    builder
+    |> supervisor.add(session.registry_supervised())
+    |> supervisor.add(listener_child)
+
+  case supervisor.start(builder) {
+    Ok(started) ->
+      // INVARIANT: supervisor.start returns only after every child started,
+      // and the listener child sent its Listener before returning.
+      case process.receive(first_start, 0) {
+        Ok(listener) -> {
+          let port = server.get_port(listener)
+          log.info(
+            "beacon.application",
+            "Beacon application started (supervised) on port "
+              <> int.to_string(port),
+          )
+          Ok(App(supervisor_pid: started.pid, port: port, listener: listener))
+        }
+        Error(Nil) -> {
+          let reason = "the listener did not report its port after starting"
+          log.error("beacon.application", reason)
+          fail_loudly(reason)
+        }
+      }
+    Error(err) -> {
+      let reason = describe_start_error(err)
+      log.error(
+        "beacon.application",
+        "Failed to start the supervision tree: " <> reason,
+      )
+      Error(config_error("Supervision tree failed to start: " <> reason))
+    }
+  }
+}
+
+/// Stop an application: shuts the tree down child by child in reverse
+/// start order (listener first, PubSub last) and returns once every
+/// process of the tree has exited. For an app from `start`, this stops the
+/// listener only (the shared infrastructure keeps running).
+///
+/// Stopping is a normal exit, so a linked caller is not taken down.
+pub fn stop(app: App) -> Result(Nil, error.BeaconError) {
   log.info(
     "beacon.application",
-    "Starting Beacon application on port "
+    "Stopping Beacon application on port " <> int.to_string(app.port),
+  )
+  case stop_supervisor(app.supervisor_pid, stop_timeout_ms) {
+    Ok(Nil) -> {
+      server.release(app.listener)
+      log.info(
+        "beacon.application",
+        "Beacon application stopped (port " <> int.to_string(app.port) <> ")",
+      )
+      Ok(Nil)
+    }
+    Error(reason) -> {
+      log.error(
+        "beacon.application",
+        "Failed to stop the application: " <> reason,
+      )
+      Error(config_error("Application stop failed: " <> reason))
+    }
+  }
+}
+
+fn start_telemetry() -> Result(Nil, error.BeaconError) {
+  case telemetry.start() {
+    Ok(Nil) -> Ok(Nil)
+    Error(reason) ->
+      Error(config_error(
+        "Telemetry failed to start: " <> string.inspect(reason),
+      ))
+  }
+}
+
+/// The tree owns PubSub, the cluster manager and the session scope; one
+/// already running was started by someone else and would not be watched.
+fn refuse_running_infrastructure() -> Result(Nil, error.BeaconError) {
+  let pubsub_running = result.is_ok(pubsub.running_config())
+  let cluster_running = result.is_ok(cluster.members())
+  case pubsub_running, cluster_running, session.registry_running() {
+    True, _, _ ->
+      Error(config_error(
+        "PubSub is already running on this node outside a supervision tree",
+      ))
+    _, True, _ ->
+      Error(config_error(
+        "The cluster manager is already running on this node outside a supervision tree",
+      ))
+    _, _, True ->
+      Error(config_error(
+        "The session scope is already running on this node outside a supervision tree",
+      ))
+    False, False, False -> Ok(Nil)
+  }
+}
+
+fn config_error(reason: String) -> error.BeaconError {
+  log.error("beacon.application", reason)
+  error.ConfigError(reason: reason)
+}
+
+fn describe_start_error(err: actor.StartError) -> String {
+  case err {
+    actor.InitTimeout -> "a child did not start in time"
+    actor.InitFailed(reason) -> reason
+    actor.InitExited(reason) -> "a child exited: " <> string.inspect(reason)
+  }
+}
+
+fn log_starting(config: AppConfig(state, msg), mode: String) -> Nil {
+  log.info(
+    "beacon.application",
+    "Starting Beacon application ("
+      <> mode
+      <> ") on port "
       <> int.to_string(config.port)
       <> " (router: "
       <> case config.route {
@@ -128,9 +388,20 @@ fn start_with_valid_secret(
       Some(_) -> "yes"
       None -> "no"
     }
+      <> ", cluster: "
+      <> case config.cluster {
+      Some(_) -> "yes"
+      None -> "no"
+    }
       <> ")",
   )
+}
 
+/// The transport configuration of an app: server rendering per request and
+/// a runtime per WebSocket connection.
+fn transport_config(
+  config: AppConfig(state, msg),
+) -> transport.TransportConfig {
   let ssr_config =
     ssr.SsrConfig(
       init: config.init,
@@ -173,117 +444,15 @@ fn start_with_valid_secret(
       Some(static.StaticConfig(directory: dir, prefix: "/static", max_age: 3600))
     None -> None
   }
-  let transport_config =
-    transport.TransportConfig(
-      ..base_transport_config,
-      middlewares: config.middlewares,
-      static_config: static_cfg,
-      security_limits: config.security_limits,
-      ssr_factory: Some(ssr_factory),
-      api_handler: config.api_handler,
-      ws_auth: config.ws_auth,
-    )
-  case transport.start_listener(transport_config) {
-    Ok(listener) -> {
-      let port = server.get_port(listener)
-      log.info(
-        "beacon.application",
-        "Beacon application started (per-connection mode) on port "
-          <> int.to_string(port),
-      )
-      Ok(App(supervisor_pid: server.get_supervisor(listener), port: port))
-    }
-    Error(err) -> {
-      log.error(
-        "beacon.application",
-        "Failed to start transport: " <> error.to_string(err),
-      )
-      Error(err)
-    }
-  }
-}
-
-/// Start a Beacon application with a full OTP supervision tree.
-/// Uses `static_supervisor` to supervise the state manager.
-///
-/// This is the production-ready entry point.
-pub fn start_supervised(
-  config: AppConfig(state, msg),
-) -> Result(App, error.BeaconError) {
-  start_supervised_with(config, start)
-}
-
-fn start_supervised_with(
-  config: AppConfig(model, msg),
-  start_fn: fn(AppConfig(model, msg)) -> Result(App, error.BeaconError),
-) -> Result(App, error.BeaconError) {
-  log.configure()
-  // Refuse a weak secret before any process is started, so a failed start
-  // leaves nothing running.
-  case beacon_config.validate_secret_key(config.secret_key) {
-    Error(err) -> Error(err)
-    Ok(_) -> start_supervised_with_valid_secret(config, start_fn)
-  }
-}
-
-fn start_supervised_with_valid_secret(
-  config: AppConfig(model, msg),
-  start_fn: fn(AppConfig(model, msg)) -> Result(App, error.BeaconError),
-) -> Result(App, error.BeaconError) {
-  log.info(
-    "beacon.application",
-    "Starting supervised Beacon application on port "
-      <> int.to_string(config.port),
+  transport.TransportConfig(
+    ..base_transport_config,
+    middlewares: config.middlewares,
+    static_config: static_cfg,
+    security_limits: config.security_limits,
+    ssr_factory: Some(ssr_factory),
+    api_handler: config.api_handler,
+    ws_auth: config.ws_auth,
   )
-
-  // Start state manager under supervision. The supervisor must be given
-  // the state manager's own pid (not the supervisor's) so it can monitor
-  // and restart it.
-  let state_mgr_spec =
-    supervision.worker(fn() {
-      case state_manager.start_in_memory() {
-        Ok(subject) ->
-          case process.subject_owner(subject) {
-            Ok(pid) -> Ok(actor.Started(pid: pid, data: subject))
-            Error(Nil) -> {
-              log.error(
-                "beacon.application",
-                "State manager subject has no owner process",
-              )
-              Error(actor.InitFailed("state manager subject has no owner"))
-            }
-          }
-        Error(err) -> Error(err)
-      }
-    })
-
-  // Build supervisor
-  let sup_result =
-    supervisor.new(supervisor.OneForOne)
-    |> supervisor.add(state_mgr_spec)
-    |> supervisor.start
-
-  case sup_result {
-    Ok(sup_started) -> {
-      log.info("beacon.application", "Supervisor started")
-      case start_fn(config) {
-        Ok(app) -> {
-          log.info("beacon.application", "Application fully started")
-          Ok(App(supervisor_pid: sup_started.pid, port: app.port))
-        }
-        Error(err) -> Error(err)
-      }
-    }
-    Error(err) -> {
-      log.error(
-        "beacon.application",
-        "Failed to start supervisor: " <> string.inspect(err),
-      )
-      Error(error.ConfigError(
-        reason: "Supervisor start failed: " <> string.inspect(err),
-      ))
-    }
-  }
 }
 
 /// Keep the main process alive so the application keeps running.
@@ -398,3 +567,16 @@ fn get_env_int(name: String) -> Result(Int, EnvIntError)
 /// Stop the calling process with an error (crash loudly).
 @external(erlang, "beacon_application_ffi", "fail_loudly")
 fn fail_loudly(reason: String) -> a
+
+/// A one-shot flag: `once_take` returns True exactly once.
+type Once
+
+@external(erlang, "beacon_application_ffi", "once_new")
+fn once_new() -> Once
+
+@external(erlang, "beacon_application_ffi", "once_take")
+fn once_take(once: Once) -> Bool
+
+/// Stop a supervisor with reason `normal`, waiting up to `timeout` ms.
+@external(erlang, "beacon_application_ffi", "stop_supervisor")
+fn stop_supervisor(pid: process.Pid, timeout: Int) -> Result(Nil, String)
