@@ -14,6 +14,61 @@
   - **Resolution:** how it was fixed (fill in when resolved)
 -->
 
+Found while making the docs match the code (Milestone 117, WS10a, 2026-11-03).
+The docs describe the current behaviour; each item is a code change.
+
+- **Issue:** dev-mode browser reload never reaches a browser.
+  - **Context:** `dev.gleam:151` calls `notify_browser_reload`, which sends to
+    the local subscribers of `beacon:reload` (`beacon_dev_ffi.erl:155`).
+    Nothing subscribes to that topic, and `transport.ServerReload`
+    (`transport.gleam:106`, handled at `:642`) is never constructed.
+  - **Files:** `src/beacon/dev.gleam`, `src/beacon_dev_ffi.erl`, `src/beacon/transport.gleam`
+- **Issue:** the dev watcher falls back to polling every 500 ms when neither
+  `fswatch` nor `inotifywait` is installed (`dev.gleam:104-107`), against the
+  no-fallbacks rule.
+  - **Files:** `src/beacon/dev.gleam`
+- **Issue:** `middleware.body_parser(max_bytes)` passes through a request whose
+  `Content-Length` is missing or does not parse (`middleware.gleam:282`).
+  - **Files:** `src/beacon/middleware.gleam`
+- **Issue:** `middleware.Context` (`new_context`, `set_context`,
+  `get_context`, `middleware.gleam:519-538`) is carried by nothing; its doc
+  comment says it passes data to the handler.
+  - **Files:** `src/beacon/middleware.gleam`
+- **Issue:** `/health` answers every method, not only GET and HEAD
+  (`transport.gleam:2374`).
+  - **Files:** `src/beacon/transport.gleam`
+- **Issue:** `store.StoreError` aliases `state_manager.EtsError`
+  (`store.gleam:44`), and `state_manager` is an internal module, so an app
+  cannot match or describe the error without importing it.
+  - **Files:** `src/beacon/store.gleam`, `src/beacon/state_manager.gleam`
+- **Issue:** `beacon/rate_limit` is an internal module (`gleam.toml`
+  `internal_modules`), but `middleware.rate_limit` needs a
+  `rate_limit.RateLimiter` from `rate_limit.new`.
+  - **Files:** `gleam.toml`, `src/beacon/rate_limit.gleam`
+- **Issue:** `beacon.title` is computed only for the HTML render
+  (`ssr.gleam:308`); a client navigation leaves `document.title` unchanged.
+  - **Files:** `src/beacon/ssr.gleam`, `beacon_client/`
+- **Issue:** a join token whose model does not decode is logged and the
+  session continues with the state `init` returned (`runtime.gleam:920-929`),
+  a silent degradation for the user.
+  - **Files:** `src/beacon/runtime.gleam`
+- **Issue:** `transport/http.read_body` returns `Result(BitArray, String)`
+  and is internal (`transport/http.gleam:508`); the public way to read a body
+  is `api.read_text` / `api.read_form`. Older docs pointed users at
+  `read_body`.
+  - **Files:** `src/beacon/transport/http.gleam`
+- **Issue:** the `Dockerfile` HEALTHCHECK comment (`Dockerfile:66-67`) says
+  Beacon has no built-in health route; `/health` exists.
+  - **Files:** `Dockerfile`
+- **Issue:** `examples/auth_workspace` checks the login form against a
+  constant CSRF token (`auth_workspace/app.gleam:12`), so the login CSRF
+  check does not protect anything.
+  - **Files:** `examples/auth_workspace/src/auth_workspace/app.gleam`
+- **Issue:** several simulation tests allow leaked processes or failed
+  connections (`sim_test.gleam:177`, `:247`, `:320`, `:377-379`), against
+  TIGERSTYLE's zero-leak rule.
+  - **Files:** `test/beacon/sim_test.gleam`
+
 ## Resolved Issues
 
 <!-- Move resolved issues here with full resolution details -->

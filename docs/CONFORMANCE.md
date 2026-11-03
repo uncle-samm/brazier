@@ -15,7 +15,7 @@ checks.
 | `examples/routed` | Explicit imported route modules with root-owned `Model`/`Msg` |
 | `examples/routed_workspace` | Explicit route-aware app with Local/model state |
 | `examples/route_server_workspace` | Explicit route mini-apps with route-local private `Server` state |
-| `examples/auth_workspace` | API login/logout, HttpOnly auth cookie, CSRF, `ws_auth`, `ws_init`, route-aware SSR, and server-private session state |
+| `examples/auth_workspace` | API login/logout, HttpOnly auth cookie, CSRF, `ws_auth` with `auth.allow_guests_ws`, `init` through `auth.init_from_session`, a role-gated route, route-aware SSR, and server-private session state |
 
 ## Required Checks
 
@@ -127,8 +127,15 @@ following guarantees:
 - `GET /api/me` requires `beacon_session`.
 - `POST /api/profile` requires the authenticated session and matching CSRF token.
 - `POST /api/logout` requires CSRF, deletes the server session, and clears the cookie.
-- WebSocket upgrade without `beacon_session` is rejected by `ws_auth`.
-- WebSocket upgrade with `beacon_session` initializes model/server state through `ws_init`.
+- A WebSocket upgrade without `beacon_session` connects as a guest
+  (`auth.allow_guests_ws`); one with a signed-in session is bound to it, so
+  logout closes the socket.
+- `init` loads the account from `beacon_session` through
+  `auth.init_from_session`, on the HTML render and on the connected mount. A
+  session store that cannot answer refuses the page with 503 and the socket
+  with close code 4503.
+- `/admin` shows its content only to an account with the admin role, and
+  `update` refuses admin events from any other account.
 - Server-only fields such as session ID, CSRF token, audit key, and audit log never
   appear in the public client model, DOM, or client bundle.
 

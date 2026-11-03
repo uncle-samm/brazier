@@ -362,6 +362,8 @@ beacon.full_application(init:, update:, sync:, local: local.layer(init: init_loc
 2. **`map` maps handlers.** `element.map` / `attribute.map` rewrite every event decoder with `decode.map`. This replaces `component.map_node` (which today copies attributes unchanged and logs on every call) and removes the `wrap:` parameters. Eager mapping is enough because `MemoNode` already holds a built child.
 3. **`update` returns effects everywhere.** Every `update` is `fn(state, msg) -> #(state, Effect(msg))`, including child modules (`effect.map`). `on_update` and the separate pure update are removed. `update_local` is not a model update; it returns `local.Update`.
 4. **No triple.** No public type mentions `#(model, local, server)`. Route handling, `ws_init`, subscriptions and the codec all take `model` (or the user's own `state` record). The runtime keeps its own private session record.
+
+   > Note (2026-11-03): `ws_init` no longer exists. Step 5 of section 10 removed it, as the migration list in section 8 records: `init(ctx)` runs on the HTML render and on the connected mount, reading cookies with `beacon.cookie(ctx, name)`, and `beacon.ws_auth` only admits or refuses the upgrade.
 5. **Single route declaration.** One user `Route` type, one `parse`, `with_router(parse:, on_change:)`. The route lives in the Model, so the codec encodes it like any custom type. `Page`, `page_model`, `route_pages`, `dispatch_view`, `dispatch_page`, `update_model`, `update_server_model`, `on_route_leave`, guards and layouts are removed.
 6. **Typed payloads.** Payloads are decoders run on the client against the real DOM event, using `gleam/dynamic/decode`, which works on JS objects. The hard-coded per-event extraction in `beacon_client_ffi.mjs` (`"x,y"` strings, `data-drag-id`, pointer trail, form snapshot) is removed. Only submit gets help: the client attaches `formData` to submit events, as Lustre does. A decode failure logs a `console.warn` with the event name and errors and drops the event; nothing is silently ignored.
 7. **`internal_modules`.** Added to `gleam.toml` with the explicit list in section 2.
@@ -423,7 +425,7 @@ beacon.full_application(init:, update:, sync:, local: local.layer(init: init_loc
 | `beacon.no_local`, `beacon.no_server` | `local.none()`; `sync: function.identity` |
 | `update(model, local, server, msg) -> #(m, l, s)` + `on_update(fn(state, msg) -> Effect)` | `update(state, msg) -> #(state, Effect(msg))` + optional `update_local` |
 | `init_server: fn() -> server` | fields of the state record, built in `init(ctx)` |
-| `ws_init(fn(req) -> triple)`, `beacon.get_cookie` | `init(ctx)` with `beacon.cookie(ctx, name)`, `beacon.is_connected(ctx)` |
+| `ws_init(fn(req) -> triple)`, `beacon.get_cookie` | `init(ctx)` with `beacon.cookie(ctx, name)`, `beacon.is_connected(ctx)` (note, 2026-11-03: this is how it shipped; `init` returns `Result(_, InitError)`, and `auth.init_from_session` wraps the cookie-session case) |
 | `element.Node(msg)`, `element.Attr`, `HtmlAttr` / `EventAttr` | `element.Element(msg)`, `attribute.Attribute(msg)` (opaque) |
 | `html.class` / `href` / `src_` / … | `attribute.class` / `href` / `src` / … |
 | `beacon.on_click(msg)`, `on_input(fn)`, `on_keydown(fn)` | `event.on_click`, `event.on_input`, `event.on_keydown` |
@@ -495,6 +497,7 @@ Smaller choices, with my recommendations:
 5. **App constructors and runtime.**
    - `application` / `full_application`, `Context`, the local layer, effects returned from `update`, effects dropped during SSR.
    - Remove `on_update`, `ws_init`, the triple, `init_simple` and `update_simple`.
+     (Note, 2026-11-03: done; none of them is in `src/`.)
    - Tests: effects run after update; SSR drops effects; `handled` messages never reach the server and `forward` ones do; the `model_sync` JSON never contains Session fields.
 6. **Codegen.**
    - Find the app from the constructor call; reachability-based client code; codec over Model only; derived message allowlist.
