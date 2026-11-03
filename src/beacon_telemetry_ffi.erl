@@ -39,6 +39,7 @@
     runtime_span/5,
     runtime_render_span/4,
     runtime_stop/2,
+    runtime_stop_failed/4,
     effect_run_span/2,
     effect_timer_rejected/1,
     store_write/4,
@@ -252,6 +253,13 @@ runtime_render_span(Route, Event, ConnectionId, Run) ->
 %% [beacon, runtime, stop]
 runtime_stop(Uptime, Reason) ->
     telemetry:execute([?PREFIX, runtime, stop], #{uptime => Uptime}, #{reason => Reason}).
+
+%% [beacon, runtime, stop] for a runtime that did not stop on Shutdown:
+%% Reason is `crash` or `exit`, Kind the exception class (`exit` for an
+%% exit signal) and Error the bounded description of the reason.
+runtime_stop_failed(Uptime, Reason, Kind, Error) ->
+    telemetry:execute([?PREFIX, runtime, stop], #{uptime => Uptime},
+                      #{reason => Reason, kind => Kind, error => Error}).
 
 %% [beacon, effect, run] span. The label is `effect`, not `kind`: telemetry
 %% writes the exception class to `kind` on the exception event, which would

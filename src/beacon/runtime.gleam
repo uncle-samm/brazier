@@ -48,8 +48,17 @@
 /// snake_case (`SetCount(9)` is `"set_count"`), or
 /// `"unknown"` for an event or path the app does not handle, so the label
 /// set stays the app's finite set of constructors. `route` is
-/// `transport.page_route`: the typed router has no patterns. A `Shutdown`
-/// emits `[beacon, runtime, stop]` with the runtime's uptime.
+/// `transport.page_route`: the typed router has no patterns.
+///
+/// Every stop that runs code emits `[beacon, runtime, stop]` with the
+/// runtime's uptime: a `Shutdown` with reason `shutdown`; a crash in the
+/// message handler with reason `crash`, the exception class as `kind` and
+/// the reason as `error` (the handler is guarded the way gen_server calls
+/// `terminate/2` for a callback that raises; the crash then goes on
+/// unchanged); an exit signal (a linked process failing, an exit sent to
+/// the runtime) with reason `exit`. The runtime traps exits for that, and
+/// leaves with the signal's reason. Only an untrappable `kill` emits
+/// nothing.
 import beacon/cookie
 import beacon/effect.{type Effect}
 import beacon/error
@@ -144,6 +153,11 @@ pub type RuntimeMessage(msg) {
   EffectDispatchedKeyed(key: String, generation: Int, message: msg)
   /// Shutdown the runtime.
   Shutdown
+  /// An exit signal the runtime trapped: a linked process (the connection
+  /// handler that started it, its PubSub listener or presence watcher, a
+  /// process the app linked) exited, or a process sent the runtime an
+  /// exit. Delivered by the VM; nothing sends it.
+  ExitTrapped(exit: process.ExitMessage)
 }
 
 /// The runtime's internal state. `model` is the app's server state (for
@@ -450,12 +464,24 @@ fn spawn_actor(
           started_at: started_at,
         )
       log.debug("beacon.runtime", "Runtime initialising")
+      // Trap exits so a stop caused by a linked process still reports
+      // [beacon, runtime, stop] (see handle_exit). An untrappable `kill`
+      // is the only stop that runs no code. Because of the trap the runtime
+      // must not stop with actor.stop_abnormal: gleam_otp implements it as
+      // an exit signal to itself, which a trapping process receives as a
+      // message and then exits normally.
+      process.trap_exits(True)
+      let selector =
+        process.new_selector()
+        |> process.select(subject)
+        |> process.select_trapped_exits(ExitTrapped)
 
       actor.initialised(state)
+      |> actor.selecting(selector)
       |> actor.returning(subject)
       |> Ok
     })
-    |> actor.on_message(handle_message)
+    |> actor.on_message(guarded_handle_message)
     |> actor.start
 
   case result {
@@ -567,6 +593,85 @@ fn yes_no(flag: Bool) -> String {
     False -> "NO"
   }
 }
+
+/// `handle_message`, reporting a crash in it (the app's `update`, `view` or
+/// codec, an effect run in the runtime, a broken invariant) as
+/// `[beacon, runtime, stop]` with reason `crash` before the crash goes on
+/// unchanged: the runtime dies with the original reason and stacktrace and
+/// the VM's crash report logs it, as before.
+fn guarded_handle_message(
+  state: RuntimeState(model, msg),
+  message: RuntimeMessage(msg),
+) -> actor.Next(RuntimeState(model, msg), RuntimeMessage(msg)) {
+  case message {
+    // Outside the guard: handle_exit leaves with the signal's reason by
+    // raising an exit, which the guard would report again as a crash.
+    ExitTrapped(exit) -> handle_exit(state, exit)
+    _ ->
+      guard_handler(
+        fn() { handle_message(state, message) },
+        fn(kind, description) {
+          telemetry.runtime_stop_failed(
+            monotonic_time() - state.started_at,
+            "crash",
+            kind,
+            description,
+          )
+        },
+      )
+  }
+}
+
+@external(erlang, "beacon_runtime_ffi", "guard_handler")
+fn guard_handler(run: fn() -> a, on_crash: fn(String, String) -> Nil) -> a
+
+/// A trapped exit. A normal exit of a linked process does not stop the
+/// runtime, as an untrapped link would not; any other exit stops it with
+/// the same reason, after `[beacon, runtime, stop]` with reason `exit`, so
+/// the runtime's own links (the listener, the watcher) see what they would
+/// have seen without the trap.
+fn handle_exit(
+  state: RuntimeState(model, msg),
+  exit: process.ExitMessage,
+) -> actor.Next(RuntimeState(model, msg), RuntimeMessage(msg)) {
+  case exit.reason {
+    process.Normal -> {
+      log.debug(
+        "beacon.runtime",
+        "Linked process " <> string.inspect(exit.pid) <> " exited normally",
+      )
+      actor.continue(state)
+    }
+    reason -> {
+      let description = describe_exit(reason)
+      // The process that failed reports its own crash; this is the
+      // runtime's stop that follows from it.
+      log.warning(
+        "beacon.runtime",
+        "Runtime stopping with "
+          <> int.to_string(dict.size(state.connections))
+          <> " connection(s): exit signal from "
+          <> string.inspect(exit.pid)
+          <> ": "
+          <> description,
+      )
+      telemetry.runtime_stop_failed(
+        monotonic_time() - state.started_at,
+        "exit",
+        "exit",
+        description,
+      )
+      exit_like(reason)
+    }
+  }
+}
+
+@external(erlang, "beacon_runtime_ffi", "describe_exit")
+fn describe_exit(reason: process.ExitReason) -> String
+
+/// Exit with `reason` (never `Normal`).
+@external(erlang, "beacon_runtime_ffi", "exit_like")
+fn exit_like(reason: process.ExitReason) -> a
 
 /// The main message loop for the runtime actor.
 /// Follows Lustre's loop pattern: handle message → update state → return Next.
@@ -754,6 +859,9 @@ fn handle_message(
       }
       actor.stop()
     }
+
+    // guarded_handle_message answers trapped exits before this is called.
+    ExitTrapped(exit) -> handle_exit(state, exit)
   }
 }
 

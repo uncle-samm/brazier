@@ -34,6 +34,21 @@ reconnects with backoff on any other close. `auth.init_from_session` answers a
 session store outage with `error.unavailable`. See
 [GETTING_STARTED.md](GETTING_STARTED.md#refusing-in-init).
 
+A connection whose runtime does not start is logged once, where the cause is
+known, with the connection id and page: a crash in `init` or the initial
+route with its class, reason and stacktrace; a refusal at its status's level;
+a presence refusal with its tracker. The layers between log the same failure
+at debug, and the transport logs the close it answers with at info.
+
+## Runtime Crashes
+
+A runtime that crashes after it started (in `update`, the view or the codec)
+dies with the crash's reason, and its connections close and reconnect to a
+new one. Before it dies it emits `[beacon, runtime, stop]` with reason `crash`
+and the reason as `error`; a runtime stopped by an exit signal (a linked
+process failing) emits it with reason `exit`. See
+[TELEMETRY.md](TELEMETRY.md).
+
 ## Transport Errors
 
 Malformed messages get a `ServerError` response. Oversized messages (above 64KB) are rejected with `"Message too large"`.

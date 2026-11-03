@@ -300,10 +300,22 @@ pub fn runtime_render_span(
   run: fn() -> #(a, Int),
 ) -> a
 
-/// `[beacon, runtime, stop]`.
+/// `[beacon, runtime, stop]` for a `Shutdown`.
 @external(erlang, "beacon_telemetry_ffi", "runtime_stop")
 @internal
 pub fn runtime_stop(uptime: Int, reason: String) -> Nil
+
+/// `[beacon, runtime, stop]` for a runtime that crashed (`reason` is
+/// `crash`) or was stopped by an exit signal (`exit`), with the exception
+/// class as `kind` and the bounded description of the reason as `error`.
+@external(erlang, "beacon_telemetry_ffi", "runtime_stop_failed")
+@internal
+pub fn runtime_stop_failed(
+  uptime: Int,
+  reason: String,
+  kind: String,
+  error: String,
+) -> Nil
 
 /// `[beacon, effect, run]` span.
 @external(erlang, "beacon_telemetry_ffi", "effect_run_span")

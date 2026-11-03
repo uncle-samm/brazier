@@ -133,7 +133,7 @@ measurements: `system_time` and `monotonic_time` on start, `duration` and
 | `[beacon, ws, backpressure]` | `queue_len` | `reason`, `connection_id` | yes, `beacon/transport` |
 | `[beacon, runtime, mount \| handle_event \| navigate]` S | none | `route`, `event`, `connection_id` | yes, `beacon/runtime` |
 | `[beacon, runtime, render]` S | `patch_bytes` (stop) | `route`, `event`, `connection_id` | yes, `beacon/runtime` |
-| `[beacon, runtime, stop]` | `uptime` | `reason` | yes, `beacon/runtime` |
+| `[beacon, runtime, stop]` | `uptime` | `reason`; `kind`, `error` (crash, exit) | yes, `beacon/runtime` |
 | `[beacon, effect, run]` S | none | `effect`: `sync`, `keyed` or `background` | yes, `beacon/effect` |
 | `[beacon, effect, timer, rejected]` | none | `limit` | yes, `beacon/effect` |
 | `[beacon, store, write]` | `count` | `store`, `op`, `mode`: `local` or `replicated` | yes, `beacon/store` |
@@ -211,9 +211,19 @@ Notes on individual events:
   that caused it, or `batch` for an event batch. `patch_bytes` is the size
   of the patch sent, the model's size for a full resync, and 0 when the
   model did not change.
-- `[beacon, runtime, stop]` is emitted on `Shutdown` with `reason`
-  `shutdown` and `uptime` in native time units. A runtime that crashes
-  emits nothing.
+- `[beacon, runtime, stop]` is emitted by every runtime stop that runs
+  code, with `uptime` in native time units. `reason` is `shutdown` for a
+  `Shutdown`; `crash` for a crash in the runtime's message handler (the
+  app's `update`, `view` or codec, an effect run in the runtime), with the
+  exception class as `kind` and the reason as `error`; `exit` for an exit
+  signal (a linked process such as the connection handler, PubSub
+  listener or presence watcher failing, or an exit sent to the runtime),
+  with `kind` `exit` and the signal's reason as `error`. `error` is printed
+  to a bounded depth. The handler is guarded the way gen_server calls
+  `terminate/2` for a callback that raises, and the runtime traps exits;
+  either way it then leaves with the original reason, so its links and the
+  VM's crash report see what they did before. A normal exit of a linked
+  process does not stop it. Only an untrappable `kill` emits nothing.
 - `[beacon, http, connection, *]`: `duration` is the time from accept to
   handoff (accepted, rejected) or the connection's lifetime (closed).
   `reason` for a rejection names the limit that refused it, or is
