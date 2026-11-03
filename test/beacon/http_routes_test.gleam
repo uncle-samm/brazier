@@ -1,6 +1,7 @@
 /// Built-in HTTP routes over a real listener: static files served with
 /// sendfile (body, ETag, HEAD, misses, non-regular files) and the /health
 /// endpoint's method handling.
+import beacon/cluster/log_capture
 import beacon/middleware
 import beacon/static
 import beacon/transport
@@ -195,6 +196,29 @@ pub fn small_leftover_body_is_discarded_after_the_response_test() {
   let assert Ok(Nil) = raw_send(socket, <<second:utf8>>) as "send must succeed"
   let assert Ok(#(200, _, <<"a">>)) = raw_recv_response(socket, 2000, True)
   raw_close(socket)
+  server.stop(listener)
+  cleanup(dir)
+}
+
+// --- Handler crashes ---
+
+pub fn handler_crash_is_logged_once_with_its_stacktrace_test() {
+  // Regression: the FFI logged the crash with its stacktrace and
+  // run_handler logged it again with the route.
+  let dir = temp_dir("crash")
+  let crashing = fn(_req, _next) { panic as "routes-test crash on purpose" }
+  let listener = start_with(dir, [crashing])
+  let #(resp, logs) =
+    log_capture.capture(fn() { request(listener, "GET", "/anything", "") })
+  let assert 500 = resp.0
+  let assert [line] =
+    list.filter(logs, fn(line) {
+      string.contains(line.message, "routes-test crash on purpose")
+    })
+  let assert "error" = line.level
+  let assert True = string.contains(line.message, "request handler crashed")
+  // The stacktrace names the crashing module.
+  let assert True = string.contains(line.message, "http_routes_test")
   server.stop(listener)
   cleanup(dir)
 }

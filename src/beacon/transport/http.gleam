@@ -587,11 +587,17 @@ pub fn read_body(
 
 // --- Handler isolation ---
 
+/// A handler crash caught by `ffi_run_handler`: `class:reason` and the
+/// stacktrace, both formatted.
+type HandlerCrash {
+  HandlerCrash(reason: String, stacktrace: String)
+}
+
 @external(erlang, "beacon_transport_ffi", "run_handler")
 fn ffi_run_handler(
   handler: fn(Request(server.Connection)) -> Response(server.ResponseBody),
   req: Request(server.Connection),
-) -> Result(Response(server.ResponseBody), String)
+) -> Result(Response(server.ResponseBody), HandlerCrash)
 
 @external(erlang, "beacon_transport_ffi", "http_route_reset")
 fn ffi_route_reset() -> Nil
@@ -666,10 +672,16 @@ pub fn run_handler(
           req_bytes,
           response_body_bytes(resp),
         )
-        Error(reason) -> {
+        // The one log line for a crash: route, reason and stacktrace.
+        Error(HandlerCrash(reason:, stacktrace:)) -> {
           log.error(
             "beacon.http",
-            "Request handler crashed on route " <> route <> ": " <> reason,
+            "HTTP request handler crashed on route "
+              <> route
+              <> ": "
+              <> reason
+              <> "\n"
+              <> stacktrace,
           )
           #(Error(reason), route, 500, req_bytes, 0)
         }

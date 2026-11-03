@@ -156,6 +156,8 @@ with its own changelog, so they are not listed here.
   timeout. The response is now written first, and a leftover of at most
   64 KiB is discarded after it so the connection can be reused (the order
   cowboy and Bandit use).
+- (WS10b) An HTTP handler crash was logged twice, once with the stacktrace
+  and once with the route. It is logged once, with both.
 - (WS10b) `/health` answered every method. Methods other than GET and HEAD
   get 405 with `allow: GET, HEAD`, and the answer is `cache-control:
   no-store`.

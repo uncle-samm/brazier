@@ -614,16 +614,18 @@ maybe_send_continue(Socket, Ctx = #{expect_continue := true}) ->
 maybe_send_continue(_Socket, Ctx) ->
     {ok, Ctx}.
 
-%% Run an application handler, converting a crash into an explicit error
-%% (logged with stacktrace) so the connection can answer 500 and close.
+%% Run an application handler, converting a crash into an explicit error so
+%% the connection can answer 500 and close. Returns
+%% {error, {handler_crash, Reason, Stacktrace}} with both formatted; the
+%% caller (transport/http.run_handler) logs it once, with the route.
 run_handler(Fun, Arg) ->
     try Fun(Arg) of
         Result -> {ok, Result}
     catch
         Class:Reason:Stacktrace ->
-            beacon_log_ffi:error(<<"beacon.http">>, "request handler crashed: ~p:~p~n~p",
-                                 [Class, Reason, Stacktrace]),
-            {error, iolist_to_binary(io_lib:format("~p:~p", [Class, Reason]))}
+            {error, {handler_crash,
+                     iolist_to_binary(io_lib:format("~p:~p", [Class, Reason])),
+                     iolist_to_binary(io_lib:format("~p", [Stacktrace]))}}
     end.
 
 %% Close a connection after the server decided to end it (error response,
