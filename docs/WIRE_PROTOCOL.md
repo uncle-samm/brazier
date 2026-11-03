@@ -225,9 +225,11 @@ connection id and peer address:
 own origin on scheme, host and port, or equal one entry of
 `ws_allowed_origins` (each a bare `scheme://host[:port]`). Default ports are
 applied (`http` 80, `https` 443), and comparison is case-insensitive. The
-request scheme is the first `X-Forwarded-Proto` token when present (only
-`http` or `https` are accepted; any other value is a 403), and plain `http`
-otherwise, since Beacon does not terminate TLS itself. So `https://app.example`
+request scheme is the first `X-Forwarded-Proto` token when the peer is one of
+`trusted_proxies` (only `http` or `https` are accepted, and several
+`X-Forwarded-Proto` headers are refused; either is a 403), and plain `http`
+otherwise: the header is ignored from any other peer, since Beacon does not
+terminate TLS itself. So `https://app.example`
 is rejected against a plain-http request for the same host, and so is
 `http://app.example:8080` against `app.example:3000`.
 
@@ -292,9 +294,10 @@ the echo.
 
 ## Sessions and Authentication
 
-- When `ws_auth` is configured (for example `auth.ws_session_auth`), the
-  upgrade requires a valid session cookie. A missing, unknown or expired
-  session gets 401.
+- When `ws_auth` is configured with `auth.protect_ws`, the upgrade requires
+  a valid session cookie naming a logged-in user. A missing, unknown or
+  expired session gets 401. `auth.allow_guests_ws` admits guests and binds a
+  logged-in session the same way.
 - The check runs again every `ws_auth_recheck_interval_ms` (60s) on live
   sockets. A failed re-check closes with **4401** `authentication expired`.
 - Logging out, rotating the session id (on login or a privilege change) or

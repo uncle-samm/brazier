@@ -10,13 +10,12 @@ gleam run -m beacon/build                        # find the app module in src/
 gleam run -m beacon/build -- src/my_app.gleam    # or name it
 ```
 
-It finds the app module (the one that calls `beacon.app`/`beacon.start`,
-including through `import beacon as b` or unqualified imports; text in
-comments and strings does not count), generates the
-server codec `src/beacon_codec.gleam`, runs `gleam build`, and writes the
-client bundle `priv/static/beacon_client_<hash>.js` with
-`priv/static/beacon_client.manifest` naming it. It needs `node` and `npx`
-(esbuild is pinned and fetched by `npx`).
+It finds the app module (the one that calls `beacon.start`, including through
+`import beacon as b` or unqualified imports; text in comments and strings does
+not count), generates the server codec `src/beacon_codec.gleam`, runs
+`gleam build`, and writes the client bundle
+`priv/static/beacon_client_<hash>.js` with `priv/static/beacon_client.manifest`
+naming it. It needs `node` and `npx` (esbuild is pinned and fetched by `npx`).
 
 The build exits with status 1 on any failure: no app module or more than one,
 an unparsable source file (the error names the file, line and column), a Model
@@ -31,41 +30,86 @@ pipeline, not at startup. Automatic rebuilding exists only in dev mode
 
 ## Environment Variables
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `PORT` | `8080` | Server listen port, `0..65535` (`0` binds an ephemeral port). A set value that is not an integer in range is an error. |
-| `SECRET_KEY` | none (required) | Token signing key, at least 32 bytes |
-| `BEACON_ENV` | `development` | Set to `production` for prod |
+`beacon.start` takes its port and secret key as arguments and options, not
+from the environment. An app that wants them from the environment reads them
+itself with `beacon/config` (see the example below). Beacon reads these
+variables:
 
-`config.port()` and `config.secret_key()` return `Result(_, BeaconError)`:
-a malformed `PORT` or a missing or weak `SECRET_KEY` is a startup error, not
-a silent default.
+| Variable | Read by | Default | Meaning |
+|----------|---------|---------|---------|
+| `PORT` | `config.port()`, when the app calls it | `8080` | Listen port, `0..65535` (`0` binds an ephemeral port). A set value that is not an integer in range is an `Error`. |
+| `SECRET_KEY` | `config.secret_key()`, when the app calls it | none | Token signing key, at least 32 bytes. Unset, empty, short or the old published dev secret is an `Error`. |
+| `BEACON_ENV` | `config.is_production()`, which `beacon/cluster` calls when the app joins a cluster | not production | `production` or `prod` makes the cluster refuse insecure distribution (see [CLUSTERING.md](CLUSTERING.md)). It does not change logging or anything else. |
+| `BEACON_SHUTDOWN_TIMEOUT` | `beacon.start`, before it starts waiting | `5000` | Milliseconds to drain connections on shutdown. A value that is not a non-negative integer stops the process with an error. |
+
+`config.get_env`, `config.get_env_or` and `config.get_env_int` read any other
+variable the app needs; `get_env_int` returns an `Error` for a set value that
+is not an integer.
 
 ## Secret Key
 
 Join tokens and session tokens are signed with HMAC-SHA256, so the key must
-be at least 32 bytes (`config.min_secret_key_bytes`). `application.start`,
-`start_advanced` and `start_supervised` refuse an empty key, a shorter key,
-and the old published dev secret with a `ConfigError` before opening the
-port. Generate a key with:
+be at least 32 bytes (`config.min_secret_key_bytes`). `beacon.start` refuses
+an empty key, a shorter key and the old published dev secret with a
+`ConfigError` before opening the port. Generate a key with:
 
 ```bash
 openssl rand -base64 48
 ```
 
-`beacon.app` uses a random per-process key when none is set; it changes on
-restart (invalidating all tokens) and differs between nodes, so always set an
-explicit key in production:
+Without `beacon.secret_key`, `beacon.start` generates a random key per process
+and logs a warning. That key changes on restart (invalidating every token) and
+differs between nodes, so always set an explicit key in production:
 
+<!-- docs-check: wrap
+{{block}}
+
+pub type Model {
+  Model(count: Int)
+}
+
+pub type Msg {
+  Increment
+}
+
+fn init(_ctx: beacon.Context) -> Result(Model, beacon.InitError) {
+  Ok(Model(count: 0))
+}
+
+pub fn update(model: Model, msg: Msg) -> Model {
+  case msg {
+    Increment -> Model(count: model.count + 1)
+  }
+}
+
+pub fn view(_model: Model) -> element.Element(Msg) {
+  element.text("count")
+}
+-->
 ```gleam
-pub fn main() {
-  let assert Ok(secret) = config.secret_key() as "SECRET_KEY must be set"
-  let assert Ok(port) = config.port() as "PORT must be a valid port"
-  beacon.app(init, beacon.no_local, beacon.no_server, update, view)
+import beacon
+import beacon/config
+import beacon/element
+import beacon/error.{type BeaconError}
+import gleam/result
+
+pub fn main() -> Nil {
+  // beacon.start blocks while the server runs; returning means it failed.
+  let assert Ok(Nil) = start() as "Beacon did not start"
+  Nil
+}
+
+fn start() -> Result(Nil, BeaconError) {
+  use secret <- result.try(config.secret_key())
+  use port <- result.try(config.port())
+  beacon.simple(init:, update:, view:)
   |> beacon.secret_key(secret)
   |> beacon.start(port)
 }
 ```
+
+A failed `let assert` crashes `main` with the error, so the process exits
+loudly instead of returning as if it had stopped normally.
 
 ## Security Limits
 
@@ -73,23 +117,76 @@ Start from the defaults and override what you need; the limits are
 validated at startup and an invalid value refuses to start. The full list is
 in [SECURITY.md](SECURITY.md#securitylimits).
 
+<!-- docs-check: wrap
+import beacon
+import beacon/transport
+
+pub fn configure(
+  app: beacon.App(state, model, local, msg),
+) -> beacon.App(state, model, local, msg) {
+  app
+  |>
+  {{block}}
+}
+-->
 ```gleam
 beacon.security_limits(transport.SecurityLimits(
   ..transport.default_security_limits(),
   max_connections: 20_000,
   max_events_per_second: 100,
-  // Behind a reverse proxy: believe its X-Forwarded-For / Forwarded headers.
+  // The reverse proxy's address: believe its forwarding headers.
   trusted_proxies: ["10.0.0.0/8"],
+  // Pages served from another origin that may open the WebSocket.
+  ws_allowed_origins: ["https://www.example.com"],
 ))
 ```
 
-Behind a reverse proxy, every client shares the proxy's address. Trusted
-proxies are exempt from `max_connections_per_ip`; raise
-`max_ws_connections_per_ip` or enforce per-client caps at the proxy.
+## Behind a Reverse Proxy
+
+Beacon does not terminate TLS. Behind a TLS-terminating proxy (nginx, a load
+balancer), list the proxy in `trusted_proxies`; without it, Beacon sees every
+client as the proxy's address and ignores the forwarding headers. The rules
+are in [SECURITY.md](SECURITY.md#trusted-proxies); for deployment:
+
+- **WebSocket upgrades** must reach Beacon: forward `Upgrade` and
+  `Connection`. Beacon pings every `ws_ping_interval_ms` (30 s), so a proxy
+  idle timeout longer than that keeps quiet sockets open.
+- **`Host`**: pass the client's `Host` header through unchanged. The
+  WebSocket Origin check compares the browser's `Origin` with the request's
+  scheme, `Host` and port; Beacon does not read `X-Forwarded-Host`.
+- **`X-Forwarded-Proto`**: the proxy must send `https` for HTTPS clients.
+  Beacon reads it only from a trusted proxy. Without it the request's scheme is
+  `http`, and a browser on `https://` fails the Origin check with 403. Several
+  `X-Forwarded-Proto` headers, or a value other than `http` or `https`, reject
+  the request.
+- **`ws_allowed_origins`**: add an origin here only when pages served from a
+  different origin open the socket. The request's own origin is always
+  allowed. Entries are bare `scheme://host[:port]` origins; an entry with a
+  path, or one that does not parse, refuses to start.
+- **Per-IP caps**:
+  - `max_connections_per_ip` (HTTP, 256) counts socket peers when they are
+    accepted, before any header is read. A trusted proxy is exempt, so behind
+    one it limits nothing; enforce per-client HTTP limits at the proxy or with
+    `middleware.rate_limit_behind_proxies`.
+  - `max_ws_connections_per_ip` (100) counts the resolved client address, so
+    behind a trusted proxy it applies to each real client.
+  - Behind a proxy that is not listed, every client shares the proxy's
+    address and both caps apply to all clients together.
+- **Rate limiting**: `middleware.rate_limit` keys on the socket peer; behind a
+  proxy use `middleware.rate_limit_behind_proxies(limiter, trusted)` with the
+  same list (`transport.trusted_proxies(limits)`). See
+  [MIDDLEWARE.md](MIDDLEWARE.md).
+- **HSTS**: add `middleware.hsts(...)` once the site is served over HTTPS
+  (see [SECURITY.md](SECURITY.md#secure-headers)).
 
 ## Health Check
 
-`GET /health` returns `{"status":"ok"}` with HTTP 200.
+Beacon answers `/health` with HTTP 200 and the body `{"status":"ok"}`. It is
+a liveness check: it shows the HTTP listener accepts and answers requests,
+not that sessions, stores or the cluster work. It runs after the middleware
+pipeline and the app's API routes, so an API route for `/health` replaces it,
+and a middleware that refuses the request (authentication, rate limiting)
+refuses it too. Add your own API route when the check must cover more.
 
 ## Docker
 
@@ -114,9 +211,12 @@ shipment's `entrypoint.sh`, which calls `<package>@@main:run` and so only works
 when the package and the app module share a name.
 
 For your own app, copy your project instead of the repository and drop the
-`examples/` prefix. The image's health check requests `/`, because Beacon has
-no built-in health route.
+`examples/` prefix. The image's `HEALTHCHECK` requests `/`, which renders the
+app's first page; `/health` (above) is the cheaper check.
 
-## Logging & Connections
+## Logging and Connections
 
-Set `BEACON_ENV=production` to suppress debug output. When `max_connections` is reached, new connections get HTTP 503. Origin headers validated to prevent cross-site hijacking.
+`beacon.start` configures the Erlang logger at `info` level: debug messages
+are not printed, whatever `BEACON_ENV` says. When `max_connections` is
+reached, a new connection gets 503 before its request is read. WebSocket limits,
+Origin rules and close codes are in [SECURITY.md](SECURITY.md#websocket-limits).

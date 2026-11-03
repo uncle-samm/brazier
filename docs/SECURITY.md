@@ -10,6 +10,7 @@ starts; an invalid value (a non-positive size or interval, a timer too large
 for `erlang:send_after/3`, a malformed trusted proxy or allowed origin)
 refuses to start.
 
+<!-- docs-check: fragment an excerpt of the SecurityLimits type in beacon/transport, defaults as comments -->
 ```gleam
 pub type SecurityLimits {
   SecurityLimits(
@@ -79,29 +80,90 @@ leaks a connection slot or loses an acceptor.
 
 Override defaults via the builder:
 
+<!-- docs-check: wrap
+{{block}}
+
+pub type Model {
+  Model
+}
+
+pub type Msg {
+  Noop
+}
+
+fn init(_ctx: beacon.Context) -> Result(Model, beacon.InitError) {
+  Ok(Model)
+}
+
+pub fn update(model: Model, _msg: Msg) -> Model {
+  model
+}
+
+pub fn view(_model: Model) -> element.Element(Msg) {
+  element.text("")
+}
+-->
 ```gleam
 import beacon
+import beacon/element
 import beacon/transport
 
-beacon.simple(init:, update:, view:)
-|> beacon.security_limits(transport.SecurityLimits(
-  ..transport.default_security_limits(),
-  max_connections: 5000,
-  max_events_per_second: 100,
-))
-|> beacon.start(8080)
+pub fn main() {
+  beacon.simple(init:, update:, view:)
+  |> beacon.security_limits(transport.SecurityLimits(
+    ..transport.default_security_limits(),
+    max_connections: 5000,
+    max_events_per_second: 100,
+  ))
+  |> beacon.start(8080)
+}
 ```
 
-Route-aware apps use the same `beacon.security_limits(builder, limits)` builder
-as every other Beacon app.
+## WebSocket Limits
+
+An upgrade request is admitted in this order; the first check that fails
+answers with an HTTP status and no socket is opened:
+
+| Check | Refusal |
+|-------|---------|
+| Global `max_connections` | 503 |
+| `max_ws_connections_per_ip`, keyed on the client address resolved through `trusted_proxies` | 429 |
+| Origin (below) | 403 |
+| `ws_auth`, when configured | 401 |
+| RFC 6455 handshake (method, `Upgrade`, `Connection`, `Sec-WebSocket-Key`) | 400; an unsupported `Sec-WebSocket-Version` gets 426 |
+
+On an open socket, `max_message_bytes`, `max_events_per_second`,
+`ws_max_rate_violations`, `ws_max_decode_errors`, the ping, pong and idle
+timeouts, `ws_send_timeout_ms`, `ws_max_outbound_queue` and the
+`ws_auth_recheck_interval_ms` re-check each close the socket with a specific
+code. [WIRE_PROTOCOL.md](WIRE_PROTOCOL.md) describes each rule
+([Frames](WIRE_PROTOCOL.md#frames-rfc-6455),
+[Liveness](WIRE_PROTOCOL.md#liveness),
+[Backpressure](WIRE_PROTOCOL.md#backpressure),
+[Rate Limiting and Abuse](WIRE_PROTOCOL.md#rate-limiting-and-abuse),
+[Sessions and Authentication](WIRE_PROTOCOL.md#sessions-and-authentication))
+and lists the codes in [Close Codes](WIRE_PROTOCOL.md#close-codes).
 
 ## Origin Validation
 
-On every WebSocket upgrade, the transport checks the `Origin` header against the `Host` header. Missing origins, empty origins, empty hosts, protocol-relative values, and mismatches are rejected with HTTP 403. Non-browser clients must send an explicit same-host `Origin` header.
+Origin validation is the defence against cross-site WebSocket hijacking. On
+every upgrade the `Origin` header must equal the request's own origin, or an
+entry of `ws_allowed_origins`; scheme, host and port must all match, with the
+default port applied (80 for `http`, 443 for `https`):
+
+- the request's host and port come from its `Host` header;
+- its scheme is `http`, or the `X-Forwarded-Proto` a trusted proxy sent (see
+  Trusted Proxies);
+- a missing `Origin`, one that does not parse (empty, no scheme,
+  protocol-relative, a path), an unusable `Host` and any mismatch get 403.
+
+Non-browser clients must send an explicit `Origin`. `ws_allowed_origins`
+entries are bare `scheme://host[:port]` origins, validated at startup: an
+entry with a path, or one that does not parse, refuses to start.
 
 ## Rate Limiting
 
-**Per-connection (server-side, transport layer):** Each WebSocket connection tracks events per 1-second sliding window. When `max_events_per_second` (default 50) is exceeded, the server sends a `ServerError("Rate limited")` message and drops the event. Heartbeats are exempt from rate limiting.
+**Per-connection (server-side, transport layer):** Each WebSocket connection counts events per 1-second window. An event over `max_events_per_second` (default 50) is dropped and answered with `{"type":"error","reason":"Rate limited"}`; heartbeats have their own limit of 2 per second. Repeated violations close the socket with 1008. See [WIRE_PROTOCOL.md](WIRE_PROTOCOL.md#rate-limiting-and-abuse).
 
 **HTTP middleware:** The `middleware.rate_limit(limiter)` middleware returns HTTP 429 (with `Retry-After` set to the window length) when a client exceeds the configured request rate. It keys on the socket peer address and ignores `X-Forwarded-For` / `Forwarded`, so a client cannot get a fresh budget by inventing addresses. Behind a reverse proxy use `middleware.rate_limit_behind_proxies(limiter, trusted)` (see Trusted Proxies). A request whose peer address cannot be read gets 400.
 
@@ -118,11 +180,11 @@ With the default empty list, no forwarding header is ever honoured. Use the same
 
 ## Message Size Limits
 
-WebSocket text frames exceeding `max_message_bytes` (default 64KB) are rejected before decoding. The incomplete frame buffer is also capped before full-frame decode, so a peer cannot slowly accumulate an oversized partial frame. The server sends a `ServerError("Message too large")` response and closes the socket.
+A WebSocket frame, or a message reassembled from fragments, over `max_message_bytes` (default 64KB) closes the connection with 1009 before it is decoded. The length is checked from the frame header, so a peer cannot slowly accumulate an oversized partial frame.
 
 ## Connection Limits
 
-Global pre-upgrade and WebSocket connection count is tracked via ETS. When `max_connections` (default 10,000) is reached, new requests receive HTTP 503.
+A supervised tracker counts every HTTP and WebSocket connection. When `max_connections` (default 10,000) is reached, a new connection gets HTTP 503 before its request is read.
 
 ## HTTP Pre-Upgrade Limits
 
@@ -186,13 +248,24 @@ started or port bound. The key is never logged. `config.secret_key()` reads
 
 `beacon.start` generates a random per-process key when none is set, and warns at
 startup: tokens then die on restart and differ between nodes. Set an explicit
-key for production (generate one with `openssl rand -base64 48`):
+key for production (generate one with `openssl rand -base64 48`); the full
+`main` is in [DEPLOYMENT.md](DEPLOYMENT.md#secret-key):
 
+<!-- docs-check: wrap
+import beacon
+import beacon/config
+import beacon/error.{type BeaconError}
+import gleam/result
+
+pub fn with_secret(
+  app: beacon.App(state, model, local, msg),
+) -> Result(beacon.App(state, model, local, msg), BeaconError) {
+  {{block}}
+}
+-->
 ```gleam
-let assert Ok(secret) = config.secret_key() as "SECRET_KEY must be set"
-beacon.simple(init:, update:, view:)
-|> beacon.secret_key(secret)
-|> beacon.start(8080)
+use secret <- result.try(config.secret_key())
+Ok(beacon.secret_key(app, secret))
 ```
 
 ## CSRF Tokens
