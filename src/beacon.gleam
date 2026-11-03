@@ -66,6 +66,7 @@ import beacon/log
 import beacon/middleware
 import beacon/notification.{type Notification}
 import beacon/presence as beacon_presence
+import beacon/presence/sync as presence_sync
 import beacon/pubsub
 import beacon/runtime
 import beacon/transport
@@ -415,9 +416,16 @@ pub fn cluster(
 /// when the session ends. Every change on a tracked topic, from any node,
 /// arrives as `on_presence(diff)`: the session's first message for a topic
 /// lists everyone already there as joins, and up to 100 queued changes are
-/// coalesced into one message. Keep the entries with `presence.merge`.
+/// coalesced into one message. Keep the entries with
+/// `beacon/presence/sync.merge`. The diff, entry and meta types live in
+/// `beacon/presence/sync`, which runs in the browser, so `Msg` and the
+/// Model can carry them.
 ///
 /// ```gleam
+/// pub type Msg {
+///   PresenceChanged(sync.Diff(Profile))
+/// }
+///
 /// beacon.application(init:, update:, view:)
 /// |> beacon.presence(
 ///   tracker: presence.new("online", encode_user, user_decoder()),
@@ -436,7 +444,7 @@ pub fn presence(
   app: App(state, model, local, msg),
   tracker tracker: beacon_presence.PresenceConfig(meta),
   track track: fn(state) -> List(beacon_presence.Tracking(meta)),
-  on_presence on_presence: fn(beacon_presence.Diff(meta)) -> msg,
+  on_presence on_presence: fn(presence_sync.Diff(meta)) -> msg,
 ) -> App(state, model, local, msg) {
   App(..app, presence: Some(presence_watch.new(tracker, track, on_presence)))
 }

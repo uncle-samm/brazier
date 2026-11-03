@@ -275,7 +275,7 @@ optional `ws_auth` hook, which is rechecked every
 | `cookie`, `session`, `auth` | Cookies, server-side sessions, login/logout and session-bound WebSockets |
 | `form`, `upload` | Form helpers and CSRF; bounded multipart uploads with content sniffing |
 | `rate_limit`, `ip` | Fixed-window rate limiting; trusted-proxy client addresses |
-| `pubsub`, `presence` | Ports of Phoenix.PubSub (pg adapter) and Phoenix.Tracker |
+| `pubsub`, `presence`, `presence/sync` | Ports of Phoenix.PubSub (pg adapter) and Phoenix.Tracker; `presence/sync` holds the diff types and `merge`, which run in the browser too |
 | `store`, `store/*` | ETS stores that broadcast on change; replicated stores as an add-wins LWW CRDT |
 | `state_manager` | ETS storage behind stores |
 | `cluster` | Node discovery and reconnection ([CLUSTERING.md](CLUSTERING.md)) |
@@ -319,7 +319,7 @@ src/
   beacon/                 # Modules above
     build/                # Build pipeline
     internal/             # render, url, uri_check, context
-    presence/, store/     # Presence and replicated-store internals
+    presence/, store/     # Presence and replicated-store internals (and presence/sync)
     transport/            # HTTP/WebSocket server
   beacon_*.erl            # Erlang FFI and OTP processes
 beacon_client/src/

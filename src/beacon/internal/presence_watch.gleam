@@ -39,9 +39,10 @@
 
 import beacon/log
 import beacon/presence.{
-  type Diff, type Meta, type Presence, type PresenceConfig, type PresenceError,
-  type Tracking, Diff, Entry, Tracking,
+  type Presence, type PresenceConfig, type PresenceError, type Tracking,
+  Tracking,
 }
+import beacon/presence/sync.{type Diff, type Meta, Diff, Entry}
 import beacon/pubsub
 import gleam/dict.{type Dict}
 import gleam/dynamic.{type Dynamic}
@@ -1009,7 +1010,7 @@ fn report(
 }
 
 /// Group metas by key, ordered by key (and by ref within a key).
-fn entries(metas: List(#(String, Meta(meta)))) -> List(presence.Entry(meta)) {
+fn entries(metas: List(#(String, Meta(meta)))) -> List(sync.Entry(meta)) {
   metas
   |> list.sort(fn(a, b) {
     case string.compare(a.0, b.0) {

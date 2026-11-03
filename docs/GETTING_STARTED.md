@@ -530,6 +530,14 @@ compiles the client code to a content-hashed bundle like
 app, name it: `gleam run -m beacon/build -- src/my_app.gleam`. It needs
 `node` and `npx`.
 
+Client code is what `view`, a Local layer and a `simple` app's `update`
+reach, and the types they use, `Msg` and the Model included. It may use any
+package that compiles to JavaScript, but only these Beacon modules:
+`beacon/attribute`, `beacon/element`, `beacon/event`, `beacon/html`,
+`beacon/local`, `beacon/log`, `beacon/notification`, `beacon/presence/sync`
+and `beacon/svg`. Anything else (a store, an effect, the tracker) is a build
+error that names the file and line.
+
 On any failure it prints the reason (file and location for parse errors, type
 and field for an unsupported model field) and exits with status 1. Run it
 before `gleam run` and in every deployment; `beacon.start` never builds.

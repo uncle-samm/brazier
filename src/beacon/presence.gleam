@@ -27,11 +27,14 @@
 ///   pass the Diff to `decode_diff`.
 /// - **Limits.** Every violation is an `Error`.
 /// - **In an app**, `beacon.presence` tracks a session's `Tracking`s from
-///   its state and hands the app every change as a `Diff`; `merge` applies
-///   one to the entries the app keeps (Phoenix.Presence's `syncDiff`).
+///   its state and hands the app every change as a `Diff`;
+///   `beacon/presence/sync.merge` applies one to the entries the app keeps
+///   (Phoenix.Presence's `syncDiff`). `Meta`, `Entry` and `Diff` live in
+///   `beacon/presence/sync` so that they can reach the browser.
 ///
 /// See docs/CLUSTERING.md.
 import beacon/log
+import beacon/presence/sync.{type Diff, type Entry, Diff, Entry, Meta}
 import beacon/pubsub
 import beacon/telemetry
 import gleam/bit_array
@@ -47,23 +50,6 @@ import gleam/otp/actor
 import gleam/otp/supervision
 import gleam/result
 import gleam/string
-
-/// One tracked entry's meta, from any node.
-pub type Meta(meta) {
-  Meta(value: meta, ref: String, ref_prev: Option(String), node: String)
-}
-
-/// Everything tracked under one key on a topic: one meta per tracking
-/// process (several when the same key is tracked from several places).
-pub type Entry(meta) {
-  Entry(key: String, metas: List(Meta(meta)))
-}
-
-/// What changed on a topic. An update is a leave of the old meta and a
-/// join of the new one.
-pub type Diff(meta) {
-  Diff(topic: String, joins: List(Entry(meta)), leaves: List(Entry(meta)))
-}
 
 /// What a session is present as: `key` on `topic`, with `meta`. A
 /// `beacon.presence` app computes these from its state after every update.
@@ -790,48 +776,6 @@ fn sort_rows(
   rows: List(#(String, Pid, String, StoredMeta)),
 ) -> List(#(String, Pid, String, StoredMeta)) {
   list.sort(rows, fn(a, b) { string.compare(a.0, b.0) })
-}
-
-/// Apply `diff` to `entries` (Phoenix.Presence's `syncDiff`): joins add
-/// the metas whose refs are not there yet, then leaves remove the metas
-/// with their refs, and keys left without metas are dropped. Applying a
-/// diff twice changes nothing more. The result is ordered by key, like
-/// `list`.
-///
-/// ```gleam
-/// OnlineChanged(diff) ->
-///   Model(..model, online: presence.merge(model.online, diff))
-/// ```
-pub fn merge(
-  entries: List(Entry(meta)),
-  diff: Diff(meta),
-) -> List(Entry(meta)) {
-  let joined =
-    list.fold(diff.joins, entries, fn(acc, join) {
-      let #(same, others) =
-        list.partition(acc, fn(entry) { entry.key == join.key })
-      let present = list.flat_map(same, fn(entry) { entry.metas })
-      let added =
-        list.filter(join.metas, fn(meta) {
-          !list.any(present, fn(existing) { existing.ref == meta.ref })
-        })
-      [Entry(key: join.key, metas: list.append(present, added)), ..others]
-    })
-  let leaving =
-    list.flat_map(diff.leaves, fn(entry) {
-      list.map(entry.metas, fn(meta) { meta.ref })
-    })
-  joined
-  |> list.map(fn(entry) {
-    Entry(
-      ..entry,
-      metas: list.filter(entry.metas, fn(meta) {
-        !list.contains(leaving, meta.ref)
-      }),
-    )
-  })
-  |> list.filter(fn(entry) { entry.metas != [] })
-  |> list.sort(fn(a, b) { string.compare(a.key, b.key) })
 }
 
 // --- Introspection ---

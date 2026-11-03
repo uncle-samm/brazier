@@ -10,8 +10,9 @@ import beacon/cluster/peer.{type Peer, Timeout}
 import beacon/effect
 import beacon/error
 import beacon/internal/presence_watch
-import beacon/presence.{type Diff, type Entry, type Presence, Tracking}
+import beacon/presence.{type Presence, Tracking}
 import beacon/presence/holder.{type Holder}
+import beacon/presence/sync.{type Diff, type Entry}
 import beacon/pubsub
 import beacon/runtime
 import beacon/test_ctx
@@ -95,7 +96,7 @@ fn session_config(
         Leave -> #(Model(..model, room: None), effect.none())
         SetStatus(status) -> #(Model(..model, status:), effect.none())
         Online(diff) -> {
-          let online = presence.merge(model.online, diff)
+          let online = sync.merge(model.online, diff)
           process.send(proof, #(diff, online))
           #(Model(..model, online:), effect.none())
         }

@@ -7,8 +7,9 @@
 //// always `peer.eventually` with a deadline.
 
 import beacon/cluster/peer.{type Peer, Timeout}
-import beacon/presence.{type Presence, Diff, Down, Entry, Up}
+import beacon/presence.{type Presence, Down, Up}
 import beacon/presence/holder.{type Holder}
+import beacon/presence/sync.{Diff, Entry}
 import beacon/pubsub
 import gleam/dynamic.{type Dynamic}
 import gleam/dynamic/decode
@@ -138,7 +139,7 @@ fn diffs(
   })
 }
 
-fn flatten(entries: List(presence.Entry(String))) -> List(String) {
+fn flatten(entries: List(sync.Entry(String))) -> List(String) {
   list.flat_map(entries, fn(entry) {
     list.map(entry.metas, fn(meta) { entry.key <> "=" <> meta.value })
   })
@@ -250,7 +251,7 @@ pub fn rapid_changes_converge_test_() -> peer.Timeout {
 }
 
 fn result_values(
-  outcome: Result(presence.Entry(String), presence.PresenceError),
+  outcome: Result(sync.Entry(String), presence.PresenceError),
 ) -> List(String) {
   case outcome {
     Ok(entry) -> list.map(entry.metas, fn(meta) { meta.value })
