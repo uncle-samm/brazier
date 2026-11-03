@@ -2,9 +2,9 @@
 //// on peer nodes: the shared test VM already runs PubSub and the session
 //// scope unlinked, and the tree refuses to start beside them.
 ////
-//// Children, in start order (RestForOne): PubSub, the cluster manager,
-//// the session scope, the presence tracker, the listener (the cluster
-//// manager and the tracker only when configured). A crash restarts the
+//// Children, in start order (RestForOne): the ETS table owner, PubSub, the
+//// cluster manager, the session scope, the presence tracker, the listener
+//// (the cluster manager and the tracker only when configured). A crash restarts the
 //// child and every child after it, never one before it.
 
 import beacon/app_config_fixture
@@ -130,7 +130,7 @@ pub fn tree_runs_children_in_order_test_() -> peer.Timeout {
   use peers <- peer.with_cluster(1, "beacon_tree_order")
   let assert [p] = peers
   let app = start_tree(p, clustered_config())
-  let assert [pubsub_sup, cluster_manager, scope, listener] =
+  let assert [_ets_owner, pubsub_sup, cluster_manager, scope, listener] =
     children_on(p, app)
   let assert Ok(named_pubsub) =
     peer.on(p, fn() { whereis_name("beacon_pubsub_sup") })
@@ -151,8 +151,8 @@ pub fn listener_crash_restarts_only_the_listener_test_() -> peer.Timeout {
   use peers <- peer.with_cluster(1, "beacon_tree_listener")
   let assert [p] = peers
   let app = start_tree(p, clustered_config())
-  let #(before, after) = crash_child(p, app, 3)
-  let assert [True, True, True, False] = kept(before, after)
+  let #(before, after) = crash_child(p, app, 4)
+  let assert [True, True, True, True, False] = kept(before, after)
   // The restarted listener binds the same port again.
   let assert True = get_ok(p, app)
   Nil
@@ -163,8 +163,8 @@ pub fn session_scope_crash_restarts_scope_and_listener_test_() -> peer.Timeout {
   use peers <- peer.with_cluster(1, "beacon_tree_scope")
   let assert [p] = peers
   let app = start_tree(p, clustered_config())
-  let #(before, after) = crash_child(p, app, 2)
-  let assert [True, True, False, False] = kept(before, after)
+  let #(before, after) = crash_child(p, app, 3)
+  let assert [True, True, True, False, False] = kept(before, after)
   let assert True = peer.on(p, session.registry_running)
   let assert True = get_ok(p, app)
   Nil
@@ -175,8 +175,8 @@ pub fn cluster_crash_restarts_everything_after_it_test_() -> peer.Timeout {
   use peers <- peer.with_cluster(1, "beacon_tree_cluster")
   let assert [p] = peers
   let app = start_tree(p, clustered_config())
-  let #(before, after) = crash_child(p, app, 1)
-  let assert [True, False, False, False] = kept(before, after)
+  let #(before, after) = crash_child(p, app, 2)
+  let assert [True, True, False, False, False] = kept(before, after)
   let assert Ok(_) = peer.on(p, cluster.members)
   let assert True = get_ok(p, app)
   Nil
@@ -187,8 +187,8 @@ pub fn pubsub_crash_restarts_the_whole_tree_test_() -> peer.Timeout {
   use peers <- peer.with_cluster(1, "beacon_tree_pubsub")
   let assert [p] = peers
   let app = start_tree(p, clustered_config())
-  let #(before, after) = crash_child(p, app, 0)
-  let assert [False, False, False, False] = kept(before, after)
+  let #(before, after) = crash_child(p, app, 1)
+  let assert [True, False, False, False, False] = kept(before, after)
   // PubSub works again: a subscriber on the new partitions gets broadcasts.
   let assert Ok("hello") =
     peer.on(p, fn() {
@@ -200,14 +200,14 @@ pub fn pubsub_crash_restarts_the_whole_tree_test_() -> peer.Timeout {
   Nil
 }
 
-pub fn tree_without_cluster_has_three_children_test_() -> peer.Timeout {
+pub fn tree_without_cluster_has_four_children_test_() -> peer.Timeout {
   use <- Timeout(60)
   use peers <- peer.with_cluster(1, "beacon_tree_nocluster")
   let assert [p] = peers
   let app = start_tree(p, config())
-  let assert [_pubsub, _scope, _listener] = children_on(p, app)
-  let #(before, after) = crash_child(p, app, 1)
-  let assert [True, False, False] = kept(before, after)
+  let assert [_ets_owner, _pubsub, _scope, _listener] = children_on(p, app)
+  let #(before, after) = crash_child(p, app, 2)
+  let assert [True, True, False, False] = kept(before, after)
   let assert True = get_ok(p, app)
   Nil
 }
@@ -217,7 +217,8 @@ pub fn tree_with_presence_runs_the_tracker_before_the_listener_test_() -> peer.T
   use peers <- peer.with_cluster(1, "beacon_tree_presence")
   let assert [p] = peers
   let app = start_tree(p, presence_config(tracker_config()))
-  let assert [_pubsub, _cluster, scope, tracker, listener] = children_on(p, app)
+  let assert [_ets_owner, _pubsub, _cluster, scope, tracker, listener] =
+    children_on(p, app)
   let assert Ok(named_scope) =
     peer.on(p, fn() { whereis_name("beacon_session_pg") })
   let assert Ok(named_tracker) =
@@ -226,8 +227,8 @@ pub fn tree_with_presence_runs_the_tracker_before_the_listener_test_() -> peer.T
   let assert True = tracker == named_tracker
   let assert True = listener == server.get_supervisor(app.listener)
   // A tracker crash restarts the tracker and the listener only.
-  let #(before, after) = crash_child(p, app, 3)
-  let assert [True, True, True, False, False] = kept(before, after)
+  let #(before, after) = crash_child(p, app, 4)
+  let assert [True, True, True, True, False, False] = kept(before, after)
   let assert True = tracker_running(p)
   let assert True = get_ok(p, app)
   Nil
@@ -374,7 +375,7 @@ pub fn wait_forever_crashes_when_the_tree_gives_up_test_() -> peer.Timeout {
       list.each([1, 2], fn(_) {
         let victim = listener_pid(app)
         crash(app.supervisor_pid, victim)
-        await_restart(app.supervisor_pid, 2, victim)
+        await_restart(app.supervisor_pid, 3, victim)
       })
       crash(app.supervisor_pid, listener_pid(app))
       let down =
@@ -390,7 +391,7 @@ pub fn wait_forever_crashes_when_the_tree_gives_up_test_() -> peer.Timeout {
 }
 
 fn listener_pid(app: App) -> Pid {
-  let assert [_, _, listener] = children(app.supervisor_pid)
+  let assert [_, _, _, listener] = children(app.supervisor_pid)
   listener
 }
 

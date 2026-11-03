@@ -100,6 +100,17 @@ tables are owned by a long-lived Beacon table-owner process, not by the
 caller, so a store created inside a request handler, a runtime or `init`
 survives that process exiting.
 
+Under `beacon.start` the table owner is the first child of the application's
+supervision tree, so a restart of PubSub, the session scope or the listener
+never touches store data. A store created in `main` before `beacon.start`
+keeps its contents: the tree's owner adopts the table. `application.stop`
+deletes every local store's table, so a store handle from before the stop
+must not be used after it (it crashes with `badarg`). If the owner itself
+crashes while it owns tables, their data is gone: Beacon does not restart it
+with empty tables but stops the application loudly, and creating a store on
+that node fails with `TableOwnerUnavailable` until the application starts
+again. See [ARCHITECTURE.md](ARCHITECTURE.md#supervision-applicationgleam).
+
 Store names are developer-chosen constants: 1-255 bytes of `[A-Za-z0-9_-]`
 (they become ETS table atoms; never derive a name from user input).
 `store.new` / `store.new_list` log and crash loudly on an invalid name; use

@@ -4,8 +4,9 @@
 /// Reference: Reflex.dev state manager (in-memory dict → Redis).
 import beacon/log
 import gleam/dict.{type Dict}
-import gleam/erlang/process.{type Subject}
+import gleam/erlang/process.{type Pid, type Subject}
 import gleam/otp/actor
+import gleam/otp/supervision
 
 /// Messages for the state manager actor.
 pub type StateManagerMessage(state) {
@@ -114,7 +115,9 @@ pub fn count(
 ///
 /// The table is owned by a long-lived, node-wide owner process rather than
 /// the caller, so it survives the process that created it (a request handler,
-/// a runtime, a test). Creation is idempotent: starting a manager with a name
+/// a runtime, a test). Under `application.start_supervised` that owner is a
+/// child of the root tree (`table_owner_supervised`), and stopping the tree
+/// deletes the table. Creation is idempotent: starting a manager with a name
 /// that already exists returns the same table.
 ///
 /// Note: ETS tables use Erlang terms, so state must be serializable.
@@ -185,6 +188,52 @@ pub fn describe_ets_error(err: EtsError) -> String {
       "table owner could not create \"" <> name <> "\": " <> reason
   }
 }
+
+/// The ETS table owner as a child of the application's root tree (the first
+/// one, so no other child's restart deletes the tables). It adopts the
+/// tables of the owner started on demand before the tree (stores created in
+/// `main`), and stopping the tree deletes every table it owns.
+///
+/// An owner that crashes owning tables is not restarted empty: its restart
+/// fails, so the supervisor gives up and the application stops, and the node
+/// refuses to create tables until it restarts. The store handles the
+/// application holds name tables that are gone, so continuing with empty
+/// ones would silently lose their data.
+pub fn table_owner_supervised() -> supervision.ChildSpecification(Nil) {
+  let tree = ffi_new_owner_tree()
+  supervision.worker(fn() {
+    case ffi_start_supervised_owner(tree) {
+      Ok(pid) -> {
+        log.info(
+          "beacon.state_manager",
+          "ETS table owner running under the tree",
+        )
+        Ok(actor.Started(pid: pid, data: Nil))
+      }
+      // Already logged with the cause by the owner FFI.
+      Error(reason) -> Error(actor.InitFailed(reason))
+    }
+  })
+}
+
+/// Whether the ETS table owner running on this node belongs to a supervision
+/// tree; Error(Nil) when no owner runs.
+@internal
+pub fn table_owner_is_supervised() -> Result(Bool, Nil) {
+  ffi_owner_supervised()
+}
+
+/// Opaque per-tree record of how many tables the tree's owner holds.
+type OwnerTree
+
+@external(erlang, "beacon_ets_ffi", "new_owner_tree")
+fn ffi_new_owner_tree() -> OwnerTree
+
+@external(erlang, "beacon_ets_ffi", "start_supervised_owner")
+fn ffi_start_supervised_owner(tree: OwnerTree) -> Result(Pid, String)
+
+@external(erlang, "beacon_ets_ffi", "owner_supervised")
+fn ffi_owner_supervised() -> Result(Bool, Nil)
 
 /// Start (or reuse) an ETS-based state manager.
 /// Calling this twice with the same name returns the same table.

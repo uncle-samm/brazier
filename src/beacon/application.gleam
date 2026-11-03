@@ -4,11 +4,18 @@
 /// `start_supervised` (what `beacon.start` uses) runs everything under one
 /// root supervisor with the `RestForOne` strategy, children in this order:
 ///
-/// 1. PubSub (`pubsub.supervised`)
-/// 2. the cluster manager, when configured (`cluster.supervised`)
-/// 3. the session revocation scope (`session.registry_supervised`)
-/// 4. the presence tracker, when configured (`presence.supervised`)
-/// 5. the HTTP/WebSocket listener (`transport.supervised`)
+/// 1. the ETS table owner (`state_manager.table_owner_supervised`)
+/// 2. PubSub (`pubsub.supervised`)
+/// 3. the cluster manager, when configured (`cluster.supervised`)
+/// 4. the session revocation scope (`session.registry_supervised`)
+/// 5. the presence tracker, when configured (`presence.supervised`)
+/// 6. the HTTP/WebSocket listener (`transport.supervised`)
+///
+/// The table owner holds the stores' data, so it comes first: no other
+/// child's restart may delete its tables. It adopts the tables of stores
+/// created before the tree (in `main`), and `stop` deletes them. An owner
+/// that crashes owning tables is not restarted empty: the restart fails and
+/// the tree gives up, because every store handle now names a lost table.
 ///
 /// A child that crashes is restarted together with every child after it:
 /// a PubSub restart also restarts the cluster manager, the session scope,
@@ -44,6 +51,7 @@ import beacon/pubsub
 import beacon/runtime
 import beacon/session
 import beacon/ssr
+import beacon/state_manager
 import beacon/static
 import beacon/telemetry
 import beacon/transport
@@ -289,6 +297,7 @@ pub fn start_supervised(
 
   let builder =
     supervisor.new(supervisor.RestForOne)
+    |> supervisor.add(state_manager.table_owner_supervised())
     |> supervisor.add(pubsub_child)
   let builder = case cluster_child {
     Some(child) -> supervisor.add(builder, child)
@@ -335,9 +344,11 @@ pub fn start_supervised(
 }
 
 /// Stop an application: shuts the tree down child by child in reverse
-/// start order (listener first, PubSub last) and returns once every
-/// process of the tree has exited. For an app from `start`, this stops the
-/// listener only (the shared infrastructure keeps running).
+/// start order (listener first, the ETS table owner last) and returns once
+/// every process of the tree has exited. The owner's tables go with it, so a
+/// store from before the stop must not be used after it. For an app from
+/// `start`, this stops the listener only (the shared infrastructure keeps
+/// running).
 ///
 /// Stopping is a normal exit, so a linked caller is not taken down.
 pub fn stop(app: App) -> Result(Nil, error.BeaconError) {

@@ -244,6 +244,31 @@ queue, and decode errors. Forwarding headers are honoured only from
 optional `ws_auth` hook, which is rechecked every
 `ws_auth_recheck_interval_ms`. See [SECURITY.md](SECURITY.md).
 
+## Supervision (`application.gleam`)
+
+`beacon.start` runs `application.start_supervised`: one root supervisor with
+the `RestForOne` strategy, so a crashing child restarts with every child
+after it and never one before it. The children, in start order:
+
+1. **The ETS table owner** (`state_manager.table_owner_supervised`). It owns
+   every local store's table, so it comes first: no other child's restart
+   deletes store data. Stores are usually created in `main` before the tree,
+   by an owner started on demand; the supervised owner takes that owner's
+   name and its tables (`ets:give_away/3`), so the data is kept. Stopping
+   the tree stops the owner and deletes its tables. An owner that crashes
+   owning tables is not restarted empty: its restart fails, the supervisor
+   gives up, `wait_forever` crashes the main process, and the node refuses
+   to create tables on demand until a new tree starts. An owner that owned
+   no table restarts normally.
+2. **PubSub** (`pubsub.supervised`).
+3. **The cluster manager**, when configured (`cluster.supervised`).
+4. **The session revocation scope** (`session.registry_supervised`).
+5. **The presence tracker**, when configured (`presence.supervised`).
+6. **The HTTP/WebSocket listener** (`transport.supervised`).
+
+`application.start` (tests, embedding) starts the shared infrastructure
+unsupervised, and the table owner on demand runs until the node stops.
+
 ## Modules
 
 ### View
