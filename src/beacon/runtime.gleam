@@ -37,6 +37,19 @@
 /// arrive as dispatched effects. The watcher is linked: if it fails (PubSub
 /// or the tracker gone for good, a refused track) the runtime exits with
 /// its reason and the clients reconnect.
+///
+/// ## Telemetry
+///
+/// `start` runs inside a `[beacon, runtime, mount]` span; every client
+/// event's `update` inside `[beacon, runtime, handle_event]`; a client
+/// navigation's (or a join's route change) inside `[beacon, runtime,
+/// navigate]`; every broadcast to joined connections inside `[beacon,
+/// runtime, render]`. `event` is the message's constructor name in
+/// snake_case (`SetCount(9)` is `"set_count"`), or
+/// `"unknown"` for an event or path the app does not handle, so the label
+/// set stays the app's finite set of constructors. `route` is
+/// `transport.page_route`: the typed router has no patterns. A `Shutdown`
+/// emits `[beacon, runtime, stop]` with the runtime's uptime.
 import beacon/cookie
 import beacon/effect.{type Effect}
 import beacon/error
@@ -48,6 +61,7 @@ import beacon/notification.{type Notification, Notification}
 import beacon/patch
 import beacon/pubsub
 import beacon/ssr
+import beacon/telemetry
 import beacon/transport
 import beacon/transport/server
 import gleam/dict.{type Dict}
@@ -186,6 +200,8 @@ pub type RuntimeState(model, msg) {
     effect_processes: List(Pid),
     /// The session's presence watcher, when the app has presence.
     presence: Option(presence_watch.Watcher(model)),
+    /// Native monotonic time the runtime started, for its uptime.
+    started_at: Int,
   )
 }
 
@@ -240,6 +256,23 @@ pub fn start(
   config: RuntimeConfig(model, msg),
   ctx: Context,
 ) -> Result(Subject(RuntimeMessage(msg)), error.BeaconError) {
+  log.debug(
+    "beacon.runtime",
+    "Starting a runtime outside the transport for " <> context.uri(ctx).path,
+  )
+  start_for(config, ctx, no_connection)
+}
+
+/// The `connection_id` telemetry label of work no connection caused (an
+/// effect's message, a runtime started outside the transport).
+const no_connection = "none"
+
+/// `start`, with the connection the mount span is reported for.
+fn start_for(
+  config: RuntimeConfig(model, msg),
+  ctx: Context,
+  connection_id: String,
+) -> Result(Subject(RuntimeMessage(msg)), error.BeaconError) {
   let page_uri = context.uri(ctx)
   case uri_check.check(page_uri) {
     Error(reason) -> {
@@ -252,7 +285,14 @@ pub fn start(
       )
       Error(error.RuntimeError(reason: "Invalid page URL: " <> reason))
     }
-    Ok(Nil) -> start_actor(config, ctx, page_uri)
+    Ok(Nil) ->
+      telemetry.runtime_span(
+        telemetry.Mount,
+        transport.page_route,
+        "mount",
+        connection_id,
+        fn() { start_actor(config, ctx, page_uri) },
+      )
   }
 }
 
@@ -261,6 +301,7 @@ fn start_actor(
   ctx: Context,
   page_uri: Uri,
 ) -> Result(Subject(RuntimeMessage(msg)), error.BeaconError) {
+  let started_at = monotonic_time()
   let #(initial_model, init_effects) = config.init(ctx)
   let #(initial_model, route_effects, route_msg) = case config.route {
     None -> #(initial_model, effect.none(), None)
@@ -320,6 +361,7 @@ fn start_actor(
           cached_model: NoCache,
           effect_processes: initial_effect_processes,
           presence: watcher,
+          started_at: started_at,
         )
       log.debug("beacon.runtime", "Runtime initialising")
 
@@ -498,20 +540,34 @@ fn handle_message(
             state.decode_event(event_name, handler_id, event_data, target_path)
           {
             Ok(msg) -> {
-              let #(state, changed) = run_update_for(state, msg, Some(conn_id))
+              let #(state, changed) =
+                run_update_for(
+                  state,
+                  msg,
+                  Some(conn_id),
+                  Some(telemetry.HandleEvent),
+                )
               actor.continue(ack_if_unchanged(state, conn_id, changed))
             }
-            Error(err) -> {
-              let err_str = error.to_string(err)
-              log.warning(
-                "beacon.runtime",
-                "Failed to decode event from " <> conn_id <> ": " <> err_str,
+            Error(err) ->
+              telemetry.runtime_span(
+                telemetry.HandleEvent,
+                transport.page_route,
+                unknown_event,
+                conn_id,
+                fn() {
+                  let err_str = error.to_string(err)
+                  log.warning(
+                    "beacon.runtime",
+                    "Failed to decode event from " <> conn_id <> ": " <> err_str,
+                  )
+                  send_to_conn_id(state, conn_id, transport.SendError(err_str))
+                  // The rejected event is still acknowledged so the client
+                  // drops its optimistic state and returns to the server's
+                  // model.
+                  actor.continue(ack_if_unchanged(state, conn_id, False))
+                },
               )
-              send_to_conn_id(state, conn_id, transport.SendError(err_str))
-              // The rejected event is still acknowledged so the client drops
-              // its optimistic state and returns to the server's model.
-              actor.continue(ack_if_unchanged(state, conn_id, False))
-            }
           }
         }
       }
@@ -561,7 +617,7 @@ fn handle_message(
 
     EffectDispatched(msg) -> {
       log.debug("beacon.runtime", "Effect dispatched a message")
-      let #(state, _changed) = run_update_for(state, msg, None)
+      let #(state, _changed) = run_update_for(state, msg, None, None)
       actor.continue(state)
     }
 
@@ -569,7 +625,7 @@ fn handle_message(
       case effect.is_current_key_generation(key, generation) {
         True -> {
           log.debug("beacon.runtime", "Keyed effect dispatched for key " <> key)
-          let #(state, _changed) = run_update_for(state, msg, None)
+          let #(state, _changed) = run_update_for(state, msg, None, None)
           actor.continue(state)
         }
         False -> {
@@ -584,6 +640,7 @@ fn handle_message(
 
     Shutdown -> {
       log.info("beacon.runtime", "Runtime shutting down")
+      telemetry.runtime_stop(monotonic_time() - state.started_at, "shutdown")
       stop_listener(state.listener_subject)
       stop_effect_processes(state.effect_processes)
       case state.presence {
@@ -848,6 +905,14 @@ fn handle_batch(
             )
             Error(err) -> {
               let reason = error.to_string(err)
+              // The rejection itself is the event's span: nothing ran.
+              telemetry.runtime_span(
+                telemetry.HandleEvent,
+                transport.page_route,
+                unknown_event,
+                conn_id,
+                fn() { Nil },
+              )
               log.warning(
                 "beacon.runtime",
                 "Event rejected in batch from "
@@ -880,7 +945,7 @@ fn handle_batch(
             ),
           )
       }
-      let #(state, changed) = broadcast_model(state)
+      let #(state, changed) = broadcast_model(state, "batch", Some(conn_id))
       let state = reconcile_subscriptions(state)
       ack_if_unchanged(state, conn_id, changed)
     }
@@ -991,8 +1056,47 @@ fn handle_navigation(
   conn_id: transport.ConnectionId,
   path: String,
 ) -> RuntimeState(model, msg) {
-  case state.route {
-    None -> {
+  let resolved = case state.route {
+    None -> Error(NoRouter)
+    Some(route) ->
+      route_for_path(route, state.page_uri, path)
+      |> result.map_error(Unroutable)
+  }
+  case resolved {
+    Ok(msg) -> {
+      let state = RuntimeState(..state, current_route_msg: Some(msg))
+      let #(state, _changed) =
+        run_update_for(state, msg, Some(conn_id), Some(telemetry.Navigate))
+      state
+    }
+    Error(problem) ->
+      telemetry.runtime_span(
+        telemetry.Navigate,
+        transport.page_route,
+        unknown_event,
+        conn_id,
+        fn() { refuse_navigation(state, conn_id, path, problem) },
+      )
+  }
+}
+
+/// Why a client navigation is not run in place.
+type NavigationProblem {
+  /// The app has no router: every navigation loads the page.
+  NoRouter
+  Unroutable(PathProblem)
+}
+
+/// Answer a navigation that does not run `on_change`: a hard navigation
+/// (the dead render answers it), or an error for a non-local path.
+fn refuse_navigation(
+  state: RuntimeState(model, msg),
+  conn_id: transport.ConnectionId,
+  path: String,
+  problem: NavigationProblem,
+) -> RuntimeState(model, msg) {
+  case problem {
+    NoRouter -> {
       log.warning(
         "beacon.runtime",
         "Navigation to "
@@ -1003,14 +1107,9 @@ fn handle_navigation(
       )
       hard_navigate(state, conn_id, path)
     }
-    Some(route) ->
-      case route_for_path(route, state.page_uri, path) {
-        Ok(msg) -> {
-          let state = RuntimeState(..state, current_route_msg: Some(msg))
-          let #(state, _changed) = run_update_for(state, msg, Some(conn_id))
-          state
-        }
-        Error(NotLocal) -> {
+    Unroutable(problem) ->
+      case problem {
+        NotLocal -> {
           log.warning(
             "beacon.runtime",
             "Navigation from "
@@ -1025,7 +1124,7 @@ fn handle_navigation(
           )
           state
         }
-        Error(BadEncoding(reason)) -> {
+        BadEncoding(reason) -> {
           log.warning(
             "beacon.runtime",
             "Navigation from "
@@ -1038,7 +1137,7 @@ fn handle_navigation(
           )
           hard_navigate(state, conn_id, path)
         }
-        Error(UnknownRoute) -> {
+        UnknownRoute -> {
           log.info(
             "beacon.runtime",
             "Navigation from "
@@ -1088,7 +1187,13 @@ fn route_join(
                 "Join path " <> path <> " changes the route; running on_change",
               )
               let state = RuntimeState(..state, current_route_msg: Some(msg))
-              let #(state, _changed) = run_update_for(state, msg, Some(conn_id))
+              let #(state, _changed) =
+                run_update_for(
+                  state,
+                  msg,
+                  Some(conn_id),
+                  Some(telemetry.Navigate),
+                )
               state
             }
           }
@@ -1121,14 +1226,29 @@ fn describe_uri(page_uri: Uri) -> String {
 /// Run the update cycle: update model → broadcast the client-visible change
 /// → run effects → reconcile subscriptions. Returns whether a patch or
 /// model_sync was broadcast.
+///
+/// With `span`, the update runs inside that runtime span (a client event or
+/// navigation); an effect's message has none.
 fn run_update_for(
   state: RuntimeState(model, msg),
   msg: msg,
   conn_id: Option(transport.ConnectionId),
+  span: Option(telemetry.RuntimeSpan),
 ) -> #(RuntimeState(model, msg), Bool) {
-  let #(new_model, effects) = state.update(state.model, msg)
+  let label = event_label(msg)
+  let #(new_model, effects) = case span {
+    None -> state.update(state.model, msg)
+    Some(kind) ->
+      telemetry.runtime_span(
+        kind,
+        transport.page_route,
+        label,
+        connection_label(conn_id),
+        fn() { state.update(state.model, msg) },
+      )
+  }
   let #(state, changed) =
-    broadcast_model(RuntimeState(..state, model: new_model))
+    broadcast_model(RuntimeState(..state, model: new_model), label, conn_id)
   let effect_processes =
     run_effects_with_context(effects, state.self, conn_id, state.connections)
   let state = track_effect_processes(state, effect_processes)
@@ -1197,7 +1317,14 @@ fn run_update_only(
   msg: msg,
   conn_id: Option(transport.ConnectionId),
 ) -> RuntimeState(model, msg) {
-  let #(new_model, effects) = state.update(state.model, msg)
+  let #(new_model, effects) =
+    telemetry.runtime_span(
+      telemetry.HandleEvent,
+      transport.page_route,
+      event_label(msg),
+      connection_label(conn_id),
+      fn() { state.update(state.model, msg) },
+    )
   let effect_processes =
     run_effects_with_context(effects, state.self, conn_id, state.connections)
   track_effect_processes(
@@ -1375,8 +1502,14 @@ fn model_too_large(
 /// Broadcast the current model to every joined connection: a patch when
 /// the cache can be diffed, a full model_sync otherwise, nothing when the
 /// client-visible JSON is unchanged. Returns whether anything was sent.
+///
+/// With joined connections, the broadcast is a `[beacon, runtime, render]`
+/// span for `event` (the message's label, or `"batch"`); with none,
+/// nothing is rendered and nothing is emitted.
 fn broadcast_model(
   state: RuntimeState(model, msg),
+  event: String,
+  conn_id: Option(transport.ConnectionId),
 ) -> #(RuntimeState(model, msg), Bool) {
   let targets = set.to_list(state.joined)
   case targets {
@@ -1384,57 +1517,72 @@ fn broadcast_model(
       log.debug("beacon.runtime", "No joined connections; nothing to broadcast")
       #(RuntimeState(..state, cached_model: NoCache), False)
     }
-    _ -> {
-      let model_json = state.model_encoder(state.model)
-      let snapshot = FullModelCache(json: model_json)
-      case check_model_size(string.byte_size(model_json), "broadcast") {
-        TooLarge(size) -> #(
-          model_too_large(state, targets, size, "broadcast"),
-          False,
-        )
-        SizeOk ->
-          case diff_snapshot(state.cached_model, model_json) {
-            Unchanged -> {
-              log.debug("beacon.runtime", "Model unchanged, skipping broadcast")
-              #(RuntimeState(..state, cached_model: snapshot), False)
-            }
-            Changed(ops_json) -> {
-              let revision = state.revision + 1
-              let state =
-                RuntimeState(
-                  ..state,
-                  revision: revision,
-                  cached_model: snapshot,
-                )
-              log.debug(
-                "beacon.runtime",
-                "Broadcasting patch revision " <> int.to_string(revision),
-              )
-              list.each(targets, fn(conn_id) {
-                send_to_conn_id(
-                  state,
-                  conn_id,
-                  transport.SendPatch(
-                    ops_json: ops_json,
-                    version: revision,
-                    ack_clock: ack_for(state, conn_id),
-                  ),
-                )
-              })
-              #(state, True)
-            }
-            Resync -> {
-              log.debug(
-                "beacon.runtime",
-                "No usable cache; broadcasting full model_sync",
-              )
-              let state = RuntimeState(..state, revision: state.revision + 1)
-              let state = send_model_sync_to(state, targets, "broadcast_resync")
-              #(state, True)
-            }
-          }
+    _ ->
+      telemetry.runtime_render_span(
+        transport.page_route,
+        event,
+        connection_label(conn_id),
+        fn() {
+          let #(state, changed, sent_bytes) = broadcast_to(state, targets)
+          #(#(state, changed), sent_bytes)
+        },
+      )
+  }
+}
+
+/// The broadcast to a non-empty `targets`. The `Int` is the size in bytes
+/// of what each connection was sent: the patch ops, the model on a
+/// resync, 0 when nothing was sent.
+fn broadcast_to(
+  state: RuntimeState(model, msg),
+  targets: List(transport.ConnectionId),
+) -> #(RuntimeState(model, msg), Bool, Int) {
+  let model_json = state.model_encoder(state.model)
+  let model_bytes = string.byte_size(model_json)
+  let snapshot = FullModelCache(json: model_json)
+  case check_model_size(model_bytes, "broadcast") {
+    TooLarge(size) -> #(
+      model_too_large(state, targets, size, "broadcast"),
+      False,
+      0,
+    )
+    SizeOk ->
+      case diff_snapshot(state.cached_model, model_json) {
+        Unchanged -> {
+          log.debug("beacon.runtime", "Model unchanged, skipping broadcast")
+          #(RuntimeState(..state, cached_model: snapshot), False, 0)
+        }
+        Changed(ops_json) -> {
+          let revision = state.revision + 1
+          let state =
+            RuntimeState(..state, revision: revision, cached_model: snapshot)
+          log.debug(
+            "beacon.runtime",
+            "Broadcasting patch revision " <> int.to_string(revision),
+          )
+          list.each(targets, fn(conn_id) {
+            send_to_conn_id(
+              state,
+              conn_id,
+              transport.SendPatch(
+                ops_json: ops_json,
+                version: revision,
+                ack_clock: ack_for(state, conn_id),
+              ),
+            )
+          })
+          #(state, True, string.byte_size(ops_json))
+        }
+        Resync -> {
+          log.debug(
+            "beacon.runtime",
+            "No usable cache; broadcasting full model_sync",
+          )
+          let state = RuntimeState(..state, revision: state.revision + 1)
+          let state = send_model_sync_to(state, targets, "broadcast_resync")
+          #(state, True, model_bytes)
+        }
       }
-    }
   }
 }
 
@@ -1651,6 +1799,22 @@ fn send_to_connection(
 @external(erlang, "beacon_runtime_ffi", "message_queue_len")
 fn process_message_queue_len(pid: Pid) -> Int
 
+/// The telemetry `event` of an app message: its constructor name in
+/// snake_case (the atom the BEAM uses for it), or
+/// `"unknown"` for a message type without constructors (a String or Int).
+@external(erlang, "beacon_runtime_ffi", "event_label")
+fn event_label(msg: msg) -> String
+
+/// The telemetry `event` of an event or path the app does not handle.
+const unknown_event = "unknown"
+
+fn connection_label(conn_id: Option(transport.ConnectionId)) -> String {
+  option.unwrap(conn_id, no_connection)
+}
+
+@external(erlang, "erlang", "monotonic_time")
+fn monotonic_time() -> Int
+
 /// Create a TransportConfig that wires transport events to a runtime.
 /// This is the glue between the transport and runtime layers.
 pub fn connect_transport(
@@ -1801,7 +1965,7 @@ fn spawn_and_connect(
   error.BeaconError,
 ) {
   log.info("beacon.runtime", "Spawning runtime for " <> conn_id)
-  case start(config, ctx) {
+  case start_for(config, ctx, conn_id) {
     Ok(runtime_subject) -> {
       // Register this connection with the new runtime
       process.send(

@@ -970,6 +970,7 @@ fn recheck_bound(store: SessionStore, joined: Node) -> Nil {
               revocation_reason_to_string(Deleted),
             )
           log_revoked(store, notified, "deleted", " (re-check)")
+          telemetry.session_event(telemetry.Revoked, "recheck")
           #(revoked + 1, failed)
         }
         Error(SessionContention)

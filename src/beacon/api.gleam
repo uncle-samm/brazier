@@ -32,37 +32,59 @@ pub type Response =
 ///
 /// Construct with `get`, `post`, `put`, `patch`, or `delete`, then pass the list
 /// to `routes`.
+///
+/// A matched route tags the request with its declared path (for example
+/// `/api/items`) for the `[beacon, http, request]` telemetry span, so the
+/// span never carries the raw request path.
 pub opaque type Route {
   Route(
     method: http.Method,
     segments: List(String),
+    pattern: String,
     handler: fn(Request) -> Response,
   )
 }
 
 /// Declare a GET route.
 pub fn get(path: String, handler: fn(Request) -> Response) -> Route {
-  Route(method: http.Get, segments: path_segments(path), handler: handler)
+  new_route(http.Get, path, handler)
 }
 
 /// Declare a POST route.
 pub fn post(path: String, handler: fn(Request) -> Response) -> Route {
-  Route(method: http.Post, segments: path_segments(path), handler: handler)
+  new_route(http.Post, path, handler)
 }
 
 /// Declare a PUT route.
 pub fn put(path: String, handler: fn(Request) -> Response) -> Route {
-  Route(method: http.Put, segments: path_segments(path), handler: handler)
+  new_route(http.Put, path, handler)
 }
 
 /// Declare a PATCH route.
 pub fn patch(path: String, handler: fn(Request) -> Response) -> Route {
-  Route(method: http.Patch, segments: path_segments(path), handler: handler)
+  new_route(http.Patch, path, handler)
 }
 
 /// Declare a DELETE route.
 pub fn delete(path: String, handler: fn(Request) -> Response) -> Route {
-  Route(method: http.Delete, segments: path_segments(path), handler: handler)
+  new_route(http.Delete, path, handler)
+}
+
+/// Build a route and its telemetry pattern. A path whose normalised form
+/// is longer than `transport_http.max_route_tag_bytes` is a programming
+/// error: it crashes here, at declaration, rather than on the first
+/// matching request.
+fn new_route(
+  method: http.Method,
+  path: String,
+  handler: fn(Request) -> Response,
+) -> Route {
+  let segments = path_segments(path)
+  let pattern = "/" <> string.join(segments, "/")
+  let size = string.byte_size(pattern)
+  let assert True = size <= transport_http.max_route_tag_bytes
+    as "api route path is longer than transport_http.max_route_tag_bytes"
+  Route(method: method, segments: segments, pattern: pattern, handler: handler)
 }
 
 /// Build the handler expected by `beacon.api_routes`.
@@ -141,9 +163,12 @@ pub fn form_field(
 fn dispatch(route_list: List(Route), req: Request) -> Option(Response) {
   case route_list {
     [] -> None
-    [Route(method, segments, handler), ..rest] -> {
+    [Route(method:, segments:, pattern:, handler:), ..rest] -> {
       case req.method == method && request.path_segments(req) == segments {
-        True -> Some(handler(req))
+        True -> {
+          transport_http.tag_route(pattern)
+          Some(handler(req))
+        }
         False -> dispatch(rest, req)
       }
     }

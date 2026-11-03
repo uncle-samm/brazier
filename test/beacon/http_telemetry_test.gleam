@@ -5,6 +5,10 @@
 /// Handlers run in the emitting process (a connection process, an acceptor
 /// or the connection owner), so each test forwards events to its own
 /// subject and synchronizes on them; nothing sleeps.
+import beacon/api
+import beacon/middleware
+import beacon/ssr
+import beacon/static
 import beacon/telemetry.{type Event}
 import beacon/transport
 import beacon/transport/http as transport_http
@@ -20,6 +24,7 @@ import gleam/int
 import gleam/list
 import gleam/option.{None, Some}
 import gleam/string
+import simplifile
 
 // --- Test server ------------------------------------------------------------
 
@@ -353,6 +358,160 @@ pub fn tag_route_rejects_empty_and_oversized_patterns_test() {
         transport_http.max_route_tag_bytes,
       ))
     })
+}
+
+// --- Route tags of the built-in routes --------------------------------------
+
+/// A server with every built-in route: API routes, static files, pages and
+/// (with `middlewares`) the WebSocket middleware pass.
+fn start_app_server(
+  static_dir: String,
+  middlewares: List(middleware.Middleware),
+) -> server.Listener {
+  let assert Ok(Nil) = telemetry.start()
+  let config =
+    transport.TransportConfig(
+      port: 0,
+      on_connect: fn(_id, _subject) { Nil },
+      on_event: fn(_id, _msg) { Nil },
+      on_disconnect: fn(_id) { Nil },
+      page_html: Some(ssr.RenderedPage(
+        html: "<html><body>page</body></html>",
+        sign_join_token: fn(_fingerprint) { "" },
+        cookie_secure: False,
+        status: 200,
+      )),
+      middlewares: middlewares,
+      static_config: Some(static.StaticConfig(
+        directory: static_dir,
+        prefix: "/assets",
+        max_age: 0,
+      )),
+      runtime_factory: None,
+      ws_auth: None,
+      ssr_factory: None,
+      security_limits: limits(),
+      api_handler: Some(
+        api.routes([api.get("/api/items/", fn(_req) { api.text(200, "items") })]),
+      ),
+    )
+  let assert Ok(listener) = transport.start_listener(config)
+    as "test listener must bind an OS-assigned port"
+  listener
+}
+
+fn static_dir() -> String {
+  let dir = "/tmp/beacon_http_telemetry_" <> unique("static")
+  let assert Ok(Nil) = simplifile.create_directory_all(dir)
+    as "test static directory must be creatable"
+  let assert Ok(Nil) = simplifile.write(dir <> "/app.css", "body{}")
+    as "test static file must be writable"
+  dir
+}
+
+/// The route of the next request stop whose status is `status`.
+fn route_of_next(events: Subject(Event), status: Int) -> String {
+  let stop =
+    expect(events, fn(event) {
+      named(event, ["request", "stop"])
+      && telemetry.int(event, "status") == Ok(status)
+    })
+  let assert Ok(route) = telemetry.string(stop, "route")
+  route
+}
+
+pub fn built_in_routes_report_their_pattern_never_the_path_test() {
+  let dir = static_dir()
+  let listener = start_app_server(dir, [])
+  let #(id, events) = listen(request_events)
+  let socket = open(listener)
+
+  // An API route reports its declared, normalised path.
+  let assert #(200, _, "items") = request(socket, get("/api/items"))
+  let assert "/api/items" = route_of_next(events, 200)
+
+  let assert #(200, _, _) = request(socket, get("/health"))
+  let assert "/health" = route_of_next(events, 200)
+
+  // A served static file reports the prefix pattern, not the file.
+  let assert #(200, _, "body{}") = request(socket, get("/assets/app.css"))
+  let assert "/assets/*" = route_of_next(events, 200)
+
+  // A page reports the shared page pattern, whatever its path.
+  let page = "/users/" <> unique("u")
+  let assert #(200, _, _) = request(socket, get(page))
+  let stop =
+    expect(events, fn(event) {
+      named(event, ["request", "stop"])
+      && telemetry.int(event, "status") == Ok(200)
+    })
+  let assert Ok("/*") = telemetry.string(stop, "route")
+  let assert False = metadata_mentions(stop, page)
+
+  // A static method the files do not answer is a 405 on the static route.
+  let assert #(405, _, _) =
+    request(
+      socket,
+      "POST /assets/app.css HTTP/1.1\r\nHost: test\r\ncontent-length: 0\r\n\r\n",
+    )
+  let assert "/assets/*" = route_of_next(events, 405)
+
+  let #(_, _, _) = request(socket, "OPTIONS * HTTP/1.1\r\nHost: test\r\n\r\n")
+  let options =
+    expect(events, fn(event) {
+      named(event, ["request", "stop"])
+      && has_string(event, "method", "OPTIONS")
+    })
+  let assert Ok("*") = telemetry.string(options, "route")
+
+  let assert Ok(Nil) = telemetry.detach(id)
+  raw_close(socket)
+  server.stop(listener)
+  let assert Ok(Nil) = simplifile.delete(dir) as "test directory cleanup"
+}
+
+pub fn client_script_routes_are_tagged_test() {
+  let dir = static_dir()
+  let listener = start_app_server(dir, [])
+  let #(id, events) = listen(request_events)
+  let socket = open(listener)
+  // The client script may or may not be built in this checkout: only the
+  // tag is asserted, never the status.
+  let #(_, _, _) = request(socket, get("/beacon_client.js"))
+  let first = expect(events, fn(event) { named(event, ["request", "stop"]) })
+  let assert Ok("/beacon_client.js") = telemetry.string(first, "route")
+  let #(_, _, _) = request(socket, get("/beacon_client_0123456789abcdef.js"))
+  let second = expect(events, fn(event) { named(event, ["request", "stop"]) })
+  let assert Ok("/beacon_client_:hash") = telemetry.string(second, "route")
+  // A name that is not a bundle name is an ordinary page path.
+  let #(_, _, _) = request(socket, get("/beacon_client_nothex.js"))
+  let third = expect(events, fn(event) { named(event, ["request", "stop"]) })
+  let assert Ok("/*") = telemetry.string(third, "route")
+  let assert Ok(Nil) = telemetry.detach(id)
+  raw_close(socket)
+  server.stop(listener)
+  let assert Ok(Nil) = simplifile.delete(dir) as "test directory cleanup"
+}
+
+pub fn websocket_middleware_pass_reports_the_ws_route_test() {
+  let dir = static_dir()
+  let passthrough: middleware.Middleware = fn(req, next) { next(req) }
+  let listener = start_app_server(dir, [passthrough])
+  let #(id, events) = listen(request_events)
+  let socket = open(listener)
+  let upgrade =
+    "GET /ws?path=%2F HTTP/1.1\r\nHost: test\r\nUpgrade: websocket\r\n"
+    <> "Connection: Upgrade\r\nSec-WebSocket-Version: 13\r\n"
+    <> "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+  let assert Ok(Nil) = raw_send(socket, <<upgrade:utf8>>)
+    as "test client send must succeed"
+  let stop = expect(events, fn(event) { named(event, ["request", "stop"]) })
+  let assert Ok("/ws") = telemetry.string(stop, "route")
+  let assert Ok("GET") = telemetry.string(stop, "method")
+  let assert Ok(Nil) = telemetry.detach(id)
+  raw_close(socket)
+  server.stop(listener)
+  let assert Ok(Nil) = simplifile.delete(dir) as "test directory cleanup"
 }
 
 // --- [beacon, http, connection, *] ------------------------------------------

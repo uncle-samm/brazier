@@ -69,6 +69,13 @@ pub fn validate_config(config: StaticConfig) -> Result(Nil, String) {
         contains_traversal(config.prefix),
         "prefix must not contain traversal sequences: " <> config.prefix,
       ),
+      #(
+        string.byte_size(config.prefix) > max_prefix_bytes,
+        "prefix must be at most "
+          <> int.to_string(max_prefix_bytes)
+          <> " bytes (its telemetry route pattern is capped at 255): "
+          <> config.prefix,
+      ),
       #(config.directory == "", "directory must not be empty"),
       #(
         config.max_age < 0,
@@ -85,6 +92,16 @@ pub fn validate_config(config: StaticConfig) -> Result(Nil, String) {
       Error(reason)
     }
   }
+}
+
+/// Longest accepted prefix: the telemetry route pattern `<prefix>/*` must
+/// fit `transport/http.max_route_tag_bytes` (255).
+const max_prefix_bytes = 253
+
+/// The route pattern a served static file reports to telemetry:
+/// `<prefix>/*`, never the file path.
+pub fn route_pattern(config: StaticConfig) -> String {
+  config.prefix <> "/*"
 }
 
 /// True when `path` is inside the static prefix: equal to it or below it on
