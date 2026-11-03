@@ -580,6 +580,11 @@ export class PacedQueue {
     return true;
   }
 
+  /** Whether some queued message satisfies `pred(msg)`. */
+  some(pred) {
+    return this.items.some((item) => pred(item.msg));
+  }
+
   /** Remove every item for which `pred(msg)` is true; returns how many. */
   removeWhere(pred) {
     const before = this.items.length;

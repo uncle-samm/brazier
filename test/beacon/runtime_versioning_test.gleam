@@ -727,10 +727,14 @@ pub fn client_replay_of_server_frames_matches_final_sync_test() {
   let assert True = string.contains(output, "9 replayed frames")
 }
 
-/// The browser runtime itself (close codes, backoff, heartbeats, outbound
-/// pacing, server errors, revision handling) driven by a fake socket and
-/// clock. The harness exits non-zero on any failed scenario.
+/// The browser runtime itself (startup checks, the socket URL, close codes,
+/// backoff, heartbeats, outbound pacing, server errors, revision handling,
+/// event delegation with prevent-default, stop-propagation, debounce and
+/// throttle, decoder failures, submit form data, pre-hydration replay,
+/// `simple` prediction, the focused-input lock and server navigation) driven
+/// by a fake socket, clock and DOM. The harness exits non-zero on any failed
+/// scenario.
 pub fn client_runtime_behaviour_harness_test() {
   let assert Ok(output) = run_node("beacon_client/test/ffi_harness.mjs", "")
-  let assert True = string.contains(output, "ffi harness ok: 11 scenarios")
+  let assert True = string.contains(output, "ffi harness ok: 26 scenarios")
 }

@@ -2,6 +2,13 @@
 
 Beacon communicates over WebSocket at `/ws` using JSON messages with a `type` discriminator.
 
+The browser connects to `/ws?path=<page path>`, the URL-encoded path and
+query string of the page (`encodeURIComponent(location.pathname +
+location.search)`), on the first connection and on every reconnect. The server
+resolves the route from it, so `init` sees the same URL as the server render,
+and refuses the connection (logging a warning) when `path` is missing or not a
+local path.
+
 ## Client Messages (browser to server)
 
 **join** -- Sent after WebSocket opens. `path` drives routing. `token` remains in the JSON shape for direct runtime tests and non-browser clients, but browser join/session recovery uses the HttpOnly `beacon_join_token` cookie from the WebSocket upgrade request.
@@ -9,14 +16,19 @@ Beacon communicates over WebSocket at `/ws` using JSON messages with a `type` di
 {"type": "join", "token": "", "path": "/"}
 ```
 
-**event** -- DOM event. Generated clients resolve `handler_id` in the browser
-and put the encoded typed message in `data.__beacon_msg`; the server decodes
-that generated event contract and never renders `view` to resolve handlers.
-`clock` is monotonic. `ops` is an optional client-computed patch hint (empty
-string if none). The server never treats `ops` as authoritative state; it runs
-the server-side update and replies with the server-computed model state or patch.
+**event** -- A Msg the browser decoded from a DOM event. The client runs the
+handler's decoder against the event, applies the Msg locally, and sends it
+unless the Local layer handled it. `data` is the generated entry's
+`encode_msg` output: a JSON string `{"__beacon_msg": <Msg>}`, the Msg in the
+app's generated codec. The server decodes only the Msg constructors the
+client-reachable code builds, and never renders `view` to resolve handlers.
+`handler_id` and `target_path` are both the position id of the element whose
+handler produced the Msg (`"0"` is the root, `"0.N"` its children); they are
+for logs and traces. `clock` is monotonic per connection. `ops` is optional and
+the browser client does not send it; the server never treats it as
+authoritative state.
 ```json
-{"type": "event", "name": "click", "handler_id": "h0", "data": "{\"__beacon_msg\":\"{\\\"tag\\\":\\\"Increment\\\"}\",\"__beacon_event\":\"{}\"}", "target_path": "0.1.0", "clock": 5, "ops": ""}
+{"type": "event", "name": "click", "handler_id": "0.1.0", "data": "{\"__beacon_msg\":{\"tag\":\"SetName\",\"arg0\":\"Ada\"}}", "target_path": "0.1.0", "clock": 5}
 ```
 
 **event_batch** -- Bounded batch for explicit non-browser clients that need to
@@ -34,7 +46,9 @@ reconnect does not release a burst of heartbeats.
 {"type": "heartbeat"}
 ```
 
-**navigate** -- Client-side SPA navigation.
+**navigate** -- Client-side SPA navigation: a same-origin link click,
+back/forward, or the client following a server `navigate`. Debounced events
+of the old page are sent before it.
 ```json
 {"type": "navigate", "path": "/about"}
 ```
@@ -48,10 +62,10 @@ without sending a new `mount`.
 
 ## Server Messages (server to browser)
 
-**mount** -- Reserved HTML remount message. Normal SSR + client-state apps do
-not receive `mount` on join or on ordinary updates. First paint comes from HTTP
-SSR; live join replies with `model_sync`, and later updates use `model_sync` or
-`patch`.
+**mount** -- Reserved. The server does not send it: first paint comes from
+HTTP SSR, a join is answered with `model_sync`, and later updates use
+`model_sync` or `patch`. The browser client logs a received `mount` as an
+error and ignores it.
 ```json
 {"type": "mount", "payload": "<div>...</div>"}
 ```
@@ -85,9 +99,14 @@ model. Its `version` is the current revision, not a new one.
 {"type": "error", "reason": "Rate limited"}
 ```
 
-**navigate** -- Server-initiated redirect.
+**navigate** -- Server-initiated navigation (`router.push` / `router.replace`).
+The client pushes the path onto the history, or replaces the current entry
+when `replace` is true, and answers with its own `navigate`. A path that is not
+local (does not start with `/`, or starts with `//`) is logged as an error and
+ignored; the current path is not navigated again.
 ```json
 {"type": "navigate", "path": "/dashboard"}
+{"type": "navigate", "path": "/search?q=x", "replace": true}
 ```
 
 ### hard_navigate (server → client)
@@ -167,7 +186,7 @@ follows.
   queue paced at 40 messages per sliding 1s window (an `event_batch` costs one
   per event, as on the server), below the server's 50 per second. The queue
   holds 200 messages. `request_sync` goes ahead of queued events. Events wait
-  until the first `model_sync` (or `mount`) on a connection. A full queue is
+  until the first `model_sync` on a connection. A full queue is
   logged as an error and, once the queue drains, followed by `request_sync`.
   Nothing is dropped silently.
 - **Batches**: an `event_batch` with more than 40 events is split into
@@ -179,7 +198,7 @@ follows.
 
 ## Reconnection Flow
 
-1. Client reopens WebSocket to `/ws`.
+1. Client reopens WebSocket to `/ws?path=<current page path>`.
 2. Browser sends `join` with an empty token; the cookie is carried by the WebSocket upgrade request.
 3. Server validates token age (max 24h) and deserializes model.
 4. Success: `model_sync` with recovered state. Failure: uses current model and logs the recovery error.

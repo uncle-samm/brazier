@@ -122,13 +122,11 @@ pub fn publish(static: String, contents: String) -> Result(Bundle, String) {
   Ok(Bundle(filename:, path:))
 }
 
-/// The esbuild entry: exposes the generated entry module to the runtime as
-/// `window.BeaconApp`, then starts the runtime.
+/// The esbuild entry: starts the runtime with the generated entry module.
 const entry =
-  "import { initClientAfterBoot } from './build/dev/javascript/beacon_client_app/beacon_client_ffi.mjs';
+  "import { start } from './build/dev/javascript/beacon_client_app/beacon_client_ffi.mjs';
 import * as App from './build/dev/javascript/beacon_client_app/beacon_app_entry.mjs';
-window.BeaconApp = App;
-initClientAfterBoot();
+start(App);
 "
 
 fn project_files(

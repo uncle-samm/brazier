@@ -1,5 +1,5 @@
-/// Generates `beacon_app_entry.gleam`, the module the client bundle exposes
-/// to `beacon_client_ffi.mjs` as `window.BeaconApp`.
+/// Generates `beacon_app_entry.gleam`, the module the client bundle passes
+/// to the runtime's `start` (in `beacon_client_ffi.mjs`).
 ///
 /// The client runtime calls these exports by name:
 ///

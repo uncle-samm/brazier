@@ -1,12 +1,35 @@
-// Beacon Client Runtime — the ONLY JavaScript that runs in the browser.
-// Event delegation, WebSocket, DOM morphing, Rendered format — all here.
-// When BeaconApp is available (compiled user code), runs updates LOCALLY.
-// Local-only events produce ZERO WebSocket traffic.
-// Keydown is forwarded for non-text targets, and text inputs/textareas only
-// forward Enter without Shift when not composing, so chat composers do not
-// flood the server while still supporting submit-by-enter.
+// Beacon client runtime: the only hand-written JavaScript that runs in the
+// browser. It owns the WebSocket, event delegation and DOM morphing; the
+// app's own code (the generated entry, see beacon/build/client_entry) owns
+// rendering, event decoding and the client-side updates.
+//
+// Startup: the bundle entry calls `start(App)` with the generated entry
+// module. `start` checks every export the runtime calls, then boots on
+// DOMContentLoaded: it listens for the event names the server-rendered
+// markup uses, intercepts same-origin links and connects to
+// `/ws?path=<page path>`.
+//
+// Events: one capture-phase listener on `document` per event name in the
+// handler table. A DOM event is matched to the elements carrying
+// `data-beacon-on-<name>="<id>"` (innermost first; only the target itself for
+// events that do not bubble). Each handler's options apply prevent-default,
+// stop-propagation (among Beacon handlers), throttle and debounce; its
+// decoder runs against the real event object and yields a Msg. The Msg goes
+// through `update_local` (and a `simple` app's `update`), the view is
+// re-rendered, and a forwarded Msg is sent to the server as
+// `{type: "event", data: encode_msg(msg)}`. A decoder failure is a
+// console.warn naming the event, and the event is dropped.
+//
+// Before the first model_sync there is no handler table: events on elements
+// with a `data-beacon-on-*` marker are queued with a snapshot of their common
+// fields (prevent-default is applied from the SSR `data-beacon-prevent-*`
+// marker) and replayed through the decoders after the first render.
+//
+// The server is authoritative: model_sync and patch frames replace the
+// client's model. A `simple` app predicts the model by running its update in
+// the browser; when the server's model differs, the server's wins and the
+// mismatch is logged.
 
-import { Ok, Error as GleamError } from "./gleam.mjs";
 import {
   applyOps,
   classifyModelSync,
@@ -22,8 +45,29 @@ import {
   CLIENT_SEND_WINDOW_MS,
 } from "./beacon_client/patch.mjs";
 
-// === State ===
-const _pd = {};
+// === Generated entry ===
+
+// Every export of the generated entry the runtime calls. A `simple` app also
+// exports `update`.
+const REQUIRED_EXPORTS = [
+  "decode_model",
+  "init_local",
+  "render",
+  "lookup_handler",
+  "run_handler",
+  "handler_options",
+  "event_names",
+  "update_local",
+  "encode_msg",
+  "same_model",
+  "is_simple",
+];
+
+let app = null;
+let simple = false;
+let started = false;
+
+// === Connection state ===
 let ws = null;
 let heartbeatTimer = null;
 let lastHeartbeatAt = null;
@@ -40,11 +84,15 @@ let modelSynced = false;
 let consecutiveModelSyncFailures = 0;
 const MAX_MODEL_SYNC_RETRIES = 3;
 let syncGaveUp = false;
+let readyForServerEvents = false;
+let syncRequestInFlight = false;
 let appRoot = null;
-let hydrated = false;
 let eventClock = 0;
 let currentModelVersion = 0;
+// The highest event clock the server has acknowledged on this connection.
 let latestAckClock = 0;
+// The highest event clock written to the current socket.
+let writtenEventClock = 0;
 const TRACE_LIMIT = 400;
 const traceBuffer = [];
 const hookRegistry = new Map();
@@ -63,9 +111,36 @@ const outbound = new PacedQueue(
 );
 let outboundOverflowed = false;
 let pumpTimer = null;
+
+// === Client state ===
+let clientModel = null;
+let clientLocal = null;
+let clientInitialized = false;
+// Set when the app's client code crashed; events are then dropped loudly.
+let clientFailed = false;
+let renderPending = false;
+// The JSON of the last authoritative model, which patches apply to.
+let clientModelJson = null;
+// The handler table of the last render (opaque, owned by the entry).
+let handlers = null;
+// Event names with a document listener.
+const listening = new Set();
+// A `simple` app's model was predicted by its update and not yet confirmed.
+let predicted = false;
+// The clock of the latest queued event of a `simple` app; server state that
+// does not acknowledge it is held back so the prediction is not undone.
+let pendingModelEventClock = 0;
+let skippedAuthoritativeWhilePending = false;
+
+// Pre-hydration events: { name, ids, snapshot }.
 const MAX_PENDING_EARLY_EVENTS = 50;
-const INPUT_DEBOUNCE_MS = 80;
-const pendingInputEvents = new Map();
+let pendingEarlyEvents = [];
+
+// Debounced messages by "name:id": { name, id, msg, seq, timer }.
+const debounced = new Map();
+let debounceSeq = 0;
+// Time of the last dispatched throttled event by "name:id".
+const throttled = new Map();
 
 function isDevMode() {
   return !!appRoot && appRoot.getAttribute("data-beacon-dev") === "true";
@@ -85,18 +160,20 @@ function mark(name) {
 
 function measure(name, start, end) {
   if (typeof performance !== "undefined" && performance.measure) {
-    try { performance.measure("beacon:" + name, "beacon:" + start, "beacon:" + end); } catch (_) {}
+    try {
+      performance.measure("beacon:" + name, "beacon:" + start, "beacon:" + end);
+    } catch (e) {
+      console.warn("[beacon] performance.measure(" + name + ") failed:", e && e.message);
+    }
   }
 }
 
 function ensureBeaconDebug() {
-  if (typeof window === "undefined") return;
   window.__beacon = window.__beacon || {};
   window.__beacon.trace = () => traceBuffer.slice();
 }
 
 function ensureHookRegistry() {
-  if (typeof window === "undefined") return;
   window.beaconClient = window.beaconClient || {};
   window.beaconClient.registerHook = (name, hook) => {
     hookRegistry.set(name, hook);
@@ -104,126 +181,331 @@ function ensureHookRegistry() {
   };
 }
 
-// === Client-Side State (when BeaconApp is available) ===
-let clientModel = null;
-let clientLocal = null;
-let clientRegistry = null;
-let clientInitialized = false;
-let renderPending = false;  // RAF throttle: true when a render is scheduled
-let clientModelJson = null;  // Cached JSON representation for patch diffing
-let pendingEarlyEvents = [];
-let readyForServerEvents = false;
-let syncRequestInFlight = false;
-let pendingModelEventClock = 0;
-let skippedAuthoritativeWhilePending = false;
+// === Startup ===
 
-// === Process Dictionary (handler registry storage) ===
-export function pd_set(key, value) { _pd[key] = value; return undefined; }
-export function pd_get(key) {
-  return key in _pd ? new Ok(_pd[key]) : new GleamError(undefined);
+// Start the runtime with the generated entry module. Called once by the
+// bundle entry. A bundle without a complete entry is not interactive: the
+// runtime reports it and does not connect.
+export function start(entry) {
+  if (started) {
+    throw new Error("[beacon] invariant violated: start called twice");
+  }
+  const missing = missingExports(entry);
+  if (missing.length > 0) {
+    console.error(
+      "[beacon] This page is not interactive: the client bundle has no generated app" +
+        (entry ? " (missing exports: " + missing.join(", ") + ")" : "") +
+        ". Build it with `gleam run -m beacon/build`.",
+    );
+    return undefined;
+  }
+  started = true;
+  app = entry;
+  simple = app.is_simple() === true;
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", boot, { once: true });
+  } else {
+    boot();
+  }
+  return undefined;
 }
 
-// === Client-Side Execution ===
-export function initClient() {
-  // State-over-the-wire: client waits for model_sync from server to initialize.
-  // The real model comes from the server — we don't use the stub init().
-  // handleModelSync will set clientModel, clientLocal, and clientInitialized.
-  if (!window.BeaconApp) return;
-  console.log("[beacon] BeaconApp loaded, waiting for model_sync...");
+function missingExports(entry) {
+  if (!entry) return REQUIRED_EXPORTS.slice();
+  const missing = REQUIRED_EXPORTS.filter((name) => typeof entry[name] !== "function");
+  if (missing.length === 0 && entry.is_simple() === true && typeof entry.update !== "function") {
+    missing.push("update");
+  }
+  return missing;
 }
 
-function clientRenderNow() {
+function boot() {
+  const root = document.querySelector("#beacon-app");
+  if (!root) {
+    console.error("[beacon] No #beacon-app element on the page; the client runtime cannot start");
+    return;
+  }
+  mark("boot");
+  ensureBeaconDebug();
+  ensureHookRegistry();
+  setAppRoot(root);
+  // Until the first render there is no handler table: listen for the events
+  // the server-rendered markup names, so they can be queued and replayed.
+  listenFor(markupEventNames(root));
+  setupNavigation();
+  connect();
+}
+
+function setAppRoot(root) {
+  const previousRoot = appRoot;
+  appRoot = root;
+  if (!previousRoot) {
+    trace("root.init", { root: describeNode(root) });
+    return;
+  }
+  if (previousRoot === root) return;
+  trace("root.replace", { from: describeNode(previousRoot), to: describeNode(root) });
+  unmountSubtree(previousRoot);
+}
+
+// The event names of every `data-beacon-on-<name>` attribute under root.
+function markupEventNames(root) {
+  const prefix = "data-beacon-on-";
+  const names = new Set();
+  for (const node of root.querySelectorAll("*")) {
+    for (const attr of Array.from(node.attributes)) {
+      if (attr.name.startsWith(prefix)) names.add(attr.name.slice(prefix.length));
+    }
+  }
+  return Array.from(names);
+}
+
+// === Rendering ===
+
+function renderNow() {
+  renderPending = false;
   if (!clientInitialized || !appRoot) return;
-  const App = window.BeaconApp;
   mark("render-start");
   const t0 = performance.now();
-  App.start_render();
-  const html = App.view_to_html(clientModel, clientLocal);
-  clientRegistry = App.finish_render();
+  const rendered = app.render(clientModel, clientLocal);
+  const html = rendered[0];
+  const table = rendered[1];
   const t1 = performance.now();
   morphInnerHTML(appRoot, html);
+  handlers = table;
+  listenFor(app.event_names(table).toArray());
   const t2 = performance.now();
-  attachEvents();
-  renderPending = false;
-  // Log slow renders (>5ms)
   const total = t2 - t0;
   if (total > 5) {
-    console.log("[beacon] Slow render: view=" + (t1-t0).toFixed(1) + "ms morph=" + (t2-t1).toFixed(1) + "ms total=" + total.toFixed(1) + "ms");
+    console.log(
+      "[beacon] Slow render: view=" + (t1 - t0).toFixed(1) + "ms morph=" + (t2 - t1).toFixed(1) +
+        "ms total=" + total.toFixed(1) + "ms",
+    );
   }
   window._lastRenderMs = total;
   mark("render-end");
   measure("render", "render-start", "render-end");
 }
 
-// Throttled render — batches multiple LOCAL events into one render per frame.
-// State is updated immediately (clientModel/clientLocal always current),
-// but DOM rendering is deferred to the next animation frame.
-function clientRender() {
-  if (renderPending) return;  // Already scheduled
+// Batches the renders of several events into one per animation frame. The
+// state is current immediately; only the DOM waits.
+function scheduleRender() {
+  if (renderPending) return;
   renderPending = true;
-  requestAnimationFrame(clientRenderNow);
+  requestAnimationFrame(renderNow);
 }
 
-// Synchronous render — used when we need the DOM up-to-date immediately
-// (e.g., before sending a MODEL event to the server).
-function clientRenderFlush() {
-  if (renderPending) {
-    renderPending = false;
-    clientRenderNow();
+// === Event delegation ===
+
+function listenFor(names) {
+  for (const name of names) {
+    if (listening.has(name)) continue;
+    listening.add(name);
+    document.addEventListener(name, onDomEvent, true);
+    trace("listen", { name });
   }
 }
 
-// Handles an event locally. Returns:
-// {action: "local"} — LOCAL event, handled client-only, don't send to server
-// {action: "send", ops: "", msg, affectsModel: Bool} — send encoded Msg to server
-// {action: "send", ops: ""} — MODEL event, server recomputes authoritative state
-function handleEventLocally(handlerId, eventData, eventName, targetPath, clock) {
-  if (!clientInitialized) return { action: "send", ops: "" };
-  const App = window.BeaconApp;
-
-  if (!App.encode_msg) {
-    console.error("[beacon] Generated client is missing encode_msg; event contract is unavailable.");
-    return { action: "error" };
-  }
-
-  const result = App.resolve_handler(clientRegistry, handlerId, eventData);
-  if (!result.isOk()) {
-    console.error("[beacon] Could not resolve client handler " + handlerId + "; event contract is unavailable.");
-    return { action: "error" };
-  }
-
-  try {
-    const msg = result[0];
-
-    if (!App.update || !App.msg_affects_model) {
-      return { action: "send", ops: "", msg, affectsModel: false };
+// The elements from the event target outwards that have a handler for
+// `name`, innermost first, as { el, id }. An event that does not bubble only
+// reaches its own target.
+function handlerTargets(name, target, bubbles) {
+  const attr = "data-beacon-on-" + name;
+  const found = [];
+  let node = target && target.nodeType !== 1 ? target.parentNode : target;
+  while (node && node !== appRoot) {
+    if (node.nodeType === 1 && node.hasAttribute(attr)) {
+      found.push({ el: node, id: node.getAttribute(attr) });
     }
+    if (!bubbles) break;
+    node = node.parentNode;
+  }
+  return found;
+}
 
-    const updateResult = App.update(clientModel, clientLocal, msg);
-    clientModel = updateResult[0];
-    clientLocal = updateResult[1];
-    clientRender();
+function onDomEvent(event) {
+  const target = event.target;
+  if (!appRoot || !target || target === appRoot || !appRoot.contains(target)) return;
+  const name = event.type;
+  const found = handlerTargets(name, target, event.bubbles);
+  if (found.length === 0) return;
+  if (!clientInitialized) {
+    enqueueEarlyEvent(name, event, found);
+    return;
+  }
+  runHandlers(name, event, found.map((f) => f.id), event, false);
+}
 
-    const affectsModel = App.msg_affects_model(msg);
-    if (affectsModel) {
-      // MODEL event — rendered optimistically on the client, then sent as an
-      // event. The server recomputes the authoritative model and returns sync/patch.
-      return { action: "send", ops: "", msg, affectsModel: true };
-    } else if (eventName === "keydown") {
-      // Keydown events must still reach the server so server-side apps can
-      // respond to Enter / navigation keys even when the local update is
-      // model-neutral.
-      return { action: "send", ops: "", msg, affectsModel: false };
+// Run the handlers for `ids` (innermost first) against `payload`: the DOM
+// event, or a snapshot of it when `replay` is true. `domEvent` is the live
+// event prevent-default applies to, or null on replay.
+function runHandlers(name, payload, ids, domEvent, replay) {
+  if (clientFailed) {
+    console.error("[beacon] " + name + " event dropped: the client stopped after an earlier crash. Reload the page.");
+    return;
+  }
+  for (const id of ids) {
+    const looked = app.lookup_handler(handlers, name, id);
+    if (!looked.isOk()) {
+      if (replay) {
+        console.warn("[beacon] " + name + " event on element " + id + " from before hydration dropped: the rendered page has no such handler");
+      } else {
+        console.error("[beacon] No " + name + " handler for element " + id + " in the last render; the page and its handler table disagree");
+      }
+      continue;
+    }
+    const handler = looked[0];
+    const options = app.handler_options(handler);
+    const preventDefault = options[0] === true;
+    const stopPropagation = options[1] === true;
+    const debounceMs = options[2];
+    const throttleMs = options[3];
+    if (preventDefault && domEvent) domEvent.preventDefault();
+    if (name === "submit" && domEvent) attachFormData(domEvent);
+    const key = name + ":" + id;
+    if (throttleMs > 0) {
+      const now = performance.now();
+      const last = throttled.get(key);
+      if (last !== undefined && now - last < throttleMs) {
+        trace("event.throttled", { name, id });
+        if (stopPropagation) return;
+        continue;
+      }
+    }
+    const decoded = app.run_handler(handler, payload);
+    if (!decoded.isOk()) {
+      console.warn("[beacon] " + name + " event on element " + id + " dropped: its decoder failed: " + String(decoded[0]));
     } else {
-      // LOCAL event — client-only, zero server traffic
-      return { action: "local" };
+      if (throttleMs > 0) throttled.set(key, performance.now());
+      if (debounceMs > 0) {
+        scheduleDebounced(name, id, decoded[0], debounceMs);
+      } else {
+        flushDebounced();
+        dispatchMsg(name, id, decoded[0]);
+      }
+    }
+    if (stopPropagation) return;
+  }
+}
+
+// Submit events carry the form's fields as `detail.formData`, a list of
+// [name, value] pairs, for `event.on_submit` to decode.
+function attachFormData(event) {
+  if (event.detail && Array.isArray(event.detail.formData)) return;
+  const form = event.target;
+  const entries = Array.from(new FormData(form, event.submitter || null).entries());
+  if (event.detail && typeof event.detail === "object") {
+    event.detail.formData = entries;
+  } else {
+    Object.defineProperty(event, "detail", { value: { formData: entries }, configurable: true });
+  }
+}
+
+function scheduleDebounced(name, id, msg, ms) {
+  const key = name + ":" + id;
+  const existing = debounced.get(key);
+  if (existing) clearTimeout(existing.timer);
+  const entry = { name, id, msg, seq: ++debounceSeq, timer: null };
+  entry.timer = setTimeout(() => {
+    debounced.delete(key);
+    dispatchMsg(name, id, msg);
+  }, ms);
+  debounced.set(key, entry);
+  trace("event.debounced", { name, id, ms });
+}
+
+// Dispatch every debounced message now, in the order they were scheduled.
+function flushDebounced() {
+  if (debounced.size === 0) return;
+  const entries = Array.from(debounced.values()).sort((a, b) => a.seq - b.seq);
+  debounced.clear();
+  for (const entry of entries) {
+    clearTimeout(entry.timer);
+    dispatchMsg(entry.name, entry.id, entry.msg);
+  }
+  trace("event.debounce_flush", { count: entries.length });
+}
+
+// Apply a decoded Msg in the browser and forward it to the server unless the
+// Local layer handled it.
+function dispatchMsg(name, id, msg) {
+  if (clientFailed) {
+    console.error("[beacon] " + name + " event dropped: the client stopped after an earlier crash. Reload the page.");
+    return;
+  }
+  let forward;
+  try {
+    const result = app.update_local(clientModel, clientLocal, msg);
+    clientLocal = result[0];
+    forward = result[1] === true;
+    if (simple) {
+      clientModel = app.update(clientModel, msg);
+      predicted = true;
     }
   } catch (e) {
-    console.error("[beacon] Local update crashed; generated event contract cannot continue.", e);
-    clientInitialized = false;
-    return { action: "error" };
+    clientFailed = true;
+    console.error("[beacon] The app's client update crashed on a " + name + " event (element " + id + "); the client stops handling events. Reload the page.", e);
+    return;
   }
+  scheduleRender();
+  if (!forward) {
+    trace("event.local", { name, id });
+    return;
+  }
+  const clock = ++eventClock;
+  const queued = send({
+    type: "event",
+    name,
+    handler_id: id,
+    data: app.encode_msg(msg),
+    target_path: id,
+    clock,
+  });
+  // Only a queued event can be acknowledged, so only a queued event may hold
+  // back server state while it is pending.
+  if (queued && simple) pendingModelEventClock = Math.max(pendingModelEventClock, clock);
 }
+
+// === Pre-hydration events ===
+
+function enqueueEarlyEvent(name, event, found) {
+  if (found.some((f) => f.el.hasAttribute("data-beacon-prevent-" + name))) event.preventDefault();
+  if (pendingEarlyEvents.length >= MAX_PENDING_EARLY_EVENTS) {
+    console.error("[beacon] Early event queue full (" + MAX_PENDING_EARLY_EVENTS + "); " + name + " before the first model_sync was dropped");
+    trace("early_event.full", { name });
+    return;
+  }
+  pendingEarlyEvents.push({ name, ids: found.map((f) => f.id), snapshot: snapshotEvent(event) });
+  trace("early_event.enqueue", { name, size: pendingEarlyEvents.length });
+}
+
+// The fields decoders commonly read, copied while the event is live.
+function snapshotEvent(event) {
+  const snapshot = { type: event.type, bubbles: event.bubbles };
+  for (const field of [
+    "key", "code", "shiftKey", "ctrlKey", "altKey", "metaKey", "isComposing", "repeat",
+    "button", "buttons", "clientX", "clientY", "offsetX", "offsetY", "pageX", "pageY",
+  ]) {
+    if (event[field] !== undefined) snapshot[field] = event[field];
+  }
+  const target = event.target;
+  if (target) snapshot.target = { value: target.value, checked: target.checked };
+  if (event.type === "submit" && target) {
+    snapshot.detail = { formData: Array.from(new FormData(target, event.submitter || null).entries()) };
+  }
+  return snapshot;
+}
+
+function flushPendingEarlyEvents() {
+  if (!clientInitialized || pendingEarlyEvents.length === 0) return;
+  const queued = pendingEarlyEvents;
+  pendingEarlyEvents = [];
+  for (const entry of queued) runHandlers(entry.name, entry.snapshot, entry.ids, null, true);
+  console.log("[beacon] Replayed " + queued.length + " event(s) from before hydration");
+  trace("early_event.flush", { count: queued.length });
+}
+
+// === Server state ===
 
 function hasPendingModelEvent() {
   return pendingModelEventClock > latestAckClock;
@@ -250,38 +532,47 @@ function markServerAckApplied(ackClock) {
   }
 }
 
-// === Initialization ===
-export function boot(rootSelector) {
-  const root = document.querySelector(rootSelector || "#beacon-app");
-  if (!root) { console.error("[beacon] Root not found:", rootSelector); return undefined; }
-  mark("boot");
-  ensureBeaconDebug();
-  ensureHookRegistry();
-  setAppRoot(root);
-  hydrated = appRoot.childNodes.length > 0;
-  if (hydrated) attachEvents();
-  const wsUrl = (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws";
-  connect(wsUrl);
-  return undefined;
+// Whether a focused form control keeps the value the user is typing: while a
+// debounced message is pending or a sent event is not yet acknowledged, a
+// render must not overwrite it with a value the server computed earlier.
+function inputLocked() {
+  return debounced.size > 0
+    || writtenEventClock > latestAckClock
+    || outbound.some((msg) => msg.type === "event" || msg.type === "event_batch");
 }
 
-function setAppRoot(root) {
-  const previousRoot = appRoot;
-  appRoot = root;
-  if (!previousRoot) {
-    trace("root.init", { root: describeNode(root) });
-    return;
+// Decode an authoritative model and render it. Returns null on success or
+// the reason it failed. Throws if the app's code throws.
+function adoptAuthoritativeModel(modelStr) {
+  const result = app.decode_model(modelStr);
+  if (!result.isOk()) return "decode_model failed: " + String(result[0]);
+  const model = result[0];
+  if (predicted) {
+    predicted = false;
+    if (!app.same_model(clientModel, model)) {
+      console.warn("[beacon] The browser's update predicted a different model than the server's; the server's model wins. Check that update is pure and deterministic.");
+      trace("model.mismatch");
+    }
   }
-  if (previousRoot === root) return;
-  trace("root.replace", {
-    from: describeNode(previousRoot),
-    to: describeNode(root),
-  });
-  unmountSubtree(previousRoot);
+  clientModel = model;
+  if (!clientInitialized) {
+    clientLocal = app.init_local(model);
+    clientInitialized = true;
+    console.log("[beacon] Client ready (from model_sync)");
+  }
+  // Render synchronously: requestAnimationFrame may not fire in a background tab.
+  renderNow();
+  return null;
 }
 
 // === WebSocket ===
-function connect(wsUrl) {
+
+function socketUrl() {
+  const scheme = location.protocol === "https:" ? "wss://" : "ws://";
+  return scheme + location.host + "/ws?path=" + encodeURIComponent(location.pathname + location.search);
+}
+
+function connect() {
   if (reconnectStopped) {
     console.error("[beacon] Not connecting: the session was revoked (close 4401). Reload to sign in again.");
     return;
@@ -291,18 +582,20 @@ function connect(wsUrl) {
   modelSynced = false;
   currentModelVersion = 0;
   latestAckClock = 0;
+  writtenEventClock = 0;
   syncRequestInFlight = false;
   syncGaveUp = false;
   consecutiveModelSyncFailures = 0;
   pendingModelEventClock = 0;
   skippedAuthoritativeWhilePending = false;
+  predicted = false;
   // The server counts its rate limit per connection, so a new socket starts
   // with a fresh budget. A queued request_sync is superseded by the join's
   // model_sync.
   outbound.setBudget(new SendBudget(CLIENT_SEND_BUDGET, CLIENT_SEND_WINDOW_MS));
   const purged = outbound.removeWhere((msg) => msg.type === "request_sync");
   if (purged > 0) trace("send_queue.purge_request_sync", { purged });
-  const socket = new WebSocket(wsUrl);
+  const socket = new WebSocket(socketUrl());
   ws = socket;
   socket.onopen = () => {
     mark("ws-open");
@@ -310,7 +603,7 @@ function connect(wsUrl) {
     sendJoin(socket);
   };
   socket.onmessage = (e) => handleMessage(e.data);
-  socket.onclose = (e) => handleClose(socket, wsUrl, e);
+  socket.onclose = (e) => handleClose(socket, e);
   socket.onerror = (e) => console.error("[beacon] WS error:", e);
 }
 
@@ -330,7 +623,7 @@ function sendJoin(socket) {
   pumpOutbound();
 }
 
-function handleClose(socket, wsUrl, e) {
+function handleClose(socket, e) {
   if (socket !== ws) {
     console.warn("[beacon] Close event for a replaced socket ignored (code " + e.code + ")");
     return;
@@ -346,7 +639,7 @@ function handleClose(socket, wsUrl, e) {
     return;
   }
   console.warn("[beacon] WebSocket closed (code " + e.code + (e.reason ? ", " + e.reason : "") + "); reconnecting with backoff");
-  scheduleReconnect(wsUrl);
+  scheduleReconnect();
 }
 
 // Write one message to the socket. Returns false when it was not written.
@@ -354,11 +647,16 @@ function writeSocket(socket, msg) {
   if (socket !== ws || socket.readyState !== WebSocket.OPEN) return false;
   try {
     socket.send(JSON.stringify(msg));
-    return true;
   } catch (e) {
     console.error("[beacon] WS send failed for " + msg.type + "; it stays queued:", e);
     return false;
   }
+  if (msg.type === "event") {
+    writtenEventClock = Math.max(writtenEventClock, msg.clock);
+  } else if (msg.type === "event_batch") {
+    for (const event of msg.events) writtenEventClock = Math.max(writtenEventClock, event.clock || 0);
+  }
+  return true;
 }
 
 // Queue a message for the paced sender. Returns false when the queue is full;
@@ -377,7 +675,7 @@ function send(msg) {
 }
 
 // request_sync only needs a joined socket; everything else also waits for
-// the first model_sync (or mount) so it is processed against a known model.
+// the first model_sync so it is processed against a known model.
 function canSendNow(msg) {
   if (!ws || ws.readyState !== WebSocket.OPEN || !socketJoined) return false;
   return msg.type === "request_sync" || readyForServerEvents;
@@ -401,9 +699,9 @@ function pumpOutbound() {
   }
 }
 
-// Debug: expose WS state for testing when running in a browser.
+// Debug: expose WS state for browser tests.
 if (typeof window !== "undefined") {
-  window.__beaconWsState = () => ws ? ws.readyState : -1;
+  window.__beaconWsState = () => (ws ? ws.readyState : -1);
   window.__beaconConnectionReady = () => readyForServerEvents;
   if (window.__BEACON_ENABLE_TEST_HOOKS === true) {
     window.__beaconCloseSocketForTest = () => {
@@ -435,15 +733,21 @@ function sendHeartbeat(socket) {
   }
 }
 
-function stopHeartbeat() { if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; } }
+function stopHeartbeat() {
+  if (heartbeatTimer) {
+    clearInterval(heartbeatTimer);
+    heartbeatTimer = null;
+  }
+}
 
-function scheduleReconnect(wsUrl) {
+function scheduleReconnect() {
   const delay = reconnectDelayMs(reconnectAttempts, Math.random());
   reconnectAttempts++;
   console.log("[beacon] Reconnect attempt " + reconnectAttempts + " in " + delay + "ms");
-  setTimeout(() => connect(wsUrl), delay);
+  setTimeout(connect, delay);
 }
 
+// Test seam: queue a raw client message (JSON) as the runtime would.
 export function ws_send(data) {
   const msg = JSON.parse(data);
   if (msg.type === "event_batch") {
@@ -453,27 +757,29 @@ export function ws_send(data) {
   }
   return undefined;
 }
-export function ws_connect(url) { connect(url); return undefined; }
 
-// === Message Handling ===
+// === Server messages ===
+
 function handleMessage(raw) {
   let msg;
   // A frame that is not JSON cannot be processed. It may have been a patch,
   // so the cached model can no longer be trusted: log it and resync.
-  try { msg = JSON.parse(raw); } catch (e) {
-    console.error("[beacon] Failed to parse server message:", e.message, raw.substring(0, 100));
+  try {
+    msg = JSON.parse(raw);
+  } catch (e) {
+    console.error("[beacon] Failed to parse server message:", e.message, String(raw).substring(0, 100));
     requestFullSync("unparseable_server_message");
     return;
   }
   switch (msg.type) {
-    case "mount": handleMount(msg.payload); break;
     case "model_sync": handleModelSync(msg.model, msg.version, msg.ack_clock || 0); break;
     case "patch": handlePatch(msg.ops, msg.version, msg.ack_clock || 0); break;
-    case "navigate": handleServerNavigate(msg.path); break;
+    case "navigate": handleServerNavigate(msg.path, msg.replace === true); break;
     case "hard_navigate": handleServerHardNavigate(msg.path); break;
-    case "reload": console.log("[beacon] Hot reload — refreshing..."); location.reload(); break;
+    case "reload": console.log("[beacon] Hot reload: refreshing"); location.reload(); break;
     case "heartbeat_ack": break;
     case "error": handleServerError(msg.reason); break;
+    case "mount": console.error("[beacon] Server sent a mount frame, which this client does not support; ignored"); break;
     default: console.error("[beacon] Unknown server message type:", msg.type); break;
   }
 }
@@ -490,50 +796,6 @@ function handleServerError(reason) {
   }
 }
 
-function handleMount(payload) {
-  if (!appRoot) return;
-  // Always morph mount HTML into the DOM. The mount is authoritative —
-  // it reflects the ws_init model which may differ from SSR (e.g., auth state).
-  // SSR content was a quick first paint; the mount from the runtime replaces it.
-  hydrated = false;
-  morphInnerHTML(appRoot, payload);
-  attachEvents();
-  syncHooks(appRoot);
-  trace("mount", { length: payload.length });
-  readyForServerEvents = true;
-  pumpOutbound();
-}
-
-// Decode authoritative client-visible model JSON into clientModel (and
-// clientLocal when the JSON carries it) and render. Returns null on success or
-// the reason it failed. May throw if generated code throws.
-function adoptAuthoritativeModel(App, modelStr) {
-  const result = App.decode_model(modelStr);
-  if (!result.isOk()) return "decode_model failed: " + String(result[0]);
-  clientModel = result[0];
-  if (App.decode_local) {
-    const localResult = App.decode_local(modelStr);
-    if (localResult.isOk()) {
-      clientLocal = localResult[0];
-    } else {
-      // Local state is client-owned; JSON without Local fields keeps it.
-      trace("local.kept", { reason: String(localResult[0]) });
-    }
-  }
-  if (!clientInitialized) {
-    if (!clientLocal && App.init_local) {
-      clientLocal = App.init_local(clientModel);
-    }
-    if (!clientLocal) clientLocal = null;
-    clientInitialized = true;
-    console.log("[beacon] Client-side execution ready (from model_sync)");
-  }
-  // Synchronous render so the DOM updates immediately
-  // (requestAnimationFrame may not fire in background tabs).
-  clientRenderNow();
-  return null;
-}
-
 function invalidateModelCache() {
   clientModelJson = null;
   modelSynced = false;
@@ -542,12 +804,6 @@ function invalidateModelCache() {
 function handleModelSync(modelJson, version, ackClock) {
   // Any model_sync answers an outstanding request_sync, applied or not.
   syncRequestInFlight = false;
-  if (!window.BeaconApp) return;
-  const App = window.BeaconApp;
-  if (!App.decode_model) {
-    console.error("[beacon] model_sync received but the generated client has no decode_model");
-    return;
-  }
   mark("model-sync-start");
   const verdict = classifyModelSync({ version: currentModelVersion, synced: modelSynced }, version);
   if (verdict === "invalid") {
@@ -563,7 +819,8 @@ function handleModelSync(modelJson, version, ackClock) {
   let parsed;
   try {
     parsed = JSON.parse(modelJson);
-    const failure = adoptAuthoritativeModel(App, modelJson);
+    markServerAckApplied(ackClock);
+    const failure = adoptAuthoritativeModel(modelJson);
     if (failure !== null) {
       modelSyncFailed(version, failure);
       return;
@@ -579,7 +836,6 @@ function handleModelSync(modelJson, version, ackClock) {
   // Backoff resets only once a connection proved usable, so a server that
   // accepts and immediately drops sockets is still retried with backoff.
   reconnectAttempts = 0;
-  markServerAckApplied(ackClock);
   console.log("[beacon] Model synced v" + version);
   trace("model_sync", { version, ackClock });
   readyForServerEvents = true;
@@ -602,12 +858,6 @@ function modelSyncFailed(version, reason) {
 }
 
 function handlePatch(opsJson, version, ackClock) {
-  if (!window.BeaconApp) return;
-  const App = window.BeaconApp;
-  if (!App.decode_model) {
-    console.error("[beacon] Patch received but the generated client has no decode_model");
-    return;
-  }
   mark("patch-start");
   let ops;
   try {
@@ -641,7 +891,7 @@ function handlePatch(opsJson, version, ackClock) {
       requestFullSync("patch_gap");
       return;
     case "ack":
-      handleAckPatch(App, version, ackClock);
+      handleAckPatch(version, ackClock);
       return;
     case "apply":
       break;
@@ -660,7 +910,8 @@ function handlePatch(opsJson, version, ackClock) {
     // applyOps never mutates its input, so a failure leaves the cache intact
     // until it is invalidated below.
     newModelJson = applyOps(clientModelJson, ops);
-    const failure = adoptAuthoritativeModel(App, JSON.stringify(newModelJson));
+    markServerAckApplied(ackClock);
+    const failure = adoptAuthoritativeModel(JSON.stringify(newModelJson));
     if (failure !== null) {
       console.error("[beacon] Patch v" + version + " produced a model the client cannot decode (" + failure + "); requesting full sync");
       invalidateModelCache();
@@ -675,7 +926,6 @@ function handlePatch(opsJson, version, ackClock) {
   }
   clientModelJson = newModelJson;
   currentModelVersion = version;
-  markServerAckApplied(ackClock);
   console.log("[beacon] Patch applied v" + version + " (" + ops.length + " ops)");
   trace("patch", { version, ackClock, ops: ops.length });
   mark("patch-end");
@@ -683,16 +933,19 @@ function handlePatch(opsJson, version, ackClock) {
 }
 
 // An empty patch at the cached revision: the server processed events up to
-// ackClock without changing the client-visible model. If that covers our
-// pending model event, the optimistic local result is replaced by the
-// authoritative cached model.
-function handleAckPatch(App, version, ackClock) {
+// ackClock without changing the client-visible model. When that covers the
+// pending event of a `simple` app, its prediction is checked against the
+// cached authoritative model, which then replaces it. Other apps re-render
+// so a focused input released by the ack shows the server's value.
+function handleAckPatch(version, ackClock) {
   const wasPending = hasPendingModelEvent();
+  const wasLocked = inputLocked();
   markServerAckApplied(ackClock);
   trace("patch.ack", { version, ackClock });
-  if (!wasPending || hasPendingModelEvent()) return;
+  if (hasPendingModelEvent()) return;
+  if (!wasPending && !(wasLocked && !inputLocked())) return;
   try {
-    const failure = adoptAuthoritativeModel(App, JSON.stringify(clientModelJson));
+    const failure = adoptAuthoritativeModel(JSON.stringify(clientModelJson));
     if (failure !== null) {
       console.error("[beacon] Cached model v" + version + " cannot be decoded after ack (" + failure + "); requesting full sync");
       invalidateModelCache();
@@ -721,100 +974,107 @@ function requestFullSync(reason) {
   if (send({ type: "request_sync" })) syncRequestInFlight = true;
 }
 
-function enqueueEarlyEvent(eventName, hid, data, tp, clock) {
-  if (pendingEarlyEvents.length >= MAX_PENDING_EARLY_EVENTS) {
-    console.error("[beacon] Early event queue full; dropping " + eventName + " before model_sync.");
-    trace("early_event.full", { eventName, size: pendingEarlyEvents.length });
+// === Navigation ===
+
+function currentPath() {
+  return location.pathname + location.search;
+}
+
+function isLocalPath(path) {
+  return typeof path === "string" && path.startsWith("/") && !path.startsWith("//");
+}
+
+// A route change sends what the old page still owes the server (debounced
+// messages) before the navigate message, and resets throttling.
+function leaveRoute(path) {
+  flushDebounced();
+  throttled.clear();
+  trace("route.leave", { path });
+}
+
+// The server's router.push / router.replace: change the URL, then tell the
+// server so its on_change runs, as for a link click.
+function handleServerNavigate(path, replace) {
+  if (!isLocalPath(path)) {
+    console.error("[beacon] Server navigate rejected: not a local path:", path);
     return;
   }
-  pendingEarlyEvents.push({ eventName, hid, data, tp, clock });
-  trace("early_event.enqueue", { eventName, size: pendingEarlyEvents.length });
-}
-
-function flushPendingEarlyEvents() {
-  if (!clientInitialized || pendingEarlyEvents.length === 0) return;
-  const queued = pendingEarlyEvents;
-  pendingEarlyEvents = [];
-  for (const evt of queued) {
-    dispatchEvent(evt.eventName, evt.hid, evt.data, evt.tp, evt.clock);
+  if (path === currentPath()) {
+    trace("navigate.same_path", { path });
+    return;
   }
-  trace("early_event.flush", { count: queued.length });
+  leaveRoute(path);
+  if (replace) history.replaceState(null, "", path);
+  else history.pushState(null, "", path);
+  send({ type: "navigate", path });
 }
 
-function handleServerNavigate(path) {
-  if (path && path !== location.pathname + location.search) {
-    history.pushState(null, "", path);
-    resetClientRouteTransientState(path);
-    // Trigger navigate to server for route-change processing
-    send({ type: "navigate", path: path });
-  }
-}
-
-function resetClientRouteTransientState(path) {
-  for (const item of pendingInputEvents.values()) {
-    clearTimeout(item.timer);
-  }
-  pendingInputEvents.clear();
-  renderPending = false;
-  trace("route.transient_reset", { path });
-}
-
-// Hard navigation — full page reload via window.location.href.
-// Used when the browser needs to make a real HTTP request (e.g., to receive Set-Cookie headers).
+// Hard navigation: a full page load, e.g. to receive Set-Cookie headers.
 function handleServerHardNavigate(path) {
-  if (!path) {
-    console.warn("[beacon] Hard navigate: received empty path from server");
+  // SECURITY: only same-origin paths, never //host, absolute, javascript: or
+  // data: URLs, so the server cannot be turned into an open redirect.
+  if (!isLocalPath(path)) {
+    console.error("[beacon] Hard navigate rejected: not a local path:", path);
     return;
   }
-  // SECURITY: Only allow same-origin relative paths to prevent open redirect attacks.
-  // Protocol-relative URLs (//evil.com), absolute URLs, javascript: and data: are rejected.
-  if (path.startsWith("/") && !path.startsWith("//")) {
-    window.location.href = path;
-  } else {
-    console.error("[beacon] Hard navigate rejected: path must start with / (got:", path, ")");
-  }
+  window.location.href = path;
 }
 
-// === Rendered Format ===
+function setupNavigation() {
+  // Same-origin links navigate without a page load.
+  document.addEventListener("click", (e) => {
+    if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+    const a = e.target && e.target.closest ? e.target.closest("a[href]") : null;
+    if (!a) return;
+    if (a.hostname.toLowerCase() !== location.hostname.toLowerCase()) return;
+    if (a.hasAttribute("data-beacon-external") || a.hasAttribute("download")) return;
+    if (a.target && a.target !== "_self") return;
+    e.preventDefault();
+    const path = a.pathname + a.search;
+    if (path === currentPath()) return;
+    leaveRoute(path);
+    history.pushState(null, "", path);
+    send({ type: "navigate", path });
+  });
+  // Back and forward.
+  window.addEventListener("popstate", () => {
+    const path = currentPath();
+    leaveRoute(path);
+    send({ type: "navigate", path });
+  });
+}
 
-// === DOM Morphing ===
-export function morph_html(container, html) { morphInnerHTML(container, html); return undefined; }
+// === DOM morphing ===
 
 function morphInnerHTML(container, html) {
-  // Save focused element state before morphing
+  // Focus and selection, to restore if the focused control is replaced.
   const focused = document.activeElement;
-  const focusedTag = focused?.tagName;
-  const focusedName = focused?.getAttribute("name") || focused?.getAttribute("data-beacon-event-input");
-  const selStart = focused?.selectionStart;
-  const selEnd = focused?.selectionEnd;
-  const focusedValue = focused?.value;
+  const focusedTag = focused ? focused.tagName : undefined;
+  const focusedName = focused && focused.getAttribute ? focused.getAttribute("name") : null;
+  const selStart = focused ? focused.selectionStart : undefined;
+  const selEnd = focused ? focused.selectionEnd : undefined;
+  const focusedValue = focused ? focused.value : undefined;
+  const locked = inputLocked();
 
-  const t = document.createElement("template"); t.innerHTML = html; morphChildren(container, t.content); syncHooks(container);
+  const t = document.createElement("template");
+  t.innerHTML = html;
+  morphChildren(container, t.content);
+  syncHooks(container);
   trace("morph", { childCount: container.childNodes.length });
 
-  // Restore focus after morph — find the same element by name/handler
-  if (focusedTag === "INPUT" || focusedTag === "TEXTAREA" || focusedTag === "SELECT") {
-    let restored = null;
-    if (focusedName) {
-      // SECURITY: Use CSS.escape to prevent selector injection from attribute values
-      const safeName = CSS.escape(focusedName);
-      restored = container.querySelector(`[name="${safeName}"]`) ||
-                 container.querySelector(`[data-beacon-event-input="${safeName}"]`);
-    }
-    if (restored) {
-      if (restored !== document.activeElement) {
-        restored.focus();
-      }
-      // Preserve active typing only while an input event is still debounced.
-      // Once submit/Enter has flushed input, the server-rendered value is
-      // authoritative so cleared composers do not snap back to stale text.
-      if (hasPendingUnackedInput() && focusedValue !== undefined && restored.value !== focusedValue) {
-        restored.value = focusedValue;
-      }
-      // Restore cursor position
-      if (typeof selStart === "number" && restored.setSelectionRange) {
-        try { restored.setSelectionRange(selStart, selEnd); } catch(e) { console.warn("[beacon] setSelectionRange failed:", e.message); }
-      }
+  if (focusedTag !== "INPUT" && focusedTag !== "TEXTAREA" && focusedTag !== "SELECT") return;
+  if (container.contains(focused) || !focusedName) return;
+  // The focused control was replaced: focus its successor by name.
+  // SECURITY: CSS.escape keeps the attribute value out of the selector syntax.
+  const restored = container.querySelector(`[name="${CSS.escape(focusedName)}"]`);
+  if (!restored) return;
+  restored.focus();
+  if (locked && focusedValue !== undefined && restored.value !== focusedValue) restored.value = focusedValue;
+  if (typeof selStart === "number" && restored.setSelectionRange) {
+    try {
+      restored.setSelectionRange(selStart, selEnd);
+    } catch (e) {
+      console.warn("[beacon] setSelectionRange failed:", e.message);
     }
   }
 }
@@ -848,21 +1108,20 @@ function morphNode(o, n) {
   if (o.nodeType === 3) { if (o.textContent !== n.textContent) o.textContent = n.textContent; return; }
   if (o.nodeType !== 1) return;
   morphAttributes(o, n);
-  if (preservesChildren(o)) return;
+  if (o.hasAttribute("data-beacon-preserve-children")) return;
   const isFormControl = o.tagName === "INPUT" || o.tagName === "TEXTAREA" || o.tagName === "SELECT";
   if (isFormControl && o === document.activeElement) {
+    // The user is typing here: keep their value while it is not yet
+    // reflected by the server (LiveView's rule for focused inputs).
+    if (inputLocked()) {
+      trace("morph.focused_input_kept", { name: o.getAttribute("name") || "" });
+      return;
+    }
     if (formControlValuesDiffer(o, n)) syncFormControlState(o, n);
     return;
   }
   morphChildren(o, n);
   if (isFormControl) syncFormControlState(o, n);
-}
-
-function preservesChildren(node) {
-  if (!node || !node.hasAttribute) return false;
-  if (node.hasAttribute("data-beacon-preserve-children")) return true;
-  const ignore = node.getAttribute("data-beacon-ignore");
-  return ignore === "children" || ignore === "true";
 }
 
 function nodeKey(node) {
@@ -886,17 +1145,14 @@ function formControlValuesDiffer(o, n) {
     const nextValue = n.hasAttribute("value") ? n.getAttribute("value") : "";
     return o.value !== nextValue;
   }
-
   if (o.tagName === "TEXTAREA") {
     const nextValue = n.hasAttribute("value") ? n.getAttribute("value") : n.textContent;
     return o.value !== nextValue;
   }
-
   if (o.tagName === "SELECT") {
     if (o.value !== n.value) return true;
     return Array.from(o.options).some((oOption, i) => n.options[i] && oOption.selected !== n.options[i].selected);
   }
-
   return false;
 }
 
@@ -911,7 +1167,6 @@ function syncFormControlState(o, n) {
     if (o.value !== nextValue) o.value = nextValue;
     return;
   }
-
   if (o.tagName === "INPUT") {
     const type = (o.getAttribute("type") || "").toLowerCase();
     if (type === "checkbox" || type === "radio") {
@@ -924,7 +1179,6 @@ function syncFormControlState(o, n) {
     }
     return;
   }
-
   if (o.tagName === "SELECT") {
     for (let i = 0; i < o.options.length && i < n.options.length; i++) {
       o.options[i].selected = n.options[i].selected;
@@ -941,9 +1195,9 @@ function sameNode(a, b) {
   const aKey = nodeKey(a);
   const bKey = nodeKey(b);
   if (aKey || bKey) return aKey === bKey;
-  if (a.id && b.id) return a.id === b.id;
   return true;
 }
+
 function findMatch(s, t) {
   const targetKey = nodeKey(t);
   let c = s, k = 8;
@@ -955,24 +1209,28 @@ function findMatch(s, t) {
   return null;
 }
 
+// === Hooks ===
+
 function syncHooks(root) {
-  if (!root || !root.querySelectorAll) return;
   root.querySelectorAll("[data-beacon-hook]").forEach((node) => {
     const hookName = node.getAttribute("data-beacon-hook");
     const hook = hookRegistry.get(hookName);
-    if (!hook) return;
+    if (!hook) {
+      trace("hook.unregistered", { hook: hookName });
+      return;
+    }
     const attrs = serializeHookAttrs(node);
     const existing = mountedHooks.get(node);
     if (!existing) {
       const state = hook.mount ? hook.mount(node) : undefined;
       mountedHooks.set(node, { hookName, hook, attrs, state });
-      trace("hook.mount", { hook: hookName, island: node.getAttribute("data-beacon-island") || "" });
+      trace("hook.mount", { hook: hookName });
       return;
     }
     if (existing.attrs !== attrs && existing.hook.update) {
       existing.hook.update(node, existing.state);
       mountedHooks.set(node, { ...existing, attrs });
-      trace("hook.update", { hook: hookName, island: node.getAttribute("data-beacon-island") || "" });
+      trace("hook.update", { hook: hookName });
     }
   });
 }
@@ -1010,354 +1268,5 @@ function hookWatchSet(node) {
 function shouldIncludeHookAttr(name, watchedAttrs) {
   if (name === "data-beacon-preserve-children") return false;
   if (!watchedAttrs) return true;
-  return name === "data-beacon-hook"
-    || name === "data-beacon-hook-watch"
-    || name === "data-beacon-island"
-    || watchedAttrs.has(name);
-}
-
-// === Event Delegation ===
-
-// Helper: dispatch an event through local handling and/or server.
-// Builds the wire message with optional ops for patch-based sync.
-function dispatchEvent(eventName, hid, data, tp, forcedClock) {
-  const clock = forcedClock ?? ++eventClock;
-  const eventPayload = { name: eventName, handler_id: hid, data, target_path: tp, clock };
-  if (clientInitialized) {
-    const r = handleEventLocally(hid, data, eventName, tp, clock);
-    if (r.action === "send") {
-      if (r.ops) eventPayload.ops = r.ops;
-      const encodedMsg = window.BeaconApp.encode_msg(r.msg);
-      eventPayload.data = JSON.stringify({ __beacon_msg: encodedMsg, __beacon_event: data });
-      // Paced, never dropped silently. Only a queued event can be acked, so
-      // only a queued event may hold back server state while pending.
-      if (caseSendEvent(eventPayload) && r.affectsModel) {
-        pendingModelEventClock = Math.max(pendingModelEventClock, clock);
-      }
-    } else if (r.action === "error") {
-      console.error("[beacon] Event dropped because generated event decoding is unavailable.");
-    }
-  } else {
-    console.warn("[beacon] Event queued before model_sync; generated event decoding will replay after hydration.");
-    enqueueEarlyEvent(eventName, hid, data, tp, clock);
-  }
-}
-
-function caseSendEvent(eventPayload) {
-  return send({ type: "event", ...eventPayload });
-}
-
-function dispatchInputEvent(hid, data, tp, debounceMs) {
-  const key = hid + "\n" + tp;
-  const existing = pendingInputEvents.get(key);
-  if (existing) clearTimeout(existing.timer);
-  const clock = ++eventClock;
-  const pending = {
-    hid,
-    data,
-    tp,
-    clock,
-    timer: setTimeout(() => {
-      pendingInputEvents.delete(key);
-      dispatchEvent("input", hid, data, tp, clock);
-    }, debounceMs),
-  };
-  pendingInputEvents.set(key, pending);
-}
-
-function flushPendingInputEvents() {
-  if (pendingInputEvents.size === 0) return;
-  const pending = Array.from(pendingInputEvents.values()).sort((a, b) => a.clock - b.clock);
-  pendingInputEvents.clear();
-  for (const item of pending) {
-    clearTimeout(item.timer);
-    dispatchEvent("input", item.hid, item.data, item.tp, item.clock);
-  }
-}
-
-function hasPendingUnackedInput() {
-  return Array.from(pendingInputEvents.values()).some((item) => item.clock > latestAckClock);
-}
-
-function getInputDebounceMs(node) {
-  const raw = node.getAttribute("data-beacon-input-debounce");
-  const parsed = raw ? parseInt(raw, 10) : INPUT_DEBOUNCE_MS;
-  return Number.isFinite(parsed) && parsed >= 0 ? parsed : INPUT_DEBOUNCE_MS;
-}
-
-function formSnapshot(form) {
-  const fields = {};
-  const data = new FormData(form);
-  for (const [key, value] of data.entries()) {
-    if (Object.prototype.hasOwnProperty.call(fields, key)) {
-      if (Array.isArray(fields[key])) fields[key].push(String(value));
-      else fields[key] = [fields[key], String(value)];
-    } else {
-      fields[key] = String(value);
-    }
-  }
-  return JSON.stringify({ value: JSON.stringify(fields) });
-}
-
-function attachEvents() {
-  if (!appRoot) return;
-  appRoot.onclick = (e) => {
-    let t = e.target;
-    while (t && t !== appRoot) {
-      if (t.hasAttribute && t.hasAttribute("data-beacon-event-click")) {
-        e.preventDefault();
-        flushPendingInputEvents();
-        dispatchEvent("click", t.getAttribute("data-beacon-event-click"), "{}", getPath(t));
-        return;
-      }
-      t = t.parentNode;
-    }
-  };
-  appRoot.oninput = (e) => {
-    let t = e.target;
-    while (t && t !== appRoot) {
-      if (t.hasAttribute && t.hasAttribute("data-beacon-event-input")) {
-        const hid = t.getAttribute("data-beacon-event-input");
-        const data = JSON.stringify({ value: t.value || "" });
-        dispatchInputEvent(hid, data, getPath(t), getInputDebounceMs(t));
-        return;
-      }
-      t = t.parentNode;
-    }
-  };
-  appRoot.onchange = (e) => {
-    let t = e.target;
-    while (t && t !== appRoot) {
-      if (t.hasAttribute && t.hasAttribute("data-beacon-event-change")) {
-        const hid = t.getAttribute("data-beacon-event-change");
-        const data = JSON.stringify({ value: t.value || "" });
-        flushPendingInputEvents();
-        dispatchEvent("change", hid, data, getPath(t));
-        return;
-      }
-      t = t.parentNode;
-    }
-  };
-  appRoot.onfocusin = (e) => {
-    let t = e.target;
-    while (t && t !== appRoot) {
-      if (t.hasAttribute && t.hasAttribute("data-beacon-event-focus")) {
-        dispatchEvent("focus", t.getAttribute("data-beacon-event-focus"), "{}", getPath(t));
-        return;
-      }
-      t = t.parentNode;
-    }
-  };
-  appRoot.onfocusout = (e) => {
-    let t = e.target;
-    while (t && t !== appRoot) {
-      if (t.hasAttribute && t.hasAttribute("data-beacon-event-blur")) {
-        dispatchEvent("blur", t.getAttribute("data-beacon-event-blur"), "{}", getPath(t));
-        return;
-      }
-      t = t.parentNode;
-    }
-  };
-  appRoot.onsubmit = (e) => {
-    let t = e.target;
-    while (t && t !== appRoot) {
-      if (t.hasAttribute && t.hasAttribute("data-beacon-event-submit")) {
-        e.preventDefault();
-        flushPendingInputEvents();
-        dispatchEvent("submit", t.getAttribute("data-beacon-event-submit"), "{}", getPath(t));
-        return;
-      }
-      if (t.hasAttribute && t.hasAttribute("data-beacon-event-submit-local")) {
-        e.preventDefault();
-        flushPendingInputEvents();
-        dispatchEvent("submit-local", t.getAttribute("data-beacon-event-submit-local"), formSnapshot(t), getPath(t));
-        return;
-      }
-      t = t.parentNode;
-    }
-  };
-  appRoot.onmousedown = (e) => {
-    let t = e.target;
-    while (t && t !== appRoot) {
-      if (t.hasAttribute && t.hasAttribute("data-beacon-event-mousedown")) {
-        const hid = t.getAttribute("data-beacon-event-mousedown");
-        const rect = t.getBoundingClientRect();
-        const x = Math.round(e.clientX - rect.left);
-        const y = Math.round(e.clientY - rect.top);
-        t.__beaconPointerTrail = [x + "," + y];
-        dispatchEvent("mousedown", hid, JSON.stringify({ value: x + "," + y }), getPath(t));
-        return;
-      }
-      t = t.parentNode;
-    }
-  };
-  appRoot.onmouseup = (e) => {
-    let t = e.target;
-    while (t && t !== appRoot) {
-      if (t.hasAttribute && t.hasAttribute("data-beacon-event-mouseup")) {
-        const hid = t.getAttribute("data-beacon-event-mouseup");
-        const rect = t.getBoundingClientRect();
-        const x = Math.round(e.clientX - rect.left);
-        const y = Math.round(e.clientY - rect.top);
-        const trail = Array.isArray(t.__beaconPointerTrail) ? t.__beaconPointerTrail : [];
-        if (x >= 0 && y >= 0 && x <= Math.round(rect.width) && y <= Math.round(rect.height)) {
-          trail.push(x + "," + y);
-        }
-        const value = trail.length > 0 ? trail.join(";") : x + "," + y;
-        delete t.__beaconPointerTrail;
-        dispatchEvent("mouseup", hid, JSON.stringify({ value }), getPath(t));
-        return;
-      }
-      t = t.parentNode;
-    }
-  };
-  appRoot.onmousemove = (e) => {
-    let t = e.target;
-    while (t && t !== appRoot) {
-      if (t.hasAttribute && t.hasAttribute("data-beacon-event-mousemove")) {
-        const hid = t.getAttribute("data-beacon-event-mousemove");
-        const rect = t.getBoundingClientRect();
-        const x = Math.round(e.clientX - rect.left);
-        const y = Math.round(e.clientY - rect.top);
-        if (Array.isArray(t.__beaconPointerTrail)) {
-          t.__beaconPointerTrail.push(x + "," + y);
-        }
-        dispatchEvent("mousemove", hid, JSON.stringify({ value: x + "," + y }), getPath(t));
-        return;
-      }
-      t = t.parentNode;
-    }
-  };
-  appRoot.ondragstart = (e) => {
-    let t = e.target;
-    while (t && t !== appRoot) {
-      if (t.hasAttribute && t.hasAttribute("data-beacon-event-dragstart")) {
-        const hid = t.getAttribute("data-beacon-event-dragstart");
-        const dragId = t.getAttribute("data-drag-id") || "";
-        e.dataTransfer.setData("text/plain", dragId);
-        e.dataTransfer.effectAllowed = "move";
-        setTimeout(() => { t.style.opacity = "0.4"; }, 0);
-        dispatchEvent("dragstart", hid, JSON.stringify({ value: dragId }), getPath(t));
-        return;
-      }
-      t = t.parentNode;
-    }
-  };
-  appRoot.ondragend = (e) => {
-    // Reset opacity on all draggable elements
-    appRoot.querySelectorAll("[draggable]").forEach(el => { el.style.opacity = "1"; });
-  };
-  appRoot.ondragover = (e) => {
-    // Walk up from target to find a drop zone (has data-beacon-event-drop)
-    let t = e.target;
-    while (t && t !== appRoot) {
-      if (t.hasAttribute && t.hasAttribute("data-beacon-event-drop")) {
-        e.preventDefault();
-        e.dataTransfer.dropEffect = "move";
-        t.style.outline = "2px dashed #2196F3";
-        return;
-      }
-      t = t.parentNode;
-    }
-  };
-  appRoot.ondragleave = (e) => {
-    let t = e.target;
-    while (t && t !== appRoot) {
-      if (t.hasAttribute && t.hasAttribute("data-beacon-event-drop")) {
-        // Only remove highlight if we're leaving the drop zone itself,
-        // not when entering a child element
-        if (!t.contains(e.relatedTarget)) {
-          t.style.outline = "";
-        }
-        return;
-      }
-      t = t.parentNode;
-    }
-  };
-  appRoot.ondrop = (e) => {
-    let t = e.target;
-    while (t && t !== appRoot) {
-      if (t.hasAttribute && t.hasAttribute("data-beacon-event-drop")) {
-        e.preventDefault();
-        t.style.outline = "";
-        const dragId = e.dataTransfer.getData("text/plain");
-        dispatchEvent("drop", t.getAttribute("data-beacon-event-drop"), JSON.stringify({ value: dragId }), getPath(t));
-        return;
-      }
-      t = t.parentNode;
-    }
-  };
-  appRoot.onkeydown = (e) => {
-    let t = e.target;
-    while (t && t !== appRoot) {
-      if (t.hasAttribute && t.hasAttribute("data-beacon-event-keydown")) {
-        const isTextEntry = t.tagName === "INPUT" || t.tagName === "TEXTAREA";
-        const isEnterSubmit = e.key === "Enter" && !e.shiftKey && !e.isComposing;
-        if (isTextEntry && !isEnterSubmit) return;
-        if (isEnterSubmit) e.preventDefault();
-        flushPendingInputEvents();
-        dispatchEvent("keydown", t.getAttribute("data-beacon-event-keydown"), JSON.stringify({ value: e.key }), getPath(t));
-        return;
-      }
-      t = t.parentNode;
-    }
-  };
-}
-
-function getPath(node) {
-  const parts = []; let c = node;
-  while (c && c !== appRoot) { const p = c.parentNode; if (p) { const ch = p.childNodes; for (let i = 0; i < ch.length; i++) if (ch[i] === c) { parts.unshift(i); break; } } c = c.parentNode; }
-  return parts.join(".");
-}
-
-// === SPA Navigation ===
-function setupNavigation() {
-  // Intercept internal link clicks for SPA navigation
-  document.addEventListener("click", (e) => {
-    const a = e.target.closest("a[href]");
-    if (!a) return;
-    // Only intercept same-origin links without data-beacon-external
-    if (a.hostname.toLowerCase() !== location.hostname.toLowerCase()) return;
-    if (a.hasAttribute("data-beacon-external")) return;
-    if (a.target === "_blank") return;
-
-    e.preventDefault();
-    const path = a.pathname + a.search;
-    if (path !== location.pathname + location.search) {
-      history.pushState(null, "", path);
-      resetClientRouteTransientState(path);
-      send({ type: "navigate", path: path });
-    }
-  });
-
-  // Handle browser back/forward
-  window.addEventListener("popstate", () => {
-    const path = location.pathname + location.search;
-    resetClientRouteTransientState(path);
-    send({ type: "navigate", path });
-  });
-}
-
-// === Exports for Gleam FFI ===
-export function query_selector(sel) { const el = document.querySelector(sel); return el ? { type: "Ok", 0: el } : { type: "Error", 0: undefined }; }
-export function log(msg) { console.log("[beacon]", msg); return undefined; }
-export function log_error(msg) { console.error("[beacon]", msg); return undefined; }
-
-// === Auto-boot ===
-// When loaded as a script tag, auto-boot: find the app root, set up navigation, connect WS.
-// For base builds (no codec), this is the only entry point — initClientAfterBoot is never called.
-if (typeof document !== "undefined") {
-  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", () => { boot("#beacon-app"); setupNavigation(); });
-  else { boot("#beacon-app"); setupNavigation(); }
-}
-
-// Called from bundle entry AFTER window.BeaconApp is set
-export function initClientAfterBoot() {
-  // If boot hasn't run yet (script loaded before DOMContentLoaded),
-  // defer initClient to after boot
-  if (!appRoot) {
-    document.addEventListener("DOMContentLoaded", () => initClient());
-  } else {
-    initClient();
-  }
+  return name === "data-beacon-hook" || name === "data-beacon-hook-watch" || watchedAttrs.has(name);
 }
