@@ -469,7 +469,7 @@ each room and who is typing this way.
   topic lists everyone already there as joins. Up to 100 queued changes
   of a topic are coalesced into one message. `sync.merge` applies a diff
   to a list (Phoenix's `syncDiff`).
-- **Shard restarts are invisible to the app.** When a tracker shard
+- **Shard restarts are handled for the app.** When a tracker shard
   restarts, the session tracks its entries again (with backoff) and gets
   one message with the old entry leaving and the new one joining.
   Entries of other nodes do not flap. The new shard starts empty and
@@ -483,7 +483,56 @@ each room and who is typing this way.
   heard from the node for `down_period`, or when it has not synced
   within `down_period`. The last case is logged as a warning.
   Entries of this node that the old shard held are reported as leaves at
-  once. Their processes track again with new refs.
+  once. Their processes track again with new refs. What other sessions
+  see of that is below.
+
+#### What other sessions see when a shard restarts
+
+When the shard of node A restarts, every entry it held is a presence that
+has ended, on every node. A session that tracks itself there tracks again
+under a new ref, and that is a new presence. So every session that follows
+the topic, on A or on another node, gets the old ref as a leave and the
+new ref as a join:
+
+- **On another node B,** the shard of B sees A's new shard as a new
+  replica of A (a new `vsn`) at its first heartbeat. The old replica is
+  then down and permanently down at once, which reports its entries as
+  leaves. The new replica's entries arrive as joins when B gets them, with
+  the transfer at the next clock sample or as later deltas.
+- **On A,** a session that follows the topic gets the leaves when it sees
+  the old shard go (the paragraph above). A session that tracks there
+  tracks again after its backoff, and its join arrives when it does.
+
+The leave and the join are separate messages when they are not queued at
+the same time, and one coalesced message when they are. Either way the
+leave comes first, and `sync.merge` ends with the new ref only. A list
+keyed by `key` (as Phoenix's JavaScript `Presence.list` is) shows the key
+throughout when both arrive in one message, and is without it in between
+when they do not.
+
+This is Phoenix.Tracker's model, kept on purpose:
+
+- A presence is identified by its ref (`phx_ref`), not its key: a key can
+  be on a topic many times (two tabs), and a tracking made again may carry
+  a different meta. Merging the old ref into the new one would need a
+  rule Phoenix does not have.
+- `Phoenix.Tracker.Shard.handle_heartbeat` treats a known node with a new
+  `vsn` as down, then permanently down, then up: the old replica's entries
+  leave at once, and the new replica's join when they replicate. Beacon's
+  shard does the same (`beacon_presence_shard.erl`, `handle_heartbeat`).
+- Holding the leaves until the entries come back would not be bounded by
+  anything the watcher can know. Only Beacon sessions track again, a
+  process that called `presence.track` itself does not, and a session may
+  have ended meanwhile. Phoenix does not track again at all: the shard
+  links its tracked processes, so a shard crash ends them, and their
+  clients join again. A watcher that held leaves would show entries that
+  may never return, and the delay before it gave up would be a guess.
+
+The suspects described above are different: they are entries that did
+not end, held only until the new shard has synced with their node, which
+the shard reports.
+
+`ws10b_presence_restart_semantics_test` checks this on two nodes.
 - **Failures stop the session loudly.** A tracking the tracker refuses (a
   limit, an invalid topic or key, the same key twice on a topic), a
   tracker that stays down, or the loss of the session's PubSub partition
