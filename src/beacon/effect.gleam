@@ -16,7 +16,19 @@
 /// spawned effect kills the process previously started under the same key
 /// (so re-keying an `every` timer replaces it instead of leaking it and
 /// consuming a timer slot), and `cancel` kills it as well.
+///
+/// ## Telemetry
+///
+/// - `[beacon, effect, run]` span around every callback that runs code:
+///   `effect` is `"sync"` for `from` (it runs in the runtime and blocks its
+///   update loop), `"keyed"` for a keyed `from`, and `"background"` for the
+///   work of a `background` effect (measured in its own process). Spawning
+///   timers is not a span; a crash inside the span emits `exception` and
+///   is re-raised unchanged.
+/// - `[beacon, effect, timer, rejected]` with `limit` when `every` hits the
+///   per-runtime timer cap.
 import beacon/log
+import beacon/telemetry
 import gleam/erlang/process
 import gleam/int
 import gleam/list
@@ -155,12 +167,14 @@ pub fn perform_tracked(
   list.fold(effect.callbacks, [], fn(pids, callback) {
     case callback {
       SimpleCallback(run) -> {
-        run(dispatch)
+        telemetry.effect_run_span("sync", fn() { run(dispatch) })
         pids
       }
       KeyedCallback(key, run) -> {
         let generation = register_key_generation(key)
-        run(fn(message) { dispatch_keyed(key, generation, message) })
+        telemetry.effect_run_span("keyed", fn() {
+          run(fn(message) { dispatch_keyed(key, generation, message) })
+        })
         pids
       }
       SpawnedCallback(run) ->
@@ -229,7 +243,10 @@ fn stop_keyed_process(key: String, reason: String) -> Nil {
 pub fn background(callback: fn(fn(msg) -> Nil) -> Nil) -> Effect(msg) {
   Effect(callbacks: [
     SpawnedCallback(run: fn(dispatch) {
-      let pid = spawn_owned(fn() { callback(dispatch) })
+      let pid =
+        spawn_owned(fn() {
+          telemetry.effect_run_span("background", fn() { callback(dispatch) })
+        })
       log.debug("beacon.effect", "Started owned background effect process")
       Some(pid)
     }),
@@ -276,6 +293,7 @@ pub fn every(interval_ms: Int, make_msg: fn() -> msg) -> Effect(msg) {
           case current >= max_timers {
             True -> {
               log_timer_limit_warning(current, max_timers)
+              telemetry.effect_timer_rejected(max_timers)
               None
             }
             False -> {

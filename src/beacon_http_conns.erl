@@ -15,6 +15,11 @@
 %%   {port, Port}                      bound listen port (survives acceptor restarts)
 %% Slot removal uses ets:take/2 so a concurrent early release and 'EXIT'
 %% can never double-decrement.
+%%
+%% The children map is Pid => StartedAt (native monotonic time). When a
+%% handler exits, this process emits [beacon, http, connection, closed]
+%% with the connection's lifetime as `duration` and a bounded `reason`:
+%% normal, shutdown, handoff_failed, crash or killed (see close_reason/1).
 -behaviour(gen_server).
 
 -export([
@@ -170,7 +175,8 @@ handle_call({start_connection, Ip}, _From, State) ->
                 true ->
                     Pid = spawn_link(?MODULE, connection_init, [self(), Tid, Handler]),
                     true = ets:insert(Tid, {{pid, Pid}, Ip, CountPerIp}),
-                    {reply, {ok, Pid}, State#{children := Children#{Pid => true}}}
+                    StartedAt = erlang:monotonic_time(),
+                    {reply, {ok, Pid}, State#{children := Children#{Pid => StartedAt}}}
             end
     end;
 handle_call(get_port, _From, State = #{tid := Tid}) ->
@@ -202,12 +208,14 @@ handle_cast(Other, State) ->
     {noreply, State}.
 
 handle_info({'EXIT', Pid, Reason}, State = #{tid := Tid, children := Children}) ->
-    case maps:is_key(Pid, Children) of
-        true ->
+    case maps:take(Pid, Children) of
+        {StartedAt, Rest} ->
+            %% false: the handler already released its slot early.
             _ = release_pid(Tid, Pid),
             log_exit(Pid, Reason),
-            {noreply, State#{children := maps:remove(Pid, Children)}};
-        false ->
+            emit_closed(StartedAt, close_reason(Reason)),
+            {noreply, State#{children := Rest}};
+        error ->
             logger:warning("beacon.http_conns EXIT from unknown process ~p: ~p", [Pid, Reason]),
             {noreply, State}
     end;
@@ -220,14 +228,16 @@ terminate(Reason, #{children := Children, tid := Tid}) ->
     logger:info("beacon.http_conns terminating (~p), shutting down ~p connections",
                 [Reason, length(Pids)]),
     [exit(Pid, shutdown) || Pid <- Pids],
-    Remaining = await_exits(maps:from_keys(Pids, true), Tid,
+    Remaining = await_exits(Children, Tid,
                             erlang:monotonic_time(millisecond) + ?SHUTDOWN_GRACE_MS),
     case maps:size(Remaining) of
         0 -> ok;
         N ->
             logger:error("beacon.http_conns ~p connections ignored shutdown, killing", [N]),
-            [exit(Pid, kill) || Pid <- maps:keys(Remaining)],
-            ok
+            maps:foreach(fun(Pid, StartedAt) ->
+                exit(Pid, kill),
+                emit_closed(StartedAt, <<"killed">>)
+            end, Remaining)
     end.
 
 await_exits(Remaining, _Tid, _Deadline) when map_size(Remaining) =:= 0 ->
@@ -235,12 +245,29 @@ await_exits(Remaining, _Tid, _Deadline) when map_size(Remaining) =:= 0 ->
 await_exits(Remaining, Tid, Deadline) ->
     Timeout = max(0, Deadline - erlang:monotonic_time(millisecond)),
     receive
-        {'EXIT', Pid, _} when is_map_key(Pid, Remaining) ->
+        {'EXIT', Pid, Reason} when is_map_key(Pid, Remaining) ->
+            %% false: the handler already released its slot early.
             _ = release_pid(Tid, Pid),
-            await_exits(maps:remove(Pid, Remaining), Tid, Deadline)
+            {StartedAt, Rest} = maps:take(Pid, Remaining),
+            emit_closed(StartedAt, close_reason(Reason)),
+            await_exits(Rest, Tid, Deadline)
     after Timeout ->
         Remaining
     end.
+
+%% [beacon, http, connection, closed]. Runs in this process: telemetry
+%% catches a crashing handler, so it can never take the owner down.
+emit_closed(StartedAt, Reason) ->
+    beacon_telemetry_ffi:http_connection(closed, erlang:monotonic_time() - StartedAt, Reason).
+
+%% A bounded label for a handler's exit reason. Crash reasons are logged by
+%% log_exit/2 and never become metadata (they may hold request data).
+close_reason(normal) -> <<"normal">>;
+close_reason(shutdown) -> <<"shutdown">>;
+close_reason({shutdown, handoff_aborted}) -> <<"handoff_failed">>;
+close_reason({shutdown, _}) -> <<"shutdown">>;
+close_reason(killed) -> <<"killed">>;
+close_reason(_) -> <<"crash">>.
 
 log_exit(_Pid, normal) -> ok;
 log_exit(_Pid, shutdown) -> ok;
@@ -259,7 +286,7 @@ connection_init(Conns, Tid, Handler) ->
         {beacon_http_abort, Reason} ->
             logger:warning("beacon.http_conns connection ~p aborted before start: ~p",
                            [self(), Reason]),
-            ok
+            exit({shutdown, handoff_aborted})
     after ?SHOOT_TIMEOUT_MS ->
         logger:error("beacon.http_conns connection ~p never received its socket", [self()]),
         exit(socket_handoff_timeout)

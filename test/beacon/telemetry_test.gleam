@@ -236,9 +236,9 @@ fn documented() -> List(Documented) {
   [
     Span(
       ["http", "request"],
-      ["method", "route", "connection_id"],
+      ["method", "connection_id"],
       ["req_body_bytes", "resp_body_bytes"],
-      ["status"],
+      ["route", "status"],
     ),
     connection("accepted"),
     connection("rejected"),
@@ -261,7 +261,7 @@ fn documented() -> List(Documented) {
       [],
     ),
     Plain(["runtime", "stop"], ["uptime"], ["reason"]),
-    Span(["effect", "run"], ["kind"], [], []),
+    Span(["effect", "run"], ["effect"], [], []),
     Plain(["effect", "timer", "rejected"], [], ["limit"]),
     Plain(["store", "write"], ["count"], ["store", "op", "mode"]),
     Span(["store", "sync"], ["store", "peer"], ["entries", "bytes"], []),
@@ -341,10 +341,8 @@ fn emit_everything() -> Nil {
     let assert Error(_) = rescue(run)
     Nil
   }
-  let request = fn(run) {
-    telemetry.http_request_span("GET", "/items/:id", "c1", run)
-  }
-  let assert 1 = request(fn() { #(1, 200, 10, 20) })
+  let request = fn(run) { telemetry.http_request_span("GET", "c1", run) }
+  let assert 1 = request(fn() { #(1, "/items/:id", 200, 10, 20) })
   crash(fn() { request(fn() { panic as "request crashed" }) })
   telemetry.http_connection(telemetry.Accepted, 0, "ok")
   telemetry.http_connection(telemetry.Rejected, 0, "limit")

@@ -52,6 +52,11 @@ store.get(s, "theme")               // Ok("dark")
 store.delete(s, "theme")            // Remove (auto-broadcasts)
 ```
 
+`store.new` and `store.new_list` open a **local** store: each node has its
+own table, and change notifications reach watchers on that node only. For a
+store whose contents every node shares, open it in replicated mode (see
+[Replicated stores](#replicated-stores) below).
+
 Creation is **idempotent**: `store.new("settings")` called again -- from any
 process, at any time -- returns a handle to the same data. The backing ETS
 tables are owned by a long-lived Beacon table-owner process, not by the
@@ -103,9 +108,61 @@ beacon.app(init, beacon.no_local, beacon.no_server, update, view)
 |> beacon.start(8080)
 ```
 
+### Replicated stores
+
+A replicated store keeps a full replica on every node that opens it, and
+the replicas converge. Open it with `store.open` or `store.open_list` and
+the `Replicated` mode. Every other call (`get`, `put`, `append`,
+`get_all`, `topic`, ...) is the same as for a local store.
+
+```gleam
+import beacon/store
+import beacon/store/replicated
+
+let assert Ok(settings) =
+  store.open("settings", store.Replicated(replicated.default_config()))
+store.put(settings, "theme", "dark")   // applied here, then replicated
+
+let assert Ok(chat) =
+  store.open_list("chat", store.Replicated(
+    replicated.Config(..replicated.default_config(), max_entries: 50_000),
+  ))
+```
+
+- **Opt-in.** `Local` is the default mode, and `store.new` / `new_list`
+  always open local stores. A name is open in one mode only: opening a
+  local store's name as replicated (or the reverse) returns
+  `Error(InvalidConfig(_))`, and so does reopening with a different
+  configuration. Every node must open the store with the same
+  configuration.
+- **Names** are 1 to 200 bytes of `[A-Za-z0-9_-]`.
+- **Reads stay on the node.** Each replica mirrors its state into ETS, so
+  `get`, `get_all` and `count` read locally. They crash the caller loudly
+  (after logging) while this node's replica is restarting.
+- **Writes can fail.** A replicated write fails when it would pass a limit
+  (`TooManyEntries`, `ValueTooLarge`, `DeltaTooLarge`) or when the local
+  replica is down (`Unavailable`). `put`, `delete`, `append`, ... log and
+  crash the caller. `try_put`, `try_delete`, `try_append`, ... return
+  `Result(Nil, store.WriteError)` instead, for callers that handle it.
+- **Conflicts.** Concurrent writes of one key resolve the same way on every
+  node: the latest hybrid-logical-clock timestamp wins, with the node name
+  as tiebreak. A delete never removes a value written concurrently on
+  another node (add wins).
+- **List order.** A replicated list store returns values in timestamp
+  order. For writes from one node, that is insertion order.
+- **Notifications.** Watchers on every node are notified on the store's
+  topic when a change reaches their node, whether the write was local or
+  remote. `append_notify` topics are announced on every node too.
+
+Replication, anti-entropy, limits and failure behaviour are described in
+[CLUSTERING.md](CLUSTERING.md#replicated-stores).
+
 ## PubSub
 
-Low-level publish/subscribe using Erlang `pg` (works across distributed nodes).
+Low-level publish/subscribe, a port of Phoenix.PubSub over Erlang `pg`.
+`broadcast` reaches subscribers on every connected node; `local_broadcast`
+reaches this node only. See [CLUSTERING.md](CLUSTERING.md#pubsub-across-nodes)
+for what a cluster needs and what happens during a netsplit.
 
 ```gleam
 import beacon/pubsub

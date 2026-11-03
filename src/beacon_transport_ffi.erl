@@ -14,6 +14,14 @@
     linger_close/3
 ]).
 
+%% Per-request telemetry context for [beacon, http, request].
+-export([
+    http_route_reset/0, http_route_tag/1, http_route_take/0,
+    http_connection_id/0, http_body_consumed/1
+]).
+
+-define(ROUTE_KEY, beacon_http_route).
+
 %% Strict RFC 6455 frame layer and WebSocket connection helpers.
 -export([
     ws_parse_frame/2,
@@ -404,12 +412,45 @@ head_error_to_binary({Tag, Detail}) when is_atom(Tag), is_binary(Detail) ->
 http_body_begin(Socket, Length, ExpectContinue, BodyTimeoutMs, DeadlineMs)
   when is_integer(Length), Length >= 0, is_boolean(ExpectContinue),
        is_integer(BodyTimeoutMs), BodyTimeoutMs > 0, is_integer(DeadlineMs) ->
-    put({beacon_http_body, Socket}, #{remaining => Length,
+    put({beacon_http_body, Socket}, #{length => Length,
+                                      remaining => Length,
                                       expect_continue => ExpectContinue andalso Length > 0,
                                       timeout => BodyTimeoutMs,
                                       deadline => DeadlineMs,
                                       failed => false}),
     nil.
+
+%% Body bytes the handler has read so far: declared length minus what is
+%% still unread. 0 when no request body context is active (for example the
+%% WebSocket upgrade middleware check).
+http_body_consumed(Socket) ->
+    case get({beacon_http_body, Socket}) of
+        #{length := Length, remaining := Remaining} -> Length - Remaining;
+        undefined -> 0
+    end.
+
+%% The route pattern a handler tags for the request it is serving. Handlers
+%% run in the connection process (run_handler/2 does not spawn), so the
+%% process dictionary scopes the tag to one request: reset before the
+%% handler, taken after it.
+http_route_reset() ->
+    erase(?ROUTE_KEY),
+    nil.
+
+http_route_tag(Route) when is_binary(Route) ->
+    put(?ROUTE_KEY, Route),
+    nil.
+
+http_route_take() ->
+    case erase(?ROUTE_KEY) of
+        undefined -> <<"unknown">>;
+        Route when is_binary(Route) -> Route
+    end.
+
+%% The connection process's pid as text: one id per HTTP connection, shared
+%% by every keep-alive request on it.
+http_connection_id() ->
+    list_to_binary(pid_to_list(self())).
 
 http_body_end(Socket) ->
     erase({beacon_http_body, Socket}),
