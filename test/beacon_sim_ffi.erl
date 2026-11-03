@@ -3,7 +3,9 @@
     new_metrics/0, increment/2, increment_by/3, record_latency/2, record_payload/2,
     mark_event_send_start/1, take_event_send_start/0, collect/1, destroy/1,
     monotonic_us/0, snapshot_memory/0, snapshot_processes/0,
-    message_queue_len/1
+    snapshot_pids/0, describe_new_processes/1,
+    message_queue_len/1,
+    watch_teardown/1, await_teardown/3, handle_ws_close/4
 ]).
 
 %% Create a new metrics ETS table. Returns table reference.
@@ -81,12 +83,12 @@ mark_event_send_start(SentAtUs) ->
     erlang:put(beacon_sim_event_send_start_us, SentAtUs),
     nil.
 
+%% {ok, SentAtUs} or {error, nil} when no event is in flight. Monotonic
+%% time is usually negative, so no value can mean "none".
 take_event_send_start() ->
-    case erlang:get(beacon_sim_event_send_start_us) of
-        undefined -> 0;
-        SentAtUs ->
-            erlang:erase(beacon_sim_event_send_start_us),
-            SentAtUs
+    case erlang:erase(beacon_sim_event_send_start_us) of
+        undefined -> {error, nil};
+        SentAtUs -> {ok, SentAtUs}
     end.
 
 %% Store the latest received WebSocket payload for behavioral assertions.
@@ -138,6 +140,115 @@ snapshot_memory() ->
 %% Get total process count.
 snapshot_processes() ->
     erlang:system_info(process_count).
+
+%% Every live pid, to name the processes a leak check finds.
+snapshot_pids() ->
+    erlang:processes().
+
+%% Describe the processes alive now that were not in Before: registered
+%% name or initial call, current function and queue length.
+describe_new_processes(Before) ->
+    Old = sets:from_list(Before, [{version, 2}]),
+    New = [P || P <- erlang:processes(), not sets:is_element(P, Old)],
+    Info = [{P, erlang:process_info(P, [registered_name, initial_call,
+                                        current_function, dictionary,
+                                        message_queue_len])} || P <- New],
+    Lines = [describe_process(P, I) || {P, I} <- Info, I =/= undefined],
+    iolist_to_binary(lists:join(<<"; ">>, Lines)).
+
+describe_process(Pid, Info) ->
+    Dict = proplists:get_value(dictionary, Info),
+    Initial = case proplists:get_value('$initial_call', Dict) of
+        undefined -> proplists:get_value(initial_call, Info);
+        Call -> Call
+    end,
+    io_lib:format("~p name=~0p initial=~0p current=~0p queue=~b", [
+        Pid,
+        proplists:get_value(registered_name, Info),
+        Initial,
+        proplists:get_value(current_function, Info),
+        proplists:get_value(message_queue_len, Info)
+    ]).
+
+%% --- Server teardown watch -------------------------------------------------
+%%
+%% A sim test that measures leaks must wait until the server has torn down
+%% every connection it served, not sleep and hope. Every upgraded WebSocket
+%% connection emits [beacon, ws, close] exactly once, from its own handler
+%% process, before it shuts its runtime down. The telemetry handler below
+%% runs in that process and reports it, with the processes linked to it
+%% (its per-connection runtime), to the test. The test then monitors each
+%% one and waits for it to exit.
+%%
+%% Only handlers whose parent is ConnsPid (the watched listener's
+%% connection owner) are reported, so connections of other listeners in the
+%% same VM are never counted.
+
+%% Attach the watch. Returns {HandlerId, Tag}; reports arrive as
+%% {Tag, HandlerPid, LinkedPids}.
+watch_teardown(ConnsPid) ->
+    Tag = make_ref(),
+    Id = iolist_to_binary(io_lib:format("beacon-sim-teardown-~p", [Tag])),
+    ok = telemetry:attach(Id, [beacon, ws, close], fun ?MODULE:handle_ws_close/4,
+                          #{test => self(), tag => Tag, conns => ConnsPid}),
+    {Id, Tag}.
+
+handle_ws_close(_Event, _Measurements, _Metadata, #{test := Test, tag := Tag, conns := Conns}) ->
+    case erlang:process_info(self(), [parent, links]) of
+        [{parent, Conns}, {links, Links}] ->
+            Linked = [P || P <- Links, is_pid(P), P =/= Conns],
+            Test ! {Tag, self(), Linked},
+            ok;
+        _ ->
+            ok
+    end.
+
+%% Wait for N close reports, then for every reported process to exit, all
+%% within TimeoutMs. Detaches the watch either way. Returns {ok, nil} or
+%% {error, Description}.
+await_teardown({Id, Tag}, N, TimeoutMs) ->
+    Deadline = erlang:monotonic_time(millisecond) + TimeoutMs,
+    Result = case collect_closes(Tag, N, Deadline, []) of
+        {ok, Pids} -> await_exits(Pids, Deadline);
+        {error, Got} ->
+            {error, iolist_to_binary(io_lib:format(
+                "~b of ~b connections reported [beacon, ws, close] within ~b ms",
+                [Got, N, TimeoutMs]))}
+    end,
+    ok = telemetry:detach(Id),
+    Result.
+
+collect_closes(_Tag, 0, _Deadline, Acc) ->
+    {ok, lists:usort(lists:append(Acc))};
+collect_closes(Tag, N, Deadline, Acc) ->
+    Remaining = max(0, Deadline - erlang:monotonic_time(millisecond)),
+    receive
+        {Tag, Handler, Linked} ->
+            collect_closes(Tag, N - 1, Deadline, [[Handler | Linked] | Acc])
+    after Remaining ->
+        {error, length(Acc)}
+    end.
+
+await_exits(Pids, Deadline) ->
+    Monitors = maps:from_list([{erlang:monitor(process, P), P} || P <- Pids]),
+    await_downs(Monitors, Deadline).
+
+await_downs(Monitors, _Deadline) when map_size(Monitors) =:= 0 ->
+    {ok, nil};
+await_downs(Monitors, Deadline) ->
+    Remaining = max(0, Deadline - erlang:monotonic_time(millisecond)),
+    receive
+        {'DOWN', Ref, process, _Pid, _Reason} when is_map_key(Ref, Monitors) ->
+            await_downs(maps:remove(Ref, Monitors), Deadline)
+    after Remaining ->
+        Alive = maps:values(Monitors),
+        [erlang:demonitor(R, [flush]) || R <- maps:keys(Monitors)],
+        Described = [{P, erlang:process_info(P, [current_function, initial_call, message_queue_len])}
+                     || P <- Alive],
+        {error, iolist_to_binary(io_lib:format(
+            "~b server processes still alive at the deadline: ~0p",
+            [length(Alive), Described]))}
+    end.
 
 %% Get message queue length for a process.
 message_queue_len(Pid) ->

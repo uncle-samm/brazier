@@ -1,6 +1,7 @@
 /// Simulation metrics — ETS-backed atomic counters for cross-process
 /// metric accumulation. Any spawned test process can increment counters
 /// without locking. Latency samples are stored in an ETS bag table.
+import gleam/erlang/process.{type Pid}
 import gleam/float
 import gleam/int
 import gleam/list
@@ -59,7 +60,8 @@ pub fn mark_event_send_start(sent_at_us: Int) -> Nil {
 }
 
 /// Take and clear the current worker's in-flight event start time.
-pub fn take_event_send_start() -> Int {
+/// `Error(Nil)` when no event is in flight.
+pub fn take_event_send_start() -> Result(Int, Nil) {
   take_event_send_start_ffi()
 }
 
@@ -76,6 +78,17 @@ pub fn snapshot_memory() -> Int {
 /// Get current process count.
 pub fn snapshot_processes() -> Int {
   snapshot_processes_ffi()
+}
+
+/// Every live pid, to pass to `describe_new_processes` later.
+pub fn snapshot_pids() -> List(Pid) {
+  snapshot_pids_ffi()
+}
+
+/// Describe each process alive now that is not in `before`: registered
+/// name, initial call, current function, queue length.
+pub fn describe_new_processes(before: List(Pid)) -> String {
+  describe_new_processes_ffi(before)
 }
 
 /// Collect all metrics from the tables.
@@ -157,7 +170,7 @@ fn record_latency_ffi(table: MetricsTable, latency_us: Int) -> Nil
 fn mark_event_send_start_ffi(sent_at_us: Int) -> Nil
 
 @external(erlang, "beacon_sim_ffi", "take_event_send_start")
-fn take_event_send_start_ffi() -> Int
+fn take_event_send_start_ffi() -> Result(Int, Nil)
 
 @external(erlang, "beacon_sim_ffi", "record_payload")
 fn record_payload_ffi(table: MetricsTable, payload: String) -> Nil
@@ -178,3 +191,9 @@ fn snapshot_memory_ffi() -> Int
 
 @external(erlang, "beacon_sim_ffi", "snapshot_processes")
 fn snapshot_processes_ffi() -> Int
+
+@external(erlang, "beacon_sim_ffi", "snapshot_pids")
+fn snapshot_pids_ffi() -> List(Pid)
+
+@external(erlang, "beacon_sim_ffi", "describe_new_processes")
+fn describe_new_processes_ffi(before: List(Pid)) -> String
