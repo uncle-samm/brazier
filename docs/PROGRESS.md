@@ -10,7 +10,7 @@
 **Active Milestone:** 117 — Full Review Remediation
 **Last Completed:** 116 — Review Hardening (CSRF, Timers, Auth, Cookies, Docs)
 **Build Status:** GREEN (zero errors, zero warnings) on Gleam 1.19.2
-**Test Status:** GREEN (1405 tests passed, 0 failures, after the WS8a merge)
+**Test Status:** GREEN (1484 tests passed, 0 failures, after the WS8b part 1 merge)
 **Linter:** PASSING (zero violations)
 
 ### Milestone 117: Full Review Remediation 🚧
@@ -60,15 +60,33 @@
     - `members`, `list` and `get_by_key` return a `Result`.
     - `down_period` must exceed `broadcast_period × (max_silent_periods + 1)`; this fixes peers being marked down and up again in a loop.
     - Session functions that don't return a `Result` crash on a backend error.
-  - [ ] WS8b integration:
+  - [x] WS8b part 1 (merged 2026-11-03 at 446920f; branch green twice at 1484 tests, zero warnings, lint and format clean; merged tree verified again after the coordinator fixes below). Only touched files that WS7 doesn't own.
+    - HTTP telemetry: request span, connection open/close events from `beacon_http_conns`, and `transport_http.tag_route`. Routes report `"unknown"` until part 2 calls `tag_route`.
+    - Telemetry for effects, sessions and store writes.
+    - Auth moved to the `Result` session API:
+      - `login*`/`create_login*` return a `Result`.
+      - `logout_response` returns a `ResponseError` and never clears the cookie when the store fails.
+      - `SessionStoreUnavailable` → 503 in wrappers and middleware, and a rejected socket in WS auth.
+    - Replicated store mode: `store.open`/`open_list` with `Replicated(config)`, an add-wins LWW CRDT (`store/crdt.gleam`) with a hybrid logical clock (`store/hlc.gleam`). `store.new` stays node-local.
+    - Benchmarks:
+      - HTTP: 130.4 → 131.2 µs per request (noise).
+      - Local store: put/get/append unchanged.
+      - Replicated store: 3 nodes × 2000 puts converge in 80–104 ms; a joining node syncs 6000 entries in ≈41 ms.
+    - Docs updated: STATE_MANAGEMENT, CLUSTERING, TELEMETRY.
+    - Coordinator fixes after the merge:
+      - `auth.init_from_session` rendered the guest state when the store was unavailable (a fallback). It now crashes the request process after logging, as `session.get` does; the test asserts the crash.
+      - ARCHITECTURE.md's PubSub/store lines now say stores are node-local unless Replicated.
+  - [ ] WS8b part 2 (after WS7 merges; it touches WS7 files):
     - Root supervision tree: pubsub → cluster → session revocation scope → presence, plus app stop.
     - Runtime `on_presence` hook: coalesce up to 100 diffs; monitor `pubsub.partition_for` and the presence shard, and track again when a shard restarts.
-    - Call the existing emitters from HTTP, WS, runtime, effects, session and store code. Use the matched route pattern, and `"unknown"` for event names the app did not register.
-    - Move auth to the `Result` session API.
-    - Replicated store mode.
-    - Regenerate the example manifests for the `telemetry` dependency.
-    - Fix the stale ARCHITECTURE.md:257 and STATE_MANAGEMENT.md:108 claims about PubSub working across nodes; link CLUSTERING.md.
-    - Telemetry for session events.
+    - Telemetry call sites in `transport.gleam`, runtime and the WS upgrade:
+      - `tag_route` in `run_handler` (router/api), the framework routes, and `check_middleware`;
+      - WS: rate limiting, heartbeat, backpressure, `ws_close` in cleanup/stop, and the connection id;
+      - runtime events, using `"unknown"` for event names the app did not register.
+    - Init error channel: a crashing page handler gets a 500 response if nothing was sent yet (Phoenix answers a raise in `mount` during the dead render with 500; today the connection just closes). Init gets a way to fail so that `init_from_session` answers a store outage with 503 instead of crashing.
+    - Move the auth_workspace example (:134, :173, :260), GETTING_STARTED's auth section and SECURITY.md:202 to the new auth signatures.
+    - Regenerate the example manifests for the `telemetry` dependency (23 of 24 lack it).
+    - Session recheck path: emit the revoked event.
 - [ ] WS9 Test quality + performance (follow-up from WS8a: `test/beacon_effect_test_ffi.erl` `await_pg_empty` now polls every 5 ms; use an event instead): replace sleeps with synchronization, meaningful assertions, client JS tests in CI, HTTP/WS/runtime load tests and benchmarks with recorded baselines and regression thresholds
 
 **Phase 4 — Docs, hygiene, rename, final audits**
@@ -92,6 +110,25 @@
 - [ ] Rename package `beacon` → `brazier` (confirmed): package name, every `beacon/*` module and `beacon_*` FFI module/atom, the `beacon_client` JS package, the `beacon/build`/`beacon/lint` CLIs, the `data-beacon-*` DOM attributes and wire/log prefixes, pg scopes, cookie names, docs and examples; old names become hard errors (no aliases)
 - [ ] Final read-only audits (security, stability, tigerstyle, performance) and fixes
 - [ ] Final verification: build (zero warnings), tests, all examples, CDP browser suite, perf baselines
+
+**Decisions (Milestone 117, coordinator):**
+- 2026-11-03, WS8b was split in two:
+  - Part 1 took only files WS7 does not own (HTTP and connection telemetry, effects, sessions, stores, auth, the replicated store), so it ran beside WS7.
+  - Part 2 (transport, runtime, application, the supervision tree, examples) waits for the WS7 merge, so two writers never edit one file.
+- 2026-11-03, `auth.init_from_session` with an unavailable session store crashes the request; it does not render the guest state.
+  - Rendering the guest state is a fallback: a signed-in user sees a logged-out page and the outage stays hidden.
+  - The rejected alternative was to keep the guest state, "fail closed", as part 1 shipped it.
+  - Reference: Plug.Session raises when its store fails, and so does `session.get` here.
+  - The proper answer, a 503 through an init error channel, needs WS7's `init(Context)`; it is listed under WS8b part 2.
+- 2026-11-03, replicated store caveats accepted as CRDT semantics; they are documented in CLUSTERING.md and are not fallbacks:
+  - A new replica serves empty reads until its first sync, like Phoenix.Tracker and DeltaCrdt.
+  - A remote clock more than 60 s ahead only logs a warning.
+  - Reads during a replica restart crash the caller.
+  - Follow-ups for WS10/audits:
+    - expose a "synced" signal so callers can wait for it;
+    - add a refused-merge telemetry event and retry backoff;
+    - compact the causal context, which gains one entry per replica restart and never shrinks;
+    - `delta_crdt_ex` was not on disk, so check the CRDT against its source in the final stability audit.
 
 ### Milestone 116: Review Hardening (CSRF, Timers, Auth, Cookies, Docs)
 > Fix the five must-fix findings from a full-framework review: a no-op CSRF

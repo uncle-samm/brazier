@@ -254,8 +254,8 @@ Files: `beacon_client.gleam` (Gleam types), `beacon_client_ffi.mjs` (JS runtime)
 - **`static.gleam`** — Static file serving: `StaticConfig(directory, prefix, max_age)`. MIME types, cache headers, directory traversal prevention.
 
 ### PubSub and Stores
-- **`pubsub.gleam`** — Erlang `pg`-based publish/subscribe. `subscribe(topic)`, `unsubscribe(topic)`, `broadcast(topic, message)`. Works across distributed BEAM nodes.
-- **`store.gleam`** — ETS-backed shared stores: `Store` (key-value) and `ListStore` (bag-type). Auto-broadcast via PubSub on mutation (`put`, `delete`, `push`). Use `beacon.watch(store, fn() -> msg)` to subscribe.
+- **`pubsub.gleam`** — A port of Phoenix.PubSub's `pg` adapter: `subscribe(topic)`, `unsubscribe(topic)`, `broadcast(topic, message)` reaches every connected node; `local_broadcast` and `direct_broadcast` target one node. See `docs/CLUSTERING.md`.
+- **`store.gleam`** — ETS-backed shared stores: `Store` (key-value) and `ListStore` (bag-type). Auto-broadcast via PubSub on mutation (`put`, `delete`, `push`). Use `beacon.watch(store, fn() -> msg)` to subscribe. Stores from `store.new` are node-local; `store.open` with `Replicated(config)` replicates one across the cluster as an add-wins LWW CRDT (see `docs/CLUSTERING.md`).
 - **`session.gleam`** — Cookie-based sessions stored in ETS with TTL.
 - **`cookie.gleam`** — Cookie parsing and setting utilities (parse, get, set, delete with secure defaults).
 

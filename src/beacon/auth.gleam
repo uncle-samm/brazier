@@ -3,14 +3,16 @@
 ///
 /// Every helper uses the session functions that return errors
 /// (`session.try_create_with_data`, `session.try_delete`, `session.fetch`,
-/// `session.rotate`), so an External backend failure never crashes a
-/// request:
+/// `session.rotate`), so an External backend failure is returned, not
+/// raised:
 /// - a missing, deleted or expired session is `InvalidSession`;
 /// - a backend failure (or a write that lost every compare-and-swap race)
 ///   is `SessionStoreUnavailable`, logged as an error with its reason.
-///   Request wrappers and middleware answer it with 503, WebSocket auth
-///   rejects the socket, and `init_from_session` renders the guest state
-///   (fail closed: an unverifiable session is never trusted).
+///   Request wrappers and middleware answer it with 503 and WebSocket auth
+///   rejects the socket. `init_from_session` has no error channel, so it
+///   crashes the request process after logging, as `session.get` does:
+///   rendering the guest state instead would show a signed-in user a
+///   logged-out page and hide the outage.
 import beacon/api
 import beacon/cookie
 import beacon/log
@@ -547,6 +549,9 @@ pub fn protect_ws(
 ///
 /// Use with `beacon.ws_init` when SSR should render the authenticated state on
 /// the first response. Invalid sessions are logged and treated as guests.
+/// When the session store is unavailable the session cannot be verified
+/// either way, and init has no error channel: this logs the failure and
+/// crashes the request process (see the module docs).
 pub fn init_from_session(
   store: session.SessionStore,
   config: SessionConfig,
@@ -565,17 +570,7 @@ pub fn init_from_session(
         }
       }
       Error(MissingSessionCookie) -> guest_init(req)
-      Error(SessionStoreUnavailable(reason)) -> {
-        // Fail closed: a session that cannot be verified is never trusted,
-        // and init has no error channel, so the guest state is rendered.
-        log.error(
-          "beacon.auth",
-          "Rendering the guest state: the session store is unavailable ("
-            <> reason
-            <> ")",
-        )
-        guest_init(req)
-      }
+      Error(SessionStoreUnavailable(_) as err) -> crash_init(Error(err))
       Error(err) -> {
         log.warning(
           "beacon.auth",
@@ -585,6 +580,25 @@ pub fn init_from_session(
       }
     }
   }
+}
+
+/// The store failure was already logged by `store_failure`; this records
+/// the consequence and crashes the request process, as `session.or_crash`
+/// does for an operation with no error channel.
+fn crash_init(outcome: Result(model, SessionError)) -> model {
+  case outcome {
+    Ok(_) -> Nil
+    Error(err) ->
+      log.error(
+        "beacon.auth",
+        "init_from_session cannot verify the session ("
+          <> error_to_string(err)
+          <> "); crashing the request",
+      )
+  }
+  let assert Ok(model) = outcome
+    as "session store unavailable during init_from_session"
+  model
 }
 
 /// Wrap an API route handler with session + current-user validation.

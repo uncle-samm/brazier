@@ -1,10 +1,11 @@
 /// beacon/auth against an External session backend that fails.
 ///
-/// Every helper must return (or answer with) the failure instead of
-/// crashing the request process or treating it as "no session": wrappers
-/// and middleware answer 503, WebSocket auth rejects, `init_from_session`
-/// renders the guest state, and login never creates a session after it
-/// failed to delete the previous one.
+/// Every helper with an error channel must return (or answer with) the
+/// failure instead of crashing or treating it as "no session": wrappers
+/// and middleware answer 503, WebSocket auth rejects, and login never
+/// creates a session after it failed to delete the previous one.
+/// `init_from_session` has no error channel, so it crashes instead of
+/// rendering the guest state.
 ///
 /// The fakes are plain Gleam functions answering fixed values; the ones
 /// that must never run report to a subject owned by the test.
@@ -18,6 +19,7 @@ import beacon/transport/server.{type Connection, type ResponseBody, Bytes}
 import gleam/bit_array
 import gleam/bytes_tree
 import gleam/dict
+import gleam/dynamic
 import gleam/erlang/process.{type Subject}
 import gleam/http/request.{type Request}
 import gleam/http/response.{type Response}
@@ -220,7 +222,7 @@ pub fn ws_auth_rejects_when_the_store_is_unavailable_test() {
     auth_fn(with_cookie("GET", "/ws"))
 }
 
-pub fn init_renders_the_guest_state_when_the_store_is_unavailable_test() {
+pub fn init_crashes_when_the_store_is_unavailable_test() {
   let init =
     auth.init_from_session(
       store(broken()),
@@ -228,9 +230,12 @@ pub fn init_renders_the_guest_state_when_the_store_is_unavailable_test() {
       fn(_req) { "guest" },
       fn(_req, _sess, user_id) { "user:" <> user_id },
     )
-  let assert "guest" = init(with_cookie("GET", "/"))
+  // Never the guest state: that would show a signed-in user a logged-out
+  // page and hide the outage.
+  let assert Error(#("error", _)) =
+    rescue(fn() { init(with_cookie("GET", "/")) })
   // The same request against a healthy store is authenticated, so the
-  // guest state above came from the failure, not from the request.
+  // crash above came from the failure, not from the request.
   let healthy_init =
     auth.init_from_session(
       store(healthy()),
@@ -265,6 +270,9 @@ fn empty_response() -> Response(ResponseBody) {
 
 @external(erlang, "beacon_middleware_test_ffi", "make_request")
 fn make_request(method: String, path: String) -> Request(Connection)
+
+@external(erlang, "beacon_telemetry_test_ffi", "rescue")
+fn rescue(run: fn() -> a) -> Result(a, #(String, dynamic.Dynamic))
 
 @external(erlang, "erlang", "unique_integer")
 fn unique_integer() -> Int
