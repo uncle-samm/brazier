@@ -60,10 +60,12 @@ import beacon/effect.{type Effect}
 import beacon/element.{type Element}
 import beacon/error
 import beacon/internal/context
+import beacon/internal/presence_watch
 import beacon/local
 import beacon/log
 import beacon/middleware
 import beacon/notification.{type Notification}
+import beacon/presence as beacon_presence
 import beacon/pubsub
 import beacon/runtime
 import beacon/transport
@@ -143,6 +145,7 @@ pub opaque type App(state, model, local, msg) {
     dev_mode: Bool,
     pubsub: pubsub.PubSubConfig,
     cluster: Option(beacon_cluster.ClusterConfig),
+    presence: Option(presence_watch.Watch(state, msg)),
   )
 }
 
@@ -233,6 +236,7 @@ fn new_app(
     dev_mode: False,
     pubsub: pubsub.default_config(),
     cluster: None,
+    presence: None,
   )
 }
 
@@ -390,6 +394,39 @@ pub fn cluster(
   App(..app, cluster: Some(config))
 }
 
+/// Track who is here (Phoenix.Presence). The tracker (built with
+/// `presence.new`) runs in the application's supervision tree, and every
+/// session tracks what `track` returns for its state: computed after every
+/// update, tracked, updated and untracked as the list changes, and gone
+/// when the session ends. Every change on a tracked topic, from any node,
+/// arrives as `on_presence(diff)`: the session's first message for a topic
+/// lists everyone already there as joins, and up to 100 queued changes are
+/// coalesced into one message. Keep the entries with `presence.merge`.
+///
+/// ```gleam
+/// beacon.application(init:, update:, view:)
+/// |> beacon.presence(
+///   tracker: presence.new("online", encode_user, user_decoder()),
+///   track: fn(model) {
+///     [presence.Tracking(topic: "room:" <> model.room, key: model.user, meta: model.profile)]
+///   },
+///   on_presence: PresenceChanged,
+/// )
+/// ```
+///
+/// A tracking the tracker refuses (a limit, an invalid topic or key, the
+/// same key twice on a topic) stops the session with a logged error. When
+/// a shard of the tracker restarts, every session tracks its entries on it
+/// again. Start fails when the tracker configuration is invalid.
+pub fn presence(
+  app: App(state, model, local, msg),
+  tracker tracker: beacon_presence.PresenceConfig(meta),
+  track track: fn(state) -> List(beacon_presence.Tracking(meta)),
+  on_presence on_presence: fn(beacon_presence.Diff(meta)) -> msg,
+) -> App(state, model, local, msg) {
+  App(..app, presence: Some(presence_watch.new(tracker, track, on_presence)))
+}
+
 /// Recover the session after a reconnect to a new server process: the
 /// page carries the Model in a signed join token, and `restore` rebuilds
 /// the server state from it. For `simple` and `application`, where the
@@ -506,6 +543,7 @@ pub fn to_config(
     dev_mode: app.dev_mode,
     pubsub: app.pubsub,
     cluster: app.cluster,
+    presence: app.presence,
   )
 }
 

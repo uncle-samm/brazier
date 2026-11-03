@@ -3,8 +3,9 @@
 //// scope unlinked, and the tree refuses to start beside them.
 ////
 //// Children, in start order (RestForOne): PubSub, the cluster manager,
-//// the session scope, the listener. A crash restarts the child and every
-//// child after it, never one before it.
+//// the session scope, the presence tracker, the listener (the cluster
+//// manager and the tracker only when configured). A crash restarts the
+//// child and every child after it, never one before it.
 
 import beacon/app_config_fixture
 import beacon/application.{type App}
@@ -14,14 +15,18 @@ import beacon/cluster/peer.{type Peer, Timeout}
 import beacon/effect
 import beacon/error
 import beacon/html
+import beacon/internal/presence_watch
 import beacon/log
+import beacon/presence
 import beacon/presence/holder
 import beacon/pubsub
 import beacon/session
 import beacon/telemetry
 import beacon/transport/server
+import gleam/dynamic/decode
 import gleam/erlang/process.{type Pid}
 import gleam/int
+import gleam/json
 import gleam/list
 import gleam/option.{Some}
 import gleam/string
@@ -58,6 +63,28 @@ fn clustered_config() -> application.AppConfig(Model, Msg) {
     ..config(),
     cluster: Some(cluster.new(cluster.NoDiscovery, secret_key: secret)),
   )
+}
+
+fn tracker_config() -> presence.PresenceConfig(String) {
+  presence.new("tree", json.string, decode.string)
+}
+
+fn presence_config(
+  tracker: presence.PresenceConfig(String),
+) -> application.AppConfig(Model, Msg) {
+  application.AppConfig(
+    ..clustered_config(),
+    presence: Some(
+      presence_watch.new(tracker, fn(_model) { [] }, fn(_diff) { Inc }),
+    ),
+  )
+}
+
+fn tracker_running(p: Peer) -> Bool {
+  peer.on(p, fn() {
+    let assert Ok(tracker) = presence.handle(tracker_config())
+    presence.running(tracker)
+  })
 }
 
 /// Start the tree on `p` from a holder process that stays alive, so the
@@ -182,6 +209,71 @@ pub fn tree_without_cluster_has_three_children_test_() -> peer.Timeout {
   let #(before, after) = crash_child(p, app, 1)
   let assert [True, False, False] = kept(before, after)
   let assert True = get_ok(p, app)
+  Nil
+}
+
+pub fn tree_with_presence_runs_the_tracker_before_the_listener_test_() -> peer.Timeout {
+  use <- Timeout(60)
+  use peers <- peer.with_cluster(1, "beacon_tree_presence")
+  let assert [p] = peers
+  let app = start_tree(p, presence_config(tracker_config()))
+  let assert [_pubsub, _cluster, scope, tracker, listener] = children_on(p, app)
+  let assert Ok(named_scope) =
+    peer.on(p, fn() { whereis_name("beacon_session_pg") })
+  let assert Ok(named_tracker) =
+    peer.on(p, fn() { whereis_name("beacon_presence_tree_sup") })
+  let assert True = scope == named_scope
+  let assert True = tracker == named_tracker
+  let assert True = listener == server.get_supervisor(app.listener)
+  // A tracker crash restarts the tracker and the listener only.
+  let #(before, after) = crash_child(p, app, 3)
+  let assert [True, True, True, False, False] = kept(before, after)
+  let assert True = tracker_running(p)
+  let assert True = get_ok(p, app)
+  Nil
+}
+
+pub fn supervised_start_refuses_unsupervised_tracker_test_() -> peer.Timeout {
+  use <- Timeout(60)
+  use peers <- peer.with_cluster(1, "beacon_tree_refuse_tracker")
+  let assert [p] = peers
+  let outcome =
+    peer.on(p, fn() {
+      // The tracker runs over PubSub, so both run unsupervised.
+      let holder = holder.start()
+      holder.run(holder, pubsub.start)
+      let assert Ok(_) =
+        holder.run(holder, fn() { presence.start(tracker_config()) })
+      holder.run(holder, fn() {
+        application.start_supervised(presence_config(tracker_config()))
+      })
+    })
+  let assert Error(error.ConfigError(reason)) = outcome
+  let assert True =
+    string.contains(reason, "presence tracker is already running")
+  // Nothing of the refused tree started; the unsupervised tracker runs on.
+  let assert False = peer.on(p, session.registry_running)
+  let assert True = tracker_running(p)
+  Nil
+}
+
+pub fn supervised_start_refuses_invalid_presence_config_test_() -> peer.Timeout {
+  use <- Timeout(60)
+  use peers <- peer.with_cluster(1, "beacon_tree_bad_tracker")
+  let assert [p] = peers
+  let outcome =
+    peer.on(p, fn() {
+      let holder = holder.start()
+      holder.run(holder, fn() {
+        application.start_supervised(presence_config(
+          tracker_config() |> presence.pool_size(0),
+        ))
+      })
+    })
+  let assert Error(error.ConfigError(reason)) = outcome
+  let assert True = string.contains(reason, "Invalid presence configuration")
+  let assert Error(_) = peer.on(p, pubsub.running_config)
+  let assert False = peer.on(p, session.registry_running)
   Nil
 }
 

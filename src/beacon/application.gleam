@@ -7,18 +7,21 @@
 /// 1. PubSub (`pubsub.supervised`)
 /// 2. the cluster manager, when configured (`cluster.supervised`)
 /// 3. the session revocation scope (`session.registry_supervised`)
-/// 4. the HTTP/WebSocket listener (`transport.supervised`)
+/// 4. the presence tracker, when configured (`presence.supervised`)
+/// 5. the HTTP/WebSocket listener (`transport.supervised`)
 ///
 /// A child that crashes is restarted together with every child after it:
-/// a PubSub restart also restarts the cluster manager, the session scope
-/// and the listener (closing every connection, whose runtimes were linked
-/// to PubSub partitions anyway); a listener restart touches nothing before
-/// it. Past the restart tolerance the supervisor gives up and exits, which
+/// a PubSub restart also restarts the cluster manager, the session scope,
+/// the presence tracker and the listener (closing every connection, whose
+/// runtimes were linked to PubSub partitions anyway); a listener restart
+/// touches nothing before it. A single presence shard that crashes is
+/// restarted by the tracker's own supervisor, and every session tracks its
+/// entries on it again. Past the restart tolerance the supervisor gives up and exits, which
 /// `wait_forever` turns into a crash of the main process.
 ///
 /// `start` is the unsupervised form for embedding and tests: it makes sure
-/// PubSub and the session scope run on the node (unlinked, shared) and
-/// links only the listener to the caller.
+/// PubSub, the session scope and the presence tracker run on the node
+/// (unlinked, shared) and links only the listener to the caller.
 ///
 /// `beacon.start` builds an `AppConfig` from the app and the generated codec;
 /// tests build it directly with hand-written codecs.
@@ -32,9 +35,11 @@ import beacon/effect.{type Effect}
 import beacon/element.{type Element}
 import beacon/error
 import beacon/internal/context.{type Context}
+import beacon/internal/presence_watch
 import beacon/log
 import beacon/middleware
 import beacon/notification.{type Notification}
+import beacon/presence
 import beacon/pubsub
 import beacon/runtime
 import beacon/session
@@ -111,6 +116,9 @@ pub type AppConfig(state, msg) {
     pubsub: pubsub.PubSubConfig,
     /// Cluster membership, when the node joins a cluster.
     cluster: Option(cluster.ClusterConfig),
+    /// Presence: the tracker the tree runs, and what each session tracks
+    /// and is told (`beacon.presence`).
+    presence: Option(presence_watch.Watch(state, msg)),
   )
 }
 
@@ -139,9 +147,9 @@ const stop_timeout_ms = 30_000
 /// WebSocket connection gets its own runtime process. Refuses a weak secret
 /// key.
 ///
-/// PubSub, the cluster manager (when configured) and the session
-/// revocation scope are started unlinked if they are not running yet, and
-/// stay running after `stop`: they are shared by every app on the node.
+/// PubSub, the cluster manager (when configured), the session revocation
+/// scope and the presence tracker (when configured) are started unlinked
+/// if they are not running yet, and stay running after `stop`: they are shared by every app on the node.
 /// Only the listener is linked to the caller. Use `start_supervised` in
 /// production.
 pub fn start(config: AppConfig(state, msg)) -> Result(App, error.BeaconError) {
@@ -166,6 +174,19 @@ pub fn start(config: AppConfig(state, msg)) -> Result(App, error.BeaconError) {
       })
   })
   session.ensure_registry()
+  use Nil <- result.try(case config.presence {
+    None -> Ok(Nil)
+    Some(watch) ->
+      presence_watch.ensure_started(watch)
+      |> result.map_error(fn(reason) {
+        config_error(
+          "Presence tracker "
+          <> presence_watch.name(watch)
+          <> " failed to start: "
+          <> presence.describe(reason),
+        )
+      })
+  })
   log_starting(config, "unsupervised")
   case transport.start_listener(transport_config(config)) {
     Ok(listener) -> {
@@ -196,8 +217,8 @@ pub fn start(config: AppConfig(state, msg)) -> Result(App, error.BeaconError) {
 /// The root supervisor is linked to the caller. This is the production
 /// entry point; stop it with `stop`.
 ///
-/// Refuses to start when PubSub, the cluster manager or the session scope
-/// already run on this node outside a tree: the tree must own them, or a
+/// Refuses to start when PubSub, the cluster manager, the session scope or
+/// the presence tracker already run on this node outside a tree: the tree must own them, or a
 /// crash of theirs would go unnoticed.
 pub fn start_supervised(
   config: AppConfig(state, msg),
@@ -207,7 +228,7 @@ pub fn start_supervised(
   // leaves nothing running.
   use _ <- result.try(beacon_config.validate_secret_key(config.secret_key))
   use Nil <- result.try(start_telemetry())
-  use Nil <- result.try(refuse_running_infrastructure())
+  use Nil <- result.try(refuse_running_infrastructure(config))
   use pubsub_child <- result.try(
     pubsub.supervised(config.pubsub)
     |> result.map_error(fn(reason) {
@@ -222,6 +243,17 @@ pub fn start_supervised(
       |> result.map_error(fn(reason) {
         config_error(
           "Invalid cluster configuration: " <> cluster.describe(reason),
+        )
+      })
+  })
+  use presence_child <- result.try(case config.presence {
+    None -> Ok(None)
+    Some(watch) ->
+      presence_watch.supervised(watch)
+      |> result.map(Some)
+      |> result.map_error(fn(reason) {
+        config_error(
+          "Invalid presence configuration: " <> presence.describe(reason),
         )
       })
   })
@@ -263,7 +295,11 @@ pub fn start_supervised(
   let builder =
     builder
     |> supervisor.add(session.registry_supervised())
-    |> supervisor.add(listener_child)
+  let builder = case presence_child {
+    Some(child) -> supervisor.add(builder, child)
+    None -> builder
+  }
+  let builder = supervisor.add(builder, listener_child)
 
   case supervisor.start(builder) {
     Ok(started) ->
@@ -336,25 +372,43 @@ fn start_telemetry() -> Result(Nil, error.BeaconError) {
   }
 }
 
-/// The tree owns PubSub, the cluster manager and the session scope; one
-/// already running was started by someone else and would not be watched.
-fn refuse_running_infrastructure() -> Result(Nil, error.BeaconError) {
+/// The tree owns PubSub, the cluster manager, the session scope and the
+/// presence tracker; one already running was started by someone else and
+/// would not be watched.
+fn refuse_running_infrastructure(
+  config: AppConfig(state, msg),
+) -> Result(Nil, error.BeaconError) {
   let pubsub_running = result.is_ok(pubsub.running_config())
   let cluster_running = result.is_ok(cluster.members())
-  case pubsub_running, cluster_running, session.registry_running() {
-    True, _, _ ->
+  let presence_running = case config.presence {
+    Some(watch) -> presence_watch.running(watch)
+    None -> False
+  }
+  // The tracker needs PubSub, so it is checked first: a running tracker
+  // means PubSub runs too, and the tracker is the more specific report.
+  case
+    presence_running,
+    pubsub_running,
+    cluster_running,
+    session.registry_running()
+  {
+    True, _, _, _ ->
+      Error(config_error(
+        "The presence tracker is already running on this node outside a supervision tree",
+      ))
+    _, True, _, _ ->
       Error(config_error(
         "PubSub is already running on this node outside a supervision tree",
       ))
-    _, True, _ ->
+    _, _, True, _ ->
       Error(config_error(
         "The cluster manager is already running on this node outside a supervision tree",
       ))
-    _, _, True ->
+    _, _, _, True ->
       Error(config_error(
         "The session scope is already running on this node outside a supervision tree",
       ))
-    False, False, False -> Ok(Nil)
+    False, False, False, False -> Ok(Nil)
   }
 }
 
@@ -391,6 +445,11 @@ fn log_starting(config: AppConfig(state, msg), mode: String) -> Nil {
       <> ", cluster: "
       <> case config.cluster {
       Some(_) -> "yes"
+      None -> "no"
+    }
+      <> ", presence: "
+      <> case config.presence {
+      Some(watch) -> presence_watch.name(watch)
       None -> "no"
     }
       <> ")",
@@ -435,6 +494,7 @@ fn transport_config(
       on_notify: config.on_notify,
       on_notification: config.on_notification,
       secret_key: config.secret_key,
+      presence: config.presence,
     )
 
   let base_transport_config =

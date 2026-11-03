@@ -7,7 +7,7 @@
 %% every node sends a topic's entries through the same shard index.
 %% Errors are returned as beacon/presence.PresenceError values.
 
--export([names/2, start/2, start_link/2, stop/1, call/3, call_all/2, list/2,
+-export([names/2, start/2, start_link/2, stop/1, running/1, call/3, call_all/2, list/2,
          get_by_key/3, shard_pid/2, shard_index/2, decode_diff/2]).
 
 %% Bound on a shard call. A shard serves calls between heartbeats, so a
@@ -52,6 +52,10 @@ start_error(Config, Reason) ->
     logger:error("[beacon.presence] Tracker ~ts failed to start: ~p",
                  [element(2, Config), Reason]),
     {error, {start_failed, format(Reason)}}.
+
+%% Whether the tracker's supervisor is registered on this node.
+running({names, Sup, _Shards}) ->
+    whereis(Sup) =/= undefined.
 
 stop({names, Sup, _Shards}) ->
     case whereis(Sup) of

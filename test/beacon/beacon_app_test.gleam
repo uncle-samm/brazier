@@ -6,12 +6,16 @@ import beacon/application
 import beacon/effect
 import beacon/element
 import beacon/error
+import beacon/internal/presence_watch
 import beacon/local
 import beacon/log_capture
 import beacon/middleware
+import beacon/presence
 import beacon/runtime
 import beacon/test_ctx
+import gleam/dynamic/decode
 import gleam/int
+import gleam/json
 import gleam/list
 import gleam/option.{None, Some}
 import gleam/string
@@ -227,6 +231,45 @@ pub fn state_recovery_decodes_and_restores_test() {
   let assert Ok(State(count: 42, secret: "restored")) = restore("42")
   // A model the codec cannot decode is an error, not a default state.
   let assert Error("not an int: {\"x\":1}") = restore("{\"x\":1}")
+}
+
+// --- presence ---
+
+pub fn no_presence_by_default_test() {
+  let cfg = config(keyed(counter()))
+  let assert None = cfg.presence
+}
+
+pub fn presence_reaches_the_config_test() {
+  let cfg =
+    counter()
+    |> keyed
+    |> beacon.presence(
+      tracker: presence.new("builder", json.string, decode.string),
+      track: fn(count) {
+        [presence.Tracking(topic: "room", key: "k", meta: int.to_string(count))]
+      },
+      on_presence: fn(_diff) { Inc },
+    )
+    |> config
+  let assert Some(watch) = cfg.presence
+  let assert "builder" = presence_watch.name(watch)
+  let assert Ok(Nil) = presence_watch.validate(watch)
+}
+
+pub fn invalid_presence_config_fails_validation_test() {
+  let cfg =
+    counter()
+    |> keyed
+    |> beacon.presence(
+      tracker: presence.new("builder", json.string, decode.string)
+        |> presence.pool_size(0),
+      track: fn(_count) { [] },
+      on_presence: fn(_diff) { Inc },
+    )
+    |> config
+  let assert Some(watch) = cfg.presence
+  let assert Error(presence.InvalidConfig(_)) = presence_watch.validate(watch)
 }
 
 // --- secret_key ---

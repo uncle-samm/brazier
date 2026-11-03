@@ -26,10 +26,22 @@
 /// client navigation runs `update` with the new route's message; a URL the
 /// app does not route (or whose encoding does not decode) is answered with
 /// a hard navigation, so the server's dead render produces the 404 or 400.
+///
+/// ## Presence
+///
+/// With `presence` configured, the initialiser starts the session's
+/// presence watcher (`beacon/internal/presence_watch`) with the initial
+/// state's trackings and fails the start if they are refused. After every
+/// update (like dynamic subscriptions) the trackings are computed again and
+/// handed to the watcher when they changed; its `on_presence` messages
+/// arrive as dispatched effects. The watcher is linked: if it fails (PubSub
+/// or the tracker gone for good, a refused track) the runtime exits with
+/// its reason and the clients reconnect.
 import beacon/cookie
 import beacon/effect.{type Effect}
 import beacon/error
 import beacon/internal/context.{type Context}
+import beacon/internal/presence_watch
 import beacon/internal/uri_check
 import beacon/log
 import beacon/notification.{type Notification, Notification}
@@ -172,6 +184,8 @@ pub type RuntimeState(model, msg) {
     cached_model: CachedModelState,
     /// Framework-owned effect processes, such as effect.every timers.
     effect_processes: List(Pid),
+    /// The session's presence watcher, when the app has presence.
+    presence: Option(presence_watch.Watcher(model)),
   )
 }
 
@@ -208,6 +222,9 @@ pub type RuntimeConfig(state, msg) {
     /// Secret key for join-token verification.
     /// Must not be empty when state recovery is enabled.
     secret_key: String,
+    /// The app's presence: what the session tracks for its state and the
+    /// message for a change on its topics.
+    presence: Option(presence_watch.Watch(state, msg)),
   )
 }
 
@@ -272,6 +289,13 @@ fn start_actor(
   let initial_effects = effect.batch([init_effects, route_effects])
   let result =
     actor.new_with_initialiser(5000, fn(subject) {
+      // Presence first: a refused tracking fails the start before any
+      // effect runs.
+      use watcher <- result.try(start_presence(
+        config.presence,
+        subject,
+        initial_model,
+      ))
       let initial_effect_processes = run_effects(initial_effects, subject)
       let state =
         RuntimeState(
@@ -295,6 +319,7 @@ fn start_actor(
           dynamic_subscriptions: config.dynamic_subscriptions,
           cached_model: NoCache,
           effect_processes: initial_effect_processes,
+          presence: watcher,
         )
       log.debug("beacon.runtime", "Runtime initialising")
 
@@ -318,7 +343,9 @@ fn start_actor(
           <> ", on_notification: "
           <> yes_no(option.is_some(config.on_notification))
           <> ", router: "
-          <> yes_no(option.is_some(config.route)),
+          <> yes_no(option.is_some(config.route))
+          <> ", presence: "
+          <> yes_no(option.is_some(config.presence)),
       )
       case config.dynamic_subscriptions {
         Some(compute) -> {
@@ -355,6 +382,35 @@ fn start_actor(
       )
       Error(error.RuntimeError(reason: "Runtime init process exited"))
     }
+  }
+}
+
+/// Start the presence watcher from inside the runtime's initialiser, so the
+/// runtime is its owner.
+fn start_presence(
+  watch: Option(presence_watch.Watch(model, msg)),
+  subject: Subject(RuntimeMessage(msg)),
+  model: model,
+) -> Result(Option(presence_watch.Watcher(model)), String) {
+  case watch {
+    None -> Ok(None)
+    Some(watch) ->
+      presence_watch.start(
+        watch,
+        fn(msg) { process.send(subject, EffectDispatched(message: msg)) },
+        model,
+      )
+      |> result.map(Some)
+      |> result.map_error(fn(reason) {
+        log.error(
+          "beacon.runtime",
+          "Presence of tracker "
+            <> presence_watch.name(watch)
+            <> " refused the session: "
+            <> reason,
+        )
+        "presence: " <> reason
+      })
   }
 }
 
@@ -494,7 +550,7 @@ fn handle_message(
       log.debug("beacon.runtime", "Listener subject registered")
       // The model may have changed (init effects) since the initial topics
       // were computed; reconcile immediately.
-      actor.continue(update_dynamic_subscriptions(
+      actor.continue(reconcile_subscriptions(
         RuntimeState(
           ..state,
           listener_subject: Some(listener),
@@ -530,6 +586,10 @@ fn handle_message(
       log.info("beacon.runtime", "Runtime shutting down")
       stop_listener(state.listener_subject)
       stop_effect_processes(state.effect_processes)
+      case state.presence {
+        Some(watcher) -> presence_watch.stop(watcher)
+        None -> Nil
+      }
       actor.stop()
     }
   }
@@ -653,7 +713,7 @@ fn handle_join(
         )
       let state =
         send_model_sync_to(state, [conn_id, ..stale_others], "join_model_sync")
-      update_dynamic_subscriptions(state)
+      reconcile_subscriptions(state)
     }
   }
 }
@@ -821,7 +881,7 @@ fn handle_batch(
           )
       }
       let #(state, changed) = broadcast_model(state)
-      let state = update_dynamic_subscriptions(state)
+      let state = reconcile_subscriptions(state)
       ack_if_unchanged(state, conn_id, changed)
     }
   }
@@ -1072,10 +1132,26 @@ fn run_update_for(
   let effect_processes =
     run_effects_with_context(effects, state.self, conn_id, state.connections)
   let state = track_effect_processes(state, effect_processes)
-  #(update_dynamic_subscriptions(state), changed)
+  #(reconcile_subscriptions(state), changed)
 }
 
-/// After an update, diff dynamic subscriptions and apply changes.
+/// After an update (or a join), bring dynamic subscriptions and presence
+/// trackings in line with the model.
+fn reconcile_subscriptions(
+  state: RuntimeState(model, msg),
+) -> RuntimeState(model, msg) {
+  let state = update_dynamic_subscriptions(state)
+  case state.presence {
+    None -> state
+    Some(watcher) ->
+      RuntimeState(
+        ..state,
+        presence: Some(presence_watch.sync(watcher, state.model)),
+      )
+  }
+}
+
+/// Diff dynamic subscriptions and apply changes.
 fn update_dynamic_subscriptions(
   state: RuntimeState(model, msg),
 ) -> RuntimeState(model, msg) {

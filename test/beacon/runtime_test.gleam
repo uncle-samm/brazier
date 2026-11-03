@@ -102,6 +102,7 @@ fn counter_config() -> runtime.RuntimeConfig(CounterModel, CounterMsg) {
     on_notify: option.None,
     on_notification: option.None,
     secret_key: "",
+    presence: option.None,
   )
 }
 
@@ -178,6 +179,7 @@ fn route_config() -> runtime.RuntimeConfig(RouteModel, RouteMsg) {
     on_notify: option.None,
     on_notification: option.None,
     secret_key: "",
+    presence: option.None,
   )
 }
 
@@ -680,6 +682,7 @@ pub fn runtime_effect_dispatches_message_test() {
       on_notify: option.None,
       on_notification: option.None,
       secret_key: "",
+      presence: option.None,
     )
 
   let assert Ok(subject) = runtime.start(config, test_context())
@@ -744,6 +747,7 @@ pub fn live_update_does_not_render_server_view_test() {
       on_notify: option.None,
       on_notification: option.None,
       secret_key: "",
+      presence: option.None,
     )
   let assert Ok(subject) = runtime.start(config, test_context())
   let transport_subject = process.new_subject()
@@ -1151,6 +1155,7 @@ pub fn model_sync_sent_after_event_test() {
       on_notify: option.None,
       on_notification: option.None,
       secret_key: "",
+      presence: option.None,
     )
   let assert Ok(subject) = runtime.start(config, test_context())
   let transport_subject = process.new_subject()
@@ -1684,6 +1689,7 @@ pub fn server_state_not_in_model_sync_test() {
       on_notify: option.None,
       on_notification: option.None,
       secret_key: "",
+      presence: option.None,
     )
   let assert Ok(subject) = runtime.start(config, test_context())
   let transport_subject = process.new_subject()
@@ -1749,6 +1755,7 @@ pub fn server_state_background_effect_pushes_update_test() {
       on_notify: option.None,
       on_notification: option.None,
       secret_key: "",
+      presence: option.None,
     )
   let assert Ok(subject) = runtime.start(config, test_context())
   let transport_subject = process.new_subject()
@@ -1826,6 +1833,7 @@ pub fn server_state_user_event_pushes_update_test() {
       on_notify: option.None,
       on_notification: option.None,
       secret_key: "",
+      presence: option.None,
     )
   let assert Ok(subject) = runtime.start(config, test_context())
   let transport_subject = process.new_subject()
@@ -2142,6 +2150,7 @@ pub fn on_update_effect_is_invoked_test() {
       on_notify: option.None,
       on_notification: option.None,
       secret_key: "",
+      presence: option.None,
     )
   let assert Ok(subject) = runtime.start(config, test_context())
   let transport_subject = process.new_subject()

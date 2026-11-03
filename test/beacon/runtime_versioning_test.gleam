@@ -81,6 +81,7 @@ fn config() -> runtime.RuntimeConfig(Model, Msg) {
     on_notify: None,
     on_notification: None,
     secret_key: secret,
+    presence: None,
   )
 }
 

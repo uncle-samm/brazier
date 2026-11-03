@@ -144,6 +144,7 @@ fn start_parent(seen: Subject(Msg)) -> Subject(runtime.RuntimeMessage(Msg)) {
       on_notify: option.None,
       on_notification: option.None,
       secret_key: "",
+      presence: option.None,
     )
   let assert Ok(subject) = runtime.start(config, test_context())
   subject

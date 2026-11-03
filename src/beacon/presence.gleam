@@ -26,6 +26,9 @@
 ///   that learns about it. They receive `{beacon_pubsub, DiffTopic, Diff}`;
 ///   pass the Diff to `decode_diff`.
 /// - **Limits.** Every violation is an `Error`.
+/// - **In an app**, `beacon.presence` tracks a session's `Tracking`s from
+///   its state and hands the app every change as a `Diff`; `merge` applies
+///   one to the entries the app keeps (Phoenix.Presence's `syncDiff`).
 ///
 /// See docs/CLUSTERING.md.
 import beacon/log
@@ -60,6 +63,12 @@ pub type Entry(meta) {
 /// join of the new one.
 pub type Diff(meta) {
   Diff(topic: String, joins: List(Entry(meta)), leaves: List(Entry(meta)))
+}
+
+/// What a session is present as: `key` on `topic`, with `meta`. A
+/// `beacon.presence` app computes these from its state after every update.
+pub type Tracking(meta) {
+  Tracking(topic: String, key: String, meta: meta)
 }
 
 pub type PresenceError {
@@ -459,6 +468,13 @@ pub fn stop(presence: Presence(meta)) -> Result(Nil, PresenceError) {
   stop_ffi(presence.names)
 }
 
+/// Whether the tracker runs on this node (its supervisor is registered).
+/// A running tracker may still be restarting a shard: calls for that
+/// shard's topics return `TrackerDown` meanwhile.
+pub fn running(presence: Presence(meta)) -> Bool {
+  running_ffi(presence.names)
+}
+
 /// The handle of the tracker `config` starts, for a tracker started with
 /// `supervised`. It does not check that the tracker is running: calls
 /// return `TrackerDown` until it is.
@@ -776,6 +792,48 @@ fn sort_rows(
   list.sort(rows, fn(a, b) { string.compare(a.0, b.0) })
 }
 
+/// Apply `diff` to `entries` (Phoenix.Presence's `syncDiff`): joins add
+/// the metas whose refs are not there yet, then leaves remove the metas
+/// with their refs, and keys left without metas are dropped. Applying a
+/// diff twice changes nothing more. The result is ordered by key, like
+/// `list`.
+///
+/// ```gleam
+/// OnlineChanged(diff) ->
+///   Model(..model, online: presence.merge(model.online, diff))
+/// ```
+pub fn merge(
+  entries: List(Entry(meta)),
+  diff: Diff(meta),
+) -> List(Entry(meta)) {
+  let joined =
+    list.fold(diff.joins, entries, fn(acc, join) {
+      let #(same, others) =
+        list.partition(acc, fn(entry) { entry.key == join.key })
+      let present = list.flat_map(same, fn(entry) { entry.metas })
+      let added =
+        list.filter(join.metas, fn(meta) {
+          !list.any(present, fn(existing) { existing.ref == meta.ref })
+        })
+      [Entry(key: join.key, metas: list.append(present, added)), ..others]
+    })
+  let leaving =
+    list.flat_map(diff.leaves, fn(entry) {
+      list.map(entry.metas, fn(meta) { meta.ref })
+    })
+  joined
+  |> list.map(fn(entry) {
+    Entry(
+      ..entry,
+      metas: list.filter(entry.metas, fn(meta) {
+        !list.contains(leaving, meta.ref)
+      }),
+    )
+  })
+  |> list.filter(fn(entry) { entry.metas != [] })
+  |> list.sort(fn(a, b) { string.compare(a.key, b.key) })
+}
+
 // --- Introspection ---
 
 /// The shard process for `topic`. Tracked processes monitor it: if it
@@ -827,6 +885,9 @@ fn names_ffi(name: String, pool_size: Int) -> Names
 
 @external(erlang, "beacon_presence_ffi", "start")
 fn start_ffi(config: ShardConfig, names: Names) -> Result(Nil, PresenceError)
+
+@external(erlang, "beacon_presence_ffi", "running")
+fn running_ffi(names: Names) -> Bool
 
 @external(erlang, "beacon_presence_ffi", "start_link")
 fn start_link_ffi(

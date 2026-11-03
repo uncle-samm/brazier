@@ -125,6 +125,7 @@ fn nav_config() -> runtime.RuntimeConfig(Model, Msg) {
     on_notify: option.None,
     on_notification: option.None,
     secret_key: "",
+    presence: option.None,
   )
 }
 

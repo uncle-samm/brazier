@@ -287,6 +287,7 @@ fn lifecycle_config(
     on_notify: option.Some(fn(_topic) { LifeNotified }),
     on_notification: option.None,
     secret_key: "",
+    presence: None,
   )
 }
 

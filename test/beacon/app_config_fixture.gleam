@@ -46,5 +46,6 @@ pub fn new(
     dev_mode: False,
     pubsub: pubsub.default_config(),
     cluster: option.None,
+    presence: option.None,
   )
 }

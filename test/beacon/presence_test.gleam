@@ -483,6 +483,73 @@ pub fn decode_diff_rejects_other_messages_test() {
   finish(other, "room")
 }
 
+// --- merge ------------------------------------------------------------------
+
+fn meta(value: String, ref: String) -> presence.Meta(String) {
+  Meta(value:, ref:, ref_prev: None, node: "n@host")
+}
+
+/// key=value@ref, in order.
+fn view(entries: List(presence.Entry(String))) -> List(String) {
+  list.flat_map(entries, fn(entry) {
+    list.map(entry.metas, fn(m) { entry.key <> "=" <> m.value <> "@" <> m.ref })
+  })
+}
+
+pub fn merge_adds_joins_sorted_by_key_test() {
+  let diff =
+    Diff(
+      "room",
+      [Entry("carol", [meta("x", "3")]), Entry("alice", [meta("y", "1")])],
+      [],
+    )
+  let assert ["alice=y@1", "carol=x@3"] = view(presence.merge([], diff))
+}
+
+pub fn merge_is_idempotent_test() {
+  let diff =
+    Diff("room", [Entry("alice", [meta("a", "1"), meta("b", "2")])], [
+      Entry("bob", [meta("c", "9")]),
+    ])
+  let start = [Entry("bob", [meta("c", "9")])]
+  let once = presence.merge(start, diff)
+  let assert ["alice=a@1", "alice=b@2"] = view(once)
+  let assert True = presence.merge(once, diff) == once
+}
+
+/// An update arrives as a join of the new ref and a leave of the old one in
+/// one diff: the joins apply first, so the key never disappears.
+pub fn merge_applies_joins_then_leaves_test() {
+  let start = [Entry("alice", [meta("here", "1")])]
+  let diff =
+    Diff("room", [Entry("alice", [meta("away", "2")])], [
+      Entry("alice", [meta("here", "1")]),
+    ])
+  let assert ["alice=away@2"] = view(presence.merge(start, diff))
+  // A join and leave of the same ref in one diff leaves nothing.
+  let flap =
+    Diff("room", [Entry("bob", [meta("x", "5")])], [
+      Entry("bob", [meta("x", "5")]),
+    ])
+  let assert ["alice=here@1"] = view(presence.merge(start, flap))
+}
+
+pub fn merge_drops_keys_without_metas_test() {
+  let start = [
+    Entry("alice", [meta("a", "1"), meta("b", "2")]),
+    Entry("bob", [meta("c", "3")]),
+  ]
+  let diff =
+    Diff("room", [], [
+      Entry("alice", [meta("a", "1")]),
+      Entry("bob", [meta("c", "3")]),
+      Entry("zed", [meta("unknown", "99")]),
+    ])
+  let merged = presence.merge(start, diff)
+  let assert ["alice=b@2"] = view(merged)
+  let assert [Entry("alice", [_])] = merged
+}
+
 // --- Lifecycle --------------------------------------------------------------
 
 pub fn stopped_tracker_is_down_test() {
