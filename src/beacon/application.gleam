@@ -372,7 +372,18 @@ pub fn start_supervised(
 /// timeout to finish (see `transport.SecurityLimits.drain_timeout_ms`).
 ///
 /// Stopping is a normal exit, so a linked caller is not taken down.
+///
+/// An app that is not running (stopped already, or its tree died) is an
+/// error saying so, logged once as a warning; a stop that fails is an
+/// error, logged once as an error.
 pub fn stop(app: App) -> Result(Nil, error.BeaconError) {
+  stop_app(app)
+  |> result.map_error(fn(failure) { error.ConfigError(reason: failure.reason) })
+}
+
+/// Stop an application and log the outcome once: a stop that failed is an
+/// error, an application that was not running a warning.
+fn stop_app(app: App) -> Result(Nil, StopFailure) {
   log.info(
     "beacon.application",
     "Stopping Beacon application on port "
@@ -386,24 +397,56 @@ pub fn stop(app: App) -> Result(Nil, error.BeaconError) {
   {
     Ok(Nil) -> {
       forget_app(app.supervisor_pid)
-      server.release(app.listener)
+      case server.release(app.listener) {
+        True -> Nil
+        False ->
+          log.warning(
+            "beacon.application",
+            "The listener of the application on port "
+              <> int.to_string(app.port)
+              <> " had no remembered port",
+          )
+      }
       log.info(
         "beacon.application",
         "Beacon application stopped (port " <> int.to_string(app.port) <> ")",
       )
       Ok(Nil)
     }
-    Error(reason) -> {
-      log.error(
-        "beacon.application",
-        "Failed to stop the application: " <> reason,
-      )
-      Error(config_error("Application stop failed: " <> reason))
+    // Already stopped (a second `stop`), or the tree died on its own: an
+    // unexpected call, not a failed shutdown, so it is one warning. A tree
+    // that died without `stop` still held its port memory: it goes now.
+    Error(NotRunning(reason)) -> {
+      forget_app(app.supervisor_pid)
+      let message =
+        "The application on port "
+        <> int.to_string(app.port)
+        <> " was not stopped: "
+        <> reason
+        <> case server.release(app.listener) {
+          True -> " (it exited without stop; its port is forgotten now)"
+          False -> " (it was stopped already)"
+        }
+      log.warning("beacon.application", message)
+      Error(NotRunning(message))
+    }
+    Error(StopFailed(reason)) -> {
+      let message = "Application stop failed: " <> reason
+      log.error("beacon.application", message)
+      Error(StopFailed(message))
     }
   }
 }
 
-/// Remember an app in the process that started it, for `wait_forever`.
+/// Why `stop_supervisor` did not stop a supervisor.
+type StopFailure {
+  /// It was not running.
+  NotRunning(reason: String)
+  /// It did not stop in time, or exited with another reason.
+  StopFailed(reason: String)
+}
+
+/// Remember an app node-wide, for `wait_forever`.
 fn remember(app: App) -> App {
   remember_app(app.supervisor_pid, app)
   app
@@ -620,11 +663,14 @@ fn transport_config(
 /// Returns when the application should stop:
 ///
 /// - **SIGTERM** (`docker stop`, Kubernetes, systemd): every application
-///   this process started and has not stopped is stopped with `stop`, so
-///   each listener drains its connections (up to its drain timeout), and
-///   then `wait_forever` returns. While a process waits here, SIGTERM no
+///   running on this node is stopped with `stop`, whichever process started
+///   it, so each listener drains its connections (up to its drain timeout),
+///   and then `wait_forever` returns. While a process waits here, SIGTERM no
 ///   longer runs OTP's default `init:stop()`; SIGUSR1 and SIGQUIT still
-///   halt the node.
+///   halt the node. A further SIGTERM during the drain is logged and
+///   ignored: the drain is not cut short. When several processes wait,
+///   they drain one after the other, and none returns before the drain is
+///   over.
 /// - **The application was stopped** elsewhere (`stop` on its supervisor,
 ///   which already drained): returns at once.
 ///
@@ -640,19 +686,33 @@ pub fn wait_forever() -> Nil {
     Error(reason) -> fail_loudly("SIGTERM handling: " <> reason)
   }
   log.info("beacon.application", "Application running. Press Ctrl+C to stop.")
-  let event = receive_wait_event()
-  case uninstall_signal_handler(waiter) {
-    Ok(Nil) -> Nil
-    Error(reason) -> fail_loudly("SIGTERM handling: " <> reason)
-  }
-  case event {
-    Sigterm -> stop_on_sigterm()
-    ShutdownRequested ->
+  case receive_wait_event() {
+    Sigterm -> {
+      // The handler stays installed through the drain, so a second SIGTERM
+      // reaches it (logged and ignored), not OTP's `init:stop()`.
+      let failures = drain_exclusively(stop_on_sigterm)
+      leave_signal_handler(waiter)
+      case failures {
+        [] -> log.info("beacon.application", "Shutdown complete.")
+        _ -> {
+          let message =
+            "Shutdown after SIGTERM failed: " <> string.join(failures, "; ")
+          log.error("beacon.application", message)
+          fail_loudly(message)
+        }
+      }
+    }
+    ShutdownRequested -> {
+      leave_signal_handler(waiter)
+      pass_on_late_sigterm()
       log.info(
         "beacon.application",
         "The application was stopped, wait_forever returns",
       )
+    }
     LinkedProcessExited(reason) -> {
+      leave_signal_handler(waiter)
+      pass_on_late_sigterm()
       let message = "Linked application process exited: " <> reason
       log.error("beacon.application", message)
       fail_loudly(message)
@@ -670,17 +730,42 @@ type WaitEvent {
   LinkedProcessExited(reason: String)
 }
 
-/// Stop every application this process started, newest first. Each stop
-/// drains its listener. A stop that fails crashes the caller once every
-/// application was tried, so a failed shutdown never exits as a success.
-fn stop_on_sigterm() -> Nil {
+fn leave_signal_handler(waiter: process.Pid) -> Nil {
+  case uninstall_signal_handler(waiter) {
+    Ok(Nil) -> Nil
+    Error(reason) -> fail_loudly("SIGTERM handling: " <> reason)
+  }
+}
+
+/// A SIGTERM that arrived after the wait ended for another reason, and
+/// before the handler let this process go, was forwarded here and nobody
+/// would act on it: hand it back to the signal server, so another waiter or
+/// OTP's `init:stop()` answers it as if it arrived now.
+fn pass_on_late_sigterm() -> Nil {
+  case take_pending_sigterm() {
+    False -> Nil
+    True -> {
+      log.warning(
+        "beacon.application",
+        "SIGTERM arrived as wait_forever was returning: passing it on",
+      )
+      pass_on_sigterm()
+    }
+  }
+}
+
+/// Stop every application running on this node, newest first, and return
+/// the failures. Each stop drains its listener. Runs under the node's drain
+/// lock (`drain_exclusively`), so an application is stopped by one waiter
+/// only. An application found not running (stopped, or its tree died
+/// earlier) is a warning from `stop`, not a failure of the shutdown.
+fn stop_on_sigterm() -> List(String) {
   let apps = remembered_apps()
   case apps {
     [] ->
-      log.warning(
+      log.info(
         "beacon.application",
-        "SIGTERM received, but this process started no running application: "
-          <> "nothing to drain, wait_forever returns",
+        "SIGTERM: no application left running on this node, nothing to drain",
       )
     _ ->
       log.info(
@@ -690,37 +775,29 @@ fn stop_on_sigterm() -> Nil {
           <> " application(s) and draining their connections",
       )
   }
-  let failures =
-    list.filter_map(apps, fn(app) {
-      // Stopping a linked supervisor sends this process (trapping exits)
-      // its EXIT: take it, so it is not mistaken for a later event.
-      let linked = is_linked(app.supervisor_pid)
-      case stop(app) {
-        Ok(Nil) -> {
-          case linked {
-            True -> {
-              let reason = await_exit(app.supervisor_pid)
-              log.debug(
-                "beacon.application",
-                "Stopped supervisor exited with " <> reason,
-              )
-            }
-            False -> Nil
+  list.filter_map(apps, fn(app) {
+    // Stopping a linked supervisor sends this process (trapping exits)
+    // its EXIT: take it, so it is not mistaken for a later event.
+    let linked = is_linked(app.supervisor_pid)
+    case stop_app(app) {
+      Ok(Nil) -> {
+        case linked {
+          True -> {
+            let reason = await_exit(app.supervisor_pid)
+            log.debug(
+              "beacon.application",
+              "Stopped supervisor exited with " <> reason,
+            )
           }
-          Error(Nil)
+          False -> Nil
         }
-        Error(err) -> Ok(error.to_string(err))
+        Error(Nil)
       }
-    })
-  case failures {
-    [] -> log.info("beacon.application", "Shutdown complete.")
-    _ -> {
-      let message =
-        "Shutdown after SIGTERM failed: " <> string.join(failures, "; ")
-      log.error("beacon.application", message)
-      fail_loudly(message)
+      // The tree is gone already, which is what SIGTERM asks for.
+      Error(NotRunning(_)) -> Error(Nil)
+      Error(StopFailed(reason)) -> Ok(reason)
     }
-  }
+  })
 }
 
 /// Why an integer environment variable could not be read.
@@ -750,6 +827,15 @@ fn forget_app(supervisor: process.Pid) -> Nil
 @external(erlang, "beacon_application_ffi", "remembered_apps")
 fn remembered_apps() -> List(App)
 
+@external(erlang, "beacon_application_ffi", "drain_exclusively")
+fn drain_exclusively(drain: fn() -> List(String)) -> List(String)
+
+@external(erlang, "beacon_application_ffi", "take_pending_sigterm")
+fn take_pending_sigterm() -> Bool
+
+@external(erlang, "beacon_application_ffi", "pass_on_sigterm")
+fn pass_on_sigterm() -> Nil
+
 @external(erlang, "beacon_application_ffi", "is_linked")
 fn is_linked(pid: process.Pid) -> Bool
 
@@ -775,4 +861,4 @@ fn once_take(once: Once) -> Bool
 
 /// Stop a supervisor with reason `normal`, waiting up to `timeout` ms.
 @external(erlang, "beacon_application_ffi", "stop_supervisor")
-fn stop_supervisor(pid: process.Pid, timeout: Int) -> Result(Nil, String)
+fn stop_supervisor(pid: process.Pid, timeout: Int) -> Result(Nil, StopFailure)

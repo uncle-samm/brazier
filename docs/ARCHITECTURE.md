@@ -283,11 +283,16 @@ after it and never one before it. The children, in start order:
 unsupervised, and the table owner on demand runs until the node stops.
 
 `wait_forever` traps exits and blocks on one receive, with no polling. It
-returns when a SIGTERM arrives (it stops every app its process started, so
+returns when a SIGTERM arrives (it stops every app running on the node, so
 each listener drains), or when the linked root supervisor exits normally.
 It crashes when that supervisor exits abnormally. SIGTERM reaches it
 through `beacon_signal_handler`, a `gen_event` handler that replaces OTP's
-`erl_signal_handler` while any process waits and puts it back afterwards.
+`erl_signal_handler` while any process waits or drains, and puts it back
+afterwards. The handler forwards the first SIGTERM only; a later one is
+logged and ignored, as `init:stop()` ignores a second call. Running apps are
+recorded node-wide, one `persistent_term` per app written by `start` and
+erased by `stop` (as `beacon_http_conns` records a bound port). Waiters
+drain under one node-local `global:trans` lock, so an app is stopped once.
 
 ## Modules
 

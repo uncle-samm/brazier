@@ -164,6 +164,15 @@ with its own changelog, so they are not listed here.
   cowboy and Bandit use).
 - (WS10b) An HTTP handler crash was logged twice, once with the stacktrace
   and once with the route. It is logged once, with both.
+- (WS10b) `wait_forever` drained only the apps started by its own process.
+  It now drains every app running on the node, recorded node-wide when it
+  starts. A second SIGTERM during the drain reached OTP's `init:stop()` and
+  cut the drain short; it is now logged and ignored. Several waiting
+  processes drain one after the other.
+- (WS10b) Stopping an app twice logged two errors. An app that is not running
+  is now one warning, and its error says whether it was stopped already or
+  its tree died (whose remembered port is then forgotten). `server.release`
+  returns whether a port was remembered.
 - (WS10b) `/health` answered every method. Methods other than GET and HEAD
   get 405 with `allow: GET, HEAD`, and the answer is `cache-control:
   no-store`.

@@ -316,20 +316,8 @@ pub fn stop(listener: Listener) -> Nil {
     "Stopping listener on port " <> int.to_string(listener.port),
   )
   ffi_stop_supervisor(listener.supervisor)
-  release(listener)
-}
-
-/// Forget the remembered bound port of a listener that has stopped for
-/// good. A restarted listener rebinds the port it bound first (so a port-0
-/// listener keeps its port across restarts); once its parent tree has been
-/// stopped, that memory must go. `stop` calls this itself.
-pub fn release(listener: Listener) -> Nil {
-  case ffi_conns_forget_port(listener.conns) {
-    True ->
-      log.debug(
-        "beacon.server",
-        "Forgot bound port " <> int.to_string(listener.port),
-      )
+  case release(listener) {
+    True -> Nil
     False ->
       log.warning(
         "beacon.server",
@@ -338,6 +326,25 @@ pub fn release(listener: Listener) -> Nil {
           <> " (stopped twice?)",
       )
   }
+}
+
+/// Forget the remembered bound port of a listener that has stopped for
+/// good. A restarted listener rebinds the port it bound first (so a port-0
+/// listener keeps its port across restarts); once its parent tree has been
+/// stopped, that memory must go. `stop` calls this itself. Returns whether
+/// a port was remembered: a caller that knows the listener ran warns when
+/// it was not.
+pub fn release(listener: Listener) -> Bool {
+  let forgot = ffi_conns_forget_port(listener.conns)
+  log.debug(
+    "beacon.server",
+    case forgot {
+      True -> "Forgot bound port "
+      False -> "No bound port remembered for port "
+    }
+      <> int.to_string(listener.port),
+  )
+  forgot
 }
 
 /// The port the listener is bound to (the OS-assigned one for port 0).

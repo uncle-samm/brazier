@@ -236,11 +236,18 @@ The drain timeout is `SecurityLimits.drain_timeout_ms` (default 5000), or
 period: `docker stop` sends SIGKILL after 10 seconds, and Kubernetes after
 `terminationGracePeriodSeconds` (30 by default).
 
-While `wait_forever` waits, Beacon's handler replaces OTP's on the
-`erl_signal_server` event manager, and puts OTP's back once nothing waits.
-A second SIGTERM that arrives after the first has been taken goes to OTP's
-handler, which runs `init:stop()`. Only apps started by the process that
-calls `wait_forever` are drained. SIGUSR1 and SIGQUIT still halt the node.
+While `wait_forever` waits and drains, Beacon's handler replaces OTP's on
+the `erl_signal_server` event manager, and puts OTP's back once nothing
+waits. Every application running on the node is drained, whichever process
+started it. A second SIGTERM during the drain is logged as a warning and
+ignored, so it cannot cut the drain short; SIGQUIT, SIGUSR1 and SIGKILL
+still stop the node at once. When several processes
+call `wait_forever`, they drain one after the other and none returns before
+the drain is over.
+
+Calling `application.stop` on an application that is not running (stopped
+already, or its tree died) returns an error that says so and logs one
+warning.
 
 ## Logging and Connections
 
