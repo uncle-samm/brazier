@@ -292,7 +292,7 @@ fn start_for(
         transport.page_route,
         "mount",
         connection_id,
-        fn() { start_actor(config, ctx, page_uri) },
+        fn() { start_actor(config, ctx, page_uri, connection_id) },
       )
   }
 }
@@ -302,18 +302,23 @@ type Mounted(model, msg) {
   Mounted(model: model, effects: Effect(msg), route_msg: Option(msg))
 }
 
+/// A runtime that does not start is logged once, here, where the cause is
+/// known: by `mount`, `start_presence` or `spawn_actor`, with the page and
+/// connection. The callers up to the transport only pass the error on (the
+/// transport logs the close it answers with at info).
 fn start_actor(
   config: RuntimeConfig(model, msg),
   ctx: Context,
   page_uri: Uri,
+  connection_id: String,
 ) -> Result(Subject(RuntimeMessage(msg)), error.BeaconError) {
   let started_at = monotonic_time()
-  use mounted <- result.try(mount(config, ctx, page_uri))
-  spawn_actor(config, mounted, page_uri, started_at)
+  use mounted <- result.try(mount(config, ctx, page_uri, connection_id))
+  spawn_actor(config, mounted, page_uri, started_at, connection_id)
 }
 
 /// Run the app's `init` and initial route in the calling process (the
-/// connection's handler). A crash in either is caught, logged with its
+/// connection's handler). A crash in either is caught, logged once with its
 /// stacktrace and returned as a `RuntimeError`, so the socket is closed
 /// with 1011 instead of the handler process dying without a close frame
 /// (LiveView answers a crash in the connected mount by failing the join).
@@ -321,13 +326,19 @@ fn mount(
   config: RuntimeConfig(model, msg),
   ctx: Context,
   page_uri: Uri,
+  connection_id: String,
 ) -> Result(Mounted(model, msg), error.BeaconError) {
-  let path = describe_uri(page_uri)
+  let path = describe_uri(page_uri) <> " (connection " <> connection_id <> ")"
   case run_guarded(fn() { init_and_route(config, ctx, page_uri) }) {
-    Error(crash) -> {
+    Error(#(crash, stacktrace)) -> {
       log.error(
         "beacon.runtime",
-        "init or the initial route crashed for " <> path <> ": " <> crash,
+        "init or the initial route crashed for "
+          <> path
+          <> ": "
+          <> crash
+          <> "\n"
+          <> stacktrace,
       )
       Error(error.RuntimeError(reason: "init crashed: " <> crash))
     }
@@ -386,15 +397,16 @@ fn init_and_route(
 }
 
 /// Run `run`, returning a crash (error, exit or throw) as `Error` with its
-/// class and reason. The FFI logs the stacktrace.
+/// `class:reason` and its formatted stacktrace. It logs nothing.
 @external(erlang, "beacon_runtime_ffi", "run_guarded")
-fn run_guarded(run: fn() -> a) -> Result(a, String)
+fn run_guarded(run: fn() -> a) -> Result(a, #(String, String))
 
 fn spawn_actor(
   config: RuntimeConfig(model, msg),
   mounted: Mounted(model, msg),
   page_uri: Uri,
   started_at: Int,
+  connection_id: String,
 ) -> Result(Subject(RuntimeMessage(msg)), error.BeaconError) {
   let Mounted(
     model: initial_model,
@@ -409,6 +421,7 @@ fn spawn_actor(
         config.presence,
         subject,
         initial_model,
+        connection_id,
       ))
       let initial_effect_processes = run_effects(initial_effects, subject)
       let state =
@@ -483,19 +496,35 @@ fn spawn_actor(
       Ok(subject)
     }
     Error(actor.InitTimeout) -> {
-      log.error("beacon.runtime", "Failed to start runtime: init timed out")
-      Error(error.RuntimeError(reason: "Runtime init timed out"))
-    }
-    Error(actor.InitFailed(reason)) -> {
-      log.error("beacon.runtime", "Failed to start runtime: " <> reason)
-      Error(error.RuntimeError(reason: "Runtime init failed: " <> reason))
-    }
-    Error(actor.InitExited(_reason)) -> {
       log.error(
         "beacon.runtime",
-        "Failed to start runtime: init process exited",
+        "Failed to start the runtime for connection "
+          <> connection_id
+          <> ": its initialiser did not finish within 5000ms",
       )
-      Error(error.RuntimeError(reason: "Runtime init process exited"))
+      Error(error.RuntimeError(reason: "Runtime init timed out"))
+    }
+    // The initialiser fails only when presence refuses the session, and
+    // start_presence logged that with the tracker and connection.
+    Error(actor.InitFailed(reason)) -> {
+      log.debug(
+        "beacon.runtime",
+        "No runtime for connection " <> connection_id <> ": " <> reason,
+      )
+      Error(error.RuntimeError(reason: "Runtime init failed: " <> reason))
+    }
+    Error(actor.InitExited(reason)) -> {
+      let reason = string.inspect(reason)
+      log.error(
+        "beacon.runtime",
+        "Failed to start the runtime for connection "
+          <> connection_id
+          <> ": its initialiser exited with "
+          <> reason,
+      )
+      Error(error.RuntimeError(
+        reason: "Runtime init process exited: " <> reason,
+      ))
     }
   }
 }
@@ -506,6 +535,7 @@ fn start_presence(
   watch: Option(presence_watch.Watch(model, msg)),
   subject: Subject(RuntimeMessage(msg)),
   model: model,
+  connection_id: String,
 ) -> Result(Option(presence_watch.Watcher(model)), String) {
   case watch {
     None -> Ok(None)
@@ -521,7 +551,9 @@ fn start_presence(
           "beacon.runtime",
           "Presence of tracker "
             <> presence_watch.name(watch)
-            <> " refused the session: "
+            <> " refused the session of connection "
+            <> connection_id
+            <> ": "
             <> reason,
         )
         "presence: " <> reason
@@ -2060,21 +2092,12 @@ fn spawn_and_connect(
       }
       Ok(#(on_event, shutdown))
     }
-    // `mount` logged the refusal at the level its status calls for.
-    Error(error.InitRejected(_) as err) -> {
+    // The start logged the cause once, where it was known (see
+    // start_actor), at the level it calls for.
+    Error(err) -> {
       log.debug(
         "beacon.runtime",
         "No runtime for " <> conn_id <> ": " <> error.to_string(err),
-      )
-      Error(err)
-    }
-    Error(err) -> {
-      log.error(
-        "beacon.runtime",
-        "Failed to spawn runtime for "
-          <> conn_id
-          <> ": "
-          <> error.to_string(err),
       )
       Error(err)
     }
@@ -2211,15 +2234,10 @@ pub fn connect_transport_per_connection(
             let on_disconnect = fn(_cid: transport.ConnectionId) { shutdown() }
             Ok(#(on_event, on_disconnect))
           }
+          // Logged where it happened; the transport logs the close.
           Error(error.InitRejected(init_error)) ->
             Error(transport.InitRefused(init_error))
-          Error(err) -> {
-            log.error(
-              "beacon.runtime",
-              "Failed to start per-connection runtime: " <> error.to_string(err),
-            )
-            Error(transport.StartupFailed(error.to_string(err)))
-          }
+          Error(err) -> Error(transport.StartupFailed(error.to_string(err)))
         }
       },
     ),

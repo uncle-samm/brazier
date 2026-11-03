@@ -510,7 +510,9 @@ pub type TransportConfig {
 }
 
 /// Why a per-connection runtime did not start. Either way the socket is
-/// closed right after the upgrade, before any other frame.
+/// closed right after the upgrade, before any other frame. The factory
+/// logs the cause where it happens (Beacon's runtime does, with the
+/// connection id); the transport logs the close at info.
 pub type StartupError {
   /// The app's `init` refused the session. The socket closes with
   /// `error.init_close_code` (4000 + the status) and the reason
@@ -1762,16 +1764,10 @@ fn start_ws_connection(
         <> int.to_string(close_code)
         <> " after the runtime did not start: "
         <> startup_error_to_string(startup_error)
-      // An init refusal with a 4xx status is the app's decision about this
-      // request, not a server fault.
-      case startup_error {
-        InitRefused(init_error) ->
-          case error.init_error_status(init_error) >= 500 {
-            True -> log.error("beacon.transport", message)
-            False -> log.warning("beacon.transport", message)
-          }
-        StartupFailed(_) -> log.error("beacon.transport", message)
-      }
+      // The cause (a crash with its stacktrace, a refusal at the level its
+      // status calls for) was logged once where it happened, with this
+      // connection's id; this line records the close that answers it.
+      log.info("beacon.transport", message)
       let close_frame = ws.encode_close(close_code, close_reason)
       let #(frames_out, bytes_out) = case
         server.send_bytes(socket, close_frame)

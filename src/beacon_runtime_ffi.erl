@@ -8,17 +8,17 @@
     run_guarded/1
 ]).
 
-%% Run Fun in the calling process. A crash (error, exit or throw) is logged
-%% with its stacktrace and returned as {error, <<"Class:Reason">>}, so the
-%% caller can answer it (close the socket with 1011) instead of dying.
+%% Run Fun in the calling process. A crash (error, exit or throw) is returned
+%% as {error, {<<"Class:Reason">>, <<"Stacktrace">>}}, so the caller can
+%% answer it (close the socket with 1011) instead of dying. The caller logs
+%% it once, with the session's context (beacon/runtime.mount).
 run_guarded(Fun) ->
     try Fun() of
         Result -> {ok, Result}
     catch
         Class:Reason:Stacktrace ->
-            beacon_log_ffi:error(<<"beacon.runtime">>, "init crashed: ~p:~p~n~p",
-                                 [Class, Reason, Stacktrace]),
-            {error, iolist_to_binary(io_lib:format("~p:~p", [Class, Reason]))}
+            {error, {unicode:characters_to_binary(io_lib:format("~p:~p", [Class, Reason])),
+                     unicode:characters_to_binary(io_lib:format("~p", [Stacktrace]))}}
     end.
 
 %% The telemetry label of an app message: its constructor name. A Gleam
