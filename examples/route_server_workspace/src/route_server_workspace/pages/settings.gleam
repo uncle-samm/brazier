@@ -1,17 +1,32 @@
-import beacon
+/// The settings page: a component with a public Model and a private audit
+/// log. Only `view` and the Model reach the browser.
+import beacon/attribute
+import beacon/element.{type Element}
+import beacon/event
 import beacon/html
-import beacon/route
+import beacon/log
 import gleam/int
 import gleam/list
+import gleam/string
 
-const server_settings_key = "route_settings_private_key_must_not_ship"
+const signing_key = "route_settings_private_key_must_not_ship"
+
+const max_email_length = 254
+
+/// The server keeps the newest audit entries up to this many.
+const max_audit_entries = 100
 
 pub type Model {
   Model(email: String, saved: Int, last_saved: String)
 }
 
+/// Server-only: never synced.
 pub type Server {
-  Server(private_key: String, audit_entries: List(String))
+  Server(
+    signing_key: String,
+    /// Newest first, at most `max_audit_entries`.
+    audit_entries: List(String),
+  )
 }
 
 pub type Msg {
@@ -24,46 +39,54 @@ pub fn init() -> Model {
 }
 
 pub fn init_server() -> Server {
-  Server(private_key: server_settings_key, audit_entries: [])
+  Server(signing_key:, audit_entries: [])
 }
 
-pub fn update(model: Model, msg: Msg) -> Model {
+pub fn update(model: Model, server: Server, msg: Msg) -> #(Model, Server) {
   case msg {
-    SetEmail(email) -> Model(..model, email: email)
+    SetEmail(email) ->
+      case string.length(email) > max_email_length {
+        True -> {
+          log.warning(
+            "settings",
+            "Refusing an email of "
+              <> int.to_string(string.length(email))
+              <> " characters (limit "
+              <> int.to_string(max_email_length)
+              <> ")",
+          )
+          #(model, server)
+        }
+        False -> #(Model(..model, email:), server)
+      }
     SaveSettings ->
-      Model(
-        ..model,
-        saved: model.saved + 1,
-        last_saved: "Saved " <> model.email,
-      )
+      case string.contains(model.email, "@") {
+        False -> {
+          log.warning("settings", "Refusing to save an email without \"@\"")
+          #(Model(..model, last_saved: "Not saved: enter an email"), server)
+        }
+        True -> {
+          let saved = model.saved + 1
+          log.info(
+            "settings",
+            "Saved settings (save " <> int.to_string(saved) <> ")",
+          )
+          #(
+            Model(..model, saved:, last_saved: "Saved " <> model.email),
+            Server(
+              ..server,
+              audit_entries: list.take(
+                ["save-" <> int.to_string(saved), ..server.audit_entries],
+                max_audit_entries,
+              ),
+            ),
+          )
+        }
+      }
   }
 }
 
-pub fn update_server(model: Model, server: Server, msg: Msg) -> #(Model, Server) {
-  let model = update(model, msg)
-  case msg {
-    SetEmail(_) -> #(model, server)
-    SaveSettings -> #(
-      model,
-      Server(..server, audit_entries: [
-        "save-" <> int.to_string(list.length(server.audit_entries) + 1),
-        ..server.audit_entries
-      ]),
-    )
-  }
-}
-
-pub fn page(
-  on_enter: fn(route.Route) -> msg,
-  select: fn(model) -> Model,
-  wrap: fn(Msg) -> msg,
-) -> route.Page(model, msg) {
-  route.page_model("/settings", on_enter, select, fn(model, _route) {
-    view(model, wrap)
-  })
-}
-
-pub fn view(model: Model, wrap: fn(Msg) -> msg) -> beacon.Node(msg) {
+pub fn view(model: Model) -> Element(Msg) {
   html.section([], [
     html.h1([], [html.text("Settings")]),
     html.p([], [
@@ -72,19 +95,17 @@ pub fn view(model: Model, wrap: fn(Msg) -> msg) -> beacon.Node(msg) {
     html.label([], [
       html.text("Email"),
       html.input([
-        html.attribute("data-testid", "settings-email"),
-        html.type_("email"),
-        html.value(model.email),
-        beacon.on_input(fn(value) { wrap(SetEmail(value)) }),
+        attribute.data("testid", "settings-email"),
+        attribute.type_("email"),
+        attribute.value(model.email),
+        event.on_input(SetEmail),
       ]),
     ]),
-    html.button([beacon.on_click(wrap(SaveSettings))], [
-      html.text("Save settings"),
-    ]),
-    html.p([html.attribute("data-testid", "settings-last-saved")], [
+    html.button([event.on_click(SaveSettings)], [html.text("Save settings")]),
+    html.p([attribute.data("testid", "settings-last-saved")], [
       html.text(model.last_saved),
     ]),
-    html.p([html.attribute("data-testid", "settings-save-count")], [
+    html.p([attribute.data("testid", "settings-save-count")], [
       html.text("Saves: " <> int.to_string(model.saved)),
     ]),
   ])

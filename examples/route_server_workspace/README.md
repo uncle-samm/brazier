@@ -1,16 +1,29 @@
 # Route Server Workspace
 
-Focused example for route mini-apps with private route-local server state.
+Routed pages that are components with private server state.
 
-It exercises:
+## Features
 
-- Explicitly imported route modules with their own `Model`, `Msg`, and `view`
-- Route-local `Server`, `init_server`, and `update_server`
-- Root `Server state` embedding each route server value privately
-- Generated client bundles that strip route server secrets before JS compilation
+- `beacon.full_application` with `beacon.with_router`: `/` (accounts) and
+  `/settings`. Any other path is a 404.
+- Each page module is a component with a public `Model`, a `Msg`, a `view`
+  and a server-only `Server` record built by `init_server`. Its `update`
+  takes and returns both, and runs only on the server.
+- The root `Session` holds the Model next to both pages' `Server` records.
+  `sync` sends only the Model, so the audit counts and signing keys stay on
+  the server. The client bundle holds only what `view` reaches, so the keys
+  are not in the JavaScript either.
+- The root maps page messages with `element.map(Accounts)` and
+  `element.map(Settings)`.
+- Unhappy paths: a transfer that would take the balance below zero is
+  refused, an email over 254 characters is refused, and saving an email
+  without `@` is refused. Each refusal is logged as a warning.
 
-```sh
+## Run
+
+```bash
 cd examples/route_server_workspace
+gleam run -m beacon/build   # after changing the source
 gleam run -m main
 ```
 

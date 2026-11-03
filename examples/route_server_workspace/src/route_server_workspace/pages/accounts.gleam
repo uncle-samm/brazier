@@ -1,16 +1,24 @@
-import beacon
+/// The accounts page: a component with a public Model and private server
+/// state. Only `view` and the Model reach the browser; the signing key is
+/// reached from `init_server` alone, so it is not in the client bundle.
+import beacon/attribute
+import beacon/element.{type Element}
+import beacon/event
 import beacon/html
-import beacon/route
+import beacon/log
 import gleam/int
 
-const server_accounts_key = "route_accounts_private_key_must_not_ship"
+const signing_key = "route_accounts_private_key_must_not_ship"
+
+const transfer_amount = 25
 
 pub type Model {
   Model(balance: Int, approved: Int, denied: Int, last_event: String)
 }
 
+/// Server-only: never synced.
 pub type Server {
-  Server(private_key: String, approval_signatures: Int, denial_signatures: Int)
+  Server(signing_key: String, approval_signatures: Int, denial_signatures: Int)
 }
 
 pub type Msg {
@@ -28,76 +36,74 @@ pub fn init() -> Model {
 }
 
 pub fn init_server() -> Server {
-  Server(
-    private_key: server_accounts_key,
-    approval_signatures: 0,
-    denial_signatures: 0,
-  )
+  Server(signing_key:, approval_signatures: 0, denial_signatures: 0)
 }
 
-pub fn update(model: Model, msg: Msg) -> Model {
+pub fn update(model: Model, server: Server, msg: Msg) -> #(Model, Server) {
   case msg {
     ApproveTransfer ->
-      Model(
-        ..model,
-        balance: model.balance - 25,
-        approved: model.approved + 1,
-        last_event: "Transfer approved",
+      case model.balance >= transfer_amount {
+        True -> {
+          let signatures = server.approval_signatures + 1
+          log.info("accounts", "Signed approval " <> int.to_string(signatures))
+          #(
+            Model(
+              ..model,
+              balance: model.balance - transfer_amount,
+              approved: model.approved + 1,
+              last_event: "Transfer approved",
+            ),
+            Server(..server, approval_signatures: signatures),
+          )
+        }
+        False -> {
+          log.warning(
+            "accounts",
+            "Refused a transfer: balance "
+              <> int.to_string(model.balance)
+              <> " is below "
+              <> int.to_string(transfer_amount),
+          )
+          #(
+            Model(..model, last_event: "Transfer refused: insufficient balance"),
+            server,
+          )
+        }
+      }
+    DenyTransfer -> {
+      let signatures = server.denial_signatures + 1
+      log.info("accounts", "Signed denial " <> int.to_string(signatures))
+      #(
+        Model(..model, denied: model.denied + 1, last_event: "Transfer denied"),
+        Server(..server, denial_signatures: signatures),
       )
-    DenyTransfer ->
-      Model(..model, denied: model.denied + 1, last_event: "Transfer denied")
+    }
   }
 }
 
-pub fn update_server(model: Model, server: Server, msg: Msg) -> #(Model, Server) {
-  let model = update(model, msg)
-  case msg {
-    ApproveTransfer -> #(
-      model,
-      Server(..server, approval_signatures: server.approval_signatures + 1),
-    )
-    DenyTransfer -> #(
-      model,
-      Server(..server, denial_signatures: server.denial_signatures + 1),
-    )
-  }
-}
-
-pub fn page(
-  on_enter: fn(route.Route) -> msg,
-  select: fn(model) -> Model,
-  wrap: fn(Msg) -> msg,
-) -> route.Page(model, msg) {
-  route.page_model("/", on_enter, select, fn(model, _route) {
-    view(model, wrap)
-  })
-}
-
-pub fn view(model: Model, wrap: fn(Msg) -> msg) -> beacon.Node(msg) {
+pub fn view(model: Model) -> Element(Msg) {
   html.section([], [
     html.h1([], [html.text("Accounts")]),
     html.p([], [
       html.text("This route owns public model state and private server state."),
     ]),
-    html.p([html.attribute("data-testid", "account-balance")], [
+    html.p([attribute.data("testid", "account-balance")], [
       html.text("Balance: " <> int.to_string(model.balance)),
     ]),
-    html.p([html.attribute("data-testid", "account-approved")], [
+    html.p([attribute.data("testid", "account-approved")], [
       html.text("Approved: " <> int.to_string(model.approved)),
     ]),
-    html.p([html.attribute("data-testid", "account-denied")], [
+    html.p([attribute.data("testid", "account-denied")], [
       html.text("Denied: " <> int.to_string(model.denied)),
     ]),
-    html.p([html.attribute("data-testid", "account-last-event")], [
+    html.p([attribute.data("testid", "account-last-event")], [
       html.text(model.last_event),
     ]),
-    html.div([html.style("display:flex;gap:8px;")], [
-      html.button([beacon.on_click(wrap(ApproveTransfer))], [
+    html.div([attribute.styles([#("display", "flex"), #("gap", "8px")])], [
+      html.button([event.on_click(ApproveTransfer)], [
         html.text("Approve transfer"),
       ]),
-      html.button([beacon.on_click(wrap(DenyTransfer))], [
-        html.text("Deny transfer"),
-      ]),
+      html.button([event.on_click(DenyTransfer)], [html.text("Deny transfer")]),
     ]),
   ])
 }
