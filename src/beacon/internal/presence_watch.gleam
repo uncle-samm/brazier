@@ -21,7 +21,10 @@
 ////   tracks that topic's entries again on the restarted shard (retrying
 ////   after 10ms, doubling to 1s, at most 12 times), then reconciles the
 ////   topic with a fresh read. A shard that does not come back stops the
-////   watcher with `beacon_presence_down`.
+////   watcher with `beacon_presence_down`. The restarted shard has none of
+////   the other nodes' entries until it has synced with them, so known
+////   entries of other nodes that it does not list are held, not reported,
+////   until the shard says it has synced with their node (see `reconcile`).
 //// - **PubSub.** The watcher traps exits and monitors its PubSub registry
 ////   partition. If the partition dies the watcher logs it and exits with
 ////   `beacon_pubsub_down`; the runtime dies with it and its clients
@@ -211,6 +214,18 @@ type Event(meta) {
   PartitionDown(reason: String)
   MonitorDown(pid: Pid, reason: String)
   LinkedExit(pid: Pid, reason: String)
+  /// A shard's answer to `await_sync` for one node.
+  Synced(shard: Pid, node: String, status: SyncStatus)
+}
+
+/// Where a shard stands with another node (`beacon_presence_shard`'s sync
+/// waiters): it holds every entry the node had, the node is down, it has
+/// not heard from the node for down_period, or neither within down_period.
+type SyncStatus {
+  InSync
+  NodeDown
+  NodeAbsent
+  SyncTimeout
 }
 
 /// Why a watcher stops abnormally (the exit reason the runtime dies with).
@@ -238,6 +253,10 @@ type State(meta, msg) {
     monitors: Dict(Pid, Monitor),
     /// What the app was told, by topic then meta ref.
     known: Dict(String, Dict(String, #(String, Meta(meta)))),
+    /// Refs in `known` of other nodes that a restarted shard did not list
+    /// yet, by topic: reported as leaves only if the shard still does not
+    /// list them once it has synced with their node.
+    suspects: Dict(String, Set(String)),
     /// Retries done since a shard went down (0: none scheduled).
     retries: Int,
   )
@@ -342,6 +361,7 @@ fn init(
         pending: set.new(),
         monitors: dict.new(),
         known: dict.new(),
+        suspects: dict.new(),
         retries: 0,
       )
     set_trackings(state, initial)
@@ -405,6 +425,11 @@ fn loop(state: State(meta, msg)) -> Nil {
         name,
         "linked process " <> string.inspect(pid) <> " exited: " <> reason,
       )
+    Synced(shard, node, status) ->
+      case synced(state, shard, node, status) {
+        Ok(state) -> loop(state)
+        Error(reason) -> fail(state, reason)
+      }
     MonitorDown(pid, reason) ->
       case dict.has_key(state.monitors, pid) {
         True -> loop(shard_down(state, pid, reason))
@@ -543,6 +568,7 @@ fn remove_topic(
       ..state,
       trackings: dict.delete(state.trackings, topic),
       known: dict.delete(state.known, topic),
+      suspects: dict.delete(state.suspects, topic),
       pending: set.delete(state.pending, topic),
     )
   Ok(forget_shard(state, topic))
@@ -610,7 +636,7 @@ fn activate(
         }),
       )
       case dict.has_key(state.shards, topic) {
-        True -> reconcile(state, topic)
+        True -> reconcile(state, topic, shard)
         False -> Ok(state)
       }
     }
@@ -865,30 +891,209 @@ fn pow2(n: Int) -> Int {
 // --- Diffs --------------------------------------------------------------------
 
 /// Tell the app what changed on `topic` since it was last told: joins for
-/// listed metas it does not know, leaves for known metas no longer listed.
+/// listed metas it does not know, leaves for known metas of this node no
+/// longer listed.
+///
+/// A known meta of another node that is not listed is held as a suspect,
+/// not reported: a shard that restarted starts empty and gets each other
+/// node's entries from that node (its heartbeat marks the node up, the
+/// transfer at the next clock sample carries them). Reporting them now
+/// would make them leave and join again. `shard` is asked to say when it
+/// has synced with their nodes; `synced` reports the ones still missing
+/// then (Phoenix.Tracker's replica up and state transfer).
 fn reconcile(
   state: State(meta, msg),
   topic: String,
+  shard: Pid,
 ) -> Result(State(meta, msg), String) {
   case presence.list(state.tracker, topic) {
     Error(presence.TrackerDown) -> Ok(lost(state, topic, "list: shard down"))
     Error(reason) -> Error(describe(topic, reason))
     Ok(entries) -> {
-      let listed =
-        list.flat_map(entries, fn(entry) {
-          list.map(entry.metas, fn(meta) { #(meta.ref, #(entry.key, meta)) })
-        })
-        |> dict.from_list
+      let listed = listed_metas(entries)
       let known = dict.get(state.known, topic) |> result.unwrap(dict.new())
       let joins =
         dict.filter(listed, fn(ref, _) { !dict.has_key(known, ref) })
         |> dict.values
-      let leaves =
+      let missing =
         dict.filter(known, fn(ref, _) { !dict.has_key(listed, ref) })
+      let own = node_name()
+      // This node's entries died with the old shard: this watcher's were
+      // tracked again with new refs, other local processes track theirs.
+      let leaves =
+        dict.filter(missing, fn(_, pair) { { pair.1 }.node == own })
         |> dict.values
+      let held = dict.filter(missing, fn(_, pair) { { pair.1 }.node != own })
       report(state, topic, joins, leaves)
-      Ok(State(..state, known: dict.insert(state.known, topic, listed)))
+      let state =
+        State(
+          ..state,
+          known: dict.insert(state.known, topic, dict.merge(listed, held)),
+        )
+      case dict.is_empty(held) {
+        True -> Ok(State(..state, suspects: dict.delete(state.suspects, topic)))
+        False -> {
+          let nodes =
+            dict.values(held)
+            |> list.map(fn(pair) { { pair.1 }.node })
+            |> list.unique
+            |> list.sort(string.compare)
+          log.info(
+            "beacon.presence",
+            "Presence watcher of "
+              <> presence.name(state.tracker)
+              <> ": shard "
+              <> string.inspect(shard)
+              <> " does not list "
+              <> int.to_string(dict.size(held))
+              <> " entries of "
+              <> string.join(nodes, ", ")
+              <> " on "
+              <> topic
+              <> " yet; holding them until it has synced with those nodes",
+          )
+          await_sync(shard, nodes)
+          let refs = set.from_list(dict.keys(held))
+          Ok(State(..state, suspects: dict.insert(state.suspects, topic, refs)))
+        }
+      }
     }
+  }
+}
+
+/// The metas of a read, by ref.
+fn listed_metas(
+  entries: List(sync.Entry(meta)),
+) -> Dict(String, #(String, Meta(meta))) {
+  list.flat_map(entries, fn(entry) {
+    list.map(entry.metas, fn(meta) { #(meta.ref, #(entry.key, meta)) })
+  })
+  |> dict.from_list
+}
+
+/// `shard` has resolved its sync with `node`: on every topic it serves,
+/// the suspects of `node` it still does not list leave. Their diffs, if
+/// any, were sent before this answer, so they are already applied.
+fn synced(
+  state: State(meta, msg),
+  shard: Pid,
+  node: String,
+  status: SyncStatus,
+) -> Result(State(meta, msg), String) {
+  let topics =
+    dict.keys(state.suspects)
+    |> list.filter(fn(topic) { dict.get(state.shards, topic) == Ok(shard) })
+    |> list.sort(string.compare)
+  case topics {
+    [] -> {
+      // The shard went down, or a later reconcile replaced the suspects.
+      log.debug(
+        "beacon.presence",
+        "Presence watcher of "
+          <> presence.name(state.tracker)
+          <> " ignoring the sync of "
+          <> string.inspect(shard)
+          <> " with "
+          <> node
+          <> ": no suspects on it",
+      )
+      Ok(state)
+    }
+    _ ->
+      list.try_fold(topics, state, fn(state, topic) {
+        settle(state, topic, node, status)
+      })
+  }
+}
+
+/// Report the suspects of `node` on `topic` that the shard does not list.
+fn settle(
+  state: State(meta, msg),
+  topic: String,
+  node: String,
+  status: SyncStatus,
+) -> Result(State(meta, msg), String) {
+  // INVARIANT: `synced` only settles topics with suspects, and every
+  // topic with suspects has an entry in `known`.
+  let assert Ok(suspects) = dict.get(state.suspects, topic)
+    as "settle is only called for topics with suspects"
+  let assert Ok(known) = dict.get(state.known, topic)
+    as "every topic with suspects is known"
+  // A suspect that left through a diff meanwhile is no longer known.
+  let of_node =
+    set.filter(suspects, fn(ref) {
+      case dict.get(known, ref) {
+        Ok(#(_, meta)) -> meta.node == node
+        Error(Nil) -> False
+      }
+    })
+  let rest =
+    set.filter(suspects, fn(ref) {
+      case dict.get(known, ref) {
+        Ok(#(_, meta)) -> meta.node != node
+        Error(Nil) -> False
+      }
+    })
+  let state = case set.is_empty(rest) {
+    True -> State(..state, suspects: dict.delete(state.suspects, topic))
+    False -> State(..state, suspects: dict.insert(state.suspects, topic, rest))
+  }
+  case set.is_empty(of_node) {
+    True -> Ok(state)
+    False ->
+      case presence.list(state.tracker, topic) {
+        Error(presence.TrackerDown) ->
+          Ok(lost(state, topic, "list after sync: shard down"))
+        Error(reason) -> Error(describe(topic, reason))
+        Ok(entries) -> {
+          let listed = listed_metas(entries)
+          let gone =
+            set.filter(of_node, fn(ref) { !dict.has_key(listed, ref) })
+            |> set.to_list
+          let leaves = list.filter_map(gone, fn(ref) { dict.get(known, ref) })
+          log_settled(state, topic, node, status, set.size(of_node), leaves)
+          report(state, topic, [], leaves)
+          let known = list.fold(gone, known, dict.delete)
+          Ok(State(..state, known: dict.insert(state.known, topic, known)))
+        }
+      }
+  }
+}
+
+fn log_settled(
+  state: State(meta, msg),
+  topic: String,
+  node: String,
+  status: SyncStatus,
+  held: Int,
+  leaves: List(#(String, Meta(meta))),
+) -> Nil {
+  let message =
+    "Presence watcher of "
+    <> presence.name(state.tracker)
+    <> ": sync with "
+    <> node
+    <> " on "
+    <> topic
+    <> " is "
+    <> describe_sync(status)
+    <> "; "
+    <> int.to_string(list.length(leaves))
+    <> " of "
+    <> int.to_string(held)
+    <> " held entries left"
+  case status {
+    SyncTimeout -> log.warning("beacon.presence", message)
+    InSync | NodeDown | NodeAbsent -> log.info("beacon.presence", message)
+  }
+}
+
+fn describe_sync(status: SyncStatus) -> String {
+  case status {
+    InSync -> "done"
+    NodeDown -> "moot, the node is down"
+    NodeAbsent -> "moot, the shard has not heard from the node"
+    SyncTimeout -> "not done within down_period"
   }
 }
 
@@ -1037,6 +1242,14 @@ fn receive_event(
   partition: Monitor,
   name: String,
 ) -> Event(meta)
+
+/// Ask `shard` to send a `Synced` event per node once it has synced.
+@external(erlang, "beacon_presence_watch_ffi", "await_sync")
+fn await_sync(shard: Pid, nodes: List(String)) -> Nil
+
+/// This node's name, as entries' `Meta.node` carries it.
+@external(erlang, "beacon_presence_watch_ffi", "node_name")
+fn node_name() -> String
 
 @external(erlang, "beacon_presence_watch_ffi", "exit")
 fn exit(reason: ExitReason) -> a

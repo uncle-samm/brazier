@@ -31,6 +31,27 @@
 %%
 %% StoredMeta is the Gleam record beacon/presence.StoredMeta:
 %% {stored_meta, Json, Ref, RefPrev}.
+%%
+%% Sync waiters. A shard that restarts starts empty and learns every other
+%% node's entries from that node (its heartbeat marks it up, the transfer
+%% at the next clock sample carries its entries). A process that read this
+%% shard can ask when that is done for some nodes by sending
+%%
+%%   {beacon_presence_await_sync, Pid, [NodeBin]}
+%%
+%% and gets {beacon_presence_synced, ShardPid, NodeBin, Status} once per
+%% node, after the diffs of everything the shard learnt before:
+%%
+%%   synced   the node is up and this shard holds every entry the node had
+%%            issued when it last heartbeat (its own clock is covered)
+%%   down     the node's replica is down: its entries are hidden
+%%   absent   the shard has not heard from the node for down_period since
+%%            it started, the rule that marks a known node down
+%%   timeout  none of these within down_period of the request (logged)
+%%
+%% Session presence watchers use it so that entries of other nodes do not
+%% leave and join again while a restarted shard catches up (Phoenix's
+%% replica up and state transfer, with the reader told when they are done).
 
 -export([start_link/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
@@ -78,7 +99,12 @@ init({Index, Config}) ->
                    silent => MaxSilent,
                    samples => Samples,
                    monitors => #{},
-                   mismatched => #{}}}
+                   mismatched => #{},
+                   started => now_ms(),
+                   %% Replica ref => its own clock value in its last heartbeat.
+                   heard => #{},
+                   %% NodeBin => [{Pid, DeadlineMs}] (see Sync waiters).
+                   waiters => #{}}}
     end.
 
 %% --- Local tracking ---
@@ -145,9 +171,18 @@ handle_cast(Request, S) ->
 handle_info(heartbeat, S = #{config := #{broadcast_period := Period}}) ->
     S1 = detect_downs(request_transfers(broadcast_delta_heartbeat(S))),
     schedule_heartbeat(Period),
-    {noreply, S1};
+    {noreply, notify_waiters(S1)};
 handle_info({beacon_pubsub, Topic, Message}, S = #{topic := Topic}) ->
-    {noreply, peer_message(Message, S)};
+    {noreply, notify_waiters(peer_message(Message, S))};
+handle_info({beacon_presence_await_sync, Pid, Nodes}, S) when is_pid(Pid), is_list(Nodes) ->
+    case lists:all(fun is_binary/1, Nodes) of
+        true ->
+            {noreply, await_sync(S, Pid, lists:usort(Nodes))};
+        false ->
+            beacon_log_ffi:warning(<<"beacon.presence">>, "Shard ~ts received an await_sync from ~p "
+                                   "with non-binary nodes ~p", [label(S), Pid, Nodes]),
+            {noreply, S}
+    end;
 handle_info({'DOWN', MRef, process, Pid, Reason}, S = #{monitors := Monitors}) ->
     case maps:find(Pid, Monitors) of
         {ok, MRef} ->
@@ -293,11 +328,11 @@ checked_peer_message(_Message, Node, PoolSize, S) ->
     end.
 
 handle_peer({beacon_presence, heartbeat, _, From, none, Clocks}, _Node, S) ->
-    handle_heartbeat(put_pending_clock(S, Clocks), From);
+    put_heard(handle_heartbeat(put_pending_clock(S, Clocks), From), From, Clocks);
 handle_peer({beacon_presence, heartbeat, _, From, Delta, Clocks}, _Node, S)
   when element(1, Delta) =:= delta ->
     S1 = merge(handle_heartbeat(S, From), {delta_transfer, Delta}),
-    push_delta(put_pending_clock(S1, Clocks), Delta);
+    put_heard(push_delta(put_pending_clock(S1, Clocks), Delta), From, Clocks);
 handle_peer({beacon_presence, transfer_req, _, From, {_, RemoteContext}}, Node, S) ->
     #{pres := Pres, deltas := Deltas, ref := Ref, topic := Topic,
       config := #{pool_size := PoolSize}} = S,
@@ -398,12 +433,13 @@ down(S = #{pres := Pres, name := Name, replicas := Replicas}, Node) ->
            Joins, Leaves).
 
 %% Drop a replica's data. Its entries already left when it went down.
-permdown(S = #{pres := Pres, deltas := Deltas, name := Name}, Ref) ->
+permdown(S = #{pres := Pres, deltas := Deltas, name := Name, heard := Heard}, Ref) ->
     beacon_log_ffi:info(<<"beacon.presence">>, "Shard ~ts: replica ~p is permanently down",
                         [label(S), Ref]),
     beacon_telemetry_ffi:presence_replica(replica_permdown, ref_binary(Ref), Name),
     S#{pres := ?STATE:remove_down_replicas(Pres, Ref),
-       deltas := ?DG:remove_down_replicas(Deltas, Ref)}.
+       deltas := ?DG:remove_down_replicas(Deltas, Ref),
+       heard := maps:remove(Ref, Heard)}.
 
 %% Merge a peer's delta or snapshot. Entries of replicas that are not up
 %% stay hidden: they are reported when their replica comes up.
@@ -413,6 +449,89 @@ merge(S = #{pres := Pres}, Transfer) ->
         ?STATE:replica_status(Pres1, Ref) =:= {ok, up}
     end,
     report(S#{pres := Pres1}, lists:filter(Visible, Joins), lists:filter(Visible, Leaves)).
+
+%% --- Sync waiters (see the module doc) ---
+
+%% Remember the sender's own clock value from its heartbeat clocks.
+put_heard(S = #{heard := Heard}, From, {From, Context}) when is_map(Context) ->
+    S#{heard := Heard#{From => maps:get(From, Context, 0)}};
+put_heard(S, From, Clocks) ->
+    %% ?STATE:clocks/1 is {OwnRef, Context}, so a peer running this module
+    %% never sends this. Nothing is recorded: waiters for the node time out.
+    beacon_log_ffi:error(<<"beacon.presence">>, "Shard ~ts: heartbeat of ~p carries clocks ~P "
+                         "that are not its own; not recording them", [label(S), From, Clocks, 10]),
+    S.
+
+await_sync(S, Pid, Nodes) ->
+    #{waiters := Waiters, config := #{down_period := DownPeriod}} = S,
+    Now = now_ms(),
+    Deadline = Now + DownPeriod,
+    Waiters1 = lists:foldl(fun(NodeBin, Acc) ->
+        case resolution(S, NodeBin, Now) of
+            waiting ->
+                Acc#{NodeBin => [{Pid, Deadline} | maps:get(NodeBin, Acc, [])]};
+            Status ->
+                synced(S, Pid, NodeBin, Status),
+                Acc
+        end
+    end, Waiters, Nodes),
+    beacon_log_ffi:debug(<<"beacon.presence">>, "Shard ~ts: ~p waits for sync with ~p",
+                         [label(S), Pid, Nodes]),
+    S#{waiters := Waiters1}.
+
+%% Answer every waiter whose node is resolved or whose deadline passed.
+notify_waiters(S = #{waiters := Waiters}) when map_size(Waiters) =:= 0 ->
+    S;
+notify_waiters(S = #{waiters := Waiters}) ->
+    Now = now_ms(),
+    Waiters1 = maps:fold(fun(NodeBin, Pids, Acc) ->
+        case resolution(S, NodeBin, Now) of
+            waiting ->
+                {Expired, Kept} = lists:partition(fun({_, Deadline}) -> Now > Deadline end, Pids),
+                [timed_out(S, Pid, NodeBin) || {Pid, _} <- Expired],
+                case Kept of
+                    [] -> Acc;
+                    _ -> Acc#{NodeBin => Kept}
+                end;
+            Status ->
+                beacon_log_ffi:info(<<"beacon.presence">>, "Shard ~ts: sync with ~ts is ~p, "
+                                    "telling ~b waiters", [label(S), NodeBin, Status, length(Pids)]),
+                [synced(S, Pid, NodeBin, Status) || {Pid, _} <- Pids],
+                Acc
+        end
+    end, #{}, Waiters),
+    S#{waiters := Waiters1}.
+
+timed_out(S, Pid, NodeBin) ->
+    beacon_log_ffi:warning(<<"beacon.presence">>, "Shard ~ts did not sync with ~ts within "
+                           "down_period; telling ~p its entries are not here", [label(S), NodeBin, Pid]),
+    synced(S, Pid, NodeBin, timeout).
+
+synced(_S, Pid, NodeBin, Status) ->
+    Pid ! {beacon_presence_synced, self(), NodeBin, Status},
+    ok.
+
+%% Where this shard stands with the node named NodeBin.
+resolution(S, NodeBin, Now) ->
+    #{replicas := Replicas, pres := Pres, heard := Heard, started := Started,
+      config := #{down_period := DownPeriod}} = S,
+    Found = [Replica || {Node, Replica} <- maps:to_list(Replicas),
+                        atom_to_binary(Node, utf8) =:= NodeBin],
+    case Found of
+        [#{status := down}] ->
+            down;
+        [#{status := up, ref := Ref}] ->
+            Issued = maps:get(Ref, Heard, 0),
+            Held = maps:get(Ref, ?STATE:context(Pres), 0),
+            case Held >= Issued of
+                true -> synced;
+                false -> waiting
+            end;
+        [] when Now - Started > DownPeriod ->
+            absent;
+        [] ->
+            waiting
+    end.
 
 %% --- Local pids ---
 

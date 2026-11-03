@@ -471,6 +471,18 @@ each room and who is typing this way.
 - **Shard restarts are invisible to the app.** When a tracker shard
   restarts, the session tracks its entries again (with backoff) and gets
   one message with the old entry leaving and the new one joining.
+  Entries of other nodes do not flap. The new shard starts empty and
+  gets each peer's entries from that peer: the peer's next heartbeat
+  marks it up, and the transfer at the next clock sample carries them.
+  Until then the session keeps them, without a leave or a join, and asks
+  the shard to say when it has synced with their nodes. The shard
+  answers after the diffs of what it learnt. The session then reports
+  only the entries the shard still does not have, which left meanwhile.
+  It also reports them when the node is down, when the shard has not
+  heard from the node for `down_period`, or when it has not synced
+  within `down_period`. The last case is logged as a warning.
+  Entries of this node that the old shard held are reported as leaves at
+  once. Their processes track again with new refs.
 - **Failures stop the session loudly.** A tracking the tracker refuses (a
   limit, an invalid topic or key, the same key twice on a topic), a
   tracker that stays down, or the loss of the session's PubSub partition
@@ -573,7 +585,7 @@ Further constraints:
 | A netsplit | Each side marks the other down after `down_period` and sees only its own entries. When the split heals, the sides exchange state and converge, including changes made during the split. |
 | A node comes back before `permdown_period` | Its entries rejoin from its heartbeats or a transfer (`replica, up`). |
 | A tracker stops normally | It tells its peers, which drop its entries at once instead of waiting for `down_period`. |
-| A shard crashes and restarts | The new shard has a new version, and peers drop the old version's entries at once. Tracked processes must track again. They can monitor `presence.shard_pid(users, topic)` to find out. |
+| A shard crashes and restarts | The new shard has a new version, and peers drop the old version's entries at once. Tracked processes must track again. They can monitor `presence.shard_pid(users, topic)` to find out. The new shard learns each peer's entries from the peer's heartbeat and the transfer that follows, and Beacon sessions keep those entries until it has (see Session presence). |
 | A new node joins | It asks a peer for a transfer of the current state (`[beacon, presence, transfer]`). |
 
 `presence.replicas(users, topic)` returns the peers a shard knows, with
