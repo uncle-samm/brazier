@@ -599,6 +599,7 @@ Where the code forced a choice the design did not make, WS7 picked the option cl
 - **`route_server_workspace`** folds the separate server update into one page `update(model, server, msg)`.
 - **Pages keyed by route.** `routed`, `routed_workspace` and `route_server_workspace` wrap the page in `element.keyed(href(route), ...)`. Without a key, the morph reuses one page's nodes for the next page by position. Focus and input state carry over, and the moved nodes show up as layout shift. ROUTING.md documents the pattern. A follow-up could have the client key the root on navigation by itself.
 - **`auth_workspace` WebSocket auth.** `auth.protect_ws` refuses guest sockets. On a page that guests may open, a revoked or missing session would then make the client reconnect forever. The example wraps `protect_ws` in a `ws_auth` that sends a signed-in request through `protect_ws`, connects a request with no live signed-in session as a guest, and refuses the socket when the store is unavailable. An `auth.allow_guests_ws` helper in `beacon/auth` (owned by ws8b) would remove the wrapper.
+  - **Resolved in WS8b.** `auth.allow_guests_ws` replaces the wrapper.
 
 ### Tooling
 

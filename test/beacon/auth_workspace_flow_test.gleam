@@ -1,6 +1,7 @@
 /// End-to-end auth workspace flow over real HTTP and WebSocket sockets.
-/// This test composes API routes, HttpOnly cookies, CSRF, ws_auth, ws_init,
-/// route-aware SSR, and server-private state in one app shape.
+/// This test composes API routes, HttpOnly cookies, CSRF, ws_auth, an init
+/// that reads the session cookie from the Context, route-aware SSR, and
+/// server-private state in one app shape.
 import beacon/app_config_fixture
 import beacon/application
 import beacon/attribute

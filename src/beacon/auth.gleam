@@ -547,6 +547,80 @@ pub fn protect_ws(
   ws_session_auth(store, config)
 }
 
+/// WebSocket auth for apps whose pages guests may open too. Use it in place
+/// of `protect_ws` when `init` renders a guest page (`init_from_session`).
+///
+/// - A live session with a user is bound to the socket, as `protect_ws`
+///   does, so logout, rotation or expiry closes it with 4401.
+/// - No session cookie, a cookie naming no live session and a session
+///   without a user connect as a guest. They are not bound to anything.
+/// - A session store that cannot answer refuses the socket (401 before the
+///   upgrade, 4401 on a recheck): the socket cannot be verified either way,
+///   and treating it as a guest would hide the outage.
+///
+/// `protect_ws` refuses guests, so a guest page's socket would reconnect
+/// forever. The server still checks every event against the page's `view`,
+/// and `update` must refuse what a guest may not do.
+pub fn allow_guests_ws(
+  store: session.SessionStore,
+  config: SessionConfig,
+) -> fn(Request(Connection)) -> Result(Nil, String) {
+  fn(req: Request(Connection)) {
+    // The lookup is spelled out, as in `init_from_session`, so every case is
+    // one of the store's outcomes and no CSRF branch is impossible.
+    case session_id_from_request(req, config) {
+      Error(reason) -> {
+        log.debug(
+          "beacon.auth",
+          "WS auth: a guest (" <> error_to_string(reason) <> ")",
+        )
+        Ok(Nil)
+      }
+      Ok(session_id) ->
+        case session.fetch(store, session_id) {
+          Ok(sess) ->
+            case current_user(sess) {
+              Ok(_user_id) -> {
+                session.bind_current_process(store, sess.id)
+                log.debug("beacon.auth", "WS auth: a signed-in session, bound")
+                Ok(Nil)
+              }
+              Error(Nil) -> {
+                log.debug(
+                  "beacon.auth",
+                  "WS auth: a guest (" <> error_to_string(MissingUser) <> ")",
+                )
+                Ok(Nil)
+              }
+            }
+          Error(session.SessionNotFound as err)
+          | Error(session.SessionExpired as err) -> {
+            log.debug(
+              "beacon.auth",
+              "WS auth: a guest ("
+                <> error_to_string(store_failure(err, "WS session lookup"))
+                <> ")",
+            )
+            Ok(Nil)
+          }
+          Error(session.SessionContention as err)
+          | Error(session.SessionBackendFailed(_) as err)
+          | Error(session.InvalidBackend(_) as err) -> {
+            // `store_failure` logs the backend's reason as an error.
+            let failure = store_failure(err, "WS session lookup")
+            log.error(
+              "beacon.auth",
+              "WS auth cannot verify the session ("
+                <> error_to_string(failure)
+                <> "); refusing the socket",
+            )
+            Error(error_to_string(failure))
+          }
+        }
+    }
+  }
+}
+
 /// The session named by the Context's session cookie, for code that runs
 /// in an app's `init`. The same outcomes as `session_from_request`.
 pub fn session_from_context(

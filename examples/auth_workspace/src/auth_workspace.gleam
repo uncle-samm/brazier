@@ -5,8 +5,9 @@
 ///   the HttpOnly session cookie; `POST /api/logout` deletes it.
 /// - `init` reads that cookie from the `Context`, on the HTML render and on
 ///   the connected mount, and loads the account from the session store.
-/// - A signed-in socket is bound to its session (`auth.protect_ws`), so
-///   logout closes it; a guest socket connects to the guest page.
+/// - A signed-in socket is bound to its session (`auth.allow_guests_ws`), so
+///   logout closes it; a guest socket connects to the guest page. A session
+///   store outage refuses the page (503) and the socket.
 /// - The session id, the audit key and the audit trail stay in the
 ///   server-only `Session` record; `sync` sends only the Model.
 import auth_workspace/app.{type Model, type Msg}
@@ -57,7 +58,7 @@ pub fn main() {
   let auth_config = auth.dev_session_config()
 
   beacon.full_application(
-    init: fn(ctx) { init(store, auth_config, ctx) },
+    init: init(store, auth_config),
     update:,
     sync:,
     local: local.none(),
@@ -67,50 +68,9 @@ pub fn main() {
   |> beacon.title(fn(_model) { "Auth Workspace" })
   |> beacon.secret_key("auth-workspace-session-secret-key-32-chars")
   |> beacon.api_routes(api_handler(store, auth_config))
-  |> beacon.ws_auth(ws_auth(store, auth_config))
+  |> beacon.ws_auth(auth.allow_guests_ws(store, auth_config))
   |> beacon.dev_mode(True)
   |> beacon.start(8080)
-}
-
-/// The WebSocket policy mirrors `init`. A request with a signed-in session
-/// goes through `auth.protect_ws`, which binds the socket to the session so
-/// logout, rotation or expiry closes it. A request with no live signed-in
-/// session connects as a guest: the guest pages are live too, and `update`
-/// ignores every guest message except navigation. A store that cannot
-/// answer refuses the socket.
-fn ws_auth(
-  store: session.SessionStore,
-  config: auth.SessionConfig,
-) -> fn(api.Request) -> Result(Nil, String) {
-  let protect = auth.protect_ws(store, config)
-  fn(req: api.Request) {
-    case auth.current_user_from_request(req, store, config) {
-      Ok(_user) -> protect(req)
-      Error(auth.MissingSessionCookie as reason)
-      | Error(auth.InvalidSession as reason)
-      | Error(auth.MissingUser as reason) -> {
-        log.debug(
-          "auth_workspace",
-          "Guest WebSocket (" <> auth.error_to_string(reason) <> ")",
-        )
-        Ok(Nil)
-      }
-      // Already logged as an error by beacon/auth.
-      Error(auth.SessionStoreUnavailable(_) as reason) ->
-        Error(auth.error_to_string(reason))
-      // A session lookup never checks CSRF tokens.
-      Error(auth.MissingCsrfToken as reason)
-      | Error(auth.InvalidCsrfToken as reason) -> {
-        log.error(
-          "auth_workspace",
-          "Session lookup returned a CSRF error ("
-            <> auth.error_to_string(reason)
-            <> "); refusing the socket",
-        )
-        Error(auth.error_to_string(reason))
-      }
-    }
-  }
 }
 
 fn parse_route(uri: Uri) -> Result(app.Route, Nil) {
@@ -119,15 +79,15 @@ fn parse_route(uri: Uri) -> Result(app.Route, Nil) {
 
 // ===== Session lifecycle =====
 
-/// Load the account named by the session cookie. A missing, unknown or
-/// expired session is a guest. A store that cannot answer crashes the
-/// request (the HTML render answers 500, the mount is refused) rather than
-/// show a signed-in user the guest page.
+/// Load the account named by the session cookie, through
+/// `auth.init_from_session`. A missing, unknown or expired session is a
+/// guest. A store that cannot answer refuses the request with
+/// `error.unavailable` (the HTML render answers 503, the socket closes with
+/// 4503) rather than show a signed-in user the guest page.
 fn init(
   store: session.SessionStore,
   config: auth.SessionConfig,
-  ctx: beacon.Context,
-) -> #(Session, Effect(Msg)) {
+) -> fn(beacon.Context) -> Result(#(Session, Effect(Msg)), beacon.InitError) {
   let guest =
     Session(
       model: app.guest_model(),
@@ -137,44 +97,17 @@ fn init(
       audit_entries: [],
       denied_admin_events: 0,
     )
-  case beacon.cookie(ctx, config.cookie_name) {
-    Error(Nil) -> {
-      log.debug("auth_workspace", "No session cookie; rendering the guest page")
-      #(guest, effect.none())
-    }
-    Ok(id) -> {
-      let fetched = session.fetch(store, id)
-      case fetched {
-        Ok(sess) -> #(restore(guest, sess, ctx), effect.none())
-        Error(session.SessionNotFound) | Error(session.SessionExpired) -> {
-          log.info(
-            "auth_workspace",
-            "Session cookie names no live session; rendering the guest page",
-          )
-          #(guest, effect.none())
-        }
-        Error(err) -> {
-          log.error(
-            "auth_workspace",
-            "Session store unavailable while loading the account ("
-              <> session.store_error_to_string(err)
-              <> "); crashing the request",
-          )
-          #(restore(guest, crash_unless_fetched(fetched), ctx), effect.none())
-        }
-      }
-    }
-  }
-}
-
-/// `init` has no error channel: a store that cannot answer crashes the
-/// request, as `auth.init_from_session` does. The caller logs the reason.
-fn crash_unless_fetched(
-  fetched: Result(session.Session, session.SessionStoreError),
-) -> session.Session {
-  let assert Ok(sess) = fetched
-    as "auth_workspace init: session store unavailable (logged above)"
-  sess
+  auth.init_from_session(
+    store,
+    config,
+    guest_init: fn(_ctx) {
+      log.debug("auth_workspace", "Rendering the guest page")
+      Ok(#(guest, effect.none()))
+    },
+    authenticated_init: fn(ctx, sess, _user_id) {
+      Ok(#(restore(guest, sess, ctx), effect.none()))
+    },
+  )
 }
 
 fn restore(

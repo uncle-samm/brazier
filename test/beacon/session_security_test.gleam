@@ -2,6 +2,7 @@
 /// Unhappy paths first.
 import beacon/api
 import beacon/auth
+import beacon/log_capture
 import beacon/session
 import beacon/transport/server.{type Connection, type ResponseBody, Bytes}
 import gleam/bytes_tree
@@ -331,6 +332,59 @@ pub fn ws_session_auth_rejects_session_without_user_test() {
   let req = cookie_request("GET", "/ws", config.cookie_name, anon.id)
   let assert Error(_) = auth_fn(req)
   should.equal(session.bound_process_count(store, anon.id), 0)
+}
+
+pub fn allow_guests_ws_admits_a_request_without_a_cookie_test() {
+  let store = session.new_store("sec_guests_ws_no_cookie")
+  let auth_fn = auth.allow_guests_ws(store, auth.dev_session_config())
+  let req = make_request("GET", "/ws")
+  let #(outcome, logs) = log_capture.capture(fn() { auth_fn(req) })
+  should.equal(outcome, Ok(Nil))
+  let assert True =
+    log_capture.has(logs, level: "debug", containing: [
+      "a guest", "missing session cookie",
+    ])
+}
+
+pub fn allow_guests_ws_admits_a_dead_session_unbound_test() {
+  let store = session.new_store("sec_guests_ws_dead")
+  let config = auth.dev_session_config()
+  let assert Ok(login) = auth.create_login(store, "alice")
+  session.delete(store, login.session.id)
+  let auth_fn = auth.allow_guests_ws(store, config)
+  let req = cookie_request("GET", "/ws", config.cookie_name, login.session.id)
+  let #(outcome, logs) = log_capture.capture(fn() { auth_fn(req) })
+  should.equal(outcome, Ok(Nil))
+  should.equal(session.bound_process_count(store, login.session.id), 0)
+  let assert True =
+    log_capture.has(logs, level: "debug", containing: [
+      "a guest", "invalid session",
+    ])
+}
+
+pub fn allow_guests_ws_admits_a_session_without_a_user_unbound_test() {
+  let store = session.new_store("sec_guests_ws_no_user")
+  let config = auth.dev_session_config()
+  let anon = session.create(store)
+  let auth_fn = auth.allow_guests_ws(store, config)
+  let req = cookie_request("GET", "/ws", config.cookie_name, anon.id)
+  should.equal(auth_fn(req), Ok(Nil))
+  should.equal(session.bound_process_count(store, anon.id), 0)
+}
+
+pub fn allow_guests_ws_binds_a_signed_in_session_test() {
+  let store = session.new_store("sec_guests_ws_binds")
+  let config = auth.dev_session_config()
+  let assert Ok(login) = auth.create_login(store, "alice")
+  let auth_fn = auth.allow_guests_ws(store, config)
+  let req = cookie_request("GET", "/ws", config.cookie_name, login.session.id)
+  should.equal(auth_fn(req), Ok(Nil))
+  should.equal(session.bound_process_count(store, login.session.id), 1)
+  // Logout revokes the bound socket, as with protect_ws; the same request
+  // then connects as a guest.
+  session.delete(store, login.session.id)
+  let assert Ok(#(_, "deleted")) = receive_revoked(1000)
+  should.equal(auth_fn(req), Ok(Nil))
 }
 
 // --- Request helpers / secrets ---

@@ -358,9 +358,9 @@ pub fn main() {
   let store = session.new_store("my_app_sessions")
   let config = auth.default_session_config()
 
-  beacon.application(init: init(_, store, config), update:, view:)
+  beacon.application(init: init(store, config), update:, view:)
   |> beacon.api_routes(auth.session_routes(store, config, authenticate_login))
-  |> beacon.ws_auth(auth.protect_ws(store, config))
+  |> beacon.ws_auth(auth.allow_guests_ws(store, config))
   |> beacon.start(8080)
 }
 
@@ -427,26 +427,19 @@ socket to it: logout, session rotation or expiry closes the socket with code
 4401, and the browser reloads the page.
 
 `protect_ws` refuses guests. An app with a guest page must let guest sockets
-connect, or the guest page's reconnects are refused forever. Wrap it:
+connect, or the guest page's reconnects are refused forever. Use
+`auth.allow_guests_ws(store, config)` instead, next to `init_from_session`:
 
 ```gleam
-fn ws_auth(store, config) -> fn(api.Request) -> Result(Nil, String) {
-  let protect = auth.protect_ws(store, config)
-  fn(req: api.Request) {
-    case auth.current_user_from_request(req, store, config) {
-      Ok(_user) -> protect(req)
-      Error(auth.MissingSessionCookie)
-      | Error(auth.InvalidSession)
-      | Error(auth.MissingUser) -> Ok(Nil)
-      Error(reason) -> Error(auth.error_to_string(reason))
-    }
-  }
-}
+beacon.application(init: init(store, config), update:, view:)
+|> beacon.ws_auth(auth.allow_guests_ws(store, config))
 ```
 
-The server still checks every event: a guest's socket can send only messages
-that the guest page's `view` produces, and `update` must refuse signed-in
-actions from a guest.
+It binds a signed-in socket to its session as `protect_ws` does, connects a
+request with no live signed-in session as a guest, and refuses the socket
+when the session store cannot answer. The server still checks every event:
+a guest's socket can send only messages that the guest page's `view`
+produces, and `update` must refuse signed-in actions from a guest.
 
 ## Effects and Async
 

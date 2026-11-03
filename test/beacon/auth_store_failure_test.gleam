@@ -225,6 +225,22 @@ pub fn ws_auth_rejects_when_the_store_is_unavailable_test() {
     auth_fn(with_cookie("GET", "/ws"))
 }
 
+pub fn allow_guests_ws_rejects_when_the_store_is_unavailable_test() {
+  let auth_fn = auth.allow_guests_ws(store(broken()), auth.dev_session_config())
+  // Never a guest: the socket cannot be verified either way.
+  let #(outcome, logs) =
+    log_capture.capture(fn() { auth_fn(with_cookie("GET", "/ws")) })
+  let assert Error("session store unavailable") = outcome
+  let assert True =
+    log_capture.has(logs, level: "error", containing: [
+      "Session store unavailable during WS session lookup",
+    ])
+  let assert True =
+    log_capture.has(logs, level: "error", containing: [
+      "WS auth cannot verify the session", "refusing the socket",
+    ])
+}
+
 pub fn init_refuses_with_503_when_the_store_is_unavailable_test() {
   let init =
     auth.init_from_session(
