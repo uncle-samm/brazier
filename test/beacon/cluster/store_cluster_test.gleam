@@ -364,6 +364,15 @@ pub fn remote_merges_past_the_limits_are_refused_test_() -> peer.Timeout {
     )
   start_on(b, small)
   peer.on(b, record_syncs)
+  // b's PubSub started inside start_on, and pg tells a about b's forwarding
+  // worker asynchronously (not ordered with start_on's reply). Until a lists
+  // it, a's deltas skip b, and b refuses every full sync here, so no write
+  // may run before then.
+  let b_node = peer.node(b)
+  assert peer.eventually(
+    fn() { peer.on(a, fn() { remote_worker_nodes(0) }) == [b_node] },
+    wait_ms,
+  )
 
   // Larger than b's delta and sync limits: never merged on b.
   put_on(a, kv, "big", string.repeat("x", 5000))
@@ -374,16 +383,18 @@ pub fn remote_merges_past_the_limits_are_refused_test_() -> peer.Timeout {
   put_on(a, kv, "s4", "4")
   // A removal shrinks b, so it merges; it arrives after s4's delta.
   delete_on(a, kv, "s1")
-  // The removal's delta carries no entries; every other merge here does.
+  // a's deltas reach b in write order (one sender, one forwarding shard),
+  // so s3 present with s1 gone means every delta above was merged or
+  // refused. A merge span cannot mark that point: a's reply to b's startup
+  // sync_req carries no entries either, like the removal's delta.
   let from_a = node_name(a)
   assert peer.eventually(
-    fn() {
-      list.any(peer.on(b, recorded_syncs), fn(sync) {
-        sync.1 == from_a && sync.2 == 0
-      })
-    },
+    fn() { get_on(b, kv, "s3") == Ok("3") && get_on(b, kv, "s1") == Error(Nil) },
     wait_ms,
   )
+  assert list.any(peer.on(b, recorded_syncs), fn(sync) {
+    sync.1 == from_a && sync.2 == 0
+  })
   assert get_on(b, kv, "s1") == Error(Nil)
   assert get_on(b, kv, "s2") == Ok("2")
   assert get_on(b, kv, "s3") == Ok("3")
@@ -528,6 +539,9 @@ fn spawn_recorder(topics: List(String)) -> Pid
 
 @external(erlang, "beacon_cluster_test_ffi", "recorded_count")
 fn recorded_count(pid: Pid) -> Int
+
+@external(erlang, "beacon_cluster_test_ffi", "remote_worker_nodes")
+fn remote_worker_nodes(shard: Int) -> List(node.Node)
 
 @external(erlang, "beacon_store_test_ffi", "now_us")
 fn now_us() -> Int

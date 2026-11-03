@@ -76,6 +76,12 @@
     - Coordinator fixes after the merge:
       - `auth.init_from_session` rendered the guest state when the store was unavailable (a fallback). It now crashes the request process after logging, as `session.get` does; the test asserts the crash.
       - ARCHITECTURE.md's PubSub/store lines now say stores are node-local unless Replicated.
+      - Flaky `store_cluster_test.remote_merges_past_the_limits_are_refused_test_`: about half the runs failed under CPU load (`s2` missing on b).
+        - Root cause: its wait for "a merge from a with 0 entries" was meant to mark the removal's delta, but a's reply to b's startup `sync_req` (a's still-empty state) also has 0 entries. Under load that reply is recorded, the wait passes at once, and the assertions run before any delta arrives. A per-test diagnostic of b's merge spans showed exactly that one 44-byte span in every failure.
+        - Fix: wait on b's state instead (s3 present and s1 gone). That point is unambiguous because one sender's deltas arrive in write order.
+        - Also: wait until a's pg view lists b's forwarding worker before writing. That race is real but was not the cause seen here.
+        - The module passed 15 of 15 runs alone under 12 busy-loop processes, where 4 of 10 had failed.
+      - Seen once under 10 synthetic busy loops, never in normal runs: `sim_test.sim_1000_connections_test` (needs at least 950 of 1000 connections to succeed). Left to WS9's thresholds work.
   - [ ] WS8b part 2 (after WS7 merges; it touches WS7 files):
     - Root supervision tree: pubsub → cluster → session revocation scope → presence, plus app stop.
     - Runtime `on_presence` hook: coalesce up to 100 diffs; monitor `pubsub.partition_for` and the presence shard, and track again when a shard restarts.
@@ -87,7 +93,7 @@
     - Move the auth_workspace example (:134, :173, :260), GETTING_STARTED's auth section and SECURITY.md:202 to the new auth signatures.
     - Regenerate the example manifests for the `telemetry` dependency (23 of 24 lack it).
     - Session recheck path: emit the revoked event.
-- [ ] WS9 Test quality + performance (follow-up from WS8a: `test/beacon_effect_test_ffi.erl` `await_pg_empty` now polls every 5 ms; use an event instead): replace sleeps with synchronization, meaningful assertions, client JS tests in CI, HTTP/WS/runtime load tests and benchmarks with recorded baselines and regression thresholds
+- [ ] WS9 Test quality + performance (follow-ups: from WS8a, `test/beacon_effect_test_ffi.erl` `await_pg_empty` now polls every 5 ms, so use an event instead; `sim_1000_connections_test` failed once under synthetic CPU starvation, so review its threshold together with the perf thresholds; run the suite under CPU stress as a flake gate): replace sleeps with synchronization, meaningful assertions, client JS tests in CI, HTTP/WS/runtime load tests and benchmarks with recorded baselines and regression thresholds
 
 **Phase 4 — Docs, hygiene, rename, final audits**
 - [ ] WS10 Docs that compile, LICENSE, remove stale committed builds/stray files, archive old PROGRESS notes, honest CHANGELOG, publish script
