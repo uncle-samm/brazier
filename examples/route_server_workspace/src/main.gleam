@@ -136,10 +136,12 @@ pub fn view(model: Model, _local: Nil) -> Element(Msg) {
       html.p([attribute.data("testid", "route-visits")], [
         html.text("Route visits: " <> int.to_string(model.visits)),
       ]),
-      case model.route {
+      // Keyed by route: a route change replaces the page's DOM instead of
+      // morphing one page's nodes into the next page.
+      element.keyed(href(model.route), case model.route {
         AccountsPage -> accounts.view(model.accounts) |> element.map(Accounts)
         SettingsPage -> settings.view(model.settings) |> element.map(Settings)
-      },
+      }),
     ],
   )
 }

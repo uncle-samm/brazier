@@ -53,6 +53,7 @@
 /// them to JavaScript.
 ///
 /// Reference: Lustre `application`/`simple`, LiveView mount.
+import beacon/api
 import beacon/application
 import beacon/effect.{type Effect}
 import beacon/element.{type Element}
@@ -65,10 +66,7 @@ import beacon/notification.{type Notification}
 import beacon/pubsub
 import beacon/runtime
 import beacon/transport
-import beacon/transport/server.{type Connection, type ResponseBody}
 import gleam/dynamic/decode
-import gleam/http/request
-import gleam/http/response
 import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
@@ -139,10 +137,8 @@ pub opaque type App(state, model, local, msg) {
     static_dir: Option(String),
     security_limits: transport.SecurityLimits,
     head_html: Option(String),
-    api_handler: Option(
-      fn(request.Request(Connection)) -> Option(response.Response(ResponseBody)),
-    ),
-    ws_auth: Option(fn(request.Request(Connection)) -> Result(Nil, String)),
+    api_handler: Option(fn(api.Request) -> Option(api.Response)),
+    ws_auth: Option(fn(api.Request) -> Result(Nil, String)),
     dev_mode: Bool,
   )
 }
@@ -312,8 +308,7 @@ pub fn head_html(
 /// helpers for ordinary JSON/text endpoints.
 pub fn api_routes(
   app: App(state, model, local, msg),
-  handler: fn(request.Request(Connection)) ->
-    Option(response.Response(ResponseBody)),
+  handler: fn(api.Request) -> Option(api.Response),
 ) -> App(state, model, local, msg) {
   App(..app, api_handler: Some(handler))
 }
@@ -322,7 +317,7 @@ pub fn api_routes(
 /// rejects the connection with 401.
 pub fn ws_auth(
   app: App(state, model, local, msg),
-  auth: fn(request.Request(Connection)) -> Result(Nil, String),
+  auth: fn(api.Request) -> Result(Nil, String),
 ) -> App(state, model, local, msg) {
   App(..app, ws_auth: Some(auth))
 }

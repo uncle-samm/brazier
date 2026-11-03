@@ -5,7 +5,8 @@
 ///   the HttpOnly session cookie; `POST /api/logout` deletes it.
 /// - `init` reads that cookie from the `Context`, on the HTML render and on
 ///   the connected mount, and loads the account from the session store.
-/// - The WebSocket is refused without a valid session (`auth.protect_ws`).
+/// - A signed-in socket is bound to its session (`auth.protect_ws`), so
+///   logout closes it; a guest socket connects to the guest page.
 /// - The session id, the audit key and the audit trail stay in the
 ///   server-only `Session` record; `sync` sends only the Model.
 import auth_workspace/app.{type Model, type Msg}
@@ -66,9 +67,50 @@ pub fn main() {
   |> beacon.title(fn(_model) { "Auth Workspace" })
   |> beacon.secret_key("auth-workspace-session-secret-key-32-chars")
   |> beacon.api_routes(api_handler(store, auth_config))
-  |> beacon.ws_auth(auth.protect_ws(store, auth_config))
+  |> beacon.ws_auth(ws_auth(store, auth_config))
   |> beacon.dev_mode(True)
   |> beacon.start(8080)
+}
+
+/// The WebSocket policy mirrors `init`. A request with a signed-in session
+/// goes through `auth.protect_ws`, which binds the socket to the session so
+/// logout, rotation or expiry closes it. A request with no live signed-in
+/// session connects as a guest: the guest pages are live too, and `update`
+/// ignores every guest message except navigation. A store that cannot
+/// answer refuses the socket.
+fn ws_auth(
+  store: session.SessionStore,
+  config: auth.SessionConfig,
+) -> fn(api.Request) -> Result(Nil, String) {
+  let protect = auth.protect_ws(store, config)
+  fn(req: api.Request) {
+    case auth.current_user_from_request(req, store, config) {
+      Ok(_user) -> protect(req)
+      Error(auth.MissingSessionCookie as reason)
+      | Error(auth.InvalidSession as reason)
+      | Error(auth.MissingUser as reason) -> {
+        log.debug(
+          "auth_workspace",
+          "Guest WebSocket (" <> auth.error_to_string(reason) <> ")",
+        )
+        Ok(Nil)
+      }
+      // Already logged as an error by beacon/auth.
+      Error(auth.SessionStoreUnavailable(_) as reason) ->
+        Error(auth.error_to_string(reason))
+      // A session lookup never checks CSRF tokens.
+      Error(auth.MissingCsrfToken as reason)
+      | Error(auth.InvalidCsrfToken as reason) -> {
+        log.error(
+          "auth_workspace",
+          "Session lookup returned a CSRF error ("
+            <> auth.error_to_string(reason)
+            <> "); refusing the socket",
+        )
+        Error(auth.error_to_string(reason))
+      }
+    }
+  }
 }
 
 fn parse_route(uri: Uri) -> Result(app.Route, Nil) {
@@ -196,8 +238,8 @@ fn update(state: Session, msg: Msg) -> #(Session, Effect(Msg)) {
     app.RouteChanged(route), _ ->
       Session(..state, model: app.Model(..model, route:))
 
-    // Only a signed-in page has these controls; a guest's socket is refused
-    // by `protect_ws`, so reaching here means a forged event.
+    // Only a signed-in page has these controls, so a guest sending one is
+    // a forged event.
     _, app.Guest -> {
       log.warning(
         "auth_workspace",

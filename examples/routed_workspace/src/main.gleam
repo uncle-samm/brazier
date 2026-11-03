@@ -352,7 +352,10 @@ pub fn view(model: Model, local: Local) -> Element(Msg) {
         ],
       ),
       html.h1([], [html.text(title)]),
-      page,
+      // Keyed by route: a route change replaces the page's DOM instead of
+      // morphing one page's nodes (and their focus and input state) into
+      // the next page.
+      element.keyed(href(model.route), page),
     ],
   )
 }
