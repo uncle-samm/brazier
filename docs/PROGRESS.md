@@ -167,7 +167,29 @@
     - Move the auth_workspace example (:134, :173, :260), GETTING_STARTED's auth section and SECURITY.md:202 to the new auth signatures.
     - Regenerate the example manifests for the `telemetry` dependency (23 of 24 lack it).
     - Session recheck path: emit the revoked event.
-- [ ] WS8c Runtime/supervision follow-ups from WS8b part 2 (source only; runs beside WS9): see the WS8c list under WS8b part 2 above
+- [x] WS8c Runtime/supervision follow-ups from WS8b part 2 (source only; ran beside WS9; merged 2026-11-03 as 713211a): all 10 items on the WS8c list above
+  - Coordinator verify on the merged tree (WS10a already in): a clean build with zero warnings; format and lint clean; 1407 tests passing in each of 3 runs; `scripts/check_docs.sh` OK (59 modules, 157 links). CLUSTERING/TELEMETRY/ERROR_HANDLING/TESTING samples are still excluded until WS10b adds markers, so WS8c's new CLUSTERING.md sample is not compiled yet. The agent's own gates: client node tests (37 sync vectors, 33 harness scenarios), the suite under 8 `yes` processes, 24/24 examples with zero warnings, desktop CDP 499 passed.
+  - What was built:
+    - Erlang modules log formatted text through `beacon_log_ffi`, so FFI logs are no longer inspected tuples;
+    - a runtime that fails to start is logged once, where it fails; every runtime stop that runs code emits `[beacon, runtime, stop]`;
+    - static error pages set no join cookie;
+    - the ETS table owner is the first child of the root tree;
+    - the listener traps exits and drains open connections when it stops: WebSockets close with 1001, an HTTP request in flight completes with `Connection: close`, and stragglers are killed after `drain_timeout_ms` (or `BEACON_SHUTDOWN_TIMEOUT`) with one error log. `wait_forever` turns SIGTERM into that drain without sleeping (DEPLOYMENT.md "Graceful Shutdown");
+    - the client reloads on 4400–4499 closes behind a sessionStorage loop guard;
+    - after a presence shard restarts, the watcher asks it to report once it has synced with each node (`beacon_presence_await_sync`), and holds those nodes' entries as suspects until then, so live remote entries no longer flap leave/join;
+    - `beacon.watch_presence(app, tracker:, watch:, on_presence:)`: a watched topic is a followed topic with no keys of its own, so it reuses the subscribe/de-duplicate/coalesce/restart paths. New `ws8c_presence_watch_only_test` (5 tests); breaking the code on purpose failed 5/5 and 2/5.
+  - Edits to existing tests, all forced by the source changes: `init_error_server_test:187` (log level), `http_telemetry_test` (`join_cookie: True`), `app_tree_test` (child indices), `runtime_versioning_test:740` (33 scenarios), and `beacon_client/test/{sync_vectors,ffi_harness}.mjs`.
+  - Bench, run back to back on an idle machine: base 59/26 and 61/25 µs, head 58/26 and 57/26 µs (changed/unchanged events), so no regression. All four are slower than WS8b2's 45–47/18–21 µs because the machine was loaded, not because of the code.
+  - Merge: the only conflicts were in DEPLOYMENT.md. The coordinator kept WS10a's env table, rewrote its `BEACON_SHUTDOWN_TIMEOUT` row to what WS8c's code does (read when `beacon.start` starts the application, replaces `drain_timeout_ms`, a bad value refuses the start), and corrected "what `main` calls" to "`beacon.start` calls `wait_forever`".
+  - Follow-ups for WS10b, the stability audit, or WS9 (where noted):
+    - an HTTP handler crash is logged twice;
+    - `ssr_test` uses `/tmp` and flaked once (WS9);
+    - the `create_via_owner` race is untested (WS9);
+    - apps started outside the process that calls `wait_forever` are not drained on SIGTERM;
+    - a second SIGTERM during the drain falls through to OTP's `init:stop()`;
+    - after node A's shard restarts, watchers on node B still see A's re-tracked entries leave and join again with new refs;
+    - local entries re-tracked by other watchers can arrive as separate leave and join messages;
+    - no public builder combines tracking with extra watched topics (`new_watching` supports it internally).
 - [ ] WS9 Test quality + performance (follow-ups: from WS8a, `test/beacon_effect_test_ffi.erl` `await_pg_empty` now polls every 5 ms, so use an event instead; `sim_1000_connections_test` failed once under synthetic CPU starvation, so review its threshold together with the perf thresholds; run the suite under CPU stress as a flake gate): replace sleeps with synchronization, meaningful assertions, client JS tests in CI, HTTP/WS/runtime load tests and benchmarks with recorded baselines and regression thresholds
 
 **Phase 4 — Docs, hygiene, rename, final audits**
@@ -182,7 +204,7 @@
       - strict bash release scripts (`publish.sh` with `--dry-run` that stops at `gleam export hex-tarball`; `push.sh`/`tag.sh` on a shared `release_lib.sh`) and fixed CDP runner scripts; the Makefile release targets use bash, and `release` runs `publish-dry-run` first;
       - removed the tracked stray `.playwright-mcp` log and the unreferenced `test_client_patch.mjs`;
       - Milestones 1–116 archived verbatim to `docs/archive/PROGRESS.md`, after which the coordinator cut this file.
-  - [ ] WS10b source follow-ups and the WS8c-owned docs (after WS8c merges):
+  - [ ] WS10b source follow-ups and the WS8c-owned docs (WS8c merged 2026-11-03; also takes the WS8c follow-ups above that are not marked WS9):
     - From WS10a's code pass (also in `docs/TODO.md`):
       - dev reload never reaches a browser (`dev.gleam:151`, nothing joins `beacon:reload`), and the watcher falls back to polling (`dev.gleam:104-107`);
       - `body_parser` passes requests with a missing or bad Content-Length (`middleware.gleam:282`), and `middleware.Context` is carried by nothing (`:519-538`);
