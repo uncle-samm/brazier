@@ -28,6 +28,7 @@ pub type SecurityLimits {
     keepalive_idle_timeout_ms: Int,   // 15000 between keep-alive requests
     max_keepalive_requests: Int,      // 1000 per connection
     send_timeout_ms: Int,             // 30000 per blocked socket send
+    drain_timeout_ms: Int,            // 5000 for open connections on stop
     trusted_proxies: List(String),    // [] (see Trusted Proxies)
     // WebSocket limits
     max_ws_connections_per_ip: Int,   // 100
@@ -72,6 +73,10 @@ follows the cowboy/ranch and Plug conventions:
 - **Supervision:** acceptors run under an OTP supervisor and are restarted
   (and logged) when they crash; a crashing handler gets 500 and closes only
   its own connection.
+- **Shutdown:** a stopping listener first stops accepting, then gives open
+  connections `drain_timeout_ms` (0 kills them at once; at most
+  4294967295) to finish, and kills the rest. `BEACON_SHUTDOWN_TIMEOUT`
+  overrides it. See [DEPLOYMENT.md](DEPLOYMENT.md#graceful-shutdown).
 
 A seeded raw-socket fuzz test (`test/beacon/http_fuzz_test.gleam`) sends
 mutated and random requests and checks that the server never crashes, hangs,

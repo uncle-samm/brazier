@@ -244,6 +244,17 @@ queue, and decode errors. Forwarding headers are honoured only from
 optional `ws_auth` hook, which is rechecked every
 `ws_auth_recheck_interval_ms`. See [SECURITY.md](SECURITY.md).
 
+A listener is a `RestForOne` pair: the connection registry
+(`beacon_http_conns`, which links every connection process) and the
+acceptors. Stopping it stops the acceptors first; the registry then sends
+each connection `{beacon_http_drain, Registry}` and waits up to
+`drain_timeout_ms` for them to exit. A WebSocket closes with 1001, an HTTP
+response in progress is sent with `Connection: close`, and an idle
+keep-alive connection closes. Whatever remains is killed.
+
+Erlang modules log through `beacon_log_ffi`, which formats the message and
+logs it with the same module tag and format as `beacon/log`.
+
 ## Supervision (`application.gleam`)
 
 `beacon.start` runs `application.start_supervised`: one root supervisor with
@@ -268,6 +279,13 @@ after it and never one before it. The children, in start order:
 
 `application.start` (tests, embedding) starts the shared infrastructure
 unsupervised, and the table owner on demand runs until the node stops.
+
+`wait_forever` traps exits and blocks on one receive, with no polling. It
+returns when a SIGTERM arrives (it stops every app its process started, so
+each listener drains), or when the linked root supervisor exits normally.
+It crashes when that supervisor exits abnormally. SIGTERM reaches it
+through `beacon_signal_handler`, a `gen_event` handler that replaces OTP's
+`erl_signal_handler` while any process waits and puts it back afterwards.
 
 ## Modules
 

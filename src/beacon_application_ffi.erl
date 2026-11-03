@@ -1,28 +1,62 @@
 -module(beacon_application_ffi).
--export([trap_exit/0, receive_shutdown_signal/1, get_env_int/1, generate_strong_secret/0,
-         fail_loudly/1, once_new/0, once_take/1, stop_supervisor/2]).
+-export([trap_exit/0, receive_wait_event/0, get_env_int/1, generate_strong_secret/0,
+         fail_loudly/1, once_new/0, once_take/1, stop_supervisor/2,
+         remember_app/2, forget_app/1, remembered_apps/0, is_linked/1, await_exit/1]).
+
+-define(APPS_KEY, '$beacon_started_apps').
 
 %% Enable trapping of exit signals (SIGTERM etc.)
 trap_exit() ->
     process_flag(trap_exit, true),
     nil.
 
-%% Wait for an exit signal from a linked process.
-%% Returns no_signal on timeout, shutdown_requested for a `normal` exit
-%% (application:stop on the root supervisor), and
+%% Block until SIGTERM (forwarded by beacon_signal_handler) or the exit of
+%% a linked process. Returns sigterm, shutdown_requested for a `normal`
+%% exit (application.stop on the root supervisor), and
 %% {linked_process_exited, ReasonBin} for any other exit. A supervisor that
 %% gives up after too many restarts exits with `shutdown`: that is a
 %% failure, not a request, so it is reported as an exit too. Because the
 %% caller traps exits, swallowing those would leave the application running
-%% with a dead tree.
-receive_shutdown_signal(Timeout) ->
+%% with a dead tree. No timeout: nothing needs to happen until one arrives.
+receive_wait_event() ->
     receive
+        {beacon_signal, sigterm} -> sigterm;
         {'EXIT', _From, normal} -> shutdown_requested;
         {'EXIT', From, Reason} ->
             {linked_process_exited,
              iolist_to_binary(io_lib:format("~p exited with ~p", [From, Reason]))}
-    after Timeout ->
-        no_signal
+    end.
+
+%% The applications this process started and has not stopped, newest first,
+%% keyed by their supervisor pid. wait_forever stops them on SIGTERM.
+remember_app(Pid, App) when is_pid(Pid) ->
+    put(?APPS_KEY, [{Pid, App} | lists:keydelete(Pid, 1, apps())]),
+    nil.
+
+forget_app(Pid) when is_pid(Pid) ->
+    put(?APPS_KEY, lists:keydelete(Pid, 1, apps())),
+    nil.
+
+remembered_apps() ->
+    [App || {_Pid, App} <- apps()].
+
+apps() ->
+    case get(?APPS_KEY) of
+        undefined -> [];
+        Apps when is_list(Apps) -> Apps
+    end.
+
+is_linked(Pid) ->
+    {links, Links} = process_info(self(), links),
+    lists:member(Pid, Links).
+
+%% The exit message of a linked process this process (trapping exits) just
+%% stopped. INVARIANT: the caller checked the link before stopping it, so
+%% the message is certain to arrive; no timeout is needed.
+await_exit(Pid) ->
+    receive
+        {'EXIT', Pid, Reason} ->
+            iolist_to_binary(io_lib:format("~p", [Reason]))
     end.
 
 %% Generate a cryptographically secure secret key using crypto:strong_rand_bytes/1.

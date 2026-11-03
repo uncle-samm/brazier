@@ -308,6 +308,7 @@ the echo.
 | Code | Meaning |
 |------|---------|
 | 1000 | Normal close, pong timeout or idle timeout |
+| 1001 | Going away: the server is shutting down (`server shutting down`) |
 | 1002 | Protocol error (bad frame, bad close payload) |
 | 1003 | Binary data not supported |
 | 1005 | Reported for an empty close frame (never sent as a code) |

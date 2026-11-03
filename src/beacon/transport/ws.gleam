@@ -528,6 +528,9 @@ pub type SocketEvent {
   SocketError(reason: String)
   /// The session this socket is bound to was deleted, rotated or expired.
   SessionRevoked(session_id: String, reason: String)
+  /// The listener is stopping: its connection owner asked this connection
+  /// to drain. The handler closes with 1001 (going away).
+  ServerDraining
   /// Anything else — a framework bug; the handler closes with 1011.
   UnexpectedMessage(description: String)
 }

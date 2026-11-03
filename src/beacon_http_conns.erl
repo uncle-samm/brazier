@@ -20,11 +20,33 @@
 %% handler exits, this process emits [beacon, http, connection, closed]
 %% with the connection's lifetime as `duration` and a bounded `reason`:
 %% normal, shutdown, handoff_failed, crash or killed (see close_reason/1).
+%%
+%% DRAIN. When this process terminates in an orderly way (its listener is
+%% stopped, or restarted because an earlier child of the application tree
+%% restarted), the acceptors have already stopped: the listen socket is
+%% closed and no connection is added. terminate/2 then sends every handler
+%% {beacon_http_drain, self()} instead of an exit signal, and each handler
+%% finishes what it is doing (drain_requested/0, mark_draining/0):
+%%   * a WebSocket sends close 1001 (going away) and exits;
+%%   * an HTTP request in flight completes, its response says
+%%     `connection: close`, and the connection closes;
+%%   * an idle keep-alive connection closes at once;
+%%   * a handler still waiting for its socket exits.
+%% A drained handler exits with `shutdown`. terminate/2 waits for the 'EXIT'
+%% of every handler (event-driven, no polling) until the drain deadline,
+%% then kills the rest and logs how many it killed. The deadline is the
+%% listener's drain_timeout_ms (DrainMs); this process's own supervisor
+%% shutdown timeout leaves room for it.
+%%
+%% Reference (knowledge, not code read here): Plug.Cowboy.Drainer waits for
+%% the connection count to reach zero with a deadline; Cowboy's connection
+%% processes finish their current request when their parent exits.
 -behaviour(gen_server).
 
 -export([
-    new_name/0, start_link/6, start_link_gleam/6,
+    new_name/0, start_link/7, start_link_gleam/7,
     start_connection/2, release_self/0, release_pid/2,
+    drain_requested/0, mark_draining/0, is_drain_message/1, owner/0, owner_if_any/0,
     count_self/0, count/1, count_for_ip/2, count_for_ip_text/2, children/1,
     get_port/1, set_port/2, forget_port/1
 ]).
@@ -33,7 +55,7 @@
 
 -define(PDICT_KEY, '$beacon_http_conn').
 -define(SHOOT_TIMEOUT_MS, 5000).
--define(SHUTDOWN_GRACE_MS, 5000).
+-define(DRAINING_KEY, '$beacon_http_draining').
 
 %% Each listener gets one registered name so siblings in the supervision
 %% tree (the acceptors) can find the current conns process across restarts.
@@ -41,13 +63,13 @@
 new_name() ->
     list_to_atom("beacon_http_conns_" ++ integer_to_list(erlang:unique_integer([positive]))).
 
-start_link(Name, Port, Handler, MaxConns, MaxPerIp, TrustedCidrs) ->
+start_link(Name, Port, Handler, MaxConns, MaxPerIp, TrustedCidrs, DrainMs) ->
     gen_server:start_link({local, Name}, ?MODULE,
-                          {Port, Handler, MaxConns, MaxPerIp, TrustedCidrs}, []).
+                          {Port, Handler, MaxConns, MaxPerIp, TrustedCidrs, DrainMs}, []).
 
 %% Gleam supervision start shape: {ok, {started, Pid, Name}} | {error, StartError}.
-start_link_gleam(Name, Port, Handler, MaxConns, MaxPerIp, TrustedCidrs) ->
-    case start_link(Name, Port, Handler, MaxConns, MaxPerIp, TrustedCidrs) of
+start_link_gleam(Name, Port, Handler, MaxConns, MaxPerIp, TrustedCidrs, DrainMs) ->
+    case start_link(Name, Port, Handler, MaxConns, MaxPerIp, TrustedCidrs, DrainMs) of
         {ok, Pid} -> {ok, {started, Pid, Name}};
         {error, Reason} -> {error, {init_failed, format(Reason)}};
         ignore -> {error, {init_failed, <<"connection owner returned ignore">>}}
@@ -91,6 +113,60 @@ count_self() ->
             erlang:error(not_a_connection_process)
     end.
 
+%% Whether this handler's connection owner asked it to drain. Takes a
+%% waiting drain message from the mailbox without blocking and remembers it,
+%% so the answer stays true once the message is consumed. Must run inside a
+%% handler process.
+drain_requested() ->
+    case get(?DRAINING_KEY) of
+        true -> true;
+        undefined ->
+            {Conns, _Tid} = connection_context(),
+            receive
+                {beacon_http_drain, Conns} -> mark_draining(), true
+            after 0 -> false
+            end
+    end.
+
+%% Remember that the drain message was consumed (by a receive loop that
+%% classifies its own messages, such as a WebSocket's). The handler then
+%% exits with `shutdown`.
+mark_draining() ->
+    put(?DRAINING_KEY, true),
+    nil.
+
+%% Whether Msg is the drain message of this handler's connection owner.
+is_drain_message({beacon_http_drain, From}) ->
+    case get(?PDICT_KEY) of
+        {From, _Tid} -> true;
+        _ -> false
+    end;
+is_drain_message(_) ->
+    false.
+
+%% The connection owner of the calling handler: the sender of its drain
+%% message.
+owner() ->
+    {Conns, _Tid} = connection_context(),
+    Conns.
+
+%% The connection owner when the caller is a connection handler, `none`
+%% otherwise (a test reading from a socket of its own).
+owner_if_any() ->
+    case get(?PDICT_KEY) of
+        {Conns, _Tid} -> Conns;
+        undefined -> none
+    end.
+
+connection_context() ->
+    case get(?PDICT_KEY) of
+        {_Conns, _Tid} = Context -> Context;
+        undefined ->
+            beacon_log_ffi:error(<<"beacon.http_conns">>, "drain checked outside a connection process ~p",
+                                 [self()]),
+            erlang:error(not_a_connection_process)
+    end.
+
 %% Idempotent slot release. Returns true when this call released the slot.
 release_pid(Tid, Pid) ->
     case ets:take(Tid, {pid, Pid}) of
@@ -130,11 +206,12 @@ forget_port(Name) when is_atom(Name) ->
 
 %% --- gen_server ---
 
-init({Port, Handler, MaxConns, MaxPerIp, TrustedCidrs}) ->
+init({Port, Handler, MaxConns, MaxPerIp, TrustedCidrs, DrainMs}) ->
     process_flag(trap_exit, true),
     true = is_function(Handler, 1),
     true = is_integer(MaxConns) andalso MaxConns > 0,
     true = is_integer(MaxPerIp) andalso MaxPerIp > 0,
+    true = is_integer(DrainMs) andalso DrainMs >= 0,
     Tid = ets:new(beacon_http_conns, [set, public, {write_concurrency, true},
                                       {read_concurrency, true}]),
     true = is_integer(Port) andalso Port >= 0 andalso Port =< 65535,
@@ -142,10 +219,11 @@ init({Port, Handler, MaxConns, MaxPerIp, TrustedCidrs}) ->
     %% bound the first time (the configured port may be 0).
     BoundPort = persistent_term:get({?MODULE, bound_port, self_name()}, Port),
     true = ets:insert(Tid, [{global, 0}, {port, BoundPort}]),
-    beacon_log_ffi:info(<<"beacon.http_conns">>, "started port=~p max_connections=~p max_connections_per_ip=~p",
-                        [BoundPort, MaxConns, MaxPerIp]),
+    beacon_log_ffi:info(<<"beacon.http_conns">>,
+                        "started port=~p max_connections=~p max_connections_per_ip=~p drain_timeout_ms=~p",
+                        [BoundPort, MaxConns, MaxPerIp, DrainMs]),
     {ok, #{tid => Tid, handler => Handler, max => MaxConns, max_per_ip => MaxPerIp,
-           trusted => TrustedCidrs, children => #{}}}.
+           trusted => TrustedCidrs, drain_ms => DrainMs, children => #{}}}.
 
 handle_call({start_connection, Ip}, _From, State) ->
     #{tid := Tid, max := Max, max_per_ip := MaxPerIp, trusted := Trusted,
@@ -223,22 +301,36 @@ handle_info(Other, State) ->
     beacon_log_ffi:warning(<<"beacon.http_conns">>, "unexpected message ~p", [Other]),
     {noreply, State}.
 
-terminate(Reason, #{children := Children, tid := Tid}) ->
+terminate(Reason, #{children := Children, tid := Tid, drain_ms := DrainMs}) ->
     Pids = maps:keys(Children),
-    beacon_log_ffi:info(<<"beacon.http_conns">>, "terminating (~p), shutting down ~p connections",
-                        [Reason, length(Pids)]),
-    [exit(Pid, shutdown) || Pid <- Pids],
-    Remaining = await_exits(Children, Tid,
-                            erlang:monotonic_time(millisecond) + ?SHUTDOWN_GRACE_MS),
+    beacon_log_ffi:info(<<"beacon.http_conns">>,
+                        "terminating (~p), draining ~p connections for up to ~pms",
+                        [Reason, length(Pids), DrainMs]),
+    Started = erlang:monotonic_time(millisecond),
+    [Pid ! {beacon_http_drain, self()} || Pid <- Pids],
+    Remaining = await_exits(Children, Tid, Started + DrainMs),
     case maps:size(Remaining) of
-        0 -> ok;
+        0 ->
+            beacon_log_ffi:info(<<"beacon.http_conns">>, "drained ~p connections in ~pms",
+                                [length(Pids), erlang:monotonic_time(millisecond) - Started]);
         N ->
-            beacon_log_ffi:error(<<"beacon.http_conns">>, "~p connections ignored shutdown, killing", [N]),
-            maps:foreach(fun(Pid, StartedAt) ->
-                exit(Pid, kill),
-                emit_closed(StartedAt, <<"killed">>)
-            end, Remaining)
+            beacon_log_ffi:error(<<"beacon.http_conns">>,
+                                 "~p of ~p connections did not finish within the ~pms drain timeout, killing",
+                                 [N, length(Pids), DrainMs]),
+            kill_all(Remaining)
     end.
+
+%% Kill the handlers left after the deadline and wait for their 'EXIT' (a
+%% kill cannot be ignored), so no handler outlives this process.
+kill_all(Remaining) ->
+    maps:foreach(fun(Pid, _StartedAt) -> exit(Pid, kill) end, Remaining),
+    maps:foreach(fun(Pid, StartedAt) ->
+        receive
+            %% A handler that finished on its own after the deadline
+            %% reports its own reason; a killed one reports `killed`.
+            {'EXIT', Pid, Reason} -> emit_closed(StartedAt, close_reason(Reason))
+        end
+    end, Remaining).
 
 await_exits(Remaining, _Tid, _Deadline) when map_size(Remaining) =:= 0 ->
     Remaining;
@@ -282,7 +374,14 @@ connection_init(Conns, Tid, Handler) ->
     receive
         {beacon_http_shoot, Socket} ->
             _ = Handler(Socket),
-            ok;
+            case get(?DRAINING_KEY) of
+                true -> exit(shutdown);
+                undefined -> ok
+            end;
+        {beacon_http_drain, Conns} ->
+            beacon_log_ffi:info(<<"beacon.http_conns">>, "connection ~p drained before its socket arrived",
+                                [self()]),
+            exit(shutdown);
         {beacon_http_abort, Reason} ->
             beacon_log_ffi:warning(<<"beacon.http_conns">>, "connection ~p aborted before start: ~p",
                                    [self(), Reason]),

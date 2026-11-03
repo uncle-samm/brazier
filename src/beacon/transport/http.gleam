@@ -64,6 +64,9 @@ pub type HeadError {
   PeerClosed
   /// No byte of a new request arrived before the timeout.
   IdleTimeout
+  /// The listener is stopping and no request was in progress: the
+  /// connection closes instead of waiting for one.
+  Draining
   /// A request started but its head was not complete before the deadline.
   RequestTimeout
   /// The request line exceeded the configured limit.
@@ -104,7 +107,7 @@ pub fn read_request_head(
     }
     Error(err) -> {
       case err {
-        PeerClosed | IdleTimeout ->
+        PeerClosed | IdleTimeout | Draining ->
           log.debug(
             "beacon.http",
             "No request on connection: " <> get_head_error_message(err),
@@ -124,7 +127,7 @@ pub fn read_request_head(
 /// should just be closed (the peer left, was idle, or the socket broke).
 pub fn get_head_error_status(err: HeadError) -> Option(Int) {
   case err {
-    PeerClosed | IdleTimeout | SocketError(_) -> None
+    PeerClosed | IdleTimeout | Draining | SocketError(_) -> None
     RequestTimeout -> Some(408)
     RequestLineTooLong -> Some(414)
     HeadersTooLarge | TooManyHeaders -> Some(431)
@@ -139,6 +142,7 @@ pub fn get_head_error_message(err: HeadError) -> String {
   case err {
     PeerClosed -> "peer closed the connection"
     IdleTimeout -> "idle timeout"
+    Draining -> "server draining"
     RequestTimeout -> "request head timeout"
     RequestLineTooLong -> "request line too long"
     HeadersTooLarge -> "request header fields too large"

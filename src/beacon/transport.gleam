@@ -179,6 +179,15 @@ pub type SecurityLimits {
     /// Maximum time a blocked socket send may take before the connection
     /// is closed, in milliseconds. Default: 30000.
     send_timeout_ms: Int,
+    /// How long a stopping listener waits for its open connections to
+    /// finish, in milliseconds. When the listener stops, an idle keep-alive
+    /// connection closes at once, a request in progress is answered with
+    /// `connection: close`, and a WebSocket is closed with 1001. A
+    /// connection still open after this long is killed (and logged as an
+    /// error). `0` kills every connection at once. The environment variable
+    /// `BEACON_SHUTDOWN_TIMEOUT` overrides it for an application. Default:
+    /// 5000.
+    drain_timeout_ms: Int,
     /// Reverse proxies (IP addresses or CIDRs) whose X-Forwarded-For and
     /// Forwarded headers are believed. Empty means the socket peer address
     /// is always the client address. Default: [].
@@ -240,6 +249,7 @@ pub fn default_security_limits() -> SecurityLimits {
     keepalive_idle_timeout_ms: 15_000,
     max_keepalive_requests: 1000,
     send_timeout_ms: 30_000,
+    drain_timeout_ms: 5000,
     trusted_proxies: [],
     max_ws_connections_per_ip: 100,
     ws_ping_interval_ms: 30_000,
@@ -257,9 +267,27 @@ pub fn default_security_limits() -> SecurityLimits {
 /// Largest delay `erlang:send_after/3` accepts (2^32 - 1 ms).
 const max_timer_ms = 4_294_967_295
 
+/// A drain timeout is a receive timeout: 0 (kill at once) up to the largest
+/// timer.
+pub fn validate_drain_timeout(ms: Int) -> Result(Nil, String) {
+  case ms >= 0 && ms <= max_timer_ms {
+    True -> Ok(Nil)
+    False -> {
+      let reason =
+        "drain_timeout_ms must be in 0.."
+        <> int.to_string(max_timer_ms)
+        <> "ms, got "
+        <> int.to_string(ms)
+      log.warning("beacon.transport", "Refusing drain timeout: " <> reason)
+      Error(reason)
+    }
+  }
+}
+
 /// Validate security limits. Every count, size and interval must be
 /// positive (the two abuse thresholds may be 0, meaning "first offence
-/// closes", and `max_body_bytes` may be 0, meaning "no request bodies"),
+/// closes", `max_body_bytes` may be 0, meaning "no request bodies", and
+/// `drain_timeout_ms` may be 0, meaning "kill connections at once"),
 /// timer intervals must fit `erlang:send_after/3`, and every allowed origin
 /// must be a bare `scheme://host[:port]` origin.
 pub fn validate_security_limits(limits: SecurityLimits) -> Result(Nil, String) {
@@ -325,6 +353,7 @@ pub fn validate_security_limits(limits: SecurityLimits) -> Result(Nil, String) {
         }
       }),
     )
+    use _ <- result.try(validate_drain_timeout(limits.drain_timeout_ms))
     // HTTP limits: a typo in the proxy list must never silently change who
     // is trusted.
     use _ <- result.try(
@@ -1426,6 +1455,17 @@ fn handle_socket_event(state: ConnectionState, event: ws.SocketEvent) -> Next {
         state,
         SendClose(ws.close_auth_revoked, "session revoked"),
         "session " <> reason,
+      )
+    }
+    ws.ServerDraining -> {
+      log.info(
+        "beacon.transport",
+        "Listener is stopping, closing " <> ctx(state) <> " with 1001",
+      )
+      Stop(
+        state,
+        SendClose(ws.close_going_away, "server shutting down"),
+        "server draining",
       )
     }
     ws.UnexpectedMessage(description) -> {
@@ -2777,9 +2817,25 @@ fn decide_keep_alive(
       )
       False
     }
-    True, False, transport_http.BodyConsumed, False -> True
+    True, False, transport_http.BodyConsumed, False ->
+      case drain_requested() {
+        True -> {
+          log.info(
+            "beacon.transport",
+            "Closing connection after this response: the listener is stopping",
+          )
+          False
+        }
+        False -> True
+      }
   }
 }
+
+/// Whether the listener asked this connection to drain (see
+/// `beacon_http_conns`). Runs only in a connection handler, as
+/// `serve_requests` does.
+@external(erlang, "beacon_http_conns", "drain_requested")
+fn drain_requested() -> Bool
 
 /// `OPTIONS *` (RFC 9110 9.3.7) asks about the server as a whole.
 fn asterisk_options_response(
@@ -3075,6 +3131,7 @@ pub fn to_listener_options(config: TransportConfig) -> server.ListenerOptions {
     max_connections_per_ip: limits.max_connections_per_ip,
     trusted_proxies: limits.trusted_proxies,
     send_timeout_ms: limits.send_timeout_ms,
+    drain_timeout_ms: limits.drain_timeout_ms,
   )
 }
 
