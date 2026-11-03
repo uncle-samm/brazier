@@ -229,6 +229,25 @@ If a failure shows `eaddrinuse`, first check for a concurrent run
 (`pgrep -f "gleam test"`, `pgrep -f test_all_cdp.py`) before treating it
 as a flake.
 
+**Known failure: a listener restart can hit `eaddrinuse`.** This is a
+source bug, not a test fault. `beacon_http_acceptors_sup` owns the listen
+socket and never closes it, so the runtime closes it when the process
+exits. With acceptors blocked in `accept`, that close can land after the
+parent supervisor has seen the exit and restarted the listener on the
+same port.
+
+- A standalone reproduction (no Beacon code: owner, 10 acceptors in
+  `accept`, stop, rebind on `DOWN`) failed 366 and 376 of 20000 rebinds
+  under 8 busy loops.
+- With an explicit `gen_tcp:close` before the owner exits, it failed 0
+  of 20000.
+- In the suite, the failed restart counts against the restart tolerance.
+  `app_tree_test`'s `wait_forever_crashes_when_the_tree_gives_up_test_`
+  then fails with an rpc `which_children` error, because the tree gave up
+  one crash early (1 of 5 flake runs, 2026-11-03).
+- The fix belongs in `src`: close the socket synchronously before the
+  owner exits.
+
 ## Example and CDP tests (browser)
 
 End-to-end tests run every example in Chrome through the Chrome DevTools
