@@ -1,11 +1,22 @@
-import auth_workspace/app
+/// Auth Workspace: cookie sessions, CSRF-protected API routes and a
+/// role-gated admin page.
+///
+/// - `POST /api/login` creates a session (rotating any previous id) and sets
+///   the HttpOnly session cookie; `POST /api/logout` deletes it.
+/// - `init` reads that cookie from the `Context`, on the HTML render and on
+///   the connected mount, and loads the account from the session store.
+/// - The WebSocket is refused without a valid session (`auth.protect_ws`).
+/// - The session id, the audit key and the audit trail stay in the
+///   server-only `Session` record; `sync` sends only the Model.
+import auth_workspace/app.{type Model, type Msg}
 import beacon
 import beacon/api
 import beacon/auth
 import beacon/cookie
-import beacon/effect
+import beacon/effect.{type Effect}
+import beacon/local
 import beacon/log
-import beacon/route
+import beacon/router
 import beacon/session
 import beacon/transport/server.{type Connection, type ResponseBody}
 import gleam/dict
@@ -16,103 +27,306 @@ import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/string
+import gleam/uri.{type Uri}
+
+const audit_key = "server-only-audit-key"
+
+/// The session keeps the newest audit entries up to this many.
+const max_audit_entries = 100
+
+const max_display_name_length = 80
+
+const role_key = "role"
+
+const display_name_key = "display_name"
+
+/// What the server holds per browser session. Only `model` is synced.
+pub type Session {
+  Session(
+    model: Model,
+    store: session.SessionStore,
+    /// The id of the signed-in session; `None` for a guest.
+    session_id: Option(String),
+    audit_key: String,
+    /// Newest first, at most `max_audit_entries`.
+    audit_entries: List(String),
+    denied_admin_events: Int,
+  )
+}
 
 pub fn main() {
   let store = session.new_store("auth_workspace_sessions")
   let auth_config = auth.dev_session_config()
 
-  beacon.app(
-    fn() { #(app.init(), effect.none()) },
-    beacon.no_local,
-    app.init_server,
-    update,
-    view,
+  beacon.full_application(
+    init: fn(ctx) { init(store, auth_config, ctx) },
+    update:,
+    sync:,
+    local: local.none(),
+    view: app.view,
   )
-  |> beacon.title("Auth Workspace")
+  |> beacon.with_router(parse: parse_route, on_change: app.RouteChanged)
+  |> beacon.title(fn(_model) { "Auth Workspace" })
   |> beacon.secret_key("auth-workspace-session-secret-key-32-chars")
-  |> beacon.route_pages(auth_pages())
   |> beacon.api_routes(api_handler(store, auth_config))
   |> beacon.ws_auth(auth.protect_ws(store, auth_config))
-  |> beacon.ws_init(init_from_request(store, auth_config))
   |> beacon.dev_mode(True)
   |> beacon.start(8080)
 }
 
-fn auth_pages() -> List(route.Page(#(app.Model, Nil, app.Server), app.Msg)) {
-  [
-    auth_page("/"),
-    auth_page("/login"),
-    auth_page("/app"),
-    auth_page("/settings"),
-    auth_page("/admin"),
-  ]
+fn parse_route(uri: Uri) -> Result(app.Route, Nil) {
+  app.parse_route(router.segments(uri))
 }
 
-fn auth_page(
-  pattern: String,
-) -> route.Page(#(app.Model, Nil, app.Server), app.Msg) {
-  route.page(
-    pattern,
-    fn(r: route.Route) { app.RouteChanged(r.path) },
-    fn(state: #(app.Model, Nil, app.Server), _route) {
-      let #(model, _local, _server) = state
-      app.view(model, Nil)
-    },
+// ===== Session lifecycle =====
+
+/// Load the account named by the session cookie. A missing, unknown or
+/// expired session is a guest. A store that cannot answer crashes the
+/// request (the HTML render answers 500, the mount is refused) rather than
+/// show a signed-in user the guest page.
+fn init(
+  store: session.SessionStore,
+  config: auth.SessionConfig,
+  ctx: beacon.Context,
+) -> #(Session, Effect(Msg)) {
+  let guest =
+    Session(
+      model: app.guest_model(),
+      store:,
+      session_id: None,
+      audit_key:,
+      audit_entries: [],
+      denied_admin_events: 0,
+    )
+  case beacon.cookie(ctx, config.cookie_name) {
+    Error(Nil) -> {
+      log.debug("auth_workspace", "No session cookie; rendering the guest page")
+      #(guest, effect.none())
+    }
+    Ok(id) -> {
+      let fetched = session.fetch(store, id)
+      case fetched {
+        Ok(sess) -> #(restore(guest, sess, ctx), effect.none())
+        Error(session.SessionNotFound) | Error(session.SessionExpired) -> {
+          log.info(
+            "auth_workspace",
+            "Session cookie names no live session; rendering the guest page",
+          )
+          #(guest, effect.none())
+        }
+        Error(err) -> {
+          log.error(
+            "auth_workspace",
+            "Session store unavailable while loading the account ("
+              <> session.store_error_to_string(err)
+              <> "); crashing the request",
+          )
+          #(restore(guest, crash_unless_fetched(fetched), ctx), effect.none())
+        }
+      }
+    }
+  }
+}
+
+/// `init` has no error channel: a store that cannot answer crashes the
+/// request, as `auth.init_from_session` does. The caller logs the reason.
+fn crash_unless_fetched(
+  fetched: Result(session.Session, session.SessionStoreError),
+) -> session.Session {
+  let assert Ok(sess) = fetched
+    as "auth_workspace init: session store unavailable (logged above)"
+  sess
+}
+
+fn restore(
+  guest: Session,
+  sess: session.Session,
+  ctx: beacon.Context,
+) -> Session {
+  let account = account_from_session(sess)
+  log.info(
+    "auth_workspace",
+    "Session restored for "
+      <> account.user
+      <> " (connected: "
+      <> string.inspect(beacon.is_connected(ctx))
+      <> ")",
+  )
+  Session(
+    ..guest,
+    model: app.signed_in_model(account),
+    session_id: Some(sess.id),
+    audit_entries: ["session-restored"],
   )
 }
 
-fn view(model: app.Model, _local: Nil) -> beacon.Node(app.Msg) {
-  app.view(model, Nil)
+/// Every session this app hands out was written by `handle_login`, which
+/// stores the user, role, display name and CSRF token before the cookie is
+/// sent. A session without them was not written by this app: crash.
+fn account_from_session(sess: session.Session) -> app.Account {
+  let user = required_value(sess, "user_id")
+  let role_value = required_value(sess, role_key)
+  let assert Ok(role) = app.parse_role(role_value)
+    as "auth_workspace: handle_login only stores the roles app.parse_role reads"
+  app.Account(
+    user:,
+    role:,
+    display_name: required_value(sess, display_name_key),
+    csrf_token: required_value(sess, "csrf_token"),
+  )
 }
 
-fn update(
-  model: app.Model,
-  _local: Nil,
-  server: app.Server,
-  msg: app.Msg,
-) -> #(app.Model, Nil, app.Server) {
-  case msg {
-    app.RefreshSession -> {
-      let audit_count = list.length(server.audit_entries)
-      #(
-        app.Model(
+fn required_value(sess: session.Session, key: String) -> String {
+  let value = session.get_value(sess, key)
+  case value {
+    Some(_) -> Nil
+    None ->
+      log.error(
+        "auth_workspace",
+        "Session is missing \"" <> key <> "\", which handle_login always writes",
+      )
+  }
+  let assert Some(value) = value
+    as "auth_workspace: a session without a field handle_login writes (logged above)"
+  value
+}
+
+// ===== Update =====
+
+fn update(state: Session, msg: Msg) -> #(Session, Effect(Msg)) {
+  let model = state.model
+  let state = case msg, model.viewer {
+    app.RouteChanged(route), _ ->
+      Session(..state, model: app.Model(..model, route:))
+
+    // Only a signed-in page has these controls; a guest's socket is refused
+    // by `protect_ws`, so reaching here means a forged event.
+    _, app.Guest -> {
+      log.warning(
+        "auth_workspace",
+        "Ignoring " <> string.inspect(msg) <> " from a guest session",
+      )
+      state
+    }
+
+    app.SetDisplayName(name), app.SignedIn(account) ->
+      case string.length(name) > max_display_name_length {
+        True -> {
+          log.warning(
+            "auth_workspace",
+            "Refusing a display name of "
+              <> int.to_string(string.length(name))
+              <> " characters (limit "
+              <> int.to_string(max_display_name_length)
+              <> ")",
+          )
+          state
+        }
+        False ->
+          signed_in(state, app.Account(..account, display_name: name), model)
+      }
+
+    app.SaveProfile, app.SignedIn(account) -> save_profile(state, account)
+
+    app.RefreshSession, app.SignedIn(account) ->
+      Session(
+        ..audit(state, "refresh-session"),
+        model: app.Model(
           ..model,
-          status: "Session "
-            <> server.session_id
+          status: "Session for "
+            <> account.user
             <> " has "
-            <> int.to_string(audit_count)
+            <> int.to_string(list.length(state.audit_entries))
             <> " private audit entries",
         ),
-        Nil,
-        app.Server(..server, audit_entries: [
-          "refresh-session",
-          ..server.audit_entries
-        ]),
+      )
+
+    app.AdminAudit, app.SignedIn(account) ->
+      case account.role {
+        app.Admin -> {
+          log.info("auth_workspace", "Admin audit event by " <> account.user)
+          Session(
+            ..audit(state, "admin-audit"),
+            model: app.Model(
+              ..model,
+              admin_events: model.admin_events + 1,
+              status: "Admin audit event recorded",
+            ),
+          )
+        }
+        app.Member -> {
+          log.warning(
+            "auth_workspace",
+            "Refused an admin audit event from " <> account.user,
+          )
+          Session(
+            ..state,
+            denied_admin_events: state.denied_admin_events + 1,
+            model: app.Model(..model, status: "Admin action denied"),
+          )
+        }
+      }
+  }
+  #(state, effect.none())
+}
+
+fn signed_in(state: Session, account: app.Account, model: Model) -> Session {
+  Session(..state, model: app.Model(..model, viewer: app.SignedIn(account)))
+}
+
+/// Persist the display name in the session store, so the next page load
+/// shows it too.
+fn save_profile(state: Session, account: app.Account) -> Session {
+  let model = state.model
+  let assert Some(id) = state.session_id
+    as "auth_workspace: a SignedIn model is only built with its session id"
+  let write =
+    session.update(state.store, id, fn(data) {
+      dict.insert(data, display_name_key, account.display_name)
+    })
+  case write {
+    Ok(_sess) -> {
+      log.info("auth_workspace", "Saved the profile of " <> account.user)
+      Session(
+        ..audit(state, "save-profile"),
+        model: app.Model(
+          ..model,
+          saved_profiles: model.saved_profiles + 1,
+          status: "Profile saved for " <> account.display_name,
+        ),
       )
     }
-    app.AdminAudit -> {
-      case model.role == "admin" {
-        True -> #(
-          app.update_model(model, msg),
-          Nil,
-          app.Server(..server, audit_entries: [
-            "admin-audit",
-            ..server.audit_entries
-          ]),
-        )
-        False -> #(
-          app.update_model(model, msg),
-          Nil,
-          app.Server(
-            ..server,
-            denied_admin_events: server.denied_admin_events + 1,
-          ),
-        )
-      }
+    Error(err) -> {
+      log.warning(
+        "auth_workspace",
+        "Profile of "
+          <> account.user
+          <> " not saved: "
+          <> session.store_error_to_string(err),
+      )
+      Session(
+        ..state,
+        model: app.Model(
+          ..model,
+          status: "Profile not saved: the session is no longer available",
+        ),
+      )
     }
-    _ -> #(app.update_model(model, msg), Nil, server)
   }
 }
+
+fn audit(state: Session, entry: String) -> Session {
+  Session(
+    ..state,
+    audit_entries: list.take([entry, ..state.audit_entries], max_audit_entries),
+  )
+}
+
+fn sync(state: Session) -> Model {
+  state.model
+}
+
+// ===== API routes =====
 
 fn api_handler(
   store: session.SessionStore,
@@ -123,37 +337,17 @@ fn api_handler(
     api.get("/api/me", auth.protect_api(store, config, handle_me)),
     api.post(
       "/api/profile",
-      auth.protect_api_with_csrf(store, config, fn(req, sess, user_id) {
-        handle_profile(req, store, sess, user_id)
+      auth.protect_api_with_csrf(store, config, fn(req, sess, _user_id) {
+        handle_profile(req, store, sess)
       }),
     ),
     api.post(
       "/api/logout",
-      auth.protect_api_with_csrf(store, config, fn(_req, sess, _user_id) {
-        case
-          auth.logout_response(store, sess, api.text(200, "Logged out"), config)
-        {
-          Ok(resp) -> resp
-          Error(error) -> cookie_failure("Logout", error)
-        }
+      auth.protect_api_with_csrf(store, config, fn(_req, sess, user_id) {
+        handle_logout(store, sess, user_id, config)
       }),
     ),
   ])
-}
-
-/// The session cookie config was refused (see `cookie.validate`): log it
-/// and answer 500 rather than send a broken Set-Cookie header.
-fn cookie_failure(
-  action: String,
-  error: cookie.CookieError,
-) -> response.Response(ResponseBody) {
-  log.error(
-    "auth_workspace",
-    action
-      <> " cannot set the session cookie: "
-      <> cookie.error_to_string(error),
-  )
-  api.text(500, "Internal Server Error")
 }
 
 fn handle_login(
@@ -162,65 +356,150 @@ fn handle_login(
   config: auth.SessionConfig,
 ) -> response.Response(ResponseBody) {
   case api.read_form(req, 4096) {
-    Ok(fields) -> {
+    Error(reason) -> {
+      log.warning("auth_workspace", "Login form rejected: " <> reason)
+      api.text(400, reason)
+    }
+    Ok(fields) ->
       case api.form_field(fields, "csrf"), api.form_field(fields, "username") {
-        Ok(csrf), Ok(username) if csrf == app.login_csrf_token -> {
-          let safe_user = normalize_user(username)
-          // Rotate: any session id the browser already had is deleted so it
-          // cannot be fixed by an attacker and replayed after login.
-          let old_id =
-            option.from_result(session.id_from_request(req, config.cookie_name))
-          let login = auth.create_login_rotating(store, old_id, safe_user)
-          let result =
-            session.update(store, login.session.id, fn(data) {
-              data
-              |> dict.insert("role", role_for_user(safe_user))
-              |> dict.insert("display_name", display_name_for_user(safe_user))
-            })
-          case result {
-            Ok(sess) -> {
-              let resp =
-                api.json_value(
-                  200,
-                  json.object([
-                    #("ok", json.bool(True)),
-                    #("csrf", json.string(login.csrf_token)),
-                  ]),
-                )
-                |> auth.with_session_cookie(sess, config)
-              case resp {
-                Ok(resp) -> resp
-                Error(error) -> cookie_failure("Login", error)
-              }
+        Ok(csrf), Ok(username) ->
+          case session.secure_compare(csrf, app.login_csrf_token) {
+            True -> start_session(req, store, config, normalize_user(username))
+            False -> refuse_login_csrf()
+          }
+        _, _ -> refuse_login_csrf()
+      }
+  }
+}
+
+fn refuse_login_csrf() -> response.Response(ResponseBody) {
+  log.warning("auth_workspace", "Login refused: missing or wrong CSRF field")
+  api.text(403, "Invalid login CSRF token")
+}
+
+fn start_session(
+  req: Request(Connection),
+  store: session.SessionStore,
+  config: auth.SessionConfig,
+  user: String,
+) -> response.Response(ResponseBody) {
+  // Rotate: any session id the browser already had is deleted so it cannot
+  // be fixed by an attacker and replayed after login.
+  let old_id =
+    option.from_result(session.id_from_request(req, config.cookie_name))
+  case auth.create_login_rotating(store, old_id, user) {
+    Error(err) -> {
+      log.error(
+        "auth_workspace",
+        "Login of " <> user <> " failed: " <> auth.error_to_string(err),
+      )
+      login_store_failure(err)
+    }
+    Ok(login) -> {
+      let profile =
+        session.update(store, login.session.id, fn(data) {
+          data
+          |> dict.insert(role_key, app.role_label(role_for_user(user)))
+          |> dict.insert(display_name_key, display_name_for_user(user))
+        })
+      case profile {
+        Error(err) -> {
+          log.error(
+            "auth_workspace",
+            "Login of "
+              <> user
+              <> " failed writing the profile: "
+              <> session.store_error_to_string(err),
+          )
+          api.text(503, "Session store unavailable")
+        }
+        Ok(sess) -> {
+          let resp =
+            api.json_value(
+              200,
+              json.object([
+                #("ok", json.bool(True)),
+                #("csrf", json.string(login.csrf_token)),
+              ]),
+            )
+            |> auth.with_session_cookie(sess, config)
+          case resp {
+            Ok(resp) -> {
+              log.info("auth_workspace", "Signed in " <> user)
+              resp
             }
             Error(err) -> {
               log.error(
                 "auth_workspace",
-                "Login profile write failed: "
-                  <> session.store_error_to_string(err),
+                "Login cannot set the session cookie: "
+                  <> cookie.error_to_string(err),
               )
-              api.text(500, "Login failed")
+              api.text(500, "Internal Server Error")
             }
           }
         }
-        _, _ -> api.text(403, "Invalid login CSRF token")
       }
     }
-    Error(reason) -> api.text(400, reason)
+  }
+}
+
+/// `create_login_rotating` only fails when the store cannot delete the old
+/// session or create the new one.
+fn login_store_failure(
+  err: auth.SessionError,
+) -> response.Response(ResponseBody) {
+  case err {
+    auth.SessionStoreUnavailable(_) ->
+      api.text(503, "Session store unavailable")
+    auth.InvalidSession
+    | auth.MissingSessionCookie
+    | auth.MissingUser
+    | auth.MissingCsrfToken
+    | auth.InvalidCsrfToken -> api.text(500, "Login failed")
+  }
+}
+
+fn handle_logout(
+  store: session.SessionStore,
+  sess: session.Session,
+  user: String,
+  config: auth.SessionConfig,
+) -> response.Response(ResponseBody) {
+  case auth.logout_response(store, sess, api.text(200, "Logged out"), config) {
+    Ok(resp) -> {
+      log.info("auth_workspace", "Signed out " <> user)
+      resp
+    }
+    Error(err) -> {
+      log.error(
+        "auth_workspace",
+        "Logout of "
+          <> user
+          <> " failed: "
+          <> auth.response_error_to_string(err),
+      )
+      case err {
+        // The session may still exist: keep the cookie so the browser does
+        // not believe it signed out.
+        auth.StoreFailed(_) -> api.text(503, "Session store unavailable")
+        auth.CookieRejected(_) -> api.text(500, "Internal Server Error")
+      }
+    }
   }
 }
 
 fn handle_me(
   _req: Request(Connection),
   sess: session.Session,
-  user: String,
+  _user: String,
 ) -> response.Response(ResponseBody) {
-  let role = session_value(sess, "role", "user")
+  let account = account_from_session(sess)
   api.json_value(
     200,
     json.object([
-      #("user", json.string(user)),
-      #("role", json.string(role)),
+      #("user", json.string(account.user)),
+      #("role", json.string(app.role_label(account.role))),
+      #("display_name", json.string(account.display_name)),
     ]),
   )
 }
@@ -229,68 +508,30 @@ fn handle_profile(
   req: Request(Connection),
   store: session.SessionStore,
   sess: session.Session,
-  _user_id: String,
 ) -> response.Response(ResponseBody) {
   case api.read_form(req, 4096) {
     Error(reason) -> api.text(400, reason)
-    Ok(fields) -> {
-      case api.form_field(fields, "display_name") {
-        Ok(display_name) ->
-          case session.set(store, sess, "display_name", display_name) {
-            Ok(_sess) ->
-              api.json_value(200, json.object([#("ok", json.bool(True))]))
-            Error(err) -> {
-              log.warning(
-                "auth_workspace",
-                "Profile write rejected: " <> session.store_error_to_string(err),
-              )
-              api.text(401, "Session expired")
-            }
-          }
+    Ok(fields) ->
+      case api.form_field(fields, display_name_key) {
         Error(reason) -> api.text(400, reason)
+        Ok(name) ->
+          case string.length(name) > max_display_name_length {
+            True -> api.text(400, "Display name too long")
+            False ->
+              case session.set(store, sess, display_name_key, name) {
+                Ok(_sess) ->
+                  api.json_value(200, json.object([#("ok", json.bool(True))]))
+                Error(err) -> {
+                  log.warning(
+                    "auth_workspace",
+                    "Profile write rejected: "
+                      <> session.store_error_to_string(err),
+                  )
+                  api.text(401, "Session expired")
+                }
+              }
+          }
       }
-    }
-  }
-}
-
-fn init_from_request(
-  store: session.SessionStore,
-  config: auth.SessionConfig,
-) -> fn(Request(Connection)) -> #(app.Model, Nil, app.Server) {
-  auth.init_from_session(
-    store,
-    config,
-    fn(req) {
-      #(app.Model(..app.init(), route: req.path), Nil, app.init_server())
-    },
-    fn(req, sess, _user_id) {
-      let user = session_value(sess, "user_id", "")
-      let role = session_value(sess, "role", "user")
-      let display_name = session_value(sess, "display_name", user)
-      let csrf_token = session_value(sess, "csrf_token", "")
-      #(
-        app.authenticated_model(req.path, user, role, display_name, csrf_token),
-        Nil,
-        app.Server(
-          session_id: sess.id,
-          csrf_token: csrf_token,
-          private_audit_key: "server-only-audit-key",
-          audit_entries: ["session-restored"],
-          denied_admin_events: 0,
-        ),
-      )
-    },
-  )
-}
-
-fn session_value(
-  sess: session.Session,
-  key: String,
-  default: String,
-) -> String {
-  case session.get_value(sess, key) {
-    Some(value) -> value
-    None -> default
   }
 }
 
@@ -301,10 +542,10 @@ fn normalize_user(username: String) -> String {
   }
 }
 
-fn role_for_user(username: String) -> String {
+fn role_for_user(username: String) -> app.Role {
   case username {
-    "ada" -> "admin"
-    _ -> "user"
+    "ada" -> app.Admin
+    _ -> app.Member
   }
 }
 
