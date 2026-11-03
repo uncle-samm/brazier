@@ -28,8 +28,10 @@ pub type Msg {
   ToggleMenu
 }
 
-fn init(_ctx: beacon.Context) -> #(Model, Effect(Msg)) {
-  #(Model(count: 0), effect.none())
+fn init(
+  _ctx: beacon.Context,
+) -> Result(#(Model, Effect(Msg)), beacon.InitError) {
+  Ok(#(Model(count: 0), effect.none()))
 }
 
 pub fn init_local(_model: Model) -> Local {
@@ -38,7 +40,11 @@ pub fn init_local(_model: Model) -> Local {
 
 /// Runs in the browser. Local messages are handled here and never reach the
 /// server; the counter messages are forwarded to `update`.
-pub fn update_local(_model: Model, local: Local, msg: Msg) -> local.Update(Local) {
+pub fn update_local(
+  _model: Model,
+  local: Local,
+  msg: Msg,
+) -> local.Update(Local) {
   case msg {
     SetInput(text) -> local.handled(Local(..local, input: text))
     ToggleMenu -> local.handled(Local(..local, menu_open: !local.menu_open))

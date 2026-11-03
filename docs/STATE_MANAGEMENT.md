@@ -1,44 +1,81 @@
 # State Management
 
-Each Beacon session has three state layers, plus cross-user stores:
+A Beacon session keeps its state in up to three layers, and sessions share
+state through stores and PubSub:
 
-- **Model** — server-authoritative UI state. Synced to the client and drives
-  the rendered view.
-- **Local** — client-only, per-tab state. Lives in the browser, is never sent
-  to the server, and costs zero network traffic.
-- **Server** — private, per-session state. Lives on the server only and is
-  never serialized to the client.
-- **Shared stores** — cross-user state shared by all connections (see below).
+- **Model**: what the browser sees. The server sends it to the browser, and
+  `view` renders it.
+- **Server state**: the session's full state, which stays on the server.
+  With `full_application` it can be larger than the model; `sync(state)`
+  chooses the model.
+- **Local state**: per-tab state in the browser, never sent to the server.
+- **Stores, PubSub and presence**: state shared by every session (see
+  below).
 
-`update` always receives `(model, local, server, msg)` and returns
-`#(model, local, server)`.
+Pick the constructor by the layers the app needs (the full table is in
+[GETTING_STARTED.md](GETTING_STARTED.md#three-constructors)):
+
+| Constructor | Server state | Local state |
+|---|---|---|
+| `beacon.simple(init:, update:, view:)` | The model itself | None |
+| `beacon.application(init:, update:, view:)` | The model itself | None |
+| `beacon.full_application(init:, update:, sync:, local:, view:)` | Any `state`; `sync` derives the model | `local.layer(..)` or `local.none()` |
 
 ## Model (Server-Authoritative)
 
-Each browser tab gets its own BEAM process holding the Model. Updates go
-through the server, which re-renders and syncs the Model to the client.
+Each browser tab gets its own BEAM process holding the session's state.
+Events go to the server, which runs `update`, re-renders and sends the
+browser what changed. With `simple` the browser also runs `update` at once,
+and the server's model wins when the two differ.
 
 ```gleam
-beacon.app(init, beacon.no_local, beacon.no_server, update, view) |> beacon.start(8080)
-```
-
-## Local State (Zero Traffic)
-
-Split state into Model (server-synced) and Local (instant, no network).
-Messages that only change Local run in the browser with no round trip.
-
-```gleam
-beacon.app(init, init_local, beacon.no_server, update, view) |> beacon.start(8080)
+beacon.application(init:, update:, view:)
+|> beacon.start(8080)
 ```
 
 ## Server State (Private)
 
-Per-session state that stays on the server and is never sent to the client —
-use it for secrets, tokens, and bookkeeping the browser must not see.
+With `full_application`, `update` works on a `state` that the browser never
+sees. `sync(state) -> model` runs after every update and chooses what is
+sent; secrets, tokens and bookkeeping stay in the state.
 
 ```gleam
-beacon.app(init, beacon.no_local, init_server, update, view) |> beacon.start(8080)
+pub type Session {
+  Session(model: Model, api_key: String)
+}
+
+fn sync(session: Session) -> Model {
+  session.model
+}
+
+beacon.full_application(init:, update:, sync:, local: local.none(), view:)
+|> beacon.start(8080)
 ```
+
+After a reconnect to a new server process, `beacon.with_state_recovery(restore:)`
+rebuilds the state: the page carries the model in its signed join token, and
+`restore(model)` returns the state. Anything that is not in the model must
+be rebuilt or reloaded by `restore`.
+
+## Local State (Zero Traffic)
+
+`local.layer(init:, update:)` adds state that lives only in the browser.
+Its `update` runs in the browser for every event: `local.handled(local)`
+keeps the message in the browser (no traffic), and `local.forward(local)`
+also sends it to the server. `view` receives the model and the local state.
+
+```gleam
+beacon.full_application(
+  init:,
+  update:,
+  sync:,
+  local: local.layer(init: init_local, update: update_local),
+  view:,
+)
+|> beacon.start(8080)
+```
+
+`examples/counter_local` is a complete app with a local layer.
 
 ## Shared State (Store)
 
@@ -102,11 +139,14 @@ Mutations broadcast `Nil` on the store's topic. Subscribe to it with
 ```gleam
 let messages = store.new_list("messages")
 
-beacon.app(init, beacon.no_local, beacon.no_server, update, view)
+beacon.application(init:, update:, view:)
 |> beacon.subscriptions(fn(_model) { [store.list_topic(messages)] })
 |> beacon.on_notify(fn(_topic) { MessagesChanged })
 |> beacon.start(8080)
 ```
+
+Write to a store from an effect, so the write runs on the server and never
+in the browser's copy of `update`.
 
 ### Replicated stores
 
@@ -173,39 +213,43 @@ pubsub.unsubscribe("chat:lobby")
 
 ## Dynamic Subscriptions
 
-Subscribe to topics derived from the model. The framework diffs subscriptions after each update.
+`beacon.subscriptions(fn(state) -> List(String))` computes the session's
+topics from its state after every update. Beacon diffs the list against the
+previous one and subscribes or unsubscribes as needed.
 
 ```gleam
-beacon.app(init, beacon.no_local, beacon.no_server, update, view)
+beacon.application(init:, update:, view:)
 |> beacon.subscriptions(fn(model) { ["room:" <> model.current_room] })
 |> beacon.on_notify(fn(topic) { RoomUpdated(topic) })
 |> beacon.start(8080)
 ```
 
-When `model.current_room` changes, the old topic is unsubscribed and the new one subscribed automatically.
+When `model.current_room` changes, the old topic is unsubscribed and the
+new one subscribed.
 
-## Computed Fields
+- `beacon.on_notify(fn(topic) -> msg)` turns every notification into a
+  message, by topic.
+- `beacon.broadcast(topic)` notifies subscribers without a store write.
+- `beacon.broadcast_payload(topic, payload)` sends a value with the
+  notification. Read it with `beacon.on_notification(fn(Notification) ->
+  msg)` and `beacon.notification_payload(notification, decoder)`, which
+  returns an `Error` when the payload does not decode.
 
-Public functions with the signature `fn(Model) -> T` are automatically detected as computed fields. Their values are calculated server-side on each update and included in `model_sync` messages sent to the client.
+## Presence
 
-- Computed values are derived, never stored — recalculated after every model change
-- Supported return types: `Int`, `String`, `Float`, `Bool`
-- No attribute needed — detection is by function signature
-
-```gleam
-pub fn total(model: Model) -> Int {
-  model.price * model.qty
-}
-```
-
-The client receives `total` alongside the model fields, but it is never part of the `Model` type itself.
+`beacon.presence(tracker:, track:, on_presence:)` tracks which sessions are
+on a topic, on every node, from each session's state. Every join and leave
+arrives as an `on_presence(diff)` message, and `sync.merge` (from
+`beacon/presence/sync`) applies it to the list the session keeps. See
+[CLUSTERING.md](CLUSTERING.md#session-presence).
 
 ## Cross-Route State Sharing
 
-Wrap the store in a function and call it from multiple routes -- because
-creation is idempotent, every call returns the same store. Use
-`beacon.subscriptions` with `store.topic(shared.cart())` in each route to
-react to changes:
+Every route of a `with_router` app runs in the same session, so the
+session's state is already shared between routes. Between sessions, wrap
+the store in a function and call it from every route: creation is
+idempotent, so every call returns the same store. Subscribe to
+`store.topic(shared.cart())` to react to changes:
 
 ```gleam
 pub fn cart() { store.new("cart") }  // in shared.gleam

@@ -26,9 +26,15 @@
 ///   that learns about it. They receive `{beacon_pubsub, DiffTopic, Diff}`;
 ///   pass the Diff to `decode_diff`.
 /// - **Limits.** Every violation is an `Error`.
+/// - **In an app**, `beacon.presence` tracks a session's `Tracking`s from
+///   its state and hands the app every change as a `Diff`;
+///   `beacon/presence/sync.merge` applies one to the entries the app keeps
+///   (Phoenix.Presence's `syncDiff`). `Meta`, `Entry` and `Diff` live in
+///   `beacon/presence/sync` so that they can reach the browser.
 ///
 /// See docs/CLUSTERING.md.
 import beacon/log
+import beacon/presence/sync.{type Diff, type Entry, Diff, Entry, Meta}
 import beacon/pubsub
 import beacon/telemetry
 import gleam/bit_array
@@ -45,21 +51,10 @@ import gleam/otp/supervision
 import gleam/result
 import gleam/string
 
-/// One tracked entry's meta, from any node.
-pub type Meta(meta) {
-  Meta(value: meta, ref: String, ref_prev: Option(String), node: String)
-}
-
-/// Everything tracked under one key on a topic: one meta per tracking
-/// process (several when the same key is tracked from several places).
-pub type Entry(meta) {
-  Entry(key: String, metas: List(Meta(meta)))
-}
-
-/// What changed on a topic. An update is a leave of the old meta and a
-/// join of the new one.
-pub type Diff(meta) {
-  Diff(topic: String, joins: List(Entry(meta)), leaves: List(Entry(meta)))
+/// What a session is present as: `key` on `topic`, with `meta`. A
+/// `beacon.presence` app computes these from its state after every update.
+pub type Tracking(meta) {
+  Tracking(topic: String, key: String, meta: meta)
 }
 
 pub type PresenceError {
@@ -459,6 +454,13 @@ pub fn stop(presence: Presence(meta)) -> Result(Nil, PresenceError) {
   stop_ffi(presence.names)
 }
 
+/// Whether the tracker runs on this node (its supervisor is registered).
+/// A running tracker may still be restarting a shard: calls for that
+/// shard's topics return `TrackerDown` meanwhile.
+pub fn running(presence: Presence(meta)) -> Bool {
+  running_ffi(presence.names)
+}
+
 /// The handle of the tracker `config` starts, for a tracker started with
 /// `supervised`. It does not check that the tracker is running: calls
 /// return `TrackerDown` until it is.
@@ -827,6 +829,9 @@ fn names_ffi(name: String, pool_size: Int) -> Names
 
 @external(erlang, "beacon_presence_ffi", "start")
 fn start_ffi(config: ShardConfig, names: Names) -> Result(Nil, PresenceError)
+
+@external(erlang, "beacon_presence_ffi", "running")
+fn running_ffi(names: Names) -> Bool
 
 @external(erlang, "beacon_presence_ffi", "start_link")
 fn start_link_ffi(

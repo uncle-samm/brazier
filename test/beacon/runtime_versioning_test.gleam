@@ -71,7 +71,7 @@ fn update(m: Model, msg: Msg) -> #(Model, effect.Effect(Msg)) {
 
 fn config() -> runtime.RuntimeConfig(Model, Msg) {
   runtime.RuntimeConfig(
-    init: fn(_ctx) { #(Model(count: 0, blob: "", path: ""), effect.none()) },
+    init: fn(_ctx) { Ok(#(Model(count: 0, blob: "", path: ""), effect.none())) },
     update: update,
     decode_event: decode,
     encode_model: model_json,
@@ -81,6 +81,7 @@ fn config() -> runtime.RuntimeConfig(Model, Msg) {
     on_notify: None,
     on_notification: None,
     secret_key: secret,
+    presence: None,
   )
 }
 

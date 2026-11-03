@@ -240,6 +240,42 @@ pub fn server_built_constructor_is_not_allowed_test() {
   let assert False = string.contains(codec, "GotReply")
 }
 
+/// `beacon.presence` and `beacon.on_notification` deliver their payloads
+/// as messages, so `Msg` must be able to carry them.
+fn ping_with_server_payloads(payloads: String, imports: String) -> String {
+  ping
+  |> string.replace(
+    "  GotReply(text: String)\n",
+    "  GotReply(text: String)\n" <> payloads,
+  )
+  |> string.replace("import beacon/html\n", "import beacon/html\n" <> imports)
+}
+
+pub fn presence_and_notification_payloads_may_reach_the_browser_test() {
+  let app =
+    ping_with_server_payloads(
+      "  PresenceChanged(sync.Diff(String))\n  Notified(Notification)\n",
+      "import beacon/notification.{type Notification}\nimport beacon/presence/sync\n",
+    )
+  let assert Ok(analysis) = analyze_app(app)
+  // The server builds these messages; the browser can never send them.
+  let assert True = analysis.codecs.allowed == set.from_list([#("app", "Send")])
+  let assert Ok(codec) = server_codec.generate(analysis)
+  let assert False = string.contains(codec, "PresenceChanged")
+  let assert False = string.contains(codec, "Notified")
+}
+
+pub fn tracker_types_in_msg_are_an_error_test() {
+  let app =
+    ping_with_server_payloads(
+      "  PresenceFailed(presence.PresenceError)\n",
+      "import beacon/presence\n",
+    )
+  let reason = analyze_error([#("app", app)])
+  assert_contains(reason, "uses `beacon/presence.PresenceError`")
+  assert_contains(reason, "does not run in the browser")
+}
+
 // --- view and annotations ----------------------------------------------------
 
 pub fn view_reaching_a_server_module_is_an_error_test() {

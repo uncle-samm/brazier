@@ -19,8 +19,8 @@ pub type Msg {
   Decrement
 }
 
-fn init(_ctx: beacon.Context) -> Model {
-  Model(count: 0)
+fn init(_ctx: beacon.Context) -> Result(Model, beacon.InitError) {
+  Ok(Model(count: 0))
 }
 
 pub fn update(model: Model, msg: Msg) -> Model {

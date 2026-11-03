@@ -34,7 +34,8 @@ import gleam/string
 /// `beacon/*` runs only on the server.
 pub const client_modules = [
   "beacon/attribute", "beacon/element", "beacon/event", "beacon/html",
-  "beacon/local", "beacon/log", "beacon/svg",
+  "beacon/local", "beacon/log", "beacon/notification", "beacon/presence/sync",
+  "beacon/svg",
 ]
 
 const element_module = "beacon/element"

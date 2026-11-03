@@ -1032,6 +1032,7 @@ if start_example("chat"):
     t = text()
     check("#general" in t or "general" in t, "Room shown")
     check("TestUser" in t, "Username displayed")
+    check("Online: TestUser" in t, "Presence lists the joined user")
     check("No messages yet" in t, "Empty room")
     # Send message
     evl('''

@@ -14,8 +14,8 @@
 /// pub type Model { Model(count: Int) }
 /// pub type Msg { Increment Decrement }
 ///
-/// fn init(_ctx: beacon.Context) -> #(Model, Effect(Msg)) {
-///   #(Model(count: 0), effect.none())
+/// fn init(_ctx: beacon.Context) -> Result(#(Model, Effect(Msg)), beacon.InitError) {
+///   Ok(#(Model(count: 0), effect.none()))
 /// }
 ///
 /// fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
@@ -55,14 +55,18 @@
 /// Reference: Lustre `application`/`simple`, LiveView mount.
 import beacon/api
 import beacon/application
+import beacon/cluster as beacon_cluster
 import beacon/effect.{type Effect}
 import beacon/element.{type Element}
 import beacon/error
 import beacon/internal/context
+import beacon/internal/presence_watch
 import beacon/local
 import beacon/log
 import beacon/middleware
 import beacon/notification.{type Notification}
+import beacon/presence as beacon_presence
+import beacon/presence/sync as presence_sync
 import beacon/pubsub
 import beacon/runtime
 import beacon/transport
@@ -103,6 +107,18 @@ pub fn is_connected(ctx: Context) -> Bool {
   context.is_connected(ctx)
 }
 
+/// Why `init` refused to start a session. Build one with `error.unavailable`
+/// (503) or `error.refuse(status, reason)` from `beacon/error`.
+///
+/// Every constructor's `init` returns `Result(_, InitError)`, like LiveView's
+/// `mount` returning `{:ok, socket}`. An `Error` is answered on the dead
+/// render with an error page for its status, and on the connected mount by
+/// closing the WebSocket with `4000 + status` (4503 for `unavailable`). The
+/// reason is logged and never sent to the browser. A crash in `init` is
+/// answered with 500 on the dead render and closes the WebSocket with 1011.
+pub type InitError =
+  error.InitError
+
 /// An opaque, stable id for the browser session (a hash of Beacon's session
 /// cookie), the same for the dead render and the connected mount. Error
 /// when the request has no Beacon session cookie (its first page load).
@@ -121,7 +137,7 @@ pub fn session_id(ctx: Context) -> Result(String, Nil) {
 /// - `msg`: the app's messages.
 pub opaque type App(state, model, local, msg) {
   App(
-    init: fn(Context) -> #(state, Effect(msg)),
+    init: fn(Context) -> Result(#(state, Effect(msg)), InitError),
     update: fn(state, msg) -> #(state, Effect(msg)),
     sync: fn(state) -> model,
     local: local.Layer(model, local, msg),
@@ -140,6 +156,9 @@ pub opaque type App(state, model, local, msg) {
     api_handler: Option(fn(api.Request) -> Option(api.Response)),
     ws_auth: Option(fn(api.Request) -> Result(Nil, String)),
     dev_mode: Bool,
+    pubsub: pubsub.PubSubConfig,
+    cluster: Option(beacon_cluster.ClusterConfig),
+    presence: Option(presence_watch.Watch(state, msg)),
   )
 }
 
@@ -154,12 +173,14 @@ pub opaque type App(state, model, local, msg) {
 /// as `view`); the build fails, naming the call, when it reaches anything
 /// else. Use `application` for effects or server-only work.
 pub fn simple(
-  init init: fn(Context) -> model,
+  init init: fn(Context) -> Result(model, InitError),
   update update: fn(model, msg) -> model,
   view view: fn(model) -> Element(msg),
 ) -> App(model, model, Nil, msg) {
   new_app(
-    init: fn(ctx) { #(init(ctx), effect.none()) },
+    init: fn(ctx) {
+      result.map(init(ctx), fn(model) { #(model, effect.none()) })
+    },
     update: fn(model, msg) { #(update(model, msg), effect.none()) },
     sync: identity,
     local: local.none(),
@@ -170,7 +191,7 @@ pub fn simple(
 /// An app whose whole model is synced to the client. `update` runs only on
 /// the server and returns effects.
 pub fn application(
-  init init: fn(Context) -> #(model, Effect(msg)),
+  init init: fn(Context) -> Result(#(model, Effect(msg)), InitError),
   update update: fn(model, msg) -> #(model, Effect(msg)),
   view view: fn(model) -> Element(msg),
 ) -> App(model, model, Nil, msg) {
@@ -192,7 +213,7 @@ pub fn application(
 /// Only the types `sync`, `view` and the Local layer reach are compiled for
 /// the browser, so the rest of `state` never leaves the server.
 pub fn full_application(
-  init init: fn(Context) -> #(state, Effect(msg)),
+  init init: fn(Context) -> Result(#(state, Effect(msg)), InitError),
   update update: fn(state, msg) -> #(state, Effect(msg)),
   sync sync: fn(state) -> model,
   local local: local.Layer(model, local, msg),
@@ -202,7 +223,7 @@ pub fn full_application(
 }
 
 fn new_app(
-  init init: fn(Context) -> #(state, Effect(msg)),
+  init init: fn(Context) -> Result(#(state, Effect(msg)), InitError),
   update update: fn(state, msg) -> #(state, Effect(msg)),
   sync sync: fn(state) -> model,
   local local: local.Layer(model, local, msg),
@@ -228,6 +249,9 @@ fn new_app(
     api_handler: None,
     ws_auth: None,
     dev_mode: False,
+    pubsub: pubsub.default_config(),
+    cluster: None,
+    presence: None,
   )
 }
 
@@ -364,6 +388,67 @@ pub fn dev_mode(
   App(..app, dev_mode: enabled)
 }
 
+/// Configure PubSub (partitions, pool size, limits). Start from
+/// `pubsub.default_config()`. PubSub runs as the first child of the
+/// application's supervision tree.
+pub fn pubsub_config(
+  app: App(state, model, local, msg),
+  config: pubsub.PubSubConfig,
+) -> App(state, model, local, msg) {
+  App(..app, pubsub: config)
+}
+
+/// Join a cluster: the cluster manager (built with `cluster.new`) runs in
+/// the application's supervision tree right after PubSub, connecting to
+/// and checking peers. Start fails when the configuration or this node's
+/// distribution does not pass `cluster`'s checks.
+pub fn cluster(
+  app: App(state, model, local, msg),
+  config: beacon_cluster.ClusterConfig,
+) -> App(state, model, local, msg) {
+  App(..app, cluster: Some(config))
+}
+
+/// Track who is here (Phoenix.Presence). The tracker (built with
+/// `presence.new`) runs in the application's supervision tree, and every
+/// session tracks what `track` returns for its state: computed after every
+/// update, tracked, updated and untracked as the list changes, and gone
+/// when the session ends. Every change on a tracked topic, from any node,
+/// arrives as `on_presence(diff)`: the session's first message for a topic
+/// lists everyone already there as joins, and up to 100 queued changes are
+/// coalesced into one message. Keep the entries with
+/// `beacon/presence/sync.merge`. The diff, entry and meta types live in
+/// `beacon/presence/sync`, which runs in the browser, so `Msg` and the
+/// Model can carry them.
+///
+/// ```gleam
+/// pub type Msg {
+///   PresenceChanged(sync.Diff(Profile))
+/// }
+///
+/// beacon.application(init:, update:, view:)
+/// |> beacon.presence(
+///   tracker: presence.new("online", encode_user, user_decoder()),
+///   track: fn(model) {
+///     [presence.Tracking(topic: "room:" <> model.room, key: model.user, meta: model.profile)]
+///   },
+///   on_presence: PresenceChanged,
+/// )
+/// ```
+///
+/// A tracking the tracker refuses (a limit, an invalid topic or key, the
+/// same key twice on a topic) stops the session with a logged error. When
+/// a shard of the tracker restarts, every session tracks its entries on it
+/// again. Start fails when the tracker configuration is invalid.
+pub fn presence(
+  app: App(state, model, local, msg),
+  tracker tracker: beacon_presence.PresenceConfig(meta),
+  track track: fn(state) -> List(beacon_presence.Tracking(meta)),
+  on_presence on_presence: fn(presence_sync.Diff(meta)) -> msg,
+) -> App(state, model, local, msg) {
+  App(..app, presence: Some(presence_watch.new(tracker, track, on_presence)))
+}
+
 /// Recover the session after a reconnect to a new server process: the
 /// page carries the Model in a signed join token, and `restore` rebuilds
 /// the server state from it. For `simple` and `application`, where the
@@ -399,7 +484,9 @@ pub fn notification_payload(
 
 // ===== Start =====
 
-/// Start the app on `port` and block forever.
+/// Start the app on `port` under its supervision tree and block forever.
+/// If the tree gives up (a child keeps crashing), the calling process
+/// crashes with the reason instead of running on without it.
 ///
 /// The server codec and the client bundle are build artifacts of
 /// `gleam run -m beacon/build` (or `gleam run -m beacon/dev`); starting
@@ -420,7 +507,7 @@ pub fn start(
     }
     Ok(codec) -> {
       let config = to_config(app, codec, port)
-      case application.start(config) {
+      case application.start_supervised(config) {
         Ok(_app) -> {
           log.info(
             "beacon",
@@ -476,6 +563,9 @@ pub fn to_config(
     api_handler: app.api_handler,
     ws_auth: app.ws_auth,
     dev_mode: app.dev_mode,
+    pubsub: app.pubsub,
+    cluster: app.cluster,
+    presence: app.presence,
   )
 }
 

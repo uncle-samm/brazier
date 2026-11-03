@@ -13,8 +13,10 @@
 import beacon/cookie
 import beacon/effect.{type Effect}
 import beacon/element.{type Element}
+import beacon/error.{type InitError}
 import beacon/error_page
 import beacon/internal/context
+import beacon/internal/http_status
 import beacon/internal/render
 import beacon/internal/uri_check
 import beacon/log
@@ -40,8 +42,9 @@ import simplifile
 /// `sync` and local layer.
 pub type SsrConfig(state, msg) {
   SsrConfig(
-    /// The app's `init`, run with a dead-render context.
-    init: fn(context.Context) -> #(state, Effect(msg)),
+    /// The app's `init`, run with a dead-render context. An `Error` is
+    /// answered with an error page for its status.
+    init: fn(context.Context) -> Result(#(state, Effect(msg)), InitError),
     /// The app's server `update`, used to apply the route message.
     update: fn(state, msg) -> #(state, Effect(msg)),
     /// `parse` composed with `on_change`, when the app has a router.
@@ -146,7 +149,9 @@ pub type RenderedPage {
     /// Whether the session cookie should include the Secure attribute.
     cookie_secure: Bool,
     /// HTTP status: 200 for a rendered route, 404 for an unknown route,
-    /// 400 for a URL whose percent-encoding does not decode.
+    /// 400 for a URL whose percent-encoding does not decode, the
+    /// `InitError`'s status when `init` refused the request, and 500 when
+    /// the client bundle is missing.
     status: Int,
   )
 }
@@ -157,7 +162,10 @@ pub type RenderedPage {
 /// 1. Check the URL's percent-encoding (400 when it does not decode).
 /// 2. Resolve the route, when the app has a router (404 when unknown).
 /// 3. Run `init` with a context whose `is_connected` is False. Its effects
-///    are not run: they run on the connected mount.
+///    are not run: they run on the connected mount. An `InitError` is
+///    answered with an error page for its status (503 for
+///    `error.unavailable`); its reason is logged, never rendered. A crash
+///    in `init` propagates, and the transport answers it with 500.
 /// 4. Apply the route message through `update` (effects dropped likewise).
 /// 5. Render `view` and wrap it in the HTML document with the client script.
 pub fn render_page(
@@ -198,19 +206,63 @@ pub fn render_page(
               is_connected: False,
               session_id: session_id_for_request(req),
             )
-          let #(state, init_effects) = config.init(ctx)
-          drop_effects(init_effects, "init", path)
-          let state = case route_msg {
-            None -> state
-            Some(msg) -> {
-              let #(routed, route_effects) = config.update(state, msg)
-              drop_effects(route_effects, "route update", path)
-              routed
+          case config.init(ctx) {
+            Error(init_error) -> render_init_error(config, init_error, path)
+            Ok(#(state, init_effects)) -> {
+              drop_effects(init_effects, "init", path)
+              let state = case route_msg {
+                None -> state
+                Some(msg) -> {
+                  let #(routed, route_effects) = config.update(state, msg)
+                  drop_effects(route_effects, "route update", path)
+                  routed
+                }
+              }
+              render_state(config, state, path)
             }
           }
-          render_state(config, state, path)
         }
       }
+  }
+}
+
+/// The page for an `init` that refused the request: the error page for its
+/// status, without the client script (there is no session to connect to).
+/// A 5xx refusal is logged as an error, a 4xx one as a warning.
+fn render_init_error(
+  config: SsrConfig(state, msg),
+  init_error: InitError,
+  path: String,
+) -> RenderedPage {
+  let status = error.init_error_status(init_error)
+  let message =
+    "init refused the dead render of "
+    <> path
+    <> " ("
+    <> error.init_error_to_string(init_error)
+    <> ")"
+  case status >= 500 {
+    True -> log.error("beacon.ssr", message)
+    False -> log.warning("beacon.ssr", message)
+  }
+  let title = http_status.reason_phrase(status)
+  render_error_page(
+    config,
+    status,
+    title,
+    error_page.error_page(status, title, init_error_message(status)),
+  )
+}
+
+/// What the browser is told about a refused page. The app's reason stays
+/// in the server log: it may name internals (a database host, a user id).
+fn init_error_message(status: Int) -> String {
+  case status {
+    404 -> "The page you're looking for doesn't exist."
+    401 | 403 -> "You are not allowed to see this page."
+    503 -> "This page is temporarily unavailable. Please try again shortly."
+    _ if status >= 500 -> "Something went wrong on our end."
+    _ -> "This page cannot be shown."
   }
 }
 

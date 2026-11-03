@@ -99,8 +99,10 @@ fn read_strokes(strokes: ListStore(Stroke)) -> List(Stroke) {
   store.get_all(strokes, strokes_key)
 }
 
-fn init(strokes: ListStore(Stroke)) -> #(Model, Effect(Msg)) {
-  #(Model(strokes: read_strokes(strokes), pen_ups: 0), effect.none())
+fn init(
+  strokes: ListStore(Stroke),
+) -> Result(#(Model, Effect(Msg)), beacon.InitError) {
+  Ok(#(Model(strokes: read_strokes(strokes), pen_ups: 0), effect.none()))
 }
 
 fn update(

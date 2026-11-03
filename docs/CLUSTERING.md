@@ -18,6 +18,43 @@ Plug.Session, OTP distribution) are in
 The telemetry events mentioned below are listed in
 [TELEMETRY.md](TELEMETRY.md).
 
+## The supervision tree
+
+`beacon.start` runs the application under one root supervisor with the
+`RestForOne` strategy (Phoenix's application structure). Its children start
+in this order:
+
+1. PubSub, configured with `beacon.pubsub_config`.
+2. The cluster manager, when `beacon.cluster(config)` is set.
+3. The session revocation scope, which carries logouts and rotations to
+   bound sockets on every node.
+4. The presence tracker, when `beacon.presence(..)` is set.
+5. The HTTP and WebSocket listener.
+
+```gleam
+beacon.application(init:, update:, view:)
+|> beacon.cluster(cluster.new(discovery, secret_key: secret_key))
+|> beacon.presence(tracker: online, track: track, on_presence: PresenceChanged)
+|> beacon.start(8080)
+```
+
+- **A crash restarts that child and every child after it.** A PubSub
+  restart therefore also restarts the cluster manager, the session scope,
+  the tracker and the listener, closing every connection; a listener
+  restart touches nothing before it. A single presence shard that crashes
+  is restarted by the tracker's own supervisor instead.
+- **Past the restart tolerance the root gives up.** It exits, and
+  `beacon.start` crashes the main process with the reason instead of
+  running on without PubSub or the listener. Run the release under a
+  process manager that restarts it.
+- **The tree owns these processes.** `beacon.start` refuses to start, with
+  a `ConfigError` and an error log, when PubSub, the cluster manager, the
+  session scope or the tracker is already running outside a tree.
+- **`application.stop` stops the whole tree** and frees the port.
+  `application.start` is the unsupervised form for embedding and tests: it
+  starts PubSub, the session scope and the tracker on the node if needed
+  and links only the listener to the caller.
+
 ## Security first: what distribution means
 
 **A node that can connect to your cluster can run any code on every node.**
@@ -129,11 +166,17 @@ let config =
     cluster.Dns(query: "app.internal", basename: "app", poll_ms: 5000),
     secret_key: secret_key,
   )
-let assert Ok(child) = cluster.supervised(config)
+
+beacon.application(init:, update:, view:)
+|> beacon.cluster(config)
+|> beacon.start(8080)
 ```
 
-Use `cluster.start(config)` instead to run it unsupervised, and
-`cluster.stop()` to stop it. Stopping keeps existing connections up, but
+`beacon.cluster` runs the manager in the application's supervision tree,
+right after PubSub; `beacon.start` fails when the configuration or this
+node's distribution does not pass the checks above. Outside a Beacon app,
+`cluster.supervised(config)` builds a child for your own supervisor, and
+`cluster.start(config)` runs it unsupervised; `cluster.stop()` stops it. Stopping keeps existing connections up, but
 they are no longer reconnected or checked.
 
 ### Discovery
@@ -380,6 +423,65 @@ Across the cluster:
 `beacon/presence` is a port of Phoenix.Tracker and Phoenix.Presence. It
 tracks which processes are on a topic, on every connected node.
 
+### Session presence
+
+Most apps track their sessions with `beacon.presence`. The tracker runs in
+the application's supervision tree, and each session declares what it is
+present as from its state:
+
+```gleam
+import beacon/presence
+import beacon/presence/sync
+
+pub type Msg {
+  PresenceChanged(sync.Diff(Profile))
+  // ...
+}
+
+let online = presence.new("online", encode_user, user_decoder())
+
+beacon.application(init:, update:, view:)
+|> beacon.presence(
+  tracker: online,
+  track: fn(model) {
+    [presence.Tracking(topic: "room:" <> model.room, key: model.user, meta: model.profile)]
+  },
+  on_presence: PresenceChanged,
+)
+|> beacon.start(8080)
+
+// In update:
+PresenceChanged(diff) ->
+  #(Model(..model, online: sync.merge(model.online, diff)), effect.none())
+```
+
+`Diff`, `Entry` and `Meta` are in `beacon/presence/sync`, which runs in the
+browser, so `Msg` and the Model can carry them. The rest of
+`beacon/presence` runs only on the server. `examples/chat` tracks who is in
+each room and who is typing this way.
+
+- **Tracking follows the state.** `track` runs after every update. A new
+  tracking is tracked, a changed meta is updated, a tracking that
+  disappears is untracked, and everything leaves when the session ends.
+- **Diffs arrive as messages.** Every change on a tracked topic, from any
+  node, arrives as `on_presence(diff)`. The session's first message for a
+  topic lists everyone already there as joins. Up to 100 queued changes
+  of a topic are coalesced into one message. `sync.merge` applies a diff
+  to a list (Phoenix's `syncDiff`).
+- **Shard restarts are invisible to the app.** When a tracker shard
+  restarts, the session tracks its entries again (with backoff) and gets
+  one message with the old entry leaving and the new one joining.
+- **Failures stop the session loudly.** A tracking the tracker refuses (a
+  limit, an invalid topic or key, the same key twice on a topic), a
+  tracker that stays down, or the loss of the session's PubSub partition
+  stops the session with a logged error. `beacon.start` fails when the
+  tracker configuration is invalid.
+
+### The tracker API
+
+The rest of this section describes the tracker itself, for processes that
+are not Beacon sessions.
+
 ```gleam
 import beacon/presence
 
@@ -410,7 +512,8 @@ Start the tracker on every node with the same:
 - `broadcast_period`, `max_silent_periods`, `down_period` and
   `permdown_period`.
 
-Start it after PubSub. Shards replicate only with the shard of the same
+Start it after PubSub (`beacon.presence` does this in the application's
+tree). Shards replicate only with the shard of the same
 name and index on other nodes, so a node with a different pool size sees
 some topics on the wrong shard.
 
@@ -433,8 +536,8 @@ Every change is delivered as a diff to processes subscribed to the topic,
 both on the node where it happened and on each node that learns about it.
 
 - Subscribers receive `{beacon_pubsub, presence.diff_topic(users, topic), Diff}`.
-  Pass the Diff to `presence.decode_diff(users, diff)` to get
-  `Diff(topic, joins, leaves)`.
+  Pass the Diff to `presence.decode_diff(users, diff)` to get a
+  `sync.Diff(topic, joins, leaves)`.
 - An update appears as a leave of the old meta and a join of the new one,
   with the old `ref` as the new meta's `ref_prev` (Phoenix.Presence
   semantics).

@@ -42,7 +42,7 @@ pub fn start_counter_app_with_limits(
     application.AppConfig(
       ..app_config_fixture.new(
         port: 0,
-        init: fn(_ctx) { #(CounterModel(count: 0), effect.none()) },
+        init: fn(_ctx) { Ok(#(CounterModel(count: 0), effect.none())) },
         update: fn(model: CounterModel, _msg) {
           #(CounterModel(count: model.count + 1), effect.none())
         },
@@ -84,7 +84,7 @@ pub fn start_ticker_app(
       ..app_config_fixture.new(
         port: 0,
         init: fn(_ctx) {
-          #(TickerModel(tick: 0), effect.every(interval_ms, fn() { Tick }))
+          Ok(#(TickerModel(tick: 0), effect.every(interval_ms, fn() { Tick })))
         },
         update: fn(model: TickerModel, _msg) {
           #(TickerModel(tick: model.tick + 1), effect.none())

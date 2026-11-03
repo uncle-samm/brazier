@@ -236,7 +236,10 @@ pub fn http_connection(
 @internal
 pub fn ws_upgrade_span(route: String, run: fn() -> #(a, String)) -> a
 
-/// `[beacon, ws, close]`: one summary per connection.
+/// `[beacon, ws, close]`: one summary per connection. `duration` is in
+/// native time units; `close_code` is the code sent or echoed, 1005 when
+/// the peer's close had no code, 1006 when no close frame was exchanged.
+/// `reason` is a fixed snake_case label.
 @external(erlang, "beacon_telemetry_ffi", "ws_close")
 @internal
 pub fn ws_close(
@@ -247,20 +250,35 @@ pub fn ws_close(
   bytes_out: Int,
   close_code: Int,
   reason: String,
+  connection_id: String,
 ) -> Nil
 
-/// `[beacon, ws, rate_limited]`.
+/// `[beacon, ws, rate_limited]`: a refused event, batch or heartbeat.
+/// `violations` is the connection's running count; `kind` is
+/// `"event_rate"`, `"batch_size"` or `"heartbeat_rate"`.
 @external(erlang, "beacon_telemetry_ffi", "ws_rate_limited")
 @internal
-pub fn ws_rate_limited(queue_len: Int, connection_id: String) -> Nil
+pub fn ws_rate_limited(
+  violations: Int,
+  kind: String,
+  connection_id: String,
+) -> Nil
 
-/// `[beacon, ws, backpressure]`.
+/// `[beacon, ws, backpressure]`: the connection is closed because a
+/// queue is full. `reason` is `"outbound_queue"` (the connection's
+/// mailbox) or `"runtime"` (the runtime's view of the connection).
 @external(erlang, "beacon_telemetry_ffi", "ws_backpressure")
 @internal
-pub fn ws_backpressure(queue_len: Int, connection_id: String) -> Nil
+pub fn ws_backpressure(
+  queue_len: Int,
+  reason: String,
+  connection_id: String,
+) -> Nil
 
 /// `[beacon, runtime, mount | handle_event | navigate]` span. `event` is
-/// the handler name when it is known, otherwise `"unknown"`.
+/// the message's constructor name in snake_case, as the BEAM names it
+/// (`SetCount(9)` is `"set_count"`; `"mount"` for a mount), or `"unknown"`
+/// when the event did not decode to a message of the app.
 @external(erlang, "beacon_telemetry_ffi", "runtime_span")
 @internal
 pub fn runtime_span(

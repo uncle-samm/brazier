@@ -8,13 +8,15 @@
 /// - a missing, deleted or expired session is `InvalidSession`;
 /// - a backend failure (or a write that lost every compare-and-swap race)
 ///   is `SessionStoreUnavailable`, logged as an error with its reason.
-///   Request wrappers and middleware answer it with 503 and WebSocket auth
-///   rejects the socket. `init_from_session` has no error channel, so it
-///   crashes the request process after logging, as `session.get` does:
-///   rendering the guest state instead would show a signed-in user a
-///   logged-out page and hide the outage.
+///   Request wrappers and middleware answer it with 503, WebSocket auth
+///   rejects the socket, and `init_from_session` returns
+///   `error.unavailable`, which the server render answers with 503 and the
+///   WebSocket with close 4503. None of them treats the outage as a guest:
+///   that would show a signed-in user a logged-out page and hide it.
 import beacon/api
 import beacon/cookie
+import beacon/error.{type InitError}
+import beacon/internal/context.{type Context}
 import beacon/log
 import beacon/middleware
 import beacon/session
@@ -545,60 +547,169 @@ pub fn protect_ws(
   ws_session_auth(store, config)
 }
 
-/// Request-aware initializer for apps whose initial model depends on auth.
+/// WebSocket auth for apps whose pages guests may open too. Use it in place
+/// of `protect_ws` when `init` renders a guest page (`init_from_session`).
 ///
-/// Use with `beacon.ws_init` when SSR should render the authenticated state on
-/// the first response. Invalid sessions are logged and treated as guests.
-/// When the session store is unavailable the session cannot be verified
-/// either way, and init has no error channel: this logs the failure and
-/// crashes the request process (see the module docs).
-pub fn init_from_session(
+/// - A live session with a user is bound to the socket, as `protect_ws`
+///   does, so logout, rotation or expiry closes it with 4401.
+/// - No session cookie, a cookie naming no live session and a session
+///   without a user connect as a guest. They are not bound to anything.
+/// - A session store that cannot answer refuses the socket (401 before the
+///   upgrade, 4401 on a recheck): the socket cannot be verified either way,
+///   and treating it as a guest would hide the outage.
+///
+/// `protect_ws` refuses guests, so a guest page's socket would reconnect
+/// forever. The server still checks every event against the page's `view`,
+/// and `update` must refuse what a guest may not do.
+pub fn allow_guests_ws(
   store: session.SessionStore,
   config: SessionConfig,
-  guest_init: fn(Request(Connection)) -> model,
-  authenticated_init: fn(Request(Connection), session.Session, String) -> model,
-) -> fn(Request(Connection)) -> model {
+) -> fn(Request(Connection)) -> Result(Nil, String) {
   fn(req: Request(Connection)) {
-    case session_from_request(req, store, config) {
-      Ok(sess) -> {
-        case current_user(sess) {
-          Ok(user_id) -> authenticated_init(req, sess, user_id)
-          Error(Nil) -> {
-            log.warning("beacon.auth", "Session missing user during init")
-            guest_init(req)
+    // The lookup is spelled out, as in `init_from_session`, so every case is
+    // one of the store's outcomes and no CSRF branch is impossible.
+    case session_id_from_request(req, config) {
+      Error(reason) -> {
+        log.debug(
+          "beacon.auth",
+          "WS auth: a guest (" <> error_to_string(reason) <> ")",
+        )
+        Ok(Nil)
+      }
+      Ok(session_id) ->
+        case session.fetch(store, session_id) {
+          Ok(sess) ->
+            case current_user(sess) {
+              Ok(_user_id) -> {
+                session.bind_current_process(store, sess.id)
+                log.debug("beacon.auth", "WS auth: a signed-in session, bound")
+                Ok(Nil)
+              }
+              Error(Nil) -> {
+                log.debug(
+                  "beacon.auth",
+                  "WS auth: a guest (" <> error_to_string(MissingUser) <> ")",
+                )
+                Ok(Nil)
+              }
+            }
+          Error(session.SessionNotFound as err)
+          | Error(session.SessionExpired as err) -> {
+            log.debug(
+              "beacon.auth",
+              "WS auth: a guest ("
+                <> error_to_string(store_failure(err, "WS session lookup"))
+                <> ")",
+            )
+            Ok(Nil)
+          }
+          Error(session.SessionContention as err)
+          | Error(session.SessionBackendFailed(_) as err)
+          | Error(session.InvalidBackend(_) as err) -> {
+            // `store_failure` logs the backend's reason as an error.
+            let failure = store_failure(err, "WS session lookup")
+            log.error(
+              "beacon.auth",
+              "WS auth cannot verify the session ("
+                <> error_to_string(failure)
+                <> "); refusing the socket",
+            )
+            Error(error_to_string(failure))
           }
         }
-      }
-      Error(MissingSessionCookie) -> guest_init(req)
-      Error(SessionStoreUnavailable(_) as err) -> crash_init(Error(err))
-      Error(err) -> {
-        log.warning(
-          "beacon.auth",
-          "Rejected session during init: " <> error_to_string(err),
-        )
-        guest_init(req)
-      }
     }
   }
 }
 
-/// The store failure was already logged by `store_failure`; this records
-/// the consequence and crashes the request process, as `session.or_crash`
-/// does for an operation with no error channel.
-fn crash_init(outcome: Result(model, SessionError)) -> model {
-  case outcome {
-    Ok(_) -> Nil
-    Error(err) ->
-      log.error(
-        "beacon.auth",
-        "init_from_session cannot verify the session ("
-          <> error_to_string(err)
-          <> "); crashing the request",
-      )
+/// The session named by the Context's session cookie, for code that runs
+/// in an app's `init`. The same outcomes as `session_from_request`.
+pub fn session_from_context(
+  ctx: Context,
+  store: session.SessionStore,
+  config: SessionConfig,
+) -> Result(session.Session, SessionError) {
+  use session_id <- result.try(case context.cookie(ctx, config.cookie_name) {
+    Ok("") | Error(Nil) -> Error(MissingSessionCookie)
+    Ok(id) -> Ok(id)
+  })
+  session.fetch(store, session_id)
+  |> result.map_error(store_failure(_, "session lookup"))
+}
+
+/// An `init` for apps whose first state depends on who is signed in. Pass
+/// it as a constructor's `init`, so the server render already shows the
+/// signed-in page.
+///
+/// - A live session with a user runs `authenticated_init(ctx, session,
+///   user_id)`.
+/// - No session cookie runs `guest_init(ctx)`.
+/// - A cookie naming no live session (logged out, expired, rotated) and a
+///   session without a user are logged as warnings and run `guest_init`.
+/// - A session store that cannot answer is not a guest: the session cannot
+///   be verified either way. It returns `error.unavailable`, so the server
+///   render answers 503 and the WebSocket closes with 4503 (the browser
+///   reconnects with backoff). The store's reason is logged and never sent
+///   to the browser.
+pub fn init_from_session(
+  store: session.SessionStore,
+  config: SessionConfig,
+  guest_init guest_init: fn(Context) -> Result(model, InitError),
+  authenticated_init authenticated_init: fn(Context, session.Session, String) ->
+    Result(model, InitError),
+) -> fn(Context) -> Result(model, InitError) {
+  fn(ctx: Context) {
+    // The lookup is spelled out rather than calling `session_from_context`,
+    // so every case is one of the store's outcomes: a lookup never checks a
+    // CSRF token, and there is no impossible branch to answer.
+    case context.cookie(ctx, config.cookie_name) {
+      Ok("") | Error(Nil) -> {
+        log.debug("beacon.auth", "init without a session cookie: a guest")
+        guest_init(ctx)
+      }
+      Ok(session_id) ->
+        case session.fetch(store, session_id) {
+          Ok(sess) ->
+            case current_user(sess) {
+              Ok(user_id) -> {
+                log.debug("beacon.auth", "init for a signed-in session")
+                authenticated_init(ctx, sess, user_id)
+              }
+              Error(Nil) -> {
+                log.warning(
+                  "beacon.auth",
+                  "init: "
+                    <> error_to_string(MissingUser)
+                    <> "; rendering a guest",
+                )
+                guest_init(ctx)
+              }
+            }
+          Error(session.SessionNotFound as err)
+          | Error(session.SessionExpired as err) -> {
+            log.warning(
+              "beacon.auth",
+              "init: "
+                <> error_to_string(store_failure(err, "init session lookup"))
+                <> "; rendering a guest",
+            )
+            guest_init(ctx)
+          }
+          Error(session.SessionContention as err)
+          | Error(session.SessionBackendFailed(_) as err)
+          | Error(session.InvalidBackend(_) as err) -> {
+            // `store_failure` logs the backend's reason as an error.
+            let failure = store_failure(err, "init session lookup")
+            log.error(
+              "beacon.auth",
+              "init cannot verify the session ("
+                <> error_to_string(failure)
+                <> "); refusing it with 503",
+            )
+            Error(error.unavailable(error_to_string(failure)))
+          }
+        }
+    }
   }
-  let assert Ok(model) = outcome
-    as "session store unavailable during init_from_session"
-  model
 }
 
 /// Wrap an API route handler with session + current-user validation.

@@ -75,8 +75,10 @@ type Chunk {
 
 // --- Init ---
 
-fn init(_ctx: beacon.Context) -> #(Session, Effect(Msg)) {
-  #(
+fn init(
+  _ctx: beacon.Context,
+) -> Result(#(Session, Effect(Msg)), beacon.InitError) {
+  Ok(#(
     Session(
       model: Model(
         messages: [
@@ -94,7 +96,7 @@ fn init(_ctx: beacon.Context) -> #(Session, Effect(Msg)) {
       characters_streamed: 0,
     ),
     effect.none(),
-  )
+  ))
 }
 
 // --- Update ---

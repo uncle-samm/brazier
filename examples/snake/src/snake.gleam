@@ -103,9 +103,11 @@ fn read_high_scores(scores: ListStore(HighScore)) -> List(HighScore) {
 
 // --- Init and update (server) ---
 
-fn init(scores: ListStore(HighScore)) -> #(Model, Effect(Msg)) {
+fn init(
+  scores: ListStore(HighScore),
+) -> Result(#(Model, Effect(Msg)), beacon.InitError) {
   let snake = start_snake()
-  #(
+  Ok(#(
     Model(
       phase: NameEntry,
       player_name: "",
@@ -117,7 +119,7 @@ fn init(scores: ListStore(HighScore)) -> #(Model, Effect(Msg)) {
       high_scores: read_high_scores(scores),
     ),
     effect.none(),
-  )
+  ))
 }
 
 fn update(

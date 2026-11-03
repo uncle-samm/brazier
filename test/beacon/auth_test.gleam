@@ -1,7 +1,10 @@
 import beacon/api
 import beacon/auth
 import beacon/cookie
+import beacon/error
+import beacon/log_capture
 import beacon/session
+import beacon/test_ctx
 import beacon/transport/server.{type Connection, type ResponseBody, Bytes}
 import gleam/bit_array
 import gleam/bytes_tree
@@ -336,16 +339,54 @@ pub fn init_from_session_uses_authenticated_or_guest_init_test() {
     auth.init_from_session(
       store,
       config,
-      fn(_req) { "guest" },
-      fn(_req, _sess, user_id) { "user:" <> user_id },
+      fn(_ctx) { Ok("guest") },
+      fn(_ctx, _sess, user_id) { Ok("user:" <> user_id) },
     )
-  let authed_req: Request(Connection) =
-    make_request("GET", "/")
-    |> request.set_header("cookie", "beacon_session=" <> result.session.id)
-  let guest_req: Request(Connection) = make_request("GET", "/")
+  let authed =
+    test_ctx.with_cookies("/", [#("beacon_session", result.session.id)])
 
-  should.equal(init(authed_req), "user:init-user")
-  should.equal(init(guest_req), "guest")
+  let assert Ok("user:init-user") = init(authed)
+  let #(guest, guest_logs) =
+    log_capture.capture(fn() { init(test_ctx.for_path("/")) })
+  let assert Ok("guest") = guest
+  let assert True =
+    log_capture.has(guest_logs, level: "debug", containing: [
+      "without a session cookie",
+    ])
+}
+
+pub fn init_from_session_treats_a_dead_session_as_a_guest_test() {
+  let store = session.new_store("auth_init_dead_session")
+  let init =
+    auth.init_from_session(
+      store,
+      auth.dev_session_config(),
+      fn(_ctx) { Ok("guest") },
+      fn(_ctx, _sess, user_id) { Ok("user:" <> user_id) },
+    )
+  let #(outcome, logs) =
+    log_capture.capture(fn() {
+      init(test_ctx.with_cookies("/", [#("beacon_session", "no-such-session")]))
+    })
+  let assert Ok("guest") = outcome
+  let assert True =
+    log_capture.has(logs, level: "warning", containing: ["rendering a guest"])
+}
+
+pub fn init_from_session_passes_the_apps_own_refusal_through_test() {
+  let store = session.new_store("auth_init_app_refusal")
+  let config = auth.dev_session_config()
+  let assert Ok(result) = auth.login_json_response(store, "init-user", config)
+  let init =
+    auth.init_from_session(
+      store,
+      config,
+      fn(_ctx) { Ok("guest") },
+      fn(_ctx, _sess, _user_id) { Error(error.refuse(403, "not a member")) },
+    )
+  let assert Error(refusal) =
+    init(test_ctx.with_cookies("/", [#("beacon_session", result.session.id)]))
+  let assert 403 = error.init_error_status(refusal)
 }
 
 // --- helpers ---

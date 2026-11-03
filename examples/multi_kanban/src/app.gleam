@@ -47,8 +47,8 @@ const max_title_length = 100
 
 const columns = [board.Todo, board.Doing, board.Done]
 
-fn init(_ctx: beacon.Context) -> Model {
-  Model(
+fn init(_ctx: beacon.Context) -> Result(Model, beacon.InitError) {
+  Ok(Model(
     cards: [
       board.Card(id: 1, title: "Design API", column: board.Todo),
       board.Card(id: 2, title: "Write tests", column: board.Doing),
@@ -58,7 +58,7 @@ fn init(_ctx: beacon.Context) -> Model {
     draft: "",
     dragging: None,
     over: None,
-  )
+  ))
 }
 
 /// Runs in the browser and on the server, so it is pure apart from logging.

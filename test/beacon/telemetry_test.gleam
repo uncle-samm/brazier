@@ -247,10 +247,12 @@ fn documented() -> List(Documented) {
     Plain(
       ["ws", "close"],
       ["duration", "frames_in", "frames_out", "bytes_in", "bytes_out"],
-      ["close_code", "reason"],
+      ["close_code", "reason", "connection_id"],
     ),
-    Plain(["ws", "rate_limited"], ["queue_len"], ["connection_id"]),
-    Plain(["ws", "backpressure"], ["queue_len"], ["connection_id"]),
+    Plain(["ws", "rate_limited"], ["count", "violations"], [
+      "kind", "connection_id",
+    ]),
+    Plain(["ws", "backpressure"], ["queue_len"], ["reason", "connection_id"]),
     runtime("mount"),
     runtime("handle_event"),
     runtime("navigate"),
@@ -350,9 +352,9 @@ fn emit_everything() -> Nil {
   let upgrade = fn(run) { telemetry.ws_upgrade_span("/chat", run) }
   let assert 2 = upgrade(fn() { #(2, "ok") })
   crash(fn() { upgrade(fn() { panic as "upgrade crashed" }) })
-  telemetry.ws_close(100, 1, 2, 30, 40, 1000, "normal")
-  telemetry.ws_rate_limited(5, "c1")
-  telemetry.ws_backpressure(9, "c1")
+  telemetry.ws_close(100, 1, 2, 30, 40, 1000, "normal", "c1")
+  telemetry.ws_rate_limited(5, "event", "c1")
+  telemetry.ws_backpressure(9, "outbound_queue", "c1")
   list.each(
     [telemetry.Mount, telemetry.HandleEvent, telemetry.Navigate],
     fn(kind) {

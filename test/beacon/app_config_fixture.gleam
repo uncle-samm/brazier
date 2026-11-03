@@ -7,6 +7,7 @@ import beacon/element.{type Element}
 import beacon/error
 import beacon/internal/context.{type Context}
 import beacon/middleware
+import beacon/pubsub
 import beacon/transport
 import gleam/option
 
@@ -15,7 +16,7 @@ pub const secret_key = "app-config-fixture-secret-key-0123456789"
 
 pub fn new(
   port port: Int,
-  init init: fn(Context) -> #(state, Effect(msg)),
+  init init: fn(Context) -> Result(#(state, Effect(msg)), error.InitError),
   update update: fn(state, msg) -> #(state, Effect(msg)),
   view view: fn(state) -> Element(msg),
   encode_model encode_model: fn(state) -> String,
@@ -43,5 +44,8 @@ pub fn new(
     api_handler: option.None,
     ws_auth: option.None,
     dev_mode: False,
+    pubsub: pubsub.default_config(),
+    cluster: option.None,
+    presence: option.None,
   )
 }

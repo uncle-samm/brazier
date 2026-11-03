@@ -237,10 +237,11 @@ Use `auth.dev_session_config()` only for localhost HTTP development, where the
   exist. Answer 503 and keep the cookie.
 - `auth.login_route()` and `auth.logout_route()` answer 503 (with
   `Retry-After`) on `StoreFailed` and 500 on `CookieRejected`.
-- An `init` that reads the session through `beacon.cookie(ctx, name)` treats
-  a missing, unknown or expired session as a guest, and crashes the request
-  when the store cannot answer. It never renders a guest page for a session
-  it could not check. See [GETTING_STARTED.md](GETTING_STARTED.md#signed-in-first-render).
+- `auth.init_from_session` treats a missing, unknown or expired session as a
+  guest, and refuses the request with `error.unavailable` when the store
+  cannot answer: the HTML render answers 503 and the WebSocket closes with
+  4503. It never renders a guest page for a session it could not check. See
+  [GETTING_STARTED.md](GETTING_STARTED.md#signed-in-first-render).
 
 ### WebSocket sessions
 
@@ -251,9 +252,12 @@ check is repeated every `ws_auth_recheck_interval_ms`. On 4401 the browser
 logs an error, never reconnects with the revoked session, and reloads the
 page.
 
-`protect_ws` refuses guests. An app that serves a guest page must accept
-guest sockets in its own `ws_auth` and pass signed-in requests to
-`protect_ws` (see `examples/auth_workspace`). The server then still decides
+`protect_ws` refuses guests. An app that serves a guest page uses
+`auth.allow_guests_ws(store, config)` instead (see `examples/auth_workspace`).
+It binds a signed-in socket exactly as `protect_ws` does, connects a request
+with no cookie, a dead session or a session without a user as an unbound
+guest, and refuses the socket when the store cannot answer, so an outage is
+never hidden behind a guest page. The server then still decides
 per event: a guest socket can send only messages its page's `view` produces,
 and `update` must refuse signed-in actions from a guest.
 
@@ -328,7 +332,7 @@ The runtime tracks serialized model size. Models exceeding 1MB trigger a warning
 
 ## WebSocket Authentication
 
-`beacon.ws_auth(fn(api.Request) -> Result(Nil, String))` runs before the WebSocket upgrade and again every `ws_auth_recheck_interval_ms`. `Error(reason)` rejects the upgrade with HTTP 401, or closes a live socket with 4401. For Beacon sessions use `auth.protect_ws` (see Application Session Auth).
+`beacon.ws_auth(fn(api.Request) -> Result(Nil, String))` runs before the WebSocket upgrade and again every `ws_auth_recheck_interval_ms`. `Error(reason)` rejects the upgrade with HTTP 401, or closes a live socket with 4401. For Beacon sessions use `auth.protect_ws`, or `auth.allow_guests_ws` when guests may open the page (see Application Session Auth).
 
 ## Events From the Browser
 

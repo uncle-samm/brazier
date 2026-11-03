@@ -22,7 +22,9 @@ constructors and started with `beacon.start(app, port)`:
 - **`init(Context)`** receives the request context (`beacon.uri`,
   `beacon.cookie`, `beacon.is_connected`, `beacon.session_id`). It runs twice:
   once for the HTML render and once for the connected mount. Effects returned
-  on the HTML render are dropped.
+  on the HTML render are dropped. It returns `Result(_, InitError)`: an
+  `Error` is answered with its status on the HTML render and closes the
+  WebSocket with `4000 + status`.
 - **`sync(state) -> model`** (full application) chooses what the browser
   receives. The rest of `state` never leaves the server.
 - **`local`** is `local.none()` or `local.layer(init:, update:)`. Local state
@@ -68,7 +70,8 @@ On HTTP GET, after middleware, API routes and static files, `ssr.gleam`:
 
 1. checks the URL's percent-encoding (`internal/uri_check`, 400 on failure);
 2. runs `init(ctx)` and, with a router, `update` with the route message for
-   the URL (404 when `parse` rejects it);
+   the URL (404 when `parse` rejects it). An `Error(InitError)` from `init`
+   answers a static error page with its status and skips the route message;
 3. renders `view` to HTML with `internal/render` and the `beacon.title`;
 4. sets a signed HttpOnly join-token cookie (Phoenix.Token style: purpose,
    version, issue time, expiry and the browser-session fingerprint, signed
@@ -81,7 +84,9 @@ On HTTP GET, after middleware, API routes and static files, `ssr.gleam`:
 `application.gleam` spawns one runtime actor per WebSocket connection
 (`runtime.connect_transport_per_connection`). The runtime runs `init(ctx)`
 and the route message again, performs their effects, and answers the
-client's `join` with a `model_sync` of the encoded model. With state
+client's `join` with a `model_sync` of the encoded model. When `init` refuses,
+no runtime starts and the socket closes with `4000 + status`; when it
+crashes, the socket closes with 1011. With state
 recovery, a verified join token restores the model instead of running
 `init`.
 
@@ -270,7 +275,7 @@ optional `ws_auth` hook, which is rechecked every
 | `cookie`, `session`, `auth` | Cookies, server-side sessions, login/logout and session-bound WebSockets |
 | `form`, `upload` | Form helpers and CSRF; bounded multipart uploads with content sniffing |
 | `rate_limit`, `ip` | Fixed-window rate limiting; trusted-proxy client addresses |
-| `pubsub`, `presence` | Ports of Phoenix.PubSub (pg adapter) and Phoenix.Tracker |
+| `pubsub`, `presence`, `presence/sync` | Ports of Phoenix.PubSub (pg adapter) and Phoenix.Tracker; `presence/sync` holds the diff types and `merge`, which run in the browser too |
 | `store`, `store/*` | ETS stores that broadcast on change; replicated stores as an add-wins LWW CRDT |
 | `state_manager` | ETS storage behind stores |
 | `cluster` | Node discovery and reconnection ([CLUSTERING.md](CLUSTERING.md)) |
@@ -314,7 +319,7 @@ src/
   beacon/                 # Modules above
     build/                # Build pipeline
     internal/             # render, url, uri_check, context
-    presence/, store/     # Presence and replicated-store internals
+    presence/, store/     # Presence and replicated-store internals (and presence/sync)
     transport/            # HTTP/WebSocket server
   beacon_*.erl            # Erlang FFI and OTP processes
 beacon_client/src/

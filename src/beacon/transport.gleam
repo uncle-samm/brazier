@@ -13,6 +13,7 @@ import beacon/log
 import beacon/middleware
 import beacon/ssr
 import beacon/static
+import beacon/telemetry
 import beacon/transport/client
 import beacon/transport/http as transport_http
 import beacon/transport/server.{
@@ -31,6 +32,7 @@ import gleam/int
 import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
+import gleam/otp/supervision
 import gleam/result
 import gleam/string
 import simplifile
@@ -442,6 +444,16 @@ pub type ConnectionState {
     idle_timer: Option(process.Timer),
     /// Next `ws_auth` re-check (only when `ws_auth` is configured).
     auth_timer: Option(process.Timer),
+    /// Native monotonic time the connection started (after the 101).
+    opened_at: Int,
+    /// WebSocket frames decoded from the client.
+    frames_in: Int,
+    /// WebSocket frames written to the client (including the close frame).
+    frames_out: Int,
+    /// TCP bytes received from the client after the upgrade.
+    bytes_in: Int,
+    /// Bytes written to the client after the upgrade.
+    bytes_out: Int,
   )
 }
 
@@ -468,12 +480,13 @@ pub type TransportConfig {
     /// If set, each WebSocket connection gets its OWN runtime (like LiveView).
     /// The factory returns callbacks for this specific connection's runtime.
     /// If None, uses the shared on_connect/on_event/on_disconnect callbacks.
-    /// The factory receives the HTTP request so ws_init can read cookies/headers.
+    /// The factory receives the upgrade request, from which the runtime
+    /// builds the connected mount's Context (cookies, page URL).
     runtime_factory: Option(
       fn(ConnectionId, process.Subject(InternalMessage), Request(Connection)) ->
         Result(
           #(fn(ConnectionId, ClientMessage) -> Nil, fn(ConnectionId) -> Nil),
-          String,
+          StartupError,
         ),
     ),
     /// Optional: WebSocket authentication function.
@@ -494,6 +507,45 @@ pub type TransportConfig {
       fn(Request(Connection)) -> Option(response.Response(ResponseBody)),
     ),
   )
+}
+
+/// Why a per-connection runtime did not start. Either way the socket is
+/// closed right after the upgrade, before any other frame.
+pub type StartupError {
+  /// The app's `init` refused the session. The socket closes with
+  /// `error.init_close_code` (4000 + the status) and the reason
+  /// `"init refused"`; the app's own reason is only logged.
+  InitRefused(error: error.InitError)
+  /// Anything else: an invalid page URL, a crash in `init`, a refused
+  /// presence track. The socket closes with 1011 `"startup failure"`.
+  StartupFailed(reason: String)
+}
+
+pub fn startup_error_to_string(err: StartupError) -> String {
+  let text = case err {
+    InitRefused(init_error) ->
+      "init refused (" <> error.init_error_to_string(init_error) <> ")"
+    StartupFailed(reason) -> reason
+  }
+  log.debug("beacon.transport", "Runtime startup error: " <> text)
+  text
+}
+
+/// The close frame for a runtime that did not start: code, reason sent to
+/// the client, and the telemetry reason label.
+fn startup_close(err: StartupError) -> #(Int, String, String) {
+  case err {
+    InitRefused(init_error) -> #(
+      error.init_close_code(init_error),
+      "init refused",
+      "init_refused",
+    )
+    StartupFailed(_) -> #(
+      ws.close_internal_error,
+      "startup failure",
+      "startup_failure",
+    )
+  }
 }
 
 /// Generate a unique connection ID.
@@ -698,12 +750,12 @@ fn ctx(state: ConnectionState) -> String {
 fn send_ws_message(
   state: ConnectionState,
   msg: ServerMessage,
-) -> Result(Nil, String) {
+) -> Result(ConnectionState, String) {
   let encoded = encode_server_message(msg)
-  case server.send_bytes(state.socket, ws.encode_text(encoded)) {
-    Ok(Nil) -> {
+  case send_counted(state, ws.encode_text(encoded)) {
+    Ok(sent_state) -> {
       log.debug("beacon.transport", "Sent message to " <> state.id)
-      Ok(Nil)
+      Ok(sent_state)
     }
     Error(reason) -> {
       log.warning(
@@ -715,11 +767,30 @@ fn send_ws_message(
   }
 }
 
+/// Write one encoded frame and count it in the connection's totals.
+fn send_counted(
+  state: ConnectionState,
+  frame: BitArray,
+) -> Result(ConnectionState, String) {
+  case server.send_bytes(state.socket, frame) {
+    Ok(Nil) ->
+      Ok(
+        ConnectionState(
+          ..state,
+          frames_out: state.frames_out + 1,
+          bytes_out: state.bytes_out + bit_array.byte_size(frame),
+        ),
+      )
+    Error(reason) -> Error(reason)
+  }
+}
+
 /// Send a message; a failed send stops the connection.
 fn send_or_stop(state: ConnectionState, msg: ServerMessage) -> Next {
   case send_ws_message(state, msg) {
-    Ok(Nil) -> Continue(state)
-    Error(reason) -> Stop(state, NoCloseFrame, "send failed: " <> reason)
+    Ok(sent_state) -> Continue(sent_state)
+    Error(reason) ->
+      Stop(state, NoCloseFrame("send_failed"), "send failed: " <> reason)
   }
 }
 
@@ -729,17 +800,21 @@ fn send_frame_or_stop(
   frame: BitArray,
   what: String,
 ) -> Next {
-  case server.send_bytes(state.socket, frame) {
-    Ok(Nil) -> {
+  case send_counted(state, frame) {
+    Ok(sent_state) -> {
       log.debug("beacon.transport", "Sent " <> what <> " to " <> state.id)
-      Continue(state)
+      Continue(sent_state)
     }
     Error(reason) -> {
       log.warning(
         "beacon.transport",
         "Failed to send " <> what <> " to " <> ctx(state) <> ": " <> reason,
       )
-      Stop(state, NoCloseFrame, what <> " send failed: " <> reason)
+      Stop(
+        state,
+        NoCloseFrame("send_failed"),
+        what <> " send failed: " <> reason,
+      )
     }
   }
 }
@@ -808,10 +883,32 @@ fn check_heartbeat_rate(state: ConnectionState) -> #(ConnectionState, Bool) {
   #(new_state, new_count > max_heartbeats_per_second)
 }
 
+/// What a rate limit violation refused, the `kind` of the
+/// `[beacon, ws, rate_limited]` event.
+type RateViolation {
+  /// Events (or a batch) beyond `max_events_per_second`.
+  EventRate
+  /// A batch longer than `max_batch_size`.
+  BatchSize
+  /// Heartbeats beyond `max_heartbeats_per_second`.
+  HeartbeatRate
+}
+
+fn rate_violation_label(kind: RateViolation) -> String {
+  case kind {
+    EventRate -> "event_rate"
+    BatchSize -> "batch_size"
+    HeartbeatRate -> "heartbeat_rate"
+  }
+}
+
 /// Record one rate limit violation. Too many within a window closes the
 /// connection with 1008; otherwise `reply` (if any) is sent as an error.
+/// Every violation, including the closing one, emits
+/// `[beacon, ws, rate_limited]`.
 fn record_rate_violation(
   state: ConnectionState,
+  kind: RateViolation,
   description: String,
   reply: Option(String),
 ) -> Next {
@@ -820,6 +917,7 @@ fn record_rate_violation(
   let state = roll_rate_window(state)
   let violations = state.rate_violations + 1
   let state = ConnectionState(..state, rate_violations: violations)
+  telemetry.ws_rate_limited(violations, rate_violation_label(kind), state.id)
   let max = state.security_limits.ws_max_rate_violations
   case violations > max {
     True -> {
@@ -910,7 +1008,13 @@ fn handle_ws_text_decode(state: ConnectionState, text: String) -> Next {
     Ok(ClientHeartbeat) -> {
       let #(new_state, hb_limited) = check_heartbeat_rate(state)
       case hb_limited {
-        True -> record_rate_violation(new_state, "heartbeat flood", None)
+        True ->
+          record_rate_violation(
+            new_state,
+            HeartbeatRate,
+            "heartbeat flood",
+            None,
+          )
         False -> {
           log.debug("beacon.transport", "Heartbeat from " <> state.id)
           send_or_stop(new_state, ServerHeartbeatAck)
@@ -923,6 +1027,7 @@ fn handle_ws_text_decode(state: ConnectionState, text: String) -> Next {
         True ->
           record_rate_violation(
             state,
+            BatchSize,
             "batch of "
               <> int.to_string(batch_len)
               <> " events (max "
@@ -949,6 +1054,7 @@ fn dispatch_rate_limited(
     True ->
       record_rate_violation(
         new_state,
+        EventRate,
         "rate limited "
           <> client_message_type(msg)
           <> " ("
@@ -993,7 +1099,8 @@ type CloseAction {
   /// Answer a peer close by echoing its code (empty close when it had none).
   EchoClose(code: Option(Int))
   /// The socket is already dead (peer closed, send failed): send nothing.
-  NoCloseFrame
+  /// `label` is the fixed snake_case reason reported to telemetry.
+  NoCloseFrame(label: String)
 }
 
 /// Short, constant close reason for a protocol error (sent to the peer).
@@ -1033,11 +1140,22 @@ fn process_frames(state: ConnectionState, buffer: BitArray) -> Next {
     }
     Ok(ws.Incomplete) -> Continue(ConnectionState(..state, buffer: buffer))
     Ok(ws.Fragment(rest: rest, reassembly: reassembly)) ->
-      process_frames(ConnectionState(..state, reassembly: reassembly), rest)
+      process_frames(
+        ConnectionState(
+          ..state,
+          reassembly: reassembly,
+          frames_in: state.frames_in + 1,
+        ),
+        rest,
+      )
     Ok(ws.Complete(message: message, rest: rest, reassembly: reassembly)) ->
       case
         handle_ws_message(
-          ConnectionState(..state, reassembly: reassembly),
+          ConnectionState(
+            ..state,
+            reassembly: reassembly,
+            frames_in: state.frames_in + 1,
+          ),
           message,
         )
       {
@@ -1274,7 +1392,13 @@ fn handle_socket_event(state: ConnectionState, event: ws.SocketEvent) -> Next {
   case event {
     ws.SocketData(data) -> {
       let buffer = bit_array.append(state.buffer, data)
-      case process_frames(ConnectionState(..state, buffer: <<>>), buffer) {
+      let state =
+        ConnectionState(
+          ..state,
+          buffer: <<>>,
+          bytes_in: state.bytes_in + bit_array.byte_size(data),
+        )
+      case process_frames(state, buffer) {
         Continue(new_state) -> {
           server.set_active_once(new_state.socket)
           Continue(new_state)
@@ -1282,13 +1406,14 @@ fn handle_socket_event(state: ConnectionState, event: ws.SocketEvent) -> Next {
         stop -> stop
       }
     }
-    ws.SocketClosed -> Stop(state, NoCloseFrame, "peer closed TCP connection")
+    ws.SocketClosed ->
+      Stop(state, NoCloseFrame("tcp_closed"), "peer closed TCP connection")
     ws.SocketError(reason) -> {
       log.warning(
         "beacon.transport",
         "TCP error for " <> ctx(state) <> ": " <> reason,
       )
-      Stop(state, NoCloseFrame, "TCP error: " <> reason)
+      Stop(state, NoCloseFrame("tcp_error"), "TCP error: " <> reason)
     }
     ws.SessionRevoked(session_id: _, reason: reason) -> {
       log.warning(
@@ -1339,6 +1464,7 @@ fn handle_runtime_message(
           <> int.to_string(max)
           <> ")",
       )
+      telemetry.ws_backpressure(queued, "outbound_queue", state.id)
       Stop(
         state,
         SendClose(ws.close_try_again_later, "server overloaded"),
@@ -1377,15 +1503,20 @@ fn handle_runtime_message(
             "beacon.transport",
             "Closing slow connection " <> ctx(state) <> ": " <> reason,
           )
+          telemetry.ws_backpressure(queued, "runtime", state.id)
           case send_ws_message(state, ServerError(reason: reason)) {
-            Ok(Nil) ->
+            Ok(sent_state) ->
               Stop(
-                state,
+                sent_state,
                 SendClose(ws.close_try_again_later, "backpressure"),
                 "backpressure: " <> reason,
               )
             Error(send_reason) ->
-              Stop(state, NoCloseFrame, "send failed: " <> send_reason)
+              Stop(
+                state,
+                NoCloseFrame("send_failed"),
+                "send failed: " <> send_reason,
+              )
           }
         }
         ReceivedTcpData(data) -> handle_socket_event(state, ws.SocketData(data))
@@ -1430,13 +1561,13 @@ fn stop_connection(
       Some(ws.encode_close(code, close_reason))
     EchoClose(code: Some(code)) -> Some(ws.encode_close(code, ""))
     EchoClose(code: None) -> Some(ws.encode_empty_close())
-    NoCloseFrame -> None
+    NoCloseFrame(label: _) -> None
   }
-  case frame {
+  let state = case frame {
     Some(bytes) ->
-      case server.send_bytes(state.socket, bytes) {
-        Ok(Nil) -> Nil
-        Error(send_reason) ->
+      case send_counted(state, bytes) {
+        Ok(sent_state) -> sent_state
+        Error(send_reason) -> {
           log.warning(
             "beacon.transport",
             "Failed to send close frame to "
@@ -1444,12 +1575,51 @@ fn stop_connection(
               <> ": "
               <> send_reason,
           )
+          state
+        }
       }
-    None -> Nil
+    None -> state
   }
   server.close(state.socket)
+  let #(close_code, close_label) = close_summary(action)
+  telemetry.ws_close(
+    erlang_monotonic_time() - state.opened_at,
+    state.frames_in,
+    state.frames_out,
+    state.bytes_in,
+    state.bytes_out,
+    close_code,
+    close_label,
+    state.id,
+  )
   cleanup_connection(state)
 }
+
+/// The close code and fixed reason label `[beacon, ws, close]` reports.
+/// A sent close reports its code and its (constant) reason in snake_case;
+/// a peer close reports the peer's code, or 1005 (no status received,
+/// RFC 6455 7.1.5) when it had none; a connection that ended without a
+/// close frame reports 1006 (abnormal closure) and its cause.
+fn close_summary(action: CloseAction) -> #(Int, String) {
+  case action {
+    // Every close reason is a literal, so this is a fixed label set:
+    // "invalid utf-8" becomes "invalid_utf8".
+    SendClose(code: code, reason: reason) -> #(
+      code,
+      reason |> string.replace(" ", "_") |> string.replace("-", ""),
+    )
+    EchoClose(code: Some(code)) -> #(code, "peer_close")
+    EchoClose(code: None) -> #(close_no_status, "peer_close")
+    NoCloseFrame(label: label) -> #(close_abnormal, label)
+  }
+}
+
+/// RFC 6455 7.4.1: no status code was present (never sent on the wire).
+const close_no_status = 1005
+
+/// RFC 6455 7.4.1: the connection closed without a close frame (never sent
+/// on the wire).
+const close_abnormal = 1006
 
 /// WebSocket receive loop — runs in the handler process.
 /// Receives runtime messages, its own timers and socket events.
@@ -1500,6 +1670,7 @@ fn start_ws_connection(
   admission: Admission,
 ) -> Nil {
   let conn_id = admission.conn_id
+  let opened_at = erlang_monotonic_time()
   log.info(
     "beacon.transport",
     "New connection: " <> conn_id <> " (peer " <> admission.peer_ip <> ")",
@@ -1566,6 +1737,11 @@ fn start_ws_connection(
             IdleCheck,
           )),
           auth_timer: auth_timer,
+          opened_at: opened_at,
+          frames_in: 0,
+          frames_out: 0,
+          bytes_in: 0,
+          bytes_out: 0,
         )
 
       // Start receiving TCP data
@@ -1574,24 +1750,34 @@ fn start_ws_connection(
       // Enter the receive loop — returns after close and cleanup
       ws_loop(state, subject)
     }
-    Error(reason) -> {
-      log.error(
-        "beacon.transport",
-        "Closing WebSocket after runtime startup failure for "
-          <> conn_id
-          <> " (peer "
-          <> admission.peer_ip
-          <> "): "
-          <> reason,
-      )
-      case
-        server.send_bytes(
-          socket,
-          ws.encode_close(ws.close_internal_error, "startup failure"),
-        )
+    Error(startup_error) -> {
+      let #(close_code, close_reason, close_label) =
+        startup_close(startup_error)
+      let message =
+        "Closing WebSocket "
+        <> conn_id
+        <> " (peer "
+        <> admission.peer_ip
+        <> ") with "
+        <> int.to_string(close_code)
+        <> " after the runtime did not start: "
+        <> startup_error_to_string(startup_error)
+      // An init refusal with a 4xx status is the app's decision about this
+      // request, not a server fault.
+      case startup_error {
+        InitRefused(init_error) ->
+          case error.init_error_status(init_error) >= 500 {
+            True -> log.error("beacon.transport", message)
+            False -> log.warning("beacon.transport", message)
+          }
+        StartupFailed(_) -> log.error("beacon.transport", message)
+      }
+      let close_frame = ws.encode_close(close_code, close_reason)
+      let #(frames_out, bytes_out) = case
+        server.send_bytes(socket, close_frame)
       {
-        Ok(Nil) -> Nil
-        Error(send_reason) ->
+        Ok(Nil) -> #(1, bit_array.byte_size(close_frame))
+        Error(send_reason) -> {
           log.warning(
             "beacon.transport",
             "Failed to send close frame after startup failure for "
@@ -1599,8 +1785,20 @@ fn start_ws_connection(
               <> ": "
               <> send_reason,
           )
+          #(0, 0)
+        }
       }
       server.close(socket)
+      telemetry.ws_close(
+        erlang_monotonic_time() - opened_at,
+        0,
+        frames_out,
+        0,
+        bytes_out,
+        close_code,
+        close_label,
+        conn_id,
+      )
       ws.release_ip_slot(admission.slot_key)
       let conn_count = connection_tracker_decrement()
       log.debug(
@@ -1831,16 +2029,32 @@ pub fn origin_allowed_for_host(
 /// Admission order: limits sanity, global cap, per-IP cap, origin, auth,
 /// then RFC 6455 handshake validation. Every rejection is logged with the
 /// connection id and peer address and releases what was acquired.
+/// How a WebSocket upgrade request ended: upgraded (the 101 was written
+/// and the connection starts) or refused with a fixed snake_case label,
+/// the `result` of the `[beacon, ws, upgrade]` span.
+type UpgradeOutcome {
+  Upgraded(admission: Admission)
+  Refused(label: String)
+}
+
+fn upgrade_outcome_label(outcome: UpgradeOutcome) -> String {
+  case outcome {
+    Upgraded(admission: _) -> "ok"
+    Refused(label: label) -> label
+  }
+}
+
 fn handle_ws_request(
   socket: Socket,
   req: Request(Connection),
   config: TransportConfig,
-) -> Nil {
+) -> UpgradeOutcome {
   let conn_id = generate_connection_id()
   let limits = config.security_limits
   case validate_security_limits(limits), ws_client_ip(socket, req, limits) {
     Error(reason), _ ->
       reject_ws_request(
+        "invalid_limits",
         socket,
         conn_id,
         "unknown",
@@ -1857,6 +2071,7 @@ fn handle_ws_request(
       )
       server.close(socket)
       release_connection_slot("peer gone before upgrade")
+      Refused("peer_gone")
     }
     Ok(Nil), Ok(peer_ip) ->
       admit_ws_request(socket, req, config, conn_id, peer_ip)
@@ -1869,12 +2084,13 @@ fn admit_ws_request(
   config: TransportConfig,
   conn_id: ConnectionId,
   peer_ip: String,
-) -> Nil {
+) -> UpgradeOutcome {
   let limits = config.security_limits
   let current_count = connection_tracker_count()
   case current_count > limits.max_connections {
     True ->
       reject_ws_request(
+        "rejected_connection_limit",
         socket,
         conn_id,
         peer_ip,
@@ -1894,6 +2110,7 @@ fn admit_ws_request(
       case server.get_local_port(socket) {
         Error(reason) ->
           reject_ws_request(
+            "local_port_unavailable",
             socket,
             conn_id,
             peer_ip,
@@ -1922,11 +2139,12 @@ fn acquire_ws_slot(
   conn_id: ConnectionId,
   peer_ip: String,
   slot_key: String,
-) -> Nil {
+) -> UpgradeOutcome {
   let limits = config.security_limits
   case ws.acquire_ip_slot(slot_key, limits.max_ws_connections_per_ip) {
     Error(count) ->
       reject_ws_request(
+        "rejected_ip_limit",
         socket,
         conn_id,
         peer_ip,
@@ -1950,9 +2168,10 @@ fn authorize_ws_request(
   req: Request(Connection),
   config: TransportConfig,
   admission: Admission,
-) -> Nil {
-  let reject = fn(status, body, reason) {
+) -> UpgradeOutcome {
+  let reject = fn(label, status, body, reason) {
     reject_ws_request(
+      label,
       socket,
       admission.conn_id,
       admission.peer_ip,
@@ -1963,7 +2182,13 @@ fn authorize_ws_request(
     )
   }
   case check_origin(req, config.security_limits) {
-    Error(reason) -> reject(403, "Forbidden: " <> reason, "origin: " <> reason)
+    Error(reason) ->
+      reject(
+        "rejected_origin",
+        403,
+        "Forbidden: " <> reason,
+        "origin: " <> reason,
+      )
     Ok(Nil) -> {
       let auth_ok = case config.ws_auth {
         Some(auth_fn) -> auth_fn(req)
@@ -1971,7 +2196,12 @@ fn authorize_ws_request(
       }
       case auth_ok {
         Error(reason) ->
-          reject(401, "Unauthorized: " <> reason, "ws_auth: " <> reason)
+          reject(
+            "rejected_auth",
+            401,
+            "Unauthorized: " <> reason,
+            "ws_auth: " <> reason,
+          )
         Ok(Nil) ->
           case ws.validate_upgrade(req) {
             Error(error) -> {
@@ -1980,11 +2210,16 @@ fn authorize_ws_request(
                 426 ->
                   reject_unsupported_version(socket, admission, description)
                 status ->
-                  reject(status, description, "handshake: " <> description)
+                  reject(
+                    "rejected_handshake",
+                    status,
+                    description,
+                    "handshake: " <> description,
+                  )
               }
             }
             Ok(client_key) ->
-              upgrade_ws_request(socket, req, config, admission, client_key)
+              upgrade_ws_request(socket, config, admission, client_key)
           }
       }
     }
@@ -1993,11 +2228,10 @@ fn authorize_ws_request(
 
 fn upgrade_ws_request(
   socket: Socket,
-  req: Request(Connection),
   config: TransportConfig,
   admission: Admission,
   client_key: String,
-) -> Nil {
+) -> UpgradeOutcome {
   let upgraded = {
     use _ <- result.try(ws.set_send_timeout(
       socket,
@@ -2006,7 +2240,7 @@ fn upgrade_ws_request(
     ws.send_upgrade_response(socket, client_key)
   }
   case upgraded {
-    Ok(Nil) -> start_ws_connection(socket, config, req, admission)
+    Ok(Nil) -> Upgraded(admission)
     Error(reason) -> {
       log.warning(
         "beacon.transport",
@@ -2020,6 +2254,7 @@ fn upgrade_ws_request(
       server.close(socket)
       ws.release_ip_slot(admission.slot_key)
       release_connection_slot("upgrade write failed")
+      Refused("upgrade_write_failed")
     }
   }
 }
@@ -2029,7 +2264,7 @@ fn reject_unsupported_version(
   socket: Socket,
   admission: Admission,
   description: String,
-) -> Nil {
+) -> UpgradeOutcome {
   log.warning(
     "beacon.transport",
     "WebSocket upgrade rejected for "
@@ -2057,11 +2292,14 @@ fn reject_unsupported_version(
       )
   }
   server.close(socket)
+  Refused("rejected_version")
 }
 
 /// Reject an upgrade: log with context, release the per-IP slot (if one
 /// was taken) and the global count, answer with an HTTP error and close.
+/// `label` is the upgrade span's `result`.
 fn reject_ws_request(
+  label: String,
   socket: Socket,
   conn_id: ConnectionId,
   peer_ip: String,
@@ -2069,7 +2307,7 @@ fn reject_ws_request(
   status: Int,
   body: String,
   reason: String,
-) -> Nil {
+) -> UpgradeOutcome {
   log.warning(
     "beacon.transport",
     "WebSocket upgrade rejected for "
@@ -2087,6 +2325,7 @@ fn reject_ws_request(
   }
   release_connection_slot("WebSocket request rejected")
   transport_http.write_error(socket, status, body)
+  Refused(label)
 }
 
 // --- HTTP Handler ---
@@ -2132,19 +2371,25 @@ fn route_framework_request(
   req: Request(Connection),
 ) -> response.Response(ResponseBody) {
   case req.path {
-    "/health" ->
+    "/health" -> {
+      transport_http.tag_route("/health")
       response.new(200)
       |> response.set_header("content-type", "application/json")
       |> response.set_body(Bytes(bytes_tree.from_string("{\"status\":\"ok\"}")))
-    "/beacon_client.js" ->
+    }
+    "/beacon_client.js" -> {
+      transport_http.tag_route("/beacon_client.js")
       when_readable_method(req, fn() { serve_client_js(req) })
+    }
     "/beacon_client_" <> _ -> {
       let name = string.drop_start(req.path, 1)
       // Only exact build output names are read from the assets directory;
       // anything else is an ordinary path.
       case static.is_client_bundle_name(name) {
-        True ->
+        True -> {
+          transport_http.tag_route(client_bundle_route)
           when_readable_method(req, fn() { serve_hashed_client_js(name, req) })
+        }
         False -> route_static_or_page(config, req)
       }
     }
@@ -2158,6 +2403,7 @@ fn route_static_or_page(
   req: Request(Connection),
 ) -> response.Response(ResponseBody) {
   let page = fn() {
+    transport_http.tag_route(page_route)
     serve_page_or_ssr(config.page_html, config.ssr_factory, req)
   }
   case config.static_config {
@@ -2165,7 +2411,11 @@ fn route_static_or_page(
     Some(static_cfg) ->
       case static.matches_prefix(static_cfg, req.path) {
         False -> page()
-        True ->
+        True -> {
+          // Tagged before the method check, so a 405 is reported on the
+          // static route too. A missed file is served as a page, which
+          // re-tags it (the last tag wins).
+          transport_http.tag_route(static.route_pattern(static_cfg))
           when_readable_method(req, fn() {
             case
               static.serve_with_etag_check(
@@ -2178,9 +2428,20 @@ fn route_static_or_page(
               Error(Nil) -> page()
             }
           })
+        }
       }
   }
 }
+
+/// Telemetry route of the hashed client bundle (`/beacon_client_<hash>.js`).
+const client_bundle_route = "/beacon_client_:hash"
+
+/// Telemetry route of every page request. Pages are routed by the app's
+/// typed router, which has no patterns, so all pages share one label.
+pub const page_route = "/*"
+
+/// Telemetry route of the WebSocket endpoint.
+pub const ws_route = "/ws"
 
 /// Run `serve` for GET and HEAD; any other method gets 405 (RFC 9110 §15.5.6).
 fn when_readable_method(
@@ -2313,12 +2574,34 @@ fn serve_requests(
 
 /// Route a /ws request: middleware, then the WebSocket upgrade. The
 /// connection never returns to the HTTP loop afterwards.
+///
+/// The `[beacon, ws, upgrade]` span covers the decision, from the request
+/// head to the 101 or the refusal; the connection itself runs after the
+/// span has ended.
 fn serve_ws_request(
   socket: Socket,
   req: Request(Connection),
   framing: transport_http.BodyFraming,
   config: TransportConfig,
 ) -> Nil {
+  let outcome =
+    telemetry.ws_upgrade_span(ws_route, fn() {
+      let outcome = decide_ws_upgrade(socket, req, framing, config)
+      #(outcome, upgrade_outcome_label(outcome))
+    })
+  case outcome {
+    Upgraded(admission) -> start_ws_connection(socket, config, req, admission)
+    Refused(label) ->
+      log.debug("beacon.transport", "WebSocket upgrade refused: " <> label)
+  }
+}
+
+fn decide_ws_upgrade(
+  socket: Socket,
+  req: Request(Connection),
+  framing: transport_http.BodyFraming,
+  config: TransportConfig,
+) -> UpgradeOutcome {
   case framing.content_length, transport_http.get_buffered_byte_count(socket) {
     0, 0 ->
       case check_middleware(req, config.middlewares) {
@@ -2333,6 +2616,7 @@ fn serve_ws_request(
               )
           }
           transport_http.close_gracefully(socket)
+          Refused("rejected_middleware")
         }
       }
     0, buffered -> {
@@ -2350,6 +2634,7 @@ fn serve_ws_request(
         400,
         "Data received before the WebSocket handshake completed",
       )
+      Refused("rejected_early_data")
     }
     length, _ -> {
       // Body bytes after an upgrade request would be parsed as WebSocket
@@ -2365,6 +2650,7 @@ fn serve_ws_request(
         400,
         "WebSocket upgrade requests must not have a body",
       )
+      Refused("rejected_body")
     }
   }
 }
@@ -2503,6 +2789,7 @@ fn decide_keep_alive(
 fn asterisk_options_response(
   _req: Request(Connection),
 ) -> response.Response(ResponseBody) {
+  transport_http.tag_route("*")
   log.debug("beacon.transport", "Answering OPTIONS *")
   response.new(204)
   |> response.set_header("allow", allowed_methods_header)
@@ -2525,7 +2812,13 @@ fn check_middleware(
         |> response.set_body(Bytes(bytes_tree.new()))
       }
       let piped = middleware.pipeline(mws, marker)
-      case transport_http.run_handler(piped, req) {
+      // Tag before the middleware runs, so a middleware that answers the
+      // upgrade itself is still reported on the /ws route.
+      let tagged = fn(req) {
+        transport_http.tag_route(ws_route)
+        piped(req)
+      }
+      case transport_http.run_handler(tagged, req) {
         Ok(result) ->
           case result.status {
             101 -> Ok(Nil)
@@ -2813,6 +3106,45 @@ pub fn start(
 pub fn start_listener(
   config: TransportConfig,
 ) -> Result(server.Listener, error.BeaconError) {
+  use handler_fn <- result.try(prepare_listener(config))
+  case server.start(to_listener_options(config), handler_fn) {
+    Ok(listener) -> {
+      log.info(
+        "beacon.transport",
+        "Listening on port " <> int.to_string(server.get_port(listener)),
+      )
+      Ok(listener)
+    }
+    Error(reason) -> Error(bind_failed(config, reason))
+  }
+}
+
+/// A child specification that starts the listener under a supervisor (the
+/// application's root supervision tree). The configuration is checked when
+/// the specification is built, so a bad config fails before any process
+/// starts. A restarted listener binds the port of its first start again
+/// (with port 0, the port the OS assigned then).
+pub fn supervised(
+  config: TransportConfig,
+) -> Result(supervision.ChildSpecification(server.Listener), error.BeaconError) {
+  use handler_fn <- result.try(prepare_listener(config))
+  case server.supervised(to_listener_options(config), handler_fn) {
+    Ok(spec) -> {
+      log.debug(
+        "beacon.transport",
+        "Listener child specification built for port "
+          <> int.to_string(config.port),
+      )
+      Ok(spec)
+    }
+    Error(reason) -> Error(bind_failed(config, reason))
+  }
+}
+
+/// Validate the configuration and build the per-connection handler.
+fn prepare_listener(
+  config: TransportConfig,
+) -> Result(fn(Socket) -> Nil, error.BeaconError) {
   log.info(
     "beacon.transport",
     "Starting on port " <> int.to_string(config.port),
@@ -2832,41 +3164,32 @@ pub fn start_listener(
     None -> Ok(Nil)
   }
   case validate_security_limits(config.security_limits), static_check {
-    Error(reason), _ ->
+    Error(reason), _ -> {
+      log.error("beacon.transport", "Invalid security limits: " <> reason)
       Error(error.ConfigError(reason: "Invalid security limits: " <> reason))
-    _, Error(reason) ->
+    }
+    _, Error(reason) -> {
+      log.error("beacon.transport", "Invalid static config: " <> reason)
       Error(error.ConfigError(reason: "Invalid static config: " <> reason))
+    }
     Ok(Nil), Ok(Nil) -> {
       // Built once: middleware and routing closures are shared by every
       // connection instead of being rebuilt per request.
       let handler = create_handler(config)
-      let handler_fn = fn(socket: Socket) {
-        per_connection_handler(socket, config, handler)
-      }
-      case server.start(to_listener_options(config), handler_fn) {
-        Ok(listener) -> {
-          log.info(
-            "beacon.transport",
-            "Listening on port " <> int.to_string(server.get_port(listener)),
-          )
-          Ok(listener)
-        }
-        Error(reason) -> {
-          log.error(
-            "beacon.transport",
-            "Failed to start on port "
-              <> int.to_string(config.port)
-              <> ": "
-              <> reason,
-          )
-          Error(error.TransportError(
-            reason: "Failed to bind to port "
-            <> int.to_string(config.port)
-            <> ": "
-            <> reason,
-          ))
-        }
-      }
+      Ok(fn(socket: Socket) { per_connection_handler(socket, config, handler) })
     }
   }
+}
+
+fn bind_failed(config: TransportConfig, reason: String) -> error.BeaconError {
+  log.error(
+    "beacon.transport",
+    "Failed to start on port " <> int.to_string(config.port) <> ": " <> reason,
+  )
+  error.TransportError(
+    reason: "Failed to bind to port "
+    <> int.to_string(config.port)
+    <> ": "
+    <> reason,
+  )
 }

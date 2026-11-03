@@ -155,7 +155,7 @@ pub type Draft {
 
 const api_key = \"sk_fixture_secret\"
 
-pub fn init(_ctx: b.Context) -> #(State, effect.Effect(Msg)) {
+pub fn init(_ctx: b.Context) -> Result(#(State, effect.Effect(Msg)), b.InitError) {
   let model =
     Model(
       count: 0,
@@ -167,7 +167,7 @@ pub fn init(_ctx: b.Context) -> #(State, effect.Effect(Msg)) {
       focused: False,
       kind: kinds.Plain,
     )
-  #(State(model:, api_key:), effect.none())
+  Ok(#(State(model:, api_key:), effect.none()))
 }
 
 pub fn update(state: State, msg: Msg) -> #(State, effect.Effect(Msg)) {

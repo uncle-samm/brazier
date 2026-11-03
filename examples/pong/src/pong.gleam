@@ -55,8 +55,10 @@ pub type Msg {
   PauseGame
 }
 
-fn init(_ctx: beacon.Context) -> #(Model, Effect(Msg)) {
-  #(
+fn init(
+  _ctx: beacon.Context,
+) -> Result(#(Model, Effect(Msg)), beacon.InitError) {
+  Ok(#(
     Model(
       left_y: height / 2,
       right_y: height / 2,
@@ -69,7 +71,7 @@ fn init(_ctx: beacon.Context) -> #(Model, Effect(Msg)) {
       running: False,
     ),
     effect.none(),
-  )
+  ))
 }
 
 fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {

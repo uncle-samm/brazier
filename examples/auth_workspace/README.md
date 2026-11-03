@@ -10,12 +10,14 @@ Cookie sessions, CSRF-protected API routes and a role-gated page, on a
 - `GET /api/me`, `POST /api/profile` and `POST /api/logout` use
   `auth.protect_api` and `auth.protect_api_with_csrf`. Logout deletes the
   session, and Beacon closes its live sockets.
-- `init` reads the session cookie from the `Context` (`beacon.cookie`) on
-  the HTML render and on the connected mount, and loads the account from
-  the session store. No cookie or an expired session is a guest; a store
-  that cannot answer crashes the request instead of showing the guest page.
-- `ws_auth(auth.protect_ws(...))` refuses the WebSocket without a valid
-  session.
+- `init` is `auth.init_from_session`: it reads the session cookie from the
+  `Context` on the HTML render and on the connected mount, and loads the
+  account from the session store. No cookie or an expired session is a
+  guest; a store that cannot answer refuses the page with 503 (the socket
+  closes with 4503) instead of showing the guest page.
+- `ws_auth(auth.allow_guests_ws(...))` binds a signed-in socket to its
+  session, so logout closes it, and lets the guest pages connect as guests.
+  A store outage refuses the socket.
 - One `Route` type and `parse` cover `/`, `/login`, `/app`, `/settings` and
   `/admin`; any other path is a 404. Nav links change the route without a
   page load.

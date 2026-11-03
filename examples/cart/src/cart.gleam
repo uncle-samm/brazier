@@ -149,10 +149,12 @@ fn record(changes: ListStore(StockChange), change: StockChange) -> Effect(Msg) {
 
 // --- Init and update (server) ---
 
-fn init(changes: ListStore(StockChange)) -> #(State, Effect(Msg)) {
+fn init(
+  changes: ListStore(StockChange),
+) -> Result(#(State, Effect(Msg)), beacon.InitError) {
   let cart = new_cart_id()
   log.info("cart", "New cart " <> cart)
-  #(State(cart:, model: read_model(changes, cart)), effect.none())
+  Ok(#(State(cart:, model: read_model(changes, cart)), effect.none()))
 }
 
 /// 128 random bits: no two sessions share a cart.

@@ -10,10 +10,10 @@ on the server, so an effect may use stores, PubSub, HTTP, the environment,
 randomness and any other BEAM-only code.
 
 ```gleam
-fn init(_ctx: beacon.Context) -> #(Model, Effect(Msg)) {
-  #(Model(loading: True, items: []), effect.background(fn(dispatch) {
+fn init(_ctx: beacon.Context) -> Result(#(Model, Effect(Msg)), beacon.InitError) {
+  Ok(#(Model(loading: True, items: []), effect.background(fn(dispatch) {
     dispatch(ItemsLoaded(load_items()))
-  }))
+  })))
 }
 
 fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {

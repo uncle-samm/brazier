@@ -2,8 +2,10 @@ import beacon/auth
 import beacon/cookie
 import beacon/effect
 import beacon/element
+import beacon/error
 import beacon/html
 import beacon/internal/context.{type Context}
+import beacon/log_capture
 import beacon/session
 import beacon/ssr
 import gleam/bit_array
@@ -44,7 +46,7 @@ fn test_update(
 
 fn test_config() -> ssr.SsrConfig(TestModel, TestMsg) {
   ssr.SsrConfig(
-    init: fn(_ctx) { #(TestModel(name: "World"), effect.none()) },
+    init: fn(_ctx) { Ok(#(TestModel(name: "World"), effect.none())) },
     update: test_update,
     route: option.None,
     view: test_view,
@@ -61,7 +63,7 @@ fn test_config() -> ssr.SsrConfig(TestModel, TestMsg) {
 fn routed_config() -> ssr.SsrConfig(TestModel, TestMsg) {
   ssr.SsrConfig(
     ..test_config(),
-    init: fn(_ctx) { #(TestModel(name: "default"), effect.none()) },
+    init: fn(_ctx) { Ok(#(TestModel(name: "default"), effect.none())) },
     route: option.Some(fn(page: Uri) {
       case page.path {
         "/" -> Ok(SetName("home"))
@@ -78,7 +80,7 @@ fn reporting_config(
 ) -> ssr.SsrConfig(TestModel, TestMsg) {
   ssr.SsrConfig(..routed_config(), init: fn(ctx) {
     process.send(calls, ctx)
-    #(TestModel(name: "default"), effect.none())
+    Ok(#(TestModel(name: "default"), effect.none()))
   })
 }
 
@@ -249,6 +251,64 @@ pub fn render_page_unknown_route_does_not_run_init_test() {
   let assert Error(Nil) = process.receive(calls, 0)
 }
 
+pub fn render_page_init_unavailable_is_a_static_503_test() {
+  let config =
+    ssr.SsrConfig(..test_config(), init: fn(_ctx) {
+      Error(error.unavailable("orders-db.internal:5432 refused"))
+    })
+  let #(page, logs) = log_capture.capture(fn() { render(config) })
+  let assert 503 = page.status
+  let assert True = str_contains(page.html, "Service Unavailable")
+  let assert True = str_contains(page.html, "temporarily unavailable")
+  // No client script: there is no session to connect to.
+  let assert False = str_contains(page.html, "<script")
+  // The app's reason is logged, never rendered.
+  let assert False = str_contains(page.html, "orders-db")
+  let assert True =
+    log_capture.has(logs, level: "error", containing: [
+      "init refused the dead render of",
+      "503: orders-db.internal:5432 refused",
+    ])
+  let assert Ok(resp) = ssr.to_response(page)
+  let assert 503 = resp.status
+}
+
+pub fn render_page_init_refusal_carries_its_status_test() {
+  let config =
+    ssr.SsrConfig(..test_config(), init: fn(_ctx) {
+      Error(error.refuse(404, "board 7 is archived"))
+    })
+  let #(page, logs) = log_capture.capture(fn() { render(config) })
+  let assert 404 = page.status
+  let assert True = str_contains(page.html, "Not Found")
+  let assert False = str_contains(page.html, "archived")
+  let assert False = str_contains(page.html, "<script")
+  // A client error is the app's answer, not a failure: a warning.
+  let assert True =
+    log_capture.has(logs, level: "warning", containing: [
+      "init refused", "404: board 7 is archived",
+    ])
+  let assert False =
+    log_capture.has(logs, level: "error", containing: ["init refused"])
+}
+
+pub fn render_page_init_refusal_skips_the_route_update_test() {
+  // A refused init has no state to route: the router's update never runs.
+  let calls = process.new_subject()
+  let config =
+    ssr.SsrConfig(
+      ..routed_config(),
+      init: fn(_ctx) { Error(error.refuse(403, "not a member")) },
+      update: fn(model, msg) {
+        process.send(calls, Nil)
+        test_update(model, msg)
+      },
+    )
+  let page = render_path(config, "/about")
+  let assert 403 = page.status
+  let assert Error(Nil) = process.receive(calls, 0)
+}
+
 pub fn render_page_bad_percent_encoding_is_a_static_400_test() {
   let calls = process.new_subject()
   let page = render_path(reporting_config(calls), "/%zz")
@@ -300,10 +360,10 @@ pub fn render_page_does_not_run_init_effects_test() {
   let ran = process.new_subject()
   let config =
     ssr.SsrConfig(..test_config(), init: fn(_ctx) {
-      #(
+      Ok(#(
         TestModel(name: "World"),
         effect.from(fn(_dispatch) { process.send(ran, Nil) }),
-      )
+      ))
     })
   let page = render(config)
   let assert 200 = page.status
@@ -314,7 +374,7 @@ pub fn recovery_model_is_stored_in_signed_cookie_token_test() {
   let config =
     ssr.SsrConfig(
       ..test_config(),
-      init: fn(_ctx) { #(TestModel(name: "VisibleState"), effect.none()) },
+      init: fn(_ctx) { Ok(#(TestModel(name: "VisibleState"), effect.none())) },
       title: fn(_model) { "Cookie State Test" },
       recovery_encoder: option.Some(fn(_model: TestModel) {
         "SecretCookieState"

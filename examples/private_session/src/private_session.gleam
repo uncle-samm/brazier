@@ -50,8 +50,10 @@ pub type Msg {
   RefreshPublicSummary
 }
 
-fn init(_ctx: beacon.Context) -> #(Session, Effect(Msg)) {
-  #(
+fn init(
+  _ctx: beacon.Context,
+) -> Result(#(Session, Effect(Msg)), beacon.InitError) {
+  Ok(#(
     Session(
       model: Model(
         user: "Ada",
@@ -65,7 +67,7 @@ fn init(_ctx: beacon.Context) -> #(Session, Effect(Msg)) {
       denied_attempts: 0,
     ),
     effect.none(),
-  )
+  ))
 }
 
 fn update(session: Session, msg: Msg) -> #(Session, Effect(Msg)) {

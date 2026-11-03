@@ -52,10 +52,12 @@ fn memory_mb() -> Float {
 
 // --- Init and update (server) ---
 
-fn init(_ctx: beacon.Context) -> #(Model, Effect(Msg)) {
+fn init(
+  _ctx: beacon.Context,
+) -> Result(#(Model, Effect(Msg)), beacon.InitError) {
   let processes = process_count()
   let memory = memory_mb()
-  #(
+  Ok(#(
     Model(
       process_count: processes,
       memory_mb: memory,
@@ -66,7 +68,7 @@ fn init(_ctx: beacon.Context) -> #(Model, Effect(Msg)) {
     ),
     // Runs on the connected mount only; the HTML render drops it.
     effect.every(refresh_ms, fn() { RefreshStats }),
-  )
+  ))
 }
 
 fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {

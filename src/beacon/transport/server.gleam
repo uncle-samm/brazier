@@ -246,16 +246,29 @@ pub fn supervised(
           case static_supervisor.start(builder) {
             Ok(started) -> {
               let port = ffi_conns_get_port(name)
+              // Same line as `start`: operators and the browser
+              // conformance harness wait for "Listening on port".
               log.info(
                 "beacon.server",
-                "Supervised listener on port " <> int.to_string(port),
+                "Listening on port "
+                  <> int.to_string(port)
+                  <> " with "
+                  <> int.to_string(options.acceptors)
+                  <> " acceptors (supervised)",
               )
               Ok(actor.Started(
                 pid: started.pid,
                 data: Listener(supervisor: started.pid, conns: name, port: port),
               ))
             }
-            Error(err) -> Error(err)
+            Error(err) -> {
+              log.error(
+                "beacon.server",
+                "Supervised listener failed to start: "
+                  <> describe_start_error(err),
+              )
+              Error(err)
+            }
           }
         }),
       )
@@ -271,6 +284,14 @@ pub fn stop(listener: Listener) -> Nil {
     "Stopping listener on port " <> int.to_string(listener.port),
   )
   ffi_stop_supervisor(listener.supervisor)
+  release(listener)
+}
+
+/// Forget the remembered bound port of a listener that has stopped for
+/// good. A restarted listener rebinds the port it bound first (so a port-0
+/// listener keeps its port across restarts); once its parent tree has been
+/// stopped, that memory must go. `stop` calls this itself.
+pub fn release(listener: Listener) -> Nil {
   case ffi_conns_forget_port(listener.conns) {
     True ->
       log.debug(

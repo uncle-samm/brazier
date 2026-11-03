@@ -15,6 +15,8 @@
     binding_fingerprint/1,
     constant_time_equal/2,
     ensure_registry/0,
+    start_registry_link/0,
+    registry_running/0,
     bind_process/3,
     bound_process_count/2,
     notify_revoked/3,
@@ -148,26 +150,67 @@ constant_time_equal(_, _) ->
 %% for a shared (External) store, so a revocation on one node reaches the
 %% sockets bound on all of them (pg:get_members is cluster-wide).
 %%
-%% The scope process is started unlinked on first use (store creation) so it
-%% outlives short-lived callers; beacon's supervision tree should own it.
+%% Ownership: `beacon.start` (application.start_supervised) starts the scope
+%% with start_registry_link/0 as a child of the root supervision tree, before
+%% the HTTP listener. Without the tree (application.start, tests, embedding)
+%% ensure_registry/0 starts it unlinked. Nothing else starts it: a lazy start
+%% from bind/notify could race the supervisor restarting the scope.
+%%
+%% While the scope is not running no process can be bound (pg would hold
+%% the members), so the read and notify functions report no members, and
+%% bind_process/3 crashes loudly.
 
 ensure_registry() ->
     case pg:start(?PG_SCOPE) of
         {ok, _Pid} ->
             logger:info(#{module => beacon_session_ffi,
-                          msg => <<"Started session registry scope">>,
+                          msg => <<"Started session registry scope (unsupervised)">>,
                           scope => ?PG_SCOPE}),
             nil;
         {error, {already_started, _Pid}} ->
             nil
     end.
 
+%% Start the scope linked to the caller (a supervisor). Fails when it is
+%% already running: an unlinked scope started earlier cannot be supervised.
+start_registry_link() ->
+    case pg:start_link(?PG_SCOPE) of
+        {ok, Pid} ->
+            logger:info(#{module => beacon_session_ffi,
+                          msg => <<"Started session registry scope (supervised)">>,
+                          scope => ?PG_SCOPE, pid => Pid}),
+            {ok, Pid};
+        {error, {already_started, Pid}} ->
+            logger:error(#{module => beacon_session_ffi,
+                           msg => <<"Session registry scope is already running outside the supervision tree">>,
+                           scope => ?PG_SCOPE, pid => Pid}),
+            {error, <<"the session registry scope (beacon_session_pg) is already running "
+                      "outside the supervision tree; application.start or "
+                      "session.ensure_registry ran before the supervised start">>};
+        {error, Reason} ->
+            logger:error(#{module => beacon_session_ffi,
+                           msg => <<"Session registry scope failed to start">>,
+                           scope => ?PG_SCOPE, reason => Reason}),
+            {error, unicode:characters_to_binary(io_lib:format("~0p", [Reason]))}
+    end.
+
+registry_running() ->
+    whereis(?PG_SCOPE) =/= undefined.
+
 group(Namespace, SessionId) ->
     {beacon_session, Namespace, SessionId}.
 
 %% Idempotently bind Pid to the session. Returns the local member count.
+%% Crashes when the scope is not running: binding would silently not happen.
 bind_process(Namespace, SessionId, Pid) ->
-    ensure_registry(),
+    case registry_running() of
+        true -> ok;
+        false ->
+            logger:error(#{module => beacon_session_ffi,
+                           msg => <<"Cannot bind a process: the session registry scope is not running">>,
+                           scope => ?PG_SCOPE}),
+            erlang:error({beacon_session_registry_down, ?PG_SCOPE})
+    end,
     Group = group(Namespace, SessionId),
     Members = pg:get_local_members(?PG_SCOPE, Group),
     case lists:member(Pid, Members) of
@@ -179,21 +222,26 @@ bind_process(Namespace, SessionId, Pid) ->
 
 %% Bound processes on this node only.
 bound_process_count(Namespace, SessionId) ->
-    ensure_registry(),
-    length(pg:get_local_members(?PG_SCOPE, group(Namespace, SessionId))).
+    length(local_members(group(Namespace, SessionId))).
 
 %% Send {beacon_session_revoked, SessionId, Reason} to every bound process on
 %% every connected node. Returns the number of processes notified.
 notify_revoked(Namespace, SessionId, Reason) ->
-    ensure_registry(),
-    send_revoked(pg:get_members(?PG_SCOPE, group(Namespace, SessionId)),
-                 SessionId, Reason).
+    Members = case registry_running() of
+        true -> pg:get_members(?PG_SCOPE, group(Namespace, SessionId));
+        false -> []
+    end,
+    send_revoked(Members, SessionId, Reason).
 
 %% The same, for processes on this node only (the nodeup re-check).
 notify_revoked_local(Namespace, SessionId, Reason) ->
-    ensure_registry(),
-    send_revoked(pg:get_local_members(?PG_SCOPE, group(Namespace, SessionId)),
-                 SessionId, Reason).
+    send_revoked(local_members(group(Namespace, SessionId)), SessionId, Reason).
+
+local_members(Group) ->
+    case registry_running() of
+        true -> pg:get_local_members(?PG_SCOPE, Group);
+        false -> []
+    end.
 
 send_revoked(Members, SessionId, Reason) ->
     lists:foreach(fun(Pid) ->
@@ -203,10 +251,14 @@ send_revoked(Members, SessionId, Reason) ->
 
 %% Session ids in Namespace with at least one bound process on this node.
 local_bound_sessions(Namespace) ->
-    ensure_registry(),
-    [Id || {beacon_session, Ns, Id} = Group <- pg:which_groups(?PG_SCOPE),
-           Ns =:= Namespace,
-           pg:get_local_members(?PG_SCOPE, Group) =/= []].
+    case registry_running() of
+        true ->
+            [Id || {beacon_session, Ns, Id} = Group <- pg:which_groups(?PG_SCOPE),
+                   Ns =:= Namespace,
+                   pg:get_local_members(?PG_SCOPE, Group) =/= []];
+        false ->
+            []
+    end.
 
 %% --- Maintenance process ---
 %% An unlinked process per store that

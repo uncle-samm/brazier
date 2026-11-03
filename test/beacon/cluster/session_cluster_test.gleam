@@ -17,6 +17,12 @@ import gleam/option.{None, Some}
 
 const wait_ms = 5000
 
+/// A telemetry event recorded on a peer (see beacon_cluster_test_ffi).
+pub type RecordedEvent {
+  // The constructor name is the tag the FFI builds the tuple with.
+  Event(name: String, node: String, reason: String)
+}
+
 /// Peers keep connections to the database node while a netsplit separates
 /// two app nodes, as app servers keep reaching Postgres. OTP's default
 /// (prevent_overlapping_partitions) would instead cut one of them off the
@@ -25,6 +31,9 @@ const partial_partitions = ["-kernel", "prevent_overlapping_partitions", "false"
 
 fn start_store(p: Peer, name: String, db: Node) -> SessionStore {
   peer.on(p, fn() {
+    // No application runs on the peer: start the session scope it would
+    // own, so bindings on this node can be made and seen from here.
+    session.ensure_registry()
     let ext = backend(name, db)
     let assert Ok(store) =
       owned(fn() {
@@ -97,6 +106,7 @@ pub fn revocation_during_partition_is_enforced_on_heal_test_() -> peer.Timeout {
   let _socket = bind_on(b, store_b, s.id)
   let _kept_socket = bind_on(b, store_b, kept.id)
   assert bound_seen_from(a, name, s.id, 1)
+  peer.on(b, fn() { record_events([["beacon", "session", "revoked"]]) })
 
   peer.partition(a, b)
   // A no longer sees B's socket, so the logout cannot reach it.
@@ -111,6 +121,10 @@ pub fn revocation_during_partition_is_enforced_on_heal_test_() -> peer.Timeout {
   // The live session's socket is left alone.
   assert peer.on(b, fn() { session.get(store_b, kept.id) }) == Some(kept)
   assert !list.any(peer.on(b, revocations), fn(r) { r.0 == kept.id })
+  // The re-check reports its revocation, once: the kept session is live.
+  let revoked = peer.on(b, recorded_events)
+  assert list.filter(revoked, fn(e) { e.name == "beacon.session.revoked" })
+    == [Event("beacon.session.revoked", "", "recheck")]
 }
 
 /// Sessions on an External backend are the same session on every node.
@@ -191,6 +205,12 @@ fn spawn_bound(bind: fn() -> Nil) -> Pid
 
 @external(erlang, "beacon_session_test_ffi", "revocations")
 fn revocations() -> List(#(String, String))
+
+@external(erlang, "beacon_cluster_test_ffi", "record_events")
+fn record_events(names: List(List(String))) -> Nil
+
+@external(erlang, "beacon_cluster_test_ffi", "recorded_events")
+fn recorded_events() -> List(RecordedEvent)
 
 @external(erlang, "beacon_session_test_ffi", "bound_everywhere")
 fn bound_everywhere(namespace: String, id: String) -> Int

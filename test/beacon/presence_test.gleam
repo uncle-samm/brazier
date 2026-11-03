@@ -5,11 +5,12 @@
 
 import beacon/cluster/log_capture
 import beacon/presence.{
-  type Presence, AlreadyTracked, Diff, Down, Entry, InvalidConfig, InvalidKey,
-  InvalidMessage, InvalidTopic, Meta, MetaDecodeFailed, MetaTooLarge, NotTracked,
+  type Presence, AlreadyTracked, Down, InvalidConfig, InvalidKey, InvalidMessage,
+  InvalidTopic, MetaDecodeFailed, MetaTooLarge, NotTracked,
   PresenceLimitExceeded, StartFailed, TrackerDown, Up,
 }
 import beacon/presence/holder.{type Holder}
+import beacon/presence/sync.{Diff, Entry, Meta}
 import beacon/pubsub
 import beacon/telemetry
 import gleam/dynamic.{type Dynamic}
@@ -77,13 +78,13 @@ fn keys(p: Presence(String), topic: String) -> List(String) {
   list.map(entries, fn(entry) { entry.key })
 }
 
-fn next_diff(p: Presence(String)) -> presence.Diff(String) {
+fn next_diff(p: Presence(String)) -> sync.Diff(String) {
   let assert Ok(message) = receive_diff(wait_ms)
   let assert Ok(diff) = presence.decode_diff(p, message)
   diff
 }
 
-fn entry_keys(entries: List(presence.Entry(String))) -> List(String) {
+fn entry_keys(entries: List(sync.Entry(String))) -> List(String) {
   list.map(entries, fn(entry) { entry.key })
 }
 
@@ -332,7 +333,7 @@ pub fn topic_and_key_are_validated_test() {
 }
 
 fn result_keys(
-  outcome: Result(List(presence.Entry(String)), presence.PresenceError),
+  outcome: Result(List(sync.Entry(String)), presence.PresenceError),
 ) -> Result(List(String), presence.PresenceError) {
   case outcome {
     Ok(entries) -> Ok(entry_keys(entries))
@@ -481,6 +482,73 @@ pub fn decode_diff_rejects_other_messages_test() {
   let assert Diff("room", [], [Entry("alice", _)]) = next_diff(other)
   let assert Ok(Nil) = presence.stop(p)
   finish(other, "room")
+}
+
+// --- merge ------------------------------------------------------------------
+
+fn meta(value: String, ref: String) -> sync.Meta(String) {
+  Meta(value:, ref:, ref_prev: None, node: "n@host")
+}
+
+/// key=value@ref, in order.
+fn view(entries: List(sync.Entry(String))) -> List(String) {
+  list.flat_map(entries, fn(entry) {
+    list.map(entry.metas, fn(m) { entry.key <> "=" <> m.value <> "@" <> m.ref })
+  })
+}
+
+pub fn merge_adds_joins_sorted_by_key_test() {
+  let diff =
+    Diff(
+      "room",
+      [Entry("carol", [meta("x", "3")]), Entry("alice", [meta("y", "1")])],
+      [],
+    )
+  let assert ["alice=y@1", "carol=x@3"] = view(sync.merge([], diff))
+}
+
+pub fn merge_is_idempotent_test() {
+  let diff =
+    Diff("room", [Entry("alice", [meta("a", "1"), meta("b", "2")])], [
+      Entry("bob", [meta("c", "9")]),
+    ])
+  let start = [Entry("bob", [meta("c", "9")])]
+  let once = sync.merge(start, diff)
+  let assert ["alice=a@1", "alice=b@2"] = view(once)
+  let assert True = sync.merge(once, diff) == once
+}
+
+/// An update arrives as a join of the new ref and a leave of the old one in
+/// one diff: the joins apply first, so the key never disappears.
+pub fn merge_applies_joins_then_leaves_test() {
+  let start = [Entry("alice", [meta("here", "1")])]
+  let diff =
+    Diff("room", [Entry("alice", [meta("away", "2")])], [
+      Entry("alice", [meta("here", "1")]),
+    ])
+  let assert ["alice=away@2"] = view(sync.merge(start, diff))
+  // A join and leave of the same ref in one diff leaves nothing.
+  let flap =
+    Diff("room", [Entry("bob", [meta("x", "5")])], [
+      Entry("bob", [meta("x", "5")]),
+    ])
+  let assert ["alice=here@1"] = view(sync.merge(start, flap))
+}
+
+pub fn merge_drops_keys_without_metas_test() {
+  let start = [
+    Entry("alice", [meta("a", "1"), meta("b", "2")]),
+    Entry("bob", [meta("c", "3")]),
+  ]
+  let diff =
+    Diff("room", [], [
+      Entry("alice", [meta("a", "1")]),
+      Entry("bob", [meta("c", "3")]),
+      Entry("zed", [meta("unknown", "99")]),
+    ])
+  let merged = sync.merge(start, diff)
+  let assert ["alice=b@2"] = view(merged)
+  let assert [Entry("alice", [_])] = merged
 }
 
 // --- Lifecycle --------------------------------------------------------------

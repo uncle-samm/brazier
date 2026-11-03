@@ -58,13 +58,15 @@ pub fn href(route: Route) -> String {
   }
 }
 
-fn init(_ctx: beacon.Context) -> #(Model, Effect(Msg)) {
+fn init(
+  _ctx: beacon.Context,
+) -> Result(#(Model, Effect(Msg)), beacon.InitError) {
   // `with_router` dispatches RouteChanged for the requested URL before the
   // first render, so this route is only a placeholder.
-  #(
+  Ok(#(
     Model(route: HomePage, home: home.init(), name: "", visits: 0),
     effect.none(),
-  )
+  ))
 }
 
 fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {

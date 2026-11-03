@@ -47,8 +47,10 @@ pub type Msg {
   ClearItems
 }
 
-fn init(_ctx: beacon.Context) -> #(Session, Effect(Msg)) {
-  #(
+fn init(
+  _ctx: beacon.Context,
+) -> Result(#(Session, Effect(Msg)), beacon.InitError) {
+  Ok(#(
     Session(
       model: Model(
         items: [
@@ -62,7 +64,7 @@ fn init(_ctx: beacon.Context) -> #(Session, Effect(Msg)) {
       request_count: 0,
     ),
     effect.none(),
-  )
+  ))
 }
 
 fn update(session: Session, msg: Msg) -> #(Session, Effect(Msg)) {

@@ -43,7 +43,7 @@ const iterations = 2000
 fn bench_config() -> runtime.RuntimeConfig(BenchModel, BenchMsg) {
   runtime.RuntimeConfig(
     init: fn(_ctx) {
-      #(
+      Ok(#(
         BenchModel(
           count: 0,
           items: int.range(from: item_count, to: 0, with: [], run: fn(acc, i) {
@@ -51,7 +51,7 @@ fn bench_config() -> runtime.RuntimeConfig(BenchModel, BenchMsg) {
           }),
         ),
         effect.none(),
-      )
+      ))
     },
     update: fn(model: BenchModel, msg: BenchMsg) {
       case msg {
@@ -79,6 +79,7 @@ fn bench_config() -> runtime.RuntimeConfig(BenchModel, BenchMsg) {
     on_notify: option.None,
     on_notification: option.None,
     secret_key: "bench-secret-key-that-is-long-enough-for-hmac",
+    presence: option.None,
   )
 }
 

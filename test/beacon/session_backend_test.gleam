@@ -46,6 +46,8 @@ fn row(id: String, created_at: Int, last_seen: Int) -> session.StoredSession {
 }
 
 fn bind(store: SessionStore, id: String) -> Pid {
+  // No application runs here: start the node-wide session scope.
+  session.ensure_registry()
   spawn_bound(fn() { session.bind_current_process(store, id) })
 }
 

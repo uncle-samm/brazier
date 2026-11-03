@@ -33,9 +33,9 @@
     http_request_span/3,
     http_connection/3,
     ws_upgrade_span/2,
-    ws_close/7,
-    ws_rate_limited/2,
-    ws_backpressure/2,
+    ws_close/8,
+    ws_rate_limited/3,
+    ws_backpressure/3,
     runtime_span/5,
     runtime_render_span/4,
     runtime_stop/2,
@@ -215,21 +215,22 @@ ws_upgrade_span(Route, Run) ->
     end).
 
 %% [beacon, ws, close]
-ws_close(Duration, FramesIn, FramesOut, BytesIn, BytesOut, CloseCode, Reason) ->
+ws_close(Duration, FramesIn, FramesOut, BytesIn, BytesOut, CloseCode, Reason, ConnectionId) ->
     telemetry:execute([?PREFIX, ws, close],
                       #{duration => Duration, frames_in => FramesIn, frames_out => FramesOut,
                         bytes_in => BytesIn, bytes_out => BytesOut},
-                      #{close_code => CloseCode, reason => Reason}).
+                      #{close_code => CloseCode, reason => Reason,
+                        connection_id => ConnectionId}).
 
 %% [beacon, ws, rate_limited]
-ws_rate_limited(QueueLen, ConnectionId) ->
-    telemetry:execute([?PREFIX, ws, rate_limited], #{queue_len => QueueLen},
-                      #{connection_id => ConnectionId}).
+ws_rate_limited(Violations, Kind, ConnectionId) ->
+    telemetry:execute([?PREFIX, ws, rate_limited], #{count => 1, violations => Violations},
+                      #{kind => Kind, connection_id => ConnectionId}).
 
 %% [beacon, ws, backpressure]
-ws_backpressure(QueueLen, ConnectionId) ->
+ws_backpressure(QueueLen, Reason, ConnectionId) ->
     telemetry:execute([?PREFIX, ws, backpressure], #{queue_len => QueueLen},
-                      #{connection_id => ConnectionId}).
+                      #{reason => Reason, connection_id => ConnectionId}).
 
 %% [beacon, runtime, mount | handle_event | navigate] span.
 runtime_span(Kind, Route, Event, ConnectionId, Run) ->
