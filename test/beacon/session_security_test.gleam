@@ -5,7 +5,6 @@ import beacon/auth
 import beacon/await
 import beacon/log_capture
 import beacon/session
-import beacon/telemetry.{type Event}
 import beacon/transport/server.{type Connection, type ResponseBody, Bytes}
 import gleam/bytes_tree
 import gleam/dict
@@ -134,43 +133,19 @@ pub fn background_sweeper_removes_expired_sessions_test() {
         sweep_interval_ms: 20,
       ),
     )
-  let events = process.new_subject()
-  let handler_id = "sec_sweep_background_" <> int.to_string(unique_integer())
-  let assert Ok(Nil) = telemetry.start()
-  let assert Ok(Nil) =
-    telemetry.attach(handler_id, [["beacon", "session", "expired"]], fn(event) {
-      process.send(events, event)
-    })
   list.each(seq(1, 10), fn(_) {
     let _ = session.create(store)
     Nil
   })
-  // The sweeper emits one expired event per row, after the row is deleted:
-  // each one is a point at which to look, instead of sleeping and hoping
-  // enough sweeps ran.
-  await_swept_empty(store, events)
-  let assert Ok(Nil) = telemetry.detach(handler_id)
-}
-
-/// Wait for expired events from the sweeper until the store is empty.
-fn await_swept_empty(
-  store: session.SessionStore,
-  events: process.Subject(Event),
-) -> Nil {
-  case session.count(store) {
-    0 -> Nil
-    remaining -> {
-      let _swept =
-        await.expect(
-          events,
-          "a sweep with " <> int.to_string(remaining) <> " sessions left",
-          matching: fn(event) {
-            telemetry.string(event, "reason") == Ok("sweep")
-          },
-        )
-      await_swept_empty(store, events)
-    }
-  }
+  // Nothing reads the sessions, so only the background sweeper removes
+  // them. It emits one expired event per row, after deleting the row: each
+  // event is a point to look, instead of sleeping and hoping enough sweeps
+  // ran.
+  await.until_telemetry(
+    [["beacon", "session", "expired"]],
+    "the background sweeper to empty the store",
+    fn() { session.count(store) == 0 },
+  )
 }
 
 // --- Writes never resurrect / never lose data ---
@@ -546,9 +521,6 @@ fn spawn_bound_watcher(
 fn seq(from: Int, to: Int) -> List(Int) {
   int.range(from: to, to: from - 1, with: [], run: fn(acc, i) { [i, ..acc] })
 }
-
-@external(erlang, "erlang", "unique_integer")
-fn unique_integer() -> Int
 
 fn monotonic_ms() -> Int {
   monotonic_time(Millisecond)

@@ -3,7 +3,7 @@
 %% bytes and parses responses itself so tests can observe framing,
 %% pipelining and connection closure precisely.
 -export([connect/1, send/2, recv_response/3, recv_raw/3, wait_closed/2, close/1,
-         kill/1, acceptor_pids/1, sleep_then_send/3, crash/0]).
+         kill/1, acceptor_pids/1, acceptor_pool/2, sleep_then_send/3, crash/0]).
 
 -define(BUF(S), {beacon_http_raw_buffer, S}).
 
@@ -96,6 +96,18 @@ acceptor_pids(ListenerSup) ->
                     is_pid(Pid)],
     lists:append([[Pid || {_, Pid, worker, _} <- supervisor:which_children(Pool), is_pid(Pid)]
                   || Pool <- Pools]).
+
+%% The acceptor pool supervisor under ListenerSup that supervises Acceptor:
+%% {ok, Pool} | {error, nil}.
+acceptor_pool(ListenerSup, Acceptor) ->
+    Pools = [Pid || {_, Pid, supervisor, _} <- supervisor:which_children(ListenerSup),
+                    is_pid(Pid)],
+    Owners = [Pool || Pool <- Pools,
+                      lists:keymember(Acceptor, 2, supervisor:which_children(Pool))],
+    case Owners of
+        [Pool] -> {ok, Pool};
+        _ -> {error, nil}
+    end.
 
 %% --- helpers ---
 

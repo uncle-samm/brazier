@@ -1,5 +1,5 @@
 -module(beacon_await_ffi).
--export([barrier/2, watch_info/2, next_info/2, watch_pg_scope/1,
+-export([barrier/2, watch_info/2, watch_exit/2, next_info/2, watch_pg_scope/1,
          next_pg_leave/3, unwatch_pg_scope/1]).
 
 %% A mailbox barrier on an OTP process (a gleam_otp actor, gen_server or any
@@ -25,14 +25,30 @@ barrier(Pid, TimeoutMs) ->
 %% message before handling it. The hook lives as long as Pid.
 watch_info(Pid, MessageName) when is_binary(MessageName) ->
     Message = binary_to_existing_atom(MessageName),
+    install_watch(Pid, fun(M) -> M =:= Message end).
+
+%% Tell the caller when the sys-compliant process Pid (a supervisor, or any
+%% process trapping exits) receives the exit signal of Child as a message.
+watch_exit(Pid, Child) when is_pid(Child) ->
+    install_watch(Pid, fun
+        ({'EXIT', From, _Reason}) -> From =:= Child;
+        (_) -> false
+    end).
+
+install_watch(Pid, Matches) ->
     Self = self(),
     Ref = make_ref(),
-    Hook = fun
-        (State, {in, M}, _ProcState) when M =:= Message ->
-            Self ! {beacon_await_info, Ref},
-            State;
-        (State, _Event, _ProcState) ->
-            State
+    Hook = fun(State, Event, _ProcState) ->
+        case Event of
+            {in, M} ->
+                case Matches(M) of
+                    true -> Self ! {beacon_await_info, Ref};
+                    false -> ok
+                end;
+            _ ->
+                ok
+        end,
+        State
     end,
     try sys:install(Pid, {Hook, ok}) of
         ok -> {ok, {Pid, Ref}}

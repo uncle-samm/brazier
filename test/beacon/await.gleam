@@ -15,6 +15,7 @@
 //// so the window guards against late, asynchronous sends and not against a
 //// slow scheduler.
 
+import beacon/telemetry
 import gleam/erlang/process.{type Pid, type Subject}
 import gleam/int
 import gleam/list
@@ -184,6 +185,26 @@ pub fn watch_info(pid: Pid, message: String) -> InfoWatch {
   }
 }
 
+@external(erlang, "beacon_await_ffi", "watch_exit")
+fn watch_exit_ffi(pid: Pid, child: Pid) -> Result(InfoWatch, String)
+
+/// Watch for the sys-compliant process `pid` (a supervisor, or an actor
+/// trapping exits) receiving `child`'s exit signal. `expect_info` then
+/// returns once `pid` has handled it, for example once a supervisor has
+/// restarted the child, instead of sleeping and hoping it has.
+pub fn watch_exit(pid: Pid, child: Pid) -> InfoWatch {
+  case watch_exit_ffi(pid, child) {
+    Ok(watch) -> watch
+    Error(reason) ->
+      panic as {
+        "watch_exit: cannot install a sys hook on "
+        <> string.inspect(pid)
+        <> ": "
+        <> reason
+      }
+  }
+}
+
 /// Return once the watched process has received and handled the next
 /// watched message. Crashes with `what` if none arrives by the deadline.
 pub fn expect_info(watch: InfoWatch, pid: Pid, what: String) -> Nil {
@@ -241,6 +262,74 @@ pub fn expect_pg_leave(watch: ScopeWatch, pid: Pid, what: String) -> Nil {
 pub fn unwatch_pg_scope(watch: ScopeWatch) -> Nil {
   unwatch_pg_scope_ffi(watch)
 }
+
+/// Return once `condition` holds, re-checking it each time one of `events`
+/// is emitted, and crash naming `what` if it still fails at the deadline.
+///
+/// For state that another process updates and then announces with a
+/// telemetry event (a connection slot released before
+/// `[beacon, http, connection, closed]`, a session row deleted before
+/// `[beacon, session, expired]`). The handler is attached before the first
+/// check, so an update that lands at any point is either seen by that
+/// check or followed by an event that triggers another. The events are
+/// node-wide; one from elsewhere only causes an extra check.
+pub fn until_telemetry(
+  events: List(List(String)),
+  what: String,
+  condition: fn() -> Bool,
+) -> Nil {
+  let emitted = process.new_subject()
+  let id = "beacon_await_" <> int.to_string(unique_integer())
+  case telemetry.start() {
+    Ok(Nil) -> Nil
+    Error(reason) -> panic as { "until_telemetry: " <> string.inspect(reason) }
+  }
+  case
+    telemetry.attach(id, events, fn(event) { process.send(emitted, event.name) })
+  {
+    Ok(Nil) -> Nil
+    Error(reason) ->
+      panic as { "until_telemetry: attach failed: " <> string.inspect(reason) }
+  }
+  let outcome = recheck(emitted, condition, now_ms() + deadline_ms, 0)
+  case telemetry.detach(id) {
+    Ok(Nil) -> Nil
+    Error(reason) ->
+      panic as { "until_telemetry: detach failed: " <> string.inspect(reason) }
+  }
+  case outcome {
+    Ok(Nil) -> Nil
+    Error(seen) ->
+      panic as {
+        "expected "
+        <> what
+        <> " within "
+        <> int.to_string(deadline_ms)
+        <> " ms; still false after "
+        <> int.to_string(seen)
+        <> " events"
+      }
+  }
+}
+
+fn recheck(
+  emitted: Subject(List(String)),
+  condition: fn() -> Bool,
+  deadline: Int,
+  seen: Int,
+) -> Result(Nil, Int) {
+  case condition() {
+    True -> Ok(Nil)
+    False ->
+      case process.receive(emitted, int.max(0, deadline - now_ms())) {
+        Ok(_name) -> recheck(emitted, condition, deadline, seen + 1)
+        Error(Nil) -> Error(seen)
+      }
+  }
+}
+
+@external(erlang, "erlang", "unique_integer")
+fn unique_integer() -> Int
 
 @external(erlang, "erlang", "monotonic_time")
 fn monotonic_time(unit: MillisecondUnit) -> Int
