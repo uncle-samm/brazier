@@ -58,7 +58,7 @@ fn config(
   route: Option(fn(uri.Uri) -> Result(Msg, Nil)),
 ) -> runtime.RuntimeConfig(Model, Msg) {
   runtime.RuntimeConfig(
-    init: fn(_ctx) { #(Model(count: 0, page: ""), effect.none()) },
+    init: fn(_ctx) { Ok(#(Model(count: 0, page: ""), effect.none())) },
     update: fn(model: Model, msg: Msg) {
       case msg {
         Increment -> #(Model(..model, count: model.count + 1), effect.none())

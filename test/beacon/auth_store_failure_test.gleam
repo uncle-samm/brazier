@@ -4,28 +4,31 @@
 /// failure instead of crashing or treating it as "no session": wrappers
 /// and middleware answer 503, WebSocket auth rejects, and login never
 /// creates a session after it failed to delete the previous one.
-/// `init_from_session` has no error channel, so it crashes instead of
-/// rendering the guest state.
+/// `init_from_session` refuses with 503 instead of rendering the guest
+/// state.
 ///
 /// The fakes are plain Gleam functions answering fixed values; the ones
 /// that must never run report to a subject owned by the test.
 import beacon/api
 import beacon/auth
+import beacon/error
+import beacon/log_capture
 import beacon/session.{
   type ExternalBackend, type SessionStore, External, ExternalBackend, Session,
   SessionBackendFailed, StoredSession,
 }
+import beacon/test_ctx
 import beacon/transport/server.{type Connection, type ResponseBody, Bytes}
 import gleam/bit_array
 import gleam/bytes_tree
 import gleam/dict
-import gleam/dynamic
 import gleam/erlang/process.{type Subject}
 import gleam/http/request.{type Request}
 import gleam/http/response.{type Response}
 import gleam/int
 import gleam/list
 import gleam/option.{None, Some}
+import gleam/string
 
 const csrf = "csrf-token-for-the-fake-session"
 
@@ -222,28 +225,38 @@ pub fn ws_auth_rejects_when_the_store_is_unavailable_test() {
     auth_fn(with_cookie("GET", "/ws"))
 }
 
-pub fn init_crashes_when_the_store_is_unavailable_test() {
+pub fn init_refuses_with_503_when_the_store_is_unavailable_test() {
   let init =
     auth.init_from_session(
       store(broken()),
       auth.dev_session_config(),
-      fn(_req) { "guest" },
-      fn(_req, _sess, user_id) { "user:" <> user_id },
+      fn(_ctx) { Ok("guest") },
+      fn(_ctx, _sess, user_id) { Ok("user:" <> user_id) },
     )
+  let ctx = test_ctx.with_cookies("/", [#("beacon_session", "fake")])
   // Never the guest state: that would show a signed-in user a logged-out
   // page and hide the outage.
-  let assert Error(#("error", _)) =
-    rescue(fn() { init(with_cookie("GET", "/")) })
-  // The same request against a healthy store is authenticated, so the
-  // crash above came from the failure, not from the request.
+  let #(outcome, logs) = log_capture.capture(fn() { init(ctx) })
+  let assert Error(refusal) = outcome
+  let assert 503 = error.init_error_status(refusal)
+  let assert True =
+    log_capture.has(logs, level: "error", containing: [
+      "init cannot verify the session",
+      "503",
+    ])
+  // The backend's reason is logged, never carried to the browser.
+  let assert True = log_capture.has(logs, level: "error", containing: [down])
+  let assert False = string.contains(error.init_error_reason(refusal), down)
+  // The same context against a healthy store is authenticated, so the
+  // refusal above came from the failure, not from the context.
   let healthy_init =
     auth.init_from_session(
       store(healthy()),
       auth.dev_session_config(),
-      fn(_req) { "guest" },
-      fn(_req, _sess, user_id) { "user:" <> user_id },
+      fn(_ctx) { Ok("guest") },
+      fn(_ctx, _sess, user_id) { Ok("user:" <> user_id) },
     )
-  let assert "user:alice" = healthy_init(with_cookie("GET", "/"))
+  let assert Ok("user:alice") = healthy_init(ctx)
 }
 
 // --- helpers ---
@@ -270,9 +283,6 @@ fn empty_response() -> Response(ResponseBody) {
 
 @external(erlang, "beacon_middleware_test_ffi", "make_request")
 fn make_request(method: String, path: String) -> Request(Connection)
-
-@external(erlang, "beacon_telemetry_test_ffi", "rescue")
-fn rescue(run: fn() -> a) -> Result(a, #(String, dynamic.Dynamic))
 
 @external(erlang, "erlang", "unique_integer")
 fn unique_integer() -> Int

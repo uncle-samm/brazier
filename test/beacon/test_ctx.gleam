@@ -7,6 +7,15 @@ import gleam/uri
 /// The connected-mount context for a local page path such as "/" or
 /// "/users/7?tab=posts", with no cookies and no session.
 pub fn for_path(path: String) -> context.Context {
+  with_cookies(path, [])
+}
+
+/// The connected-mount context for a local page path, carrying `cookies`
+/// as the browser sent them.
+pub fn with_cookies(
+  path: String,
+  cookies: List(#(String, String)),
+) -> context.Context {
   // Callers pass literal local paths; a parse failure is a broken test.
   let assert Ok(parsed) = uri.parse(path)
   context.new(
@@ -17,7 +26,7 @@ pub fn for_path(path: String) -> context.Context {
       path: parsed.path,
       query: parsed.query,
     ),
-    cookies: [],
+    cookies: cookies,
     is_connected: True,
     session_id: Error(Nil),
   )

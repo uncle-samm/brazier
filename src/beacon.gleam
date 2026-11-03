@@ -14,8 +14,8 @@
 /// pub type Model { Model(count: Int) }
 /// pub type Msg { Increment Decrement }
 ///
-/// fn init(_ctx: beacon.Context) -> #(Model, Effect(Msg)) {
-///   #(Model(count: 0), effect.none())
+/// fn init(_ctx: beacon.Context) -> Result(#(Model, Effect(Msg)), beacon.InitError) {
+///   Ok(#(Model(count: 0), effect.none()))
 /// }
 ///
 /// fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
@@ -106,6 +106,18 @@ pub fn is_connected(ctx: Context) -> Bool {
   context.is_connected(ctx)
 }
 
+/// Why `init` refused to start a session. Build one with `error.unavailable`
+/// (503) or `error.refuse(status, reason)` from `beacon/error`.
+///
+/// Every constructor's `init` returns `Result(_, InitError)`, like LiveView's
+/// `mount` returning `{:ok, socket}`. An `Error` is answered on the dead
+/// render with an error page for its status, and on the connected mount by
+/// closing the WebSocket with `4000 + status` (4503 for `unavailable`). The
+/// reason is logged and never sent to the browser. A crash in `init` is
+/// answered with 500 on the dead render and closes the WebSocket with 1011.
+pub type InitError =
+  error.InitError
+
 /// An opaque, stable id for the browser session (a hash of Beacon's session
 /// cookie), the same for the dead render and the connected mount. Error
 /// when the request has no Beacon session cookie (its first page load).
@@ -124,7 +136,7 @@ pub fn session_id(ctx: Context) -> Result(String, Nil) {
 /// - `msg`: the app's messages.
 pub opaque type App(state, model, local, msg) {
   App(
-    init: fn(Context) -> #(state, Effect(msg)),
+    init: fn(Context) -> Result(#(state, Effect(msg)), InitError),
     update: fn(state, msg) -> #(state, Effect(msg)),
     sync: fn(state) -> model,
     local: local.Layer(model, local, msg),
@@ -160,12 +172,14 @@ pub opaque type App(state, model, local, msg) {
 /// as `view`); the build fails, naming the call, when it reaches anything
 /// else. Use `application` for effects or server-only work.
 pub fn simple(
-  init init: fn(Context) -> model,
+  init init: fn(Context) -> Result(model, InitError),
   update update: fn(model, msg) -> model,
   view view: fn(model) -> Element(msg),
 ) -> App(model, model, Nil, msg) {
   new_app(
-    init: fn(ctx) { #(init(ctx), effect.none()) },
+    init: fn(ctx) {
+      result.map(init(ctx), fn(model) { #(model, effect.none()) })
+    },
     update: fn(model, msg) { #(update(model, msg), effect.none()) },
     sync: identity,
     local: local.none(),
@@ -176,7 +190,7 @@ pub fn simple(
 /// An app whose whole model is synced to the client. `update` runs only on
 /// the server and returns effects.
 pub fn application(
-  init init: fn(Context) -> #(model, Effect(msg)),
+  init init: fn(Context) -> Result(#(model, Effect(msg)), InitError),
   update update: fn(model, msg) -> #(model, Effect(msg)),
   view view: fn(model) -> Element(msg),
 ) -> App(model, model, Nil, msg) {
@@ -198,7 +212,7 @@ pub fn application(
 /// Only the types `sync`, `view` and the Local layer reach are compiled for
 /// the browser, so the rest of `state` never leaves the server.
 pub fn full_application(
-  init init: fn(Context) -> #(state, Effect(msg)),
+  init init: fn(Context) -> Result(#(state, Effect(msg)), InitError),
   update update: fn(state, msg) -> #(state, Effect(msg)),
   sync sync: fn(state) -> model,
   local local: local.Layer(model, local, msg),
@@ -208,7 +222,7 @@ pub fn full_application(
 }
 
 fn new_app(
-  init init: fn(Context) -> #(state, Effect(msg)),
+  init init: fn(Context) -> Result(#(state, Effect(msg)), InitError),
   update update: fn(state, msg) -> #(state, Effect(msg)),
   sync sync: fn(state) -> model,
   local local: local.Layer(model, local, msg),

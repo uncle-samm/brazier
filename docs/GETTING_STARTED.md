@@ -39,8 +39,8 @@ pub type Msg {
   Decrement
 }
 
-fn init(_ctx: beacon.Context) -> Model {
-  Model(count: 0)
+fn init(_ctx: beacon.Context) -> Result(Model, beacon.InitError) {
+  Ok(Model(count: 0))
 }
 
 pub fn update(model: Model, msg: Msg) -> Model {
@@ -92,9 +92,11 @@ arguments and return an `App` that the builder functions below configure.
 
 | Constructor | `init` | `update` | `view` | Use when |
 |---|---|---|---|---|
-| `beacon.simple(init:, update:, view:)` | `fn(Context) -> model` | `fn(model, msg) -> model` | `fn(model) -> Element(msg)` | The update is pure and safe to run in the browser |
-| `beacon.application(init:, update:, view:)` | `fn(Context) -> #(model, Effect(msg))` | `fn(model, msg) -> #(model, Effect(msg))` | `fn(model) -> Element(msg)` | The update needs effects or must stay on the server |
-| `beacon.full_application(init:, update:, sync:, local:, view:)` | `fn(Context) -> #(state, Effect(msg))` | `fn(state, msg) -> #(state, Effect(msg))` | `fn(model, local) -> Element(msg)` | The server keeps private state, or the browser keeps per-tab state |
+| `beacon.simple(init:, update:, view:)` | `fn(Context) -> Result(model, InitError)` | `fn(model, msg) -> model` | `fn(model) -> Element(msg)` | The update is pure and safe to run in the browser |
+| `beacon.application(init:, update:, view:)` | `fn(Context) -> Result(#(model, Effect(msg)), InitError)` | `fn(model, msg) -> #(model, Effect(msg))` | `fn(model) -> Element(msg)` | The update needs effects or must stay on the server |
+| `beacon.full_application(init:, update:, sync:, local:, view:)` | `fn(Context) -> Result(#(state, Effect(msg)), InitError)` | `fn(state, msg) -> #(state, Effect(msg))` | `fn(model, local) -> Element(msg)` | The server keeps private state, or the browser keeps per-tab state |
+
+Every `init` can refuse the request; see [Refusing in `init`](#refusing-in-init).
 
 ### `simple`
 
@@ -168,6 +170,36 @@ pub fn main() {
 `init` runs twice: once for the HTML render and once when the WebSocket
 connects. Effects returned from the HTML render are dropped, so a timer or a
 subscription starts once, on the connected mount.
+
+### Refusing in `init`
+
+`init` returns `Error(InitError)` when it cannot build the page, for example
+when a database it reads is down. Build the error with `beacon/error`:
+
+```gleam
+import beacon/error
+
+fn init(ctx: beacon.Context) -> Result(#(Model, Effect(Msg)), beacon.InitError) {
+  case orders.load(ctx) {
+    Ok(orders) -> Ok(#(Model(orders:), effect.none()))
+    Error(orders.DatabaseDown(reason)) -> Error(error.unavailable(reason))
+    Error(orders.NotAMember) -> Error(error.refuse(403, "not a member"))
+  }
+}
+```
+
+- `error.unavailable(reason)` refuses with 503.
+- `error.refuse(status, reason)` refuses with any status from 400 to 599. A
+  status outside that range is a bug in the app, so `refuse` crashes.
+
+The HTML render answers a refusal with a static error page for its status. The
+WebSocket mount closes the socket with code `4000 + status`, for example 4503,
+and the reason `init refused`. The reason you pass is logged (an error for a
+5xx status, a warning for a 4xx one) and never sent to the browser. The
+browser reloads the page on 4401 and reconnects with backoff on other codes.
+
+A crash in `init` is not a refusal: the HTML render answers 500 and the
+WebSocket closes with 1011 `startup failure`.
 
 ### Events
 
@@ -358,34 +390,33 @@ When you write the handlers yourself:
 
 ### Signed-in first render
 
-`init` reads the session cookie through the `Context`, so the HTML render is
-already signed in:
+`auth.init_from_session` reads the session cookie through the `Context`, so
+the HTML render is already signed in:
 
 ```gleam
-fn init(ctx: beacon.Context, store, config: auth.SessionConfig) -> #(Model, Effect(Msg)) {
-  case beacon.cookie(ctx, config.cookie_name) {
-    Error(Nil) -> #(guest_model(), effect.none())
-    Ok(id) -> {
-      let fetched = session.fetch(store, id)
-      case fetched {
-        Ok(sess) -> #(signed_in_model(sess), effect.none())
-        Error(session.SessionNotFound) | Error(session.SessionExpired) ->
-          #(guest_model(), effect.none())
-        Error(err) -> {
-          log.error("my_app", "Session store unavailable: " <> session.store_error_to_string(err))
-          // init has no error channel, so the request crashes.
-          let assert Ok(sess) = fetched as "session store unavailable (logged above)"
-          #(signed_in_model(sess), effect.none())
-        }
-      }
-    }
-  }
+fn init(store, config: auth.SessionConfig) {
+  auth.init_from_session(
+    store,
+    config,
+    guest_init: fn(_ctx) { Ok(#(guest_model(), effect.none())) },
+    authenticated_init: fn(_ctx, _session, user) {
+      Ok(#(signed_in_model(user), effect.none()))
+    },
+  )
 }
+
+beacon.application(init: init(store, config), update:, view:)
 ```
 
-A cookie that names no live session renders the guest page. A store that
-cannot answer crashes the request rather than showing a signed-in user the
-guest page. `examples/auth_workspace` is the complete version.
+- No cookie, or a cookie that names no live session, renders the guest page.
+  A dead session is logged as a warning.
+- A store that cannot answer refuses the request with `error.unavailable`:
+  the HTML render answers 503 and the WebSocket closes with 4503. A signed-in
+  user never sees the guest page because of an outage.
+- `authenticated_init` can refuse on its own, for example with
+  `error.refuse(403, ..)` for a user who may not see the page.
+
+`examples/auth_workspace` is the complete version.
 
 ### WebSocket auth
 

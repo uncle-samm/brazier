@@ -126,7 +126,7 @@ fn encode(model: Model) -> String {
 fn start_parent(seen: Subject(Msg)) -> Subject(runtime.RuntimeMessage(Msg)) {
   let config =
     runtime.RuntimeConfig(
-      init: fn(_ctx) { #(init(), effect.none()) },
+      init: fn(_ctx) { Ok(#(init(), effect.none())) },
       update: fn(model, msg) {
         process.send(seen, msg)
         update(model, msg)

@@ -69,8 +69,8 @@ pub type Msg {
   RightMsg(counter.Msg)
 }
 
-pub fn init(_ctx: beacon.Context) -> #(Model, Effect(Msg)) {
-  #(Model(left: counter.init(), right: counter.init()), effect.none())
+pub fn init(_ctx: beacon.Context) -> Result(#(Model, Effect(Msg)), beacon.InitError) {
+  Ok(#(Model(left: counter.init(), right: counter.init()), effect.none()))
 }
 
 pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {

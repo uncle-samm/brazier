@@ -88,7 +88,7 @@ fn session_config(
 ) -> runtime.RuntimeConfig(Model, Msg) {
   runtime.RuntimeConfig(
     init: fn(_ctx) {
-      #(Model(user:, room:, status: "here", online: []), effect.none())
+      Ok(#(Model(user:, room:, status: "here", online: []), effect.none()))
     },
     update: fn(model: Model, msg: Msg) {
       case msg {

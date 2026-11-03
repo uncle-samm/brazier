@@ -480,12 +480,13 @@ pub type TransportConfig {
     /// If set, each WebSocket connection gets its OWN runtime (like LiveView).
     /// The factory returns callbacks for this specific connection's runtime.
     /// If None, uses the shared on_connect/on_event/on_disconnect callbacks.
-    /// The factory receives the HTTP request so ws_init can read cookies/headers.
+    /// The factory receives the upgrade request, from which the runtime
+    /// builds the connected mount's Context (cookies, page URL).
     runtime_factory: Option(
       fn(ConnectionId, process.Subject(InternalMessage), Request(Connection)) ->
         Result(
           #(fn(ConnectionId, ClientMessage) -> Nil, fn(ConnectionId) -> Nil),
-          String,
+          StartupError,
         ),
     ),
     /// Optional: WebSocket authentication function.
@@ -506,6 +507,45 @@ pub type TransportConfig {
       fn(Request(Connection)) -> Option(response.Response(ResponseBody)),
     ),
   )
+}
+
+/// Why a per-connection runtime did not start. Either way the socket is
+/// closed right after the upgrade, before any other frame.
+pub type StartupError {
+  /// The app's `init` refused the session. The socket closes with
+  /// `error.init_close_code` (4000 + the status) and the reason
+  /// `"init refused"`; the app's own reason is only logged.
+  InitRefused(error: error.InitError)
+  /// Anything else: an invalid page URL, a crash in `init`, a refused
+  /// presence track. The socket closes with 1011 `"startup failure"`.
+  StartupFailed(reason: String)
+}
+
+pub fn startup_error_to_string(err: StartupError) -> String {
+  let text = case err {
+    InitRefused(init_error) ->
+      "init refused (" <> error.init_error_to_string(init_error) <> ")"
+    StartupFailed(reason) -> reason
+  }
+  log.debug("beacon.transport", "Runtime startup error: " <> text)
+  text
+}
+
+/// The close frame for a runtime that did not start: code, reason sent to
+/// the client, and the telemetry reason label.
+fn startup_close(err: StartupError) -> #(Int, String, String) {
+  case err {
+    InitRefused(init_error) -> #(
+      error.init_close_code(init_error),
+      "init refused",
+      "init_refused",
+    )
+    StartupFailed(_) -> #(
+      ws.close_internal_error,
+      "startup failure",
+      "startup_failure",
+    )
+  }
 }
 
 /// Generate a unique connection ID.
@@ -1710,18 +1750,29 @@ fn start_ws_connection(
       // Enter the receive loop — returns after close and cleanup
       ws_loop(state, subject)
     }
-    Error(reason) -> {
-      log.error(
-        "beacon.transport",
-        "Closing WebSocket after runtime startup failure for "
-          <> conn_id
-          <> " (peer "
-          <> admission.peer_ip
-          <> "): "
-          <> reason,
-      )
-      let close_frame =
-        ws.encode_close(ws.close_internal_error, "startup failure")
+    Error(startup_error) -> {
+      let #(close_code, close_reason, close_label) =
+        startup_close(startup_error)
+      let message =
+        "Closing WebSocket "
+        <> conn_id
+        <> " (peer "
+        <> admission.peer_ip
+        <> ") with "
+        <> int.to_string(close_code)
+        <> " after the runtime did not start: "
+        <> startup_error_to_string(startup_error)
+      // An init refusal with a 4xx status is the app's decision about this
+      // request, not a server fault.
+      case startup_error {
+        InitRefused(init_error) ->
+          case error.init_error_status(init_error) >= 500 {
+            True -> log.error("beacon.transport", message)
+            False -> log.warning("beacon.transport", message)
+          }
+        StartupFailed(_) -> log.error("beacon.transport", message)
+      }
+      let close_frame = ws.encode_close(close_code, close_reason)
       let #(frames_out, bytes_out) = case
         server.send_bytes(socket, close_frame)
       {
@@ -1744,8 +1795,8 @@ fn start_ws_connection(
         frames_out,
         0,
         bytes_out,
-        ws.close_internal_error,
-        "startup_failure",
+        close_code,
+        close_label,
         conn_id,
       )
       ws.release_ip_slot(admission.slot_key)

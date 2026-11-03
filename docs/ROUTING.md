@@ -68,8 +68,8 @@ Beacon runs `update(model, on_change(route))`:
 initial model; `on_change` replaces it before anything is rendered.
 
 ```gleam
-fn init(_ctx: beacon.Context) -> #(Model, Effect(Msg)) {
-  #(Model(route: HomePage, users: []), effect.none())
+fn init(_ctx: beacon.Context) -> Result(#(Model, Effect(Msg)), beacon.InitError) {
+  Ok(#(Model(route: HomePage, users: []), effect.none()))
 }
 
 fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {

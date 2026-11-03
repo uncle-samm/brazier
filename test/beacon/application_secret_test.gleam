@@ -12,7 +12,7 @@ fn config(port: Int, secret: String) -> application.AppConfig(Int, Nil) {
   application.AppConfig(
     ..app_config_fixture.new(
       port: port,
-      init: fn(_ctx) { #(0, effect.none()) },
+      init: fn(_ctx) { Ok(#(0, effect.none())) },
       update: fn(model, _msg) { #(model, effect.none()) },
       view: fn(_model) { element.text("secret test") },
       encode_model: int.to_string,

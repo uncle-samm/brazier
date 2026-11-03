@@ -20,7 +20,7 @@ fn test_config(port: Int) -> application.AppConfig(TestModel, TestMsg) {
   application.AppConfig(
     ..app_config_fixture.new(
       port: port,
-      init: fn(_ctx) { #(TestModel(count: 0), effect.none()) },
+      init: fn(_ctx) { Ok(#(TestModel(count: 0), effect.none())) },
       update: fn(model, _msg) {
         #(TestModel(count: model.count + 1), effect.none())
       },

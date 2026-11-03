@@ -192,7 +192,8 @@ fn test_config(
 /// both the SSR render and the connected (WebSocket) runtime.
 fn auth_init(
   store: session.SessionStore,
-) -> fn(Context) -> #(#(Model, Server), effect.Effect(Msg)) {
+) -> fn(Context) ->
+  Result(#(#(Model, Server), effect.Effect(Msg)), error.InitError) {
   fn(ctx: Context) {
     let path = context.uri(ctx).path
     let session = case context.cookie(ctx, "beacon_session") {
@@ -212,7 +213,7 @@ fn auth_init(
         )
       None -> Model(..init_model(), route: path)
     }
-    #(#(model, init_server()), effect.none())
+    Ok(#(#(model, init_server()), effect.none()))
   }
 }
 

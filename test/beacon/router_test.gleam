@@ -100,7 +100,7 @@ type Msg {
 
 fn nav_config() -> runtime.RuntimeConfig(Model, Msg) {
   runtime.RuntimeConfig(
-    init: fn(_ctx) { #(Model, effect.none()) },
+    init: fn(_ctx) { Ok(#(Model, effect.none())) },
     update: fn(model: Model, msg: Msg) {
       let Go(kind:, path:) = msg
       let eff = case kind {

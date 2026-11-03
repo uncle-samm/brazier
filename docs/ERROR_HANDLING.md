@@ -11,10 +11,28 @@ All framework errors use `BeaconError` from `src/beacon/error.gleam`.
 | `RuntimeError` | Event decode failure, unknown handler |
 | `DiffError` | VDOM diffing failure |
 | `RenderError` | SSR rendering failure |
-| `RouterError` | Route matching or codegen failure |
+| `RouteError` | Route matching or codegen failure |
 | `EffectError` | Effect execution failure |
 | `SessionError` | Token expired, state recovery failure |
 | `ConfigError` | Missing init/update, invalid config |
+| `InitRejected` | The app's `init` returned `Error(InitError)` on the connected mount |
+
+## Errors in `init`
+
+`init` returns `Result(_, InitError)`. Build the error with
+`error.unavailable(reason)` (503) or `error.refuse(status, reason)` (any status
+from 400 to 599; another status crashes, because it is a bug in the app).
+
+| Where | `Error(InitError)` | `init` crashes |
+|---|---|---|
+| HTML render | A static error page with the error's status; the bundle is not loaded | 500 |
+| WebSocket mount | Close with `4000 + status` (4503, 4404, ...) and the reason `init refused` | Close with 1011 and the reason `startup failure` |
+
+The reason is logged, as an error for a 5xx status and as a warning for a 4xx
+one, and never sent to the browser. The browser reloads the page on 4401 and
+reconnects with backoff on any other close. `auth.init_from_session` answers a
+session store outage with `error.unavailable`. See
+[GETTING_STARTED.md](GETTING_STARTED.md#refusing-in-init).
 
 ## Transport Errors
 
@@ -42,12 +60,12 @@ View rendering is wrapped in `rescue`. On crash: error logged, `ServerError` sen
 Match on `Result` in update. For effects that can fail, dispatch error messages back:
 
 ```gleam
-fn update(model, local, server, msg) {
+fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
   case msg {
     Save ->
       case validate(model) {
-        Ok(_) -> #(Model(..model, saved: True), local, server)
-        Error(reason) -> #(Model(..model, error: Some(reason)), local, server)
+        Ok(_) -> #(Model(..model, saved: True), effect.none())
+        Error(reason) -> #(Model(..model, error: Some(reason)), effect.none())
       }
   }
 }

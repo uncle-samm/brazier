@@ -47,7 +47,7 @@ fn int_codec() -> runtime.GeneratedCodec(Int, Msg) {
 
 fn counter() -> beacon.App(Int, Int, Nil, Msg) {
   beacon.simple(
-    init: fn(_ctx) { 0 },
+    init: fn(_ctx) { Ok(0) },
     update: fn(model, msg) {
       case msg {
         Inc -> model + 1
@@ -74,7 +74,7 @@ fn keyed(
 
 pub fn simple_init_and_update_have_no_effects_test() {
   let cfg = config(keyed(counter()))
-  let #(model, init_effect) = cfg.init(test_ctx.root())
+  let assert Ok(#(model, init_effect)) = cfg.init(test_ctx.root())
   let assert 0 = model
   let assert True = effect.is_none(init_effect)
   let #(model, update_effect) = cfg.update(model, Inc)
@@ -114,7 +114,7 @@ pub fn decode_event_is_the_codecs_test() {
 pub fn application_keeps_update_effects_test() {
   let cfg =
     beacon.application(
-      init: fn(_ctx) { #(0, effect.from(fn(_dispatch) { Nil })) },
+      init: fn(_ctx) { Ok(#(0, effect.from(fn(_dispatch) { Nil }))) },
       update: fn(model, _msg) {
         #(model, effect.from(fn(dispatch) { dispatch(Inc) }))
       },
@@ -122,7 +122,7 @@ pub fn application_keeps_update_effects_test() {
     )
     |> keyed
     |> config
-  let #(_model, init_effect) = cfg.init(test_ctx.root())
+  let assert Ok(#(_model, init_effect)) = cfg.init(test_ctx.root())
   let assert False = effect.is_none(init_effect)
   let #(_model, update_effect) = cfg.update(0, Inc)
   let assert False = effect.is_none(update_effect)
@@ -180,7 +180,7 @@ pub type State {
 pub fn full_application_syncs_state_for_encode_view_and_title_test() {
   let cfg =
     beacon.full_application(
-      init: fn(_ctx) { #(State(count: 1, secret: "hidden"), effect.none()) },
+      init: fn(_ctx) { Ok(#(State(count: 1, secret: "hidden"), effect.none())) },
       update: fn(state: State, _msg) {
         #(State(..state, count: state.count + 1), effect.none())
       },
@@ -196,7 +196,7 @@ pub fn full_application_syncs_state_for_encode_view_and_title_test() {
     |> keyed
     |> beacon.title(fn(model) { "M" <> int.to_string(model) })
     |> config
-  let #(state, _effect) = cfg.init(test_ctx.root())
+  let assert Ok(#(state, _effect)) = cfg.init(test_ctx.root())
   // Only the synced model is encoded; the secret never is.
   let encoded = cfg.encode_model(state)
   let assert "10" = encoded
@@ -216,7 +216,7 @@ pub fn no_state_recovery_by_default_test() {
 pub fn state_recovery_decodes_and_restores_test() {
   let cfg =
     beacon.full_application(
-      init: fn(_ctx) { #(State(count: 0, secret: ""), effect.none()) },
+      init: fn(_ctx) { Ok(#(State(count: 0, secret: ""), effect.none())) },
       update: fn(state, _msg) { #(state, effect.none()) },
       sync: fn(state: State) { state.count },
       local: local.none(),

@@ -1,6 +1,7 @@
 import beacon/effect
 import beacon/error
 import beacon/internal/context
+import beacon/log_capture
 import beacon/pubsub
 import beacon/runtime
 import beacon/ssr
@@ -57,8 +58,8 @@ fn test_context() -> context.Context {
 
 fn counter_init(
   _ctx: context.Context,
-) -> #(CounterModel, effect.Effect(CounterMsg)) {
-  #(CounterModel(count: 0), effect.none())
+) -> Result(#(CounterModel, effect.Effect(CounterMsg)), error.InitError) {
+  Ok(#(CounterModel(count: 0), effect.none()))
 }
 
 fn counter_update(
@@ -151,7 +152,7 @@ fn page_name(page: Option(Page)) -> String {
 fn route_config() -> runtime.RuntimeConfig(RouteModel, RouteMsg) {
   runtime.RuntimeConfig(
     init: fn(_ctx) {
-      #(RouteModel(page: option.None, visits: [], tab: ""), effect.none())
+      Ok(#(RouteModel(page: option.None, visits: [], tab: ""), effect.none()))
     },
     update: fn(model: RouteModel, msg: RouteMsg) {
       let RouteChanged(page, tab) = msg
@@ -215,6 +216,62 @@ pub fn start_applies_initial_route_before_first_sync_test() {
     version: 0,
     ack_clock: 0,
   ) = first
+}
+
+pub fn start_refused_by_init_starts_no_runtime_test() {
+  let calls = process.new_subject()
+  let config =
+    runtime.RuntimeConfig(
+      ..counter_config(),
+      init: fn(_ctx) { Error(error.unavailable("ledger offline")) },
+      update: fn(model, msg) {
+        process.send(calls, Nil)
+        counter_update(model, msg)
+      },
+    )
+  let #(started, logs) =
+    log_capture.capture(fn() { runtime.start(config, test_context()) })
+  let assert Error(error.InitRejected(refusal)) = started
+  let assert 503 = error.init_error_status(refusal)
+  let assert True =
+    log_capture.has(logs, level: "error", containing: [
+      "init refused", "503: ledger offline",
+    ])
+  let assert Error(Nil) = process.receive(calls, 0)
+}
+
+pub fn start_refused_with_a_client_status_logs_a_warning_test() {
+  let config =
+    runtime.RuntimeConfig(..counter_config(), init: fn(_ctx) {
+      Error(error.refuse(404, "no such board"))
+    })
+  let #(started, logs) =
+    log_capture.capture(fn() { runtime.start(config, test_context()) })
+  let assert Error(error.InitRejected(refusal)) = started
+  let assert 4404 = error.init_close_code(refusal)
+  let assert True =
+    log_capture.has(logs, level: "warning", containing: ["404: no such board"])
+  let assert False =
+    log_capture.has(logs, level: "error", containing: ["init refused"])
+}
+
+pub fn start_with_a_crashing_init_is_a_startup_error_test() {
+  let config =
+    runtime.RuntimeConfig(..counter_config(), init: fn(ctx) {
+      // The crash must not escape into the caller (the WebSocket handler).
+      let assert "/never" = context.uri(ctx).path
+      Ok(#(CounterModel(count: 0), effect.none()))
+    })
+  let #(started, logs) =
+    log_capture.capture(fn() { runtime.start(config, test_context()) })
+  let assert Error(error.RuntimeError(reason)) = started
+  let assert True = string.starts_with(reason, "init crashed: ")
+  let assert True =
+    log_capture.has(logs, level: "error", containing: [
+      "init or the initial route crashed for /",
+    ])
+  // The caller survived and can start a healthy runtime.
+  let assert Ok(_subject) = runtime.start(counter_config(), test_context())
 }
 
 pub fn start_with_unknown_route_keeps_init_state_test() {
@@ -666,10 +723,10 @@ pub fn runtime_effect_dispatches_message_test() {
   let config =
     runtime.RuntimeConfig(
       init: fn(_ctx) {
-        #(
+        Ok(#(
           CounterModel(count: 0),
           effect.from(fn(dispatch) { dispatch(SetCount(42)) }),
-        )
+        ))
       },
       update: counter_update,
       decode_event: counter_decode_event,
@@ -735,7 +792,7 @@ pub fn live_update_does_not_render_server_view_test() {
   // not render the server view after an event.
   let config =
     runtime.RuntimeConfig(
-      init: fn(_ctx) { #(CounterModel(count: 0), effect.none()) },
+      init: fn(_ctx) { Ok(#(CounterModel(count: 0), effect.none())) },
       update: counter_update,
       decode_event: counter_decode_event,
       encode_model: fn(model: CounterModel) {
@@ -849,13 +906,13 @@ pub fn runtime_shutdown_stops_periodic_effects_test() {
   let proof_subject = process.new_subject()
   let config =
     runtime.RuntimeConfig(..counter_config(), init: fn(_ctx) {
-      #(
+      Ok(#(
         CounterModel(count: 0),
         effect.every(25, fn() {
           process.send(proof_subject, "tick")
           Tick
         }),
-      )
+      ))
     })
 
   let assert Ok(subject) = runtime.start(config, test_context())
@@ -1665,7 +1722,7 @@ pub fn server_state_not_in_model_sync_test() {
     runtime.RuntimeConfig(
       init: fn(_ctx) {
         // Combined: #(Model, Server) — server state is api_key
-        #(#(CounterModel(count: 0), "secret_api_key"), effect.none())
+        Ok(#(#(CounterModel(count: 0), "secret_api_key"), effect.none()))
       },
       update: fn(combined, msg) {
         let #(model, server) = combined
@@ -1732,7 +1789,7 @@ pub fn server_state_background_effect_pushes_update_test() {
   let config =
     runtime.RuntimeConfig(
       init: fn(_ctx) {
-        #(#(CounterModel(count: 0), "server_secret"), effect.none())
+        Ok(#(#(CounterModel(count: 0), "server_secret"), effect.none()))
       },
       update: fn(combined, msg) {
         let #(model, server) = combined
@@ -1810,7 +1867,7 @@ pub fn server_state_user_event_pushes_update_test() {
   let config =
     runtime.RuntimeConfig(
       init: fn(_ctx) {
-        #(#(CounterModel(count: 0), "private_key"), effect.none())
+        Ok(#(#(CounterModel(count: 0), "private_key"), effect.none()))
       },
       update: fn(combined, msg) {
         let #(model, server) = combined
@@ -2202,7 +2259,7 @@ pub fn on_update_effect_is_invoked_test() {
 /// An init that seeds the count from the `user_id` cookie, -1 without one.
 fn cookie_init(
   ctx: context.Context,
-) -> #(CounterModel, effect.Effect(CounterMsg)) {
+) -> Result(#(CounterModel, effect.Effect(CounterMsg)), error.InitError) {
   let count = case context.cookie(ctx, "user_id") {
     Ok(raw) ->
       case int.parse(raw) {
@@ -2211,7 +2268,7 @@ fn cookie_init(
       }
     Error(Nil) -> -1
   }
-  #(CounterModel(count: count), effect.none())
+  Ok(#(CounterModel(count: count), effect.none()))
 }
 
 fn has_count_sync(msgs: List(transport.InternalMessage), count: Int) -> Bool {

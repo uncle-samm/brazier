@@ -44,7 +44,7 @@ const secret = "app-tree-test-secret-key-0123456789abcdef"
 fn config() -> application.AppConfig(Model, Msg) {
   app_config_fixture.new(
     port: 0,
-    init: fn(_ctx) { #(Model(count: 0), effect.none()) },
+    init: fn(_ctx) { Ok(#(Model(count: 0), effect.none())) },
     update: fn(model: Model, _msg) {
       #(Model(count: model.count + 1), effect.none())
     },

@@ -209,8 +209,9 @@ pub type RuntimeState(model, msg) {
 /// the app and the generated codec; tests build it directly.
 pub type RuntimeConfig(state, msg) {
   RuntimeConfig(
-    /// The app's `init`, run with the connected-mount context.
-    init: fn(Context) -> #(state, Effect(msg)),
+    /// The app's `init`, run with the connected-mount context. An `Error`
+    /// refuses the start (`error.InitRejected`).
+    init: fn(Context) -> Result(#(state, Effect(msg)), error.InitError),
     /// The app's server `update`.
     update: fn(state, msg) -> #(state, Effect(msg)),
     /// Encode the client-visible model (the codec's `encode_model` over the
@@ -296,15 +297,66 @@ fn start_for(
   }
 }
 
+/// The model a session starts from: `init`, then the initial route.
+type Mounted(model, msg) {
+  Mounted(model: model, effects: Effect(msg), route_msg: Option(msg))
+}
+
 fn start_actor(
   config: RuntimeConfig(model, msg),
   ctx: Context,
   page_uri: Uri,
 ) -> Result(Subject(RuntimeMessage(msg)), error.BeaconError) {
   let started_at = monotonic_time()
-  let #(initial_model, init_effects) = config.init(ctx)
-  let #(initial_model, route_effects, route_msg) = case config.route {
-    None -> #(initial_model, effect.none(), None)
+  use mounted <- result.try(mount(config, ctx, page_uri))
+  spawn_actor(config, mounted, page_uri, started_at)
+}
+
+/// Run the app's `init` and initial route in the calling process (the
+/// connection's handler). A crash in either is caught, logged with its
+/// stacktrace and returned as a `RuntimeError`, so the socket is closed
+/// with 1011 instead of the handler process dying without a close frame
+/// (LiveView answers a crash in the connected mount by failing the join).
+fn mount(
+  config: RuntimeConfig(model, msg),
+  ctx: Context,
+  page_uri: Uri,
+) -> Result(Mounted(model, msg), error.BeaconError) {
+  let path = describe_uri(page_uri)
+  case run_guarded(fn() { init_and_route(config, ctx, page_uri) }) {
+    Error(crash) -> {
+      log.error(
+        "beacon.runtime",
+        "init or the initial route crashed for " <> path <> ": " <> crash,
+      )
+      Error(error.RuntimeError(reason: "init crashed: " <> crash))
+    }
+    Ok(Error(init_error)) -> {
+      let message =
+        "init refused the session for "
+        <> path
+        <> " ("
+        <> error.init_error_to_string(init_error)
+        <> ")"
+      case error.init_error_status(init_error) >= 500 {
+        True -> log.error("beacon.runtime", message)
+        False -> log.warning("beacon.runtime", message)
+      }
+      Error(error.InitRejected(init_error))
+    }
+    Ok(Ok(mounted)) -> Ok(mounted)
+  }
+}
+
+fn init_and_route(
+  config: RuntimeConfig(model, msg),
+  ctx: Context,
+  page_uri: Uri,
+) -> Result(Mounted(model, msg), error.InitError) {
+  use #(initial_model, init_effects) <- result.map(config.init(ctx))
+  case config.route {
+    None ->
+      Mounted(model: initial_model, effects: init_effects, route_msg: None)
     Some(route) ->
       case route(page_uri) {
         Ok(msg) -> {
@@ -312,8 +364,12 @@ fn start_actor(
             "beacon.runtime",
             "Applying the initial route for " <> describe_uri(page_uri),
           )
-          let #(routed, effects) = config.update(initial_model, msg)
-          #(routed, effects, Some(msg))
+          let #(routed, route_effects) = config.update(initial_model, msg)
+          Mounted(
+            model: routed,
+            effects: effect.batch([init_effects, route_effects]),
+            route_msg: Some(msg),
+          )
         }
         Error(Nil) -> {
           // The dead render answered this URL with a 404 page without the
@@ -323,11 +379,28 @@ fn start_actor(
             "beacon.runtime",
             "No route for the session URL " <> describe_uri(page_uri),
           )
-          #(initial_model, effect.none(), None)
+          Mounted(model: initial_model, effects: init_effects, route_msg: None)
         }
       }
   }
-  let initial_effects = effect.batch([init_effects, route_effects])
+}
+
+/// Run `run`, returning a crash (error, exit or throw) as `Error` with its
+/// class and reason. The FFI logs the stacktrace.
+@external(erlang, "beacon_runtime_ffi", "run_guarded")
+fn run_guarded(run: fn() -> a) -> Result(a, String)
+
+fn spawn_actor(
+  config: RuntimeConfig(model, msg),
+  mounted: Mounted(model, msg),
+  page_uri: Uri,
+  started_at: Int,
+) -> Result(Subject(RuntimeMessage(msg)), error.BeaconError) {
+  let Mounted(
+    model: initial_model,
+    effects: initial_effects,
+    route_msg: route_msg,
+  ) = mounted
   let result =
     actor.new_with_initialiser(5000, fn(subject) {
       // Presence first: a refused tracking fails the start before any
@@ -1987,6 +2060,14 @@ fn spawn_and_connect(
       }
       Ok(#(on_event, shutdown))
     }
+    // `mount` logged the refusal at the level its status calls for.
+    Error(error.InitRejected(_) as err) -> {
+      log.debug(
+        "beacon.runtime",
+        "No runtime for " <> conn_id <> ": " <> error.to_string(err),
+      )
+      Error(err)
+    }
     Error(err) -> {
       log.error(
         "beacon.runtime",
@@ -2130,12 +2211,14 @@ pub fn connect_transport_per_connection(
             let on_disconnect = fn(_cid: transport.ConnectionId) { shutdown() }
             Ok(#(on_event, on_disconnect))
           }
+          Error(error.InitRejected(init_error)) ->
+            Error(transport.InitRefused(init_error))
           Error(err) -> {
             log.error(
               "beacon.runtime",
               "Failed to start per-connection runtime: " <> error.to_string(err),
             )
-            Error(error.to_string(err))
+            Error(transport.StartupFailed(error.to_string(err)))
           }
         }
       },

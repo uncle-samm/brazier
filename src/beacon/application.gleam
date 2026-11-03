@@ -65,8 +65,10 @@ pub type AppConfig(state, msg) {
   AppConfig(
     /// Port to listen on (0 picks a free port).
     port: Int,
-    /// Build the state for a request (dead render) or a connection.
-    init: fn(Context) -> #(state, Effect(msg)),
+    /// Build the state for a request (dead render) or a connection. An
+    /// `Error` refuses it: an error page for its status on the dead render,
+    /// a close with `error.init_close_code` on the WebSocket.
+    init: fn(Context) -> Result(#(state, Effect(msg)), error.InitError),
     /// The server update.
     update: fn(state, msg) -> #(state, Effect(msg)),
     /// Render the state (the app's `view` over `sync` and the initial

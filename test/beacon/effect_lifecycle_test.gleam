@@ -255,7 +255,7 @@ fn lifecycle_config(
 ) -> runtime.RuntimeConfig(LifeModel, LifeMsg) {
   runtime.RuntimeConfig(
     init: fn(_ctx) {
-      #(
+      Ok(#(
         LifeModel(ticks: 0),
         effect.batch([
           effect.background(fn(_dispatch) {
@@ -269,7 +269,7 @@ fn lifecycle_config(
             LifeTick
           }),
         ]),
-      )
+      ))
     },
     update: fn(model, msg) {
       case msg {

@@ -16,7 +16,7 @@ pub const secret_key = "app-config-fixture-secret-key-0123456789"
 
 pub fn new(
   port port: Int,
-  init init: fn(Context) -> #(state, Effect(msg)),
+  init init: fn(Context) -> Result(#(state, Effect(msg)), error.InitError),
   update update: fn(state, msg) -> #(state, Effect(msg)),
   view view: fn(state) -> Element(msg),
   encode_model encode_model: fn(state) -> String,
