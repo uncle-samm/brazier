@@ -18,10 +18,7 @@ import beacon/local
 import beacon/log
 import beacon/router
 import beacon/session
-import beacon/transport/server.{type Connection, type ResponseBody}
 import gleam/dict
-import gleam/http/request.{type Request}
-import gleam/http/response
 import gleam/int
 import gleam/json
 import gleam/list
@@ -331,7 +328,7 @@ fn sync(state: Session) -> Model {
 fn api_handler(
   store: session.SessionStore,
   config: auth.SessionConfig,
-) -> fn(Request(Connection)) -> Option(response.Response(ResponseBody)) {
+) -> fn(api.Request) -> Option(api.Response) {
   api.routes([
     api.post("/api/login", fn(req) { handle_login(req, store, config) }),
     api.get("/api/me", auth.protect_api(store, config, handle_me)),
@@ -351,10 +348,10 @@ fn api_handler(
 }
 
 fn handle_login(
-  req: Request(Connection),
+  req: api.Request,
   store: session.SessionStore,
   config: auth.SessionConfig,
-) -> response.Response(ResponseBody) {
+) -> api.Response {
   case api.read_form(req, 4096) {
     Error(reason) -> {
       log.warning("auth_workspace", "Login form rejected: " <> reason)
@@ -372,17 +369,17 @@ fn handle_login(
   }
 }
 
-fn refuse_login_csrf() -> response.Response(ResponseBody) {
+fn refuse_login_csrf() -> api.Response {
   log.warning("auth_workspace", "Login refused: missing or wrong CSRF field")
   api.text(403, "Invalid login CSRF token")
 }
 
 fn start_session(
-  req: Request(Connection),
+  req: api.Request,
   store: session.SessionStore,
   config: auth.SessionConfig,
   user: String,
-) -> response.Response(ResponseBody) {
+) -> api.Response {
   // Rotate: any session id the browser already had is deleted so it cannot
   // be fixed by an attacker and replayed after login.
   let old_id =
@@ -445,9 +442,7 @@ fn start_session(
 
 /// `create_login_rotating` only fails when the store cannot delete the old
 /// session or create the new one.
-fn login_store_failure(
-  err: auth.SessionError,
-) -> response.Response(ResponseBody) {
+fn login_store_failure(err: auth.SessionError) -> api.Response {
   case err {
     auth.SessionStoreUnavailable(_) ->
       api.text(503, "Session store unavailable")
@@ -464,7 +459,7 @@ fn handle_logout(
   sess: session.Session,
   user: String,
   config: auth.SessionConfig,
-) -> response.Response(ResponseBody) {
+) -> api.Response {
   case auth.logout_response(store, sess, api.text(200, "Logged out"), config) {
     Ok(resp) -> {
       log.info("auth_workspace", "Signed out " <> user)
@@ -489,10 +484,10 @@ fn handle_logout(
 }
 
 fn handle_me(
-  _req: Request(Connection),
+  _req: api.Request,
   sess: session.Session,
   _user: String,
-) -> response.Response(ResponseBody) {
+) -> api.Response {
   let account = account_from_session(sess)
   api.json_value(
     200,
@@ -505,10 +500,10 @@ fn handle_me(
 }
 
 fn handle_profile(
-  req: Request(Connection),
+  req: api.Request,
   store: session.SessionStore,
   sess: session.Session,
-) -> response.Response(ResponseBody) {
+) -> api.Response {
   case api.read_form(req, 4096) {
     Error(reason) -> api.text(400, reason)
     Ok(fields) ->

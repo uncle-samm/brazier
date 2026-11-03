@@ -7,14 +7,13 @@
 ///   /api/*      -> adds `x-api-version`; POST and PUT are refused
 ///   /healthz    -> health check (exact match)
 import beacon
+import beacon/api
 import beacon/attribute
 import beacon/element.{type Element}
 import beacon/event
 import beacon/html
 import beacon/log
 import beacon/middleware
-import beacon/transport/server.{type Connection, type ResponseBody, Bytes}
-import gleam/bytes_tree
 import gleam/http
 import gleam/http/request
 import gleam/http/response
@@ -126,10 +125,7 @@ const button_styles = [
 /// Admin auth for the demo: checks for an `x-admin: true` header.
 /// A real app checks a session or token.
 fn require_admin() -> middleware.Middleware {
-  fn(
-    req: request.Request(Connection),
-    next: fn(request.Request(Connection)) -> response.Response(ResponseBody),
-  ) -> response.Response(ResponseBody) {
+  fn(req: api.Request, next: fn(api.Request) -> api.Response) -> api.Response {
     case request.get_header(req, "x-admin") {
       Ok("true") -> next(req)
       Ok(value) -> {
@@ -150,19 +146,13 @@ fn require_admin() -> middleware.Middleware {
   }
 }
 
-fn forbidden() -> response.Response(ResponseBody) {
-  response.new(403)
-  |> response.set_body(
-    Bytes(bytes_tree.from_string("Forbidden: admin access required")),
-  )
+fn forbidden() -> api.Response {
+  api.text(403, "Forbidden: admin access required")
 }
 
 /// Adds the API version header to every /api response.
 fn api_version() -> middleware.Middleware {
-  fn(
-    req: request.Request(Connection),
-    next: fn(request.Request(Connection)) -> response.Response(ResponseBody),
-  ) -> response.Response(ResponseBody) {
+  fn(req: api.Request, next: fn(api.Request) -> api.Response) -> api.Response {
     next(req)
     |> response.set_header("x-api-version", "v1")
   }
@@ -170,29 +160,20 @@ fn api_version() -> middleware.Middleware {
 
 /// Answers the health check without reaching the app.
 fn health_handler() -> middleware.Middleware {
-  fn(
-    _req: request.Request(Connection),
-    _next: fn(request.Request(Connection)) -> response.Response(ResponseBody),
-  ) -> response.Response(ResponseBody) {
-    response.new(200)
-    |> response.set_header("content-type", "application/json")
-    |> response.set_body(Bytes(bytes_tree.from_string("{\"status\":\"ok\"}")))
+  fn(_req: api.Request, _next: fn(api.Request) -> api.Response) -> api.Response {
+    api.json(200, "{\"status\":\"ok\"}")
   }
 }
 
 /// Refuses the request; scoped to POST and PUT by `middleware.methods`.
 fn block_writes() -> middleware.Middleware {
-  fn(
-    req: request.Request(Connection),
-    _next: fn(request.Request(Connection)) -> response.Response(ResponseBody),
-  ) -> response.Response(ResponseBody) {
+  fn(req: api.Request, _next: fn(api.Request) -> api.Response) -> api.Response {
     log.warning(
       "middleware_demo",
       "Refused " <> http.method_to_string(req.method) <> " " <> req.path,
     )
-    response.new(405)
+    api.text(405, "Method not allowed")
     |> response.set_header("allow", "GET, HEAD")
-    |> response.set_body(Bytes(bytes_tree.from_string("Method not allowed")))
   }
 }
 
