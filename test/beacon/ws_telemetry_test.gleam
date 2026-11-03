@@ -247,11 +247,15 @@ pub fn refused_upgrade_span_reports_the_refusal_test() {
     list.filter(upgrade_headers(app.port), fn(h) { h.0 != "Origin" })
   let #(socket, status) = upgrade(app.port, headers)
   let assert "403" = status
+  // The server half-closes after the refusal and lingers, draining the peer,
+  // until the peer closes (or 1 s passes); the span stops after that. Close
+  // first so the span ends on the peer's close, not on the linger timeout.
+  raw_close(socket)
   let stop = expect(events, upgrade_stop)
   let assert Ok("rejected_origin") = telemetry.string(stop, "result")
-  // A refused upgrade never opened a connection: no close summary.
+  // A refused upgrade never reached the runtime factory. The stop event is
+  // emitted after the refusal returns, so the factory has had its chance.
   let assert Error(Nil) = process.receive(app.connected, 0)
-  raw_close(socket)
 
   let unsupported =
     list.map(upgrade_headers(app.port), fn(h) {
@@ -262,9 +266,10 @@ pub fn refused_upgrade_span_reports_the_refusal_test() {
     })
   let #(socket, status) = upgrade(app.port, unsupported)
   let assert "426" = status
+  raw_close(socket)
   let stop = expect(events, upgrade_stop)
   let assert Ok("rejected_version") = telemetry.string(stop, "result")
-  raw_close(socket)
+  let assert Error(Nil) = process.receive(app.connected, 0)
   finish(id, app)
 }
 
