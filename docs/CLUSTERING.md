@@ -6,10 +6,11 @@ are connected:
 - PubSub broadcasts reach subscribers on every node.
 - Presence shows who is on a topic, cluster-wide.
 - Session logouts and rotations close live connections on every node.
+- Replicated stores keep a converging copy on every node.
 - The cluster manager discovers peers, reconnects them, and checks that
   they belong to the same deployment.
 
-Stores remain per node (see [Stores](#stores)).
+Stores are per node unless opened in replicated mode (see [Stores](#stores)).
 
 The design and its references (Phoenix.PubSub, Phoenix.Tracker, libcluster,
 Plug.Session, OTP distribution) are in
@@ -209,11 +210,136 @@ Start PubSub before presence and before anything that subscribes:
 
 ## Stores
 
-`beacon/store` tables are per node. A write changes this node's table and
-notifies watchers on this node only (`local_broadcast`). Two nodes behind a
-load balancer therefore show different store contents. For shared state
-across nodes, use your database, or presence for "who is here". Replicated
-stores are designed in the design document but not built yet.
+A `beacon/store` store is local or replicated, chosen when it is opened.
+
+- **Local** (the default, `store.new` / `store.new_list`). The table is per
+  node. A write changes this node's table and notifies watchers on this
+  node only (`local_broadcast`). Two nodes behind a load balancer therefore
+  show different store contents.
+- **Replicated** (`store.open` / `store.open_list` with
+  `store.Replicated(config)`). Every node that opens the store keeps a full
+  replica, and the replicas converge. See below.
+
+For data that must survive every node restarting, use your database.
+Presence is the better fit for "who is here".
+
+## Replicated stores
+
+```gleam
+let assert Ok(cart) =
+  store.open("cart", store.Replicated(replicated.default_config()))
+```
+
+Each node runs one replica process per replicated store, under its own
+supervisor. The design follows Phoenix.Tracker (one process owns the
+replicated state, deltas go out over PubSub, and a periodic exchange repairs
+what was lost). Its state is an add-wins last-writer-wins map ported from
+delta_crdt_ex's `AWLWWMap` (`beacon/store/crdt`). The replica mirrors its
+values into ETS, so reads never leave the node or call the replica. The API
+is the one in [STATE_MANAGEMENT.md](STATE_MANAGEMENT.md#replicated-stores).
+
+### How writes travel
+
+1. A write is a call to this node's replica. The replica checks the limits,
+   applies the write, updates its ETS mirror, and broadcasts the write's
+   delta on `beacon_store:<kv|list>:<name>`. The writer then notifies this
+   node's watchers.
+2. Each receiving replica merges the delta, then notifies its own node's
+   watchers on the store topic and on any `append_notify` /
+   `delete_all_notify` topic the change carried.
+3. Deltas are fire and forget. Every `sync_interval_ms` (default 1 second)
+   each replica broadcasts a digest of its state. A replica whose digest
+   differs asks the sender for its full state and merges it. This repairs
+   any delta lost to a netsplit, a crash or an overloaded PubSub forwarder.
+4. A replica that starts asks every peer for its full state at once. This
+   covers a node joining, a node rejoining after a crash, and a replica
+   restarted by its supervisor. It also asks a node for its full state
+   when that node connects. Until the first sync arrives, a new replica
+   serves empty reads.
+
+Merges are idempotent and commutative, so a delta that arrives twice, late,
+or after a full state that already contained it changes nothing.
+
+### Conflicts
+
+- **Timestamps.** Every write is stamped with a hybrid logical clock
+  (`beacon/store/hlc`): the wall clock in milliseconds, a logical counter,
+  and the node name. A replica that merges a remote write advances its
+  clock past that write, so a later write on any node gets a later
+  timestamp.
+- **Last writer wins.** Concurrent writes of one key resolve to the
+  greatest `(timestamp, node)` on every node, whatever order they arrive
+  in.
+- **Add wins.** A delete removes only the values the deleting node had
+  seen. A value written concurrently on another node survives the delete.
+- **List stores** keep every appended value, ordered by timestamp.
+- **Clock skew.** A remote timestamp more than 60 seconds ahead of this
+  node's clock is logged as a warning. Its writes win every comparison
+  until the other clocks catch up, so keep node clocks synchronised (NTP).
+
+### Limits
+
+`replicated.Config` bounds every replica. `validate_config` rejects values
+out of range, and `store.open` returns `Error(InvalidConfig(_))` for them.
+
+| Field | Default | Bounds |
+|---|---|---|
+| `sync_interval_ms` | 1000 | 10 to 3,600,000 |
+| `max_entries` | 100,000 | 1 to 10,000,000 |
+| `max_value_bytes` | 64 KiB | at least 1, below `max_delta_bytes` |
+| `max_delta_bytes` | 1 MiB | at most `max_sync_bytes` |
+| `max_sync_bytes` | 64 MiB | at most 1 GiB |
+
+- **Entries.** `max_entries` counts the keys of a key-value store and the
+  values of a list store. Concurrent values of one key each count until a
+  later write replaces them.
+- **Bytes** are measured with `erlang:external_size/1`. A value includes
+  its key.
+- **On the writer**, a write past a limit returns `TooManyEntries`,
+  `ValueTooLarge` or `DeltaTooLarge` and changes nothing.
+- **On every receiver**, a delta or full state larger than its limit, or
+  one that would grow the replica past `max_entries`, is refused and
+  logged at error level. The replica keeps its state. Its digest still
+  differs, so the next exchange retries and logs again until the
+  configurations agree or the data shrinks.
+
+Every node must open a store with the same configuration. A node that
+opens a name already open with another configuration, or in the other mode,
+gets `Error(InvalidConfig(_))`.
+
+### Failures
+
+- **Netsplit.** Each side keeps accepting writes. When the nodes reconnect,
+  the digest exchange pulls the missing state and both sides converge by
+  the rules above.
+- **Replica crash.** The supervisor restarts the replica (at most 3
+  restarts in 5 seconds), and the new replica syncs from its peers. While
+  it restarts, reads crash the caller loudly and writes return
+  `Unavailable`. If the supervisor gives up, the store stays down on that
+  node until it is opened again.
+- **A write call that gets no answer within 5 seconds** returns
+  `Unavailable`.
+
+### Telemetry
+
+- Every write emits `[beacon, store, write]` with `mode: "replicated"`. A
+  rejected write emits nothing.
+- Every remote merge (delta or full state, accepted or refused) runs in a
+  `[beacon, store, sync]` span. The stop event's `entries` is the number of
+  entries the payload carried and `bytes` its size; `peer` is the sending
+  node. See [TELEMETRY.md](TELEMETRY.md).
+
+### Caveats
+
+- A replicated store is memory on every node. Size `max_entries` and
+  `max_sync_bytes` for the smallest node.
+- A full sync sends the whole state, so a large store makes joins and
+  repairs proportionally expensive. Deltas carry only the written entries.
+- The replica's causal context gains one entry for every incarnation of
+  every replica (each restart is a new one), and it is never compacted.
+  This is small, but it grows with restarts.
+- Replication messages are not authenticated: connected nodes trust each
+  other completely (see [Security first](#security-first-what-distribution-means)).
 
 ## Sessions
 

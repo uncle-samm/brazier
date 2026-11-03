@@ -11,6 +11,7 @@
 ///
 /// Reference: RFC 9112 (HTTP/1.1), RFC 9110 (HTTP semantics), cowboy_http.
 import beacon/log
+import beacon/telemetry
 import beacon/transport/server
 import gleam/bit_array
 import gleam/bytes_tree
@@ -575,19 +576,112 @@ fn ffi_run_handler(
   req: Request(server.Connection),
 ) -> Result(Response(server.ResponseBody), String)
 
-/// Run a request handler; a crash is logged with its stacktrace and
-/// returned as an error so the connection can answer 500 and close.
+@external(erlang, "beacon_transport_ffi", "http_route_reset")
+fn ffi_route_reset() -> Nil
+
+@external(erlang, "beacon_transport_ffi", "http_route_tag")
+fn ffi_route_tag(route: String) -> Nil
+
+@external(erlang, "beacon_transport_ffi", "http_route_take")
+fn ffi_route_take() -> String
+
+@external(erlang, "beacon_transport_ffi", "http_connection_id")
+fn ffi_connection_id() -> String
+
+@external(erlang, "beacon_transport_ffi", "http_body_consumed")
+fn ffi_body_consumed(socket: server.Socket) -> Int
+
+/// Longest route pattern `tag_route` accepts, in bytes.
+pub const max_route_tag_bytes = 255
+
+/// Tag the request being handled with the route pattern it matched (for
+/// example `/users/:id`), never the raw path. The pattern becomes the
+/// `route` of the `[beacon, http, request]` stop event; a request nobody
+/// tags reports `"unknown"`. Call it from the routing code that runs inside
+/// `run_handler`; the last tag wins.
+///
+/// An empty pattern or one longer than `max_route_tag_bytes` is a
+/// programming error and crashes the request (answered with 500).
+pub fn tag_route(pattern: String) -> Nil {
+  let size = string.byte_size(pattern)
+  case size > 0 && size <= max_route_tag_bytes {
+    True -> log.debug("beacon.http", "Request matched route " <> pattern)
+    False ->
+      log.error(
+        "beacon.http",
+        "tag_route called with a "
+          <> int.to_string(size)
+          <> "-byte route pattern (allowed 1 to "
+          <> int.to_string(max_route_tag_bytes)
+          <> ")",
+      )
+  }
+  let assert True = size > 0 && size <= max_route_tag_bytes
+    as "tag_route: a route pattern is 1 to 255 bytes"
+  ffi_route_tag(pattern)
+}
+
+/// Run a request handler inside a `[beacon, http, request]` telemetry span;
+/// a crash is logged with its stacktrace and returned as an error so the
+/// connection can answer 500 and close.
+///
+/// The span covers the handler only (reading the request body is part of
+/// it; writing the response is not). Its stop event carries the tagged
+/// route (see `tag_route`), the status (500 for a crash), the body bytes
+/// the handler read and the size of the body it returned.
 pub fn run_handler(
   handler: fn(Request(server.Connection)) -> Response(server.ResponseBody),
   req: Request(server.Connection),
 ) -> Result(Response(server.ResponseBody), String) {
-  case ffi_run_handler(handler, req) {
-    Ok(resp) -> Ok(resp)
-    Error(reason) -> {
-      log.error("beacon.http", "Request handler crashed: " <> reason)
-      Error(reason)
-    }
+  telemetry.http_request_span(
+    method_label(req.method),
+    ffi_connection_id(),
+    fn() {
+      ffi_route_reset()
+      let result = ffi_run_handler(handler, req)
+      let route = ffi_route_take()
+      let req_bytes = ffi_body_consumed(req.body.socket)
+      case result {
+        Ok(resp) -> #(
+          Ok(resp),
+          route,
+          resp.status,
+          req_bytes,
+          response_body_bytes(resp),
+        )
+        Error(reason) -> {
+          log.error(
+            "beacon.http",
+            "Request handler crashed on route " <> route <> ": " <> reason,
+          )
+          #(Error(reason), route, 500, req_bytes, 0)
+        }
+      }
+    },
+  )
+}
+
+/// A bounded method label: the methods the parser accepts, `OTHER` for
+/// anything else (the parser rejects other methods, so this is defensive
+/// against a handler being run on a hand-built request).
+fn method_label(method: http.Method) -> String {
+  case method {
+    http.Get -> "GET"
+    http.Post -> "POST"
+    http.Put -> "PUT"
+    http.Delete -> "DELETE"
+    http.Head -> "HEAD"
+    http.Options -> "OPTIONS"
+    http.Patch -> "PATCH"
+    http.Connect -> "CONNECT"
+    http.Trace -> "TRACE"
+    http.Other(_) -> "OTHER"
   }
+}
+
+fn response_body_bytes(resp: Response(server.ResponseBody)) -> Int {
+  let server.Bytes(body) = resp.body
+  bytes_tree.byte_size(body)
 }
 
 // --- Responses ---

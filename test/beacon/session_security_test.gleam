@@ -195,7 +195,8 @@ pub fn old_session_id_unusable_after_login_test() {
   let config = auth.dev_session_config()
   // Attacker plants an anonymous session id in the victim's browser.
   let planted = session.create(store)
-  let login = auth.create_login_rotating(store, Some(planted.id), "victim")
+  let assert Ok(login) =
+    auth.create_login_rotating(store, Some(planted.id), "victim")
   should.not_equal(login.session.id, planted.id)
   should.equal(session.get(store, planted.id), None)
   let req = cookie_request("GET", "/", config.cookie_name, planted.id)
@@ -224,7 +225,7 @@ pub fn login_route_rotates_existing_cookie_test() {
 
 pub fn change_privileges_rotates_and_applies_updates_test() {
   let store = session.new_store("sec_change_privileges")
-  let login = auth.create_login(store, "alice")
+  let assert Ok(login) = auth.create_login(store, "alice")
   let assert Ok(promoted) =
     auth.change_privileges(store, login.session.id, [#("role", "admin")])
   should.not_equal(promoted.session.id, login.session.id)
@@ -237,7 +238,7 @@ pub fn change_privileges_rotates_and_applies_updates_test() {
 
 pub fn change_privileges_on_dead_session_fails_test() {
   let store = session.new_store("sec_change_privileges_dead")
-  let login = auth.create_login(store, "alice")
+  let assert Ok(login) = auth.create_login(store, "alice")
   session.delete(store, login.session.id)
   should.equal(
     auth.change_privileges(store, login.session.id, [#("role", "admin")]),
@@ -309,7 +310,7 @@ pub fn bindings_are_released_when_process_exits_test() {
 pub fn ws_session_auth_binds_calling_process_test() {
   let store = session.new_store("sec_ws_auth_binds")
   let config = auth.dev_session_config()
-  let login = auth.create_login(store, "alice")
+  let assert Ok(login) = auth.create_login(store, "alice")
   let auth_fn = auth.ws_session_auth(store, config)
   let req = cookie_request("GET", "/ws", config.cookie_name, login.session.id)
   should.equal(auth_fn(req), Ok(Nil))
@@ -356,7 +357,7 @@ pub fn csrf_middleware_with_config_uses_configured_cookie_test() {
   let store = session.new_store("sec_csrf_config")
   let config =
     auth.SessionConfig(..auth.dev_session_config(), cookie_name: "sid")
-  let login = auth.create_login(store, "alice")
+  let assert Ok(login) = auth.create_login(store, "alice")
   let mw = auth.csrf_protection_with_config(store, config)
   let ok_req =
     cookie_request("POST", "/x", "sid", login.session.id)
@@ -372,7 +373,7 @@ pub fn require_auth_with_config_uses_configured_cookie_test() {
   let store = session.new_store("sec_require_auth_config")
   let config =
     auth.SessionConfig(..auth.dev_session_config(), cookie_name: "sid")
-  let login = auth.create_login(store, "alice")
+  let assert Ok(login) = auth.create_login(store, "alice")
   let mw = auth.require_auth_with_config(store, config)
   should.equal(
     mw(cookie_request("GET", "/x", "sid", login.session.id), ok_handler).status,
