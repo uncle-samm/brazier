@@ -1,16 +1,47 @@
+/// Routed Workspace: routing, a Local layer and server-authoritative Model
+/// updates in one app.
+///
+/// - `with_router` maps `/`, `/pipeline` and `/settings` to a `Route` in the
+///   Model; any other path is a 404.
+/// - Panels, tabs, filters, drafts and menus are Local: they change in the
+///   browser with no server traffic.
+/// - Deploys, incidents, cards and the saved profile are in the Model: the
+///   server validates every change.
 import beacon
-import beacon/effect
+import beacon/attribute
+import beacon/effect.{type Effect}
+import beacon/element.{type Element}
+import beacon/event
 import beacon/html
+import beacon/local
 import beacon/log
-import beacon/route
-import gleam/dynamic/decode
+import beacon/router
 import gleam/int
-import gleam/json
 import gleam/list
+import gleam/string
+import gleam/uri.{type Uri}
 
+const lanes = ["todo", "doing", "done"]
+
+const roles = ["owner", "operator", "viewer"]
+
+const max_title_length = 120
+
+const max_name_length = 80
+
+/// The server refuses new cards past this many.
+const max_cards = 200
+
+pub type Route {
+  OverviewPage
+  PipelinePage
+  SettingsPage
+}
+
+/// Synced to the browser.
 pub type Model {
   Model(
-    path: String,
+    route: Route,
     open_tickets: Int,
     deploys: Int,
     incidents: Int,
@@ -26,6 +57,7 @@ pub type Card {
   Card(id: Int, title: String, lane: String)
 }
 
+/// Client-only.
 pub type Local {
   Local(
     inspector_open: Bool,
@@ -40,26 +72,52 @@ pub type Local {
 }
 
 pub type Msg {
-  RouteChanged(String)
+  RouteChanged(Route)
+  // Local: handled in the browser.
   ToggleInspector
   SelectTab(String)
-  ShipDeploy
-  ResolveIncident
   SetDraft(String)
   SetFilter(String)
   ToggleCompact
-  AddCard(String)
-  Advance(Int)
   SetDraftName(String)
   SetDraftRole(String)
   ToggleMenu
-  SaveProfile(String)
+  // Model: forwarded to the server.
+  ShipDeploy
+  ResolveIncident
+  /// The submitted form's fields, as `name`/`value` pairs.
+  AddCard(List(#(String, String)))
+  Advance(Int)
+  SaveProfile(List(#(String, String)))
 }
 
-pub fn init() -> #(Model, effect.Effect(Msg)) {
+// --- Routing ---
+
+fn parse_route(uri: Uri) -> Result(Route, Nil) {
+  case router.segments(uri) {
+    [] -> Ok(OverviewPage)
+    ["pipeline"] -> Ok(PipelinePage)
+    ["settings"] -> Ok(SettingsPage)
+    _ -> Error(Nil)
+  }
+}
+
+pub fn href(route: Route) -> String {
+  case route {
+    OverviewPage -> "/"
+    PipelinePage -> "/pipeline"
+    SettingsPage -> "/settings"
+  }
+}
+
+// --- Init and update (server) ---
+
+fn init(_ctx: beacon.Context) -> #(Model, Effect(Msg)) {
+  // `with_router` dispatches RouteChanged for the requested URL before the
+  // first render, so this route is only a placeholder.
   #(
     Model(
-      path: "/",
+      route: OverviewPage,
       open_tickets: 7,
       deploys: 3,
       incidents: 1,
@@ -77,6 +135,153 @@ pub fn init() -> #(Model, effect.Effect(Msg)) {
   )
 }
 
+fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
+  let model = case msg {
+    RouteChanged(route) -> {
+      log.debug("routed_workspace", "Route changed to " <> href(route))
+      Model(..model, route:)
+    }
+    ShipDeploy -> Model(..model, deploys: model.deploys + 1)
+    ResolveIncident ->
+      case model.incidents > 0 {
+        True -> Model(..model, incidents: model.incidents - 1)
+        False -> {
+          log.warning("routed_workspace", "No active incident to resolve")
+          model
+        }
+      }
+    AddCard(fields) ->
+      case validate_card(model, fields) {
+        Ok(title) -> {
+          log.info(
+            "routed_workspace",
+            "Added card " <> int.to_string(model.next_id),
+          )
+          Model(
+            ..model,
+            cards: [
+              Card(id: model.next_id, title:, lane: "todo"),
+              ..model.cards
+            ],
+            next_id: model.next_id + 1,
+          )
+        }
+        Error(reason) -> {
+          log.warning("routed_workspace", "Rejected a card: " <> reason)
+          model
+        }
+      }
+    Advance(id) ->
+      case list.any(model.cards, fn(card) { card.id == id }) {
+        True ->
+          Model(..model, cards: list.map(model.cards, advance_card(_, id)))
+        False -> {
+          log.warning(
+            "routed_workspace",
+            "Refusing to advance unknown card " <> int.to_string(id),
+          )
+          model
+        }
+      }
+    SaveProfile(fields) ->
+      case validate_profile(fields) {
+        Ok(#(name, role)) -> {
+          let version = model.saved_version + 1
+          log.info(
+            "routed_workspace",
+            "Saved profile v" <> int.to_string(version),
+          )
+          Model(..model, display_name: name, role:, saved_version: version)
+        }
+        Error(reason) -> {
+          log.warning("routed_workspace", "Rejected a profile: " <> reason)
+          model
+        }
+      }
+    // `update_local` handles these in the browser and never forwards them.
+    ToggleInspector
+    | SelectTab(_)
+    | SetDraft(_)
+    | SetFilter(_)
+    | ToggleCompact
+    | SetDraftName(_)
+    | SetDraftRole(_)
+    | ToggleMenu -> model
+  }
+  #(model, effect.none())
+}
+
+fn validate_card(
+  model: Model,
+  fields: List(#(String, String)),
+) -> Result(String, String) {
+  case list.key_find(fields, "card_title") {
+    Error(Nil) -> Error("missing field `card_title`")
+    Ok(title) -> {
+      let title = string.trim(title)
+      let length = string.length(title)
+      case
+        length,
+        length > max_title_length,
+        list.length(model.cards) >= max_cards
+      {
+        0, _, _ -> Error("empty title")
+        _, True, _ ->
+          Error(
+            "title of "
+            <> int.to_string(length)
+            <> " characters (max "
+            <> int.to_string(max_title_length)
+            <> ")",
+          )
+        _, _, True ->
+          Error("the board is full (" <> int.to_string(max_cards) <> " cards)")
+        _, False, False -> Ok(title)
+      }
+    }
+  }
+}
+
+fn validate_profile(
+  fields: List(#(String, String)),
+) -> Result(#(String, String), String) {
+  case list.key_find(fields, "display_name"), list.key_find(fields, "role") {
+    Error(Nil), _ -> Error("missing field `display_name`")
+    _, Error(Nil) -> Error("missing field `role`")
+    Ok(name), Ok(role) -> {
+      let name = string.trim(name)
+      let length = string.length(name)
+      case length, length > max_name_length, list.contains(roles, role) {
+        0, _, _ -> Error("empty display name")
+        _, True, _ ->
+          Error(
+            "display name of "
+            <> int.to_string(length)
+            <> " characters (max "
+            <> int.to_string(max_name_length)
+            <> ")",
+          )
+        _, _, False -> Error("unknown role " <> string.inspect(role))
+        _, False, True -> Ok(#(name, role))
+      }
+    }
+  }
+}
+
+fn advance_card(card: Card, id: Int) -> Card {
+  case card.id == id, card.lane {
+    False, _ -> card
+    True, "todo" -> Card(..card, lane: "doing")
+    True, _ -> Card(..card, lane: "done")
+  }
+}
+
+fn sync(model: Model) -> Model {
+  model
+}
+
+// --- Local (browser) ---
+
 pub fn init_local(model: Model) -> Local {
   Local(
     inspector_open: False,
@@ -90,149 +295,122 @@ pub fn init_local(model: Model) -> Local {
   )
 }
 
-pub fn update(
-  model: Model,
+pub fn update_local(
+  _model: Model,
   local: Local,
-  _server: Nil,
   msg: Msg,
-) -> #(Model, Local, Nil) {
-  let #(model, local) = case msg {
-    RouteChanged(path) -> #(Model(..model, path: path), local)
-    ToggleInspector -> #(
-      model,
-      Local(..local, inspector_open: !local.inspector_open),
-    )
-    SelectTab(tab) -> #(model, Local(..local, selected_tab: tab))
-    ShipDeploy -> #(Model(..model, deploys: model.deploys + 1), local)
-    ResolveIncident -> {
-      let incidents = case model.incidents > 0 {
-        True -> model.incidents - 1
-        False -> 0
-      }
-      #(Model(..model, incidents: incidents), local)
-    }
-    SetDraft(text) -> #(model, Local(..local, draft: text))
-    SetFilter(filter) -> #(model, Local(..local, filter: filter))
-    ToggleCompact -> #(model, Local(..local, compact: !local.compact))
-    AddCard(fields_json) -> {
-      let title = case form_field(fields_json, "card_title") {
-        Ok(value) -> value
-        Error(reason) -> {
-          log.warning("routed_workspace", "Invalid card submit: " <> reason)
-          ""
-        }
-      }
-      case title == "" {
-        True -> #(model, local)
-        False -> {
-          let card = Card(id: model.next_id, title: title, lane: "todo")
-          #(
-            Model(
-              ..model,
-              cards: [card, ..model.cards],
-              next_id: model.next_id + 1,
-            ),
-            Local(..local, draft: ""),
-          )
-        }
-      }
-    }
-    Advance(id) -> #(
-      Model(..model, cards: list.map(model.cards, advance_card(_, id))),
-      local,
-    )
-    SetDraftName(name) -> #(model, Local(..local, draft_name: name))
-    SetDraftRole(role) -> #(model, Local(..local, draft_role: role))
-    ToggleMenu -> #(model, Local(..local, menu_open: !local.menu_open))
-    SaveProfile(fields_json) -> {
-      case
-        form_field(fields_json, "display_name"),
-        form_field(fields_json, "role")
-      {
-        Ok(name), Ok(role) -> #(
-          Model(
-            ..model,
-            display_name: name,
-            role: role,
-            saved_version: model.saved_version + 1,
-          ),
-          local,
-        )
-        Error(reason), _ | _, Error(reason) -> {
-          log.warning("routed_workspace", "Invalid profile submit: " <> reason)
-          #(model, local)
-        }
-      }
-    }
-  }
-  #(model, local, Nil)
-}
-
-fn advance_card(card: Card, id: Int) -> Card {
-  case card.id == id {
-    False -> card
-    True -> {
-      let next_lane = case card.lane {
-        "todo" -> "doing"
-        "doing" -> "done"
-        _ -> "done"
-      }
-      Card(..card, lane: next_lane)
-    }
+) -> local.Update(Local) {
+  case msg {
+    ToggleInspector ->
+      local.handled(Local(..local, inspector_open: !local.inspector_open))
+    SelectTab(tab) -> local.handled(Local(..local, selected_tab: tab))
+    SetDraft(text) -> local.handled(Local(..local, draft: text))
+    SetFilter(filter) -> local.handled(Local(..local, filter:))
+    ToggleCompact -> local.handled(Local(..local, compact: !local.compact))
+    SetDraftName(name) -> local.handled(Local(..local, draft_name: name))
+    SetDraftRole(role) -> local.handled(Local(..local, draft_role: role))
+    ToggleMenu -> local.handled(Local(..local, menu_open: !local.menu_open))
+    AddCard(_) -> local.forward(Local(..local, draft: ""))
+    RouteChanged(_)
+    | ShipDeploy
+    | ResolveIncident
+    | Advance(_)
+    | SaveProfile(_) -> local.forward(local)
   }
 }
 
-pub fn view(model: Model, local: Local) -> beacon.Node(Msg) {
-  // Invariant: `model.path` is initialized to "/" and later updated only from
-  // `route_pages()` entries through RouteChanged.
-  let assert Ok(page) =
-    route.dispatch_view(pages(), #(model, local, Nil), model.path)
-  page
+// --- View ---
+
+pub fn view(model: Model, local: Local) -> Element(Msg) {
+  let #(title, page) = case model.route {
+    OverviewPage -> #("Overview", overview_view(model, local))
+    PipelinePage -> #("Pipeline", pipeline_view(model, local))
+    SettingsPage -> #("Settings", settings_view(model, local))
+  }
+  html.main(
+    [
+      attribute.styles([
+        #("font-family", "system-ui"),
+        #("max-width", "1040px"),
+        #("margin", "32px auto"),
+        #("padding", "0 16px"),
+      ]),
+    ],
+    [
+      html.nav(
+        [
+          attribute.styles([
+            #("display", "flex"),
+            #("gap", "12px"),
+            #("margin-bottom", "24px"),
+          ]),
+        ],
+        [
+          html.a([attribute.href(href(OverviewPage))], [html.text("Overview")]),
+          html.a([attribute.href(href(PipelinePage))], [html.text("Pipeline")]),
+          html.a([attribute.href(href(SettingsPage))], [html.text("Settings")]),
+        ],
+      ),
+      html.h1([], [html.text(title)]),
+      page,
+    ],
+  )
 }
 
-fn overview_view(model: Model, local: Local) -> beacon.Node(Msg) {
+fn overview_view(model: Model, local: Local) -> Element(Msg) {
   html.div([], [
+    html.section([attribute.styles(grid_styles())], [
+      metric("Open tickets", int.to_string(model.open_tickets)),
+      metric("Deploys today", int.to_string(model.deploys)),
+      metric("Active incidents", int.to_string(model.incidents)),
+    ]),
     html.section(
       [
-        html.style(
-          "display:grid;gap:12px;grid-template-columns:repeat(3,minmax(0,1fr));",
-        ),
+        attribute.styles([
+          #("margin-top", "20px"),
+          #("display", "flex"),
+          #("gap", "8px"),
+          #("flex-wrap", "wrap"),
+        ]),
       ],
       [
-        metric("Open tickets", int.to_string(model.open_tickets)),
-        metric("Deploys today", int.to_string(model.deploys)),
-        metric("Active incidents", int.to_string(model.incidents)),
-      ],
-    ),
-    html.section(
-      [html.style("margin-top:20px;display:flex;gap:8px;flex-wrap:wrap;")],
-      [
-        html.button([beacon.on_click(ShipDeploy)], [html.text("Ship deploy")]),
-        html.button([beacon.on_click(ResolveIncident)], [
+        html.button([event.on_click(ShipDeploy)], [html.text("Ship deploy")]),
+        html.button([event.on_click(ResolveIncident)], [
           html.text("Resolve incident"),
         ]),
-        html.button([beacon.on_click(ToggleInspector)], [
+        html.button([event.on_click(ToggleInspector)], [
           html.text("Toggle inspector"),
         ]),
       ],
     ),
-    html.section([html.style("margin-top:20px;")], [
-      html.div([html.style("display:flex;gap:8px;margin-bottom:12px;")], [
-        tab_button("health", local.selected_tab),
-        tab_button("activity", local.selected_tab),
-        tab_button("risks", local.selected_tab),
-      ]),
-      html.p([html.attribute("data-testid", "selected-tab")], [
+    html.section([attribute.styles([#("margin-top", "20px")])], [
+      html.div(
+        [
+          attribute.styles([
+            #("display", "flex"),
+            #("gap", "8px"),
+            #("margin-bottom", "12px"),
+          ]),
+        ],
+        [
+          tab_button("health", local.selected_tab),
+          tab_button("activity", local.selected_tab),
+          tab_button("risks", local.selected_tab),
+        ],
+      ),
+      html.p([attribute.data("testid", "selected-tab")], [
         html.text("Selected tab: " <> local.selected_tab),
       ]),
       case local.inspector_open {
         True ->
           html.div(
             [
-              html.attribute("data-testid", "local-inspector"),
-              html.style(
-                "border:1px solid #d0d7de;padding:12px;border-radius:6px;",
-              ),
+              attribute.data("testid", "local-inspector"),
+              attribute.styles([
+                #("border", "1px solid #d0d7de"),
+                #("padding", "12px"),
+                #("border-radius", "6px"),
+              ]),
             ],
             [
               html.strong([], [html.text("Inspector")]),
@@ -244,111 +422,86 @@ fn overview_view(model: Model, local: Local) -> beacon.Node(Msg) {
             ],
           )
         False ->
-          html.span(
-            [html.attribute("data-testid", "local-inspector-closed")],
-            [],
-          )
+          html.span([attribute.data("testid", "local-inspector-closed")], [])
       },
     ]),
   ])
 }
 
-fn pipeline_view(model: Model, local: Local) -> beacon.Node(Msg) {
+fn pipeline_view(model: Model, local: Local) -> Element(Msg) {
   html.div([], [
-    html.form(
-      [
-        beacon.on_submit_local(AddCard),
-        html.style(
-          "display:flex;gap:8px;align-items:center;margin-bottom:16px;",
+    html.form([event.on_submit(AddCard), attribute.styles(toolbar_styles())], [
+      html.input([
+        attribute.type_("text"),
+        attribute.value(local.draft),
+        attribute.name("card_title"),
+        attribute.placeholder("New card title"),
+        event.on_input(SetDraft),
+        attribute.data("testid", "card-draft"),
+      ]),
+      html.button([attribute.type_("submit")], [html.text("Add card")]),
+    ]),
+    html.div([attribute.styles(toolbar_styles())], [
+      html.select(
+        [event.on_change(SetFilter), attribute.data("testid", "lane-filter")],
+        [
+          option("all", local.filter, "All lanes"),
+          option("todo", local.filter, "Todo"),
+          option("doing", local.filter, "Doing"),
+          option("done", local.filter, "Done"),
+        ],
+      ),
+      html.button([event.on_click(ToggleCompact)], [
+        html.text(case local.compact {
+          True -> "Comfortable"
+          False -> "Compact"
+        }),
+      ]),
+      html.span([attribute.data("testid", "pipeline-local-state")], [
+        html.text(
+          "Filter: "
+          <> local.filter
+          <> " / compact: "
+          <> bool_text(local.compact),
         ),
-      ],
-      [
-        html.input([
-          html.type_("text"),
-          html.value(local.draft),
-          html.attribute("name", "card_title"),
-          html.placeholder("New card title"),
-          beacon.on_input(SetDraft),
-          html.attribute("data-testid", "card-draft"),
-        ]),
-        html.button([html.type_("submit")], [html.text("Add card")]),
-      ],
-    ),
-    html.div(
-      [
-        html.style(
-          "display:flex;gap:8px;align-items:center;margin-bottom:16px;",
-        ),
-      ],
-      [
-        html.select(
-          [
-            beacon.on_change(SetFilter),
-            html.attribute("data-testid", "lane-filter"),
-          ],
-          [
-            option("all", local.filter, "All lanes"),
-            option("todo", local.filter, "Todo"),
-            option("doing", local.filter, "Doing"),
-            option("done", local.filter, "Done"),
-          ],
-        ),
-        html.button([beacon.on_click(ToggleCompact)], [
-          html.text(case local.compact {
-            True -> "Comfortable"
-            False -> "Compact"
-          }),
-        ]),
-        html.span([html.attribute("data-testid", "pipeline-local-state")], [
-          html.text(
-            "Filter: "
-            <> local.filter
-            <> " / compact: "
-            <> bool_text(local.compact),
-          ),
-        ]),
-      ],
-    ),
+      ]),
+    ]),
     html.section(
-      [
-        html.style(
-          "display:grid;gap:12px;grid-template-columns:repeat(3,minmax(0,1fr));",
-        ),
-      ],
-      [
-        lane("todo", model.cards, local),
-        lane("doing", model.cards, local),
-        lane("done", model.cards, local),
-      ],
+      [attribute.styles(grid_styles())],
+      list.map(lanes, lane(_, model.cards, local)),
     ),
   ])
 }
 
-fn settings_view(model: Model, local: Local) -> beacon.Node(Msg) {
+fn settings_view(model: Model, local: Local) -> Element(Msg) {
   html.div([], [
     html.form(
       [
-        beacon.on_submit_local(SaveProfile),
-        html.style("display:grid;gap:12px;max-width:460px;"),
+        event.on_submit(SaveProfile),
+        attribute.styles([
+          #("display", "grid"),
+          #("gap", "12px"),
+          #("max-width", "460px"),
+        ]),
       ],
       [
         html.label([], [
           html.text("Display name"),
           html.input([
-            html.type_("text"),
-            html.value(local.draft_name),
-            html.attribute("name", "display_name"),
-            beacon.on_input(SetDraftName),
-            html.attribute("data-testid", "draft-name"),
+            attribute.type_("text"),
+            attribute.value(local.draft_name),
+            attribute.name("display_name"),
+            event.on_input(SetDraftName),
+            attribute.data("testid", "draft-name"),
           ]),
         ]),
         html.label([], [
           html.text("Role"),
           html.select(
             [
-              beacon.on_change(SetDraftRole),
-              html.attribute("data-testid", "draft-role"),
-              html.attribute("name", "role"),
+              event.on_change(SetDraftRole),
+              attribute.data("testid", "draft-role"),
+              attribute.name("role"),
             ],
             [
               option("owner", local.draft_role, "Owner"),
@@ -357,9 +510,9 @@ fn settings_view(model: Model, local: Local) -> beacon.Node(Msg) {
             ],
           ),
         ]),
-        html.div([html.style("display:flex;gap:8px;")], [
-          html.button([html.type_("submit")], [html.text("Save profile")]),
-          html.button([html.type_("button"), beacon.on_click(ToggleMenu)], [
+        html.div([attribute.styles([#("display", "flex"), #("gap", "8px")])], [
+          html.button([attribute.type_("submit")], [html.text("Save profile")]),
+          html.button([attribute.type_("button"), event.on_click(ToggleMenu)], [
             html.text("Toggle menu"),
           ]),
         ]),
@@ -367,13 +520,16 @@ fn settings_view(model: Model, local: Local) -> beacon.Node(Msg) {
     ),
     html.section(
       [
-        html.style(
-          "margin-top:20px;border:1px solid #d0d7de;border-radius:6px;padding:12px;",
-        ),
+        attribute.styles([
+          #("margin-top", "20px"),
+          #("border", "1px solid #d0d7de"),
+          #("border-radius", "6px"),
+          #("padding", "12px"),
+        ]),
       ],
       [
         html.h2([], [html.text("Saved profile")]),
-        html.p([html.attribute("data-testid", "saved-profile")], [
+        html.p([attribute.data("testid", "saved-profile")], [
           html.text(
             model.display_name
             <> " / "
@@ -382,133 +538,122 @@ fn settings_view(model: Model, local: Local) -> beacon.Node(Msg) {
             <> int.to_string(model.saved_version),
           ),
         ]),
-        html.p([html.attribute("data-testid", "settings-local-state")], [
+        html.p([attribute.data("testid", "settings-local-state")], [
           html.text("Draft: " <> local.draft_name <> " / " <> local.draft_role),
         ]),
         case local.menu_open {
           True ->
-            html.div([html.attribute("data-testid", "settings-menu")], [
+            html.div([attribute.data("testid", "settings-menu")], [
               html.text("Local actions menu is open"),
             ])
           False ->
-            html.span(
-              [html.attribute("data-testid", "settings-menu-closed")],
-              [],
-            )
+            html.span([attribute.data("testid", "settings-menu-closed")], [])
         },
       ],
     ),
   ])
 }
 
-fn lane(name: String, cards: List(Card), local: Local) -> beacon.Node(Msg) {
+fn lane(name: String, cards: List(Card), local: Local) -> Element(Msg) {
   let visible =
     list.filter(cards, fn(card) {
       card.lane == name && { local.filter == "all" || local.filter == name }
     })
   html.div(
     [
-      html.style(
-        "border:1px solid #d0d7de;border-radius:6px;padding:12px;min-height:180px;",
-      ),
+      attribute.styles([
+        #("border", "1px solid #d0d7de"),
+        #("border-radius", "6px"),
+        #("padding", "12px"),
+        #("min-height", "180px"),
+      ]),
     ],
     [
       html.h2([], [
         html.text(name <> " (" <> int.to_string(list.length(visible)) <> ")"),
       ]),
-      ..list.map(visible, fn(card) { card_view(card, local.compact) })
+      ..list.map(visible, card_view(_, local.compact))
     ],
   )
 }
 
-fn card_view(card: Card, compact: Bool) -> beacon.Node(Msg) {
+fn card_view(card: Card, compact: Bool) -> Element(Msg) {
   let padding = case compact {
     True -> "6px"
     False -> "12px"
   }
   html.article(
     [
-      html.style(
-        "border:1px solid #d8dee4;border-radius:6px;padding:"
-        <> padding
-        <> ";margin-bottom:8px;",
-      ),
+      attribute.styles([
+        #("border", "1px solid #d8dee4"),
+        #("border-radius", "6px"),
+        #("padding", padding),
+        #("margin-bottom", "8px"),
+      ]),
     ],
     [
       html.strong([], [html.text(card.title)]),
-      html.p([html.style("margin:4px 0;color:#57606a;")], [
+      html.p([attribute.styles([#("margin", "4px 0"), #("color", "#57606a")])], [
         html.text("Card #" <> int.to_string(card.id) <> " in " <> card.lane),
       ]),
-      html.button([beacon.on_click(Advance(card.id))], [html.text("Advance")]),
+      html.button([event.on_click(Advance(card.id))], [html.text("Advance")]),
     ],
   )
 }
 
-fn tab_button(tab: String, selected: String) -> beacon.Node(Msg) {
+fn tab_button(tab: String, selected: String) -> Element(Msg) {
   let weight = case tab == selected {
     True -> "700"
     False -> "400"
   }
   html.button(
-    [beacon.on_click(SelectTab(tab)), html.style("font-weight:" <> weight)],
+    [
+      event.on_click(SelectTab(tab)),
+      attribute.styles([#("font-weight", weight)]),
+    ],
     [html.text(tab)],
   )
 }
 
-fn option(value: String, selected: String, label: String) -> beacon.Node(Msg) {
-  let attrs = case value == selected {
-    True -> [
-      html.attribute("value", value),
-      html.attribute("selected", "selected"),
-    ]
-    False -> [html.attribute("value", value)]
-  }
-  html.option(attrs, [html.text(label)])
+fn option(value: String, selected: String, label: String) -> Element(Msg) {
+  html.option([attribute.value(value), attribute.selected(value == selected)], [
+    html.text(label),
+  ])
 }
 
-fn form_field(fields_json: String, field: String) -> Result(String, String) {
-  let decoder = {
-    use value <- decode.field(field, decode.string)
-    decode.success(value)
-  }
-  case json.parse(fields_json, decoder) {
-    Ok(value) -> Ok(value)
-    Error(_) -> Error("missing string field `" <> field <> "`")
-  }
-}
-
-fn metric(label: String, value: String) -> beacon.Node(Msg) {
+fn metric(label: String, value: String) -> Element(Msg) {
   html.div(
-    [html.style("border:1px solid #d0d7de;border-radius:6px;padding:12px;")],
     [
-      html.p([html.style("margin:0;color:#57606a;")], [html.text(label)]),
-      html.h2([html.style("margin:4px 0 0;")], [html.text(value)]),
+      attribute.styles([
+        #("border", "1px solid #d0d7de"),
+        #("border-radius", "6px"),
+        #("padding", "12px"),
+      ]),
+    ],
+    [
+      html.p([attribute.styles([#("margin", "0"), #("color", "#57606a")])], [
+        html.text(label),
+      ]),
+      html.h2([attribute.styles([#("margin", "4px 0 0")])], [html.text(value)]),
     ],
   )
 }
 
-fn shell(path: String, children: List(beacon.Node(Msg))) -> beacon.Node(Msg) {
-  let title = case path {
-    "/pipeline" -> "Pipeline"
-    "/settings" -> "Settings"
-    _ -> "Overview"
-  }
-  html.main(
-    [
-      html.style(
-        "font-family:system-ui;max-width:1040px;margin:32px auto;padding:0 16px;",
-      ),
-    ],
-    [
-      html.nav([html.style("display:flex;gap:12px;margin-bottom:24px;")], [
-        html.a([html.href("/")], [html.text("Overview")]),
-        html.a([html.href("/pipeline")], [html.text("Pipeline")]),
-        html.a([html.href("/settings")], [html.text("Settings")]),
-      ]),
-      html.h1([], [html.text(title)]),
-      ..children
-    ],
-  )
+fn grid_styles() -> List(#(String, String)) {
+  [
+    #("display", "grid"),
+    #("gap", "12px"),
+    #("grid-template-columns", "repeat(3,minmax(0,1fr))"),
+  ]
+}
+
+fn toolbar_styles() -> List(#(String, String)) {
+  [
+    #("display", "flex"),
+    #("gap", "8px"),
+    #("align-items", "center"),
+    #("margin-bottom", "16px"),
+  ]
 }
 
 fn bool_text(value: Bool) -> String {
@@ -518,38 +663,17 @@ fn bool_text(value: Bool) -> String {
   }
 }
 
-pub fn main() {
-  beacon.app(init, init_local, beacon.no_server, update, view)
-  |> beacon.title("Beacon Routed Workspace")
-  |> beacon.route_pages(pages())
-  |> beacon.start(8080)
-}
+// --- Start ---
 
-fn pages() -> List(route.Page(#(Model, Local, Nil), Msg)) {
-  [
-    route.page(
-      "/",
-      fn(r: route.Route) { RouteChanged(r.path) },
-      fn(state: #(Model, Local, Nil), route) {
-        let #(model, local, _server) = state
-        shell(route.path, [overview_view(model, local)])
-      },
-    ),
-    route.page(
-      "/pipeline",
-      fn(r: route.Route) { RouteChanged(r.path) },
-      fn(state: #(Model, Local, Nil), route) {
-        let #(model, local, _server) = state
-        shell(route.path, [pipeline_view(model, local)])
-      },
-    ),
-    route.page(
-      "/settings",
-      fn(r: route.Route) { RouteChanged(r.path) },
-      fn(state: #(Model, Local, Nil), route) {
-        let #(model, local, _server) = state
-        shell(route.path, [settings_view(model, local)])
-      },
-    ),
-  ]
+pub fn main() {
+  beacon.full_application(
+    init:,
+    update:,
+    sync:,
+    local: local.layer(init: init_local, update: update_local),
+    view:,
+  )
+  |> beacon.with_router(parse: parse_route, on_change: RouteChanged)
+  |> beacon.title(fn(_model) { "Beacon Routed Workspace" })
+  |> beacon.start(8080)
 }
