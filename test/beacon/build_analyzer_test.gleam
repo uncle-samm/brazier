@@ -5,6 +5,7 @@ import beacon/build/analyzer.{type Analysis}
 import beacon/build/app_call
 import beacon/build/client_entry
 import beacon/build/contract
+import beacon/build/files
 import beacon/build/server_codec
 import gleam/list
 import gleam/option.{None, Some}
@@ -274,6 +275,93 @@ pub fn tracker_types_in_msg_are_an_error_test() {
   let reason = analyze_error([#("app", app)])
   assert_contains(reason, "uses `beacon/presence.PresenceError`")
   assert_contains(reason, "does not run in the browser")
+}
+
+// --- a real app: the chat example ------------------------------------------
+
+/// The chat example (`beacon.full_application` with `beacon.presence` and
+/// `beacon.on_notify`), extended with a typed `beacon.on_notification`
+/// handler, analyzed as the build analyzes it. The fixtures above are
+/// written for the analyzer; this one is an app people run, so a change
+/// that breaks real apps fails here even when every fixture still passes.
+fn chat_with_typed_notifications() -> String {
+  let assert Ok(source) = files.read("examples/chat/src/chat.gleam")
+  let with_import =
+    string.replace(
+      source,
+      "import beacon/log\n",
+      "import beacon/log\nimport beacon/notification.{type Notification}\n",
+    )
+  let with_variant =
+    string.replace(
+      with_import,
+      "  PresenceChanged(sync.Diff(Member))\n}",
+      "  PresenceChanged(sync.Diff(Member))\n  Pushed(Notification)\n}",
+    )
+  let app =
+    string.replace(
+      with_variant,
+      "  |> beacon.on_notify(Notified)\n",
+      "  |> beacon.on_notify(Notified)\n  |> beacon.on_notification(Pushed)\n",
+    )
+  // Each replacement must have applied once, or the test would analyze the
+  // unmodified example and prove nothing about `on_notification`.
+  let assert True = with_import != source as "chat no longer imports beacon/log"
+  let assert True = with_variant != with_import
+    as "chat's Msg no longer ends with PresenceChanged"
+  let assert True = app != with_variant as "chat no longer calls on_notify"
+  app
+}
+
+pub fn chat_example_is_a_full_application_test() {
+  let assert Ok(analysis) =
+    analyzer.analyze("chat", [#("chat", chat_with_typed_notifications())])
+  let assert app_call.FullApplication = analysis.call.kind
+  let assert #("chat", "Msg") = analysis.msg
+}
+
+pub fn chat_example_allows_only_what_its_view_builds_test() {
+  let assert Ok(analysis) =
+    analyzer.analyze("chat", [#("chat", chat_with_typed_notifications())])
+  // The view's event handlers build these; timers, presence diffs and both
+  // kinds of notification are built on the server and must never decode
+  // from the wire.
+  let expected =
+    set.from_list([
+      #("chat", "NameDraftChanged"),
+      #("chat", "Join"),
+      #("chat", "DraftChanged"),
+      #("chat", "Send"),
+      #("chat", "Typing"),
+      #("chat", "SwitchRoom"),
+    ])
+  let assert True = analysis.codecs.allowed == expected
+    as { "allowed: " <> string.inspect(set.to_list(analysis.codecs.allowed)) }
+  let assert Ok(codec) = server_codec.generate(analysis)
+  assert_contains(codec, "\"SwitchRoom\"")
+  list.each(
+    ["TypingStopped", "Notified", "PresenceChanged", "Pushed"],
+    fn(name) {
+      let assert False = string.contains(codec, "\"" <> name <> "\"")
+        as { "server codec decodes " <> name }
+      Nil
+    },
+  )
+}
+
+pub fn chat_example_keeps_the_tracker_and_store_on_the_server_test() {
+  let assert Ok(analysis) =
+    analyzer.analyze("chat", [#("chat", chat_with_typed_notifications())])
+  let source = client_source(analysis, "chat")
+  assert_contains(source, "fn view(")
+  list.each(
+    ["presence.new(", "fn track(", "store.new_list(", "crypto", "fn update("],
+    fn(needle) {
+      let assert False = string.contains(source, needle)
+        as { "the browser's chat module contains " <> needle }
+      Nil
+    },
+  )
 }
 
 // --- view and annotations ----------------------------------------------------
