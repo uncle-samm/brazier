@@ -10,7 +10,7 @@
 **Active Milestone:** 117 — Full Review Remediation
 **Last Completed:** 116 — Review Hardening (CSRF, Timers, Auth, Cookies, Docs)
 **Build Status:** GREEN (zero errors, zero warnings) on Gleam 1.19.2
-**Test Status:** GREEN (1484 tests passed, 0 failures, after the WS8b part 1 merge)
+**Test Status:** GREEN (1287 tests passed, 0 failures, after the WS7 merge; the drop from 1484 is the deleted legacy modules' own tests)
 **Linter:** PASSING (zero violations)
 
 ### Milestone 117: Full Review Remediation 🚧
@@ -41,7 +41,44 @@
 - [x] WS6 postgleam pool/protocol (branch `review/pool` includes `review/codecs`; 768 tests green incl. PgBouncer suite; pool ~10× throughput; 0.9.0 CHANGELOG + version bump at d5aed38): concurrent pool (kadei-rat design, credited) with owner monitors, checkout tokens, no write retry, timeout-safe checkout, consistent supervision; PgBouncer Flush/Sync hang, LISTEN/NOTIFY drops, stale state + drains on error paths, ParameterStatus, pipeline partial send, statement-cache invalidation, `transaction()` ROLLBACK tag, call-timeout panics, SCRAM nonce/iteration checks, frame length bounds, cleartext downgrade, TLS verification, real streaming, dependency bounds, benchmarks
 
 **Phase 2 — API redesign (single writer)**
-- [ ] WS7 (design: `docs/design/API_REDESIGN.md`, decisions recorded 2026-11-02 incl. `beacon.simple` for instant pure apps) `Attr(msg)` typed events, `component.map_node` maps handlers, `update` returns effects, hide `#(model, local, server)`, single route declaration, typed event payloads, `internal_modules`, remove dead legacy code + example-only FFI, filter `javascript:` URLs, update all examples
+- [x] WS7 (design: `docs/design/API_REDESIGN.md`, decisions recorded 2026-11-02 incl. `beacon.simple` for instant pure apps) `Attr(msg)` typed events, `component.map_node` maps handlers, `update` returns effects, hide `#(model, local, server)`, single route declaration, typed event payloads, `internal_modules`, remove dead legacy code + example-only FFI, filter `javascript:` URLs, update all examples
+  - Merged 2026-11-03 at b32b485. The merged tree is identical to the branch, which already contained the coordinator tip.
+  - Coordinator verify:
+    - clean build with zero warnings, format and lint clean;
+    - 1287 tests passing in each of 3 runs;
+    - the runtime bundle rebuilds byte-identically.
+  - Agent's CDP suite: 24 examples built, server-rendered and round-tripped. Desktop 486/486. Mobile 495/495 on the final full run.
+  - The test count fell from 1484 because the legacy modules were deleted with their tests, as the design's migration plan requires. Deleted: `state`, `substate`, `diff`, `view`, `template/*`, `island`, `handler`, `route`, `component`, `build/{ast_refs,messages,shape}`, `examples/todos`, and the example-only FFI. `stress` moved to `test/`.
+  - What was built:
+    - the `simple`/`application`/`full_application` constructors with `Context` and the router;
+    - typed `Attr(msg)` events and decoders, and a generic client runtime (`start(App)`, event delegation);
+    - a build that starts at the app constructor call: only modules the browser reaches go into the bundle, and only message types the browser can construct are accepted from it;
+    - components as nested child modules, and `internal_modules`;
+    - the URL policy for URL attributes, plus `unsafe_raw_html`;
+    - no server-render fallback to `priv/static`;
+    - all 24 examples migrated; none imports transport (they use `api.Request`/`api.Response`);
+    - rewritten docs: GETTING_STARTED, ROUTING, HTML_ELEMENTS, ARCHITECTURE, plus EFFECTS and SECURITY.
+  - Departures from the design are listed under "Implementation notes" in `docs/design/API_REDESIGN.md`:
+    - `beacon.start` reads no environment variables. Apps call `config.port()`/`config.secret_key()`, which return a `Result`.
+    - `Context.session_id` returns a `Result`.
+    - `beacon.title` applies only to the server render.
+    - The client renders after each event; there is no requestAnimationFrame batching.
+    - Routed examples wrap each page in `element.keyed`, so navigation does not reuse the previous page's DOM nodes or keep its focus.
+  - Flake seen once: one mobile CDP run had a `history.go(-1)` in `routed` leave the URL unchanged, and the later history checks then failed by one step. It did not recur in 4 reruns. The check now asserts its start path and logs the before/after paths and `history.length`. Watch for it in final verification.
+  - Follow-ups:
+    - WS8b part 2 takes:
+      - the init error channel, as `init: fn(Context) -> Result(model, InitError)`: 503 on the server render, a WS close on the socket;
+      - `auth.init_from_session` still takes a Request and documents `beacon.ws_init`, so `init(Context)` cannot call it;
+      - an `auth.allow_guests_ws` helper to replace auth_workspace's `protect_ws` wrapper;
+      - STATE_MANAGEMENT.md;
+      - the stale header in `auth.gleam` (lines 11–13).
+    - WS10 takes:
+      - README.md:57–67 and DEPLOYMENT.md:64 still use the old `beacon.app(...)`; CONFORMANCE/TESTING/WIRE_PROTOCOL may have stale references;
+      - dead code: `beacon_middleware_ffi.erl` and the `data-beacon-auto` check in transport;
+      - a build-id handshake, so a tab opened before a rebuild does not receive a model of the new shape;
+      - whether `beacon.start`'s `Error` should crash rather than be dropped by `main`;
+      - the client could key the page on navigation itself;
+      - examples ship no favicon, so Chrome's `/favicon.ico` gets a 404.
 
 **Phase 3 — Platform features + verification (parallel)**
 - [ ] WS8 (design: `docs/design/CLUSTER_PRESENCE_TELEMETRY.md`; replicated store mode confirmed, ships last) Clustering (node-consistent stores/pubsub, cross-node sessions), Presence (CRDT-style, per-topic, cluster-aware), Telemetry (structured events for HTTP, WS, runtime, effects, stores; handler attach API)
@@ -89,7 +126,8 @@
       - `tag_route` in `run_handler` (router/api), the framework routes, and `check_middleware`;
       - WS: rate limiting, heartbeat, backpressure, `ws_close` in cleanup/stop, and the connection id;
       - runtime events, using `"unknown"` for event names the app did not register.
-    - Init error channel: a crashing page handler gets a 500 response if nothing was sent yet (Phoenix answers a raise in `mount` during the dead render with 500; today the connection just closes). Init gets a way to fail so that `init_from_session` answers a store outage with 503 instead of crashing.
+    - Init error channel: a crashing page handler gets a 500 response if nothing was sent yet (Phoenix answers a raise in `mount` during the dead render with 500; today the connection just closes). Init gets a way to fail so that `init_from_session` answers a store outage with 503 instead of crashing. Shape, from WS7: `init: fn(Context) -> Result(model, InitError)`, answered with 503 on the server render and a WS close on the socket. `auth.init_from_session` moves to taking `Context`.
+    - `auth.allow_guests_ws`, replacing auth_workspace's `protect_ws` wrapper; the stale `auth.gleam` header (lines 11–13); a STATE_MANAGEMENT.md rewrite for the WS7 API.
     - Move the auth_workspace example (:134, :173, :260), GETTING_STARTED's auth section and SECURITY.md:202 to the new auth signatures.
     - Regenerate the example manifests for the `telemetry` dependency (23 of 24 lack it).
     - Session recheck path: emit the revoked event.
@@ -118,6 +156,7 @@
 - [ ] Final verification: build (zero warnings), tests, all examples, CDP browser suite, perf baselines
 
 **Decisions (Milestone 117, coordinator):**
+- 2026-11-03, WS7 merged with 197 fewer tests. Before merging I checked that every deleted test file belongs to a source module the design deletes. The init error channel goes to WS8b part 2, not WS10: it changes all three constructor signatures, and part 2 already owns runtime, transport and the init-failure path.
 - 2026-11-03, WS8b was split in two:
   - Part 1 took only files WS7 does not own (HTTP and connection telemetry, effects, sessions, stores, auth, the replicated store), so it ran beside WS7.
   - Part 2 (transport, runtime, application, the supervision tree, examples) waits for the WS7 merge, so two writers never edit one file.
