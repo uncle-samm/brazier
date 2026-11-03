@@ -118,19 +118,19 @@ measurements: `system_time` and `monotonic_time` on start, `duration` and
 
 | Event | Measurements | Metadata | Emitted |
 |---|---|---|---|
-| `[beacon, http, request]` S | `req_body_bytes`, `resp_body_bytes` (stop) | `method`, `route`, `connection_id`; `status` (stop) | not yet |
-| `[beacon, http, connection, accepted \| rejected \| closed]` | `count`, `duration` | `reason` | not yet |
+| `[beacon, http, request]` S | `req_body_bytes`, `resp_body_bytes` (stop) | `method`, `connection_id`; `route`, `status` (stop) | yes, `beacon/transport/http.run_handler` |
+| `[beacon, http, connection, accepted \| rejected \| closed]` | `count`, `duration` | `reason` | yes, `beacon_http_acceptor` (accepted, rejected), `beacon_http_conns` (closed) |
 | `[beacon, ws, upgrade]` S | none | `route`; `result` (stop) | not yet |
 | `[beacon, ws, close]` | `duration`, `frames_in`, `frames_out`, `bytes_in`, `bytes_out` | `close_code`, `reason` | not yet |
 | `[beacon, ws, rate_limited]`, `[beacon, ws, backpressure]` | `queue_len` | `connection_id` | not yet |
 | `[beacon, runtime, mount \| handle_event \| navigate]` S | none | `route`, `event`, `connection_id` | not yet |
 | `[beacon, runtime, render]` S | `patch_bytes` (stop) | `route`, `event`, `connection_id` | not yet |
 | `[beacon, runtime, stop]` | `uptime` | `reason` | not yet |
-| `[beacon, effect, run]` S | none | `effect` | not yet |
-| `[beacon, effect, timer, rejected]` | none | `limit` | not yet |
-| `[beacon, store, write]` | `count` | `store`, `op`, `mode` | yes |
-| `[beacon, store, sync]` S | `entries`, `bytes` (stop) | `store`, `peer` | not yet (replicated stores) |
-| `[beacon, session, created \| revoked \| expired \| contention]` | `count` | `reason` | not yet |
+| `[beacon, effect, run]` S | none | `effect`: `sync`, `keyed` or `background` | yes, `beacon/effect` |
+| `[beacon, effect, timer, rejected]` | none | `limit` | yes, `beacon/effect` |
+| `[beacon, store, write]` | `count` | `store`, `op`, `mode`: `local` or `replicated` | yes, `beacon/store` |
+| `[beacon, store, sync]` S | `entries`, `bytes` (stop) | `store`, `peer` | yes, `beacon_store_replica` (replicated stores) |
+| `[beacon, session, created \| revoked \| expired \| contention]` | `count` | `reason` | yes, `beacon/session` |
 | `[beacon, pubsub, broadcast]` | `local_subscribers`, `remote_nodes` | `scope`: `cluster`, `local` or `direct` | yes |
 | `[beacon, pubsub, forward, overloaded]` | `queue_len` | `shard` | yes, at most once per second per worker |
 | `[beacon, cluster, node, up \| down]` | `count` | `node`, `reason` | yes |
@@ -141,11 +141,36 @@ measurements: `system_time` and `monotonic_time` on start, `duration` and
 | `[beacon, presence, transfer]` S | `entries`, `bytes` (stop) | `tracker`, `peer` | yes |
 
 "Not yet" events are defined, have their emitters and are tested, but the
-subsystem does not call them yet. They are wired in with the runtime and
-transport instrumentation.
+subsystem does not call them yet. The WebSocket and runtime events are
+wired in with the WebSocket transport and runtime instrumentation.
 
 Notes on individual events:
 
+- `[beacon, http, request]`: the span covers the request handler, including
+  reading the request body, but not writing the response. `route` and
+  `status` are known only once the handler returns, so they are on the stop
+  event only. `route` is the pattern the routing code reported with
+  `beacon/transport/http.tag_route`, or `"unknown"` when nothing tagged
+  the request (the built-in routes do not tag yet). A crashed handler
+  reports status 500. A WebSocket upgrade request's middleware check runs
+  as a request span too and reports status 101.
+- `[beacon, http, connection, *]`: `duration` is the time from accept to
+  handoff (accepted, rejected) or the connection's lifetime (closed).
+  `reason` for a rejection names the limit that refused it, or is
+  `peer_address_unavailable`.
+- `[beacon, effect, run]` wraps each effect callback as it runs. Timer
+  ticks and cancellations are not spans; a timer refused because the live
+  timer limit was reached emits `[beacon, effect, timer, rejected]`
+  with that `limit`.
+- `[beacon, session, *]` is emitted only after the session backend
+  confirmed the change, so a failed backend call emits nothing. `reason`
+  is a fixed label (for example `deleted`, `rotated`, `sweep`, `update`).
+- `[beacon, store, write]` is emitted after a write succeeds. A write
+  refused by a replicated store's limits emits nothing.
+- `[beacon, store, sync]` wraps every remote merge into a replicated
+  store, accepted or refused. `entries` and `bytes` describe the payload,
+  and `peer` is the sending node. See
+  [CLUSTERING.md](CLUSTERING.md#replicated-stores).
 - `[beacon, pubsub, broadcast]`: for `scope: "cluster"`, `remote_nodes` is
   the number of remote nodes forwarded to, one message each, however many
   subscribers they have. `local_broadcast` reports `remote_nodes` 0, and a
