@@ -37,14 +37,6 @@ The docs describe the current behaviour; each item is a code change.
 - **Issue:** `/health` answers every method, not only GET and HEAD
   (`transport.gleam:2374`).
   - **Files:** `src/beacon/transport.gleam`
-- **Issue:** `store.StoreError` aliases `state_manager.EtsError`
-  (`store.gleam:44`), and `state_manager` is an internal module, so an app
-  cannot match or describe the error without importing it.
-  - **Files:** `src/beacon/store.gleam`, `src/beacon/state_manager.gleam`
-- **Issue:** `beacon/rate_limit` is an internal module (`gleam.toml`
-  `internal_modules`), but `middleware.rate_limit` needs a
-  `rate_limit.RateLimiter` from `rate_limit.new`.
-  - **Files:** `gleam.toml`, `src/beacon/rate_limit.gleam`
 - **Issue:** `beacon.title` is computed only for the HTML render
   (`ssr.gleam:308`); a client navigation leaves `document.title` unchanged.
   - **Files:** `src/beacon/ssr.gleam`, `beacon_client/`
@@ -68,6 +60,24 @@ The docs describe the current behaviour; each item is a code change.
 ## Resolved Issues
 
 <!-- Move resolved issues here with full resolution details -->
+
+- **Issue:** `store.StoreError` aliased `state_manager.EtsError`
+  (`store.gleam:44`), and `state_manager` is an internal module, so an app
+  could not match or describe the error without importing it.
+  `replicated.StartError.InvalidName` carried the same internal type.
+  - **Files:** `src/beacon/store.gleam`, `src/beacon/store/replicated.gleam`
+  - **Resolution:** (WS10b) `store.StoreError` is a store type
+    (`InvalidName`, `TableTypeMismatch`, `TableOwnerUnavailable`) with
+    `store.describe_error`, converted from the internal error in one place.
+    `replicated.InvalidName` carries `name` and `reason`. `store_test`
+    matches each constructor through `beacon/store`.
+- **Issue:** `beacon/rate_limit` was an internal module (`gleam.toml`
+  `internal_modules`), but `middleware.rate_limit` needs a
+  `rate_limit.RateLimiter` from `rate_limit.new`.
+  - **Files:** `gleam.toml`, `src/beacon/rate_limit.gleam`
+  - **Resolution:** (WS10b) `beacon/rate_limit` is public. The test-only
+    `owner` is `@internal`, and `config` and `max_keys` read a limiter's
+    settings. `internal_modules_test` checks the module stays public.
 
 - **Issue:** a join token whose model does not decode was logged and the
   session continued with the state `init` returned (`runtime.gleam:920-929`),

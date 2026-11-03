@@ -46,9 +46,8 @@ pub fn framework_internals_are_listed_test() {
   let entries = internal_modules()
   let expected = [
     "beacon/application", "beacon/build", "beacon/build/analyzer",
-    "beacon/debug", "beacon/internal/render", "beacon/patch",
-    "beacon/rate_limit", "beacon/runtime", "beacon/ssr", "beacon/state_manager",
-    "beacon/transport/ws",
+    "beacon/debug", "beacon/internal/render", "beacon/patch", "beacon/runtime",
+    "beacon/ssr", "beacon/state_manager", "beacon/transport/ws",
   ]
   let assert [] = list.filter(expected, fn(m) { !is_internal(m, entries) })
 }
@@ -64,6 +63,10 @@ pub fn app_facing_modules_stay_public_test() {
     // `beacon.security_limits`, `api_routes` and `ws_auth` take their types.
     "beacon/transport",
     "beacon/transport/server",
+    // `middleware.rate_limit` takes a `rate_limit.RateLimiter`.
+    "beacon/rate_limit",
+    "beacon/store",
+    "beacon/store/replicated",
     ..analyzer.client_modules
   ]
   let assert [] = list.filter(public, fn(m) { is_internal(m, entries) })

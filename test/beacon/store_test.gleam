@@ -1,5 +1,6 @@
 import beacon/state_manager
 import beacon/store
+import beacon/store/replicated
 import gleam/erlang/process
 import gleam/int
 import gleam/list
@@ -8,18 +9,17 @@ import gleam/string
 // --- Unhappy paths: creation errors ---
 
 pub fn try_new_rejects_invalid_name_test() {
-  let assert Error(state_manager.InvalidTableName(name:, reason: _)) =
+  let assert Error(store.InvalidName(name:, reason: _)) =
     store.try_new("bad name!")
   let assert True = string.contains(name, "bad name!")
 }
 
 pub fn try_new_list_rejects_empty_name_test() {
-  let assert Error(state_manager.InvalidTableName(_, _)) =
-    store.try_new_list("")
+  let assert Error(store.InvalidName(_, _)) = store.try_new_list("")
 }
 
 pub fn try_new_rejects_overlong_name_test() {
-  let assert Error(state_manager.InvalidTableName(_, reason)) =
+  let assert Error(store.InvalidName(_, reason)) =
     store.try_new(string.repeat("a", 256))
   let assert True = string.contains(reason, "too long")
 }
@@ -42,6 +42,38 @@ pub fn ensure_table_type_mismatch_is_typed_error_test() {
     found: "set",
   )) = state_manager.ensure_table(name, state_manager.EtsDuplicateBag)
   let assert True = found_name == name
+}
+
+pub fn try_new_list_over_a_set_table_is_store_type_mismatch_test() {
+  let name = "mismatch_" <> uid()
+  let assert Ok(_) =
+    state_manager.ensure_table("beacon_ls_" <> name, state_manager.EtsSet)
+  let assert Error(err) = store.try_new_list(name)
+  let assert store.TableTypeMismatch(
+    name: table,
+    expected: "duplicate_bag",
+    found: "set",
+  ) = err
+  let assert True = table == "beacon_ls_" <> name
+  let assert True =
+    store.describe_error(err)
+    == "store table \"beacon_ls_"
+    <> name
+    <> "\" already exists as set, expected duplicate_bag"
+}
+
+pub fn describe_error_names_the_invalid_store_test() {
+  let assert Error(err) = store.try_new("bad name!")
+  let assert True =
+    string.starts_with(
+      store.describe_error(err),
+      "invalid store name \"beacon_store_bad name!\": ",
+    )
+}
+
+pub fn open_replicated_with_invalid_name_is_invalid_store_test() {
+  let assert Error(store.InvalidStore(store.InvalidName(name: "bad name!", ..))) =
+    store.open("bad name!", store.Replicated(replicated.default_config()))
 }
 
 // --- Regression: store.new crashed on the second call (named table exists) ---

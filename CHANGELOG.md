@@ -59,6 +59,10 @@ with its own changelog, so they are not listed here.
   the connection before `init` runs: the socket closes with 4400 and the
   browser reloads the page. The session no longer continues from `init`'s
   state. State recovery with an empty secret key fails the runtime's start.
+- (WS10b) `store.StoreError` is a store type, `InvalidName`,
+  `TableTypeMismatch` or `TableOwnerUnavailable`, not an alias of the
+  internal `state_manager.EtsError`. `replicated.InvalidName` carries
+  `name` and `reason`.
 
 ### Added
 
@@ -104,6 +108,10 @@ with its own changelog, so they are not listed here.
   in the docs. It also compiles every Gleam sample in them with zero
   warnings, except samples marked as fragments.
 - (WS10) `make publish-dry-run`, and a release gate in `scripts/publish.sh`.
+- (WS10b) `store.describe_error`.
+- (WS10b) `beacon/rate_limit` is public, since `middleware.rate_limit` takes
+  its `RateLimiter`; `rate_limit.config` and `rate_limit.max_keys` read a
+  limiter's settings.
 - (WS10b) `[beacon, subscription, changed]` telemetry: a runtime's PubSub
   listener joined or left a topic.
 

@@ -280,7 +280,6 @@ Store names are developer-chosen constants: 1-255 bytes of `[A-Za-z0-9_-]`
 <!-- docs-check: wrap
 import beacon/log
 import beacon/store
-import gleam/string
 
 pub fn open_named(name: String) -> Nil {
   {{block}}
@@ -293,14 +292,15 @@ fn use_store(s: store.Store(String)) -> Nil {
 ```gleam
 case store.try_new(name) {
   Ok(s) -> use_store(s)
-  Error(err) -> log.error("app", "store " <> name <> ": " <> string.inspect(err))
+  Error(err) -> log.error("app", store.describe_error(err))
 }
 ```
 
-`store.StoreError` is an alias of a type in an internal module, so an app
-cannot name its constructors (an invalid name, a table that exists with the
-other type, or a table owner that could not create the table) without
-importing that module.
+`store.StoreError` is `InvalidName` (empty, too long, or a character
+outside `[A-Za-z0-9_-]`), `TableTypeMismatch` (a table of that name exists
+with the other type) or `TableOwnerUnavailable`. Its `name` is the table
+name, the store name with its prefix (`beacon_store_` or `beacon_ls_`),
+which counts toward the 255 bytes.
 
 A `Store` and a `ListStore` with the same name are separate tables, but they
 share the PubSub topic `"store:" <> name`.

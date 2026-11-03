@@ -84,7 +84,7 @@ pub type WriteError {
 /// Why a replicated store could not be opened.
 pub type StartError {
   /// The name is not 1-200 bytes of `[A-Za-z0-9_-]`.
-  InvalidName(state_manager.EtsError)
+  InvalidName(name: String, reason: String)
   /// The configuration is out of range, or the store is already open in
   /// local mode or with a different configuration.
   InvalidConfig(reason: String)
@@ -194,12 +194,12 @@ fn validate_name(name: String) -> Result(Nil, StartError) {
   case reason {
     Ok(Nil) -> Ok(Nil)
     Error(reason) -> {
-      let err = state_manager.InvalidTableName(name: name, reason: reason)
+      let err = InvalidName(name: name, reason: reason)
       log.error(
         "beacon.store.replicated",
-        "Cannot open store: " <> state_manager.describe_ets_error(err),
+        "Cannot open store: " <> describe_start_error(err),
       )
-      Error(InvalidName(err))
+      Error(err)
     }
   }
 }
@@ -294,7 +294,8 @@ pub fn describe_write_error(err: WriteError) -> String {
 /// A human-readable description of a start error.
 pub fn describe_start_error(err: StartError) -> String {
   case err {
-    InvalidName(err) -> state_manager.describe_ets_error(err)
+    InvalidName(name:, reason:) ->
+      "invalid store name \"" <> name <> "\": " <> reason
     InvalidConfig(reason:) -> "invalid configuration: " <> reason
     StartFailed(reason:) -> "replica failed to start: " <> reason
   }
