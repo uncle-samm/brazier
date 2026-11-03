@@ -1,10 +1,17 @@
-.PHONY: build test test-flake browser-canonical browser-canonical-desktop browser-canonical-mobile browser-all browser-all-desktop browser-all-mobile browser-all-shard browser-all-docker-shards push tag publish release
+.PHONY: build test test-client test-flake browser-canonical browser-canonical-desktop browser-canonical-mobile browser-all browser-all-desktop browser-all-mobile browser-all-shard browser-all-docker-shards push tag publish release
 
 build:
 	gleam build
 
 test:
 	gleam test
+
+# The client JS checks that need no Gleam-generated input. They also run
+# inside gleam test (patch_test, runtime_versioning_test), with the vector
+# checks; this target is the fast loop and fails if node is missing.
+test-client:
+	node beacon_client/test/ffi_harness.mjs
+	node beacon_client/test/patch_safety.mjs
 
 # gleam test FLAKE_RUNS times (default 5) under FLAKE_BUSY busy loops
 # (default 8); fails if any run fails.

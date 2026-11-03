@@ -606,3 +606,16 @@ pub fn client_applies_server_diffs_test() {
     Error(output) -> panic as { "client patch vectors failed: " <> output }
   }
 }
+
+/// The client refuses prototype-polluting paths, escapes "/" in keys, and
+/// replaces a model holding an unsafe key at the root
+/// (beacon_client/test/patch_safety.mjs).
+pub fn client_patch_safety_test() {
+  case run_node("beacon_client/test/patch_safety.mjs", "") {
+    Ok(output) -> {
+      let assert True = string.contains(output, "patch safety ok: 5 checks")
+      Nil
+    }
+    Error(output) -> panic as { "client patch safety failed: " <> output }
+  }
+}

@@ -68,4 +68,6 @@ RUN set -eu; \
       exit 1; \
     fi
 
-CMD ["sh", "-lc", "gleam build && gleam test && gleam run -m beacon/lint"]
+# Client JS checks first: a missing or broken node fails here, by name,
+# before the Gleam suite (whose node-driven tests would fail too).
+CMD ["sh", "-lc", "node --version && make test-client && gleam build && gleam test && gleam run -m beacon/lint"]
