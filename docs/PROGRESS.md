@@ -228,7 +228,7 @@
       - strict bash release scripts (`publish.sh` with `--dry-run` that stops at `gleam export hex-tarball`; `push.sh`/`tag.sh` on a shared `release_lib.sh`) and fixed CDP runner scripts; the Makefile release targets use bash, and `release` runs `publish-dry-run` first;
       - removed the tracked stray `.playwright-mcp` log and the unreferenced `test_client_patch.mjs`;
       - Milestones 1–116 archived verbatim to `docs/archive/PROGRESS.md`, after which the coordinator cut this file.
-  - [ ] WS10b source follow-ups and the WS8c-owned docs (WS8c merged 2026-11-03; also takes the WS8c follow-ups above that are not marked WS9):
+  - [ ] WS10b source follow-ups and the WS8c-owned docs (running 2026-11-03 as WS10b-T and WS10b-R, see Decisions; also takes the WS8c follow-ups not marked WS9 and the WS9 source hooks and follow-ups):
     - From WS10a's code pass (also in `docs/TODO.md`):
       - dev reload never reaches a browser (`dev.gleam:151`, nothing joins `beacon:reload`), and the watcher falls back to polling (`dev.gleam:104-107`);
       - `body_parser` passes requests with a missing or bad Content-Length (`middleware.gleam:282`), and `middleware.Context` is carried by nothing (`:519-538`);
@@ -258,6 +258,21 @@
 - [ ] Final verification: build (zero warnings), tests, all examples, CDP browser suite, perf baselines
 
 **Decisions (Milestone 117, coordinator):**
+- 2026-11-03, WS10b runs as two agents with disjoint files, started together after WS9 merged.
+  - **WS10b-T (transport and client)** owns the HTTP/WS server, listener, middleware, static serving, dev mode and `beacon_client/src`. It takes:
+    - the listen-socket fix;
+    - every HTTP/WS item;
+    - the build-id handshake and dev reload, which both cross transport and client;
+    - the client test hook;
+    - WIRE_PROTOCOL, DEPLOYMENT, MIDDLEWARE, SECURITY and ARCHITECTURE.
+  - **WS10b-R (runtime and hygiene)** owns runtime, SSR, stores, presence, auth, the examples, `gleam.toml`, the Dockerfile, CI, scripts, `.claude`/`.mcp.json` and lint. It takes:
+    - the join-token fallback, SSR title and SSR fallbacks;
+    - the store and rate_limit API;
+    - the subscription telemetry event and the presence follow-ups;
+    - the example fixes, the Hex tarball, and CI (docs check and mobile CDP);
+    - CLUSTERING, TELEMETRY, ERROR_HANDLING and TESTING under the docs check.
+  - Either agent may add new test files. Edits to existing tests are listed for the merge. CHANGELOG and TODO.md conflicts are resolved by the coordinator.
+  - One agent would be safer but would run about twice as long. The split is safe because the hot files (`transport.gleam`, `runtime.gleam`, `beacon_client/src`) each have exactly one owner.
 - 2026-11-03, the PROGRESS archive is named `docs/archive/PROGRESS.md`.
   - The lint's historical-file rule already skips that name, so the archive stays verbatim and no lint source changes.
   - The rejected alternative was editing the stale phrases out of the archive, which would make it not verbatim.
