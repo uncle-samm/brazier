@@ -39,8 +39,8 @@ init({root, Config}) ->
         partition_names => list_to_tuple([partition_name(I) || I <- lists:seq(1, Partitions)])
     },
     ok = persistent_term:put(?CONFIG_KEY, Persisted),
-    logger:info("[beacon.pubsub] Starting PubSub: ~b partitions, pool size ~b",
-                [Partitions, PoolSize]),
+    beacon_log_ffi:info(<<"beacon.pubsub">>, "Starting PubSub: ~b partitions, pool size ~b",
+                        [Partitions, PoolSize]),
     Children = [
         #{id => pg_scope,
           start => {pg, start_link, [?SCOPE]},

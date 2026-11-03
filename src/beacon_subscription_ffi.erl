@@ -24,7 +24,7 @@ receive_with_commands(Subject, OwnerMonitor, Timeout) ->
         {'DOWN', OwnerMonitor, process, _OwnerPid, Reason} ->
             {owner_exited, unicode:characters_to_binary(io_lib:format("~p", [Reason]))};
         Other ->
-            logger:warning("[beacon.subscription] Discarding unexpected listener message: ~p", [Other]),
+            beacon_log_ffi:warning(<<"beacon.subscription">>, "Discarding unexpected listener message: ~p", [Other]),
             receive_with_commands(Subject, OwnerMonitor, Timeout)
     after
         Timeout ->

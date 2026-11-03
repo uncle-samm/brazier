@@ -95,7 +95,7 @@ reload_each(Dir, [Name | Rest], Reloaded, Failed) ->
         unchanged -> reload_each(Dir, Rest, Reloaded, Failed);
         reloaded -> reload_each(Dir, Rest, [Name | Reloaded], Failed);
         {failed, Reason} ->
-            logger:error("[beacon.dev] Cannot reload ~ts: ~ts", [Name, Reason]),
+            beacon_log_ffi:error(<<"beacon.dev">>, "Cannot reload ~ts: ~ts", [Name, Reason]),
             reload_each(Dir, Rest, Reloaded, [[Name, ": ", Reason] | Failed])
     end.
 
@@ -140,7 +140,7 @@ start_app(ModuleName) ->
                 true ->
                     spawn_link(fun() ->
                         Module:main(),
-                        logger:notice("[beacon.dev] ~p:main/0 returned; stopping", [Module]),
+                        beacon_log_ffi:notice(<<"beacon.dev">>, "~p:main/0 returned; stopping", [Module]),
                         erlang:halt(0)
                     end),
                     {ok, nil};
@@ -158,7 +158,7 @@ notify_browser_reload() ->
             [Pid ! {beacon_reload} || Pid <- Pids],
             {ok, nil};
         {error, Reason} ->
-            logger:warning("[beacon.dev] notify_browser_reload failed: ~p", [Reason]),
+            beacon_log_ffi:warning(<<"beacon.dev">>, "notify_browser_reload failed: ~p", [Reason]),
             {error, format("~p", [Reason])}
     end.
 

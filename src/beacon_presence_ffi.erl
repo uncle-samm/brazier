@@ -46,11 +46,11 @@ start_link(Config, Names) ->
 
 start_error(Config, {already_started, Pid}) ->
     Name = element(2, Config),
-    logger:error("[beacon.presence] Tracker ~ts is already running as ~p", [Name, Pid]),
+    beacon_log_ffi:error(<<"beacon.presence">>, "Tracker ~ts is already running as ~p", [Name, Pid]),
     {error, {start_failed, <<"a tracker named ", Name/binary, " is already running">>}};
 start_error(Config, Reason) ->
-    logger:error("[beacon.presence] Tracker ~ts failed to start: ~p",
-                 [element(2, Config), Reason]),
+    beacon_log_ffi:error(<<"beacon.presence">>, "Tracker ~ts failed to start: ~p",
+                         [element(2, Config), Reason]),
     {error, {start_failed, format(Reason)}}.
 
 %% Whether the tracker's supervisor is registered on this node.
@@ -62,19 +62,19 @@ stop({names, Sup, _Shards}) ->
         undefined ->
             {error, tracker_down};
         Pid ->
-            logger:info("[beacon.presence] Stopping ~p", [Sup]),
+            beacon_log_ffi:info(<<"beacon.presence">>, "Stopping ~p", [Sup]),
             %% proc_lib:stop/3: a supervisor ignores shutdown signals from
             %% any process but its parent.
             try proc_lib:stop(Pid, shutdown, ?STOP_TIMEOUT_MS) of
                 ok ->
-                    logger:info("[beacon.presence] Stopped ~p", [Sup]),
+                    beacon_log_ffi:info(<<"beacon.presence">>, "Stopped ~p", [Sup]),
                     {ok, nil}
             catch
                 exit:noproc ->
-                    logger:warning("[beacon.presence] ~p was already stopping", [Sup]),
+                    beacon_log_ffi:warning(<<"beacon.presence">>, "~p was already stopping", [Sup]),
                     {error, tracker_down};
                 exit:Reason ->
-                    logger:error("[beacon.presence] ~p did not stop: ~p", [Sup, Reason]),
+                    beacon_log_ffi:error(<<"beacon.presence">>, "~p did not stop: ~p", [Sup, Reason]),
                     {error, {stop_failed, format(Reason)}}
             end
     end.
@@ -96,15 +96,15 @@ call_shard(Shard, Request) ->
         gen_server:call(Shard, Request, ?CALL_TIMEOUT_MS)
     catch
         exit:{noproc, _} ->
-            logger:warning("[beacon.presence] Shard ~p is not running", [Shard]),
+            beacon_log_ffi:warning(<<"beacon.presence">>, "Shard ~p is not running", [Shard]),
             {error, tracker_down};
         exit:{timeout, _} ->
-            logger:error("[beacon.presence] Shard ~p did not answer within ~b ms",
-                         [Shard, ?CALL_TIMEOUT_MS]),
+            beacon_log_ffi:error(<<"beacon.presence">>, "Shard ~p did not answer within ~b ms",
+                                 [Shard, ?CALL_TIMEOUT_MS]),
             {error, tracker_timeout};
         exit:Reason ->
-            logger:error("[beacon.presence] Shard ~p exited during a call: ~p",
-                         [Shard, Reason]),
+            beacon_log_ffi:error(<<"beacon.presence">>, "Shard ~p exited during a call: ~p",
+                                 [Shard, Reason]),
             {error, tracker_down}
     end.
 
@@ -125,8 +125,8 @@ select(Table, Spec) ->
         {ok, ets:select(Table, Spec)}
     catch
         error:badarg ->
-            logger:warning("[beacon.presence] Table ~p is missing: its shard is not running",
-                           [Table]),
+            beacon_log_ffi:warning(<<"beacon.presence">>, "Table ~p is missing: its shard is not running",
+                                   [Table]),
             {error, tracker_down}
     end.
 

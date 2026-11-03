@@ -110,7 +110,7 @@ start_owner() ->
     receive
         {Ref, registered} ->
             erlang:demonitor(MRef, [flush]),
-            logger:info("[beacon.ets] Started ETS table owner ~p", [Pid]),
+            beacon_log_ffi:info(<<"beacon.ets">>, "Started ETS table owner ~p", [Pid]),
             {ok, Pid};
         {'DOWN', MRef, process, Pid, already_registered} ->
             case whereis(?OWNER) of
@@ -140,7 +140,7 @@ owner_loop() ->
             From ! {MRef, owner_create(Name, AtomName, Type)},
             owner_loop();
         Other ->
-            logger:warning("[beacon.ets] Table owner discarding unexpected message: ~p", [Other]),
+            beacon_log_ffi:warning(<<"beacon.ets">>, "Table owner discarding unexpected message: ~p", [Other]),
             owner_loop()
     end.
 
@@ -155,12 +155,12 @@ owner_create(Name, AtomName, Type) ->
         absent ->
             try ets:new(AtomName, [Type, public, named_table, {read_concurrency, true}]) of
                 AtomName ->
-                    logger:info("[beacon.ets] Created ~p table ~p", [Type, AtomName]),
+                    beacon_log_ffi:info(<<"beacon.ets">>, "Created ~p table ~p", [Type, AtomName]),
                     {ok, AtomName}
             catch
                 error:Reason ->
-                    logger:error("[beacon.ets] Failed to create ~p table ~p: ~p",
-                                 [Type, AtomName, Reason]),
+                    beacon_log_ffi:error(<<"beacon.ets">>, "Failed to create ~p table ~p: ~p",
+                                         [Type, AtomName, Reason]),
                     {error, {table_owner_unavailable, Name, format_reason(Reason)}}
             end
     end.

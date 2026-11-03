@@ -50,7 +50,7 @@ timer_pids() ->
     end.
 
 log_timer_limit_warning(Current, Max) ->
-    logger:warning("[beacon.effect] Timer limit reached (~p/~p) - new timer rejected", [Current, Max]),
+    beacon_log_ffi:warning(<<"beacon.effect">>, "Timer limit reached (~p/~p) - new timer rejected", [Current, Max]),
     nil.
 
 unique_integer() ->
@@ -104,8 +104,8 @@ guardian(Owner, Worker) ->
     link(Worker),
     receive
         {'DOWN', OwnerRef, process, Owner, Reason} ->
-            logger:debug("[beacon.effect] Owner ~p exited (~p); killing effect process ~p",
-                         [Owner, Reason, Worker]),
+            beacon_log_ffi:debug(<<"beacon.effect">>, "Owner ~p exited (~p); killing effect process ~p",
+                                 [Owner, Reason, Worker]),
             exit(Worker, kill);
         {'EXIT', Worker, _WorkerReason} ->
             erlang:demonitor(OwnerRef, [flush]),
@@ -128,8 +128,8 @@ interval_loop(Owner, OwnerRef, Interval, MakeMsg, Dispatch) ->
     receive
         {'DOWN', OwnerRef, process, Owner, Reason} ->
             _ = erlang:cancel_timer(TimerRef),
-            logger:debug("[beacon.effect] Owner ~p exited (~p); stopping interval timer ~p",
-                         [Owner, Reason, self()]),
+            beacon_log_ffi:debug(<<"beacon.effect">>, "Owner ~p exited (~p); stopping interval timer ~p",
+                                 [Owner, Reason, self()]),
             ok;
         beacon_timer_tick ->
             Dispatch(MakeMsg()),
@@ -146,8 +146,8 @@ start_after(Delay, MakeMsg, Dispatch) when is_integer(Delay), Delay >= 0 ->
         receive
             {'DOWN', OwnerRef, process, Owner, Reason} ->
                 _ = erlang:cancel_timer(TimerRef),
-                logger:debug("[beacon.effect] Owner ~p exited (~p); cancelling delayed effect ~p",
-                             [Owner, Reason, self()]),
+                beacon_log_ffi:debug(<<"beacon.effect">>, "Owner ~p exited (~p); cancelling delayed effect ~p",
+                                     [Owner, Reason, self()]),
                 ok;
             beacon_timer_fire ->
                 erlang:demonitor(OwnerRef, [flush]),

@@ -16,8 +16,8 @@ run_guarded(Fun) ->
         Result -> {ok, Result}
     catch
         Class:Reason:Stacktrace ->
-            logger:error("beacon.runtime init crashed: ~p:~p~n~p",
-                         [Class, Reason, Stacktrace]),
+            beacon_log_ffi:error(<<"beacon.runtime">>, "init crashed: ~p:~p~n~p",
+                                 [Class, Reason, Stacktrace]),
             {error, iolist_to_binary(io_lib:format("~p:~p", [Class, Reason]))}
     end.
 

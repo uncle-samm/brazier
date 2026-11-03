@@ -30,29 +30,29 @@ init({Index, Config}) ->
     Keys = ets:new(Keys, [duplicate_bag, public, named_table,
                           {read_concurrency, true}, {write_concurrency, true}]),
     Pids = ets:new(Pids, [duplicate_bag, public, named_table, {write_concurrency, true}]),
-    logger:debug("[beacon.pubsub] Partition ~b started", [Index]),
+    beacon_log_ffi:debug(<<"beacon.pubsub">>, "Partition ~b started", [Index]),
     {ok, #{index => Index, keys => Keys, pids => Pids}}.
 
 handle_call(Request, From, State = #{index := Index}) ->
-    logger:warning("[beacon.pubsub] Partition ~b received unexpected call ~p from ~p",
-                   [Index, Request, From]),
+    beacon_log_ffi:warning(<<"beacon.pubsub">>, "Partition ~b received unexpected call ~p from ~p",
+                           [Index, Request, From]),
     {reply, {error, unexpected_call}, State}.
 
 handle_cast(Request, State = #{index := Index}) ->
-    logger:warning("[beacon.pubsub] Partition ~b received unexpected cast ~p", [Index, Request]),
+    beacon_log_ffi:warning(<<"beacon.pubsub">>, "Partition ~b received unexpected cast ~p", [Index, Request]),
     {noreply, State}.
 
 handle_info({'EXIT', Pid, Reason}, State = #{index := Index, keys := Keys, pids := Pids}) ->
     Rows = ets:take(Pids, Pid),
     [true = ets:delete_object(Keys, {Topic, Pid}) || {_, Topic} <- Rows],
-    logger:debug("[beacon.pubsub] Partition ~b removed ~b subscriptions of exited ~p (~p)",
-                 [Index, length(Rows), Pid, Reason]),
+    beacon_log_ffi:debug(<<"beacon.pubsub">>, "Partition ~b removed ~b subscriptions of exited ~p (~p)",
+                         [Index, length(Rows), Pid, Reason]),
     {noreply, State};
 handle_info(Message, State = #{index := Index}) ->
-    logger:warning("[beacon.pubsub] Partition ~b received unexpected message ~p",
-                   [Index, Message]),
+    beacon_log_ffi:warning(<<"beacon.pubsub">>, "Partition ~b received unexpected message ~p",
+                           [Index, Message]),
     {noreply, State}.
 
 terminate(Reason, #{index := Index}) ->
-    logger:info("[beacon.pubsub] Partition ~b stopping: ~p", [Index, Reason]),
+    beacon_log_ffi:info(<<"beacon.pubsub">>, "Partition ~b stopping: ~p", [Index, Reason]),
     ok.

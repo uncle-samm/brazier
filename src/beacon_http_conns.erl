@@ -77,8 +77,8 @@ release_self() ->
             release_pid(Tid, self()),
             global_count(Tid);
         undefined ->
-            logger:error("beacon.http_conns release called outside a connection process ~p",
-                         [self()]),
+            beacon_log_ffi:error(<<"beacon.http_conns">>, "release called outside a connection process ~p",
+                                 [self()]),
             erlang:error(not_a_connection_process)
     end.
 
@@ -86,8 +86,8 @@ count_self() ->
     case get(?PDICT_KEY) of
         {_Conns, Tid} -> global_count(Tid);
         undefined ->
-            logger:error("beacon.http_conns count called outside a connection process ~p",
-                         [self()]),
+            beacon_log_ffi:error(<<"beacon.http_conns">>, "count called outside a connection process ~p",
+                                 [self()]),
             erlang:error(not_a_connection_process)
     end.
 
@@ -142,8 +142,8 @@ init({Port, Handler, MaxConns, MaxPerIp, TrustedCidrs}) ->
     %% bound the first time (the configured port may be 0).
     BoundPort = persistent_term:get({?MODULE, bound_port, self_name()}, Port),
     true = ets:insert(Tid, [{global, 0}, {port, BoundPort}]),
-    logger:info("beacon.http_conns started port=~p max_connections=~p max_connections_per_ip=~p",
-                [BoundPort, MaxConns, MaxPerIp]),
+    beacon_log_ffi:info(<<"beacon.http_conns">>, "started port=~p max_connections=~p max_connections_per_ip=~p",
+                        [BoundPort, MaxConns, MaxPerIp]),
     {ok, #{tid => Tid, handler => Handler, max => MaxConns, max_per_ip => MaxPerIp,
            trusted => TrustedCidrs, children => #{}}}.
 
@@ -200,11 +200,11 @@ handle_call({count_for_ip, Ip}, _From, State = #{tid := Tid}) ->
 handle_call(children, _From, State = #{children := Children}) ->
     {reply, maps:keys(Children), State};
 handle_call(Other, From, State) ->
-    logger:error("beacon.http_conns unexpected call ~p from ~p", [Other, From]),
+    beacon_log_ffi:error(<<"beacon.http_conns">>, "unexpected call ~p from ~p", [Other, From]),
     {reply, {error, unexpected_call}, State}.
 
 handle_cast(Other, State) ->
-    logger:error("beacon.http_conns unexpected cast ~p", [Other]),
+    beacon_log_ffi:error(<<"beacon.http_conns">>, "unexpected cast ~p", [Other]),
     {noreply, State}.
 
 handle_info({'EXIT', Pid, Reason}, State = #{tid := Tid, children := Children}) ->
@@ -216,24 +216,24 @@ handle_info({'EXIT', Pid, Reason}, State = #{tid := Tid, children := Children}) 
             emit_closed(StartedAt, close_reason(Reason)),
             {noreply, State#{children := Rest}};
         error ->
-            logger:warning("beacon.http_conns EXIT from unknown process ~p: ~p", [Pid, Reason]),
+            beacon_log_ffi:warning(<<"beacon.http_conns">>, "EXIT from unknown process ~p: ~p", [Pid, Reason]),
             {noreply, State}
     end;
 handle_info(Other, State) ->
-    logger:warning("beacon.http_conns unexpected message ~p", [Other]),
+    beacon_log_ffi:warning(<<"beacon.http_conns">>, "unexpected message ~p", [Other]),
     {noreply, State}.
 
 terminate(Reason, #{children := Children, tid := Tid}) ->
     Pids = maps:keys(Children),
-    logger:info("beacon.http_conns terminating (~p), shutting down ~p connections",
-                [Reason, length(Pids)]),
+    beacon_log_ffi:info(<<"beacon.http_conns">>, "terminating (~p), shutting down ~p connections",
+                        [Reason, length(Pids)]),
     [exit(Pid, shutdown) || Pid <- Pids],
     Remaining = await_exits(Children, Tid,
                             erlang:monotonic_time(millisecond) + ?SHUTDOWN_GRACE_MS),
     case maps:size(Remaining) of
         0 -> ok;
         N ->
-            logger:error("beacon.http_conns ~p connections ignored shutdown, killing", [N]),
+            beacon_log_ffi:error(<<"beacon.http_conns">>, "~p connections ignored shutdown, killing", [N]),
             maps:foreach(fun(Pid, StartedAt) ->
                 exit(Pid, kill),
                 emit_closed(StartedAt, <<"killed">>)
@@ -273,7 +273,7 @@ log_exit(_Pid, normal) -> ok;
 log_exit(_Pid, shutdown) -> ok;
 log_exit(_Pid, {shutdown, _}) -> ok;
 log_exit(Pid, Reason) ->
-    logger:error("beacon.http_conns connection ~p exited abnormally: ~p", [Pid, Reason]).
+    beacon_log_ffi:error(<<"beacon.http_conns">>, "connection ~p exited abnormally: ~p", [Pid, Reason]).
 
 %% --- connection process ---
 
@@ -284,11 +284,11 @@ connection_init(Conns, Tid, Handler) ->
             _ = Handler(Socket),
             ok;
         {beacon_http_abort, Reason} ->
-            logger:warning("beacon.http_conns connection ~p aborted before start: ~p",
-                           [self(), Reason]),
+            beacon_log_ffi:warning(<<"beacon.http_conns">>, "connection ~p aborted before start: ~p",
+                                   [self(), Reason]),
             exit({shutdown, handoff_aborted})
     after ?SHOOT_TIMEOUT_MS ->
-        logger:error("beacon.http_conns connection ~p never received its socket", [self()]),
+        beacon_log_ffi:error(<<"beacon.http_conns">>, "connection ~p never received its socket", [self()]),
         exit(socket_handoff_timeout)
     end.
 

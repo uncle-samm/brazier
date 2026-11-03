@@ -119,8 +119,8 @@ init({TabName, WindowSeconds, Refusals, Creator}) ->
                                     {read_concurrency, true}]),
             schedule_sweep(WindowSeconds),
             _Ref = erlang:monitor(process, Creator),
-            logger:info("beacon.rate_limit owner started table=~p window=~ps",
-                        [TabName, WindowSeconds]),
+            beacon_log_ffi:info(<<"beacon.rate_limit">>, "owner started table=~p window=~ps",
+                                [TabName, WindowSeconds]),
             {ok, #{tab => Tab, window => WindowSeconds, refusals => Refusals}};
         _Existing ->
             {stop, {already_exists, TabName}}
@@ -129,11 +129,11 @@ init({TabName, WindowSeconds, Refusals, Creator}) ->
 handle_call(sweep, _From, State) ->
     {reply, sweep(State), State};
 handle_call(Other, From, State) ->
-    logger:error("beacon.rate_limit unexpected call ~p from ~p", [Other, From]),
+    beacon_log_ffi:error(<<"beacon.rate_limit">>, "unexpected call ~p from ~p", [Other, From]),
     {reply, {error, unexpected_call}, State}.
 
 handle_cast(Other, State) ->
-    logger:error("beacon.rate_limit unexpected cast ~p", [Other]),
+    beacon_log_ffi:error(<<"beacon.rate_limit">>, "unexpected cast ~p", [Other]),
     {noreply, State}.
 
 handle_info(sweep, State = #{window := WindowSeconds}) ->
@@ -141,11 +141,11 @@ handle_info(sweep, State = #{window := WindowSeconds}) ->
     schedule_sweep(WindowSeconds),
     {noreply, State};
 handle_info({'DOWN', _Ref, process, Creator, Reason}, State = #{tab := Tab}) ->
-    logger:info("beacon.rate_limit owner of ~p stopping: creator ~p exited (~p)",
-                [Tab, Creator, Reason]),
+    beacon_log_ffi:info(<<"beacon.rate_limit">>, "owner of ~p stopping: creator ~p exited (~p)",
+                        [Tab, Creator, Reason]),
     {stop, normal, State};
 handle_info(Other, State) ->
-    logger:warning("beacon.rate_limit unexpected message ~p", [Other]),
+    beacon_log_ffi:warning(<<"beacon.rate_limit">>, "unexpected message ~p", [Other]),
     {noreply, State}.
 
 %% Delete counters of windows before the current one and report refusals.
@@ -157,14 +157,14 @@ sweep(#{tab := Tab, window := WindowSeconds, refusals := Refusals}) ->
         0 -> ok;
         _ ->
             ok = counters:sub(Refusals, 1, Refused),
-            logger:error("beacon.rate_limit table ~p hit its key cap: refused ~p "
-                         "requests from new clients since the last sweep",
-                         [Tab, Refused])
+            beacon_log_ffi:error(<<"beacon.rate_limit">>, "table ~p hit its key cap: refused ~p "
+                                 "requests from new clients since the last sweep",
+                                 [Tab, Refused])
     end,
     case Deleted of
         0 -> ok;
-        _ -> logger:debug("beacon.rate_limit swept ~p expired counters from ~p",
-                          [Deleted, Tab])
+        _ -> beacon_log_ffi:debug(<<"beacon.rate_limit">>, "swept ~p expired counters from ~p",
+                                  [Deleted, Tab])
     end,
     Deleted.
 

@@ -20,8 +20,8 @@ stop_supervisor(Pid) when is_pid(Pid) ->
     receive
         {'DOWN', Ref, process, Pid, _Reason} -> nil
     after ?STOP_TIMEOUT_MS ->
-        logger:error("beacon.server listener supervisor ~p ignored shutdown for ~pms, killing",
-                     [Pid, ?STOP_TIMEOUT_MS]),
+        beacon_log_ffi:error(<<"beacon.server">>, "listener supervisor ~p ignored shutdown for ~pms, killing",
+                             [Pid, ?STOP_TIMEOUT_MS]),
         exit(Pid, kill),
         receive
             {'DOWN', Ref, process, Pid, _} -> nil

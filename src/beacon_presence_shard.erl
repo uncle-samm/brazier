@@ -52,8 +52,8 @@ init({Index, Config}) ->
     Topic = element(Index, Topics),
     case beacon_pubsub_ffi:subscribe(Topic) of
         {error, Reason} ->
-            logger:error("[beacon.presence] Shard ~ts/~b cannot subscribe to ~ts: ~p",
-                         [Name, Index, Topic, Reason]),
+            beacon_log_ffi:error(<<"beacon.presence">>, "Shard ~ts/~b cannot subscribe to ~ts: ~p",
+                                 [Name, Index, Topic, Reason]),
             {stop, {pubsub_subscribe_failed, Reason}};
         {ok, nil} ->
             Table = ets:new(Table, [ordered_set, protected, named_table,
@@ -64,7 +64,7 @@ init({Index, Config}) ->
             %% Up to 25% initial jitter so shards started together do not
             %% heartbeat in lockstep.
             schedule_heartbeat(rand:uniform(max(1, Period div 4))),
-            logger:info("[beacon.presence] Shard ~ts/~b started as ~p", [Name, Index, Ref]),
+            beacon_log_ffi:info(<<"beacon.presence">>, "Shard ~ts/~b started as ~p", [Name, Index, Ref]),
             {ok, #{index => Index,
                    name => Name,
                    config => Config,
@@ -131,13 +131,13 @@ handle_call(replicas, _From, S = #{replicas := Replicas}) ->
             || {Node, #{status := Status}} <- lists:sort(maps:to_list(Replicas))],
     {reply, {ok, Rows}, S};
 handle_call(Request, From, S) ->
-    logger:warning("[beacon.presence] Shard ~ts received unexpected call ~p from ~p",
-                   [label(S), Request, From]),
+    beacon_log_ffi:warning(<<"beacon.presence">>, "Shard ~ts received unexpected call ~p from ~p",
+                           [label(S), Request, From]),
     {reply, {error, unexpected_call}, S}.
 
 handle_cast(Request, S) ->
-    logger:warning("[beacon.presence] Shard ~ts received unexpected cast ~p",
-                   [label(S), Request]),
+    beacon_log_ffi:warning(<<"beacon.presence">>, "Shard ~ts received unexpected cast ~p",
+                           [label(S), Request]),
     {noreply, S}.
 
 %% --- Messages ---
@@ -151,24 +151,24 @@ handle_info({beacon_pubsub, Topic, Message}, S = #{topic := Topic}) ->
 handle_info({'DOWN', MRef, process, Pid, Reason}, S = #{monitors := Monitors}) ->
     case maps:find(Pid, Monitors) of
         {ok, MRef} ->
-            logger:debug("[beacon.presence] Shard ~ts: tracked ~p exited (~p)",
-                         [label(S), Pid, Reason]),
+            beacon_log_ffi:debug(<<"beacon.presence">>, "Shard ~ts: tracked ~p exited (~p)",
+                                 [label(S), Pid, Reason]),
             {noreply, leave_pid(S#{monitors := maps:remove(Pid, Monitors)}, Pid)};
         _ ->
-            logger:warning("[beacon.presence] Shard ~ts received an unknown DOWN for ~p",
-                           [label(S), Pid]),
+            beacon_log_ffi:warning(<<"beacon.presence">>, "Shard ~ts received an unknown DOWN for ~p",
+                                   [label(S), Pid]),
             {noreply, S}
     end;
 handle_info({'EXIT', Pid, Reason}, S) ->
     %% The only link besides the parent (handled by gen_server) is the
     %% PubSub partition this shard subscribed through. Without it the shard
     %% no longer hears its peers, so it stops and is restarted.
-    logger:error("[beacon.presence] Shard ~ts: linked ~p exited (~p); stopping",
-                 [label(S), Pid, Reason]),
+    beacon_log_ffi:error(<<"beacon.presence">>, "Shard ~ts: linked ~p exited (~p); stopping",
+                         [label(S), Pid, Reason]),
     {stop, {linked_exit, Reason}, S};
 handle_info(Message, S) ->
-    logger:warning("[beacon.presence] Shard ~ts received unexpected message ~p",
-                   [label(S), Message]),
+    beacon_log_ffi:warning(<<"beacon.presence">>, "Shard ~ts received unexpected message ~p",
+                           [label(S), Message]),
     {noreply, S}.
 
 terminate(Reason, S = #{ref := Ref, config := #{pool_size := PoolSize}}) ->
@@ -184,7 +184,7 @@ terminate(Reason, S = #{ref := Ref, config := #{pool_size := PoolSize}}) ->
         false ->
             ok
     end,
-    logger:info("[beacon.presence] Shard ~ts stopping: ~p", [label(S), Reason]),
+    beacon_log_ffi:info(<<"beacon.presence">>, "Shard ~ts stopping: ~p", [label(S), Reason]),
     ok.
 
 graceful(normal) -> true;
@@ -237,8 +237,8 @@ request_transfers(S = #{samples := N}) ->
 
 request_transfer(S, {Node, _Vsn} = Target) ->
     #{pres := Pres, ref := Ref, topic := Topic, config := #{pool_size := PoolSize}} = S,
-    logger:debug("[beacon.presence] Shard ~ts requests a transfer from ~p",
-                 [label(S), Target]),
+    beacon_log_ffi:debug(<<"beacon.presence">>, "Shard ~ts requests a transfer from ~p",
+                         [label(S), Target]),
     Message = {beacon_presence, transfer_req, PoolSize, Ref, ?STATE:clocks(Pres)},
     send_direct(S, Node, Topic, Message).
 
@@ -286,9 +286,9 @@ checked_peer_message(_Message, Node, PoolSize, S) ->
         true ->
             S;
         false ->
-            logger:error("[beacon.presence] Shard ~ts ignores ~p: its pool size is ~p, "
-                         "this node's is ~b. Every node must use the same pool size.",
-                         [label(S), Node, PoolSize, Own]),
+            beacon_log_ffi:error(<<"beacon.presence">>, "Shard ~ts ignores ~p: its pool size is ~p, "
+                                 "this node's is ~b. Every node must use the same pool size.",
+                                 [label(S), Node, PoolSize, Own]),
             S#{mismatched := Mismatched#{Node => true}}
     end.
 
@@ -302,8 +302,8 @@ handle_peer({beacon_presence, transfer_req, _, From, {_, RemoteContext}}, Node, 
     #{pres := Pres, deltas := Deltas, ref := Ref, topic := Topic,
       config := #{pool_size := PoolSize}} = S,
     Transfer = ?DG:extract(Pres, Deltas, From, RemoteContext),
-    logger:debug("[beacon.presence] Shard ~ts sends ~p a ~p of ~b entries",
-                 [label(S), From, element(1, Transfer), ?STATE:transfer_size(Transfer)]),
+    beacon_log_ffi:debug(<<"beacon.presence">>, "Shard ~ts sends ~p a ~p of ~b entries",
+                         [label(S), From, element(1, Transfer), ?STATE:transfer_size(Transfer)]),
     send_direct(S, Node, Topic, {beacon_presence, transfer_ack, PoolSize, Ref, Transfer}),
     S;
 handle_peer({beacon_presence, transfer_ack, _, From, Transfer}, Node, S)
@@ -314,8 +314,8 @@ handle_peer({beacon_presence, transfer_ack, _, From, Transfer}, Node, S)
         true ->
             %% Not merged. The peer's clock stays ahead of ours, so the next
             %% clock sample requests a transfer again.
-            logger:error("[beacon.presence] Shard ~ts rejected a transfer of ~b entries "
-                         "from ~p (max_transfer_entries ~b)", [label(S), Entries, From, Max]),
+            beacon_log_ffi:error(<<"beacon.presence">>, "Shard ~ts rejected a transfer of ~b entries "
+                                 "from ~p (max_transfer_entries ~b)", [label(S), Entries, From, Max]),
             event(S, limit_exceeded, 1),
             S;
         false ->
@@ -327,24 +327,24 @@ handle_peer({beacon_presence, transfer_ack, _, From, Transfer}, Node, S)
 handle_peer({beacon_presence, graceful_permdown, _, From}, Node, S = #{replicas := Replicas}) ->
     case maps:find(Node, Replicas) of
         {ok, #{ref := From, status := Status}} ->
-            logger:info("[beacon.presence] Shard ~ts: ~p shut down gracefully",
-                        [label(S), From]),
+            beacon_log_ffi:info(<<"beacon.presence">>, "Shard ~ts: ~p shut down gracefully",
+                                [label(S), From]),
             S1 = case Status of
                 up -> down(S, Node);
                 down -> S
             end,
             forget(permdown(S1, From), Node);
         _ ->
-            logger:debug("[beacon.presence] Shard ~ts ignores graceful_permdown of "
-                         "unknown replica ~p", [label(S), From]),
+            beacon_log_ffi:debug(<<"beacon.presence">>, "Shard ~ts ignores graceful_permdown of "
+                                 "unknown replica ~p", [label(S), From]),
             S
     end;
 handle_peer(Message, _Node, S) ->
     unexpected_peer_message(Message, S).
 
 unexpected_peer_message(Message, S) ->
-    logger:warning("[beacon.presence] Shard ~ts received an unexpected replication "
-                   "message ~P", [label(S), Message, 20]),
+    beacon_log_ffi:warning(<<"beacon.presence">>, "Shard ~ts received an unexpected replication "
+                           "message ~P", [label(S), Message, 20]),
     S.
 
 put_pending_clock(S = #{pending := Pending}, Clocks) ->
@@ -366,12 +366,12 @@ handle_heartbeat(S = #{replicas := Replicas}, {Node, _Vsn} = From) ->
             up(put_replica(S, Node, From, Now), From);
         {ok, #{ref := Old, status := up}} ->
             %% The node's shard restarted: its old replica is gone for good.
-            logger:info("[beacon.presence] Shard ~ts: ~p restarted as ~p",
-                        [label(S), Old, From]),
+            beacon_log_ffi:info(<<"beacon.presence">>, "Shard ~ts: ~p restarted as ~p",
+                                [label(S), Old, From]),
             up(put_replica(permdown(down(S, Node), Old), Node, From, Now), From);
         {ok, #{ref := Old, status := down}} ->
-            logger:info("[beacon.presence] Shard ~ts: ~p restarted as ~p",
-                        [label(S), Old, From]),
+            beacon_log_ffi:info(<<"beacon.presence">>, "Shard ~ts: ~p restarted as ~p",
+                                [label(S), Old, From]),
             up(put_replica(permdown(S, Old), Node, From, Now), From)
     end.
 
@@ -383,24 +383,24 @@ forget(S = #{replicas := Replicas}, Node) ->
 
 up(S = #{pres := Pres, name := Name}, Ref) ->
     {Pres1, Joins, Leaves} = ?STATE:replica_up(Pres, Ref),
-    logger:info("[beacon.presence] Shard ~ts: replica ~p is up (~b entries)",
-                [label(S), Ref, length(Joins)]),
+    beacon_log_ffi:info(<<"beacon.presence">>, "Shard ~ts: replica ~p is up (~b entries)",
+                        [label(S), Ref, length(Joins)]),
     beacon_telemetry_ffi:presence_replica(replica_up, ref_binary(Ref), Name),
     report(S#{pres := Pres1}, Joins, Leaves).
 
 down(S = #{pres := Pres, name := Name, replicas := Replicas}, Node) ->
     #{Node := Replica = #{ref := Ref}} = Replicas,
     {Pres1, Joins, Leaves} = ?STATE:replica_down(Pres, Ref),
-    logger:warning("[beacon.presence] Shard ~ts: replica ~p is down (~b entries hidden)",
-                   [label(S), Ref, length(Leaves)]),
+    beacon_log_ffi:warning(<<"beacon.presence">>, "Shard ~ts: replica ~p is down (~b entries hidden)",
+                           [label(S), Ref, length(Leaves)]),
     beacon_telemetry_ffi:presence_replica(replica_down, ref_binary(Ref), Name),
     report(S#{pres := Pres1, replicas := Replicas#{Node := Replica#{status := down}}},
            Joins, Leaves).
 
 %% Drop a replica's data. Its entries already left when it went down.
 permdown(S = #{pres := Pres, deltas := Deltas, name := Name}, Ref) ->
-    logger:info("[beacon.presence] Shard ~ts: replica ~p is permanently down",
-                [label(S), Ref]),
+    beacon_log_ffi:info(<<"beacon.presence">>, "Shard ~ts: replica ~p is permanently down",
+                        [label(S), Ref]),
     beacon_telemetry_ffi:presence_replica(replica_permdown, ref_binary(Ref), Name),
     S#{pres := ?STATE:remove_down_replicas(Pres, Ref),
        deltas := ?DG:remove_down_replicas(Deltas, Ref)}.
@@ -448,8 +448,8 @@ release_monitor(S = #{monitors := Monitors, pres := Pres}, Pid) ->
     end.
 
 limit(S, Limit, Pid, Value) ->
-    logger:warning("[beacon.presence] Shard ~ts refused a track by ~p: ~ts reached (~b)",
-                   [label(S), Pid, Limit, Value]),
+    beacon_log_ffi:warning(<<"beacon.presence">>, "Shard ~ts refused a track by ~p: ~ts reached (~b)",
+                           [label(S), Pid, Limit, Value]),
     event(S, limit_exceeded, 1),
     {error, {presence_limit_exceeded, Limit}}.
 
@@ -471,8 +471,8 @@ report(S = #{table := Table, name := Name}, Joins, Leaves) ->
             {ok, nil} ->
                 ok;
             {error, Reason} ->
-                logger:error("[beacon.presence] Shard ~ts could not deliver a diff for "
-                             "~ts: ~p", [label(S), Topic, Reason])
+                beacon_log_ffi:error(<<"beacon.presence">>, "Shard ~ts could not deliver a diff for "
+                                     "~ts: ~p", [label(S), Topic, Reason])
         end
     end, ByTopic),
     S.
@@ -505,8 +505,8 @@ publish(S = #{topic := Topic}, Message) ->
         {ok, nil} ->
             ok;
         {error, Reason} ->
-            logger:error("[beacon.presence] Shard ~ts could not broadcast ~p: ~p",
-                         [label(S), element(2, Message), Reason]),
+            beacon_log_ffi:error(<<"beacon.presence">>, "Shard ~ts could not broadcast ~p: ~p",
+                                 [label(S), element(2, Message), Reason]),
             error
     end.
 
@@ -515,12 +515,12 @@ send_direct(S, Node, Topic, Message) ->
         {ok, nil} ->
             ok;
         {error, {node_not_connected, _}} ->
-            logger:warning("[beacon.presence] Shard ~ts could not send ~p to ~p: not "
-                           "connected", [label(S), element(2, Message), Node]),
+            beacon_log_ffi:warning(<<"beacon.presence">>, "Shard ~ts could not send ~p to ~p: not "
+                                   "connected", [label(S), element(2, Message), Node]),
             ok;
         {error, Reason} ->
-            logger:error("[beacon.presence] Shard ~ts could not send ~p to ~p: ~p",
-                         [label(S), element(2, Message), Node, Reason]),
+            beacon_log_ffi:error(<<"beacon.presence">>, "Shard ~ts could not send ~p to ~p: ~p",
+                                 [label(S), element(2, Message), Node, Reason]),
             ok
     end.
 

@@ -71,10 +71,10 @@ start_link(ConfigRecord) ->
         {ok, Pid} ->
             {ok, Pid};
         {error, {already_started, Pid}} ->
-            logger:error("[beacon.pubsub] start_link: PubSub is already running as ~p", [Pid]),
+            beacon_log_ffi:error(<<"beacon.pubsub">>, "start_link: PubSub is already running as ~p", [Pid]),
             {error, {start_failed, <<"PubSub is already running under another owner">>}};
         {error, Reason} ->
-            logger:error("[beacon.pubsub] start_link failed: ~p", [Reason]),
+            beacon_log_ffi:error(<<"beacon.pubsub">>, "start_link failed: ~p", [Reason]),
             {error, {start_failed, format(Reason)}}
     end.
 
@@ -86,7 +86,7 @@ start_unlinked(Config) ->
         {error, {already_started, Pid}} ->
             {error, {already_started, Pid}};
         {error, Reason} ->
-            logger:error("[beacon.pubsub] Start failed: ~p", [Reason]),
+            beacon_log_ffi:error(<<"beacon.pubsub">>, "Start failed: ~p", [Reason]),
             {error, {start_failed, format(Reason)}}
     end.
 
@@ -100,7 +100,7 @@ compare_running(Pid, Config) ->
         true ->
             {ok, nil};
         false ->
-            logger:error("[beacon.pubsub] Already running with ~p; refusing ~p", [Running, Config]),
+            beacon_log_ffi:error(<<"beacon.pubsub">>, "Already running with ~p; refusing ~p", [Running, Config]),
             {error, {invalid_config, format_already_running(Running)}}
     end.
 
@@ -111,21 +111,21 @@ stop() ->
         undefined ->
             {error, not_started};
         Pid ->
-            logger:info("[beacon.pubsub] Stopping PubSub"),
+            beacon_log_ffi:info(<<"beacon.pubsub">>, "Stopping PubSub"),
             %% proc_lib:stop/3 rather than exit/2: a supervisor ignores a
             %% shutdown signal from any process but its parent, and stop/0
             %% may run in any process.
             try proc_lib:stop(Pid, shutdown, ?STOP_TIMEOUT_MS) of
                 ok ->
-                    logger:info("[beacon.pubsub] PubSub stopped"),
+                    beacon_log_ffi:info(<<"beacon.pubsub">>, "PubSub stopped"),
                     {ok, nil}
             catch
                 exit:noproc ->
                     %% It stopped between whereis/1 and the stop request.
-                    logger:warning("[beacon.pubsub] PubSub was already stopping"),
+                    beacon_log_ffi:warning(<<"beacon.pubsub">>, "PubSub was already stopping"),
                     {error, not_started};
                 exit:Reason ->
-                    logger:error("[beacon.pubsub] PubSub did not stop: ~p", [Reason]),
+                    beacon_log_ffi:error(<<"beacon.pubsub">>, "PubSub did not stop: ~p", [Reason]),
                     {error, {stop_failed, format(Reason)}}
             end
     end.
@@ -156,8 +156,8 @@ subscribe(Topic, Config) ->
                 true ->
                     {ok, nil};
                 false when length(Existing) >= Max ->
-                    logger:warning("[beacon.pubsub] ~p refused a subscription to ~ts: it already "
-                                   "has ~b topics (limit ~b)", [Self, Topic, length(Existing), Max]),
+                    beacon_log_ffi:warning(<<"beacon.pubsub">>, "~p refused a subscription to ~ts: it already "
+                                           "has ~b topics (limit ~b)", [Self, Topic, length(Existing), Max]),
                     {error, {too_many_subscriptions, Max}};
                 false ->
                     %% Link before inserting (Registry.register/3 order) so
@@ -193,8 +193,8 @@ partition(Pid, Config) ->
     Index = erlang:phash2(Pid, P) + 1,
     case whereis(element(Index, Names)) of
         undefined ->
-            logger:warning("[beacon.pubsub] Partition ~b is restarting; ~p cannot change its "
-                           "subscriptions until it is back", [Index, Pid]),
+            beacon_log_ffi:warning(<<"beacon.pubsub">>, "Partition ~b is restarting; ~p cannot change its "
+                                   "subscriptions until it is back", [Index, Pid]),
             {error, not_started};
         PartitionPid ->
             {ok, PartitionPid, element(Index, KeysTables), element(Index, PidsTables)}
@@ -287,8 +287,8 @@ lookup_partition(Table, Topic) ->
         [Pid || {_, Pid} <- ets:lookup(Table, Topic)]
     catch
         error:badarg ->
-            logger:warning("[beacon.pubsub] Registry table ~p is missing (partition "
-                           "restarting); it has no live subscribers for ~ts", [Table, Topic]),
+            beacon_log_ffi:warning(<<"beacon.pubsub">>, "Registry table ~p is missing (partition "
+                                   "restarting); it has no live subscribers for ~ts", [Table, Topic]),
             []
     end.
 
@@ -308,8 +308,8 @@ shard_members(#{pool_size := PoolSize}) ->
         error:badarg ->
             %% The pg scope is restarting; nothing is delivered so the
             %% caller sees the failure instead of a half-delivered message.
-            logger:error("[beacon.pubsub] The pg scope ~p is not running; broadcast refused",
-                         [?SCOPE]),
+            beacon_log_ffi:error(<<"beacon.pubsub">>, "The pg scope ~p is not running; broadcast refused",
+                                 [?SCOPE]),
             {error, not_started}
     end.
 
@@ -322,8 +322,8 @@ forward(Workers, Topic, Message) ->
             ok ->
                 Sent + 1;
             noconnect ->
-                logger:warning("[beacon.pubsub] Forward of ~ts to ~p not sent: node ~p is "
-                               "disconnected", [Topic, Worker, node(Worker)]),
+                beacon_log_ffi:warning(<<"beacon.pubsub">>, "Forward of ~ts to ~p not sent: node ~p is "
+                                       "disconnected", [Topic, Worker, node(Worker)]),
                 Sent
         end
     end, 0, Workers).

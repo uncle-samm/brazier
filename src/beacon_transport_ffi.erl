@@ -467,7 +467,7 @@ http_body_read(Socket, Length) when is_integer(Length) ->
     Key = {beacon_http_body, Socket},
     case get(Key) of
         undefined ->
-            logger:error("beacon.http read_body called outside an active HTTP request"),
+            beacon_log_ffi:error(<<"beacon.http">>, "read_body called outside an active HTTP request"),
             {error, <<"read_body called outside an active HTTP request">>};
         #{failed := true} ->
             {error, <<"request body unavailable after an earlier read failure">>};
@@ -540,8 +540,8 @@ run_handler(Fun, Arg) ->
         Result -> {ok, Result}
     catch
         Class:Reason:Stacktrace ->
-            logger:error("beacon.http request handler crashed: ~p:~p~n~p",
-                         [Class, Reason, Stacktrace]),
+            beacon_log_ffi:error(<<"beacon.http">>, "request handler crashed: ~p:~p~n~p",
+                                 [Class, Reason, Stacktrace]),
             {error, iolist_to_binary(io_lib:format("~p:~p", [Class, Reason]))}
     end.
 

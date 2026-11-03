@@ -44,8 +44,8 @@ init({ConnsName, NumAcceptors, Backlog, SendTimeoutMs}) ->
             case inet:port(ListenSocket) of
                 {ok, BoundPort} ->
                     ok = beacon_http_conns:set_port(ConnsName, BoundPort),
-                    logger:info("beacon.http_acceptors listening on port ~p with ~p acceptors",
-                                [BoundPort, NumAcceptors]),
+                    beacon_log_ffi:info(<<"beacon.http_acceptors">>, "listening on port ~p with ~p acceptors",
+                                        [BoundPort, NumAcceptors]),
                     Children = [
                         #{id => {acceptor, Id},
                           start => {beacon_http_acceptor, start_link, [ListenSocket, ConnsName, Id]},
@@ -58,12 +58,12 @@ init({ConnsName, NumAcceptors, Backlog, SendTimeoutMs}) ->
                     {ok, {#{strategy => one_for_one, intensity => Intensity, period => 5},
                           Children}};
                 {error, Reason} ->
-                    logger:error("beacon.http_acceptors could not read bound port: ~p", [Reason]),
+                    beacon_log_ffi:error(<<"beacon.http_acceptors">>, "could not read bound port: ~p", [Reason]),
                     gen_tcp:close(ListenSocket),
                     {error, {bound_port_unavailable, Reason}}
             end;
         {error, Reason} ->
-            logger:error("beacon.http_acceptors failed to listen on port ~p: ~p", [Port, Reason]),
+            beacon_log_ffi:error(<<"beacon.http_acceptors">>, "failed to listen on port ~p: ~p", [Port, Reason]),
             {error, {listen_failed, Port, Reason}}
     end.
 

@@ -70,31 +70,31 @@ init(Config = #{discovery := Discovery}) ->
         %% MonitorRef => {connect, Node} | {resolve, Pid, TimeoutRef}
         jobs => #{}
     },
-    logger:info("[beacon.cluster] Cluster manager started on ~p (~ts)",
-                [node(), describe_discovery(Discovery)]),
+    beacon_log_ffi:info(<<"beacon.cluster">>, "Cluster manager started on ~p (~ts)",
+                        [node(), describe_discovery(Discovery)]),
     %% Nodes connected before the manager started send no nodeup.
     Connected = nodes(),
     Connected =/= [] andalso
-        logger:info("[beacon.cluster] Checking ~b already-connected nodes: ~p",
-                    [length(Connected), Connected]),
+        beacon_log_ffi:info(<<"beacon.cluster">>, "Checking ~b already-connected nodes: ~p",
+                            [length(Connected), Connected]),
     State1 = lists:foldl(fun peer_up/2, State0, Connected),
     {ok, start_discovery(Discovery, State1)}.
 
 handle_call(Request, From, State) ->
-    logger:warning("[beacon.cluster] Unexpected call ~p from ~p", [Request, From]),
+    beacon_log_ffi:warning(<<"beacon.cluster">>, "Unexpected call ~p from ~p", [Request, From]),
     {reply, {error, unknown_call}, State}.
 
 handle_cast(Request, State) ->
-    logger:warning("[beacon.cluster] Unexpected cast ~p", [Request]),
+    beacon_log_ffi:warning(<<"beacon.cluster">>, "Unexpected cast ~p", [Request]),
     {noreply, State}.
 
 handle_info({nodeup, Node, _Info}, State) ->
-    logger:info("[beacon.cluster] Node up: ~p", [Node]),
+    beacon_log_ffi:info(<<"beacon.cluster">>, "Node up: ~p", [Node]),
     ok = beacon_telemetry_ffi:cluster_node(node_up, atom_to_binary(Node), <<"connected">>),
     {noreply, peer_up(Node, State)};
 handle_info({nodedown, Node, Info}, State) ->
     Reason = format(proplists:get_value(nodedown_reason, Info, unknown)),
-    logger:warning("[beacon.cluster] Node down: ~p (~ts)", [Node, Reason]),
+    beacon_log_ffi:warning(<<"beacon.cluster">>, "Node down: ~p (~ts)", [Node, Reason]),
     ok = beacon_telemetry_ffi:cluster_node(node_down, atom_to_binary(Node), Reason),
     {noreply, retry_target(Node, peer_down(Node, State))};
 handle_info({beacon_cluster_hello, Node, Version, Mac}, State) when is_atom(Node) ->
@@ -134,15 +134,15 @@ handle_info({'DOWN', Ref, process, _Pid, Result}, State = #{jobs := Jobs}) ->
     case maps:take(Ref, Jobs) of
         {Job, Rest} -> {noreply, job_done(Job, Result, State#{jobs := Rest})};
         error ->
-            logger:warning("[beacon.cluster] DOWN for unknown job ~p: ~p", [Ref, Result]),
+            beacon_log_ffi:warning(<<"beacon.cluster">>, "DOWN for unknown job ~p: ~p", [Ref, Result]),
             {noreply, State}
     end;
 handle_info(Message, State) ->
-    logger:warning("[beacon.cluster] Unexpected message ~p", [Message]),
+    beacon_log_ffi:warning(<<"beacon.cluster">>, "Unexpected message ~p", [Message]),
     {noreply, State}.
 
 terminate(Reason, #{jobs := Jobs}) ->
-    logger:info("[beacon.cluster] Cluster manager stopping: ~p", [Reason]),
+    beacon_log_ffi:info(<<"beacon.cluster">>, "Cluster manager stopping: ~p", [Reason]),
     %% A resolver may hang (that is what its timeout is for); do not leave
     %% it behind. Connect attempts end within net_setuptime on their own.
     [true = exit(Pid, kill) || {resolve, Pid, _} <- maps:values(Jobs)],
@@ -183,7 +183,7 @@ check(Node, ?PROTOCOL_VERSION, TheirMac, State = #{mac := Mac, peers := Peers})
                 _ -> ok
             end,
             true = ets:insert(?MEMBERS, {Node, erlang:system_time(millisecond)}),
-            logger:info("[beacon.cluster] Peer verified: ~p", [Node]),
+            beacon_log_ffi:info(<<"beacon.cluster">>, "Peer verified: ~p", [Node]),
             {verified, reset_attempts(Node, State#{peers := Peers#{Node => verified}})};
         false ->
             {rejected, reject(Node, <<"secret key mismatch">>, State)}
@@ -198,12 +198,12 @@ pad(Bin, Size) when byte_size(Bin) >= Size -> binary:part(Bin, 0, Size);
 pad(Bin, Size) -> <<Bin/binary, 0:((Size - byte_size(Bin)) * 8)>>.
 
 reject(Node, Reason, State) ->
-    logger:error("[beacon.cluster] Rejecting peer ~p: ~ts; disconnecting", [Node, Reason]),
+    beacon_log_ffi:error(<<"beacon.cluster">>, "Rejecting peer ~p: ~ts; disconnecting", [Node, Reason]),
     ok = beacon_telemetry_ffi:cluster_peer_rejected(atom_to_binary(Node), Reason),
     %% disconnect_node/1 returns false when the node is already gone, which
     %% is the outcome we want either way; the nodedown is handled as usual.
     Disconnected = erlang:disconnect_node(Node),
-    logger:info("[beacon.cluster] disconnect_node(~p) -> ~p", [Node, Disconnected]),
+    beacon_log_ffi:info(<<"beacon.cluster">>, "disconnect_node(~p) -> ~p", [Node, Disconnected]),
     bump_attempts(Node, peer_down(Node, State)).
 
 %% --- Discovery ---
@@ -246,7 +246,7 @@ job_done({connect, Node}, Result, State) ->
     State1 = finish_connect(Node, State),
     case Result of
         {connected, true} ->
-            logger:debug("[beacon.cluster] Connected to ~p", [Node]),
+            beacon_log_ffi:debug(<<"beacon.cluster">>, "Connected to ~p", [Node]),
             State1;
         {connected, false} ->
             connect_failed(Node, <<"unreachable">>, State1);
@@ -268,8 +268,8 @@ job_done({resolve, _Pid, TRef}, Result, State = #{discovery := {dns, Query, Base
     end.
 
 resolve_failed(Reason, State = #{discovery := {dns, Query, _, PollMs}}) ->
-    logger:error("[beacon.cluster] DNS lookup of ~ts failed: ~ts; retrying in ~bms",
-                 [Query, Reason, PollMs]),
+    beacon_log_ffi:error(<<"beacon.cluster">>, "DNS lookup of ~ts failed: ~ts; retrying in ~bms",
+                         [Query, Reason, PollMs]),
     ok = beacon_telemetry_ffi:cluster_connect_failed(Query, <<"dns: ", Reason/binary>>),
     schedule_poll(State).
 
@@ -282,15 +282,15 @@ connect_discovered(Query, Base, Addresses, State = #{max_dns_nodes := Max}) ->
     case length(Unique) =< Max of
         false ->
             Reason = format({too_many_addresses, length(Unique), Max}),
-            logger:error("[beacon.cluster] DNS lookup of ~ts returned ~b addresses, more "
-                         "than max_dns_nodes (~b); connecting to none of them",
-                         [Query, length(Unique), Max]),
+            beacon_log_ffi:error(<<"beacon.cluster">>, "DNS lookup of ~ts returned ~b addresses, more "
+                                 "than max_dns_nodes (~b); connecting to none of them",
+                                 [Query, length(Unique), Max]),
             ok = beacon_telemetry_ffi:cluster_connect_failed(Query, Reason),
             State;
         true ->
             Connected = nodes(),
             Nodes = [binary_to_atom(<<Base/binary, "@", A/binary>>) || A <- Unique],
-            logger:debug("[beacon.cluster] DNS ~ts -> ~p", [Query, Nodes]),
+            beacon_log_ffi:debug(<<"beacon.cluster">>, "DNS ~ts -> ~p", [Query, Nodes]),
             lists:foldl(fun(N, S) -> start_connect(N, S) end, State,
                         [N || N <- Nodes, N =/= node(), not lists:member(N, Connected)])
     end.
@@ -300,12 +300,12 @@ connect_failed(Node, Reason, State = #{discovery := Discovery}) ->
     case Discovery of
         {static, _} ->
             {State1, Delay, Attempt} = schedule_retry(Node, bump_attempts(Node, State)),
-            logger:warning("[beacon.cluster] Connect to ~p failed (~ts), attempt ~b; "
-                           "retrying in ~bms", [Node, Reason, Attempt, Delay]),
+            beacon_log_ffi:warning(<<"beacon.cluster">>, "Connect to ~p failed (~ts), attempt ~b; "
+                                   "retrying in ~bms", [Node, Reason, Attempt, Delay]),
             State1;
         {dns, _, _, PollMs} ->
-            logger:warning("[beacon.cluster] Connect to ~p failed (~ts); retrying on the "
-                           "next DNS poll in ~bms", [Node, Reason, PollMs]),
+            beacon_log_ffi:warning(<<"beacon.cluster">>, "Connect to ~p failed (~ts); retrying on the "
+                                   "next DNS poll in ~bms", [Node, Reason, PollMs]),
             State;
         no_discovery ->
             State
@@ -316,7 +316,7 @@ retry_target(Node, State = #{discovery := {static, _}, targets := Targets}) ->
     case maps:is_key(Node, Targets) of
         true ->
             {State1, Delay, _} = schedule_retry(Node, State),
-            logger:info("[beacon.cluster] Reconnecting to ~p in ~bms", [Node, Delay]),
+            beacon_log_ffi:info(<<"beacon.cluster">>, "Reconnecting to ~p in ~bms", [Node, Delay]),
             State1;
         false ->
             State

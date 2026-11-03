@@ -30,13 +30,13 @@ start_link(ConfigRecord) ->
     end.
 
 start_error({error, {already_started, Pid}}) ->
-    logger:error("[beacon.cluster] The cluster manager is already running as ~p", [Pid]),
+    beacon_log_ffi:error(<<"beacon.cluster">>, "The cluster manager is already running as ~p", [Pid]),
     {error, already_started};
 start_error({error, Reason}) ->
-    logger:error("[beacon.cluster] Cluster manager failed to start: ~p", [Reason]),
+    beacon_log_ffi:error(<<"beacon.cluster">>, "Cluster manager failed to start: ~p", [Reason]),
     {error, {start_failed, format(Reason)}};
 start_error(ignore) ->
-    logger:error("[beacon.cluster] Cluster manager init returned ignore"),
+    beacon_log_ffi:error(<<"beacon.cluster">>, "Cluster manager init returned ignore"),
     {error, {start_failed, <<"init returned ignore">>}}.
 
 stop() ->
@@ -44,17 +44,17 @@ stop() ->
         undefined ->
             {error, not_started};
         Pid ->
-            logger:info("[beacon.cluster] Stopping the cluster manager"),
+            beacon_log_ffi:info(<<"beacon.cluster">>, "Stopping the cluster manager"),
             try gen_server:stop(Pid, normal, ?STOP_TIMEOUT_MS) of
                 ok ->
-                    logger:info("[beacon.cluster] Cluster manager stopped"),
+                    beacon_log_ffi:info(<<"beacon.cluster">>, "Cluster manager stopped"),
                     {ok, nil}
             catch
                 exit:noproc ->
-                    logger:warning("[beacon.cluster] The cluster manager was already stopping"),
+                    beacon_log_ffi:warning(<<"beacon.cluster">>, "The cluster manager was already stopping"),
                     {error, not_started};
                 exit:Reason ->
-                    logger:error("[beacon.cluster] Cluster manager did not stop: ~p", [Reason]),
+                    beacon_log_ffi:error(<<"beacon.cluster">>, "Cluster manager did not stop: ~p", [Reason]),
                     {error, {stop_failed, format(Reason)}}
             end
     end.

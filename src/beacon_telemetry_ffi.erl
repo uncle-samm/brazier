@@ -64,14 +64,14 @@ start() ->
             case telemetry:attach(?FAILURE_LOGGER_ID, [telemetry, handler, failure],
                                   fun ?MODULE:log_handler_failure/4, #{}) of
                 ok ->
-                    logger:info("[beacon.telemetry] started; handler-failure logger attached"),
+                    beacon_log_ffi:info(<<"beacon.telemetry">>, "started; handler-failure logger attached"),
                     {ok, nil};
                 {error, already_exists} ->
                     {ok, nil}
             end;
         {error, Reason} ->
-            logger:error("[beacon.telemetry] could not start the telemetry application: ~p",
-                         [Reason]),
+            beacon_log_ffi:error(<<"beacon.telemetry">>, "could not start the telemetry application: ~p",
+                                 [Reason]),
             {error, {start_failed, format(Reason)}}
     end.
 
@@ -95,8 +95,8 @@ attach(Id, Events, Handler) ->
                             case telemetry:attach_many(Id, AtomEvents, fun ?MODULE:dispatch/4,
                                                        #{handler => Handler}) of
                                 ok ->
-                                    logger:info("[beacon.telemetry] attached handler ~ts to ~p",
-                                                [Id, AtomEvents]),
+                                    beacon_log_ffi:info(<<"beacon.telemetry">>, "attached handler ~ts to ~p",
+                                                        [Id, AtomEvents]),
                                     {ok, nil};
                                 {error, already_exists} ->
                                     {error, {already_attached, Id}}
@@ -108,7 +108,7 @@ attach(Id, Events, Handler) ->
 detach(Id) ->
     case telemetry:detach(Id) of
         ok ->
-            logger:info("[beacon.telemetry] detached handler ~ts", [Id]),
+            beacon_log_ffi:info(<<"beacon.telemetry">>, "detached handler ~ts", [Id]),
             {ok, nil};
         {error, not_found} ->
             {error, {not_attached, Id}}
@@ -131,8 +131,8 @@ log_handler_failure(_Name, _Measurements, Metadata, _Config) ->
     %% telemetry always sets these keys on the failure event.
     #{handler_id := HandlerId, event_name := EventName, kind := Kind,
       reason := Reason, stacktrace := Stacktrace} = Metadata,
-    logger:error("[beacon.telemetry] handler ~p crashed on event ~p and was detached: ~p:~p~n~p",
-                 [HandlerId, EventName, Kind, Reason, Stacktrace]),
+    beacon_log_ffi:error(<<"beacon.telemetry">>, "handler ~p crashed on event ~p and was detached: ~p:~p~n~p",
+                         [HandlerId, EventName, Kind, Reason, Stacktrace]),
     ok.
 
 %% --- Emitting from Gleam ---

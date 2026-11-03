@@ -34,8 +34,8 @@ receive_event({subject, _Pid, Tag} = Subject, {OwnerMonitor, Owner}, PartitionMo
         {'EXIT', Pid, Reason} ->
             {linked_exit, Pid, format(Reason)};
         Other ->
-            logger:warning("[beacon.presence] Watcher ~p of tracker ~ts skipping an "
-                           "unexpected message: ~p", [self(), Name, Other]),
+            beacon_log_ffi:warning(<<"beacon.presence">>, "Watcher ~p of tracker ~ts skipping an "
+                                   "unexpected message: ~p", [self(), Name, Other]),
             receive_event(Subject, {OwnerMonitor, Owner}, PartitionMonitor, Name)
     end.
 
