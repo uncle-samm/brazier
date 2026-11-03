@@ -97,7 +97,7 @@ set_active_once(Socket) ->
 %% read_http_head/3 returns
 %%   {ok, {MethodBin, PathBin, http10 | http11, [{LowerName, Value}]}}
 %% or {error, Reason} with Reason one of
-%%   peer_closed | idle_timeout | request_timeout | request_line_too_long |
+%%   peer_closed | idle_timeout | draining | request_timeout | request_line_too_long |
 %%   headers_too_large | too_many_headers | {bad_request, Bin} |
 %%   {not_implemented, Bin} | {version_not_supported, Bin} | {socket_error, Bin}
 
@@ -119,7 +119,16 @@ read_http_head(Socket, {head_limits, MaxHeaders, MaxHeaderBytes, MaxLineBytes},
     true = is_integer(MaxLineBytes) andalso MaxLineBytes > 0,
     true = is_integer(LineTimeoutMs) andalso LineTimeoutMs > 0,
     LineDeadline = now_ms() + LineTimeoutMs,
-    Buffer = take_buffer(Socket),
+    case request_start(Socket, take_buffer(Socket), LineDeadline) of
+        {ok, Buffer} ->
+            read_http_head(Socket, Buffer, MaxHeaders, MaxHeaderBytes, MaxLineBytes,
+                           LineDeadline, HeaderSpec);
+        {error, _} = Error ->
+            Error
+    end.
+
+read_http_head(Socket, Buffer, MaxHeaders, MaxHeaderBytes, MaxLineBytes, LineDeadline,
+               HeaderSpec) ->
     case read_request_line(Socket, Buffer, MaxLineBytes, LineDeadline, 0) of
         {ok, Method, Target, Version, Rest} ->
             HeaderDeadline = case HeaderSpec of
@@ -138,6 +147,59 @@ read_http_head(Socket, {head_limits, MaxHeaders, MaxHeaderBytes, MaxLineBytes},
         {error, _} = Error ->
             Error
     end.
+
+%% The first bytes of the next request. A pipelined request is already
+%% buffered. Otherwise the connection is idle: wait for bytes with the
+%% socket in {active, once}, so the connection owner's drain message (see
+%% beacon_http_conns) ends the wait at once instead of after the idle
+%% timeout. A request that has started is never interrupted: once the first
+%% bytes arrived, the head is read with blocking receives as before.
+request_start(_Socket, Buffer, _Deadline) when byte_size(Buffer) > 0 ->
+    {ok, Buffer};
+request_start(Socket, <<>>, Deadline) ->
+    Owner = beacon_http_conns:owner_if_any(),
+    case Owner =/= none andalso beacon_http_conns:drain_requested() of
+        true ->
+            {error, draining};
+        false ->
+            case inet:setopts(Socket, [{active, once}]) of
+                ok -> receive_request_start(Socket, Owner, Deadline);
+                {error, Reason} -> {error, {socket_error, format_reason(Reason)}}
+            end
+    end.
+
+receive_request_start(Socket, Owner, Deadline) ->
+    receive
+        {tcp, Socket, Data} ->
+            %% {active, once} already set the socket passive again.
+            {ok, Data};
+        {tcp_closed, Socket} ->
+            {error, peer_closed};
+        {tcp_error, Socket, Reason} ->
+            {error, {socket_error, format_reason(Reason)}};
+        {beacon_http_drain, Owner} ->
+            beacon_http_conns:mark_draining(),
+            passive_and_closing(Socket, draining)
+    after max(0, Deadline - now_ms()) ->
+        passive_and_closing(Socket, idle_timeout)
+    end.
+
+%% Leave {active, once} before the connection is closed for Reason, and drop
+%% a socket message that arrived in between: nothing reads it any more.
+passive_and_closing(Socket, Reason) ->
+    case inet:setopts(Socket, [{active, false}]) of
+        ok -> ok;
+        {error, SetoptsReason} ->
+            beacon_log_ffi:debug(<<"beacon.http">>, "socket already gone while closing (~p): ~p",
+                                 [Reason, SetoptsReason])
+    end,
+    receive
+        {tcp, Socket, _Data} -> ok;
+        {tcp_closed, Socket} -> ok;
+        {tcp_error, Socket, _} -> ok
+    after 0 -> ok
+    end,
+    {error, Reason}.
 
 take_buffer(Socket) ->
     case erase(?BUFFER_KEY(Socket)) of
@@ -467,7 +529,7 @@ http_body_read(Socket, Length) when is_integer(Length) ->
     Key = {beacon_http_body, Socket},
     case get(Key) of
         undefined ->
-            logger:error("beacon.http read_body called outside an active HTTP request"),
+            beacon_log_ffi:error(<<"beacon.http">>, "read_body called outside an active HTTP request"),
             {error, <<"read_body called outside an active HTTP request">>};
         #{failed := true} ->
             {error, <<"request body unavailable after an earlier read failure">>};
@@ -540,8 +602,8 @@ run_handler(Fun, Arg) ->
         Result -> {ok, Result}
     catch
         Class:Reason:Stacktrace ->
-            logger:error("beacon.http request handler crashed: ~p:~p~n~p",
-                         [Class, Reason, Stacktrace]),
+            beacon_log_ffi:error(<<"beacon.http">>, "request handler crashed: ~p:~p~n~p",
+                                 [Class, Reason, Stacktrace]),
             {error, iolist_to_binary(io_lib:format("~p:~p", [Class, Reason]))}
     end.
 
@@ -780,6 +842,14 @@ ws_classify_message({tcp_error, _Socket, Reason}) ->
 ws_classify_message({beacon_session_revoked, SessionId, Reason})
   when is_binary(SessionId), is_binary(Reason) ->
     {session_revoked, SessionId, Reason};
+ws_classify_message({beacon_http_drain, _} = Msg) ->
+    case beacon_http_conns:is_drain_message(Msg) of
+        true ->
+            beacon_http_conns:mark_draining(),
+            server_draining;
+        false ->
+            {unexpected_message, list_to_binary(io_lib:format("~0P", [Msg, 8]))}
+    end;
 ws_classify_message(Other) ->
     {unexpected_message, list_to_binary(io_lib:format("~0P", [Other, 8]))}.
 

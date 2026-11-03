@@ -30,15 +30,15 @@ loop(ListenSocket, ConnsName, Id) ->
             handoff(Socket, ConnsName, erlang:monotonic_time()),
             loop(ListenSocket, ConnsName, Id);
         {error, Reason} when Reason =:= emfile; Reason =:= enfile ->
-            logger:error("beacon.http_acceptor ~p out of file descriptors (~p), backing off ~pms",
-                         [Id, Reason, ?EMFILE_BACKOFF_MS]),
+            beacon_log_ffi:error(<<"beacon.http_acceptor">>, "~p out of file descriptors (~p), backing off ~pms",
+                                 [Id, Reason, ?EMFILE_BACKOFF_MS]),
             receive after ?EMFILE_BACKOFF_MS -> ok end,
             loop(ListenSocket, ConnsName, Id);
         {error, closed} ->
-            logger:warning("beacon.http_acceptor ~p listen socket closed", [Id]),
+            beacon_log_ffi:warning(<<"beacon.http_acceptor">>, "~p listen socket closed", [Id]),
             exit({shutdown, listen_socket_closed});
         {error, Reason} ->
-            logger:warning("beacon.http_acceptor ~p accept failed: ~p", [Id, Reason]),
+            beacon_log_ffi:warning(<<"beacon.http_acceptor">>, "~p accept failed: ~p", [Id, Reason]),
             loop(ListenSocket, ConnsName, Id)
     end.
 
@@ -54,19 +54,19 @@ handoff(Socket, ConnsName, AcceptedAt) ->
                             Pid ! {beacon_http_shoot, Socket},
                             ok;
                         {error, Reason} ->
-                            logger:warning("beacon.http_acceptor socket handoff failed: ~p", [Reason]),
+                            beacon_log_ffi:warning(<<"beacon.http_acceptor">>, "socket handoff failed: ~p", [Reason]),
                             Pid ! {beacon_http_abort, Reason},
                             gen_tcp:close(Socket)
                     end;
                 {error, Limit} ->
-                    logger:warning("beacon.http_acceptor rejecting connection from ~s: ~p",
-                                   [inet:ntoa(Ip), Limit]),
+                    beacon_log_ffi:warning(<<"beacon.http_acceptor">>, "rejecting connection from ~s: ~p",
+                                           [inet:ntoa(Ip), Limit]),
                     beacon_telemetry_ffi:http_connection(
                         rejected, erlang:monotonic_time() - AcceptedAt, limit_reason(Limit)),
                     reject(Socket)
             end;
         {error, Reason} ->
-            logger:warning("beacon.http_acceptor dropping connection: ~s", [Reason]),
+            beacon_log_ffi:warning(<<"beacon.http_acceptor">>, "dropping connection: ~s", [Reason]),
             beacon_telemetry_ffi:http_connection(
                 rejected, erlang:monotonic_time() - AcceptedAt, <<"peer_address_unavailable">>),
             gen_tcp:close(Socket)
@@ -92,11 +92,11 @@ reject(Socket) ->
     case inet:setopts(Socket, [{send_timeout, ?REJECT_SEND_TIMEOUT_MS}]) of
         ok -> ok;
         {error, SetoptsReason} ->
-            logger:warning("beacon.http_acceptor setopts before reject failed: ~p", [SetoptsReason])
+            beacon_log_ffi:warning(<<"beacon.http_acceptor">>, "setopts before reject failed: ~p", [SetoptsReason])
     end,
     case gen_tcp:send(Socket, Response) of
         ok -> ok;
         {error, SendReason} ->
-            logger:warning("beacon.http_acceptor failed to send 503: ~p", [SendReason])
+            beacon_log_ffi:warning(<<"beacon.http_acceptor">>, "failed to send 503: ~p", [SendReason])
     end,
     gen_tcp:close(Socket).

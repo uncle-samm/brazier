@@ -48,8 +48,17 @@
 /// snake_case (`SetCount(9)` is `"set_count"`), or
 /// `"unknown"` for an event or path the app does not handle, so the label
 /// set stays the app's finite set of constructors. `route` is
-/// `transport.page_route`: the typed router has no patterns. A `Shutdown`
-/// emits `[beacon, runtime, stop]` with the runtime's uptime.
+/// `transport.page_route`: the typed router has no patterns.
+///
+/// Every stop that runs code emits `[beacon, runtime, stop]` with the
+/// runtime's uptime: a `Shutdown` with reason `shutdown`; a crash in the
+/// message handler with reason `crash`, the exception class as `kind` and
+/// the reason as `error` (the handler is guarded the way gen_server calls
+/// `terminate/2` for a callback that raises; the crash then goes on
+/// unchanged); an exit signal (a linked process failing, an exit sent to
+/// the runtime) with reason `exit`. The runtime traps exits for that, and
+/// leaves with the signal's reason. Only an untrappable `kill` emits
+/// nothing.
 import beacon/cookie
 import beacon/effect.{type Effect}
 import beacon/error
@@ -144,6 +153,11 @@ pub type RuntimeMessage(msg) {
   EffectDispatchedKeyed(key: String, generation: Int, message: msg)
   /// Shutdown the runtime.
   Shutdown
+  /// An exit signal the runtime trapped: a linked process (the connection
+  /// handler that started it, its PubSub listener or presence watcher, a
+  /// process the app linked) exited, or a process sent the runtime an
+  /// exit. Delivered by the VM; nothing sends it.
+  ExitTrapped(exit: process.ExitMessage)
 }
 
 /// The runtime's internal state. `model` is the app's server state (for
@@ -292,7 +306,7 @@ fn start_for(
         transport.page_route,
         "mount",
         connection_id,
-        fn() { start_actor(config, ctx, page_uri) },
+        fn() { start_actor(config, ctx, page_uri, connection_id) },
       )
   }
 }
@@ -302,18 +316,23 @@ type Mounted(model, msg) {
   Mounted(model: model, effects: Effect(msg), route_msg: Option(msg))
 }
 
+/// A runtime that does not start is logged once, here, where the cause is
+/// known: by `mount`, `start_presence` or `spawn_actor`, with the page and
+/// connection. The callers up to the transport only pass the error on (the
+/// transport logs the close it answers with at info).
 fn start_actor(
   config: RuntimeConfig(model, msg),
   ctx: Context,
   page_uri: Uri,
+  connection_id: String,
 ) -> Result(Subject(RuntimeMessage(msg)), error.BeaconError) {
   let started_at = monotonic_time()
-  use mounted <- result.try(mount(config, ctx, page_uri))
-  spawn_actor(config, mounted, page_uri, started_at)
+  use mounted <- result.try(mount(config, ctx, page_uri, connection_id))
+  spawn_actor(config, mounted, page_uri, started_at, connection_id)
 }
 
 /// Run the app's `init` and initial route in the calling process (the
-/// connection's handler). A crash in either is caught, logged with its
+/// connection's handler). A crash in either is caught, logged once with its
 /// stacktrace and returned as a `RuntimeError`, so the socket is closed
 /// with 1011 instead of the handler process dying without a close frame
 /// (LiveView answers a crash in the connected mount by failing the join).
@@ -321,13 +340,19 @@ fn mount(
   config: RuntimeConfig(model, msg),
   ctx: Context,
   page_uri: Uri,
+  connection_id: String,
 ) -> Result(Mounted(model, msg), error.BeaconError) {
-  let path = describe_uri(page_uri)
+  let path = describe_uri(page_uri) <> " (connection " <> connection_id <> ")"
   case run_guarded(fn() { init_and_route(config, ctx, page_uri) }) {
-    Error(crash) -> {
+    Error(#(crash, stacktrace)) -> {
       log.error(
         "beacon.runtime",
-        "init or the initial route crashed for " <> path <> ": " <> crash,
+        "init or the initial route crashed for "
+          <> path
+          <> ": "
+          <> crash
+          <> "\n"
+          <> stacktrace,
       )
       Error(error.RuntimeError(reason: "init crashed: " <> crash))
     }
@@ -386,15 +411,16 @@ fn init_and_route(
 }
 
 /// Run `run`, returning a crash (error, exit or throw) as `Error` with its
-/// class and reason. The FFI logs the stacktrace.
+/// `class:reason` and its formatted stacktrace. It logs nothing.
 @external(erlang, "beacon_runtime_ffi", "run_guarded")
-fn run_guarded(run: fn() -> a) -> Result(a, String)
+fn run_guarded(run: fn() -> a) -> Result(a, #(String, String))
 
 fn spawn_actor(
   config: RuntimeConfig(model, msg),
   mounted: Mounted(model, msg),
   page_uri: Uri,
   started_at: Int,
+  connection_id: String,
 ) -> Result(Subject(RuntimeMessage(msg)), error.BeaconError) {
   let Mounted(
     model: initial_model,
@@ -409,6 +435,7 @@ fn spawn_actor(
         config.presence,
         subject,
         initial_model,
+        connection_id,
       ))
       let initial_effect_processes = run_effects(initial_effects, subject)
       let state =
@@ -437,12 +464,24 @@ fn spawn_actor(
           started_at: started_at,
         )
       log.debug("beacon.runtime", "Runtime initialising")
+      // Trap exits so a stop caused by a linked process still reports
+      // [beacon, runtime, stop] (see handle_exit). An untrappable `kill`
+      // is the only stop that runs no code. Because of the trap the runtime
+      // must not stop with actor.stop_abnormal: gleam_otp implements it as
+      // an exit signal to itself, which a trapping process receives as a
+      // message and then exits normally.
+      process.trap_exits(True)
+      let selector =
+        process.new_selector()
+        |> process.select(subject)
+        |> process.select_trapped_exits(ExitTrapped)
 
       actor.initialised(state)
+      |> actor.selecting(selector)
       |> actor.returning(subject)
       |> Ok
     })
-    |> actor.on_message(handle_message)
+    |> actor.on_message(guarded_handle_message)
     |> actor.start
 
   case result {
@@ -483,19 +522,35 @@ fn spawn_actor(
       Ok(subject)
     }
     Error(actor.InitTimeout) -> {
-      log.error("beacon.runtime", "Failed to start runtime: init timed out")
-      Error(error.RuntimeError(reason: "Runtime init timed out"))
-    }
-    Error(actor.InitFailed(reason)) -> {
-      log.error("beacon.runtime", "Failed to start runtime: " <> reason)
-      Error(error.RuntimeError(reason: "Runtime init failed: " <> reason))
-    }
-    Error(actor.InitExited(_reason)) -> {
       log.error(
         "beacon.runtime",
-        "Failed to start runtime: init process exited",
+        "Failed to start the runtime for connection "
+          <> connection_id
+          <> ": its initialiser did not finish within 5000ms",
       )
-      Error(error.RuntimeError(reason: "Runtime init process exited"))
+      Error(error.RuntimeError(reason: "Runtime init timed out"))
+    }
+    // The initialiser fails only when presence refuses the session, and
+    // start_presence logged that with the tracker and connection.
+    Error(actor.InitFailed(reason)) -> {
+      log.debug(
+        "beacon.runtime",
+        "No runtime for connection " <> connection_id <> ": " <> reason,
+      )
+      Error(error.RuntimeError(reason: "Runtime init failed: " <> reason))
+    }
+    Error(actor.InitExited(reason)) -> {
+      let reason = string.inspect(reason)
+      log.error(
+        "beacon.runtime",
+        "Failed to start the runtime for connection "
+          <> connection_id
+          <> ": its initialiser exited with "
+          <> reason,
+      )
+      Error(error.RuntimeError(
+        reason: "Runtime init process exited: " <> reason,
+      ))
     }
   }
 }
@@ -506,6 +561,7 @@ fn start_presence(
   watch: Option(presence_watch.Watch(model, msg)),
   subject: Subject(RuntimeMessage(msg)),
   model: model,
+  connection_id: String,
 ) -> Result(Option(presence_watch.Watcher(model)), String) {
   case watch {
     None -> Ok(None)
@@ -521,7 +577,9 @@ fn start_presence(
           "beacon.runtime",
           "Presence of tracker "
             <> presence_watch.name(watch)
-            <> " refused the session: "
+            <> " refused the session of connection "
+            <> connection_id
+            <> ": "
             <> reason,
         )
         "presence: " <> reason
@@ -535,6 +593,85 @@ fn yes_no(flag: Bool) -> String {
     False -> "NO"
   }
 }
+
+/// `handle_message`, reporting a crash in it (the app's `update`, `view` or
+/// codec, an effect run in the runtime, a broken invariant) as
+/// `[beacon, runtime, stop]` with reason `crash` before the crash goes on
+/// unchanged: the runtime dies with the original reason and stacktrace and
+/// the VM's crash report logs it, as before.
+fn guarded_handle_message(
+  state: RuntimeState(model, msg),
+  message: RuntimeMessage(msg),
+) -> actor.Next(RuntimeState(model, msg), RuntimeMessage(msg)) {
+  case message {
+    // Outside the guard: handle_exit leaves with the signal's reason by
+    // raising an exit, which the guard would report again as a crash.
+    ExitTrapped(exit) -> handle_exit(state, exit)
+    _ ->
+      guard_handler(
+        fn() { handle_message(state, message) },
+        fn(kind, description) {
+          telemetry.runtime_stop_failed(
+            monotonic_time() - state.started_at,
+            "crash",
+            kind,
+            description,
+          )
+        },
+      )
+  }
+}
+
+@external(erlang, "beacon_runtime_ffi", "guard_handler")
+fn guard_handler(run: fn() -> a, on_crash: fn(String, String) -> Nil) -> a
+
+/// A trapped exit. A normal exit of a linked process does not stop the
+/// runtime, as an untrapped link would not; any other exit stops it with
+/// the same reason, after `[beacon, runtime, stop]` with reason `exit`, so
+/// the runtime's own links (the listener, the watcher) see what they would
+/// have seen without the trap.
+fn handle_exit(
+  state: RuntimeState(model, msg),
+  exit: process.ExitMessage,
+) -> actor.Next(RuntimeState(model, msg), RuntimeMessage(msg)) {
+  case exit.reason {
+    process.Normal -> {
+      log.debug(
+        "beacon.runtime",
+        "Linked process " <> string.inspect(exit.pid) <> " exited normally",
+      )
+      actor.continue(state)
+    }
+    reason -> {
+      let description = describe_exit(reason)
+      // The process that failed reports its own crash; this is the
+      // runtime's stop that follows from it.
+      log.warning(
+        "beacon.runtime",
+        "Runtime stopping with "
+          <> int.to_string(dict.size(state.connections))
+          <> " connection(s): exit signal from "
+          <> string.inspect(exit.pid)
+          <> ": "
+          <> description,
+      )
+      telemetry.runtime_stop_failed(
+        monotonic_time() - state.started_at,
+        "exit",
+        "exit",
+        description,
+      )
+      exit_like(reason)
+    }
+  }
+}
+
+@external(erlang, "beacon_runtime_ffi", "describe_exit")
+fn describe_exit(reason: process.ExitReason) -> String
+
+/// Exit with `reason` (never `Normal`).
+@external(erlang, "beacon_runtime_ffi", "exit_like")
+fn exit_like(reason: process.ExitReason) -> a
 
 /// The main message loop for the runtime actor.
 /// Follows Lustre's loop pattern: handle message → update state → return Next.
@@ -722,6 +859,9 @@ fn handle_message(
       }
       actor.stop()
     }
+
+    // guarded_handle_message answers trapped exits before this is called.
+    ExitTrapped(exit) -> handle_exit(state, exit)
   }
 }
 
@@ -2060,21 +2200,12 @@ fn spawn_and_connect(
       }
       Ok(#(on_event, shutdown))
     }
-    // `mount` logged the refusal at the level its status calls for.
-    Error(error.InitRejected(_) as err) -> {
+    // The start logged the cause once, where it was known (see
+    // start_actor), at the level it calls for.
+    Error(err) -> {
       log.debug(
         "beacon.runtime",
         "No runtime for " <> conn_id <> ": " <> error.to_string(err),
-      )
-      Error(err)
-    }
-    Error(err) -> {
-      log.error(
-        "beacon.runtime",
-        "Failed to spawn runtime for "
-          <> conn_id
-          <> ": "
-          <> error.to_string(err),
       )
       Error(err)
     }
@@ -2211,15 +2342,10 @@ pub fn connect_transport_per_connection(
             let on_disconnect = fn(_cid: transport.ConnectionId) { shutdown() }
             Ok(#(on_event, on_disconnect))
           }
+          // Logged where it happened; the transport logs the close.
           Error(error.InitRejected(init_error)) ->
             Error(transport.InitRefused(init_error))
-          Error(err) -> {
-            log.error(
-              "beacon.runtime",
-              "Failed to start per-connection runtime: " <> error.to_string(err),
-            )
-            Error(transport.StartupFailed(error.to_string(err)))
-          }
+          Error(err) -> Error(transport.StartupFailed(error.to_string(err)))
         }
       },
     ),

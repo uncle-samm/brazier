@@ -12,14 +12,14 @@ random_token() ->
 write_new_file(Path, Data) ->
     case validate_path(Path) of
         {error, Msg} ->
-            logger:error("Upload path traversal blocked: path=~ts reason=~ts",
-                         [Path, Msg]),
+            beacon_log_ffi:error(<<"beacon.upload">>, "Upload path traversal blocked: path=~ts reason=~ts",
+                                 [Path, Msg]),
             {error, list_to_binary(Msg)};
         ok ->
             case file:open(Path, [write, exclusive, raw, binary]) of
                 {error, Reason} ->
-                    logger:error("Upload create failed: path=~ts reason=~p",
-                                 [Path, Reason]),
+                    beacon_log_ffi:error(<<"beacon.upload">>, "Upload create failed: path=~ts reason=~p",
+                                         [Path, Reason]),
                     {error, reason(Reason)};
                 {ok, Fd} ->
                     Written = file:write(Fd, Data),
@@ -27,13 +27,13 @@ write_new_file(Path, Data) ->
                     case {Written, Closed} of
                         {ok, ok} -> {ok, nil};
                         _ ->
-                            logger:error("Upload write failed: path=~ts write=~p close=~p",
-                                         [Path, Written, Closed]),
+                            beacon_log_ffi:error(<<"beacon.upload">>, "Upload write failed: path=~ts write=~p close=~p",
+                                                 [Path, Written, Closed]),
                             case file:delete(Path) of
                                 ok -> ok;
                                 {error, DeleteReason} ->
-                                    logger:error("Cannot remove partial upload: path=~ts reason=~p",
-                                                 [Path, DeleteReason])
+                                    beacon_log_ffi:error(<<"beacon.upload">>, "Cannot remove partial upload: path=~ts reason=~p",
+                                                         [Path, DeleteReason])
                             end,
                             {error, <<"write failed">>}
                     end

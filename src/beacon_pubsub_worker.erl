@@ -26,16 +26,16 @@ start_link(Shard, Config) ->
 init({Shard, Config}) ->
     #{max_forward_queue := MaxQueue} = Config,
     ok = pg:join(?SCOPE, {beacon_pubsub, Shard}, self()),
-    logger:debug("[beacon.pubsub] Forwarding worker ~b joined its pg group", [Shard]),
+    beacon_log_ffi:debug(<<"beacon.pubsub">>, "Forwarding worker ~b joined its pg group", [Shard]),
     {ok, #{shard => Shard, max_queue => MaxQueue, last_overload_report => undefined}}.
 
 handle_call(Request, From, State = #{shard := Shard}) ->
-    logger:warning("[beacon.pubsub] Worker ~b received unexpected call ~p from ~p",
-                   [Shard, Request, From]),
+    beacon_log_ffi:warning(<<"beacon.pubsub">>, "Worker ~b received unexpected call ~p from ~p",
+                           [Shard, Request, From]),
     {reply, {error, unexpected_call}, State}.
 
 handle_cast(Request, State = #{shard := Shard}) ->
-    logger:warning("[beacon.pubsub] Worker ~b received unexpected cast ~p", [Shard, Request]),
+    beacon_log_ffi:warning(<<"beacon.pubsub">>, "Worker ~b received unexpected cast ~p", [Shard, Request]),
     {noreply, State}.
 
 handle_info({forward_to_local, Topic, Message}, State) ->
@@ -45,16 +45,16 @@ handle_info({forward_to_local, Topic, Message}, State) ->
         {error, not_started} ->
             %% The worker runs under the PubSub supervisor, so the registry
             %% is gone only while that supervisor is shutting down.
-            logger:warning("[beacon.pubsub] Worker ~b could not deliver a forwarded "
-                           "message on ~ts: PubSub is stopping", [maps:get(shard, State), Topic])
+            beacon_log_ffi:warning(<<"beacon.pubsub">>, "Worker ~b could not deliver a forwarded "
+                                   "message on ~ts: PubSub is stopping", [maps:get(shard, State), Topic])
     end,
     {noreply, State1};
 handle_info(Message, State = #{shard := Shard}) ->
-    logger:warning("[beacon.pubsub] Worker ~b received unexpected message ~p", [Shard, Message]),
+    beacon_log_ffi:warning(<<"beacon.pubsub">>, "Worker ~b received unexpected message ~p", [Shard, Message]),
     {noreply, State}.
 
 terminate(Reason, #{shard := Shard}) ->
-    logger:info("[beacon.pubsub] Forwarding worker ~b stopping: ~p", [Shard, Reason]),
+    beacon_log_ffi:info(<<"beacon.pubsub">>, "Forwarding worker ~b stopping: ~p", [Shard, Reason]),
     ok.
 
 check_overload(State = #{shard := Shard, max_queue := MaxQueue, last_overload_report := Last}) ->
@@ -68,10 +68,10 @@ check_overload(State = #{shard := Shard, max_queue := MaxQueue, last_overload_re
                 false ->
                     State;
                 true ->
-                    logger:error("[beacon.pubsub] Forwarding worker ~b is overloaded: ~b queued "
-                                 "messages (limit ~b). Messages are not dropped; the node is not "
-                                 "keeping up with remote broadcasts.",
-                                 [Shard, QueueLen, MaxQueue]),
+                    beacon_log_ffi:error(<<"beacon.pubsub">>, "Forwarding worker ~b is overloaded: ~b queued "
+                                         "messages (limit ~b). Messages are not dropped; the node is not "
+                                         "keeping up with remote broadcasts.",
+                                         [Shard, QueueLen, MaxQueue]),
                     beacon_telemetry_ffi:pubsub_forward_overloaded(QueueLen, Shard),
                     State#{last_overload_report := Now}
             end

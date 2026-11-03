@@ -40,7 +40,7 @@ variables:
 | `PORT` | `config.port()`, when the app calls it | `8080` | Listen port, `0..65535` (`0` binds an ephemeral port). A set value that is not an integer in range is an `Error`. |
 | `SECRET_KEY` | `config.secret_key()`, when the app calls it | none | Token signing key, at least 32 bytes. Unset, empty, short or the old published dev secret is an `Error`. |
 | `BEACON_ENV` | `config.is_production()`, which `beacon/cluster` calls when the app joins a cluster | not production | `production` or `prod` makes the cluster refuse insecure distribution (see [CLUSTERING.md](CLUSTERING.md)). It does not change logging or anything else. |
-| `BEACON_SHUTDOWN_TIMEOUT` | `beacon.start`, before it starts waiting | `5000` | Milliseconds to drain connections on shutdown. A value that is not a non-negative integer stops the process with an error. |
+| `BEACON_SHUTDOWN_TIMEOUT` | `beacon.start`, when it starts the application | `SecurityLimits.drain_timeout_ms` (5000) | Milliseconds the listener waits for open connections when it stops (see [Graceful Shutdown](#graceful-shutdown)), `0..4294967295`. A set value that is not an integer in range refuses the start with a `ConfigError`. |
 
 `config.get_env`, `config.get_env_or` and `config.get_env_int` read any other
 variable the app needs; `get_env_int` returns an `Error` for a set value that
@@ -213,6 +213,34 @@ when the package and the app module share a name.
 For your own app, copy your project instead of the repository and drop the
 `examples/` prefix. The image's `HEALTHCHECK` requests `/`, which renders the
 app's first page; `/health` (above) is the cheaper check.
+
+## Graceful Shutdown
+
+`application.wait_forever`, which `beacon.start` calls once the application
+is up, turns SIGTERM (what `docker stop`, Kubernetes and systemd send) into a
+drain:
+
+1. The acceptors stop, so no new connection is accepted.
+2. Every open connection is told to finish. A WebSocket is closed with
+   **1001** `server shutting down` (the browser reconnects with backoff to
+   the next instance). An HTTP request in progress completes and its
+   response carries `Connection: close`. An idle keep-alive connection is
+   closed.
+3. Connections still open after the drain timeout are killed, with one
+   error log naming how many.
+4. The rest of the tree stops, `wait_forever` returns, and so does
+   `beacon.start`.
+
+The drain timeout is `SecurityLimits.drain_timeout_ms` (default 5000), or
+`BEACON_SHUTDOWN_TIMEOUT` when set. Keep it below the orchestrator's grace
+period: `docker stop` sends SIGKILL after 10 seconds, and Kubernetes after
+`terminationGracePeriodSeconds` (30 by default).
+
+While `wait_forever` waits, Beacon's handler replaces OTP's on the
+`erl_signal_server` event manager, and puts OTP's back once nothing waits.
+A second SIGTERM that arrives after the first has been taken goes to OTP's
+handler, which runs `init:stop()`. Only apps started by the process that
+calls `wait_forever` are drained. SIGUSR1 and SIGQUIT still halt the node.
 
 ## Logging and Connections
 

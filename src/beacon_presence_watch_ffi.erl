@@ -1,5 +1,5 @@
 -module(beacon_presence_watch_ffi).
--export([receive_event/4, exit/1, trap_exits/0, set_label/1]).
+-export([receive_event/4, await_sync/2, node_name/0, exit/1, trap_exits/0, set_label/1]).
 
 %% FFI of beacon/internal/presence_watch: the receive loop of a session's
 %% presence watcher.
@@ -16,6 +16,8 @@
 %%   {monitor_down, Pid, ReasonBin}    another monitored process (a shard)
 %%   {linked_exit, Pid, ReasonBin}     a linked process other than the
 %%                                     runtime exited (a PubSub partition)
+%%   {synced, Shard, NodeBin, Status}  a shard's answer to await_sync/2,
+%%                                     Status a presence_watch.SyncStatus
 %% Anything else is logged and skipped.
 receive_event({subject, _Pid, Tag} = Subject, {OwnerMonitor, Owner}, PartitionMonitor, Name) ->
     receive
@@ -23,6 +25,16 @@ receive_event({subject, _Pid, Tag} = Subject, {OwnerMonitor, Owner}, PartitionMo
             {command_received, Msg};
         {beacon_pubsub, DiffTopic, Msg} when is_binary(DiffTopic) ->
             {diffs, DiffTopic, [Msg | drain(DiffTopic, ?MAX_BATCH - 1)]};
+        {beacon_presence_synced, Shard, NodeBin, Status} when is_pid(Shard), is_binary(NodeBin) ->
+            case sync_status(Status) of
+                {ok, SyncStatus} ->
+                    {synced, Shard, NodeBin, SyncStatus};
+                error ->
+                    beacon_log_ffi:error(<<"beacon.presence">>, "Watcher ~p of tracker ~ts got an "
+                                         "unknown sync status ~p from shard ~p for ~ts; skipping it",
+                                         [self(), Name, Status, Shard, NodeBin]),
+                    receive_event(Subject, {OwnerMonitor, Owner}, PartitionMonitor, Name)
+            end;
         {'DOWN', OwnerMonitor, process, _, Reason} ->
             {owner_down, format(Reason)};
         {'EXIT', Owner, Reason} ->
@@ -34,8 +46,8 @@ receive_event({subject, _Pid, Tag} = Subject, {OwnerMonitor, Owner}, PartitionMo
         {'EXIT', Pid, Reason} ->
             {linked_exit, Pid, format(Reason)};
         Other ->
-            logger:warning("[beacon.presence] Watcher ~p of tracker ~ts skipping an "
-                           "unexpected message: ~p", [self(), Name, Other]),
+            beacon_log_ffi:warning(<<"beacon.presence">>, "Watcher ~p of tracker ~ts skipping an "
+                                   "unexpected message: ~p", [self(), Name, Other]),
             receive_event(Subject, {OwnerMonitor, Owner}, PartitionMonitor, Name)
     end.
 
@@ -49,6 +61,23 @@ drain(DiffTopic, Count) ->
     after 0 ->
         []
     end.
+
+%% The shard's sync statuses (beacon_presence_shard, Sync waiters) as the
+%% Gleam type presence_watch.SyncStatus.
+sync_status(synced) -> {ok, in_sync};
+sync_status(down) -> {ok, node_down};
+sync_status(absent) -> {ok, node_absent};
+sync_status(timeout) -> {ok, sync_timeout};
+sync_status(_) -> error.
+
+%% Ask Shard to send {beacon_presence_synced, Shard, NodeBin, Status} to
+%% the caller for each of Nodes once it has synced with it.
+await_sync(Shard, Nodes) ->
+    Shard ! {beacon_presence_await_sync, self(), Nodes},
+    nil.
+
+node_name() ->
+    atom_to_binary(node(), utf8).
 
 %% Exit the calling process with Reason.
 exit(Reason) ->

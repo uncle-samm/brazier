@@ -184,7 +184,7 @@ pub fn socket_refused_as_unavailable_closes_with_4503_test() {
   let assert Ok(4503) = telemetry.int(close, "close_code")
   let assert True =
     log_capture.contains(logs, "error", "503: orders-db.internal down")
-  let assert True = log_capture.contains(logs, "error", "4503")
+  let assert True = log_capture.contains(logs, "info", "4503")
   let assert Ok(Nil) = telemetry.detach(id)
   stop(app)
 }

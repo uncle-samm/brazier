@@ -13,7 +13,7 @@ start_link(Args = #{sup := Sup}) ->
     supervisor:start_link({local, Sup}, ?MODULE, Args).
 
 init(Args = #{name := Name, kind := Kind}) ->
-    logger:info("[beacon.store] Starting replicated store ~ts (~p)", [Name, Kind]),
+    beacon_log_ffi:info(<<"beacon.store">>, "Starting replicated store ~ts (~p)", [Name, Kind]),
     Child = #{id => replica,
               start => {beacon_store_replica, start_link, [Args]},
               type => worker,

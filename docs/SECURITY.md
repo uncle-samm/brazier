@@ -29,6 +29,7 @@ pub type SecurityLimits {
     keepalive_idle_timeout_ms: Int,   // 15000 between keep-alive requests
     max_keepalive_requests: Int,      // 1000 per connection
     send_timeout_ms: Int,             // 30000 per blocked socket send
+    drain_timeout_ms: Int,            // 5000 for open connections on stop
     trusted_proxies: List(String),    // [] (see Trusted Proxies)
     // WebSocket limits
     max_ws_connections_per_ip: Int,   // 100
@@ -73,6 +74,10 @@ follows the cowboy/ranch and Plug conventions:
 - **Supervision:** acceptors run under an OTP supervisor and are restarted
   (and logged) when they crash; a crashing handler gets 500 and closes only
   its own connection.
+- **Shutdown:** a stopping listener first stops accepting, then gives open
+  connections `drain_timeout_ms` (0 kills them at once; at most
+  4294967295) to finish, and kills the rest. `BEACON_SHUTDOWN_TIMEOUT`
+  overrides it. See [DEPLOYMENT.md](DEPLOYMENT.md#graceful-shutdown).
 
 A seeded raw-socket fuzz test (`test/beacon/http_fuzz_test.gleam`) sends
 mutated and random requests and checks that the server never crashes, hangs,
@@ -235,7 +240,7 @@ HSTS is opt-in because Beacon does not terminate TLS: add `middleware.hsts(31_53
 
 ## Session Tokens
 
-SSR pages set a signed join/state recovery token in the HttpOnly `beacon_join_token` cookie. The browser client sends an empty join token; the runtime reads the cookie from the WebSocket upgrade request. Tokens are created with `crypto.sign_message` using HMAC-SHA256 and contain a JSON payload with a timestamp, version, and optionally serialized model state. The `verify_session_token` function checks the signature and rejects tokens older than `max_age_seconds` (default 24 hours / 86400 seconds).
+SSR pages set a signed join/state recovery token in the HttpOnly `beacon_join_token` cookie; static error pages (4xx/5xx, which load no client) set none. The browser client sends an empty join token; the runtime reads the cookie from the WebSocket upgrade request. Tokens are created with `crypto.sign_message` using HMAC-SHA256 and contain a JSON payload with a timestamp, version, and optionally serialized model state. The `verify_session_token` function checks the signature and rejects tokens older than `max_age_seconds` (default 24 hours / 86400 seconds).
 
 The cookie is `HttpOnly`, `SameSite=Lax`, path `/`, and has `Max-Age=86400`. JavaScript cannot read it, so XSS cannot directly steal the join token from DOM state.
 

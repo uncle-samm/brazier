@@ -47,6 +47,8 @@ Object.defineProperty(globalThis, "performance", {
   configurable: true,
   value: { now: () => clock.now, mark() {}, measure() {} },
 });
+// The reload guard stores wall-clock times: follow the fake clock.
+Date.now = () => clock.now;
 function advance(ms) {
   const target = clock.now + ms;
   for (;;) {
@@ -111,6 +113,28 @@ class FakeWebSocket {
   }
 }
 globalThis.WebSocket = FakeWebSocket;
+
+// --- fake sessionStorage (pass the same one to the next load to simulate
+// a page reload in the same tab) ---
+class FakeStorage {
+  constructor(entries = {}) {
+    this.map = new Map(Object.entries(entries));
+  }
+  getItem(key) {
+    return this.map.has(key) ? this.map.get(key) : null;
+  }
+  setItem(key, value) {
+    this.map.set(key, String(value));
+  }
+}
+const brokenStorage = {
+  getItem() {
+    throw new Error("SecurityError: storage is disabled");
+  },
+  setItem() {
+    throw new Error("SecurityError: storage is disabled");
+  },
+};
 
 // --- console capture ---
 const realConsole = { log: console.log, warn: console.warn, error: console.error };
@@ -429,7 +453,8 @@ function freshGlobals(options = {}) {
   windowListeners = [];
   historyLog.pushed = [];
   historyLog.replaced = [];
-  clock.now = 1_000_000;
+  clock.now = options.now ?? 1_000_000;
+  globalThis.sessionStorage = options.storage || new FakeStorage();
   root = new FakeElement("div");
   root.setAttribute("id", "beacon-app");
   parseInto(root, options.ssr || "");
@@ -564,6 +589,68 @@ scenario("4401 stops reconnecting, logs an error and reloads", async () => {
   assert.ok(errorsMatching("4401").length >= 1);
   advance(120000);
   assert.equal(sockets.length, 1, "never reconnects");
+});
+
+scenario("4404 reloads at most 3 times within 60s, then shows an error state", async () => {
+  const storage = new FakeStorage();
+  for (let i = 0; i < 3; i++) {
+    await loadRuntime({ storage, now: 1_000_000 + i * 1000 });
+    sockets[0].open();
+    sockets[0].serverClose(4404);
+    assert.equal(reloads, 1, `refusal ${i + 1} reloads`);
+    assert.equal(pendingTimeouts().length, 0, "no reconnect scheduled");
+  }
+  assert.equal(JSON.parse(storage.getItem("beacon:reloads")).length, 3);
+  await loadRuntime({ storage, now: 1_003_000, ssr: "<p>stale</p>" });
+  sockets[0].open();
+  sockets[0].serverClose(4404);
+  assert.equal(reloads, 0, "the fourth refusal within 60s does not reload");
+  assert.ok(root.hasAttribute("data-beacon-error"), "the root is marked");
+  assert.equal(root.firstChild.getAttribute("role"), "alert", "a notice leads the root");
+  assert.equal(errorsMatching("after 3 reloads within 60s").length, 1);
+  advance(120000);
+  assert.equal(sockets.length, 1, "never reconnects");
+  assert.equal(reloads, 0, "never reloads");
+  // Once the first reload leaves the window, one more is allowed.
+  await loadRuntime({ storage, now: 1_060_000 });
+  sockets[0].open();
+  sockets[0].serverClose(4404);
+  assert.equal(reloads, 1);
+  assert.deepEqual(JSON.parse(storage.getItem("beacon:reloads")), [1_001_000, 1_002_000, 1_060_000]);
+});
+
+scenario("the reload guard fails loudly without usable sessionStorage", async () => {
+  await loadRuntime({ storage: brokenStorage });
+  sockets[0].open();
+  sockets[0].serverClose(4403);
+  assert.equal(reloads, 0, "no unguarded reload");
+  assert.ok(root.hasAttribute("data-beacon-error"));
+  assert.equal(errorsMatching("cannot read sessionStorage").length, 1);
+  await loadRuntime({ storage: new FakeStorage({ "beacon:reloads": "{oops" }) });
+  sockets[0].open();
+  sockets[0].serverClose(4401);
+  assert.equal(reloads, 0);
+  assert.ok(root.hasAttribute("data-beacon-error"));
+  assert.equal(errorsMatching("is invalid").length, 1);
+  advance(120000);
+  assert.equal(sockets.length, 1, "never reconnects");
+});
+
+scenario("4503 and 1011 back off up to 30s and never reload", async () => {
+  await loadRuntime();
+  const codes = [4503, 1011, 4503, 1011, 4503, 1011, 4503, 1011];
+  codes.forEach((code, i) => {
+    const s = sockets[i];
+    s.open();
+    s.serverClose(code);
+    const delay = reconnectDelay();
+    const base = Math.min(1000 * 2 ** i, 30000);
+    assert.ok(delay >= base && delay < base + 1000, `close ${code} #${i + 1}: delay ${delay}`);
+    advance(delay);
+  });
+  assert.equal(sockets.length, codes.length + 1);
+  assert.equal(reloads, 0);
+  assert.ok(!root.hasAttribute("data-beacon-error"));
 });
 
 scenario("1008, 1009 and 1013 reconnect with growing backoff", async () => {

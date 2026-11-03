@@ -16,7 +16,7 @@ start_link(Config) ->
 
 init(Config) ->
     #{name := Name, pool_size := PoolSize} = Config,
-    logger:info("[beacon.presence] Starting tracker ~ts with ~b shards", [Name, PoolSize]),
+    beacon_log_ffi:info(<<"beacon.presence">>, "Starting tracker ~ts with ~b shards", [Name, PoolSize]),
     Children = [
         #{id => {shard, I},
           start => {beacon_presence_shard, start_link, [I, Config]},

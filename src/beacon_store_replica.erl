@@ -85,8 +85,8 @@ start(Kind, Name, Config) ->
                 undefined ->
                     start_sup(Kind, Name, Config, Server, Sup, Table, Topic);
                 _ ->
-                    logger:error("[beacon.store] Cannot open ~ts as a replicated store: it is "
-                                 "already open in local mode", [Name]),
+                    beacon_log_ffi:error(<<"beacon.store">>, "Cannot open ~ts as a replicated store: it is "
+                                         "already open in local mode", [Name]),
                     {error, {invalid_config,
                              <<"store ", Name/binary, " is already open in local mode">>}}
             end;
@@ -105,8 +105,8 @@ start_sup(Kind, Name, Config, Server, Sup, Table, Topic) ->
             %% Another process opened the same store concurrently.
             same_config(Kind, Name, Config, Server, Table);
         {error, Reason} ->
-            logger:error("[beacon.store] Replicated store ~ts failed to start: ~p",
-                         [Name, Reason]),
+            beacon_log_ffi:error(<<"beacon.store">>, "Replicated store ~ts failed to start: ~p",
+                                 [Name, Reason]),
             {error, {start_failed, format(Reason)}}
     end.
 
@@ -115,8 +115,8 @@ same_config(_Kind, Name, Config, Server, Table) ->
         {ok, Config} ->
             {ok, {Server, Table}};
         {ok, Other} ->
-            logger:error("[beacon.store] Replicated store ~ts is already open with ~p, "
-                         "not ~p", [Name, Other, Config]),
+            beacon_log_ffi:error(<<"beacon.store">>, "Replicated store ~ts is already open with ~p, "
+                                 "not ~p", [Name, Other, Config]),
             {error, {invalid_config, <<"store ", Name/binary,
                                        " is already open with a different configuration">>}};
         {error, {unavailable, Reason}} ->
@@ -132,7 +132,7 @@ stop(Server) ->
         undefined ->
             {error, <<"not running">>};
         Pid ->
-            logger:info("[beacon.store] Stopping ~p", [Server]),
+            beacon_log_ffi:info(<<"beacon.store">>, "Stopping ~p", [Server]),
             try proc_lib:stop(Pid, shutdown, ?STOP_TIMEOUT_MS) of
                 ok -> {ok, nil}
             catch
@@ -157,14 +157,14 @@ call(Server, Request) ->
         gen_server:call(Server, Request, ?CALL_TIMEOUT_MS)
     catch
         exit:{timeout, _} ->
-            logger:error("[beacon.store] ~p did not answer ~p within ~bms",
-                         [Server, request_name(Request), ?CALL_TIMEOUT_MS]),
+            beacon_log_ffi:error(<<"beacon.store">>, "~p did not answer ~p within ~bms",
+                                 [Server, request_name(Request), ?CALL_TIMEOUT_MS]),
             {error, {unavailable, <<"replica timeout">>}};
         exit:{noproc, _} ->
-            logger:error("[beacon.store] ~p is not running", [Server]),
+            beacon_log_ffi:error(<<"beacon.store">>, "~p is not running", [Server]),
             {error, {unavailable, <<"replica not running">>}};
         exit:Reason ->
-            logger:error("[beacon.store] ~p exited during a call: ~p", [Server, Reason]),
+            beacon_log_ffi:error(<<"beacon.store">>, "~p exited during a call: ~p", [Server, Reason]),
             {error, {unavailable, format(Reason)}}
     end.
 
@@ -208,7 +208,7 @@ read(Table, Run) ->
     end.
 
 missing(Table) ->
-    logger:error("[beacon.store] Table ~p is missing: its replica is not running", [Table]),
+    beacon_log_ffi:error(<<"beacon.store">>, "Table ~p is missing: its replica is not running", [Table]),
     {error, <<"replica not running">>}.
 
 %% --- gen_server ---
@@ -221,8 +221,8 @@ init(Args) ->
         undefined ->
             case beacon_pubsub_ffi:subscribe(Topic) of
                 {error, Reason} ->
-                    logger:error("[beacon.store] Replica ~ts cannot subscribe to ~ts: ~p",
-                                 [Name, Topic, Reason]),
+                    beacon_log_ffi:error(<<"beacon.store">>, "Replica ~ts cannot subscribe to ~ts: ~p",
+                                         [Name, Topic, Reason]),
                     {stop, {pubsub_subscribe_failed, Reason}};
                 {ok, nil} ->
                     Type = case Kind of
@@ -242,15 +242,15 @@ init(Args) ->
                     %% Up to one interval of initial jitter so replicas
                     %% started together do not exchange digests in lockstep.
                     schedule_sync(rand:uniform(max(1, Interval))),
-                    logger:info("[beacon.store] Replica ~ts started as ~ts",
-                                [Name, ?CRDT:replica_to_string(Replica)]),
+                    beacon_log_ffi:info(<<"beacon.store">>, "Replica ~ts started as ~ts",
+                                        [Name, ?CRDT:replica_to_string(Replica)]),
                     %% Ask every running replica for its state.
                     publish(S, {beacon_store, sync_req, node()}),
                     {ok, S}
             end;
         _ ->
-            logger:error("[beacon.store] Replica ~ts cannot start: table ~p exists",
-                         [Name, Table]),
+            beacon_log_ffi:error(<<"beacon.store">>, "Replica ~ts cannot start: table ~p exists",
+                                 [Name, Table]),
             {stop, {table_exists, Table}}
     end.
 
@@ -279,13 +279,13 @@ handle_call(digest, _From, S) ->
 handle_call(size, _From, S = #{crdt := Crdt}) ->
     {reply, {ok, ?CRDT:size(Crdt)}, S};
 handle_call(Request, From, S) ->
-    logger:warning("[beacon.store] Replica ~ts received unexpected call ~p from ~p",
-                   [label(S), Request, From]),
+    beacon_log_ffi:warning(<<"beacon.store">>, "Replica ~ts received unexpected call ~p from ~p",
+                           [label(S), Request, From]),
     {reply, {error, {unavailable, <<"unexpected request">>}}, S}.
 
 handle_cast(Request, S) ->
-    logger:warning("[beacon.store] Replica ~ts received unexpected cast ~p",
-                   [label(S), Request]),
+    beacon_log_ffi:warning(<<"beacon.store">>, "Replica ~ts received unexpected cast ~p",
+                           [label(S), Request]),
     {noreply, S}.
 
 handle_info(sync_tick, S = #{config := {config, Interval, _, _, _, _}}) ->
@@ -296,27 +296,27 @@ handle_info(sync_tick, S = #{config := {config, Interval, _, _, _, _}}) ->
 handle_info({beacon_pubsub, Topic, Message}, S = #{topic := Topic}) ->
     {noreply, peer_message(Message, S)};
 handle_info({nodeup, Node}, S) ->
-    logger:info("[beacon.store] Replica ~ts: ~p connected, requesting its state",
-                [label(S), Node]),
+    beacon_log_ffi:info(<<"beacon.store">>, "Replica ~ts: ~p connected, requesting its state",
+                        [label(S), Node]),
     send_direct(S, Node, {beacon_store, sync_req, node()}),
     {noreply, S};
 handle_info({nodedown, Node}, S) ->
-    logger:info("[beacon.store] Replica ~ts: ~p disconnected", [label(S), Node]),
+    beacon_log_ffi:info(<<"beacon.store">>, "Replica ~ts: ~p disconnected", [label(S), Node]),
     {noreply, S};
 handle_info({'EXIT', Pid, Reason}, S) ->
     %% The only link besides the parent (handled by gen_server) is the
     %% PubSub partition this replica subscribed through. Without it the
     %% replica no longer hears its peers, so it stops and is restarted.
-    logger:error("[beacon.store] Replica ~ts: linked ~p exited (~p); stopping",
-                 [label(S), Pid, Reason]),
+    beacon_log_ffi:error(<<"beacon.store">>, "Replica ~ts: linked ~p exited (~p); stopping",
+                         [label(S), Pid, Reason]),
     {stop, {linked_exit, Reason}, S};
 handle_info(Message, S) ->
-    logger:warning("[beacon.store] Replica ~ts received unexpected message ~p",
-                   [label(S), Message]),
+    beacon_log_ffi:warning(<<"beacon.store">>, "Replica ~ts received unexpected message ~p",
+                           [label(S), Message]),
     {noreply, S}.
 
 terminate(Reason, S) ->
-    logger:info("[beacon.store] Replica ~ts stopping: ~p", [label(S), Reason]),
+    beacon_log_ffi:info(<<"beacon.store">>, "Replica ~ts stopping: ~p", [label(S), Reason]),
     ok.
 
 %% --- Local writes ---
@@ -328,8 +328,8 @@ local_write(S, OpName, Values, Op) ->
       config := {config, _, MaxEntries, MaxValue, MaxDelta, _}} = S,
     case oversized_value(Values, MaxValue) of
         {error, Bytes} ->
-            logger:error("[beacon.store] Replica ~ts refused a ~p: a value of ~b bytes "
-                         "exceeds max_value_bytes ~b", [label(S), OpName, Bytes, MaxValue]),
+            beacon_log_ffi:error(<<"beacon.store">>, "Replica ~ts refused a ~p: a value of ~b bytes "
+                                 "exceeds max_value_bytes ~b", [label(S), OpName, Bytes, MaxValue]),
             {reply, {error, {value_too_large, Bytes, MaxValue}}, S};
         ok ->
             {{Crdt1, Delta, Changes}, Hlc1} = Op(Crdt, Replica, Hlc),
@@ -339,13 +339,13 @@ local_write(S, OpName, Values, Op) ->
             Grows = Size > ?CRDT:size(Crdt),
             if
                 Bytes > MaxDelta ->
-                    logger:error("[beacon.store] Replica ~ts refused a ~p: its delta of ~b "
-                                 "bytes exceeds max_delta_bytes ~b",
-                                 [label(S), OpName, Bytes, MaxDelta]),
+                    beacon_log_ffi:error(<<"beacon.store">>, "Replica ~ts refused a ~p: its delta of ~b "
+                                         "bytes exceeds max_delta_bytes ~b",
+                                         [label(S), OpName, Bytes, MaxDelta]),
                     {reply, {error, {delta_too_large, Bytes, MaxDelta}}, S};
                 Size > MaxEntries andalso Grows ->
-                    logger:error("[beacon.store] Replica ~ts refused a ~p: ~b entries would "
-                                 "exceed max_entries ~b", [label(S), OpName, Size, MaxEntries]),
+                    beacon_log_ffi:error(<<"beacon.store">>, "Replica ~ts refused a ~p: ~b entries would "
+                                         "exceed max_entries ~b", [label(S), OpName, Size, MaxEntries]),
                     {reply, {error, {too_many_entries, MaxEntries}}, S};
                 Changes =:= [] ->
                     %% Nothing observed to remove: no delta to send.
@@ -379,7 +379,7 @@ peer_message({beacon_store, delta, From, Delta}, S)
 peer_message({beacon_store, sync, From, Full}, S)
   when is_atom(From), element(1, Full) =:= delta ->
     #{config := {config, _, _, _, _, MaxSync}} = S,
-    logger:debug("[beacon.store] Replica ~ts received the state of ~p", [label(S), From]),
+    beacon_log_ffi:debug(<<"beacon.store">>, "Replica ~ts received the state of ~p", [label(S), From]),
     merge(S, From, sync, Full, MaxSync, fun ?CRDT:join_full/2);
 peer_message({beacon_store, digest, From, Digest}, S)
   when is_atom(From), is_binary(Digest) ->
@@ -387,8 +387,8 @@ peer_message({beacon_store, digest, From, Digest}, S)
         {Digest, S1} ->
             S1;
         {_Other, S1} ->
-            logger:debug("[beacon.store] Replica ~ts differs from ~p, requesting its state",
-                         [label(S1), From]),
+            beacon_log_ffi:debug(<<"beacon.store">>, "Replica ~ts differs from ~p, requesting its state",
+                                 [label(S1), From]),
             send_direct(S1, From, {beacon_store, sync_req, node()}),
             S1
     end;
@@ -397,16 +397,16 @@ peer_message({beacon_store, sync_req, From}, S) when is_atom(From) ->
     Message = {beacon_store, sync, node(), ?CRDT:to_delta(Crdt)},
     case erlang:external_size(Message) of
         Bytes when Bytes > MaxSync ->
-            logger:error("[beacon.store] Replica ~ts refuses to send its state to ~p: ~b "
-                         "bytes exceed max_sync_bytes ~b", [label(S), From, Bytes, MaxSync]),
+            beacon_log_ffi:error(<<"beacon.store">>, "Replica ~ts refuses to send its state to ~p: ~b "
+                                 "bytes exceed max_sync_bytes ~b", [label(S), From, Bytes, MaxSync]),
             S;
         _ ->
             send_direct(S, From, Message),
             S
     end;
 peer_message(Message, S) ->
-    logger:warning("[beacon.store] Replica ~ts received an unexpected replication "
-                   "message ~P", [label(S), Message, 20]),
+    beacon_log_ffi:warning(<<"beacon.store">>, "Replica ~ts received an unexpected replication "
+                           "message ~P", [label(S), Message, 20]),
     S.
 
 %% Merge a delta or a full state from From inside the sync span.
@@ -418,8 +418,8 @@ merge(S = #{name := Name}, From, What, Payload, MaxBytes, Join) ->
     end).
 
 checked_merge(S, From, What, _Payload, Bytes, MaxBytes, _Join) when Bytes > MaxBytes ->
-    logger:error("[beacon.store] Replica ~ts refused a ~p of ~b bytes from ~p "
-                 "(limit ~b bytes)", [label(S), What, Bytes, From, MaxBytes]),
+    beacon_log_ffi:error(<<"beacon.store">>, "Replica ~ts refused a ~p of ~b bytes from ~p "
+                         "(limit ~b bytes)", [label(S), What, Bytes, From, MaxBytes]),
     S;
 checked_merge(S, From, What, Payload, _Bytes, _MaxBytes, Join) ->
     #{crdt := Crdt, config := {config, _, MaxEntries, _, _, _}} = S,
@@ -427,8 +427,8 @@ checked_merge(S, From, What, Payload, _Bytes, _MaxBytes, Join) ->
     Size = ?CRDT:size(Crdt1),
     case Size > MaxEntries andalso Size > ?CRDT:size(Crdt) of
         true ->
-            logger:error("[beacon.store] Replica ~ts refused a ~p from ~p: ~b entries would "
-                         "exceed max_entries ~b", [label(S), What, From, Size, MaxEntries]),
+            beacon_log_ffi:error(<<"beacon.store">>, "Replica ~ts refused a ~p from ~p: ~b entries would "
+                                 "exceed max_entries ~b", [label(S), What, From, Size, MaxEntries]),
             S;
         false ->
             S1 = S#{crdt := Crdt1, digest := undefined, hlc := advance_clock(S, From, Payload)},
@@ -451,9 +451,9 @@ advance_clock(S = #{hlc := Hlc}, From, Payload) ->
             Now = now_ms(),
             case ?HLC:drift_ms(Remote, Now) of
                 Drift when Drift > ?DRIFT_WARNING_MS ->
-                    logger:warning("[beacon.store] Replica ~ts: ~p sent a timestamp ~bms ahead "
-                                   "of this node's clock; check clock synchronisation",
-                                   [label(S), From, Drift]);
+                    beacon_log_ffi:warning(<<"beacon.store">>, "Replica ~ts: ~p sent a timestamp ~bms ahead "
+                                           "of this node's clock; check clock synchronisation",
+                                           [label(S), From, Drift]);
                 _ ->
                     ok
             end,
@@ -487,8 +487,8 @@ announce(S = #{name := Name}, Changes, DeltaTopics) ->
             {ok, nil} ->
                 ok;
             {error, Reason} ->
-                logger:error("[beacon.store] Replica ~ts could not announce a remote change "
-                             "on ~ts: ~p", [label(S), Topic, Reason])
+                beacon_log_ffi:error(<<"beacon.store">>, "Replica ~ts could not announce a remote change "
+                                     "on ~ts: ~p", [label(S), Topic, Reason])
         end
     end, Topics).
 
@@ -513,8 +513,8 @@ publish(S = #{topic := Topic}, Message) ->
             ok;
         {error, Reason} ->
             %% The digest exchange delivers the change later.
-            logger:error("[beacon.store] Replica ~ts could not broadcast a ~p: ~p",
-                         [label(S), element(2, Message), Reason]),
+            beacon_log_ffi:error(<<"beacon.store">>, "Replica ~ts could not broadcast a ~p: ~p",
+                                 [label(S), element(2, Message), Reason]),
             error
     end.
 
@@ -524,12 +524,12 @@ send_direct(S = #{topic := Topic}, Node, Message) ->
             ok;
         {error, {node_not_connected, _}} ->
             %% Retried by the next digest exchange.
-            logger:warning("[beacon.store] Replica ~ts could not send a ~p to ~p: not "
-                           "connected", [label(S), element(2, Message), Node]),
+            beacon_log_ffi:warning(<<"beacon.store">>, "Replica ~ts could not send a ~p to ~p: not "
+                                   "connected", [label(S), element(2, Message), Node]),
             ok;
         {error, Reason} ->
-            logger:error("[beacon.store] Replica ~ts could not send a ~p to ~p: ~p",
-                         [label(S), element(2, Message), Node, Reason]),
+            beacon_log_ffi:error(<<"beacon.store">>, "Replica ~ts could not send a ~p to ~p: ~p",
+                                 [label(S), element(2, Message), Node, Reason]),
             ok
     end.
 

@@ -5,20 +5,69 @@
     try_load_codec_event_decoder/0,
     message_queue_len/1,
     event_label/1,
-    run_guarded/1
+    run_guarded/1,
+    guard_handler/2,
+    describe_exit/1,
+    exit_like/1
 ]).
 
-%% Run Fun in the calling process. A crash (error, exit or throw) is logged
-%% with its stacktrace and returned as {error, <<"Class:Reason">>}, so the
-%% caller can answer it (close the socket with 1011) instead of dying.
+%% The depth a crash or exit reason is printed to in telemetry metadata and
+%% logs, so a huge term (a model in a badmatch) stays bounded.
+-define(REASON_DEPTH, 30).
+
+%% Run the runtime's message handler. A crash (error, exit or throw) is
+%% reported to OnCrash with its class and a bounded description, then
+%% raised again unchanged, so the runtime still dies with the original
+%% reason and stacktrace (gen_server runs terminate/2 for a callback that
+%% raises the same way, then exits with the reason).
+guard_handler(Run, OnCrash) ->
+    try Run()
+    catch
+        Class:Reason:Stacktrace ->
+            report_crash(OnCrash, Class, Reason),
+            erlang:raise(Class, Reason, Stacktrace)
+    end.
+
+%% A report that fails is logged and the original crash still propagates:
+%% the report must never replace the reason the runtime dies with.
+report_crash(OnCrash, Class, Reason) ->
+    Description = describe(Reason),
+    try
+        OnCrash(atom_to_binary(Class, utf8), Description)
+    catch
+        ReportClass:ReportReason:ReportStacktrace ->
+            beacon_log_ffi:error(<<"beacon.runtime">>,
+                "Reporting the runtime crash ~ts:~ts failed: ~p:~0tP~n~p",
+                [Class, Description, ReportClass, ReportReason, ?REASON_DEPTH,
+                 ReportStacktrace])
+    end.
+
+%% A trapped exit's reason, as gleam/erlang/process.ExitReason, described
+%% for telemetry and the log.
+describe_exit(killed) -> <<"killed">>;
+describe_exit({abnormal, Reason}) -> describe(Reason).
+
+%% Exit the calling process with the reason a linked process exited with,
+%% so the runtime's own links see the same reason. A normal exit is not
+%% passed here (a normal exit of a linked process does not stop the
+%% runtime), so `normal` crashes with function_clause.
+exit_like(killed) -> exit(killed);
+exit_like({abnormal, Reason}) -> exit(Reason).
+
+describe(Reason) ->
+    unicode:characters_to_binary(io_lib:format("~0tP", [Reason, ?REASON_DEPTH])).
+
+%% Run Fun in the calling process. A crash (error, exit or throw) is returned
+%% as {error, {<<"Class:Reason">>, <<"Stacktrace">>}}, so the caller can
+%% answer it (close the socket with 1011) instead of dying. The caller logs
+%% it once, with the session's context (beacon/runtime.mount).
 run_guarded(Fun) ->
     try Fun() of
         Result -> {ok, Result}
     catch
         Class:Reason:Stacktrace ->
-            logger:error("beacon.runtime init crashed: ~p:~p~n~p",
-                         [Class, Reason, Stacktrace]),
-            {error, iolist_to_binary(io_lib:format("~p:~p", [Class, Reason]))}
+            {error, {unicode:characters_to_binary(io_lib:format("~p:~p", [Class, Reason])),
+                     unicode:characters_to_binary(io_lib:format("~p", [Stacktrace]))}}
     end.
 
 %% The telemetry label of an app message: its constructor name. A Gleam

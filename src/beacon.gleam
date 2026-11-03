@@ -449,6 +449,38 @@ pub fn presence(
   App(..app, presence: Some(presence_watch.new(tracker, track, on_presence)))
 }
 
+/// Watch who is here without being there: every session follows the topics
+/// `watch` returns for its state (computed after every update) and tracks
+/// nothing. A dashboard or a lobby list uses this. The diffs are those of
+/// `presence`: the first message for a topic lists everyone already there
+/// as joins, up to 100 queued changes are coalesced into one message, every
+/// entry is reported exactly once, and a topic the session stops watching
+/// reports everyone it knew there as leaves.
+///
+/// ```gleam
+/// beacon.application(init:, update:, view:)
+/// |> beacon.watch_presence(
+///   tracker: presence.new("online", encode_user, user_decoder()),
+///   watch: fn(model) { ["room:" <> model.room] },
+///   on_presence: PresenceChanged,
+/// )
+/// ```
+///
+/// It and `presence` set the same thing: the later call replaces the
+/// earlier. An invalid topic (empty, or over `presence.max_topic_bytes`)
+/// fails the session's start, or stops it later, with a logged error.
+/// Start fails when the tracker configuration is invalid.
+pub fn watch_presence(
+  app: App(state, model, local, msg),
+  tracker tracker: beacon_presence.PresenceConfig(meta),
+  watch watch: fn(state) -> List(String),
+  on_presence on_presence: fn(presence_sync.Diff(meta)) -> msg,
+) -> App(state, model, local, msg) {
+  let watching =
+    presence_watch.new_watching(tracker, fn(_state) { [] }, watch, on_presence)
+  App(..app, presence: Some(watching))
+}
+
 /// Recover the session after a reconnect to a new server process: the
 /// page carries the Model in a signed join token, and `restore` rebuilds
 /// the server state from it. For `simple` and `application`, where the

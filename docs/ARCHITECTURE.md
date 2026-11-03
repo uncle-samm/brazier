@@ -164,8 +164,10 @@ exports at startup: `decode_model`, `init_local`, `render`, `lookup_handler`,
   are queued with a snapshot of their fields and replayed after the first
   `model_sync`.
 - **Connection.** Heartbeats every 30 s, a client send budget, reconnect
-  with exponential backoff and jitter. Close code 4401 (session revoked)
-  stops reconnecting.
+  with exponential backoff and jitter. Close codes 4400 to 4499 (an `init`
+  refusal with a client error, 4401 for a revoked session) stop reconnecting
+  and reload the page, at most 3 times per tab within 60 s (counted in
+  `sessionStorage`); after that the page shows an error state.
 
 ## Build (`build.gleam`, `build/`)
 
@@ -243,6 +245,49 @@ queue, and decode errors. Forwarding headers are honoured only from
 `trusted_proxies`. The WebSocket upgrade checks the origin and runs the
 optional `ws_auth` hook, which is rechecked every
 `ws_auth_recheck_interval_ms`. See [SECURITY.md](SECURITY.md).
+
+A listener is a `RestForOne` pair: the connection registry
+(`beacon_http_conns`, which links every connection process) and the
+acceptors. Stopping it stops the acceptors first; the registry then sends
+each connection `{beacon_http_drain, Registry}` and waits up to
+`drain_timeout_ms` for them to exit. A WebSocket closes with 1001, an HTTP
+response in progress is sent with `Connection: close`, and an idle
+keep-alive connection closes. Whatever remains is killed.
+
+Erlang modules log through `beacon_log_ffi`, which formats the message and
+logs it with the same module tag and format as `beacon/log`.
+
+## Supervision (`application.gleam`)
+
+`beacon.start` runs `application.start_supervised`: one root supervisor with
+the `RestForOne` strategy, so a crashing child restarts with every child
+after it and never one before it. The children, in start order:
+
+1. **The ETS table owner** (`state_manager.table_owner_supervised`). It owns
+   every local store's table, so it comes first: no other child's restart
+   deletes store data. Stores are usually created in `main` before the tree,
+   by an owner started on demand; the supervised owner takes that owner's
+   name and its tables (`ets:give_away/3`), so the data is kept. Stopping
+   the tree stops the owner and deletes its tables. An owner that crashes
+   owning tables is not restarted empty: its restart fails, the supervisor
+   gives up, `wait_forever` crashes the main process, and the node refuses
+   to create tables on demand until a new tree starts. An owner that owned
+   no table restarts normally.
+2. **PubSub** (`pubsub.supervised`).
+3. **The cluster manager**, when configured (`cluster.supervised`).
+4. **The session revocation scope** (`session.registry_supervised`).
+5. **The presence tracker**, when configured (`presence.supervised`).
+6. **The HTTP/WebSocket listener** (`transport.supervised`).
+
+`application.start` (tests, embedding) starts the shared infrastructure
+unsupervised, and the table owner on demand runs until the node stops.
+
+`wait_forever` traps exits and blocks on one receive, with no polling. It
+returns when a SIGTERM arrives (it stops every app its process started, so
+each listener drains), or when the linked root supervisor exits normally.
+It crashes when that supervisor exits abnormally. SIGTERM reaches it
+through `beacon_signal_handler`, a `gen_event` handler that replaces OTP's
+`erl_signal_handler` while any process waits and puts it back afterwards.
 
 ## Modules
 

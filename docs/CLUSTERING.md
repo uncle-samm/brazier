@@ -28,7 +28,8 @@ in this order:
 2. The cluster manager, when `beacon.cluster(config)` is set.
 3. The session revocation scope, which carries logouts and rotations to
    bound sockets on every node.
-4. The presence tracker, when `beacon.presence(..)` is set.
+4. The presence tracker, when `beacon.presence(..)` or
+   `beacon.watch_presence(..)` is set.
 5. The HTTP and WebSocket listener.
 
 ```gleam
@@ -471,11 +472,51 @@ each room and who is typing this way.
 - **Shard restarts are invisible to the app.** When a tracker shard
   restarts, the session tracks its entries again (with backoff) and gets
   one message with the old entry leaving and the new one joining.
+  Entries of other nodes do not flap. The new shard starts empty and
+  gets each peer's entries from that peer: the peer's next heartbeat
+  marks it up, and the transfer at the next clock sample carries them.
+  Until then the session keeps them, without a leave or a join, and asks
+  the shard to say when it has synced with their nodes. The shard
+  answers after the diffs of what it learnt. The session then reports
+  only the entries the shard still does not have, which left meanwhile.
+  It also reports them when the node is down, when the shard has not
+  heard from the node for `down_period`, or when it has not synced
+  within `down_period`. The last case is logged as a warning.
+  Entries of this node that the old shard held are reported as leaves at
+  once. Their processes track again with new refs.
 - **Failures stop the session loudly.** A tracking the tracker refuses (a
   limit, an invalid topic or key, the same key twice on a topic), a
   tracker that stays down, or the loss of the session's PubSub partition
   stops the session with a logged error. `beacon.start` fails when the
   tracker configuration is invalid.
+
+### Watching without tracking
+
+A session that only shows who is here, such as a dashboard or a lobby
+list, uses `beacon.watch_presence`. It follows the topics `watch` returns
+for its state and tracks nothing, so it never appears in a list:
+
+```gleam
+beacon.application(init:, update:, view:)
+|> beacon.watch_presence(
+  tracker: online,
+  watch: fn(model) { ["room:" <> model.room] },
+  on_presence: PresenceChanged,
+)
+```
+
+A watched topic gets the same diffs as a tracked one. The first message
+lists everyone already there as joins, up to 100 queued changes are
+coalesced into one message, every entry is reported once, and shard
+restarts are handled as above. `watch` runs after every update. A topic
+that is no longer listed reports everyone the session knew there as
+leaves. A topic listed twice is followed once. An invalid topic (empty, or
+over `presence.max_topic_bytes`) fails the session's start, or stops the
+session later, with a logged error.
+
+`beacon.presence` and `beacon.watch_presence` set the same thing. When both
+are called, the later call wins. A session that tracks itself already
+hears its tracked topics, so it does not also need to watch them.
 
 ### The tracker API
 
@@ -573,7 +614,7 @@ Further constraints:
 | A netsplit | Each side marks the other down after `down_period` and sees only its own entries. When the split heals, the sides exchange state and converge, including changes made during the split. |
 | A node comes back before `permdown_period` | Its entries rejoin from its heartbeats or a transfer (`replica, up`). |
 | A tracker stops normally | It tells its peers, which drop its entries at once instead of waiting for `down_period`. |
-| A shard crashes and restarts | The new shard has a new version, and peers drop the old version's entries at once. Tracked processes must track again. They can monitor `presence.shard_pid(users, topic)` to find out. |
+| A shard crashes and restarts | The new shard has a new version, and peers drop the old version's entries at once. Tracked processes must track again. They can monitor `presence.shard_pid(users, topic)` to find out. The new shard learns each peer's entries from the peer's heartbeat and the transfer that follows, and Beacon sessions keep those entries until it has (see Session presence). |
 | A new node joins | It asks a peer for a transfer of the current state (`[beacon, presence, transfer]`). |
 
 `presence.replicas(users, topic)` returns the peers a shard knows, with

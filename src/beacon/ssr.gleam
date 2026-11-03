@@ -146,6 +146,11 @@ pub type RenderedPage {
     /// Sign a join token for the given session fingerprint (see
     /// `session_fingerprint`). Use `join_token_for`.
     sign_join_token: fn(String) -> String,
+    /// Whether the response sets the join cookie. True for a page that
+    /// loads the client script; False for a static error page, which opens
+    /// no session, so it neither mints a join token nor replaces the one a
+    /// page in another tab may still be joining with.
+    join_cookie: Bool,
     /// Whether the session cookie should include the Secure attribute.
     cookie_secure: Bool,
     /// HTTP status: 200 for a rendered route, 404 for an unknown route,
@@ -315,6 +320,7 @@ fn render_state(
       RenderedPage(
         html: html,
         sign_join_token: join_token_signer(config.secret_key, model_json),
+        join_cookie: True,
         cookie_secure: !config.dev_mode,
         status: 200,
       )
@@ -342,7 +348,8 @@ fn render_state(
 }
 
 /// A static error page: no client script, so the browser does not open a
-/// session for a page the app cannot render.
+/// session for a page the app cannot render, and no join cookie (see
+/// `RenderedPage.join_cookie`).
 fn render_error_page(
   config: SsrConfig(state, msg),
   status: Int,
@@ -360,6 +367,7 @@ fn render_error_page(
   RenderedPage(
     html: html,
     sign_join_token: join_token_signer(config.secret_key, None),
+    join_cookie: False,
     cookie_secure: !config.dev_mode,
     status: status,
   )
@@ -377,6 +385,7 @@ fn describe_uri(page_uri: Uri) -> String {
 /// to a browser session (fingerprint ""). Prefer `to_response_for_request`,
 /// which binds the token to the request's session cookie; an unbound token
 /// only verifies for a connection that also has no session cookie.
+/// A page whose `join_cookie` is False gets no join cookie.
 /// Errors when the join token cannot be set as a cookie.
 pub fn to_response(
   page: RenderedPage,
@@ -386,6 +395,7 @@ pub fn to_response(
 
 /// Convert a RenderedPage to an HTTP response whose join token is bound to
 /// the session cookie on `req` (see `session_fingerprint`).
+/// A page whose `join_cookie` is False gets no join cookie.
 /// Errors when the join token cannot be set as a cookie.
 pub fn to_response_for_request(
   page: RenderedPage,
@@ -398,14 +408,28 @@ fn page_response(
   page: RenderedPage,
   fingerprint: String,
 ) -> Result(Response(ResponseBody), cookie.CookieError) {
-  response.new(page.status)
-  |> response.set_header("content-type", "text/html; charset=utf-8")
-  |> response.set_body(Bytes(bytes_tree.from_string(page.html)))
-  |> cookie.set(
-    session_cookie_name,
-    join_token_for(page, fingerprint),
-    session_cookie_options(page.cookie_secure),
-  )
+  let resp =
+    response.new(page.status)
+    |> response.set_header("content-type", "text/html; charset=utf-8")
+    |> response.set_body(Bytes(bytes_tree.from_string(page.html)))
+  case page.join_cookie {
+    True ->
+      cookie.set(
+        resp,
+        session_cookie_name,
+        join_token_for(page, fingerprint),
+        session_cookie_options(page.cookie_secure),
+      )
+    False -> {
+      log.debug(
+        "beacon.ssr",
+        "No join cookie on the "
+          <> int.to_string(page.status)
+          <> " page: it loads no client",
+      )
+      Ok(resp)
+    }
+  }
 }
 
 /// Mint a fresh join token for this page, bound to `fingerprint`.

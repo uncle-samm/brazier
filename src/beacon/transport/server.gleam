@@ -15,6 +15,14 @@
 ///       owns the listen socket; N permanent acceptor processes
 /// ```
 ///
+/// Stopping the listener stops the acceptors first (no new connection is
+/// accepted), then the connection owner drains: it sends every handler a
+/// drain message and waits, without polling, up to `drain_timeout_ms` for
+/// them to exit. An idle keep-alive connection closes at once, a request in
+/// progress finishes and is answered with `connection: close`, a WebSocket
+/// closes with 1001. Handlers still running at the deadline are killed and
+/// logged as an error.
+///
 /// A crashing handler only takes itself down (its slot is released by the
 /// owner). A crashing acceptor is restarted and reported by its supervisor.
 /// If the connection owner itself dies, rest_for_one restarts the acceptors
@@ -161,6 +169,9 @@ pub type ListenerOptions {
     /// Socket send timeout. A peer that stops reading is disconnected
     /// instead of blocking its handler forever.
     send_timeout_ms: Int,
+    /// How long a stopping listener waits for its connections to finish
+    /// before killing them, in milliseconds. `0` kills them at once.
+    drain_timeout_ms: Int,
   )
 }
 
@@ -174,6 +185,7 @@ pub fn default_listener_options(port: Int) -> ListenerOptions {
     max_connections_per_ip: 256,
     trusted_proxies: [],
     send_timeout_ms: 30_000,
+    drain_timeout_ms: 5000,
   )
 }
 
@@ -357,10 +369,12 @@ fn build(
         options.max_connections,
         options.max_connections_per_ip,
         trusted,
+        options.drain_timeout_ms,
       )
     })
-    // The owner waits up to 5s for its connections to exit on shutdown.
-    |> supervision.timeout(ms: 10_000)
+    // The owner drains for up to drain_timeout_ms, then kills the
+    // stragglers and waits for their exits: the margin covers that.
+    |> supervision.timeout(ms: options.drain_timeout_ms + conns_stop_margin_ms)
   let acceptors =
     supervision.supervisor(fn() {
       ffi_acceptors_start_link(
@@ -378,6 +392,14 @@ fn build(
   Ok(#(name, builder))
 }
 
+/// Time the connection owner gets on top of its drain timeout to kill the
+/// remaining handlers and collect their exits before its supervisor kills
+/// it.
+const conns_stop_margin_ms = 5000
+
+/// Largest receive timeout (2^32 - 1 ms).
+const max_drain_timeout_ms = 4_294_967_295
+
 fn validate_options(options: ListenerOptions) -> Result(Nil, String) {
   case options {
     ListenerOptions(port: port, ..) if port < 0 || port > 65_535 ->
@@ -394,6 +416,15 @@ fn validate_options(options: ListenerOptions) -> Result(Nil, String) {
       )
     ListenerOptions(send_timeout_ms: n, ..) if n < 1 ->
       Error("send_timeout_ms must be at least 1, got " <> int.to_string(n))
+    ListenerOptions(drain_timeout_ms: n, ..)
+      if n < 0 || n > max_drain_timeout_ms
+    ->
+      Error(
+        "drain_timeout_ms must be between 0 and "
+        <> int.to_string(max_drain_timeout_ms)
+        <> ", got "
+        <> int.to_string(n),
+      )
     _ -> Ok(Nil)
   }
 }
@@ -428,6 +459,7 @@ fn ffi_conns_start_link(
   max_connections: Int,
   max_connections_per_ip: Int,
   trusted: ip.TrustedProxies,
+  drain_timeout_ms: Int,
 ) -> Result(actor.Started(ConnsName), actor.StartError)
 
 @external(erlang, "beacon_http_acceptors_sup", "start_link_gleam")

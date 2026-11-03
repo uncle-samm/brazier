@@ -4,11 +4,18 @@
 /// `start_supervised` (what `beacon.start` uses) runs everything under one
 /// root supervisor with the `RestForOne` strategy, children in this order:
 ///
-/// 1. PubSub (`pubsub.supervised`)
-/// 2. the cluster manager, when configured (`cluster.supervised`)
-/// 3. the session revocation scope (`session.registry_supervised`)
-/// 4. the presence tracker, when configured (`presence.supervised`)
-/// 5. the HTTP/WebSocket listener (`transport.supervised`)
+/// 1. the ETS table owner (`state_manager.table_owner_supervised`)
+/// 2. PubSub (`pubsub.supervised`)
+/// 3. the cluster manager, when configured (`cluster.supervised`)
+/// 4. the session revocation scope (`session.registry_supervised`)
+/// 5. the presence tracker, when configured (`presence.supervised`)
+/// 6. the HTTP/WebSocket listener (`transport.supervised`)
+///
+/// The table owner holds the stores' data, so it comes first: no other
+/// child's restart may delete its tables. It adopts the tables of stores
+/// created before the tree (in `main`), and `stop` deletes them. An owner
+/// that crashes owning tables is not restarted empty: the restart fails and
+/// the tree gives up, because every store handle now names a lost table.
 ///
 /// A child that crashes is restarted together with every child after it:
 /// a PubSub restart also restarts the cluster manager, the session scope,
@@ -44,6 +51,7 @@ import beacon/pubsub
 import beacon/runtime
 import beacon/session
 import beacon/ssr
+import beacon/state_manager
 import beacon/static
 import beacon/telemetry
 import beacon/transport
@@ -52,6 +60,7 @@ import gleam/erlang/process
 import gleam/http/request.{type Request}
 import gleam/http/response
 import gleam/int
+import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
 import gleam/otp/static_supervisor as supervisor
@@ -137,12 +146,17 @@ pub type App {
     /// The listener as it first started (its connection registry and
     /// remembered port outlive restarts of the listener child).
     listener: server.Listener,
+    /// How long stopping the listener waits for its connections to finish
+    /// (`drain_timeout_ms` of the security limits, or
+    /// `BEACON_SHUTDOWN_TIMEOUT`).
+    drain_timeout_ms: Int,
   )
 }
 
-/// How long `stop` waits for the tree to shut down (each child has its own
-/// shutdown timeout inside this bound).
-const stop_timeout_ms = 30_000
+/// How long `stop` waits for the tree to shut down beyond the listener's
+/// drain timeout (each child has its own shutdown timeout inside this
+/// bound).
+const stop_margin_ms = 30_000
 
 /// Start a Beacon application without the root supervision tree: every
 /// page request is rendered with `init(ctx)` (and the route), and every
@@ -159,6 +173,7 @@ pub fn start(config: AppConfig(state, msg)) -> Result(App, error.BeaconError) {
   // A weak secret makes every signed join token forgeable: refuse to start.
   use _ <- result.try(beacon_config.validate_secret_key(config.secret_key))
   use Nil <- result.try(start_telemetry())
+  use config <- result.try(apply_shutdown_timeout(config))
   use Nil <- result.try(
     pubsub.start_with(config.pubsub)
     |> result.map_error(fn(reason) {
@@ -198,11 +213,14 @@ pub fn start(config: AppConfig(state, msg)) -> Result(App, error.BeaconError) {
         "Beacon application started (unsupervised) on port "
           <> int.to_string(port),
       )
-      Ok(App(
-        supervisor_pid: server.get_supervisor(listener),
-        port: port,
-        listener: listener,
-      ))
+      Ok(
+        remember(App(
+          supervisor_pid: server.get_supervisor(listener),
+          port: port,
+          listener: listener,
+          drain_timeout_ms: config.security_limits.drain_timeout_ms,
+        )),
+      )
     }
     Error(err) -> {
       log.error(
@@ -230,6 +248,7 @@ pub fn start_supervised(
   // leaves nothing running.
   use _ <- result.try(beacon_config.validate_secret_key(config.secret_key))
   use Nil <- result.try(start_telemetry())
+  use config <- result.try(apply_shutdown_timeout(config))
   use Nil <- result.try(refuse_running_infrastructure(config))
   use pubsub_child <- result.try(
     pubsub.supervised(config.pubsub)
@@ -289,6 +308,7 @@ pub fn start_supervised(
 
   let builder =
     supervisor.new(supervisor.RestForOne)
+    |> supervisor.add(state_manager.table_owner_supervised())
     |> supervisor.add(pubsub_child)
   let builder = case cluster_child {
     Some(child) -> supervisor.add(builder, child)
@@ -315,7 +335,14 @@ pub fn start_supervised(
             "Beacon application started (supervised) on port "
               <> int.to_string(port),
           )
-          Ok(App(supervisor_pid: started.pid, port: port, listener: listener))
+          Ok(
+            remember(App(
+              supervisor_pid: started.pid,
+              port: port,
+              listener: listener,
+              drain_timeout_ms: config.security_limits.drain_timeout_ms,
+            )),
+          )
         }
         Error(Nil) -> {
           let reason = "the listener did not report its port after starting"
@@ -335,18 +362,30 @@ pub fn start_supervised(
 }
 
 /// Stop an application: shuts the tree down child by child in reverse
-/// start order (listener first, PubSub last) and returns once every
-/// process of the tree has exited. For an app from `start`, this stops the
-/// listener only (the shared infrastructure keeps running).
+/// start order (listener first, the ETS table owner last) and returns once
+/// every process of the tree has exited. The owner's tables go with it, so a
+/// store from before the stop must not be used after it. For an app from
+/// `start`, this stops the listener only (the shared infrastructure keeps
+/// running).
+///
+/// The listener drains first: open connections get up to the app's drain
+/// timeout to finish (see `transport.SecurityLimits.drain_timeout_ms`).
 ///
 /// Stopping is a normal exit, so a linked caller is not taken down.
 pub fn stop(app: App) -> Result(Nil, error.BeaconError) {
   log.info(
     "beacon.application",
-    "Stopping Beacon application on port " <> int.to_string(app.port),
+    "Stopping Beacon application on port "
+      <> int.to_string(app.port)
+      <> " (drain timeout "
+      <> int.to_string(app.drain_timeout_ms)
+      <> "ms)",
   )
-  case stop_supervisor(app.supervisor_pid, stop_timeout_ms) {
+  case
+    stop_supervisor(app.supervisor_pid, app.drain_timeout_ms + stop_margin_ms)
+  {
     Ok(Nil) -> {
+      forget_app(app.supervisor_pid)
       server.release(app.listener)
       log.info(
         "beacon.application",
@@ -362,6 +401,64 @@ pub fn stop(app: App) -> Result(Nil, error.BeaconError) {
       Error(config_error("Application stop failed: " <> reason))
     }
   }
+}
+
+/// Remember an app in the process that started it, for `wait_forever`.
+fn remember(app: App) -> App {
+  remember_app(app.supervisor_pid, app)
+  app
+}
+
+/// `BEACON_SHUTDOWN_TIMEOUT` (milliseconds), when set, replaces the
+/// configured `drain_timeout_ms`: operators tune the drain without a
+/// rebuild. A value that is not an integer in range refuses the start.
+fn apply_shutdown_timeout(
+  config: AppConfig(state, msg),
+) -> Result(AppConfig(state, msg), error.BeaconError) {
+  let configured = config.security_limits.drain_timeout_ms
+  use drain_ms <- result.try(case get_env_int("BEACON_SHUTDOWN_TIMEOUT") {
+    Ok(ms) -> {
+      log.info(
+        "beacon.application",
+        "BEACON_SHUTDOWN_TIMEOUT="
+          <> int.to_string(ms)
+          <> "ms replaces the configured drain_timeout_ms ("
+          <> int.to_string(configured)
+          <> "ms)",
+      )
+      transport.validate_drain_timeout(ms)
+      |> result.map(fn(_) { ms })
+      |> result.map_error(fn(reason) {
+        config_error("BEACON_SHUTDOWN_TIMEOUT: " <> reason)
+      })
+    }
+    Error(EnvNotSet) -> {
+      log.debug(
+        "beacon.application",
+        "BEACON_SHUTDOWN_TIMEOUT not set, draining for the configured "
+          <> int.to_string(configured)
+          <> "ms",
+      )
+      transport.validate_drain_timeout(configured)
+      |> result.map(fn(_) { configured })
+      |> result.map_error(config_error)
+    }
+    Error(EnvNotInteger(value)) ->
+      Error(config_error(
+        "BEACON_SHUTDOWN_TIMEOUT must be an integer of milliseconds, got \""
+        <> value
+        <> "\"",
+      ))
+  })
+  Ok(
+    AppConfig(
+      ..config,
+      security_limits: transport.SecurityLimits(
+        ..config.security_limits,
+        drain_timeout_ms: drain_ms,
+      ),
+    ),
+  )
 }
 
 fn start_telemetry() -> Result(Nil, error.BeaconError) {
@@ -520,61 +617,109 @@ fn transport_config(
 /// Keep the main process alive so the application keeps running.
 /// Call this after `start()` in your main function.
 ///
-/// The calling process traps exits so a shutdown signal can drain
-/// connections. Because of that, the exit of any linked process (for
-/// example the listener supervisor giving up after repeated crashes) is
-/// received here and re-raised: the application never keeps running with
-/// a dead listener.
+/// Returns when the application should stop:
 ///
-/// `BEACON_SHUTDOWN_TIMEOUT` (milliseconds, default 5000) is validated
-/// before waiting; a value that is not a non-negative integer stops the
-/// process with an error instead of being ignored.
+/// - **SIGTERM** (`docker stop`, Kubernetes, systemd): every application
+///   this process started and has not stopped is stopped with `stop`, so
+///   each listener drains its connections (up to its drain timeout), and
+///   then `wait_forever` returns. While a process waits here, SIGTERM no
+///   longer runs OTP's default `init:stop()`; SIGUSR1 and SIGQUIT still
+///   halt the node.
+/// - **The application was stopped** elsewhere (`stop` on its supervisor,
+///   which already drained): returns at once.
+///
+/// The calling process traps exits. The abnormal exit of any linked
+/// process (for example the root supervisor giving up after repeated
+/// crashes) is received here and re-raised: the application never keeps
+/// running with a dead tree. Nothing is polled and nothing sleeps.
 pub fn wait_forever() -> Nil {
-  let timeout = case shutdown_timeout() {
-    Ok(ms) -> ms
-    Error(reason) -> {
-      log.error("beacon.application", reason)
-      fail_loudly(reason)
-    }
+  let waiter = process.self()
+  trap_exit()
+  case install_signal_handler(waiter) {
+    Ok(Nil) -> Nil
+    Error(reason) -> fail_loudly("SIGTERM handling: " <> reason)
   }
   log.info("beacon.application", "Application running. Press Ctrl+C to stop.")
-  // Trap exit signals for graceful shutdown
-  trap_exit()
-  wait_for_shutdown(timeout)
-}
-
-/// What `receive_shutdown_signal` observed.
-type ShutdownSignal {
-  /// Nothing arrived before the timeout.
-  NoSignal
-  /// A linked process asked this one to shut down.
-  ShutdownRequested
-  /// A linked process exited abnormally.
-  LinkedProcessExited(reason: String)
-}
-
-/// Wait for shutdown signal, then drain connections.
-fn wait_for_shutdown(timeout: Int) -> Nil {
-  case receive_shutdown_signal(60_000) {
-    ShutdownRequested -> {
+  let event = receive_wait_event()
+  case uninstall_signal_handler(waiter) {
+    Ok(Nil) -> Nil
+    Error(reason) -> fail_loudly("SIGTERM handling: " <> reason)
+  }
+  case event {
+    Sigterm -> stop_on_sigterm()
+    ShutdownRequested ->
       log.info(
         "beacon.application",
-        "Shutdown signal received, draining connections...",
+        "The application was stopped, wait_forever returns",
       )
-      // Give in-flight requests time to complete
-      log.info(
-        "beacon.application",
-        "Draining for " <> int.to_string(timeout) <> "ms...",
-      )
-      process.sleep(timeout)
-      log.info("beacon.application", "Shutdown complete.")
-    }
     LinkedProcessExited(reason) -> {
       let message = "Linked application process exited: " <> reason
       log.error("beacon.application", message)
       fail_loudly(message)
     }
-    NoSignal -> wait_for_shutdown(timeout)
+  }
+}
+
+/// What ended `wait_forever`'s wait.
+type WaitEvent {
+  /// The OS sent SIGTERM.
+  Sigterm
+  /// A linked process exited normally (the application was stopped).
+  ShutdownRequested
+  /// A linked process exited abnormally.
+  LinkedProcessExited(reason: String)
+}
+
+/// Stop every application this process started, newest first. Each stop
+/// drains its listener. A stop that fails crashes the caller once every
+/// application was tried, so a failed shutdown never exits as a success.
+fn stop_on_sigterm() -> Nil {
+  let apps = remembered_apps()
+  case apps {
+    [] ->
+      log.warning(
+        "beacon.application",
+        "SIGTERM received, but this process started no running application: "
+          <> "nothing to drain, wait_forever returns",
+      )
+    _ ->
+      log.info(
+        "beacon.application",
+        "SIGTERM received, stopping "
+          <> int.to_string(list.length(apps))
+          <> " application(s) and draining their connections",
+      )
+  }
+  let failures =
+    list.filter_map(apps, fn(app) {
+      // Stopping a linked supervisor sends this process (trapping exits)
+      // its EXIT: take it, so it is not mistaken for a later event.
+      let linked = is_linked(app.supervisor_pid)
+      case stop(app) {
+        Ok(Nil) -> {
+          case linked {
+            True -> {
+              let reason = await_exit(app.supervisor_pid)
+              log.debug(
+                "beacon.application",
+                "Stopped supervisor exited with " <> reason,
+              )
+            }
+            False -> Nil
+          }
+          Error(Nil)
+        }
+        Error(err) -> Ok(error.to_string(err))
+      }
+    })
+  case failures {
+    [] -> log.info("beacon.application", "Shutdown complete.")
+    _ -> {
+      let message =
+        "Shutdown after SIGTERM failed: " <> string.join(failures, "; ")
+      log.error("beacon.application", message)
+      fail_loudly(message)
+    }
   }
 }
 
@@ -584,44 +729,33 @@ type EnvIntError {
   EnvNotInteger(value: String)
 }
 
-/// Shutdown drain timeout in milliseconds from `BEACON_SHUTDOWN_TIMEOUT`,
-/// 5000 when the variable is unset. A malformed or negative value is an
-/// error.
-fn shutdown_timeout() -> Result(Int, String) {
-  case get_env_int("BEACON_SHUTDOWN_TIMEOUT") {
-    Ok(ms) if ms >= 0 -> {
-      log.debug(
-        "beacon.application",
-        "BEACON_SHUTDOWN_TIMEOUT=" <> int.to_string(ms) <> "ms",
-      )
-      Ok(ms)
-    }
-    Ok(ms) ->
-      Error(
-        "BEACON_SHUTDOWN_TIMEOUT must be a non-negative integer of milliseconds, got "
-        <> int.to_string(ms),
-      )
-    Error(EnvNotSet) -> {
-      log.debug(
-        "beacon.application",
-        "BEACON_SHUTDOWN_TIMEOUT not set, using the 5000ms default",
-      )
-      Ok(5000)
-    }
-    Error(EnvNotInteger(value)) ->
-      Error(
-        "BEACON_SHUTDOWN_TIMEOUT must be a non-negative integer of milliseconds, got \""
-        <> value
-        <> "\"",
-      )
-  }
-}
-
 @external(erlang, "beacon_application_ffi", "trap_exit")
 fn trap_exit() -> Nil
 
-@external(erlang, "beacon_application_ffi", "receive_shutdown_signal")
-fn receive_shutdown_signal(timeout: Int) -> ShutdownSignal
+@external(erlang, "beacon_application_ffi", "receive_wait_event")
+fn receive_wait_event() -> WaitEvent
+
+@external(erlang, "beacon_signal_handler", "install")
+fn install_signal_handler(waiter: process.Pid) -> Result(Nil, String)
+
+@external(erlang, "beacon_signal_handler", "uninstall")
+fn uninstall_signal_handler(waiter: process.Pid) -> Result(Nil, String)
+
+@external(erlang, "beacon_application_ffi", "remember_app")
+fn remember_app(supervisor: process.Pid, app: App) -> Nil
+
+@external(erlang, "beacon_application_ffi", "forget_app")
+fn forget_app(supervisor: process.Pid) -> Nil
+
+@external(erlang, "beacon_application_ffi", "remembered_apps")
+fn remembered_apps() -> List(App)
+
+@external(erlang, "beacon_application_ffi", "is_linked")
+fn is_linked(pid: process.Pid) -> Bool
+
+/// The EXIT message of a linked process just stopped, formatted.
+@external(erlang, "beacon_application_ffi", "await_exit")
+fn await_exit(pid: process.Pid) -> String
 
 @external(erlang, "beacon_application_ffi", "get_env_int")
 fn get_env_int(name: String) -> Result(Int, EnvIntError)

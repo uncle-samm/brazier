@@ -163,9 +163,9 @@ constant_time_equal(_, _) ->
 ensure_registry() ->
     case pg:start(?PG_SCOPE) of
         {ok, _Pid} ->
-            logger:info(#{module => beacon_session_ffi,
-                          msg => <<"Started session registry scope (unsupervised)">>,
-                          scope => ?PG_SCOPE}),
+            beacon_log_ffi:info(<<"beacon.session">>,
+                                "Started session registry scope ~p (unsupervised)",
+                                [?PG_SCOPE]),
             nil;
         {error, {already_started, _Pid}} ->
             nil
@@ -176,21 +176,21 @@ ensure_registry() ->
 start_registry_link() ->
     case pg:start_link(?PG_SCOPE) of
         {ok, Pid} ->
-            logger:info(#{module => beacon_session_ffi,
-                          msg => <<"Started session registry scope (supervised)">>,
-                          scope => ?PG_SCOPE, pid => Pid}),
+            beacon_log_ffi:info(<<"beacon.session">>,
+                                "Started session registry scope ~p as ~p (supervised)",
+                                [?PG_SCOPE, Pid]),
             {ok, Pid};
         {error, {already_started, Pid}} ->
-            logger:error(#{module => beacon_session_ffi,
-                           msg => <<"Session registry scope is already running outside the supervision tree">>,
-                           scope => ?PG_SCOPE, pid => Pid}),
+            beacon_log_ffi:error(<<"beacon.session">>,
+                                 "Session registry scope ~p is already running as ~p "
+                                 "outside the supervision tree", [?PG_SCOPE, Pid]),
             {error, <<"the session registry scope (beacon_session_pg) is already running "
                       "outside the supervision tree; application.start or "
                       "session.ensure_registry ran before the supervised start">>};
         {error, Reason} ->
-            logger:error(#{module => beacon_session_ffi,
-                           msg => <<"Session registry scope failed to start">>,
-                           scope => ?PG_SCOPE, reason => Reason}),
+            beacon_log_ffi:error(<<"beacon.session">>,
+                                 "Session registry scope ~p failed to start: ~p",
+                                 [?PG_SCOPE, Reason]),
             {error, unicode:characters_to_binary(io_lib:format("~0p", [Reason]))}
     end.
 
@@ -206,9 +206,9 @@ bind_process(Namespace, SessionId, Pid) ->
     case registry_running() of
         true -> ok;
         false ->
-            logger:error(#{module => beacon_session_ffi,
-                           msg => <<"Cannot bind a process: the session registry scope is not running">>,
-                           scope => ?PG_SCOPE}),
+            beacon_log_ffi:error(<<"beacon.session">>,
+                                 "Cannot bind ~p: the session registry scope ~p is not running",
+                                 [Pid, ?PG_SCOPE]),
             erlang:error({beacon_session_registry_down, ?PG_SCOPE})
     end,
     Group = group(Namespace, SessionId),
@@ -283,9 +283,9 @@ start_maintenance(Owner, IntervalMs, SweepFun, RecheckFun)
 maintenance_loop(Ref, IntervalMs, SweepFun, RecheckFun) ->
     receive
         {'DOWN', Ref, process, _, Reason} ->
-            logger:debug(#{module => beacon_session_ffi,
-                           msg => <<"Session store owner exited; stopping maintenance">>,
-                           reason => Reason}),
+            beacon_log_ffi:debug(<<"beacon.session">>,
+                                 "Session store owner exited (~p); stopping maintenance",
+                                 [Reason]),
             ok;
         beacon_session_sweep ->
             run_guarded(sweep, fun() -> SweepFun() end),
@@ -299,9 +299,9 @@ maintenance_loop(Ref, IntervalMs, SweepFun, RecheckFun) ->
             %% pg drops the remote members itself; nothing to do here.
             maintenance_loop(Ref, IntervalMs, SweepFun, RecheckFun);
         Other ->
-            logger:warning(#{module => beacon_session_ffi,
-                             msg => <<"Session maintenance got an unexpected message">>,
-                             message => Other}),
+            beacon_log_ffi:warning(<<"beacon.session">>,
+                                   "Session maintenance got an unexpected message: ~p",
+                                   [Other]),
             maintenance_loop(Ref, IntervalMs, SweepFun, RecheckFun)
     end.
 
@@ -317,8 +317,7 @@ run_guarded(What, Fun) ->
         Fun()
     catch
         Class:Reason:Stack ->
-            logger:error(#{module => beacon_session_ffi,
-                           msg => <<"Session maintenance task crashed">>,
-                           task => What, class => Class,
-                           reason => Reason, stacktrace => Stack})
+            beacon_log_ffi:error(<<"beacon.session">>,
+                                 "Session maintenance task ~p crashed: ~p:~p~n~p",
+                                 [What, Class, Reason, Stack])
     end.

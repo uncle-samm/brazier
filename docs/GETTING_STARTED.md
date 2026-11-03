@@ -267,7 +267,9 @@ The HTML render answers a refusal with a static error page for its status. The
 WebSocket mount closes the socket with code `4000 + status`, for example 4503,
 and the reason `init refused`. The reason you pass is logged (an error for a
 5xx status, a warning for a 4xx one) and never sent to the browser. The
-browser reloads the page on 4401 and reconnects with backoff on other codes.
+browser reloads the page on a 4xx refusal (4400 to 4499; at most 3 times
+within 60 seconds, then it shows an error state) and reconnects with backoff
+on other codes, a 5xx refusal included.
 
 A crash in `init` is not a refusal: the HTML render answers 500 and the
 WebSocket closes with 1011 `startup failure`.

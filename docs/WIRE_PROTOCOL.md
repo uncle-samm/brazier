@@ -176,12 +176,21 @@ model event is held until the server catches up.
 The generated browser client handles close codes, reconnects and sending as
 follows.
 
-- **4401**: stop reconnecting, log an error and reload the page so the user
-  gets a fresh session or the login page.
-- **Any other close** (including 1008, 1009 and 1013): reconnect after
-  `min(1s * 2^attempts, 30s)` plus up to 1s of random jitter. `attempts`
-  resets only after a `model_sync` is applied, so a server that accepts and
-  immediately drops sockets is still retried with backoff.
+- **4400 to 4499** (`init` refused with a client error, and 4401 for a
+  revoked session): stop reconnecting, log an error and reload the page. The
+  new page load decides: the server renders the page again (a fresh session,
+  or the login page) or answers with its error page, which opens no socket.
+  A reload guard in `sessionStorage` (`beacon:reloads`) allows at most 3 such
+  reloads per tab within 60 seconds. After that, or when `sessionStorage`
+  cannot be used, the client does not reload. It logs the reason, marks the
+  app root with `data-beacon-error` and puts a `role="alert"` notice
+  (`data-beacon-error-notice`) at the top of the root.
+- **Any other close** (including 1001, 1008, 1009, 1011, 1013 and 4500 to
+  4599): reconnect after `min(1s * 2^attempts, 30s)` plus up to 1s of random
+  jitter. `attempts` resets only after a `model_sync` is applied. A server
+  that keeps refusing (4503 while a store is down, 1011 for an `init` that
+  crashes) or that accepts and drops sockets is therefore tried at most once
+  every 31 seconds per tab.
 - **Outbound pacing**: every message except `heartbeat` passes through one
   queue paced at 40 messages per sliding 1s window (an `event_batch` costs one
   per event, as on the server), below the server's 50 per second. The queue
@@ -311,6 +320,7 @@ the echo.
 | Code | Meaning |
 |------|---------|
 | 1000 | Normal close, pong timeout or idle timeout |
+| 1001 | Going away: the server is shutting down (`server shutting down`) |
 | 1002 | Protocol error (bad frame, bad close payload) |
 | 1003 | Binary data not supported |
 | 1005 | Reported for an empty close frame (never sent as a code) |
@@ -320,3 +330,5 @@ the echo.
 | 1011 | Internal error (runtime startup failure or an unexpected process message) |
 | 1013 | Try again later (backpressure or overload) |
 | 4401 | Session revoked or authentication expired. Do not reconnect |
+| 4400-4499 | `init` refused with a 4xx status (4000 + status). The client reloads the page |
+| 4500-4599 | `init` refused with a 5xx status (4503 for `error.unavailable`). The client reconnects with backoff |
