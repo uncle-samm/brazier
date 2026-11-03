@@ -109,6 +109,8 @@ with its own changelog, so they are not listed here.
   warnings, except samples marked as fragments.
 - (WS10) `make publish-dry-run`, and a release gate in `scripts/publish.sh`.
 - (WS10b) `store.describe_error`.
+- (WS10b) `beacon.track_and_watch_presence`: a session tracks itself on
+  the topics `track` returns and follows the topics `watch` returns.
 - (WS10b) `beacon/rate_limit` is public, since `middleware.rate_limit` takes
   its `RateLimiter`; `rate_limit.config` and `rate_limit.max_keys` read a
   limiter's settings.

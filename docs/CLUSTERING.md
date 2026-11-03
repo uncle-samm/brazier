@@ -514,9 +514,30 @@ leaves. A topic listed twice is followed once. An invalid topic (empty, or
 over `presence.max_topic_bytes`) fails the session's start, or stops the
 session later, with a logged error.
 
-`beacon.presence` and `beacon.watch_presence` set the same thing. When both
-are called, the later call wins. A session that tracks itself already
-hears its tracked topics, so it does not also need to watch them.
+### Tracking and watching
+
+A session that is on some topics and follows others, such as a user in a
+room who also sees the lobby, uses `beacon.track_and_watch_presence`:
+
+```gleam
+beacon.application(init:, update:, view:)
+|> beacon.track_and_watch_presence(
+  tracker: online,
+  track: fn(model) {
+    [presence.Tracking(topic: "room:" <> model.room, key: model.user, meta: model.status)]
+  },
+  watch: fn(_model) { ["lobby"] },
+  on_presence: PresenceChanged,
+)
+```
+
+Its topics are those `track` returns plus those `watch` returns, each
+followed once. The session appears only on its tracked topics.
+
+`beacon.presence`, `beacon.watch_presence` and
+`beacon.track_and_watch_presence` set the same thing. When more than one
+is called, the last call wins. A session that tracks itself already hears
+its tracked topics, so it does not also need to watch them.
 
 ### The tracker API
 
