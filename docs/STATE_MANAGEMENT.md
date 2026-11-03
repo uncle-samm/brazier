@@ -251,7 +251,9 @@ new one subscribed.
 `beacon.presence(tracker:, track:, on_presence:)` tracks which sessions are
 on a topic, on every node, from each session's state. Every join and leave
 arrives as an `on_presence(diff)` message, and `sync.merge` (from
-`beacon/presence/sync`) applies it to the list the session keeps. See
+`beacon/presence/sync`) applies it to the list the session keeps.
+`beacon.watch_presence(tracker:, watch:, on_presence:)` gets the same
+messages for the topics `watch` returns without tracking the session. See
 [CLUSTERING.md](CLUSTERING.md#session-presence).
 
 ## Cross-Route State Sharing

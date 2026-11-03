@@ -9,7 +9,12 @@
 ////   the shard monitors it, so its entries leave when it exits. After every
 ////   update the runtime computes the list again and, when it changed, sends
 ////   it here; the watcher tracks, updates and untracks to match.
-//// - **Diffs.** For every tracked topic the watcher subscribes to the
+//// - **Watching.** The session may also follow topics it does not track
+////   (`beacon.watch_presence`, `new_watching`). Such a topic is followed
+////   exactly like a tracked one, with no keys: the same diffs, coalescing
+////   and shard-restart handling, and nothing of the session's in the
+////   topic. A topic that is both tracked and watched is followed once.
+//// - **Diffs.** For every followed topic the watcher subscribes to the
 ////   topic's diffs, then reads the topic's entries once and reports them
 ////   as joins. Each delivery is checked against what was already reported
 ////   (by meta ref): a join already reported or a leave never reported is
@@ -80,8 +85,8 @@ pub opaque type Watch(state, msg) {
 pub opaque type Watcher(state) {
   Watcher(
     pid: Pid,
-    /// Send the trackings of a new state when they changed. Returns the
-    /// watcher to keep (it remembers the last trackings sent).
+    /// Send the trackings and watched topics of a new state when they
+    /// changed. Returns the watcher to keep (it remembers the last sent).
     sync: fn(state) -> Watcher(state),
     stop: fn() -> Nil,
   )
@@ -103,6 +108,18 @@ const start_timeout_ms = 4500
 pub fn new(
   config: PresenceConfig(meta),
   track: fn(state) -> List(Tracking(meta)),
+  on_presence: fn(Diff(meta)) -> msg,
+) -> Watch(state, msg) {
+  new_watching(config, track, fn(_state) { [] }, on_presence)
+}
+
+/// `new`, and the session also follows the topics `watch` gives for its
+/// state without tracking anything on them. A topic both tracked and
+/// watched is followed once.
+pub fn new_watching(
+  config: PresenceConfig(meta),
+  track: fn(state) -> List(Tracking(meta)),
+  watch: fn(state) -> List(String),
   on_presence: fn(Diff(meta)) -> msg,
 ) -> Watch(state, msg) {
   let handle = presence.handle(config)
@@ -134,7 +151,7 @@ pub fn new(
       case handle {
         Error(reason) -> Error(presence.describe(reason))
         Ok(tracker) ->
-          spawn_watcher(tracker, track, on_presence, dispatch, state)
+          spawn_watcher(tracker, track, watch, on_presence, dispatch, state)
       }
     },
   )
@@ -201,7 +218,8 @@ pub fn pid(watcher: Watcher(state)) -> Pid {
 // --- The watcher process ------------------------------------------------------
 
 type Command(meta) {
-  SetTrackings(List(Tracking(meta)))
+  /// What to track, and the topics to follow without tracking.
+  SetWanted(trackings: List(Tracking(meta)), watched: List(String))
   Retry
   Stop
 }
@@ -243,7 +261,8 @@ type State(meta, msg) {
     commands: Subject(Command(meta)),
     owner: #(Monitor, Pid),
     partition: Monitor,
-    /// What should be tracked, by topic then key.
+    /// What should be tracked, by topic then key. A watched topic that is
+    /// not tracked has no keys.
     trackings: Dict(String, Dict(String, meta)),
     /// Tracked topics whose shard is up: topic → shard.
     shards: Dict(String, Pid),
@@ -265,13 +284,14 @@ type State(meta, msg) {
 fn spawn_watcher(
   tracker: Presence(meta),
   track: fn(state) -> List(Tracking(meta)),
+  watch: fn(state) -> List(String),
   on_presence: fn(Diff(meta)) -> msg,
   dispatch: fn(msg) -> Nil,
   state: state,
 ) -> Result(Watcher(state), String) {
   let owner = process.self()
   let reply = process.new_subject()
-  let initial = track(state)
+  let initial = #(track(state), watch(state))
   let pid =
     process.spawn_unlinked(fn() {
       init(tracker, on_presence, dispatch, owner, initial, reply)
@@ -283,10 +303,12 @@ fn spawn_watcher(
         "Presence watcher "
           <> string.inspect(pid)
           <> " started with "
-          <> int.to_string(list.length(initial))
-          <> " trackings",
+          <> int.to_string(list.length(initial.0))
+          <> " trackings and "
+          <> int.to_string(list.length(initial.1))
+          <> " watched topics",
       )
-      Ok(make_watcher(pid, commands, track, initial))
+      Ok(make_watcher(pid, commands, track, watch, initial))
     }
     Ok(Error(reason)) -> Error(reason)
     Error(Nil) -> {
@@ -305,17 +327,18 @@ fn make_watcher(
   pid: Pid,
   commands: Subject(Command(meta)),
   track: fn(state) -> List(Tracking(meta)),
-  last: List(Tracking(meta)),
+  watch: fn(state) -> List(String),
+  last: #(List(Tracking(meta)), List(String)),
 ) -> Watcher(state) {
   Watcher(
     pid:,
     sync: fn(state) {
-      let trackings = track(state)
-      case trackings == last {
-        True -> make_watcher(pid, commands, track, last)
+      let wanted = #(track(state), watch(state))
+      case wanted == last {
+        True -> make_watcher(pid, commands, track, watch, last)
         False -> {
-          process.send(commands, SetTrackings(trackings))
-          make_watcher(pid, commands, track, trackings)
+          process.send(commands, SetWanted(wanted.0, wanted.1))
+          make_watcher(pid, commands, track, watch, wanted)
         }
       }
     },
@@ -328,7 +351,7 @@ fn init(
   on_presence: fn(Diff(meta)) -> msg,
   dispatch: fn(msg) -> Nil,
   owner: Pid,
-  initial: List(Tracking(meta)),
+  initial: #(List(Tracking(meta)), List(String)),
   reply: Subject(Result(Subject(Command(meta)), String)),
 ) -> Nil {
   trap_exits()
@@ -364,7 +387,7 @@ fn init(
         suspects: dict.new(),
         retries: 0,
       )
-    set_trackings(state, initial)
+    set_wanted(state, initial.0, initial.1)
   }
   case started {
     Ok(state) -> {
@@ -373,7 +396,7 @@ fn init(
         "beacon.presence",
         "Presence watcher of tracker "
           <> presence.name(tracker)
-          <> " tracking "
+          <> " following "
           <> int.to_string(dict.size(state.trackings))
           <> " topics",
       )
@@ -396,8 +419,8 @@ fn init(
 fn loop(state: State(meta, msg)) -> Nil {
   let name = presence.name(state.tracker)
   case receive_event(state.commands, state.owner, state.partition, name) {
-    CommandReceived(SetTrackings(trackings)) ->
-      case set_trackings(state, trackings) {
+    CommandReceived(SetWanted(trackings, watched)) ->
+      case set_wanted(state, trackings, watched) {
         Ok(state) -> loop(state)
         Error(reason) -> fail(state, reason)
       }
@@ -473,12 +496,22 @@ fn pubsub_down(name: String, reason: String) -> Nil {
 
 // --- Trackings ----------------------------------------------------------------
 
-/// Track, update and untrack so that `trackings` is what is tracked.
-fn set_trackings(
+/// Track, update and untrack so that `trackings` is what is tracked, and
+/// follow the topics of `trackings` and `watched`.
+fn set_wanted(
   state: State(meta, msg),
   trackings: List(Tracking(meta)),
+  watched: List(String),
 ) -> Result(State(meta, msg), String) {
-  use wanted <- result.try(group_trackings(trackings))
+  use tracked <- result.try(group_trackings(trackings))
+  // A watched topic without trackings is followed with no keys.
+  let wanted =
+    list.fold(watched, tracked, fn(acc, topic) {
+      case dict.has_key(acc, topic) {
+        True -> acc
+        False -> dict.insert(acc, topic, dict.new())
+      }
+    })
   let old_topics = dict.keys(state.trackings)
   let gone = list.filter(old_topics, fn(topic) { !dict.has_key(wanted, topic) })
   use state <- result.try(list.try_fold(gone, state, remove_topic))
@@ -1121,7 +1154,7 @@ fn report_diffs(
             "beacon.presence",
             "Presence watcher dropping "
               <> int.to_string(list.length(diffs))
-              <> " diffs of untracked topic "
+              <> " diffs of unfollowed topic "
               <> topic,
           )
           Ok(state)

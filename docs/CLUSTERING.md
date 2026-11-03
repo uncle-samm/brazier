@@ -28,7 +28,8 @@ in this order:
 2. The cluster manager, when `beacon.cluster(config)` is set.
 3. The session revocation scope, which carries logouts and rotations to
    bound sockets on every node.
-4. The presence tracker, when `beacon.presence(..)` is set.
+4. The presence tracker, when `beacon.presence(..)` or
+   `beacon.watch_presence(..)` is set.
 5. The HTTP and WebSocket listener.
 
 ```gleam
@@ -488,6 +489,34 @@ each room and who is typing this way.
   tracker that stays down, or the loss of the session's PubSub partition
   stops the session with a logged error. `beacon.start` fails when the
   tracker configuration is invalid.
+
+### Watching without tracking
+
+A session that only shows who is here, such as a dashboard or a lobby
+list, uses `beacon.watch_presence`. It follows the topics `watch` returns
+for its state and tracks nothing, so it never appears in a list:
+
+```gleam
+beacon.application(init:, update:, view:)
+|> beacon.watch_presence(
+  tracker: online,
+  watch: fn(model) { ["room:" <> model.room] },
+  on_presence: PresenceChanged,
+)
+```
+
+A watched topic gets the same diffs as a tracked one. The first message
+lists everyone already there as joins, up to 100 queued changes are
+coalesced into one message, every entry is reported once, and shard
+restarts are handled as above. `watch` runs after every update. A topic
+that is no longer listed reports everyone the session knew there as
+leaves. A topic listed twice is followed once. An invalid topic (empty, or
+over `presence.max_topic_bytes`) fails the session's start, or stops the
+session later, with a logged error.
+
+`beacon.presence` and `beacon.watch_presence` set the same thing. When both
+are called, the later call wins. A session that tracks itself already
+hears its tracked topics, so it does not also need to watch them.
 
 ### The tracker API
 
