@@ -286,6 +286,22 @@
       - Both may make small edits to `brazier.gleam` and `application.gleam`, which fix-cluster also edits; the coordinator resolves those merges. Neither touches the `.erl` files fix-cluster owns.
     - Wave 3: wire and encoding performance, PERF-2 and PERF-6. Raw JSON envelopes need a wire version bump. Started 2026-11-04 at the commit after 4678b0f as one agent (w3-wire-perf), because both findings cross the runtime-to-transport boundary. It runs alongside the W4 monitor-race sweep, which touches only tests that are not runtime, transport or client tests.
     - Wave 4: PERF-9, which closes the bench gate's gaps (benches for large models, SSR, static files, client render and CRDT; no ungated metrics) and re-baselines. Then a sweep of the remaining TS-12 items.
+      - Started 2026-11-04 as three agents with disjoint files:
+        - **w4-bench-gate** (PERF-9), from 75a71a8. It owns the bench code, `bench/`, the Makefile bench targets and the bench docs.
+        - **w4-server-sweep**, from 67e1158. It owns `src/` outside the client and takes:
+          - the TS-12 sweep, plus a lint rule that requires `as` on every `let assert`;
+          - raw-path logging (the rest of SEC-11);
+          - `trusted_proxies` parsed once, and the scheme read only from the configured forwarding header;
+          - stale `asset_cache_ffi` entries;
+          - the `stop_server` error;
+          - validation of peer deltas in `store_replica`;
+          - the CRDT compact sort.
+        - **w4-client-tests**, from 67e1158. It owns `brazier_client`, `priv/static` and the test-hygiene files, and takes:
+          - unmounting a hook when its attribute is removed;
+          - `#` links;
+          - the `rejected_middleware` retry;
+          - keyed morph;
+          - telemetry and presence cleanup, `watch_info`/`unwatch`, `sleep_ms`, the exact exit reason, and the `peer.eventually` polls.
     - PERF-11 (about 0.5µs of telemetry span cost per event with no handler) is accepted within the overhead budget already recorded, and is not fixed.
   - [x] fix-crdt (PERF-7), merged as 461baf2.
     - The fix: `join_keys` finds removed dots from whichever is smaller, the delta's context or the key. This is the delta-state dot-set join (Almeida, Shoker and Baquero; delta_crdt_ex `join_dot_sets`).
