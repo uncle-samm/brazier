@@ -73,15 +73,25 @@ forwarding headers) and runs the pipeline on it, at three points:
 
 | When | Page | Refusal |
 |------|------|---------|
-| The WebSocket upgrade | the upgrade's required `path` query parameter (`/ws?path=%2Fadmin`) | the upgrade gets the middleware's response; no runtime starts (upgrade result `rejected_middleware`) |
+| The WebSocket upgrade | the upgrade's required `path` query parameter (`/ws?path=%2Fadmin`) | the handshake completes and the socket closes at once with 4600 `middleware refused <status>`; no runtime starts (upgrade result `rejected_middleware`). The client loads the page, so the browser gets the middleware's answer |
 | A client `navigate` (link click, back/forward, `router.push`/`replace`) | the target path | `hard_navigate` to it: the browser loads it over HTTP and gets the middleware's answer |
 | A `join` for a page other than the upgrade's | the joined path | `hard_navigate`, as for `navigate` |
 
-A browser does not show a page the status of a refused upgrade: the client
-sees a socket that closes before it opens, keeps reconnecting with backoff,
-and from the third such close in a row logs an error (see
-[WIRE_PROTOCOL.md](WIRE_PROTOCOL.md#client-connection-behaviour)). Reloading
-the page shows the middleware's answer over HTTP.
+A browser cannot read the HTTP status of a failed upgrade: a 403 looks like
+an unreachable server. So the upgrade does not answer with the middleware's
+response. The middleware runs after the origin, `ws_auth` and handshake
+checks, and a refusal is a 101 followed by close 4600, which the client can
+read. The client stops reconnecting and loads the current URL, behind the
+same guard as its other reloads (at most 3 per tab within 60 seconds; see
+[WIRE_PROTOCOL.md](WIRE_PROTOCOL.md#client-connection-behaviour)). The
+server logs the refusal as a warning with the connection id, the page and
+the status. LiveView does the same for a refused join: `onJoinError`
+navigates to the page's URL.
+
+A middleware that refuses a page's live connection but admits its `GET`
+(it tells the two apart by `Upgrade: websocket`, say) makes the page load
+three times, then show the client's error notice. Gate the page the same
+way for both, or check the socket with `brazier.ws_auth`.
 
 The page is admitted when the pipeline reaches the handler (some middleware
 calls `next` all the way through); any response a middleware returns

@@ -131,7 +131,7 @@ fn click(session: Session, handler_id: String) -> Nil {
       event_data: "{}",
       target_path: "0",
       clock: 1,
-      ops: "",
+      ops: [],
     ),
   )
 }
@@ -255,12 +255,12 @@ pub fn undecodable_event_reports_unknown_test() {
 pub fn batch_reports_each_event_and_one_render_test() {
   let session = joined(option.None)
   use events <- listen()
-  let increment = #("click", "increment", "{}", "0", 1, "")
+  let increment = #("click", "increment", "{}", "0", 1, [])
   process.send(
     session.runtime,
     runtime.ClientEventBatchReceived(conn_id: session.conn_id, events: [
       increment,
-      #("click", "nope", "{}", "0", 2, ""),
+      #("click", "nope", "{}", "0", 2, []),
       increment,
     ]),
   )

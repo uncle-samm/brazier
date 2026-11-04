@@ -143,14 +143,17 @@ pub type RuntimeMessage(msg) {
     event_data: String,
     target_path: String,
     clock: Int,
-    /// JSON-encoded patch ops from client. Empty string means no ops.
-    ops: String,
+    /// Model ops the client attached, already checked by the transport.
+    /// `[]` means none. They are never applied (see `warn_client_ops`).
+    ops: List(transport.ClientOp),
   )
   /// A batch of events to process atomically (all updates, one render).
   /// Used when LOCAL events are replayed before a MODEL event.
   ClientEventBatchReceived(
     conn_id: transport.ConnectionId,
-    events: List(#(String, String, String, String, Int, String)),
+    events: List(
+      #(String, String, String, String, Int, List(transport.ClientOp)),
+    ),
   )
   /// A client navigated to a new URL path.
   ClientNavigated(conn_id: transport.ConnectionId, path: String)
@@ -999,13 +1002,18 @@ fn forget_connection(
   )
 }
 
-fn warn_client_ops(conn_id: transport.ConnectionId, ops: String) -> Nil {
+fn warn_client_ops(
+  conn_id: transport.ConnectionId,
+  ops: List(transport.ClientOp),
+) -> Nil {
   case ops {
-    "" -> Nil
+    [] -> Nil
     _ ->
       log.warning(
         "brazier.runtime",
-        "Ignoring client-supplied model ops from "
+        "Ignoring "
+          <> int.to_string(list.length(ops))
+          <> " client-supplied model ops from "
           <> conn_id
           <> " because server update is authoritative",
       )
@@ -1342,7 +1350,7 @@ fn check_join_token(
 fn handle_batch(
   state: RuntimeState(model, msg),
   conn_id: transport.ConnectionId,
-  events: List(#(String, String, String, String, Int, String)),
+  events: List(#(String, String, String, String, Int, List(transport.ClientOp))),
 ) -> RuntimeState(model, msg) {
   let count = list.length(events)
   log.debug(

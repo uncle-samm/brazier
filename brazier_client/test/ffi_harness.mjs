@@ -94,9 +94,9 @@ class FakeWebSocket {
     this.readyState = FakeWebSocket.OPEN;
     this.onopen();
   }
-  serverClose(code) {
+  serverClose(code, reason = "") {
     this.readyState = FakeWebSocket.CLOSED;
-    this.onclose({ code, reason: "" });
+    this.onclose({ code, reason });
   }
   deliver(frame) {
     this.onmessage({ data: JSON.stringify(frame) });
@@ -1745,6 +1745,66 @@ scenario("closes before the socket opens back off to 30s, warn, then log an erro
   sockets[8].serverClose(1006);
   assert.equal(beforeOpening(), 3, "an open resets the count of unopened closes");
   assert.equal(errorsMatching("The WebSocket upgrade failed").length, 5);
+});
+
+// The server completes the handshake of a mount its route middleware
+// refuses and closes with 4600, so the client can load the page and show
+// the middleware's answer instead of retrying a socket that is refused
+// every time (LiveView's onJoinError navigating to the page's URL).
+scenario("4600 (middleware refused the mount) loads the current URL once, never reconnects", async () => {
+  await loadRuntime({ path: "/admin?tab=1#users" });
+  const s = sockets[0];
+  s.open();
+  assert.equal(s.types()[0], "join");
+  s.serverClose(4600, "middleware refused 403");
+  assert.equal(reloads, 1, "the page is loaded again, at its current URL");
+  assert.equal(location.pathname + location.search + location.hash, "/admin?tab=1#users", "the URL is not changed");
+  assert.equal(pendingTimeouts().length, 0, "no reconnect scheduled");
+  assert.equal(timers.length, 0, "heartbeat stopped");
+  assert.equal(errorsMatching("middleware refused this page's live connection (close 4600 middleware refused 403)").length, 1);
+  assert.equal(logsMatching("warn", "reconnecting").length, 0, "nothing says it reconnects");
+  advance(120000);
+  assert.equal(sockets.length, 1, "never reconnects");
+  assert.equal(reloads, 1);
+});
+
+scenario("4600 shares the reload guard: a middleware that admits the GET but refuses the mount stops after 3 loads", async () => {
+  const storage = new FakeStorage();
+  for (let i = 0; i < 3; i++) {
+    await loadRuntime({ storage, now: 3_000_000 + i * 1000 });
+    sockets[0].open();
+    sockets[0].serverClose(4600, "middleware refused 403");
+    assert.equal(reloads, 1, `refused mount ${i + 1} loads the page`);
+  }
+  await loadRuntime({ storage, now: 3_003_000, ssr: "<p>admin</p>" });
+  sockets[0].open();
+  sockets[0].serverClose(4600, "middleware refused 403");
+  assert.equal(reloads, 0, "the fourth refused mount within 60s does not load the page");
+  assert.ok(root.hasAttribute("data-brazier-error"), "the page shows its error state");
+  assert.equal(errorsMatching("(close 4600 middleware refused 403) after 3 reloads within 60s").length, 1);
+  advance(120000);
+  assert.equal(sockets.length, 1, "never reconnects");
+});
+
+scenario("unknown 4xxx codes and ordinary closes after open reconnect, never load the page", async () => {
+  await loadRuntime();
+  const codes = [4123, 4601, 4999, 1000, 1001];
+  codes.forEach((code, i) => {
+    const s = sockets[i];
+    s.open();
+    s.serverClose(code, "unknown");
+    assert.equal(logsMatching("warn", "WebSocket closed (code " + code + ", unknown); reconnecting").length, 1, `close ${code} warns`);
+    advance(reconnectDelay());
+    assert.equal(sockets.length, i + 2, `reconnected after ${code}`);
+  });
+  assert.equal(reloads, 0, "no close but 4600 and 4400-4499 loads the page");
+  assert.equal(errorsMatching("middleware refused").length, 0);
+  assert.ok(!root.hasAttribute("data-brazier-error"));
+  // A 4600 that arrives without an open (the handshake did not finish on
+  // this side) still means a refused mount.
+  sockets[codes.length].serverClose(4600, "middleware refused 302");
+  assert.equal(reloads, 1);
+  assert.equal(logsMatching("warn", "closed before opening").length, 0, "not counted as an unopened close");
 });
 
 // --- keyed children ---

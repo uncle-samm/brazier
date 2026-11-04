@@ -549,7 +549,9 @@ pub fn websocket_middleware_pass_reports_the_ws_route_test() {
   use events <- listen(request_events)
   let socket = open(listener)
   let upgrade =
-    "GET /ws?path=%2F HTTP/1.1\r\nHost: test\r\nUpgrade: websocket\r\n"
+    // Same-origin: the page's middleware runs after the origin check.
+    "GET /ws?path=%2F HTTP/1.1\r\nHost: test\r\nOrigin: http://test\r\n"
+    <> "Upgrade: websocket\r\n"
     <> "Connection: Upgrade\r\nSec-WebSocket-Version: 13\r\n"
     <> "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
   let assert Ok(Nil) = raw_send(socket, <<upgrade:utf8>>)

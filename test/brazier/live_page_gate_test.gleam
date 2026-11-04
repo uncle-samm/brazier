@@ -1,7 +1,7 @@
 //// SEC-2: route-scoped middleware gates a live page, not only its dead
 //// render. `middleware.only("/admin", auth)` refuses `GET /admin`, and the
 //// same middleware refuses the WebSocket that mounts `/admin`
-//// (`/ws?path=%2Fadmin`), a `navigate` to `/admin` on a connection that
+//// (`/ws?path=%2Fadmin`, closed with 4600 after the handshake), a `navigate` to `/admin` on a connection that
 //// mounted another page, and a `join` that names `/admin`. A refused
 //// navigation or join is answered with a hard navigation, so the browser's
 //// page load gets the middleware's own answer, and it never reaches the
@@ -248,7 +248,13 @@ pub fn websocket_mounting_the_admin_page_is_refused_test() {
     fn(page) {
       let #(socket, status) =
         request_status(port, "/ws?path=" <> page, upgrade_headers(port, []))
-      let assert True = status == "403" as { "upgrade on " <> page }
+      // The handshake completes, then the socket closes with 4600 and the
+      // middleware's status: a browser cannot read a refused upgrade's.
+      let assert True = status == "101" as { "upgrade on " <> page }
+      let assert Ok(#(8, <<4600:16, reason:bits>>)) =
+        raw_recv_frame(socket, 3000)
+        as "a refused mount closes with 4600"
+      let assert <<"middleware refused 403">> = reason
       let stop =
         expect(events, ["brazier", "ws", "upgrade", "stop"], fn(_) { True })
       let assert Ok("rejected_middleware") = telemetry.string(stop, "result")

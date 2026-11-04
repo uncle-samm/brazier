@@ -179,6 +179,32 @@ with its own changelog, so they are not listed here.
   crash. `patch.is_empty`, `patch.diff_json` and `patch.merge_ops_json`
   are removed. The runtime's cached model is
   `FullModelCache(snapshot: patch.Snapshot)`.
+- (M117 transport follow-ups) **Wire break:** the client `event`'s
+  optional `ops` is a raw JSON array (`"ops":[{"op":"replace",...}]`), as
+  the server's `patch` already is, not a string holding the array. The
+  server decodes it strictly (RFC 6902 op names and members, RFC 6901
+  pointers, no `__proto__`/`constructor`/`prototype` segment) and refuses
+  an event or `event_batch` with any malformed op whole: a warning with the
+  connection id, the `error` frame `"Invalid event ops"`, and one count
+  toward `ws_max_decode_errors`. The old string form is refused the same
+  way. A page from an older bundle sends its build id on join and gets 4409,
+  so it reloads before it sends an event. `ClientEvent.ops` and
+  `ClientEventReceived.ops` are `List(transport.ClientOp)`, not `String`.
+- (M117 transport follow-ups) **New close code 4600:** a WebSocket upgrade
+  whose page the route middleware refuses now completes the handshake and
+  closes with 4600 `middleware refused <status>`, instead of answering the
+  upgrade with the middleware's response, which a browser cannot read. The
+  client answers 4600 by loading the current URL behind its reload guard
+  (at most 3 loads per tab within 60 seconds), so the page shows the
+  middleware's answer, where it used to retry the upgrade with backoff
+  forever. The middleware now runs after the connection limits, the origin
+  and `ws_auth` checks and the RFC 6455 handshake checks, not before them,
+  so a cross-origin upgrade never reaches it, and the `/ws` request span it
+  emits appears only for upgrades that passed those checks. Other 4xxx
+  codes the client does not know still reconnect with backoff. The 4xxx
+  scheme (4400-4499 reload, 4500-4599 reconnect, 4600-4699 transport
+  refusals) is in `docs/WIRE_PROTOCOL.md`. This follows LiveView, whose
+  `onJoinError` navigates to the page's URL when a join is refused.
 
 ### Added
 
@@ -729,7 +755,7 @@ with its own changelog, so they are not listed here.
   refuses over HTTP. The middleware ran only on the `/ws` request, so an
   auth middleware scoped to `/admin` never saw a WebSocket mounting or
   navigating to `/admin`. It now runs on a `GET` of the page at the
-  upgrade (a refusal answers the upgrade), and at every `navigate` and
+  upgrade (a refusal closes the socket with 4600; see Breaking), and at every `navigate` and
   every `join` for another page, where a refusal sends `hard_navigate` so
   the browser loads the page and gets the middleware's response. A refusal
   is logged and emits `[brazier, ws, navigation_refused]`. This follows

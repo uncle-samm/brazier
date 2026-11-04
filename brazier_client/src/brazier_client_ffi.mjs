@@ -724,9 +724,10 @@ function handleClose(socket, e) {
   socketJoined = false;
   readyForServerEvents = false;
   trace("ws.close", { code: e.code, reason: e.reason });
-  if (closeAction(e.code) === "reload") {
+  const action = closeAction(e.code);
+  if (action === "reload" || action === "navigate") {
     reconnectStopped = true;
-    reloadRefusedPage(e);
+    reloadRefusedPage(e, action);
     return;
   }
   const closed = "code " + e.code + (e.reason ? ", " + e.reason : "");
@@ -738,7 +739,7 @@ function handleClose(socket, e) {
     if (unopenedCloses >= UNOPENED_CLOSES_BEFORE_ERROR) {
       console.error(
         "[brazier] The WebSocket upgrade failed " + unopenedCloses + " times in a row before opening (" + closed + "): " +
-          "the server is unreachable, or it refused the upgrade (its middleware refusing this page, a disallowed origin or host). " +
+          "the server is unreachable, or it refused the upgrade (a disallowed origin or host, ws_auth, a connection limit). " +
           "Reconnecting with backoff; reload the page to see the server's answer.",
       );
     } else {
@@ -752,9 +753,17 @@ function handleClose(socket, e) {
 // a new page load decides. The reload guard allows MAX_RELOADS within
 // RELOAD_WINDOW_MS per tab; past that, or when the guard cannot keep its
 // count, the page shows an error state instead of reloading forever.
-// Reference (knowledge, not code read): LiveView reloads on a stale or
-// unauthorized join and counts consecutive reloads to stop a reload loop.
-function reloadRefusedPage(e) {
+// `action` "navigate" is close 4600, the route middleware refusing this
+// page's mount: the page load of the current URL shows the middleware's
+// answer (its redirect or error page), which the socket cannot. A
+// middleware whose GET admits what its mount refuses would loop, so the
+// same guard counts these loads. location.reload() is the hard navigation
+// to the current URL: assigning location.href to itself would only scroll
+// when the URL has a fragment.
+// Reference: Phoenix LiveView, view.ts onJoinError (a stale or unauthorized
+// join calls onRedirect({to: this.root.href})) and live_socket.ts
+// reloadWithJitter (counts consecutive reloads to stop a reload loop).
+function reloadRefusedPage(e, action) {
   const close = "close " + e.code + (e.reason ? " " + e.reason : "");
   let raw;
   try {
@@ -780,8 +789,14 @@ function reloadRefusedPage(e) {
     showFatalError("The server refused this page's session (" + close + "). The reload guard cannot write sessionStorage (" + err + "), so the page is not reloaded.");
     return;
   }
-  trace("ws.reload", { code: e.code, reloads: decision.history.length });
-  console.error("[brazier] The server refused this page's session (" + close + "); not reconnecting, reloading the page (reload " + decision.history.length + " of at most " + MAX_RELOADS + " within " + RELOAD_WINDOW_MS / 1000 + "s)");
+  const count = "(reload " + decision.history.length + " of at most " + MAX_RELOADS + " within " + RELOAD_WINDOW_MS / 1000 + "s)";
+  if (action === "navigate") {
+    trace("ws.middleware_refused", { code: e.code, reason: e.reason, reloads: decision.history.length });
+    console.error("[brazier] The server's middleware refused this page's live connection (" + close + "); not reconnecting, loading the page to show its answer " + count);
+  } else {
+    trace("ws.reload", { code: e.code, reloads: decision.history.length });
+    console.error("[brazier] The server refused this page's session (" + close + "); not reconnecting, reloading the page " + count);
+  }
   location.reload();
 }
 

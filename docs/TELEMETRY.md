@@ -183,7 +183,8 @@ Notes on individual events:
   - pages: `/*`, the shared page pattern (Brazier's router is typed, so a
     page has no textual pattern);
   - `*` for `OPTIONS *`, and `/ws` for the middleware pass on a live page
-    (at the upgrade, and for each gated live navigation and join; see
+    (at the upgrade, once it has passed every other check, and for each
+    gated live navigation and join; see
     [MIDDLEWARE.md](MIDDLEWARE.md#the-live-page)), which runs as a request
     span and reports status 101 when the page is admitted, or the
     middleware's status when it is refused.
@@ -201,8 +202,9 @@ Notes on individual events:
   `rejected_host` (a `Host` not in `allowed_hosts`), `rejected_early_data`,
   `rejected_body`, `rejected_path` (no `path` parameter, or one that is not
   a same-origin path), `rejected_middleware` (the middleware refused the
-  page),
-  `peer_gone`, `rejected_connection_limit`, `rejected_ip_limit`,
+  page: the span then covers the 101, the 4600 close and its wait of at
+  most 1 second for the peer to close, and the connection's `[brazier, ws,
+  close]` is emitted inside it), `peer_gone`, `rejected_connection_limit`, `rejected_ip_limit`,
   `rejected_origin`, `rejected_auth`, `rejected_handshake`,
   `rejected_version` or `upgrade_write_failed`.
 - `[brazier, ws, close]` is emitted once per upgraded connection when its
@@ -218,7 +220,9 @@ Notes on individual events:
   manifest, and a dev-mode handler that cannot subscribe to reloads),
   `authentication_expired`, `session_revoked`, `server_overloaded`,
   `backpressure`, `server_shutting_down` or `stale_build` (4409, a join
-  from a page of another build) for a close Brazier sent; `tcp_closed`,
+  from a page of another build) or `middleware_refused` (4600, an upgrade
+  the page's middleware refused; it has `frames_out` 1 and no runtime ran)
+  for a close Brazier sent; `tcp_closed`,
   `tcp_error` or `send_failed` without a close frame; or `init_refused`
   (including a join token that fails its check, 4400) and
   `startup_failure` when the runtime did not start. Dev mode's `reload`

@@ -10,6 +10,7 @@ import brazier/runtime
 import brazier/ssr
 import brazier/transport
 import brazier/transport/server
+import gleam/dynamic
 import gleam/erlang/process
 import gleam/http
 import gleam/http/request
@@ -678,7 +679,7 @@ pub fn runtime_sends_model_sync_on_event_test() {
       event_data: "{}",
       target_path: "0.0",
       clock: 1,
-      ops: "",
+      ops: [],
     ),
   )
 
@@ -718,7 +719,7 @@ pub fn runtime_handles_disconnect_test() {
       event_data: "{}",
       target_path: "0.0",
       clock: 1,
-      ops: "",
+      ops: [],
     ),
   )
 
@@ -753,7 +754,7 @@ pub fn runtime_handles_unknown_event_test() {
       event_data: "{}",
       target_path: "0.0",
       clock: 1,
-      ops: "",
+      ops: [],
     ),
   )
 
@@ -875,7 +876,7 @@ pub fn live_update_does_not_render_server_view_test() {
       event_data: "{}",
       target_path: "0",
       clock: 1,
-      ops: "",
+      ops: [],
     ),
   )
 
@@ -1089,7 +1090,7 @@ fn assert_join_refused(
       event_data: "{}",
       target_path: "",
       clock: 1,
-      ops: "",
+      ops: [],
     ),
   )
   let assert Ok(transport.SendError(reason: "event received before join")) =
@@ -1377,7 +1378,7 @@ pub fn model_sync_sent_after_event_test() {
       event_data: "{}",
       target_path: "0",
       clock: 1,
-      ops: "",
+      ops: [],
     ),
   )
 
@@ -1436,7 +1437,7 @@ pub fn sends_patch_not_model_sync_after_join_test() {
       event_data: "{}",
       target_path: "0",
       clock: 1,
-      ops: "",
+      ops: [],
     ),
   )
 
@@ -1486,7 +1487,7 @@ pub fn patch_contains_only_changed_field_test() {
       event_data: "{}",
       target_path: "0",
       clock: 1,
-      ops: "",
+      ops: [],
     ),
   )
 
@@ -1535,7 +1536,14 @@ pub fn client_ops_are_ignored_server_update_authoritative_test() {
       event_data: "{}",
       target_path: "0",
       clock: 1,
-      ops: "[{\"op\":\"replace\",\"path\":\"/count\",\"value\":42}]",
+      ops: [
+        transport.ClientOp(
+          op: "replace",
+          path: "/count",
+          from: option.None,
+          value: option.Some(dynamic.int(42)),
+        ),
+      ],
     ),
   )
 
@@ -1574,7 +1582,7 @@ pub fn client_ops_are_ignored_server_update_authoritative_test() {
       event_data: "{}",
       target_path: "0",
       clock: 2,
-      ops: "",
+      ops: [],
     ),
   )
 
@@ -1630,7 +1638,7 @@ pub fn post_mount_updates_never_send_html_mount_test() {
       event_data: "{}",
       target_path: "0",
       clock: 1,
-      ops: "",
+      ops: [],
     ),
   )
 
@@ -1679,7 +1687,7 @@ pub fn slow_client_mailbox_triggers_backpressure_close_test() {
       event_data: "{}",
       target_path: "0",
       clock: 1,
-      ops: "",
+      ops: [],
     ),
   )
 
@@ -1736,7 +1744,7 @@ pub fn multiple_increments_produce_patches_test() {
         event_data: "{}",
         target_path: "0",
         clock: i,
-        ops: "",
+        ops: [],
       ),
     )
   })
@@ -1790,7 +1798,7 @@ pub fn patch_content_correct_after_many_increments_test() {
         event_data: "{}",
         target_path: "0",
         clock: i,
-        ops: "",
+        ops: [],
       ),
     )
   })
@@ -2024,7 +2032,7 @@ pub fn server_state_user_event_pushes_update_test() {
       event_data: "",
       target_path: "",
       clock: 1,
-      ops: "",
+      ops: [],
     ),
   )
 
@@ -2085,7 +2093,7 @@ pub fn runtime_handles_malformed_event_data_test() {
       event_data: "THIS_IS_NOT_JSON!!!",
       target_path: "0",
       clock: 1,
-      ops: "",
+      ops: [],
     ),
   )
 
@@ -2099,7 +2107,7 @@ pub fn runtime_handles_malformed_event_data_test() {
       event_data: "{}",
       target_path: "0",
       clock: 2,
-      ops: "",
+      ops: [],
     ),
   )
 
@@ -2142,7 +2150,7 @@ pub fn runtime_handles_rapid_events_test() {
         event_data: "{}",
         target_path: "0",
         clock: i,
-        ops: "",
+        ops: [],
       ),
     )
   })
@@ -2201,7 +2209,7 @@ pub fn connection_isolation_test() {
         event_data: "{}",
         target_path: "0",
         clock: i,
-        ops: "",
+        ops: [],
       ),
     )
   })
@@ -2307,7 +2315,7 @@ pub fn on_update_effect_is_invoked_test() {
       event_data: "{}",
       target_path: "0",
       clock: 1,
-      ops: "",
+      ops: [],
     ),
   )
 

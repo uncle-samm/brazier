@@ -142,7 +142,7 @@ pub fn decode_event_test() {
     data: "{}",
     target_path: "0.1.0",
     clock: 0,
-    ops: "",
+    ops: [],
   )) = transport.decode_client_message(raw)
 }
 
@@ -155,7 +155,7 @@ pub fn decode_event_with_handler_id_test() {
     data: "{}",
     target_path: "0.3",
     clock: 5,
-    ops: "",
+    ops: [],
   )) = transport.decode_client_message(raw)
 }
 
@@ -168,7 +168,7 @@ pub fn decode_event_with_data_test() {
     data: _,
     target_path: "0.2",
     clock: 0,
-    ops: "",
+    ops: [],
   )) = transport.decode_client_message(raw)
 }
 
@@ -255,19 +255,24 @@ pub fn encode_reload_message_test() {
 
 pub fn decode_event_with_ops_test() {
   let raw =
-    "{\"type\":\"event\",\"name\":\"click\",\"handler_id\":\"increment\",\"data\":\"{}\",\"target_path\":\"0\",\"clock\":1,\"ops\":\"[{\\\"op\\\":\\\"replace\\\",\\\"path\\\":\\\"/count\\\",\\\"value\\\":1}]\"}"
+    "{\"type\":\"event\",\"name\":\"click\",\"handler_id\":\"increment\",\"data\":\"{}\",\"target_path\":\"0\",\"clock\":1,\"ops\":[{\"op\":\"replace\",\"path\":\"/count\",\"value\":1}]}"
   let assert Ok(transport.ClientEvent(
     name: "click",
     handler_id: "increment",
     data: "{}",
     target_path: "0",
     clock: 1,
-    ops: ops,
+    ops: [
+      transport.ClientOp(
+        op: "replace",
+        path: "/count",
+        from: option.None,
+        value: option.Some(value),
+      ),
+    ],
   )) = transport.decode_client_message(raw)
-  // Verify ops is valid JSON patch format, not just non-empty
-  let assert True = string.contains(ops, "replace")
-  let assert True = string.contains(ops, "/count")
-  let assert True = string.contains(ops, "1")
+  // The ops are a JSON array embedded raw, decoded with the frame.
+  let assert Ok(1) = decode.run(value, decode.int)
 }
 
 pub fn decode_event_without_ops_test() {
@@ -279,7 +284,7 @@ pub fn decode_event_without_ops_test() {
     data: "{}",
     target_path: "0",
     clock: 1,
-    ops: "",
+    ops: [],
   )) = transport.decode_client_message(raw)
 }
 
@@ -327,7 +332,7 @@ pub fn decode_client_event_batch_test() {
       data: "{}",
       target_path: "0",
       clock: 1,
-      ops: "",
+      ops: [],
     ),
     transport.ClientEvent(
       name: "input",
@@ -335,7 +340,7 @@ pub fn decode_client_event_batch_test() {
       data: _,
       target_path: "0.2",
       clock: 2,
-      ops: "",
+      ops: [],
     ),
   ] = events
 }

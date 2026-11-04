@@ -153,7 +153,7 @@ fn event(
       event_data: "{}",
       target_path: "0",
       clock: clock,
-      ops: "",
+      ops: [],
     ),
   )
 }
@@ -198,7 +198,7 @@ pub fn batch_before_join_is_rejected_test() {
   process.send(
     rt,
     runtime.ClientEventBatchReceived(conn_id: "c", events: [
-      #("click", "inc", "{}", "0", 1, ""),
+      #("click", "inc", "{}", "0", 1, []),
     ]),
   )
   let assert transport.SendError(reason: "event batch received before join") =
@@ -529,8 +529,8 @@ pub fn batch_with_failing_last_event_still_broadcasts_test() {
   process.send(
     rt,
     runtime.ClientEventBatchReceived(conn_id: "c", events: [
-      #("click", "inc", "{}", "0", 1, ""),
-      #("click", "bogus", "{}", "0", 2, ""),
+      #("click", "inc", "{}", "0", 1, []),
+      #("click", "bogus", "{}", "0", 2, []),
     ]),
   )
   let assert transport.SendError(reason: reason) = next(s)
@@ -553,8 +553,8 @@ pub fn unchanged_batch_sends_ack_only_patch_test() {
   process.send(
     rt,
     runtime.ClientEventBatchReceived(conn_id: "c", events: [
-      #("click", "noop", "{}", "0", 1, ""),
-      #("click", "noop", "{}", "0", 3, ""),
+      #("click", "noop", "{}", "0", 1, []),
+      #("click", "noop", "{}", "0", 3, []),
     ]),
   )
   let assert transport.SendPatch(ops_json: "[]", version: 0, ack_clock: 3) =
@@ -998,9 +998,9 @@ fn record_session() -> #(List(String), String, Int) {
   process.send(
     rt,
     runtime.ClientEventBatchReceived(conn_id: "a", events: [
-      #("click", "inc", "{}", "0", 4, ""),
-      #("click", "noop", "{}", "0", 5, ""),
-      #("click", "inc", "{}", "0", 6, ""),
+      #("click", "inc", "{}", "0", 4, []),
+      #("click", "noop", "{}", "0", 5, []),
+      #("click", "inc", "{}", "0", 6, []),
     ]),
   )
   let f8 = next(a)
@@ -1097,6 +1097,6 @@ pub fn client_replay_of_server_frames_matches_final_sync_test() {
 pub fn client_runtime_behaviour_harness_test() {
   let assert Ok(output) = run_node("brazier_client/test/ffi_harness.mjs", "")
     as "the client FFI harness failed; run node brazier_client/test/ffi_harness.mjs"
-  let assert True = string.contains(output, "ffi harness ok: 52 scenarios")
-    as "the client FFI harness did not run all 52 scenarios"
+  let assert True = string.contains(output, "ffi harness ok: 55 scenarios")
+    as "the client FFI harness did not run all 55 scenarios"
 }

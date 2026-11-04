@@ -291,7 +291,7 @@ fn click(
       event_data: "{}",
       target_path: "0",
       clock: 1,
-      ops: "",
+      ops: [],
     ),
   )
 }

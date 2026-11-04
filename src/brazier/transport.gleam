@@ -14,6 +14,7 @@ import brazier/internal/log_path
 import brazier/ip
 import brazier/log
 import brazier/middleware
+import brazier/patch
 import brazier/pubsub
 import brazier/ssr
 import brazier/static
@@ -65,11 +66,14 @@ pub type ClientMessage {
     /// Monotonic event clock value for ordering and acknowledgment.
     /// Reference: LiveView 1.1 event clocking.
     clock: Int,
-    /// JSON-encoded patch operations from client-side model diff.
-    /// The server treats these as optimization hints only and never uses them
-    /// as authoritative state. Empty string "" means no client hint.
-    /// Size is bounded by max_message_bytes in SecurityLimits (default 64KB).
-    ops: String,
+    /// Model operations from a client-side model diff: the frame's `ops`, a
+    /// JSON array embedded raw (`"ops":[...]`), each op checked by
+    /// `client_op_decoder`. `[]` when the frame has no `ops`. The server
+    /// treats them as hints only and never applies them: the server's
+    /// `update` is authoritative. A frame whose `ops` is not such an array
+    /// is refused (`error` frame `"Invalid event ops"`). The size is
+    /// bounded by `max_message_bytes`.
+    ops: List(ClientOp),
   )
   /// Client sends a heartbeat to keep the connection alive.
   ClientHeartbeat
@@ -84,6 +88,22 @@ pub type ClientMessage {
   /// Batch of events: LOCAL events replayed + MODEL event at the end.
   /// Sent when a MODEL event fires after LOCAL events accumulated state.
   ClientEventBatch(events: List(ClientMessage))
+}
+
+/// One model operation a client attached to an event: an RFC 6902 op
+/// (`add`, `remove`, `replace`, `move`, `copy`, `test`) or Brazier's
+/// `append` (see `brazier/patch`). `path` and `from` are JSON Pointers
+/// (RFC 6901) that pass through no unsafe key (`patch.unsafe_keys`).
+/// `from` is set for `move` and `copy` only, `value` for `add`, `replace`,
+/// `test` and `append` only (an array for `append`). Members RFC 6902 does
+/// not define for an op are ignored, as the RFC says.
+pub type ClientOp {
+  ClientOp(
+    op: String,
+    path: String,
+    from: Option(String),
+    value: Option(Dynamic),
+  )
 }
 
 /// Messages sent from the server to the client (browser).
@@ -771,7 +791,7 @@ fn client_frame_decoder() -> decode.Decoder(ClientFrame) {
       use data <- decode.field("data", decode.string)
       use target_path <- decode.field("target_path", decode.string)
       use clock <- decode.optional_field("clock", 0, decode.int)
-      use ops <- decode.optional_field("ops", "", decode.string)
+      use ops <- decode.optional_field("ops", [], client_ops_decoder())
       decode.success(#(
         ClientEvent(
           name: name,
@@ -812,7 +832,7 @@ fn client_frame_decoder() -> decode.Decoder(ClientFrame) {
           decode.string,
         )
         use clock <- decode.optional_field("clock", 0, decode.int)
-        use ops <- decode.optional_field("ops", "", decode.string)
+        use ops <- decode.optional_field("ops", [], client_ops_decoder())
         decode.success(ClientEvent(
           name: name,
           handler_id: handler_id,
@@ -829,28 +849,178 @@ fn client_frame_decoder() -> decode.Decoder(ClientFrame) {
   }
 }
 
+/// The key of an event's model ops. A decode error whose path holds it
+/// came from `client_ops_decoder`.
+const ops_key = "ops"
+
+/// Decode the `ops` of an event: a JSON array (never a string holding one,
+/// the wire format before the ops were embedded raw) of ops that each pass
+/// `client_op_decoder`.
+fn client_ops_decoder() -> decode.Decoder(List(ClientOp)) {
+  decode.list(client_op_decoder())
+}
+
+/// Decode one model op strictly: an object with a known `op`, a JSON
+/// Pointer `path`, and the members RFC 6902 §4 requires for that op
+/// (`value` for add/replace/test, `from` for move/copy; Brazier's `append`
+/// needs an array `value`). Members the RFC does not define for the op are
+/// ignored (RFC 6902 §4: they "MUST be ignored").
+///
+/// The expected texts of its failures are fixed strings, so a decode error
+/// can be logged without echoing client text.
+///
+/// Reference: RFC 6902 §4 and §5 (an invalid op makes the whole patch an
+/// error); `brazier/patch` and the client's `patch.mjs` refuse the same ops.
+fn client_op_decoder() -> decode.Decoder(ClientOp) {
+  use op <- decode.field("op", decode.string)
+  use path <- decode.field("path", json_pointer_decoder())
+  case op {
+    "add" | "replace" | "test" -> {
+      use value <- decode.field("value", decode.dynamic)
+      decode.success(ClientOp(op:, path:, from: None, value: Some(value)))
+    }
+    "append" -> {
+      use value <- decode.field("value", {
+        use _items <- decode.then(decode.list(decode.dynamic))
+        decode.dynamic
+      })
+      decode.success(ClientOp(op:, path:, from: None, value: Some(value)))
+    }
+    "move" | "copy" -> {
+      use from <- decode.field("from", json_pointer_decoder())
+      decode.success(ClientOp(op:, path:, from: Some(from), value: None))
+    }
+    "remove" -> decode.success(ClientOp(op:, path:, from: None, value: None))
+    _ ->
+      decode.failure(
+        ClientOp(op: "remove", path:, from: None, value: None),
+        "an op of add, remove, replace, move, copy, test or append",
+      )
+  }
+}
+
+/// Decode an RFC 6901 JSON Pointer: `""` or `/`-separated reference tokens
+/// in which `~` is only ever `~0` or `~1`, none of them an unsafe key.
+fn json_pointer_decoder() -> decode.Decoder(String) {
+  use pointer <- decode.then(decode.string)
+  case check_json_pointer(pointer) {
+    Ok(Nil) -> decode.success(pointer)
+    Error(reason) ->
+      decode.failure(pointer, "a JSON Pointer (" <> reason <> ")")
+  }
+}
+
+/// Check a JSON Pointer. The reasons are fixed strings, never client text.
+/// Reference: RFC 6901 §3 (syntax) and §4 (`~1` then `~0` unescaping).
+fn check_json_pointer(pointer: String) -> Result(Nil, String) {
+  case pointer {
+    "" -> Ok(Nil)
+    "/" <> rest ->
+      string.split(rest, "/")
+      |> list.try_each(fn(token) {
+        case valid_pointer_escapes(token) {
+          False -> Error("~ not followed by 0 or 1")
+          True ->
+            case list.contains(patch.unsafe_keys(), unescape_token(token)) {
+              True -> Error("passes through an unsafe key")
+              False -> Ok(Nil)
+            }
+        }
+      })
+    _ -> Error("does not start with /")
+  }
+}
+
+/// Every `~` in a reference token is followed by `0` or `1`.
+fn valid_pointer_escapes(token: String) -> Bool {
+  case string.split_once(token, "~") {
+    Error(Nil) -> True
+    Ok(#(_before, "0" <> rest)) | Ok(#(_before, "1" <> rest)) ->
+      valid_pointer_escapes(rest)
+    Ok(_) -> False
+  }
+}
+
+/// Unescape a reference token: `~1` to `/`, then `~0` to `~` (RFC 6901 §4).
+fn unescape_token(token: String) -> String {
+  token
+  |> string.replace("~1", "/")
+  |> string.replace("~0", "~")
+}
+
+/// Why a client frame was refused. Each `reason` is fixed text (decoder
+/// paths, expected shapes and dynamic type names), never client text.
+type FrameError {
+  /// Not JSON, or not one of the client message shapes.
+  Undecodable(reason: String)
+  /// An event (alone or in a batch) whose `ops` is not a valid ops array.
+  InvalidOps(reason: String)
+}
+
 /// Decode a JSON string from the client into a ClientMessage.
 pub fn decode_client_message(
   raw: String,
 ) -> Result(ClientMessage, error.BrazierError) {
-  decode_client_frame(raw) |> result.map(fn(frame) { frame.0 })
+  case decode_client_frame(raw) {
+    Ok(frame) -> Ok(frame.0)
+    Error(refused) -> {
+      let reason = case refused {
+        Undecodable(reason) -> "Failed to decode client message: " <> reason
+        InvalidOps(reason) -> "Invalid event ops: " <> reason
+      }
+      log.warning("brazier.transport", reason)
+      Error(error.CodecError(reason: reason, raw: raw))
+    }
+  }
 }
 
 /// Decode a JSON string from the client into a message and its build id.
-fn decode_client_frame(raw: String) -> Result(ClientFrame, error.BrazierError) {
-  case json.parse(raw, client_frame_decoder()) {
-    Ok(frame) -> {
-      log.debug("brazier.transport", "Decoded client message")
-      Ok(frame)
+/// A frame whose only decode errors are in an event's `ops` is
+/// `InvalidOps`, so the client is told which part it got wrong. The caller
+/// logs a refusal with its connection; this logs at debug only.
+fn decode_client_frame(raw: String) -> Result(ClientFrame, FrameError) {
+  let outcome = case json.parse(raw, client_frame_decoder()) {
+    Ok(frame) -> Ok(frame)
+    Error(json.UnableToDecode(errors)) -> {
+      let reason = describe_decode_errors(errors)
+      case
+        errors != []
+        && list.all(errors, fn(err) { list.contains(err.path, ops_key) })
+      {
+        True -> Error(InvalidOps(reason))
+        False -> Error(Undecodable(reason))
+      }
     }
-    Error(_json_err) -> {
-      log.warning("brazier.transport", "Failed to decode client message")
-      Error(error.CodecError(
-        reason: "Failed to decode client message",
-        raw: raw,
-      ))
-    }
+    Error(json.UnexpectedEndOfInput) ->
+      Error(Undecodable("not valid JSON (unexpected end of input)"))
+    Error(json.UnexpectedByte(_)) | Error(json.UnexpectedSequence(_)) ->
+      Error(Undecodable("not valid JSON"))
   }
+  case outcome {
+    Ok(_) -> log.debug("brazier.transport", "Decoded client message")
+    Error(refused) ->
+      log.debug(
+        "brazier.transport",
+        "Client message refused: " <> refused.reason,
+      )
+  }
+  outcome
+}
+
+/// Describe decode errors for a log line or an error reason: path, what was
+/// expected and the dynamic type found. The path holds only the decoder's
+/// own keys and list indexes, and `expected` and `found` are fixed text,
+/// so no client text gets into a log line.
+fn describe_decode_errors(errors: List(decode.DecodeError)) -> String {
+  errors
+  |> list.map(fn(err) {
+    let at = case err.path {
+      [] -> "the message"
+      path -> string.join(path, ".")
+    }
+    at <> ": expected " <> err.expected <> ", found " <> err.found
+  })
+  |> string.join("; ")
 }
 
 /// Return the type name of a client message for safe logging.
@@ -1097,15 +1267,33 @@ fn record_rate_violation(
   }
 }
 
-/// Record one undecodable message. The raw text is never logged or echoed
-/// (it may carry user data); only its size is.
-fn record_decode_error(state: ConnectionState, size: Int) -> Next {
+/// Record one refused message: undecodable, or an event with invalid ops.
+/// Both count toward `ws_max_decode_errors`. The raw text is never logged
+/// or echoed (it may carry user data); only its size is, and for invalid
+/// ops the fixed-text reason. The client is sent an `error` frame:
+/// `"Invalid message"`, or `"Invalid event ops"`.
+fn record_decode_error(
+  state: ConnectionState,
+  size: Int,
+  refused: FrameError,
+) -> Next {
   let errors = state.decode_errors + 1
   let state = ConnectionState(..state, decode_errors: errors)
   let max = state.security_limits.ws_max_decode_errors
+  let #(what, reply) = case refused {
+    Undecodable(reason) -> #(
+      "Undecodable message (" <> reason <> ")",
+      "Invalid message",
+    )
+    InvalidOps(reason) -> #(
+      "Event with invalid ops (" <> reason <> ")",
+      "Invalid event ops",
+    )
+  }
   log.warning(
     "brazier.transport",
-    "Undecodable message from "
+    what
+      <> " from "
       <> ctx(state)
       <> " ("
       <> int.to_string(size)
@@ -1129,7 +1317,7 @@ fn record_decode_error(state: ConnectionState, size: Int) -> Next {
         "decode errors exceeded",
       )
     }
-    False -> send_or_stop(state, ServerError(reason: "Invalid message"))
+    False -> send_or_stop(state, ServerError(reason: reply))
   }
 }
 
@@ -1193,7 +1381,8 @@ fn handle_ws_text_decode(state: ConnectionState, text: String) -> Next {
       deliver(gated_state, msg)
     }
     Ok(#(msg, _)) -> dispatch_rate_limited(state, msg, 1)
-    Error(_codec_error) -> record_decode_error(state, string.byte_size(text))
+    Error(refused) ->
+      record_decode_error(state, string.byte_size(text), refused)
   }
 }
 
@@ -2714,9 +2903,12 @@ fn upgrade_outcome_label(outcome: UpgradeOutcome) -> String {
 }
 
 /// Handle a WebSocket upgrade request on a raw socket.
-/// Admission order: global cap, per-IP cap, origin, auth, then RFC 6455
-/// handshake validation. Every rejection is logged with the connection id
-/// and peer address and releases what was acquired.
+/// Admission order: global cap, per-IP cap, origin, auth, RFC 6455
+/// handshake validation, then the route middleware on the page. Every
+/// rejection is logged with the connection id and peer address and
+/// releases what was acquired. The checks before the middleware answer
+/// with an HTTP status; a middleware refusal completes the handshake and
+/// closes with 4600 (`close_refused_upgrade`), so the browser learns of it.
 fn handle_ws_request(
   socket: Socket,
   req: Request(Connection),
@@ -2862,8 +3054,20 @@ fn authorize_ws_request(
                   )
               }
             }
+            // The middleware gate the dead render of that page passed: the
+            // pipeline runs on the page's GET, not on the /ws request
+            // (SEC-2).
             Ok(client_key) ->
-              upgrade_ws_request(socket, config, admission, client_key)
+              upgrade_ws_request(
+                socket,
+                config,
+                admission,
+                client_key,
+                check_middleware(
+                  page_request(req, admission.page),
+                  config.middlewares,
+                ),
+              )
           }
       }
     }
@@ -2875,6 +3079,7 @@ fn upgrade_ws_request(
   config: TransportConfig,
   admission: Admission,
   client_key: String,
+  gate: Result(Nil, response.Response(ResponseBody)),
 ) -> UpgradeOutcome {
   let upgraded = {
     use _ <- result.try(ws.set_send_timeout(
@@ -2884,7 +3089,11 @@ fn upgrade_ws_request(
     ws.send_upgrade_response(socket, client_key)
   }
   case upgraded {
-    Ok(Nil) -> Upgraded(admission)
+    Ok(Nil) ->
+      case gate {
+        Ok(Nil) -> Upgraded(admission)
+        Error(resp) -> close_refused_upgrade(socket, admission, resp.status)
+      }
     Error(reason) -> {
       log.warning(
         "brazier.transport",
@@ -2901,6 +3110,81 @@ fn upgrade_ws_request(
       Refused("upgrade_write_failed")
     }
   }
+}
+
+/// Route middleware refused the page this upgraded socket would mount.
+/// A browser's WebSocket API cannot read the HTTP status of a refused
+/// upgrade (it only reports a failed connection), so the handshake was
+/// completed and the socket closes here with 4600 and
+/// `middleware refused <status>`; the client answers by loading the page
+/// over HTTP, where the middleware's answer is shown. No runtime starts.
+/// Phoenix LiveView does the same one layer up: a join the server refuses
+/// as unauthorized makes the client navigate to the page's URL
+/// (`view.ts` `onJoinError`, `onRedirect({to: this.root.href})`).
+fn close_refused_upgrade(
+  socket: Socket,
+  admission: Admission,
+  status: Int,
+) -> UpgradeOutcome {
+  let Admission(conn_id:, peer_ip:, page:) = admission
+  let opened_at = erlang_monotonic_time()
+  log.warning(
+    "brazier.transport",
+    "Closing WebSocket "
+      <> conn_id
+      <> " (peer "
+      <> peer_ip
+      <> ") with "
+      <> int.to_string(ws.close_middleware_refused)
+      <> ": the middleware answered "
+      <> int.to_string(status)
+      <> " for page "
+      <> log_path.describe(page.path),
+  )
+  let close_frame =
+    ws.encode_close(
+      ws.close_middleware_refused,
+      "middleware refused " <> int.to_string(status),
+    )
+  let #(close_code, label, frames_out, bytes_out) = case
+    server.send_bytes(socket, close_frame)
+  {
+    Ok(Nil) -> #(
+      ws.close_middleware_refused,
+      "middleware_refused",
+      1,
+      bit_array.byte_size(close_frame),
+    )
+    Error(reason) -> {
+      log.warning(
+        "brazier.transport",
+        "Failed to send the middleware refusal close to "
+          <> conn_id
+          <> ": "
+          <> reason,
+      )
+      #(close_abnormal, "send_failed", 0, 0)
+    }
+  }
+  // The slots go back before the connection ends, so the page load the
+  // client makes next, and its new socket, never find them still held.
+  ws.release_ip_slot()
+  release_connection_slot("middleware refused the page")
+  // Linger until the client echoes the close: closing at once would reset
+  // the connection if its first frame is already in flight, and a reset
+  // can drop the close frame before the browser reads its code.
+  transport_http.close_gracefully(socket)
+  telemetry.ws_close(
+    erlang_monotonic_time() - opened_at,
+    0,
+    frames_out,
+    0,
+    bytes_out,
+    close_code,
+    label,
+    conn_id,
+  )
+  Refused("rejected_middleware")
 }
 
 /// 426 Upgrade Required must advertise the supported version (§4.4).
@@ -3309,31 +3593,10 @@ fn decide_ws_framing(
           )
           Refused("rejected_path")
         }
-        // The middleware gate the dead render of that page passed: the
-        // pipeline runs on the page's GET, not on the /ws request (SEC-2).
-        Ok(page) ->
-          case check_middleware(page_request(req, page), config.middlewares) {
-            Ok(Nil) -> handle_ws_request(socket, req, config, guards, page)
-            Error(resp) -> {
-              log.warning(
-                "brazier.transport",
-                "Refusing WebSocket upgrade for page "
-                  <> log_path.describe(page.path)
-                  <> ": the middleware answered "
-                  <> int.to_string(resp.status),
-              )
-              case transport_http.write_response(socket, resp) {
-                Ok(Nil) -> Nil
-                Error(reason) ->
-                  log.error(
-                    "brazier.transport",
-                    "Failed to write middleware rejection: " <> reason,
-                  )
-              }
-              transport_http.close_gracefully(socket)
-              Refused("rejected_middleware")
-            }
-          }
+        // The middleware gate on the page runs last, after the handshake
+        // checks (`authorize_ws_request`), because its refusal is a close
+        // on an upgraded socket.
+        Ok(page) -> handle_ws_request(socket, req, config, guards, page)
       }
     0, buffered -> {
       // RFC 6455 4.1: the client must wait for the handshake response
