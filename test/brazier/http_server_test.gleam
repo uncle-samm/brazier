@@ -33,6 +33,11 @@ fn test_handler(
         |> response.set_header("connection", "close"),
       )
     "/crash" -> crash()
+    "/tree" ->
+      Some(
+        response.new(200)
+        |> response.set_body(Bytes(tree_body())),
+      )
     _ -> {
       let host = case request.get_header(req, "host") {
         Ok(host) -> host
@@ -41,6 +46,20 @@ fn test_handler(
       Some(text_response(200, req.path <> "|" <> host))
     }
   }
+}
+
+/// A body built from many chunks, nested and appended, one of them larger
+/// than a TCP segment.
+fn tree_body() -> bytes_tree.BytesTree {
+  bytes_tree.from_string("head|")
+  |> bytes_tree.append_tree(
+    bytes_tree.concat([
+      bytes_tree.from_string("a"),
+      bytes_tree.from_bit_array(<<"b":utf8>>),
+    ]),
+  )
+  |> bytes_tree.append_string(string.repeat("x", 100_000))
+  |> bytes_tree.append(<<"|tail":utf8>>)
 }
 
 fn text_response(status: Int, body: String) {
@@ -545,6 +564,29 @@ pub fn head_keeps_content_length_without_body_test() {
   server.stop(listener)
 }
 
+// --- Response bodies ---
+
+/// The head and a many-chunk body go out as one iodata send: the length
+/// and bytes on the wire are exactly the tree's, in order.
+pub fn chunked_tree_body_is_sent_whole_and_in_order_test() {
+  let listener = start_server(fast_limits())
+  let socket = open(listener)
+  send(socket, get("/tree"))
+  let expected = bytes_tree.to_bit_array(tree_body())
+  let assert Ok(#(200, headers, body)) = raw_recv_response(socket, 2000, True)
+    as "response with a tree body"
+  let assert Ok(length) = header(headers, "content-length")
+  let assert True = length == int.to_string(bit_array.byte_size(expected))
+  let assert True = <<body:utf8>> == expected
+  // The connection is still framed correctly for the next request.
+  send(socket, get("/after"))
+  let assert Ok(#(200, _, "/after|test")) =
+    raw_recv_response(socket, 2000, True)
+    as "response after the tree body"
+  raw_close(socket)
+  server.stop(listener)
+}
+
 // --- Slow clients ---
 
 pub fn slow_request_line_gets_408_test() {
@@ -562,11 +604,14 @@ pub fn slow_headers_get_408_test() {
   let listener = start_server(fast_limits())
   let socket = open(listener)
   send(socket, "GET / HTTP/1.1\r\nHost: x\r\n")
-  // Drip one header byte at a time; the deadline still expires. The delays
-  // are the thing under test: a slow client is one that waits between
-  // bytes, and a slower scheduler only makes it slower.
-  let assert Ok(Nil) = raw_sleep_then_send(socket, 100, <<"X":utf8>>)
-  let assert Ok(Nil) = raw_sleep_then_send(socket, 100, <<"-":utf8>>)
+  // Keep dripping header bytes, one every 50 ms of silence from the
+  // server, until it answers. Bytes keep arriving, yet the 300 ms deadline
+  // on the whole head (pre_upgrade_timeout_ms) expires: 408. Each wait is a
+  // recv that ends as soon as the server writes; 100 drips (5 s) bound the
+  // test far past the deadline.
+  let assert Ok(drips) = raw_drip_until_answer(socket, 50, 100, <<"X":utf8>>)
+    as "the server must answer a slow header section"
+  let assert True = drips >= 1
   let assert Ok(#(408, _, _)) = raw_recv_response(socket, 2000, True)
     as "slow header section must time out with 408"
   assert_closed(socket)
@@ -731,12 +776,13 @@ fn raw_acceptor_pool(
   acceptor: process.Pid,
 ) -> Result(process.Pid, Nil)
 
-@external(erlang, "brazier_http_raw_ffi", "sleep_then_send")
-fn raw_sleep_then_send(
+@external(erlang, "brazier_http_raw_ffi", "drip_until_answer")
+fn raw_drip_until_answer(
   socket: Socket,
-  delay_ms: Int,
+  interval_ms: Int,
+  max_drips: Int,
   data: BitArray,
-) -> Result(Nil, String)
+) -> Result(Int, String)
 
 @external(erlang, "brazier_http_raw_ffi", "recv_response")
 fn raw_recv_response(
