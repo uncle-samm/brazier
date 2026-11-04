@@ -119,9 +119,13 @@ let syncGaveUp = false;
 let readyForServerEvents = false;
 let syncRequestInFlight = false;
 let appRoot = null;
+// Events and navigations take their clocks from this one counter, so an ack
+// orders them: an ack_clock of a navigation's clock or more is a frame the
+// server sent after it handled that navigation.
 let eventClock = 0;
 let currentModelVersion = 0;
-// The highest event clock the server has acknowledged on this connection.
+// The highest event or navigation clock the server has acknowledged on this
+// connection.
 let latestAckClock = 0;
 // The highest event clock written to the current socket.
 let writtenEventClock = 0;
@@ -667,6 +671,14 @@ function connect() {
   }
   pendingModelEventClock = queuedClock;
   predicted = queuedClock > 0;
+  // A navigation written to the old socket is never acknowledged on this
+  // one, but the join is for the current URL, so its model_sync renders the
+  // page the navigation went to. A still-queued navigate keeps its clock.
+  const scroll = pendingFragmentScroll;
+  if (scroll !== null && !outbound.some((msg) => msg.type === "navigate" && msg.clock === scroll.clock)) {
+    trace("reconnect.fragment_scroll_on_join", { hash: scroll.hash, clock: scroll.clock });
+    pendingFragmentScroll = { hash: scroll.hash, clock: 0 };
+  }
   readyForServerEvents = false;
   socketJoined = false;
   modelSynced = false;
@@ -1057,6 +1069,7 @@ function handleModelSync(model, version, ackClock) {
   reconnectAttempts = 0;
   console.log("[brazier] Model synced v" + version);
   trace("model_sync", { version, ackClock });
+  if (!held) resolveFragmentScroll();
   readyForServerEvents = true;
   flushPendingEarlyEvents();
   pumpOutbound();
@@ -1154,6 +1167,7 @@ function handlePatch(ops, version, ackClock) {
   currentModelVersion = version;
   console.log("[brazier] Patch applied v" + version + " (" + ops.length + " ops)");
   trace("patch", { version, ackClock, ops: ops.length });
+  resolveFragmentScroll();
   mark("patch-end");
   measure("patch", "patch-start", "patch-end");
 }
@@ -1169,19 +1183,27 @@ function handleAckPatch(version, ackClock) {
   markServerAckApplied(ackClock);
   trace("patch.ack", { version, ackClock });
   if (hasPendingModelEvent()) return;
-  if (!wasPending && !(wasLocked && !inputLocked())) return;
+  // The page shows the cached model unless a prediction or a locked input
+  // needs the re-render below.
+  if (!wasPending && !(wasLocked && !inputLocked())) {
+    resolveFragmentScroll();
+    return;
+  }
   try {
     const failure = adoptAuthoritativeModel(clientModelJson);
     if (failure !== null) {
       console.error("[brazier] Cached model v" + version + " cannot be decoded after ack (" + failure + "); requesting full sync");
       invalidateModelCache();
       requestFullSync("ack_decode_failed");
+      return;
     }
   } catch (e) {
     console.error("[brazier] Re-render after ack failed:", e);
     invalidateModelCache();
     requestFullSync("ack_render_failed");
+    return;
   }
+  resolveFragmentScroll();
 }
 
 function requestFullSync(reason) {
@@ -1211,6 +1233,76 @@ function currentPath() {
 // between two of them) changes the URL but not this path, and fires
 // popstate; it is the same page, so no navigate is sent for it.
 let routePath = null;
+
+// A live navigation to another page's #fragment, waiting for that page:
+// { hash, clock }, clock being the navigate's. The browser does not scroll
+// for pushState, and the new page exists only once the server's answer to
+// the navigate is rendered, so the first applied frame whose ack_clock
+// covers the clock scrolls to the fragment, or to the top when the page has
+// no such element. LiveView's Browser.pushState does the same after the
+// patch reply is rendered (getHashTargetEl, then scrollIntoView, else
+// window.scroll(0, 0)).
+let pendingFragmentScroll = null;
+
+// Tell the server about a route change. `path` is what the server routes on
+// (pathname and search) and `hash` the URL's fragment ("" for none). The
+// navigate takes its clock from the event counter, so the frame that shows
+// the new page is the first one acknowledging it.
+function sendNavigate(path, hash) {
+  const clock = ++eventClock;
+  pendingFragmentScroll = hash === "" || hash === "#" ? null : { hash, clock };
+  if (!send({ type: "navigate", path, clock })) {
+    // send() reported the full queue; the page will not change, so there is
+    // no fragment of it to scroll to.
+    pendingFragmentScroll = null;
+    return;
+  }
+  if (pendingFragmentScroll !== null) trace("navigate.fragment_pending", { path, hash, clock });
+}
+
+// The element a fragment names: the HTML indicated-part rules (an element
+// with that id, else an <a> with that name), for the fragment as written
+// and then percent-decoded, as LiveView's getHashTargetEl and the browser
+// look it up.
+function fragmentTarget(hash) {
+  const raw = hash.slice(1);
+  const candidates = [raw];
+  try {
+    const decoded = decodeURIComponent(raw);
+    if (decoded !== raw) candidates.push(decoded);
+  } catch (e) {
+    console.warn("[brazier] The fragment " + JSON.stringify(hash) + " is not valid percent-encoding (" + e.message + "); looking it up only as written");
+  }
+  for (const name of candidates) {
+    const byId = document.getElementById(name);
+    if (byId) return byId;
+    const anchor = Array.from(document.getElementsByName(name)).find((node) => node.tagName === "A");
+    if (anchor) return anchor;
+  }
+  return null;
+}
+
+// Called after every applied (not held) model_sync, patch or ack.
+function resolveFragmentScroll() {
+  const pending = pendingFragmentScroll;
+  if (pending === null || latestAckClock < pending.clock) return;
+  pendingFragmentScroll = null;
+  // The user moved to another fragment (an in-page link) before the page
+  // arrived; the browser already scrolled for that one.
+  if (location.hash !== pending.hash) {
+    trace("navigate.fragment_superseded", { hash: pending.hash, now: location.hash });
+    return;
+  }
+  const target = fragmentTarget(pending.hash);
+  if (target) {
+    target.scrollIntoView();
+    trace("navigate.fragment_scroll", { hash: pending.hash });
+    return;
+  }
+  console.warn("[brazier] The page has no element for the fragment " + JSON.stringify(pending.hash) + " (no id, no <a name>); scrolled to the top");
+  window.scrollTo(0, 0);
+  trace("navigate.fragment_missing", { hash: pending.hash });
+}
 
 // Why the server's navigation target is not a same-origin path of this
 // page, or null. See localPathRefusal.
@@ -1243,7 +1335,11 @@ function handleServerNavigate(path, replace) {
   if (replace) history.replaceState(null, "", path);
   else history.pushState(null, "", path);
   routePath = currentPath();
-  send({ type: "navigate", path });
+  // As for a link, the server is told the path without the fragment (a URL's
+  // first "#" starts it) and the client scrolls to the fragment once the
+  // page is rendered.
+  const hashAt = path.indexOf("#");
+  sendNavigate(hashAt < 0 ? path : path.slice(0, hashAt), hashAt < 0 ? "" : location.hash);
 }
 
 // Hard navigation: a full page load, e.g. to receive Set-Cookie headers.
@@ -1295,7 +1391,7 @@ function setupNavigation() {
     // server is told only the path, which is what it routes on.
     history.pushState(null, "", path + url.hash);
     routePath = path;
-    send({ type: "navigate", path });
+    sendNavigate(path, url.hash);
   });
   // Back and forward. Moving between fragments of the same page fires
   // popstate too, and is not a navigation: LiveView's popstate handler
@@ -1308,7 +1404,9 @@ function setupNavigation() {
     }
     leaveRoute(path);
     routePath = path;
-    send({ type: "navigate", path });
+    // Back and forward keep the browser's scroll restoration, so no
+    // fragment scroll is scheduled (and a pending one is dropped).
+    sendNavigate(path, "");
   });
 }
 

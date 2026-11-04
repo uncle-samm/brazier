@@ -320,7 +320,11 @@ pub fn routed_navigation_reports_the_route_message_test() {
   use events <- listen()
   process.send(
     session.runtime,
-    runtime.ClientNavigated(conn_id: session.conn_id, path: "/settings"),
+    runtime.ClientNavigated(
+      conn_id: session.conn_id,
+      path: "/settings",
+      clock: 0,
+    ),
   )
   assert_tags(
     stop_of(events, "navigate", session.conn_id),
@@ -338,7 +342,7 @@ pub fn unroutable_navigation_reports_unknown_test() {
   use events <- listen()
   process.send(
     session.runtime,
-    runtime.ClientNavigated(conn_id: session.conn_id, path: "/nope"),
+    runtime.ClientNavigated(conn_id: session.conn_id, path: "/nope", clock: 0),
   )
   assert_tags(
     stop_of(events, "navigate", session.conn_id),
@@ -356,7 +360,11 @@ pub fn navigation_without_router_reports_unknown_test() {
   use events <- listen()
   process.send(
     session.runtime,
-    runtime.ClientNavigated(conn_id: session.conn_id, path: "/elsewhere"),
+    runtime.ClientNavigated(
+      conn_id: session.conn_id,
+      path: "/elsewhere",
+      clock: 0,
+    ),
   )
   assert_tags(
     stop_of(events, "navigate", session.conn_id),

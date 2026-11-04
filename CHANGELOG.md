@@ -208,6 +208,18 @@ with its own changelog, so they are not listed here.
 
 ### Added
 
+- (M117 transport follow-ups) A live navigation to another page's fragment
+  (`/docs#install`, by a link or `router.push`) scrolls to it once the new
+  page is rendered: to the element with that id, else the `<a>` with that
+  name, or to the top with a console warning when there is neither, as
+  LiveView's `Browser.pushState` does. To find that render, the client's
+  `navigate` now carries a `clock` from the events' counter and the server
+  acknowledges it like an event: the frame with the navigation's state
+  carries `ack_clock` = `clock`, and a navigation that leaves the model as
+  it was gets an empty ack patch (it used to get no frame). The field is
+  additive: a `navigate` without `clock` is acknowledged at 0. A
+  `router.push` path's fragment is no longer sent to the server.
+
 - (WS1) Supervised HTTP listener with an acceptor pool, keep-alive and
   `Connection: close`. It binds to port 0 and reports the bound port.
 - (WS1) A connection tracker owned by a supervised process, so a connection

@@ -337,7 +337,7 @@ pub fn navigation_runs_on_change_for_known_route_test() {
   let #(subject, transport_subject, _first) = join_routed("/", "r_nav")
   process.send(
     subject,
-    runtime.ClientNavigated(conn_id: "r_nav", path: "/settings?tab=a"),
+    runtime.ClientNavigated(conn_id: "r_nav", path: "/settings?tab=a", clock: 0),
   )
   let assert Ok(transport.SendPatch(ops_json: ops, version: 1, ack_clock: 0)) =
     process.receive(transport_subject, await.deadline_ms)
@@ -366,7 +366,11 @@ pub fn join_and_navigation_logs_omit_the_query_test() {
         join_routed("/settings?tab=s3cr3t-join", "r_log")
       process.send(
         subject,
-        runtime.ClientNavigated(conn_id: "r_log", path: "/?tab=s3cr3t-nav"),
+        runtime.ClientNavigated(
+          conn_id: "r_log",
+          path: "/?tab=s3cr3t-nav",
+          clock: 0,
+        ),
       )
       // The patch is sent after the navigation is logged.
       let assert Ok(transport.SendPatch(ops_json: ops, ..)) =
@@ -392,7 +396,7 @@ pub fn navigation_to_same_route_runs_on_change_again_test() {
   let #(subject, transport_subject, _first) = join_routed("/settings", "r_same")
   process.send(
     subject,
-    runtime.ClientNavigated(conn_id: "r_same", path: "/settings"),
+    runtime.ClientNavigated(conn_id: "r_same", path: "/settings", clock: 0),
   )
   let assert Ok(transport.SendPatch(ops_json: ops, version: 1, ..)) =
     process.receive(transport_subject, await.deadline_ms)
@@ -403,7 +407,7 @@ pub fn navigation_to_unknown_route_hard_navigates_test() {
   let #(subject, transport_subject, _first) = join_routed("/", "r_404")
   process.send(
     subject,
-    runtime.ClientNavigated(conn_id: "r_404", path: "/nope"),
+    runtime.ClientNavigated(conn_id: "r_404", path: "/nope", clock: 0),
   )
   let assert Ok(transport.SendHardNavigate(path: "/nope")) =
     process.receive(transport_subject, await.deadline_ms)
@@ -413,7 +417,7 @@ pub fn navigation_with_bad_encoding_hard_navigates_test() {
   let #(subject, transport_subject, _first) = join_routed("/", "r_400")
   process.send(
     subject,
-    runtime.ClientNavigated(conn_id: "r_400", path: "/users/%E0%A4"),
+    runtime.ClientNavigated(conn_id: "r_400", path: "/users/%E0%A4", clock: 0),
   )
   let assert Ok(transport.SendHardNavigate(path: "/users/%E0%A4")) =
     process.receive(transport_subject, await.deadline_ms)
@@ -429,7 +433,7 @@ pub fn navigation_to_non_local_path_is_refused_test() {
     fn(path) {
       process.send(
         subject,
-        runtime.ClientNavigated(conn_id: "r_ext", path: path),
+        runtime.ClientNavigated(conn_id: "r_ext", path: path, clock: 0),
       )
       let assert Ok(transport.SendError(reason: reason)) =
         process.receive(transport_subject, await.deadline_ms)
@@ -453,6 +457,7 @@ pub fn refused_navigation_log_omits_the_query_test() {
         runtime.ClientNavigated(
           conn_id: "r_ext_log",
           path: "//evil.example/x?token=s3cr3t",
+          clock: 0,
         ),
       )
       // The refusal is logged before it is sent.
@@ -478,7 +483,7 @@ pub fn navigation_without_router_hard_navigates_test() {
   let #(transport_subject, _first) = join_and_receive(subject, "no_router", "")
   process.send(
     subject,
-    runtime.ClientNavigated(conn_id: "no_router", path: "/elsewhere"),
+    runtime.ClientNavigated(conn_id: "no_router", path: "/elsewhere", clock: 0),
   )
   let assert Ok(transport.SendHardNavigate(path: "/elsewhere")) =
     process.receive(transport_subject, await.deadline_ms)

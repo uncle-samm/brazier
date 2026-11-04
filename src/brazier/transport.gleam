@@ -81,8 +81,12 @@ pub type ClientMessage {
   /// Includes an optional session token for state recovery
   /// and the current URL path for route-aware apps.
   ClientJoin(token: String, path: String)
-  /// Client navigated to a new URL path (SPA navigation).
-  ClientNavigate(path: String)
+  /// Client navigated to a new URL path (SPA navigation). `clock` is
+  /// stamped from the same counter as the events' clocks, and the frame
+  /// that carries the navigation's state acknowledges it (`ack_clock`), so
+  /// the client knows which render shows the new page (it scrolls to the
+  /// URL's fragment then). Absent on the wire is 0, as for an event.
+  ClientNavigate(path: String, clock: Int)
   /// Client requests a full authoritative model sync without remounting HTML.
   ClientRequestSync
   /// Batch of events: LOCAL events replayed + MODEL event at the end.
@@ -817,7 +821,8 @@ fn client_frame_decoder() -> decode.Decoder(ClientFrame) {
     }
     "navigate" -> {
       use path <- decode.field("path", decode.string)
-      decode.success(#(ClientNavigate(path: path), None))
+      use clock <- decode.optional_field("clock", 0, decode.int)
+      decode.success(#(ClientNavigate(path: path, clock: clock), None))
     }
     "request_sync" -> decode.success(#(ClientRequestSync, None))
     "event_batch" -> {
@@ -1034,7 +1039,7 @@ pub fn get_client_message_type(msg: ClientMessage) -> String {
     ClientEvent(name: name, ..) -> "event:" <> string.inspect(name)
     ClientHeartbeat -> "heartbeat"
     ClientJoin(..) -> "join"
-    ClientNavigate(path: path) -> "navigate:" <> log_path.describe(path)
+    ClientNavigate(path: path, ..) -> "navigate:" <> log_path.describe(path)
     ClientRequestSync -> "request_sync"
     ClientEventBatch(..) -> "event_batch"
   }
@@ -1375,7 +1380,7 @@ fn handle_ws_text_decode(state: ConnectionState, text: String) -> Next {
         Error(stop) -> stop
       }
     }
-    Ok(#(ClientNavigate(path:) as msg, _)) -> {
+    Ok(#(ClientNavigate(path:, ..) as msg, _)) -> {
       use new_state <- admit_rate_limited(state, msg, 1)
       use gated_state <- gate_live_page(new_state, NavigateGate, path)
       deliver(gated_state, msg)

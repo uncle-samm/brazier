@@ -320,7 +320,7 @@ pub fn navigation_to_the_admin_page_is_answered_with_a_hard_navigation_test() {
   })
   // None of them reached the runtime: its first message is this one.
   send_text(socket, navigate_json("/about"))
-  let assert Ok(GotEvent(cid, transport.ClientNavigate(path: "/about"))) =
+  let assert Ok(GotEvent(cid, transport.ClientNavigate(path: "/about", ..))) =
     process.receive(observer, 3000)
   let assert True = cid == conn_id
   raw_close(socket)
@@ -332,7 +332,7 @@ pub fn navigation_to_the_admin_page_with_the_cookie_is_admitted_test() {
   let #(listener, port, observer) = start_server()
   let #(socket, conn_id) = open(port, observer, "%2F", [admin_cookie])
   send_text(socket, navigate_json("/admin"))
-  let assert Ok(GotEvent(cid, transport.ClientNavigate(path: "/admin"))) =
+  let assert Ok(GotEvent(cid, transport.ClientNavigate(path: "/admin", ..))) =
     process.receive(observer, 3000)
   let assert True = cid == conn_id
   raw_close(socket)

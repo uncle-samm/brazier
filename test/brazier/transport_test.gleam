@@ -174,7 +174,7 @@ pub fn decode_event_with_data_test() {
 
 pub fn decode_navigate_test() {
   let raw = "{\"type\":\"navigate\",\"path\":\"/about\"}"
-  let assert Ok(transport.ClientNavigate(path: "/about")) =
+  let assert Ok(transport.ClientNavigate(path: "/about", clock: 0)) =
     transport.decode_client_message(raw)
 }
 

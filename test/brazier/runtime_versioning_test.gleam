@@ -213,7 +213,7 @@ pub fn navigation_before_join_is_rejected_test() {
   let assert Ok("/") = process.receive(proof, 1000)
     as "the runtime's start did not apply the route for /"
   let s = connect(rt, "c")
-  process.send(rt, runtime.ClientNavigated(conn_id: "c", path: "/a"))
+  process.send(rt, runtime.ClientNavigated(conn_id: "c", path: "/a", clock: 0))
   let assert transport.SendError(reason: "navigation received before join") =
     next(s)
     as "a navigation before join was not refused with 'navigation received before join'"
@@ -415,22 +415,27 @@ pub fn navigation_bumps_revision_only_when_model_changes_test() {
 
   // A navigation that changes the model: one revision, sent to every joined
   // connection including the navigator.
-  process.send(rt, runtime.ClientNavigated(conn_id: "a", path: "/a"))
+  process.send(rt, runtime.ClientNavigated(conn_id: "a", path: "/a", clock: 1))
   let assert Ok("/a") = process.receive(proof, 1000)
     as "navigating to /a did not run the route handler"
-  let assert transport.SendPatch(ops_json: ops, version: 1, ack_clock: 0) =
+  let assert transport.SendPatch(ops_json: ops, version: 1, ack_clock: 1) =
     next(a)
-    as "the navigation to /a did not patch the navigator to revision 1"
+    as "the navigation to /a did not patch the navigator to revision 1, ack 1"
   let assert True = string.contains(ops, "/path")
     as "the navigation patch does not touch /path"
   let assert transport.SendPatch(version: 1, ..) = next(b)
     as "the navigation to /a did not patch b to revision 1"
 
   // Navigating to the same route re-runs on_route_change (like LiveView's
-  // handle_params) but the JSON is unchanged: no patch, no new revision.
-  process.send(rt, runtime.ClientNavigated(conn_id: "a", path: "/a"))
+  // handle_params) but the JSON is unchanged: no new revision, and only the
+  // navigator gets a frame, the empty ack for its navigation's clock (as for
+  // an unchanged event).
+  process.send(rt, runtime.ClientNavigated(conn_id: "a", path: "/a", clock: 2))
   let assert Ok("/a") = process.receive(proof, 1000)
     as "navigating to /a again did not re-run the route handler"
+  let assert transport.SendPatch(ops_json: "[]", version: 1, ack_clock: 2) =
+    next(a)
+    as "the same-route navigation was not acked to a at revision 1, ack 2"
   let assert transport.SendModelSync(version: 1, ..) = barrier(rt, "a", a)
     as "the same-route navigation sent a a patch or moved the revision"
   let assert transport.SendModelSync(version: 1, ..) = barrier(rt, "b", b)
@@ -958,31 +963,35 @@ fn record_session() -> #(List(String), String, Int) {
     as "b's change did not patch b to revision 2"
 
   // Navigation that changes the model, then one that does not.
-  process.send(rt, runtime.ClientNavigated(conn_id: "a", path: "/a"))
+  // A navigation's clock comes from the same counter as a's events.
+  process.send(rt, runtime.ClientNavigated(conn_id: "a", path: "/a", clock: 3))
   let assert Ok("/a") = process.receive(proof, 1000)
     as "a's navigation to /a did not run the route handler"
   let f4 = next(a)
-  let assert transport.SendPatch(version: 3, ..) = f4
-    as "frame 4 is not the /a navigation patch at revision 3"
+  let assert transport.SendPatch(version: 3, ack_clock: 3, ..) = f4
+    as "frame 4 is not the /a navigation patch at revision 3, ack 3"
   let assert transport.SendPatch(version: 3, ..) = next(b)
     as "the /a navigation did not patch b to revision 3"
-  process.send(rt, runtime.ClientNavigated(conn_id: "a", path: "/a"))
+  process.send(rt, runtime.ClientNavigated(conn_id: "a", path: "/a", clock: 4))
   let assert Ok("/a") = process.receive(proof, 1000)
     as "a's repeat navigation to /a did not re-run the route handler"
+  let f4b = next(a)
+  let assert transport.SendPatch(ops_json: "[]", version: 3, ack_clock: 4) = f4b
+    as "frame 4b is not the repeat navigation's empty ack at revision 3, ack 4"
 
   // A failing event: error (not a state frame), then an ack.
-  event(rt, "a", "bogus", 3)
+  event(rt, "a", "bogus", 5)
   let assert transport.SendError(..) = next(a)
     as "a's undecodable event reported no error"
   let f5 = next(a)
-  let assert transport.SendPatch(ops_json: "[]", version: 3, ack_clock: 3) = f5
-    as "frame 5 is not the failing event's empty ack at revision 3, ack 3"
+  let assert transport.SendPatch(ops_json: "[]", version: 3, ack_clock: 5) = f5
+    as "frame 5 is not the failing event's empty ack at revision 3, ack 5"
 
   // Rejoin: full resync at the current revision.
   process.send(rt, runtime.ClientJoined(conn_id: "a", token: "", path: "/a"))
   let f6 = next(a)
-  let assert transport.SendModelSync(version: 3, ack_clock: 3, ..) = f6
-    as "frame 6 is not a's rejoin model_sync at revision 3, ack 3"
+  let assert transport.SendModelSync(version: 3, ack_clock: 5, ..) = f6
+    as "frame 6 is not a's rejoin model_sync at revision 3, ack 5"
 
   // A join on another route changes the model for everyone already joined.
   let c = join(rt, "c", "/")
@@ -998,19 +1007,19 @@ fn record_session() -> #(List(String), String, Int) {
   process.send(
     rt,
     runtime.ClientEventBatchReceived(conn_id: "a", events: [
-      #("click", "inc", "{}", "0", 4, []),
-      #("click", "noop", "{}", "0", 5, []),
       #("click", "inc", "{}", "0", 6, []),
+      #("click", "noop", "{}", "0", 7, []),
+      #("click", "inc", "{}", "0", 8, []),
     ]),
   )
   let f8 = next(a)
-  let assert transport.SendPatch(version: 5, ack_clock: 6, ..) = f8
-    as "frame 8 is not the batch's single patch at revision 5, ack 6"
+  let assert transport.SendPatch(version: 5, ack_clock: 8, ..) = f8
+    as "frame 8 is not the batch's single patch at revision 5, ack 8"
 
   let assert transport.SendModelSync(model_json: final_json, version: 5, ..) =
     barrier(rt, "a", a)
     as "a's final barrier got no model_sync at revision 5"
-  let frames = list.map([f0, f1, f2, f3, f4, f5, f6, f7, f8], wire)
+  let frames = list.map([f0, f1, f2, f3, f4, f4b, f5, f6, f7, f8], wire)
   #(frames, final_json, 5)
 }
 
@@ -1080,8 +1089,8 @@ pub fn client_replay_of_server_frames_matches_final_sync_test() {
   let assert Ok(output) =
     replay_on_client("sync_ok.json", frames, final_json, final_version)
     as "the client rejected the replay of the recorded server frames"
-  let assert True = string.contains(output, "9 replayed frames")
-    as "the client did not replay all 9 recorded frames"
+  let assert True = string.contains(output, "10 replayed frames")
+    as "the client did not replay all 10 recorded frames"
 }
 
 /// The browser runtime itself (startup checks, the socket URL, close codes,
@@ -1097,6 +1106,6 @@ pub fn client_replay_of_server_frames_matches_final_sync_test() {
 pub fn client_runtime_behaviour_harness_test() {
   let assert Ok(output) = run_node("brazier_client/test/ffi_harness.mjs", "")
     as "the client FFI harness failed; run node brazier_client/test/ffi_harness.mjs"
-  let assert True = string.contains(output, "ffi harness ok: 55 scenarios")
-    as "the client FFI harness did not run all 55 scenarios"
+  let assert True = string.contains(output, "ffi harness ok: 58 scenarios")
+    as "the client FFI harness did not run all 58 scenarios"
 }

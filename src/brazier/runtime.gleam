@@ -156,7 +156,9 @@ pub type RuntimeMessage(msg) {
     ),
   )
   /// A client navigated to a new URL path.
-  ClientNavigated(conn_id: transport.ConnectionId, path: String)
+  /// `clock` is the navigation's event clock: the frame with its state, or
+  /// an ack when the model did not change, acknowledges it.
+  ClientNavigated(conn_id: transport.ConnectionId, path: String, clock: Int)
   /// Client requested a full model sync without a remount.
   ClientSyncRequested(conn_id: transport.ConnectionId)
   /// Set the listener subject for dynamic subscription management.
@@ -895,7 +897,7 @@ fn handle_message(
         True -> actor.continue(handle_batch(state, conn_id, events))
       }
 
-    ClientNavigated(conn_id, path) ->
+    ClientNavigated(conn_id, path, clock) ->
       case set.contains(state.joined, conn_id) {
         False ->
           actor.continue(reject_before_join(state, conn_id, "navigation"))
@@ -904,7 +906,12 @@ fn handle_message(
             "brazier.runtime",
             "Navigation: " <> conn_id <> " → " <> log_path(path),
           )
-          actor.continue(handle_navigation(state, conn_id, path))
+          // Acknowledged like an event (LiveView answers a live_patch with
+          // a reply), so the client can tell the render of the new page
+          // from a broadcast that arrives before it.
+          let state = record_ack(state, conn_id, clock)
+          let #(state, answered) = handle_navigation(state, conn_id, path)
+          actor.continue(ack_if_unchanged(state, conn_id, answered))
         }
       }
 
@@ -1530,11 +1537,16 @@ fn route_for_path(
 /// A client navigation (link click, back/forward, or the client's half of
 /// `router.push`/`replace`). Like LiveView's `handle_params` on every live
 /// patch, `on_change` always runs for a known route.
+///
+/// Returns whether the client was already answered: by the broadcast of a
+/// changed model, or by the `hard_navigate` or `error` of a refusal. When
+/// it was not (`on_change` left the model as it was), the caller sends an
+/// ack, so every navigation the runtime handles gets an answer.
 fn handle_navigation(
   state: RuntimeState(model, msg),
   conn_id: transport.ConnectionId,
   path: String,
-) -> RuntimeState(model, msg) {
+) -> #(RuntimeState(model, msg), Bool) {
   let resolved = case state.route {
     None -> Error(NoRouter)
     Some(route) ->
@@ -1544,18 +1556,18 @@ fn handle_navigation(
   case resolved {
     Ok(msg) -> {
       let state = RuntimeState(..state, current_route_msg: Some(msg))
-      let #(state, _changed) =
-        run_update_for(state, msg, Some(conn_id), Some(telemetry.Navigate))
-      state
+      run_update_for(state, msg, Some(conn_id), Some(telemetry.Navigate))
     }
-    Error(problem) ->
+    Error(problem) -> #(
       telemetry.runtime_span(
         telemetry.Navigate,
         transport.page_route,
         unknown_event,
         conn_id,
         fn() { refuse_navigation(state, conn_id, path, problem) },
-      )
+      ),
+      True,
+    )
   }
 }
 
@@ -2753,10 +2765,10 @@ fn forward_client_message(
             ClientJoined(conn_id: conn_id, token: token, path: path),
           )
       }
-    transport.ClientNavigate(path) ->
+    transport.ClientNavigate(path, clock) ->
       process.send(
         runtime_subject,
-        ClientNavigated(conn_id: conn_id, path: path),
+        ClientNavigated(conn_id: conn_id, path: path, clock: clock),
       )
     transport.ClientRequestSync ->
       process.send(runtime_subject, ClientSyncRequested(conn_id: conn_id))

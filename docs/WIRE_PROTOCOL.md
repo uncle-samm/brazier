@@ -113,10 +113,29 @@ reconnect does not release a burst of heartbeats.
 
 **navigate** -- Client-side SPA navigation: a same-origin link click,
 back/forward, or the client following a server `navigate`. Debounced events
-of the old page are sent before it.
+of the old page are sent before it. `path` is the pathname and search; the
+URL's fragment stays in the browser. `clock` comes from the same per-connection
+counter as the events' clocks, and the server acknowledges it like an event:
+the first `model_sync` or `patch` it sends this connection after handling the
+navigation carries `ack_clock` = `clock`, and a navigation that leaves the
+client-visible model as it was is answered with an ack (an empty patch). A
+navigation the server refuses (`hard_navigate`, `error`) gets no ack. A
+`navigate` without `clock` is acknowledged at 0; one whose `clock` is not an
+integer is malformed.
 ```json
-{"type": "navigate", "path": "/about"}
+{"type": "navigate", "path": "/about", "clock": 7}
 ```
+That ack is how the browser client finds the frame that shows the new page.
+After a link click or a server `navigate` to a URL with a fragment
+(`/docs#install`), it scrolls once the first applied frame with `ack_clock` ≥
+the navigate's clock is rendered: to the element whose id is the fragment,
+else to the `<a>` with that `name` (the fragment as written, then
+percent-decoded), and to the top of the page, with a console warning, when
+there is neither. This is LiveView's `Browser.pushState` after a patch reply
+(`getHashTargetEl`, `scrollIntoView`, else `window.scroll(0, 0)`). Back and
+forward keep the browser's scroll restoration and schedule no scroll. A
+navigate written to a socket that dropped before its ack is answered by the
+next connection's join `model_sync`, whose page is the current URL's.
 The middleware runs on a `GET` of the target page first, as it does at the
 upgrade. A page it refuses is not navigated to: the server sends
 `hard_navigate` to the path, so the browser loads it over HTTP and gets the
@@ -157,8 +176,8 @@ client-visible model JSON. `version` is the revision the patch produces.
 {"type": "patch", "ops": [{"op": "replace", "path": "/count", "value": 2}], "version": 2, "ack_clock": 2}
 ```
 A patch with `"ops": []` is an **ack**: the server processed the
-connection's events up to `ack_clock` without changing the client-visible
-model. Its `version` is the current revision, not a new one.
+connection's events and navigations up to `ack_clock` without changing the
+client-visible model. Its `version` is the current revision, not a new one.
 ```json
 {"type": "patch", "ops": [], "version": 2, "ack_clock": 3}
 ```
@@ -182,7 +201,8 @@ server escape every quote in the model and the client parse it twice.
 
 **navigate** -- Server-initiated navigation (`router.push` / `router.replace`).
 The client pushes the path onto the history, or replaces the current entry
-when `replace` is true, and answers with its own `navigate`. A path that is not
+when `replace` is true, and answers with its own `navigate` for the path
+without its fragment, scrolling to the fragment as for a link. A path that is not
 local (does not start with `/`, or starts with `//`) is logged as an error and
 ignored; the current path is not navigated again.
 ```json
@@ -268,8 +288,8 @@ syncs on that connection (a reload recovers). A new connection starts over.
 
 ## Event Clocking
 
-Each `event` has a monotonic `clock`. The server keeps the highest clock it has
-processed per connection and echoes it back as `ack_clock` on `model_sync` and
+Each `event` and `navigate` has a monotonic `clock`, from one counter. The
+server keeps the highest clock it has processed per connection and echoes it back as `ack_clock` on `model_sync` and
 `patch`, so the client knows which of its optimistic events the server state
 already includes. A frame whose `ack_clock` is behind the client's pending
 model event is held until the server catches up. `clock` and `ack_clock` are
