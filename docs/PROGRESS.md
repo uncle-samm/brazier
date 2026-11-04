@@ -302,6 +302,19 @@
           - the `rejected_middleware` retry;
           - keyed morph;
           - telemetry and presence cleanup, `watch_info`/`unwatch`, `sleep_ms`, the exact exit reason, and the `peer.eventually` polls.
+    - Wave 5: follow-ups from waves 3 and 4 that are worth fixing before final verification. Started 2026-11-04 at e798211 as three agents with disjoint files, while w4-bench-gate is still running:
+      - **w5-transport-client** owns transport, `brazier_client` and `priv/static`. It takes:
+        - the server side of `rejected_middleware`: complete the handshake, then close with a 4xxx refusal code that makes the client hard-navigate;
+        - raw JSON `ops` in client-to-server `event` messages;
+        - the fragment scroll after a live navigation;
+        - the duplicate proxy-hop and security-limits logs;
+        - the bundle, the examples and a CDP desktop run.
+      - **w5-store-build** owns the store, CRDT, replica and build FFI. It takes the refused-payload telemetry event, an incremental `crdt.fingerprint`, and an honest `absolute_path`.
+      - **w5-test-hygiene** owns test files and test FFIs only. It takes:
+        - scoped watch and telemetry cleanup in the remaining tests;
+        - the stray `[brazier, ws, upgrade, stop]` handler leak;
+        - the `peer.eventually` polls in cluster_test and membership_test;
+        - the cluster test FFI counter races.
     - PERF-11 (about 0.5µs of telemetry span cost per event with no handler) is accepted within the overhead budget already recorded, and is not fixed.
   - [x] fix-crdt (PERF-7), merged as 461baf2.
     - The fix: `join_keys` finds removed dots from whichever is smaller, the delta's context or the key. This is the delta-state dot-set join (Almeida, Shoker and Baquero; delta_crdt_ex `join_dot_sets`).
