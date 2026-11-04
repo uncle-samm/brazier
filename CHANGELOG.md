@@ -102,6 +102,12 @@ with its own changelog, so they are not listed here.
   `TableTypeMismatch` or `TableOwnerUnavailable`, not an alias of the
   internal `state_manager.EtsError`. `replicated.InvalidName` carries
   `name` and `reason`.
+- (Final audit) `element.memo` is removed (see Removed).
+  `attribute.attribute` crashes on `srcdoc` (use `attribute.unsafe_srcdoc`)
+  and on `attributeName` with a value containing `href`, and rendering
+  crashes on an attribute that reaches it with a refused name.
+  `middleware.default_csp` no longer allows inline scripts, any `ws:`/`wss:`
+  host or `avatars.githubusercontent.com` (see Changed).
 
 ### Added
 
@@ -168,6 +174,8 @@ with its own changelog, so they are not listed here.
 - (WS10b) `window.__beaconOutboundPendingForTest()` behind
   `__BEACON_ENABLE_TEST_HOOKS`: the client's queued and scheduled sends, for
   browser tests that wait on the client instead of a quiet period.
+- (Final audit) `attribute.unsafe_srcdoc(html)`: an `<iframe>` `srcdoc`,
+  named for what it does like `element.unsafe_raw_html`.
 
 ### Changed
 
@@ -234,6 +242,20 @@ with its own changelog, so they are not listed here.
 - (WS10b) A `max_events_per_second` below 50, the rate the generated client
   paces itself for, is logged as a warning when the listener starts. The
   limit is still not advertised to the client, as in Phoenix channels.
+- (Final audit) `middleware.default_csp` is `default-src 'self'; script-src
+  'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:;
+  connect-src 'self'; frame-ancestors 'self'; object-src 'none'; base-uri
+  'self'`. Brazier renders no inline script, so `'unsafe-inline'` in
+  `script-src` only helped injected markup. `connect-src 'self'` covers the
+  same-origin WebSocket in CSP Level 3; Safari 15 and earlier need the
+  app's own `wss://host` through `secure_headers_with_csp`.
+- (Final audit) Rendering is faster: the name checks and the HTML escapers
+  are FFI (`brazier_render_ffi.erl` and `.mjs`) that scan bytes or code
+  units in one pass, as Phoenix.HTML escapes, instead of splitting into
+  graphemes and chaining `string.replace`. A 1000-row table renders about
+  2.3 times faster on Erlang; escaping is about 8 times faster. The client
+  build copies the framework's JavaScript FFI files into the client project
+  and fails when one is missing.
 - (PERF-7) Appending to a replicated list store, and merging that append on
   every other node, no longer costs time in proportion to the values already
   under the key. On a 10,000-value key an append fell from about 2,200 µs to
@@ -308,6 +330,9 @@ with its own changelog, so they are not listed here.
 - (WS10b) Dev mode's polling watcher. Without `fswatch` (macOS) or
   `inotifywait` (Linux) dev mode now exits with status 1 and names the package
   to install.
+- (Final audit) `element.memo` and `render.Memo`. Nothing read its key or
+  dependencies, on the server or in the browser, so it skipped no work. Remove
+  the call and keep its child.
 
 ### Security
 
@@ -334,6 +359,17 @@ with its own changelog, so they are not listed here.
 - (WS10b) `examples/auth_workspace` checks its login form against a random
   per-browser token in an HttpOnly cookie (a double-submit cookie), renewed
   at each login, instead of a constant that protected nothing.
+- (Final audit) On Erlang the HTML escapers missed a `"`, `&` or `<` that a
+  combining mark followed (`string.replace` matches whole graphemes), so a
+  value such as `x"` + U+0301 + ` onmouseover=...` closed its attribute and
+  added a handler in server-rendered HTML. The escapers now work on bytes.
+- (Final audit) The URL policy reads the scheme by code point, as the
+  WHATWG URL parser does. A combining mark after the `:` (`javascript:` +
+  U+0E33) hid the colon from the grapheme-based reader, so the value passed
+  as relative and the browser ran it.
+- (Final audit) `srcdoc` and an SVG `attributeName` targeting `href` or
+  `xlink:href` are refused, as DOMPurify refuses them: both put markup or a
+  URL in the page past the URL policy.
 
 ## Before Milestone 117 (never released)
 

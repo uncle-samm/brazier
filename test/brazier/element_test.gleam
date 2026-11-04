@@ -4,6 +4,7 @@ import brazier/event
 import brazier/html
 import brazier/internal/render
 import brazier/log_capture
+import brazier/svg
 import gleam/dict
 import gleam/dynamic
 import gleam/dynamic/decode
@@ -141,7 +142,7 @@ pub fn attribute_none_renders_nothing_test() {
   let assert "<div></div>" = element.to_string(html.div([attribute.none()], []))
 }
 
-// --- keyed, memo, client integration ---
+// --- keyed, client integration ---
 
 pub fn keyed_renders_data_brazier_key_test() {
   let node = element.keyed("terminal-session-1", html.div([], []))
@@ -156,11 +157,6 @@ pub fn inner_key_wins_over_outer_key_test() {
 
 pub fn keyed_text_renders_text_test() {
   let assert "hi" = element.to_string(element.keyed("k", element.text("hi")))
-}
-
-pub fn memo_is_transparent_test() {
-  let node = element.memo("m", ["1"], html.span([], [html.text("x")]))
-  let assert "<span>x</span>" = element.to_string(node)
 }
 
 pub fn ignore_updates_hook_and_watch_render_test() {
@@ -225,11 +221,11 @@ pub fn none_and_text_consume_position_ids_test() {
   let assert Ok(_) = render.lookup(handlers, "click", "0.2")
 }
 
-pub fn keyed_and_memo_do_not_add_a_level_test() {
+pub fn keyed_does_not_add_a_level_test() {
   let node =
     html.ul([], [
       element.keyed("a", html.li([event.on_click("a")], [])),
-      element.memo("m", [], html.li([event.on_click("b")], [])),
+      element.keyed("b", html.li([event.on_click("b")], [])),
     ])
   let #(_html, handlers) = render.render(element.to_node(node))
   let assert Ok(_) = render.lookup(handlers, "click", "0.0")
@@ -434,4 +430,129 @@ pub fn allowed_urls_render_test() {
 pub fn safe_url_does_not_log_test() {
   let #(_attr, logs) = log_capture.capture(fn() { attribute.href("/safe") })
   let assert False = log_capture.has(logs, level: "warning", containing: [])
+}
+
+// --- Refused names (SEC-6, SEC-13) ---
+
+@external(erlang, "brazier_telemetry_test_ffi", "rescue")
+fn rescue(run: fn() -> a) -> Result(a, #(String, dynamic.Dynamic))
+
+/// Whether `run` crashed with a reason whose printed form contains
+/// `containing` (a `let assert` message).
+fn crashes_with(run: fn() -> a, containing: String) -> Bool {
+  case rescue(run) {
+    Ok(_) -> False
+    Error(#(_class, reason)) ->
+      string.contains(string.inspect(reason), containing)
+  }
+}
+
+pub fn srcdoc_attribute_crashes_test() {
+  let assert True =
+    crashes_with(fn() { attribute.attribute("srcdoc", "<p>x</p>") }, "srcdoc")
+  let assert True =
+    crashes_with(fn() { attribute.attribute("SrcDoc", "<p>x</p>") }, "srcdoc")
+  let assert True =
+    crashes_with(fn() { attribute.boolean("SRCDOC", True) }, "srcdoc")
+}
+
+pub fn unsafe_srcdoc_renders_escaped_value_test() {
+  let node =
+    html.iframe(
+      [
+        attribute.attribute("sandbox", ""),
+        attribute.unsafe_srcdoc("<p class=\"x\">a & b</p>"),
+      ],
+      [],
+    )
+  let assert "<iframe sandbox=\"\" srcdoc=\"&lt;p class=&quot;x&quot;&gt;a &amp; b&lt;/p&gt;\"></iframe>" =
+    element.to_string(node)
+}
+
+pub fn attribute_name_targeting_href_crashes_test() {
+  let assert True =
+    list.all(["href", "xlink:href", "HREF", " href", "xlink:HRef"], fn(value) {
+      crashes_with(
+        fn() { attribute.attribute("attributeName", value) },
+        "attributeName=href",
+      )
+    })
+  let assert True =
+    crashes_with(
+      fn() { attribute.attribute("ATTRIBUTENAME", "href") },
+      "attributeName=href",
+    )
+  let assert True =
+    crashes_with(
+      fn() {
+        svg.animate([
+          attribute.attribute("attributeName", "href"),
+          attribute.attribute("values", "javascript:alert(1)"),
+        ])
+      },
+      "attributeName=href",
+    )
+}
+
+pub fn attribute_name_targeting_other_attributes_renders_test() {
+  let node =
+    svg.animate([
+      attribute.attribute("attributeName", "opacity"),
+      attribute.attribute("values", "0;1"),
+    ])
+  let assert "<animate attributeName=\"opacity\" values=\"0;1\"></animate>" =
+    element.to_string(node)
+}
+
+pub fn render_refuses_directly_built_refused_attributes_test() {
+  let render_with = fn(attr) {
+    fn() { render.to_string(render.Element("div", [attr], [])) }
+  }
+  let assert True =
+    crashes_with(render_with(render.Attribute("onclick", "x")), "name policy")
+  let assert True =
+    crashes_with(render_with(render.Attribute("srcdoc", "<p>")), "name policy")
+  let assert True =
+    crashes_with(
+      render_with(render.Attribute("attributeName", "xlink:href")),
+      "name policy",
+    )
+  let assert True =
+    crashes_with(render_with(render.Attribute("a\"b", "x")), "name policy")
+  let assert True =
+    crashes_with(render_with(render.Attribute("ïd", "x")), "name policy")
+}
+
+pub fn render_refuses_directly_built_bad_tag_and_event_test() {
+  let assert True =
+    crashes_with(
+      fn() { render.to_string(render.Element("div onload=x", [], [])) },
+      "tag names",
+    )
+  let event = render.Event("a:b", render.handler(decode.success(Nil)))
+  let assert True =
+    crashes_with(
+      fn() { render.to_string(render.Element("div", [event], [])) },
+      "event names",
+    )
+}
+
+pub fn constructors_crash_with_messages_test() {
+  let assert True =
+    crashes_with(fn() { element.element("dïv", [], []) }, "tag names")
+  let assert True =
+    crashes_with(fn() { attribute.attribute("onclick", "x") }, "name policy")
+}
+
+// --- Escaping next to combining marks ---
+
+pub fn quote_before_combining_mark_cannot_close_an_attribute_test() {
+  // `"` + U+0301 is one grapheme. The value must still not close its
+  // quotes, or the rest of it becomes attributes.
+  let node =
+    html.div([attribute.title("x\"\u{0301} onmouseover=alert(1) y")], [])
+  let assert "<div title=\"x&quot;\u{0301} onmouseover=alert(1) y\"></div>" =
+    element.to_string(node)
+  let text = html.p([], [html.text("<\u{0301}b>&\u{0301}")])
+  let assert "<p>&lt;\u{0301}b&gt;&amp;\u{0301}</p>" = element.to_string(text)
 }
