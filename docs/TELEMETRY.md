@@ -149,6 +149,8 @@ measurements: `system_time` and `monotonic_time` on start, `duration` and
 | `[brazier, runtime, stop]` | `uptime` | `reason`; `kind`, `error` (crash, exit) | yes, `brazier/runtime` |
 | `[brazier, effect, run]` S | none | `effect`: `sync`, `keyed` or `background` | yes, `brazier/effect` |
 | `[brazier, effect, timer, rejected]` | none | `limit` | yes, `brazier/effect` |
+| `[brazier, effect, after, rejected]` | none | `limit` | yes, `brazier/effect` |
+| `[brazier, effect, background, rejected]` | none | `limit` | yes, `brazier/effect` |
 | `[brazier, store, write]` | `count` | `store`, `op`, `mode`: `local` or `replicated` | yes, `brazier/store` |
 | `[brazier, store, sync]` S | `entries`, `bytes` (stop) | `store`, `peer` | yes, `brazier_store_replica` (replicated stores) |
 | `[brazier, session, created \| revoked \| expired \| contention]` | `count` | `reason` | yes, `brazier/session` |
@@ -247,9 +249,11 @@ Notes on individual events:
   `reason` for a rejection names the limit that refused it, or is
   `peer_address_unavailable`.
 - `[brazier, effect, run]` wraps each effect callback as it runs. Timer
-  ticks and cancellations are not spans; a timer refused because the live
-  timer limit was reached emits `[brazier, effect, timer, rejected]`
-  with that `limit`.
+  ticks and cancellations are not spans. An effect refused at its
+  per-runtime limit emits one event with that `limit`: `timer, rejected`
+  for `every` (10 live timers), `after, rejected` for `after` (100
+  pending timers) and `background, rejected` for `background` (32 live
+  workers). See [EFFECTS.md](EFFECTS.md#limits).
 - `[brazier, session, *]` is emitted only after the session backend
   confirmed the change, so a failed backend call emits nothing. `reason`
   is a fixed label (for example `deleted`, `rotated`, `sweep`, `update`).

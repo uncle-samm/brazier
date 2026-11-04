@@ -161,6 +161,9 @@ pub type RuntimeMessage(msg) {
   EffectDispatched(message: msg)
   /// A keyed effect dispatched a message back to the runtime.
   EffectDispatchedKeyed(key: String, generation: Int, message: msg)
+  /// An `effect.after` timer the runtime armed in its own mailbox fired.
+  /// Delivered by the VM's `erlang:send_after`; nothing sends it.
+  EffectTimerFired(timer: effect.AfterTimer)
   /// Shutdown the runtime.
   Shutdown
   /// An exit signal the runtime trapped: a linked process (the connection
@@ -220,8 +223,6 @@ pub type RuntimeState(model, msg) {
     dynamic_subscriptions: Option(fn(model) -> List(String)),
     /// Cached client-visible model JSON for diffing.
     cached_model: CachedModelState,
-    /// Framework-owned effect processes, such as effect.every timers.
-    effect_processes: List(Pid),
     /// The session's presence watcher, when the app has presence.
     presence: Option(presence_watch.Watcher(model)),
     /// Native monotonic time the runtime started, for its uptime.
@@ -492,7 +493,7 @@ fn spawn_actor(
         initial_model,
         connection_id,
       ))
-      let initial_effect_processes = run_effects(initial_effects, subject)
+      run_effects(initial_effects, subject)
       let state =
         RuntimeState(
           model: initial_model,
@@ -514,7 +515,6 @@ fn spawn_actor(
           current_subscriptions: [],
           dynamic_subscriptions: config.dynamic_subscriptions,
           cached_model: NoCache,
-          effect_processes: initial_effect_processes,
           presence: watcher,
           started_at: started_at,
           title: config.title,
@@ -532,6 +532,7 @@ fn spawn_actor(
         process.new_selector()
         |> process.select(subject)
         |> process.select_trapped_exits(ExitTrapped)
+        |> effect.select_after_timers(EffectTimerFired)
 
       actor.initialised(state)
       |> actor.selecting(selector)
@@ -918,11 +919,17 @@ fn handle_message(
       }
     }
 
+    EffectTimerFired(timer) -> {
+      log.debug("brazier.runtime", "An after timer fired")
+      effect.fire_after_timer(timer)
+      actor.continue(state)
+    }
+
     Shutdown -> {
       log.info("brazier.runtime", "Runtime shutting down")
       telemetry.runtime_stop(monotonic_time() - state.started_at, "shutdown")
       stop_listener(state.listener_subject)
-      stop_effect_processes(state.effect_processes)
+      stop_effect_processes()
       case state.presence {
         Some(watcher) -> presence_watch.stop(watcher)
         None -> Nil
@@ -1612,9 +1619,7 @@ fn run_update_for(
   }
   let #(state, changed) =
     broadcast_model(RuntimeState(..state, model: new_model), label, conn_id)
-  let effect_processes =
-    run_effects_with_context(effects, state.self, conn_id, state.connections)
-  let state = track_effect_processes(state, effect_processes)
+  run_effects_with_context(effects, state.self, conn_id, state.connections)
   #(reconcile_subscriptions(state), changed)
 }
 
@@ -1641,34 +1646,44 @@ fn update_dynamic_subscriptions(
   case state.dynamic_subscriptions, state.listener_subject {
     Some(compute_subs), Some(listener) -> {
       let new_subs = compute_subs(state.model)
-      // Find topics to subscribe/unsubscribe
-      let to_subscribe =
-        list.filter(new_subs, fn(t) {
-          !list.contains(state.current_subscriptions, t)
-        })
-      let to_unsubscribe =
-        list.filter(state.current_subscriptions, fn(t) {
-          !list.contains(new_subs, t)
-        })
-      // Apply changes
-      list.each(to_subscribe, fn(t) { process.send(listener, SubscribeTo(t)) })
-      list.each(to_unsubscribe, fn(t) {
-        process.send(listener, UnsubscribeFrom(t))
-      })
-      case list.length(to_subscribe) + list.length(to_unsubscribe) > 0 {
-        True ->
-          log.info(
-            "brazier.subscription",
-            "Subscriptions updated: +"
-              <> int.to_string(list.length(to_subscribe))
-              <> " -"
-              <> int.to_string(list.length(to_unsubscribe)),
+      // Most updates do not change the topics: an equal list needs no diff.
+      case new_subs == state.current_subscriptions {
+        True -> state
+        False -> {
+          apply_subscription_diff(
+            listener,
+            set.from_list(state.current_subscriptions),
+            set.from_list(new_subs),
           )
-        False -> Nil
+          RuntimeState(..state, current_subscriptions: new_subs)
+        }
       }
-      RuntimeState(..state, current_subscriptions: new_subs)
     }
     _, _ -> state
+  }
+}
+
+/// Send the listener the topics to join and leave, diffed as sets so the
+/// cost is O(n log n) in the number of topics.
+fn apply_subscription_diff(
+  listener: Subject(ListenerCommand),
+  current: Set(String),
+  wanted: Set(String),
+) -> Nil {
+  let to_subscribe = set.to_list(set.difference(wanted, current))
+  let to_unsubscribe = set.to_list(set.difference(current, wanted))
+  list.each(to_subscribe, fn(t) { process.send(listener, SubscribeTo(t)) })
+  list.each(to_unsubscribe, fn(t) { process.send(listener, UnsubscribeFrom(t)) })
+  case to_subscribe, to_unsubscribe {
+    [], [] -> Nil
+    _, _ ->
+      log.info(
+        "brazier.subscription",
+        "Subscriptions updated: +"
+          <> int.to_string(list.length(to_subscribe))
+          <> " -"
+          <> int.to_string(list.length(to_unsubscribe)),
+      )
   }
 }
 
@@ -1688,12 +1703,8 @@ fn run_update_only(
       connection_label(conn_id),
       fn() { state.update(state.model, msg) },
     )
-  let effect_processes =
-    run_effects_with_context(effects, state.self, conn_id, state.connections)
-  track_effect_processes(
-    RuntimeState(..state, model: new_model),
-    effect_processes,
-  )
+  run_effects_with_context(effects, state.self, conn_id, state.connections)
+  RuntimeState(..state, model: new_model)
 }
 
 /// The generated server codec (`brazier_codec`, written by
@@ -2122,7 +2133,7 @@ fn resync(
 fn run_effects(
   effects: Effect(msg),
   self: Subject(RuntimeMessage(msg)),
-) -> List(Pid) {
+) -> Nil {
   run_effects_with_context(effects, self, None, dict.new())
 }
 
@@ -2158,9 +2169,9 @@ fn run_effects_with_context(
   self: Subject(RuntimeMessage(msg)),
   conn_id: Option(transport.ConnectionId),
   connections: Dict(transport.ConnectionId, Subject(transport.InternalMessage)),
-) -> List(Pid) {
+) -> Nil {
   case effect.is_none(effects) {
-    True -> []
+    True -> Nil
     False -> {
       log.debug("brazier.runtime", "Executing effects")
       store_navigation_targets(navigation_targets(conn_id, connections))
@@ -2173,39 +2184,28 @@ fn run_effects_with_context(
           EffectDispatchedKeyed(key: key, generation: generation, message: msg),
         )
       }
-      effect.perform_tracked(effects, dispatch, dispatch_keyed)
+      effect.perform(effects, dispatch, dispatch_keyed)
     }
   }
 }
 
-fn track_effect_processes(
-  state: RuntimeState(model, msg),
-  new_processes: List(Pid),
-) -> RuntimeState(model, msg) {
-  case new_processes {
-    [] -> state
-    _ -> {
-      let live_existing =
-        list.filter(state.effect_processes, fn(pid) { process.is_alive(pid) })
-      RuntimeState(
-        ..state,
-        effect_processes: list.append(new_processes, live_existing),
-      )
-    }
-  }
-}
-
-fn stop_effect_processes(processes: List(Pid)) -> Nil {
-  let live_processes = list.filter(processes, fn(pid) { process.is_alive(pid) })
-  case list.length(live_processes) {
-    0 -> Nil
-    count ->
+/// Stop the effect processes and timers this runtime owns. The effect
+/// module tracks them in the runtime's process, each kind bounded by its
+/// limit (see `brazier/effect`), so this costs at most the sum of the
+/// limits.
+fn stop_effect_processes() -> Nil {
+  case effect.stop_owned() {
+    #(0, 0) -> Nil
+    #(processes, timers) ->
       log.info(
         "brazier.runtime",
-        "Stopping " <> int.to_string(count) <> " effect processes",
+        "Stopped "
+          <> int.to_string(processes)
+          <> " effect process(es) and cancelled "
+          <> int.to_string(timers)
+          <> " after timer(s)",
       )
   }
-  list.each(live_processes, fn(pid) { process.kill(pid) })
 }
 
 fn stop_listener(listener: Option(Subject(ListenerCommand))) -> Nil {
@@ -2704,6 +2704,8 @@ type Listener(msg) {
     owner_monitor: process.Monitor,
     on_notify: Option(fn(String) -> msg),
     on_notification: Option(fn(Notification) -> msg),
+    /// "listener <pid> of runtime <pid>", the prefix of every log line.
+    log_context: String,
   )
 }
 
@@ -2727,57 +2729,71 @@ fn start_pubsub_listener(
   let reply_subject = process.new_subject()
   // The listener sends its command subject back on `reply_subject`; its Pid
   // is not needed.
-  process.spawn_unlinked(fn() {
-    // Monitor before linking: if the runtime is already gone the monitor
-    // delivers DOWN (noproc) and the loop exits on its first receive.
-    let owner_monitor = process.monitor(runtime_pid)
-    case process.link(runtime_pid) {
-      True -> Nil
-      // The runtime already exited; the monitor above delivers DOWN and
-      // the loop stops on its first receive.
-      False ->
-        log.debug(
-          "brazier.runtime",
-          "PubSub listener: runtime already exited before link",
-        )
-    }
-    // Create the command subject HERE — inside the spawned process —
-    // so it's owned by this process and receives messages correctly.
-    let command_subject = process.new_subject()
+  let listener_pid =
+    process.spawn_unlinked(fn() {
+      let log_context =
+        "listener "
+        <> string.inspect(process.self())
+        <> " of runtime "
+        <> string.inspect(runtime_pid)
+      // Monitor before linking: if the runtime is already gone the monitor
+      // delivers DOWN (noproc) and the loop exits on its first receive.
+      let owner_monitor = process.monitor(runtime_pid)
+      case process.link(runtime_pid) {
+        True -> Nil
+        // The runtime already exited; the monitor above delivers DOWN and
+        // the loop stops on its first receive.
+        False ->
+          log.debug(
+            "brazier.subscription",
+            log_context <> ": runtime already exited before link",
+          )
+      }
+      // Create the command subject HERE — inside the spawned process —
+      // so it's owned by this process and receives messages correctly.
+      let command_subject = process.new_subject()
 
-    log.info("brazier.subscription", "Listener process spawned")
-    // Subscribe to the initial topics BEFORE replying, so that once
-    // `start` returns no broadcast to an initial topic can be missed.
-    let topics = list.unique(topics)
-    subscribe_initial(topics, 0)
-    process.send(reply_subject, command_subject)
-    log.info(
-      "brazier.subscription",
-      "Listener started with "
-        <> int.to_string(list.length(topics))
-        <> " initial topics",
-    )
-    listener_loop(
-      Listener(
-        runtime_subject: runtime_subject,
-        command_subject: command_subject,
-        owner_monitor: owner_monitor,
-        on_notify: on_notify,
-        on_notification: on_notification,
-      ),
-      topics,
-    )
-  })
-  // INVARIANT: The listener process was just spawned and MUST send its
-  // command_subject back immediately. If this times out (5s), the listener
-  // failed to start — a fatal configuration error. Crash is intentional:
-  // the runtime cannot function without its PubSub listener.
+      // Subscribe to the initial topics BEFORE replying, so that once
+      // `start` returns no broadcast to an initial topic can be missed.
+      let topics = set.from_list(topics)
+      subscribe_initial(log_context, set.to_list(topics), 0)
+      process.send(reply_subject, command_subject)
+      log.info(
+        "brazier.subscription",
+        log_context
+          <> ": started with "
+          <> int.to_string(set.size(topics))
+          <> " initial topic(s)",
+      )
+      listener_loop(
+        Listener(
+          runtime_subject: runtime_subject,
+          command_subject: command_subject,
+          owner_monitor: owner_monitor,
+          on_notify: on_notify,
+          on_notification: on_notification,
+          log_context: log_context,
+        ),
+        topics,
+      )
+    })
+  // INVARIANT: the listener replies as soon as it has joined its initial
+  // topics. No reply within 5s means it crashed (it is linked to this
+  // runtime, so that crash also arrives as an exit signal) or is stuck:
+  // either way the runtime cannot deliver notifications, so it crashes.
   let assert Ok(command_subject) = process.receive(reply_subject, 5000)
+    as {
+      "PubSub listener "
+      <> string.inspect(listener_pid)
+      <> " of runtime "
+      <> string.inspect(runtime_pid)
+      <> " did not report its command subject within 5000ms"
+    }
   command_subject
 }
 
 /// Listener receive loop — handles commands and PubSub notifications.
-fn listener_loop(listener: Listener(msg), subscriptions: List(String)) -> Nil {
+fn listener_loop(listener: Listener(msg), subscriptions: Set(String)) -> Nil {
   case
     receive_with_commands(
       listener.command_subject,
@@ -2789,53 +2805,86 @@ fn listener_loop(listener: Listener(msg), subscriptions: List(String)) -> Nil {
       // pg allows a process to join a group more than once (and then
       // delivers every broadcast once per membership), so joining is
       // guarded by the listener's own subscription set.
-      case list.contains(subscriptions, topic) {
+      case set.contains(subscriptions, topic) {
         True -> {
-          log.debug("brazier.subscription", "Already subscribed to: " <> topic)
+          log.debug(
+            "brazier.subscription",
+            listener.log_context
+              <> ": already subscribed to "
+              <> string.inspect(topic),
+          )
           listener_loop(listener, subscriptions)
         }
         False -> {
           pubsub.subscribe(topic)
-          log.debug("brazier.subscription", "Subscribed to: " <> topic)
-          let subscriptions = [topic, ..subscriptions]
+          let subscriptions = set.insert(subscriptions, topic)
+          log.debug(
+            "brazier.subscription",
+            listener.log_context
+              <> ": subscribed to "
+              <> string.inspect(topic)
+              <> " ("
+              <> int.to_string(set.size(subscriptions))
+              <> " topic(s))",
+          )
           telemetry.subscription_changed(
             telemetry.Subscribe,
-            list.length(subscriptions),
+            set.size(subscriptions),
           )
           listener_loop(listener, subscriptions)
         }
       }
     CommandReceived(UnsubscribeFrom(topic)) ->
-      case list.contains(subscriptions, topic) {
+      case set.contains(subscriptions, topic) {
         True -> {
           pubsub.unsubscribe(topic)
-          log.debug("brazier.subscription", "Unsubscribed from: " <> topic)
-          let subscriptions =
-            list.filter(subscriptions, fn(existing) { existing != topic })
+          let subscriptions = set.delete(subscriptions, topic)
+          log.debug(
+            "brazier.subscription",
+            listener.log_context
+              <> ": unsubscribed from "
+              <> string.inspect(topic)
+              <> " ("
+              <> int.to_string(set.size(subscriptions))
+              <> " topic(s))",
+          )
           telemetry.subscription_changed(
             telemetry.Unsubscribe,
-            list.length(subscriptions),
+            set.size(subscriptions),
           )
           listener_loop(listener, subscriptions)
         }
         False -> {
           log.debug(
             "brazier.subscription",
-            "Ignoring unsubscribe from non-subscribed topic: " <> topic,
+            listener.log_context
+              <> ": ignoring unsubscribe from non-subscribed topic "
+              <> string.inspect(topic),
           )
           listener_loop(listener, subscriptions)
         }
       }
     CommandReceived(ShutdownListener) -> {
-      log.info("brazier.subscription", "Listener shutting down")
-      unsubscribe_all(subscriptions)
+      log.info(
+        "brazier.subscription",
+        listener.log_context
+          <> ": shutting down, leaving "
+          <> int.to_string(set.size(subscriptions))
+          <> " topic(s)",
+      )
+      unsubscribe_all(listener.log_context, set.to_list(subscriptions))
     }
     OwnerExited(reason) -> {
       log.info(
         "brazier.subscription",
-        "Owning runtime exited (" <> reason <> "); listener stopping",
+        listener.log_context
+          <> ": owning runtime exited ("
+          <> reason
+          <> "); stopping, leaving "
+          <> int.to_string(set.size(subscriptions))
+          <> " topic(s)",
       )
-      unsubscribe_all(subscriptions)
+      unsubscribe_all(listener.log_context, set.to_list(subscriptions))
     }
     NotificationReceived(topic, payload) -> {
       case listener.on_notify {
@@ -2863,26 +2912,36 @@ fn listener_loop(listener: Listener(msg), subscriptions: List(String)) -> Nil {
 }
 
 /// Join the listener's initial topics, counting the subscriptions made.
-fn subscribe_initial(topics: List(String), subscribed: Int) -> Nil {
+fn subscribe_initial(
+  log_context: String,
+  topics: List(String),
+  subscribed: Int,
+) -> Nil {
   case topics {
     [] -> Nil
     [topic, ..rest] -> {
-      log.info("brazier.subscription", "Subscribing to: " <> topic)
+      log.info(
+        "brazier.subscription",
+        log_context <> ": subscribing to " <> string.inspect(topic),
+      )
       pubsub.subscribe(topic)
       telemetry.subscription_changed(telemetry.Subscribe, subscribed + 1)
-      subscribe_initial(rest, subscribed + 1)
+      subscribe_initial(log_context, rest, subscribed + 1)
     }
   }
 }
 
-fn unsubscribe_all(subscriptions: List(String)) -> Nil {
+fn unsubscribe_all(log_context: String, subscriptions: List(String)) -> Nil {
   case subscriptions {
     [] -> Nil
     [topic, ..rest] -> {
-      log.debug("brazier.subscription", "Unsubscribing on shutdown: " <> topic)
+      log.debug(
+        "brazier.subscription",
+        log_context <> ": unsubscribing on stop from " <> string.inspect(topic),
+      )
       pubsub.unsubscribe(topic)
       telemetry.subscription_changed(telemetry.Unsubscribe, list.length(rest))
-      unsubscribe_all(rest)
+      unsubscribe_all(log_context, rest)
     }
   }
 }

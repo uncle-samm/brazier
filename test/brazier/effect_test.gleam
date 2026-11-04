@@ -111,23 +111,60 @@ pub fn every_dispatches_periodically_test() {
   list.each(pids, process.kill)
 }
 
-pub fn after_dispatches_once_test() {
-  let subject = process.new_subject()
-  let eff = effect.after(50, fn() { 42 })
-  perform(eff, fn(n) { process.send(subject, n) })
-  // Should receive exactly once after ~50ms
-  let assert Ok(42) = process.receive(subject, 200)
-  // Should NOT receive again
-  let assert Error(Nil) = process.receive(subject, 150)
+/// The selector the runtime uses for `after` timers, here in the test
+/// process (which owns the timers it arms).
+fn after_timers() -> process.Selector(effect.AfterTimer) {
+  process.new_selector()
+  |> effect.select_after_timers(fn(timer) { timer })
 }
 
-pub fn perform_tracked_returns_spawned_effect_process_test() {
-  let eff = effect.after(1000, fn() { 42 })
-  let pids = effect.perform_tracked(eff, fn(_) { Nil }, fn(_, _, _) { Nil })
-  let assert True = list.length(pids) == 1
-  let assert Ok(pid) = list.first(pids)
-  let assert True = process.is_alive(pid)
-  list.each(pids, fn(pid) { process.kill(pid) })
+pub fn after_dispatches_once_test() {
+  let subject = process.new_subject()
+  let eff = effect.after(10, fn() { 42 })
+  perform(eff, fn(n) { process.send(subject, n) })
+  let assert 1 = effect.pending_after_timers()
+  // The timer is a message to this process; make_msg runs only when the
+  // owner hands that message back to the effect module.
+  let assert Error(Nil) = process.receive(subject, 0)
+    as "after must not dispatch before its timer fires"
+  let assert Ok(timer) =
+    process.selector_receive(after_timers(), await.deadline_ms)
+    as "the after timer message must arrive"
+  effect.fire_after_timer(timer)
+  let assert Ok(42) = process.receive(subject, 0)
+    as "firing the timer dispatches make_msg() synchronously"
+  // Fired timers leave the registry: it cannot fire again.
+  let assert 0 = effect.pending_after_timers()
+  effect.fire_after_timer(timer)
+  let assert Error(Nil) = process.receive(subject, 0)
+    as "a timer fires at most once"
+}
+
+pub fn after_starts_no_process_test() {
+  let eff = effect.after(60_000, fn() { 42 })
+  // An after timer is an erlang:send_after into the owner's mailbox, not a
+  // process: nothing is returned for the runtime to track.
+  let assert [] =
+    effect.perform_tracked(eff, fn(_) { Nil }, fn(_, _, _) { Nil })
+  let assert 1 = effect.pending_after_timers()
+  let assert #(0, 1) = effect.stop_owned()
+  let assert 0 = effect.pending_after_timers()
+}
+
+pub fn cancelled_after_drops_message_already_sent_test() {
+  // erlang:cancel_timer cannot recall a message already in the mailbox: a
+  // cancel that races the expiry must still prevent the dispatch.
+  let subject = process.new_subject()
+  let #(eff, token) = effect.cancellable(effect.after(0, fn() { 7 }))
+  effect.perform(eff, fn(_) { Nil }, fn(_, _, n) { process.send(subject, n) })
+  let assert Ok(timer) =
+    process.selector_receive(after_timers(), await.deadline_ms)
+    as "a zero-delay after timer must fire"
+  perform(effect.cancel(token), fn(_) { Nil })
+  effect.fire_after_timer(timer)
+  let assert Error(Nil) = process.receive(subject, 0)
+    as "a cancelled timer must not dispatch"
+  let assert 0 = effect.pending_after_timers()
 }
 
 // Regression: the per-runtime timer cap must self-heal as timers die. An

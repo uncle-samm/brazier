@@ -171,6 +171,21 @@ with its own changelog, so they are not listed here.
 
 ### Changed
 
+- `effect.after` no longer spawns a process. It is an `erlang:send_after`
+  into the runtime's own mailbox (LiveView's `Process.send_after(self(), ...)`),
+  and its `make_msg` runs in the runtime when it fires. At most 100 timers
+  (`effect.max_after_timers`) can be pending per runtime; one more is
+  rejected with a warning and `[brazier, effect, after, rejected]`. A keyed
+  or cancellable `after` cancels its timer, and a message that was already
+  in flight is dropped.
+- `effect.background` is capped at 32 live workers per runtime
+  (`effect.max_background_processes`); one more never runs and is logged at
+  warning with `[brazier, effect, background, rejected]`.
+- The runtime no longer keeps a list of effect pids and no longer scans it
+  with `is_alive` on every update. The effect module tracks what each
+  runtime owns, bounded by the limits above, and `Shutdown` stops it all.
+- A dynamic-subscription change is diffed with sets, and not at all when
+  `subscriptions(model)` returns the same list as before.
 - (Phase 0) Gleam is pinned to 1.19.2 through `mise.toml`, and the
   dependency floors were raised.
 - (WS3) Per-event cost fell from about 243 µs to about 48 µs for an event
@@ -237,6 +252,15 @@ with its own changelog, so they are not listed here.
 
 ### Fixed
 
+- A `background` worker could run for a moment with no guardian watching
+  its owner, so an owner dying in that window left it orphaned. The
+  guardian now starts first, monitors the owner, and only then starts the
+  worker linked to itself.
+- `ws8c_runtime_stop_test` flaked when the runtime exited, from its
+  helper's exit signal, before it had handled the test's monitor, so the
+  DOWN said `noproc`. The test now makes the runtime (and the helper)
+  answer a synchronous request after each such monitor, and fails with a
+  clear message on a `noproc` DOWN.
 - (WS10b) After a shard restart, a session on the shard's node that follows
   the topic could get the new entry's join before the old entry's leave.
   The new shard's diffs that arrive before the session's read of the
