@@ -334,15 +334,15 @@ fn walk_closure(
 /// lock for them.
 pub fn pinned_dependency_line(
   package: LockedPackage,
-  local_path: fn(String) -> String,
+  local_path: fn(String) -> Result(String, String),
 ) -> Result(String, String) {
   case package.source {
     HexSource ->
       Ok(package.name <> " = " <> toml_string("== " <> package.version))
-    LocalSource(path:) ->
-      Ok(
-        package.name <> " = { path = " <> toml_string(local_path(path)) <> " }",
-      )
+    LocalSource(path:) -> {
+      use resolved <- result.map(local_path(path))
+      package.name <> " = { path = " <> toml_string(resolved) <> " }"
+    }
     GitSource(repo:, ..) ->
       Error(
         "Package `"
