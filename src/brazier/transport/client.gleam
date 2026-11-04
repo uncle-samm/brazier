@@ -62,24 +62,39 @@ pub fn ip_for_socket(
   }
 }
 
-/// The scheme the client used to reach the server: `http` or `https`.
-/// Errors when the peer address cannot be read, or a trusted proxy sent an
-/// unusable scheme in the configured header.
-pub fn scheme(
-  req: Request(Connection),
+/// The client IP and scheme together, from one parse of the forwarding
+/// header (`ip.client`), so a WebSocket upgrade that needs both logs a
+/// problem in that header once. Errors only when the socket peer address
+/// cannot be read; the scheme is a `Result` of its own.
+pub fn ip_and_scheme(
+  socket: Socket,
+  headers: List(#(String, String)),
   trusted: ip.TrustedProxies,
-) -> Result(String, String) {
-  case server.get_peer_ip(req.body.socket) {
+) -> Result(ip.Client, String) {
+  case server.get_peer_ip(socket) {
     Error(reason) -> {
       log.warning("brazier.client", "Cannot read peer address: " <> reason)
       Error(reason)
     }
-    Ok(peer) -> scheme_from(peer, req.headers, trusted)
+    Ok(peer) -> {
+      let resolved = ip.client(peer, headers, trusted)
+      case resolved.address == peer {
+        True -> Nil
+        False ->
+          log.debug(
+            "brazier.client",
+            "Client " <> resolved.address <> " via trusted proxy " <> peer,
+          )
+      }
+      Ok(resolved)
+    }
   }
 }
 
-/// Pure core of `scheme`: decide from the peer address and headers (see
-/// `ip.client_scheme`).
+/// The scheme the client used to reach the server, `http` or `https`,
+/// decided from the peer address and headers (see `ip.client_scheme`).
+/// Errors when a trusted proxy sent an unusable scheme in the configured
+/// header. A caller that also needs the address uses `ip_and_scheme`.
 pub fn scheme_from(
   peer: String,
   headers: List(#(String, String)),

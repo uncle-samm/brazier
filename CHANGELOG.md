@@ -492,6 +492,15 @@ with its own changelog, so they are not listed here.
 
 ### Fixed
 
+- (M117 transport follow-ups) A WebSocket upgrade logged a malformed
+  forwarding hop (and a `Forwarded` request's unconfigured `X-Forwarded-*`
+  headers) twice: the per-IP cap and the Origin check each parsed the
+  forwarding header. The upgrade now resolves the address and scheme
+  together, from one parse (`ip.client`), and logs each problem once.
+- (M117 transport follow-ups) `start_listener` and `transport.supervised`
+  logged "Invalid security limits" and "Invalid static config" twice, in
+  the check and again in the listener. Each refusal is logged once, and the
+  static config is checked only after the limits pass.
 - (Final audit TS-8) A failed `session.try_delete` logs the store's error
   reason.
 - (Final audit TS-4) The session store reads its time from a clock, so the

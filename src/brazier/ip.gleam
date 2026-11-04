@@ -153,16 +153,7 @@ pub fn client_address(
       let x_forwarded_for = header_values(headers, "x-forwarded-for")
       case trusted.header {
         NoForwardingHeader -> {
-          case forwarded, x_forwarded_for {
-            [], [] -> Nil
-            _, _ ->
-              log.debug(
-                "brazier.ip",
-                "Ignoring forwarding headers from trusted proxy "
-                  <> peer
-                  <> ": no forwarding header is configured",
-              )
-          }
+          ignore_forwarding_headers(forwarded, x_forwarded_for, peer)
           peer
         }
         Forwarded -> {
@@ -223,7 +214,10 @@ pub fn client_scheme(
     }
     True, Forwarded -> {
       warn_unconfigured(x_forwarded_proto, "X-Forwarded-Proto", peer)
-      forwarded_scheme(forwarded, peer, trusted)
+      forwarded_scheme(
+        resolve(forwarded_elements(forwarded), peer, trusted).tag,
+        peer,
+      )
     }
     True, XForwardedFor -> {
       // `client_address` already warns about a Forwarded header here.
@@ -239,6 +233,76 @@ pub fn client_scheme(
       }
       x_forwarded_proto_scheme(x_forwarded_proto, peer)
     }
+  }
+}
+
+/// A request's client address and scheme, from one parse of its forwarding
+/// header (see `client`).
+pub type Client {
+  Client(address: String, scheme: Result(String, String))
+}
+
+/// `client_address` and `client_scheme` together, for a caller that needs
+/// both (the WebSocket upgrade: its per-IP cap and its Origin check). The
+/// configured header is parsed once, so a problem in it (a malformed hop,
+/// an unconfigured header from a trusted proxy) is logged once per request,
+/// not once per question asked about it.
+pub fn client(
+  peer: String,
+  headers: List(#(String, String)),
+  trusted: TrustedProxies,
+) -> Client {
+  let forwarded = header_values(headers, "forwarded")
+  let x_forwarded_for = header_values(headers, "x-forwarded-for")
+  let x_forwarded_proto = header_values(headers, "x-forwarded-proto")
+  case is_trusted(peer, trusted), trusted.header {
+    False, _ -> {
+      ignore_scheme_headers(
+        forwarded,
+        x_forwarded_proto,
+        "untrusted peer",
+        peer,
+      )
+      Client(address: peer, scheme: Ok("http"))
+    }
+    True, NoForwardingHeader -> {
+      ignore_forwarding_headers(
+        forwarded,
+        list.append(x_forwarded_for, x_forwarded_proto),
+        peer,
+      )
+      Client(address: peer, scheme: Ok("http"))
+    }
+    True, Forwarded -> {
+      warn_unconfigured(x_forwarded_for, "X-Forwarded-For", peer)
+      warn_unconfigured(x_forwarded_proto, "X-Forwarded-Proto", peer)
+      let stop = resolve(forwarded_elements(forwarded), peer, trusted)
+      Client(address: stop.address, scheme: forwarded_scheme(stop.tag, peer))
+    }
+    True, XForwardedFor -> {
+      warn_unconfigured(forwarded, "Forwarded", peer)
+      Client(
+        address: resolve(forwarded_for_hops(x_forwarded_for), peer, trusted).address,
+        scheme: x_forwarded_proto_scheme(x_forwarded_proto, peer),
+      )
+    }
+  }
+}
+
+fn ignore_forwarding_headers(
+  forwarded: List(String),
+  x_forwarded: List(String),
+  peer: String,
+) -> Nil {
+  case forwarded, x_forwarded {
+    [], [] -> Nil
+    _, _ ->
+      log.debug(
+        "brazier.ip",
+        "Ignoring forwarding headers from trusted proxy "
+          <> peer
+          <> ": no forwarding header is configured",
+      )
   }
 }
 
@@ -258,12 +322,13 @@ fn ignore_scheme_headers(
   }
 }
 
+/// The scheme of the `Forwarded` element the walk stopped at (its tag holds
+/// the element's `proto=` values).
 fn forwarded_scheme(
-  values: List(String),
+  tag: Option(List(String)),
   peer: String,
-  trusted: TrustedProxies,
 ) -> Result(String, String) {
-  case resolve(forwarded_elements(values), peer, trusted).tag {
+  case tag {
     // No Forwarded header (`resolve` logged it): the proxy did not say.
     None -> Ok("http")
     Some([]) -> {

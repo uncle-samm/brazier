@@ -2540,27 +2540,6 @@ fn parse_port(text: String) -> Result(Int, String) {
   }
 }
 
-/// The scheme the client used to reach us. The configured forwarding
-/// header's scheme is honoured only from a trusted proxy
-/// (`brazier/transport/client`); otherwise plain http (Brazier itself does
-/// not terminate TLS).
-fn request_scheme(
-  req: Request(Connection),
-  trusted: ip.TrustedProxies,
-) -> Result(String, String) {
-  client.scheme(req, trusted)
-}
-
-/// The client address for an upgrade: the socket peer, or the forwarded
-/// client when the peer is a trusted proxy (same rule as the HTTP side).
-fn ws_client_ip(
-  socket: Socket,
-  req: Request(Connection),
-  trusted: ip.TrustedProxies,
-) -> Result(String, String) {
-  client.ip_for_socket(socket, req.headers, trusted)
-}
-
 /// The `ws_allowed_origins` of a listener, parsed once when it starts.
 pub opaque type AllowedOrigins {
   AllowedOrigins(origins: List(Origin))
@@ -2784,9 +2763,15 @@ fn check_host(
 /// host and port) or an entry of `ws_allowed_origins`.
 /// This prevents cross-site WebSocket hijacking (CSWSH).
 ///
+/// `scheme` is the one `handle_ws_request` resolved with the client
+/// address: the configured forwarding header's scheme from a trusted proxy
+/// (`brazier/transport/client`), otherwise plain http (Brazier itself does
+/// not terminate TLS).
+///
 /// SECURITY: Origin validation is the primary CSRF defense for WebSocket connections.
 fn check_origin(
   req: Request(Connection),
+  scheme: Result(String, String),
   guards: Guards,
 ) -> Result(Nil, String) {
   case request.get_header(req, "origin") {
@@ -2802,7 +2787,7 @@ fn check_origin(
         Ok(h) -> h
         Error(Nil) -> ""
       }
-      case request_scheme(req, guards.trusted) {
+      case scheme {
         Error(reason) -> {
           log.warning("brazier.transport", "Origin check failed: " <> reason)
           Error(reason)
@@ -2815,7 +2800,7 @@ fn check_origin(
 }
 
 /// Validate an Origin header against the request's own origin
-/// (`request_scheme` + Host header, default ports applied) and an explicit
+/// (its scheme and Host header, default ports applied) and an explicit
 /// allow-list of origins. Scheme, host and port must all match.
 pub fn origin_allowed(
   origin: String,
@@ -2923,8 +2908,11 @@ fn handle_ws_request(
 ) -> UpgradeOutcome {
   let conn_id = generate_connection_id()
   // The trusted proxies were parsed once, when the listener started
-  // (`prepare_listener` refuses to build a handler otherwise).
-  case ws_client_ip(socket, req, guards.trusted) {
+  // (`prepare_listener` refuses to build a handler otherwise). The address
+  // (for the per-IP cap) and the scheme (for the Origin check) come from
+  // one parse of the forwarding header, so a problem in it is logged once
+  // per upgrade.
+  case client.ip_and_scheme(socket, req.headers, guards.trusted) {
     Error(reason) -> {
       // The peer is already gone: nobody to answer.
       log.warning(
@@ -2935,10 +2923,11 @@ fn handle_ws_request(
       release_connection_slot("peer gone before upgrade")
       Refused("peer_gone")
     }
-    Ok(peer_ip) ->
+    Ok(ip.Client(address: peer_ip, scheme:)) ->
       admit_ws_request(
         socket,
         req,
+        scheme,
         config,
         guards,
         Admission(conn_id:, peer_ip:, page:),
@@ -2949,6 +2938,7 @@ fn handle_ws_request(
 fn admit_ws_request(
   socket: Socket,
   req: Request(Connection),
+  scheme: Result(String, String),
   config: TransportConfig,
   guards: Guards,
   admission: Admission,
@@ -2974,13 +2964,14 @@ fn admit_ws_request(
       )
     // The slots belong to this listener's connection owner, so two
     // listeners in one VM never share per-IP counts.
-    False -> acquire_ws_slot(socket, req, config, guards, admission)
+    False -> acquire_ws_slot(socket, req, scheme, config, guards, admission)
   }
 }
 
 fn acquire_ws_slot(
   socket: Socket,
   req: Request(Connection),
+  scheme: Result(String, String),
   config: TransportConfig,
   guards: Guards,
   admission: Admission,
@@ -2999,13 +2990,15 @@ fn acquire_ws_slot(
         "Too many connections from this address",
         "per-IP WebSocket limit reached (" <> int.to_string(count) <> ")",
       )
-    Ok(_count) -> authorize_ws_request(socket, req, config, guards, admission)
+    Ok(_count) ->
+      authorize_ws_request(socket, req, scheme, config, guards, admission)
   }
 }
 
 fn authorize_ws_request(
   socket: Socket,
   req: Request(Connection),
+  scheme: Result(String, String),
   config: TransportConfig,
   guards: Guards,
   admission: Admission,
@@ -3022,7 +3015,7 @@ fn authorize_ws_request(
       reason,
     )
   }
-  case check_origin(req, guards) {
+  case check_origin(req, scheme, guards) {
     Error(reason) ->
       reject(
         "rejected_origin",
@@ -4285,34 +4278,33 @@ fn prepare_listener(
       )
     False -> Nil
   }
-  let static_check = case config.static_config {
-    Some(static_cfg) -> static.validate_config(static_cfg)
-    None -> Ok(Nil)
-  }
-  let checked =
+  // Each check logs its own refusal ("Invalid security limits: ...",
+  // "Invalid static config: ..."), once; the error carries the same text
+  // to the caller, so it is not logged again here.
+  use guards <- result.try(
     check_security_limits(
       config.security_limits,
       production: app_env.is_production(),
     )
-  case checked, static_check {
-    Error(reason), _ -> {
-      log.error("brazier.transport", "Invalid security limits: " <> reason)
-      Error(error.ConfigError(reason: "Invalid security limits: " <> reason))
-    }
-    _, Error(reason) -> {
-      log.error("brazier.transport", "Invalid static config: " <> reason)
-      Error(error.ConfigError(reason: "Invalid static config: " <> reason))
-    }
-    Ok(guards), Ok(Nil) -> {
-      // Built once: middleware and routing closures, and the parsed hosts
-      // and origins, are shared by every connection instead of being
-      // rebuilt per request.
-      let handler = create_handler(config)
-      Ok(fn(socket: Socket) {
-        per_connection_handler(socket, config, guards, handler)
+    |> result.map_error(fn(reason) {
+      error.ConfigError(reason: "Invalid security limits: " <> reason)
+    }),
+  )
+  use Nil <- result.try(case config.static_config {
+    Some(static_cfg) ->
+      static.validate_config(static_cfg)
+      |> result.map_error(fn(reason) {
+        error.ConfigError(reason: "Invalid static config: " <> reason)
       })
-    }
-  }
+    None -> Ok(Nil)
+  })
+  // Built once: middleware and routing closures, and the parsed hosts and
+  // origins, are shared by every connection instead of being rebuilt per
+  // request.
+  let handler = create_handler(config)
+  Ok(fn(socket: Socket) {
+    per_connection_handler(socket, config, guards, handler)
+  })
 }
 
 fn bind_failed(config: TransportConfig, reason: String) -> error.BrazierError {
