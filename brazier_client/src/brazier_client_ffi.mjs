@@ -164,12 +164,15 @@ let debounceSeq = 0;
 // Time of the last dispatched throttled event by "name:id".
 const throttled = new Map();
 
-function isDevMode() {
-  return !!appRoot && appRoot.getAttribute("data-brazier-dev") === "true";
-}
+// Whether the app root carries data-brazier-dev="true". The server renders
+// the attribute on the root, which no morph touches, so it is read once when
+// the root is set. Callers whose trace detail costs anything to build (a
+// node description, a key lookup, work inside a per-node loop) check it
+// before building the detail; trace checks it again for the rest.
+let devMode = false;
 
 function trace(kind, detail = {}) {
-  if (!isDevMode()) return;
+  if (!devMode) return;
   traceBuffer.push({ ts: Date.now(), kind, ...detail });
   if (traceBuffer.length > TRACE_LIMIT) traceBuffer.shift();
 }
@@ -199,6 +202,9 @@ function ensureHookRegistry() {
   window.brazierClient = window.brazierClient || {};
   window.brazierClient.registerHook = (name, hook) => {
     hookRegistry.set(name, hook);
+    // Elements already on the page may name this hook: the next sync scans
+    // the whole root, not only what its morph touched.
+    hooksNeedFullScan = true;
     trace("hook.register", { name });
   };
 }
@@ -267,12 +273,13 @@ function boot() {
 function setAppRoot(root) {
   const previousRoot = appRoot;
   appRoot = root;
+  devMode = root.getAttribute("data-brazier-dev") === "true";
   if (!previousRoot) {
-    trace("root.init", { root: describeNode(root) });
+    if (devMode) trace("root.init", { root: describeNode(root) });
     return;
   }
   if (previousRoot === root) return;
-  trace("root.replace", { from: describeNode(previousRoot), to: describeNode(root) });
+  if (devMode) trace("root.replace", { from: describeNode(previousRoot), to: describeNode(root) });
   unmountSubtree(previousRoot);
 }
 
@@ -1236,15 +1243,31 @@ function morphInnerHTML(container, html) {
   const focusedValue = focused ? focused.value : undefined;
   const locked = inputLocked();
 
-  const t = document.createElement("template");
-  t.innerHTML = html;
   autofocusQueue = [];
-  morphChildren(container, t.content);
+  hookTouched = [];
+  morphChildren(container, parseFragment(html));
   syncHooks(container);
-  trace("morph", { childCount: container.childNodes.length });
+  if (devMode) trace("morph", { childCount: container.childNodes.length });
 
   restoreReplacedFocus(container, focused, focusedTag, focusedName, focusedValue, selStart, selEnd, locked);
   focusAutofocused(container);
+}
+
+// The fragment parsed from the last rendered HTML. The morph only reads the
+// new tree and clones from it (it never moves or changes a node of it), so a
+// render that produced the same HTML reuses the fragment instead of parsing
+// it again. It still morphs: the DOM may have drifted from the markup (a
+// typed value, an attribute set by other code).
+let lastFragmentHtml = null;
+let lastFragment = null;
+
+function parseFragment(html) {
+  if (html === lastFragmentHtml) return lastFragment;
+  const t = document.createElement("template");
+  t.innerHTML = html;
+  lastFragmentHtml = html;
+  lastFragment = t.content;
+  return lastFragment;
 }
 
 // Elements that gained `autofocus` during the current morph, in document
@@ -1265,7 +1288,7 @@ function focusAutofocused(container) {
   autofocusQueue = [];
   if (!target || !container.contains(target)) return;
   target.focus();
-  trace("morph.autofocus", { node: describeNode(target) });
+  if (devMode) trace("morph.autofocus", { node: describeNode(target) });
 }
 
 function restoreReplacedFocus(container, focused, focusedTag, focusedName, focusedValue, selStart, selEnd, locked) {
@@ -1289,39 +1312,49 @@ function restoreReplacedFocus(container, focused, focusedTag, focusedName, focus
 function morphChildren(op, np) {
   let oc = op.firstChild, nc = np.firstChild;
   while (nc) {
-    if (!oc) { queueAutofocus(op.appendChild(nc.cloneNode(true))); trace("morph.append", { key: nodeKey(nc) }); nc = nc.nextSibling; continue; }
+    if (!oc) { inserted(op.appendChild(nc.cloneNode(true))); if (devMode) trace("morph.append", { key: nodeKey(nc) }); nc = nc.nextSibling; continue; }
     if (sameNode(oc, nc)) { morphNode(oc, nc); oc = oc.nextSibling; nc = nc.nextSibling; continue; }
     const m = findMatch(oc.nextSibling, nc);
     if (m) {
       const targetKey = nodeKey(nc);
       if (targetKey) {
         op.insertBefore(m, oc);
-        trace("morph.move", { key: targetKey });
+        if (devMode) trace("morph.move", { key: targetKey });
         morphNode(m, nc);
         nc = nc.nextSibling;
         continue;
       }
-      while (oc && oc !== m) { const nx = oc.nextSibling; unmountSubtree(oc); op.removeChild(oc); trace("morph.remove", { key: nodeKey(oc) }); oc = nx; }
+      while (oc && oc !== m) { const nx = oc.nextSibling; unmountSubtree(oc); op.removeChild(oc); if (devMode) trace("morph.remove", { key: nodeKey(oc) }); oc = nx; }
       if (oc) { morphNode(oc, nc); oc = oc.nextSibling; }
       nc = nc.nextSibling;
       continue;
     }
-    queueAutofocus(op.insertBefore(nc.cloneNode(true), oc)); trace("morph.insert", { key: nodeKey(nc) }); nc = nc.nextSibling;
+    inserted(op.insertBefore(nc.cloneNode(true), oc)); if (devMode) trace("morph.insert", { key: nodeKey(nc) }); nc = nc.nextSibling;
   }
-  while (oc) { const nx = oc.nextSibling; unmountSubtree(oc); op.removeChild(oc); trace("morph.remove", { key: nodeKey(oc) }); oc = nx; }
+  while (oc) { const nx = oc.nextSibling; unmountSubtree(oc); op.removeChild(oc); if (devMode) trace("morph.remove", { key: nodeKey(oc) }); oc = nx; }
+}
+
+// A subtree the morph inserted: its autofocus and hook elements are new.
+function inserted(node) {
+  queueAutofocus(node);
+  if (node.nodeType === 1) hookTouched.push({ node, subtree: true });
 }
 
 function morphNode(o, n) {
   if (o.nodeType === 3) { if (o.textContent !== n.textContent) o.textContent = n.textContent; return; }
   if (o.nodeType !== 1) return;
-  morphAttributes(o, n);
-  if (o.hasAttribute("data-brazier-preserve-children")) return;
+  if (morphAttributes(o, n) && o.hasAttribute("data-brazier-hook")) hookTouched.push({ node: o, subtree: false });
+  if (o.hasAttribute("data-brazier-preserve-children")) {
+    // Other code owns these children, and may have added hook elements.
+    hookTouched.push({ node: o, subtree: true });
+    return;
+  }
   const isFormControl = o.tagName === "INPUT" || o.tagName === "TEXTAREA" || o.tagName === "SELECT";
   if (isFormControl && o === document.activeElement) {
     // The user is typing here: keep their value while it is not yet
     // reflected by the server (LiveView's rule for focused inputs).
     if (inputLocked()) {
-      trace("morph.focused_input_kept", { name: o.getAttribute("name") || "" });
+      if (devMode) trace("morph.focused_input_kept", { name: o.getAttribute("name") || "" });
       return;
     }
     if (formControlValuesDiffer(o, n)) syncFormControlState(o, n);
@@ -1363,10 +1396,13 @@ function formControlValuesDiffer(o, n) {
   return false;
 }
 
+// Returns whether any attribute of `o` changed.
 function morphAttributes(o, n) {
   if (!o.hasAttribute("autofocus") && n.hasAttribute("autofocus")) autofocusQueue.push(o);
-  for (let i = o.attributes.length - 1; i >= 0; i--) if (!n.hasAttribute(o.attributes[i].name)) o.removeAttribute(o.attributes[i].name);
-  for (let i = 0; i < n.attributes.length; i++) { const nm = n.attributes[i].name, v = n.attributes[i].value; if (o.getAttribute(nm) !== v) o.setAttribute(nm, v); }
+  let changed = false;
+  for (let i = o.attributes.length - 1; i >= 0; i--) if (!n.hasAttribute(o.attributes[i].name)) { o.removeAttribute(o.attributes[i].name); changed = true; }
+  for (let i = 0; i < n.attributes.length; i++) { const nm = n.attributes[i].name, v = n.attributes[i].value; if (o.getAttribute(nm) !== v) { o.setAttribute(nm, v); changed = true; } }
+  return changed;
 }
 
 function syncFormControlState(o, n) {
@@ -1419,28 +1455,75 @@ function findMatch(s, t) {
 
 // === Hooks ===
 
+// What the current morph touched that can hold a hook element, in document
+// order: { node, subtree } for an element whose attributes changed (subtree
+// false), or for a subtree it inserted or did not descend into (subtree
+// true: data-brazier-preserve-children). Nothing else can have gained a hook
+// element or changed a hook element's attributes since the last sync; the
+// morph removes everything the markup does not have, and unmounts it. This
+// is morphdom's onNodeAdded/onElUpdated and LiveView DOMPatch's tracking of
+// added and updated elements, instead of rescanning the whole page.
+let hookTouched = [];
+// The whole root is scanned on the first sync, after a hook is registered
+// and when the root changes.
+let hooksNeedFullScan = true;
+let hookScanRoot = null;
+
 function syncHooks(root) {
-  root.querySelectorAll("[data-brazier-hook]").forEach((node) => {
-    const hookName = node.getAttribute("data-brazier-hook");
-    const hook = hookRegistry.get(hookName);
-    if (!hook) {
-      trace("hook.unregistered", { hook: hookName });
-      return;
+  if (hooksNeedFullScan || root !== hookScanRoot) {
+    hooksNeedFullScan = false;
+    hookScanRoot = root;
+    hookTouched = [];
+    root.querySelectorAll("[data-brazier-hook]").forEach(syncHook);
+    return;
+  }
+  const touched = hookTouched;
+  hookTouched = [];
+  // Collected before any hook runs, as the full scan's querySelectorAll is,
+  // so a hook's mount or update changing the DOM does not change the set.
+  const nodes = [];
+  const seen = new Set();
+  const collect = (node) => {
+    if (seen.has(node)) return;
+    seen.add(node);
+    nodes.push(node);
+  };
+  for (const { node, subtree } of touched) {
+    // A touched element always stays in the root: the morph only removes
+    // siblings it has not reached yet. Only other code can take one out
+    // mid-morph (a hook's unmount removing an element outside its own).
+    if (!root.contains(node)) {
+      throw new Error(
+        "[brazier] invariant violated: an element the morph touched (" + describeNode(node) +
+          ") left the app root before hooks synced; did a hook's unmount remove an element it does not own?",
+      );
     }
-    const attrs = serializeHookAttrs(node);
-    const existing = mountedHooks.get(node);
-    if (!existing) {
-      const state = hook.mount ? hook.mount(node) : undefined;
-      mountedHooks.set(node, { hookName, hook, attrs, state });
-      trace("hook.mount", { hook: hookName });
-      return;
-    }
-    if (existing.attrs !== attrs && existing.hook.update) {
-      existing.hook.update(node, existing.state);
-      mountedHooks.set(node, { ...existing, attrs });
-      trace("hook.update", { hook: hookName });
-    }
-  });
+    if (node.hasAttribute("data-brazier-hook")) collect(node);
+    if (subtree) node.querySelectorAll("[data-brazier-hook]").forEach(collect);
+  }
+  nodes.forEach(syncHook);
+}
+
+function syncHook(node) {
+  const hookName = node.getAttribute("data-brazier-hook");
+  const hook = hookRegistry.get(hookName);
+  if (!hook) {
+    trace("hook.unregistered", { hook: hookName });
+    return;
+  }
+  const attrs = serializeHookAttrs(node);
+  const existing = mountedHooks.get(node);
+  if (!existing) {
+    const state = hook.mount ? hook.mount(node) : undefined;
+    mountedHooks.set(node, { hookName, hook, attrs, state });
+    trace("hook.mount", { hook: hookName });
+    return;
+  }
+  if (existing.attrs !== attrs && existing.hook.update) {
+    existing.hook.update(node, existing.state);
+    mountedHooks.set(node, { ...existing, attrs });
+    trace("hook.update", { hook: hookName });
+  }
 }
 
 function unmountSubtree(node) {
