@@ -737,11 +737,33 @@
 - [ ] m118-lifecycle: `runtime.gleam`, `application.gleam`, `brazier_application_ffi.erl`, `ws8c_runtime_stop_test`. Resolve the atom-DOWN flake; title over `title_max_bytes` reported once, not every update; `receive_wait_event` takes only its parent's `EXIT`; a crashed tree's `persistent_term` entry is cleared.
 - [ ] m118-transport: `transport*`, `ssr`, `error.gleam`, `brazier_client/src` except `patch.mjs`, `test_all_cdp.py`. Join build-id warning once per connection; manifest read once in production; 4409 split from the init-409 close; dev reload not missed while reconnecting; `read_body` error type; outbound-pending hook counts debounced sends; server side of `rejected_middleware` (4000 + status); scroll to `#fragment` after live navigation.
 - [ ] m118-diff-shift: `brazier_patch_ffi.erl`, `brazier_client/src/brazier_client/patch.mjs` and their tests (the shift item below).
-- [ ] m118-tests: existing tests and test FFI outside the files above. Scoped cleanup and detach-on-failure, the stray `[brazier, ws, upgrade, stop]` handler, the `peer.eventually` polls, the cluster test FFI races.
+- [ ] m118-tests: existing tests and test FFI outside the files above. Redirected 2026-11-05: its four original items were done in M117 by w5-test-hygiene (L574–589; the follow-up lines at L553–556 were stale). It takes w5-test-hygiene's leftovers instead: the 2 polls in `store_replica_validation_test`, `await_restart` spinning on `yield`, and a mailbox-residue check (child_module, router and presence_test only, for now).
 - [ ] Streams design (`docs/design/STREAMS.md`), posted to Modorra before the build.
-- [ ] Follow-up audit (read-only): every M117 follow-up checked against the code; the open ones go into `docs/TODO.md` and phase B.
+- [x] Follow-up audit (read-only), done 2026-11-05: 30 M117 follow-ups are still open; they are listed below. The rest were fixed in later workstreams or are recorded decisions.
+- [ ] m118-cluster (started 2026-11-05; owns `brazier_session_ffi.erl`, `session.gleam`, `brazier_cluster_manager.erl`, `brazier_cluster_ffi.erl`, `cluster.gleam`, the replicated store and CRDT, and `CLUSTERING.md`): L409–412, L515–516, L716–719 below.
+- [ ] m118-build (started 2026-11-05; owns `src/brazier/build/**`): L267 below.
+- Decision, 2026-11-05: m118-transport's 4409 split keeps init refusals on 4000 + status, and moves the stale build to 4499. 4499 is in the reload band, so every client released since the bands existed still reloads on it. The 4600 refusal band would leave old clients reconnecting forever. `error.refuse(499, _)` becomes a programming error.
 
-**Phase B (after phase A merges):** the streams build, the follow-ups the audit finds open, then the perf re-baseline last, so it measures the final code.
+**Open M117 follow-ups (audit, 2026-11-05; Lnnn are PROGRESS line numbers at d068c9b).** Real defects first.
+- [ ] L409 (security): session pg group names hold the raw session id, and any connected node, a rejected one included, can list them (`brazier_session_ffi.erl:209,288`). m118-cluster.
+- [ ] L410: await interests are lost when the cluster manager restarts (`brazier_cluster_manager.erl:128,349`). m118-cluster.
+- [ ] L411: a stale verified row survives between a disconnect and the nodedown (`brazier_cluster_ffi.erl:73`). m118-cluster.
+- [ ] L412: a revocation is lost while only one side has verified the other (`brazier_session_ffi.erl:154,330`). m118-cluster.
+- [ ] L452 (SEC-11): `upload.gleam:537` logs a raw client path. Phase B, with the transport-side log items.
+- [ ] L605: a navigation refused with an `error` frame gets no ack, so its pending scroll fires on a later ack (`runtime.gleam:1565`). After m118-lifecycle.
+- [ ] L453: a cascade of `CloseForBackpressure` closes was seen once; needs a reproduction. After m118-transport.
+- [ ] L515–516: with `NoDiscovery` a member lost to a netsplit never reconnects, and `global` can drop members on a netsplit. Neither is a recorded decision. m118-cluster (decide and document).
+- [ ] L716–719: replicated stores expose no "synced" signal; a refused merge has no retry backoff; the causal context gains a clock entry per replica restart and is never compacted; the CRDT was never checked against the `delta_crdt_ex` source. m118-cluster.
+- [ ] L267: the client build writes no manifest, so every fresh build resolves dependencies from Hex (the cause of the rate-limit failures). m118-build.
+- [ ] L83: the client doesn't key the page root on navigation, so examples wrap each page in `element.keyed`. After m118-transport.
+- [ ] L606: a navigation without a hash doesn't scroll to the top (LiveView does). m118-transport if it fits item 8, otherwise after.
+- [ ] L607: the non-monotonic clock warning says "event clock" for navigations too. After m118-lifecycle.
+- [ ] L608–609: a bad proxy hop can be logged twice, and one refused limit makes two log lines. After m118-transport.
+- [ ] L190: the owner-moved DOWN race in `create_via_owner` has no test. L414: the churn test survives some mutants. After m118-tests.
+- [ ] L589: no check for messages a test leaves in the mailbox. m118-tests (partly).
+- [ ] Perf, before the re-baseline: L637 SSR at 1000 rows takes about 8 ms; L638 client decode and patch at 1000 rows; L639 `presence.list` copies the whole room; L640 a DOM morph bench (CDP); L642 6 atoms leak per suite run; L643 `ws.100x200` runs only 5 rounds.
+
+**Phase B (after phase A merges):** the streams build, the open follow-ups above, then the perf re-baseline last, so it measures the final code.
 
 - Decision, 2026-11-05: the re-baseline runs last, after every code change of 118, on an idle machine (Sam asked to quiet it then). A baseline taken now would be stale after the streams build.
 - [ ] Perf re-baseline, deferred from M117 final verification: `make bench-baseline` on an idle machine (no other agents, no audio apps), then `make bench-check` against it must pass. The gate's spread rule stays as it is.
