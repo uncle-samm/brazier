@@ -653,6 +653,7 @@
     - Run 1: `store.crdt_append.10.p99` was a p99 of only 50 blocks (in effect the second-worst block), and `client.render.rows_1000.p99` of only 400 calls. The coordinator raised these to 500 blocks and 1000 calls.
     - Run 2: both now hold. Instead, five other p99s spread by 50–190% (`runtime.unchanged`, `runtime.list_50kb.changed`, `http.static.100kb.200`, `presence.list.10`, `presence.track.10000`). Those scenarios already take 1000–2000 samples a round.
     - The machine was in interactive use: FL Studio and coreaudiod were running, with a load average of about 5 before the bench and 9–11 during it.
+    - Run 3, 23:32, load 2.6 at the start and 8 during the runs: refused, with 13 p99s spread past 50%. Each spread came from one slow run in five. The fresh 3-run check against the old baseline failed only the 6 `store.crdt_append` metrics, the accepted digest cost; every HTTP, WS and SSR p99 passed.
   - Decision: no baseline from a busy machine, and no wider tolerance to make one pass. The baseline is retried when the load average is low. Merging into main waits for that baseline and a passing `make bench-check` against it.
 
 **Decisions (Milestone 117, coordinator):**
