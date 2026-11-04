@@ -1,17 +1,24 @@
 //// Multi-node presence tests (design test matrix, "Presence" rows).
 ////
 //// Every node runs PubSub and a tracker with the same name. Tracking goes
-//// through holder processes on a peer (brazier/presence/holder), diffs are
-//// recorded by PubSub recorders on a peer and decoded there. Heartbeats
-//// are fast (50ms) and peers go down after 300ms of silence; waiting is
-//// always `peer.eventually` with a deadline.
+//// through holder processes on a peer (brazier/presence/holder); diffs and
+//// telemetry are relayed to holders on a peer (brazier/cluster/relay) and
+//// taken one at a time. Heartbeats are fast (50ms) and peers go down after
+//// 300ms of silence.
+////
+//// Nothing here polls. A wait is `peer.until` on what announces the
+//// change: the diffs a shard reports after writing its table, the replica
+//// events a shard emits while it changes a replica's status, a shard's own
+//// heartbeat tick, a supervisor handling its shard's exit.
 
+import brazier/await
 import brazier/cluster/peer.{type Peer, Timeout}
+import brazier/cluster/relay
 import brazier/presence.{type Presence, Down, Up}
 import brazier/presence/holder.{type Holder}
 import brazier/presence/sync.{Diff, Entry}
+import brazier/presence/wake
 import brazier/pubsub
-import gleam/dynamic.{type Dynamic}
 import gleam/dynamic/decode
 import gleam/erlang/atom
 import gleam/erlang/node
@@ -77,70 +84,135 @@ fn run_on(p: Peer, h: Holder, run: fn() -> a) -> a {
   peer.on(p, fn() { holder.run(h, run) })
 }
 
-/// The keys `p` sees on `topic`, with the node of each meta.
-fn seen(
-  p: Peer,
-  tracker: Presence(String),
-  topic: String,
-) -> List(#(String, String)) {
-  peer.on(p, fn() {
-    let assert Ok(entries) = presence.list(tracker, topic)
-      as "presence.list succeeds"
-    list.flat_map(entries, fn(entry) {
-      list.map(entry.metas, fn(meta) { #(entry.key, meta.node) })
-    })
+/// The keys this node sees on `topic`, with the node of each meta.
+fn listed(tracker: Presence(String), topic: String) -> List(#(String, String)) {
+  let assert Ok(entries) = presence.list(tracker, topic)
+    as "presence.list succeeds"
+  list.flat_map(entries, fn(entry) {
+    list.map(entry.metas, fn(meta) { #(entry.key, meta.node) })
   })
 }
 
-fn keys(p: Peer, tracker: Presence(String), topic: String) -> List(String) {
-  seen(p, tracker, topic) |> list.map(fn(pair) { pair.0 })
+fn listed_keys(tracker: Presence(String), topic: String) -> List(String) {
+  listed(tracker, topic) |> list.map(fn(pair) { pair.0 })
 }
 
+fn keys(p: Peer, tracker: Presence(String), topic: String) -> List(String) {
+  peer.on(p, fn() { listed_keys(tracker, topic) })
+}
+
+/// Whether `p` comes to list `expected` on `topic`, re-checked on each diff
+/// it reports there.
 fn sees(
   p: Peer,
   tracker: Presence(String),
   topic: String,
   expected: List(String),
 ) -> Bool {
-  peer.eventually(fn() { keys(p, tracker, topic) == expected }, wait_ms)
+  peer.until(
+    p,
+    wake.diffs(tracker, topic),
+    fn() { listed_keys(tracker, topic) == expected },
+    wait_ms,
+  )
+}
+
+fn replicas_here(
+  tracker: Presence(String),
+) -> List(#(String, presence.ReplicaStatus)) {
+  let assert Ok(replicas) = presence.replicas(tracker, "any")
+    as "presence.replicas succeeds"
+  replicas
 }
 
 fn replicas(
   p: Peer,
   tracker: Presence(String),
 ) -> List(#(String, presence.ReplicaStatus)) {
-  peer.on(p, fn() {
-    let assert Ok(replicas) = presence.replicas(tracker, "any")
-      as "presence.replicas succeeds"
-    replicas
-  })
+  peer.on(p, fn() { replicas_here(tracker) })
+}
+
+/// Whether `p`'s replicas come to satisfy `holds`, re-checked on each
+/// replica status change there.
+fn replicas_reach(
+  p: Peer,
+  tracker: Presence(String),
+  holds: fn(List(#(String, presence.ReplicaStatus))) -> Bool,
+) -> Bool {
+  peer.until(
+    p,
+    wake.replica_changes(),
+    fn() { holds(replicas_here(tracker)) },
+    wait_ms,
+  )
 }
 
 fn node_name(p: Peer) -> String {
   atom.to_string(node.name(peer.node(p)))
 }
 
-/// A diff recorder on `p` for `topic`.
-fn record_diffs(p: Peer, tracker: Presence(String), topic: String) -> Pid {
-  peer.on(p, fn() { spawn_recorder([presence.diff_topic(tracker, topic)]) })
+fn shard(tracker: Presence(String), topic: String) -> Pid {
+  let assert Ok(shard) = presence.shard_pid(tracker, topic)
+    as "presence.shard_pid succeeds"
+  shard
 }
 
-/// The diffs `recorder` on `p` received, as #(joins, leaves) of
-/// `key=value` strings.
-fn diffs(
+/// Whether `p`'s shard for `topic` comes to have sent every change in a
+/// heartbeat, re-checked on each heartbeat tick. `shard_has_delta` reads
+/// the state through the shard, which answers after handling the tick.
+fn delta_sent(p: Peer, tracker: Presence(String), topic: String) -> Bool {
+  let shard = peer.on(p, fn() { shard(tracker, topic) })
+  peer.until(
+    p,
+    peer.info(shard, "heartbeat"),
+    fn() { !shard_has_delta(shard) },
+    wait_ms,
+  )
+}
+
+/// A relay on `p` of the diffs it reports on `topic`.
+fn record_diffs(
   p: Peer,
   tracker: Presence(String),
-  recorder: Pid,
-) -> List(#(List(String), List(String))) {
-  peer.on(p, fn() {
-    recorded(recorder)
-    |> list.map(fn(message) {
-      let assert Ok(Diff(_, joins, leaves)) =
-        presence.decode_diff(tracker, message)
-        as "presence.decode_diff succeeds"
-      #(flatten(joins), flatten(leaves))
-    })
+  topic: String,
+) -> relay.Deliveries {
+  relay.deliveries(p, [presence.diff_topic(tracker, topic)])
+}
+
+/// The next diff `recorder` on `p` receives, as #(joins, leaves) of
+/// `key=value` strings.
+fn next_diff(
+  p: Peer,
+  tracker: Presence(String),
+  recorder: relay.Deliveries,
+) -> Result(#(List(String), List(String)), Nil) {
+  relay.next_delivery(p, recorder, wait_ms, fn(message) {
+    let assert Ok(Diff(_, joins, leaves)) =
+      presence.decode_diff(tracker, message)
+      as "presence.decode_diff succeeds"
+    #(flatten(joins), flatten(leaves))
   })
+}
+
+/// The joins of the diffs `recorder` on `p` receives, taken until there
+/// are `count` of them.
+fn joins(
+  p: Peer,
+  tracker: Presence(String),
+  recorder: relay.Deliveries,
+  count: Int,
+) -> List(String) {
+  case count <= 0 {
+    True -> []
+    False -> {
+      let assert Ok(#(joined, [])) = next_diff(p, tracker, recorder)
+        as "a diff of joins arrives"
+      list.append(
+        joined,
+        joins(p, tracker, recorder, count - list.length(joined)),
+      )
+    }
+  }
 }
 
 fn flatten(entries: List(sync.Entry(String))) -> List(String) {
@@ -164,16 +236,16 @@ pub fn cross_node_track_test_() -> peer.Timeout {
 
   let expected = [#("alice", node_name(a)), #("bob", node_name(b))]
   list.each(peers, fn(p) {
-    assert peer.eventually(
-      fn() { seen(p, tracker, "room") == expected },
+    assert peer.until(
+      p,
+      wake.diffs(tracker, "room"),
+      fn() { listed(tracker, "room") == expected },
       wait_ms,
     )
   })
-  let joined =
-    diffs(c, tracker, recorder)
-    |> list.flat_map(fn(diff) { diff.0 })
-    |> list.sort(string.compare)
+  let joined = joins(c, tracker, recorder, 2) |> list.sort(string.compare)
   assert joined == ["alice=online", "bob=away"]
+  assert relay.pending_deliveries(c, recorder) == 0
   let assert Ok(Entry("bob", [meta])) =
     peer.on(c, fn() { presence.get_by_key(tracker, "room", "bob") })
     as "presence.get_by_key succeeds"
@@ -203,32 +275,20 @@ pub fn diffs_arrive_in_order_remotely_test_() -> peer.Timeout {
   let tracker = start_all(peers, fast_config())
   let recorder = record_diffs(b, tracker, "room")
   let h = track_on(a, tracker, "room", "alice", "v1")
-  let step = fn(count) {
-    assert peer.eventually(
-      fn() { list.length(diffs(b, tracker, recorder)) == count },
-      wait_ms,
-    )
-  }
-  step(1)
+  assert next_diff(b, tracker, recorder) == Ok(#(["alice=v1"], []))
   let assert Ok(_) =
     run_on(a, h, fn() { presence.update(tracker, "room", "alice", "v2") })
     as "presence.update succeeds"
-  step(2)
+  assert next_diff(b, tracker, recorder) == Ok(#(["alice=v2"], ["alice=v1"]))
   let assert Ok(_) =
     run_on(a, h, fn() { presence.update(tracker, "room", "alice", "v3") })
     as "presence.update succeeds"
-  step(3)
+  assert next_diff(b, tracker, recorder) == Ok(#(["alice=v3"], ["alice=v2"]))
   let assert Ok(Nil) =
     run_on(a, h, fn() { presence.untrack(tracker, "room", "alice") })
     as "presence.untrack succeeds"
-  step(4)
-  assert diffs(b, tracker, recorder)
-    == [
-      #(["alice=v1"], []),
-      #(["alice=v2"], ["alice=v1"]),
-      #(["alice=v3"], ["alice=v2"]),
-      #([], ["alice=v3"]),
-    ]
+  assert next_diff(b, tracker, recorder) == Ok(#([], ["alice=v3"]))
+  assert relay.pending_deliveries(b, recorder) == 0
 }
 
 /// Changes made within one heartbeat reach remote nodes as their final
@@ -250,11 +310,11 @@ pub fn rapid_changes_converge_test_() -> peer.Timeout {
       as "presence.untrack succeeds"
     Nil
   })
-  assert peer.eventually(
+  assert peer.until(
+    b,
+    wake.diffs(tracker, "room"),
     fn() {
-      peer.on(b, fn() { presence.get_by_key(tracker, "room", "alice") })
-      |> result_values
-      == ["v4"]
+      presence.get_by_key(tracker, "room", "alice") |> result_values == ["v4"]
     },
     wait_ms,
   )
@@ -281,20 +341,14 @@ pub fn late_node_receives_a_transfer_test_() -> peer.Timeout {
   let _ = track_on(a, tracker, "room", "bob", "online")
   // A's heartbeat has sent these changes, to nobody: B can only get them
   // through a transfer.
-  assert peer.eventually(
-    fn() { !peer.on(a, fn() { shard_has_delta(tracker, "room") }) },
-    wait_ms,
-  )
-  peer.on(b, fn() { count_events(["brazier", "presence", "transfer", "stop"]) })
+  assert delta_sent(a, tracker, "room")
+  let transfers = relay.events(b, [["brazier", "presence", "transfer", "stop"]])
   let _ = start_on(b, fast_config())
   assert sees(b, tracker, "room", ["alice", "bob"])
-  assert peer.on(b, counted_events) != []
-}
-
-fn shard_has_delta(tracker: Presence(String), topic: String) -> Bool {
-  let assert Ok(shard) = presence.shard_pid(tracker, topic)
-    as "presence.shard_pid succeeds"
-  shard_has_delta_ffi(shard)
+  // The span's stop event follows the merge that reported the joins.
+  let assert Ok(_) = relay.next_event(b, transfers, wait_ms)
+    as "B merges a transfer"
+  Nil
 }
 
 // --- Failures ---------------------------------------------------------------
@@ -311,18 +365,16 @@ pub fn crashed_node_goes_down_then_permdown_test_() -> peer.Timeout {
   assert sees(b, tracker, "room", ["alice", "carol"])
   let recorder = record_diffs(b, tracker, "room")
 
+  let a_name = node_name(a)
+  let c_name = node_name(c)
   peer.crash(c)
   assert sees(b, tracker, "room", ["alice"])
   assert sees(a, tracker, "room", ["alice"])
-  assert peer.eventually(
-    fn() { list.contains(replicas(b, tracker), #(node_name(c), Down)) },
-    wait_ms,
-  )
-  assert diffs(b, tracker, recorder) == [#([], ["carol=online"])]
-  assert peer.eventually(
-    fn() { replicas(b, tracker) == [#(node_name(a), Up)] },
-    wait_ms,
-  )
+  assert replicas_reach(b, tracker, list.contains(_, #(c_name, Down)))
+  assert next_diff(b, tracker, recorder) == Ok(#([], ["carol=online"]))
+  assert replicas_reach(b, tracker, fn(r) { r == [#(a_name, Up)] })
+  // Permanently down reports nothing more: carol had already left.
+  assert relay.pending_deliveries(b, recorder) == 0
 }
 
 /// During a netsplit each side sees only its own entries; after it heals
@@ -367,19 +419,22 @@ pub fn restarted_shard_is_a_new_replica_test_() -> peer.Timeout {
   let h = track_on(a, tracker, "room", "alice", "v1")
   assert sees(b, tracker, "room", ["alice"])
 
-  let old =
-    peer.on(a, fn() {
-      let assert Ok(shard) = presence.shard_pid(tracker, "room")
-        as "presence.shard_pid succeeds"
-      process.kill(shard)
-      shard
-    })
-  assert peer.eventually(
-    fn() {
-      peer.on(a, fn() { presence.shard_pid(tracker, "room") }) |> is_new(old)
-    },
-    wait_ms,
-  )
+  peer.on_within(a, await.deadline_ms + 10_000, fn() {
+    let old = shard(tracker, "room")
+    // The supervisor restarts the shard while handling its 'EXIT', and the
+    // new shard registers in its init, before the supervisor goes on.
+    let supervisor = parent(old)
+    {
+      use restart <- await.with_watch_exit(supervisor, old)
+      process.kill(old)
+      await.expect_info(
+        restart,
+        supervisor,
+        "the supervisor restarting the shard",
+      )
+    }
+    assert shard(tracker, "room") != old
+  })
   // The empty new shard heartbeats after max_silent_periods.
   assert sees(b, tracker, "room", [])
   let assert Ok(_) =
@@ -387,13 +442,6 @@ pub fn restarted_shard_is_a_new_replica_test_() -> peer.Timeout {
     as "presence.track succeeds"
   assert sees(b, tracker, "room", ["alice"])
   assert replicas(b, tracker) == [#(node_name(a), Up)]
-}
-
-fn is_new(outcome: Result(Pid, presence.PresenceError), old: Pid) -> Bool {
-  case outcome {
-    Ok(pid) -> pid != old
-    Error(_) -> False
-  }
 }
 
 /// A tracker that stops tells its peers, which drop its entries at once
@@ -414,6 +462,8 @@ pub fn graceful_stop_drops_entries_at_once_test_() -> peer.Timeout {
 
   let assert Ok(Nil) = peer.on(a, fn() { presence.stop(tracker) })
     as "presence.stop succeeds"
+  // The shard forgets the replica while handling the message whose diff
+  // reports alice leaving, so the replicas call after it sees none.
   assert sees(b, tracker, "room", ["bob"])
   assert replicas(b, tracker) == []
 }
@@ -455,16 +505,13 @@ pub fn oversized_transfer_is_rejected_test_() -> peer.Timeout {
   })
   // A's heartbeat has sent the changes, to nobody: B can only get them
   // through a transfer.
-  assert peer.eventually(
-    fn() { !peer.on(a, fn() { shard_has_delta(tracker, "room") }) },
-    wait_ms,
-  )
-  peer.on(b, fn() { count_events(["brazier", "presence", "limit_exceeded"]) })
+  assert delta_sent(a, tracker, "room")
+  let limits = relay.events(b, [["brazier", "presence", "limit_exceeded"]])
   let _ = start_on(b, fast_config() |> presence.max_transfer_entries(2))
-  assert peer.eventually(
-    fn() { peer.on(b, counted_events) |> list.length >= 2 },
-    wait_ms,
-  )
+  let assert Ok(_) = relay.next_event(b, limits, wait_ms)
+    as "B rejects the transfer"
+  let assert Ok(_) = relay.next_event(b, limits, wait_ms)
+    as "B rejects the transfer again"
   // Rejected every time: nothing was merged, though A's keepalives keep
   // it up.
   assert keys(b, tracker, "room") == []
@@ -503,19 +550,18 @@ pub fn presence_convergence_benchmark_test_() -> peer.Timeout {
         })
       })
     })
-  assert peer.eventually(
-    fn() {
-      list.all(peers, fn(p) {
-        peer.on(p, fn() {
-          let assert Ok(entries) = presence.list(tracker, "bench")
-            as "presence.list succeeds"
-          list.length(entries)
-        })
-        == total
-      })
-    },
-    60_000,
-  )
+  assert list.all(peers, fn(p) {
+    peer.until(
+      p,
+      wake.diffs(tracker, "bench"),
+      fn() {
+        let assert Ok(entries) = presence.list(tracker, "bench")
+          as "presence.list succeeds"
+        list.length(entries) == total
+      },
+      60_000,
+    )
+  })
   let converged_us = now_us() - started
   let slowest = list.fold(track_us, 0, int.max)
   report(
@@ -537,20 +583,12 @@ pub fn presence_convergence_benchmark_test_() -> peer.Timeout {
 
 // --- FFI --------------------------------------------------------------------
 
-@external(erlang, "brazier_cluster_test_ffi", "spawn_recorder")
-fn spawn_recorder(topics: List(String)) -> Pid
-
-@external(erlang, "brazier_cluster_test_ffi", "recorded")
-fn recorded(pid: Pid) -> List(Dynamic)
-
-@external(erlang, "brazier_cluster_test_ffi", "count_events")
-fn count_events(event: List(String)) -> Nil
-
-@external(erlang, "brazier_cluster_test_ffi", "counted_events")
-fn counted_events() -> List(Int)
-
 @external(erlang, "brazier_presence_test_ffi", "shard_has_delta")
-fn shard_has_delta_ffi(shard: Pid) -> Bool
+fn shard_has_delta(shard: Pid) -> Bool
+
+/// The process that started `pid` (its supervisor, for a shard).
+@external(erlang, "brazier_presence_test_ffi", "parent")
+fn parent(pid: Pid) -> Pid
 
 @external(erlang, "brazier_cluster_test_ffi", "now_us")
 fn now_us() -> Int

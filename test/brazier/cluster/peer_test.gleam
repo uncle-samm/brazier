@@ -2,7 +2,12 @@
 //// test that started them, and the failure controls must do what they
 //// say.
 
+import brazier/await
 import brazier/cluster/peer.{type Peer, Timeout}
+import brazier/telemetry
+import gleam/dict
+import gleam/dynamic.{type Dynamic}
+import gleam/erlang/atom.{type Atom}
 import gleam/erlang/node.{type Node}
 import gleam/erlang/process
 import gleam/list
@@ -63,13 +68,16 @@ pub fn crash_and_stop_take_nodes_down_test_() -> peer.Timeout {
   let assert [a, b, c] = peers as "the cluster starts three peers"
   peer.crash(b)
   assert !peer.alive(b)
-  assert peer.eventually(
-    fn() { !list.contains(peer.on(a, nodes), peer.node(b)) },
+  let b_node = peer.node(b)
+  assert peer.until(
+    a,
+    peer.node_changes(),
+    fn() { !list.contains(nodes(), b_node) },
     wait_ms,
   )
   peer.stop(c)
   assert !peer.alive(c)
-  assert peer.eventually(fn() { peer.on(a, nodes) == [] }, wait_ms)
+  assert peer.until(a, peer.node_changes(), fn() { nodes() == [] }, wait_ms)
   let assert Error(_) = peer.rpc(b, node_self) as "peer.rpc returns Error"
   Nil
 }
@@ -81,8 +89,8 @@ pub fn partition_and_heal_test_() -> peer.Timeout {
   use peers <- peer.with_cluster(2, "brazier_peer_split")
   let assert [a, b] = peers as "the cluster starts two peers"
   peer.partition(a, b)
-  assert peer.eventually(fn() { peer.on(a, nodes) == [] }, wait_ms)
-  assert peer.eventually(fn() { peer.on(b, nodes) == [] }, wait_ms)
+  assert peer.until(a, peer.node_changes(), fn() { nodes() == [] }, wait_ms)
+  assert peer.until(b, peer.node_changes(), fn() { nodes() == [] }, wait_ms)
   let assert Error(_) = peer.connect(a, b) as "peer.connect returns Error"
   peer.heal(a, b)
   assert peer.on(a, nodes) == [peer.node(b)]
@@ -99,24 +107,73 @@ pub fn add_peer_joins_on_connect_test_() -> peer.Timeout {
   assert peer.on(a, nodes) == [peer.node(late)]
 }
 
-fn all_gone(peers: List(Peer)) -> Bool {
-  peer.eventually(
-    fn() {
-      case peers {
-        [] -> True
-        _ -> none_alive(peers)
-      }
-    },
-    wait_ms,
-  )
+/// `until` re-checks on each wake-up, gives up at its deadline, and undoes
+/// its wake however the wait ends: here a telemetry handler, which would
+/// otherwise outlive the rpc process that attached it.
+pub fn until_undoes_its_wake_test_() -> peer.Timeout {
+  use <- Timeout(60)
+  use peers <- peer.with_cluster(1, "brazier_peer_until")
+  let assert [a] = peers as "the cluster starts one peer"
+  let name = ["brazier_peer_test", "wake"]
+  let wake = peer.events([name])
+
+  // The event arrives after the first check, so only the wake-up sees it.
+  let emitted =
+    peer.until(
+      a,
+      wake,
+      fn() {
+        let seen = seen_before()
+        let assert Ok(Nil) = telemetry.execute(name, dict.new(), dict.new())
+          as "telemetry.execute succeeds"
+        seen
+      },
+      wait_ms,
+    )
+  assert emitted
+  assert peer.on(a, fn() { wake_handlers(name) }) == 0
+
+  assert !peer.until(a, wake, fn() { False }, 50)
+  assert peer.on(a, fn() { wake_handlers(name) }) == 0
+
+  let outcome =
+    rescue(fn() {
+      peer.until(
+        a,
+        wake,
+        fn() {
+          fail("checking cleanup")
+          False
+        },
+        wait_ms,
+      )
+    })
+  assert outcome == Error("error")
+  assert peer.on(a, fn() { wake_handlers(name) }) == 0
 }
 
-fn none_alive(peers: List(Peer)) -> Bool {
-  case peers {
-    [] -> True
-    [p, ..rest] -> !peer.alive(p) && none_alive(rest)
-  }
+/// Whether every peer's control process (on this node) exits within
+/// `wait_ms`: each is monitored, so its DOWN ends the wait.
+fn all_gone(peers: List(Peer)) -> Bool {
+  list.all(peers, fn(p) { await.await_down(p.control, wait_ms) == Ok(Nil) })
 }
+
+/// Whether this rpc process has called it before (its process dictionary
+/// lives as long as the one rpc).
+fn seen_before() -> Bool {
+  put(atom.create("brazier_peer_test_seen"), True) == dynamic.bool(True)
+}
+
+/// How many handlers are attached to `name` on this node.
+fn wake_handlers(name: List(String)) -> Int {
+  list.length(list_handlers(list.map(name, atom.create)))
+}
+
+@external(erlang, "erlang", "put")
+fn put(key: Atom, value: Bool) -> Dynamic
+
+@external(erlang, "telemetry", "list_handlers")
+fn list_handlers(prefix: List(Atom)) -> List(Dynamic)
 
 @external(erlang, "erlang", "nodes")
 fn nodes() -> List(Node)

@@ -5,11 +5,21 @@
 //// way every node would reach Postgres. Bound processes stand in for
 //// WebSocket handlers; the transport turns the revocation message they
 //// record into a 4401 close (covered by ws_protocol_test).
+////
+//// Nothing here polls. A bound process is spawned by a holder on its peer,
+//// so it reports each revocation to that long-lived holder, which waits
+//// for it (`await_revoked`); pg membership is watched with `pg:monitor/2`;
+//// telemetry is relayed to a holder (brazier/cluster/relay) that receives
+//// it like ExUnit's `assert_receive`.
 
 import brazier/cluster/log_capture
 import brazier/cluster/peer.{type Peer, Timeout}
+import brazier/cluster/relay
+import brazier/presence/holder.{type Holder}
 import brazier/session.{type ExternalBackend, type SessionStore, External}
+import brazier/telemetry
 import gleam/dict
+import gleam/erlang/atom
 import gleam/erlang/node.{type Node}
 import gleam/erlang/process.{type Pid}
 import gleam/list
@@ -17,10 +27,10 @@ import gleam/option.{None, Some}
 
 const wait_ms = 5000
 
-/// A telemetry event recorded on a peer (see brazier_cluster_test_ffi).
-pub type RecordedEvent {
-  // The constructor name is the tag the FFI builds the tuple with.
-  Event(name: String, node: String, reason: String)
+/// A bound process standing in for a socket, and the holder on its peer
+/// that spawned it and receives its revocation reports.
+pub type Socket {
+  Socket(holder: Holder, pid: Pid)
 }
 
 /// Peers keep connections to the database node while a netsplit separates
@@ -44,26 +54,39 @@ fn start_store(p: Peer, name: String, db: Node) -> SessionStore {
   })
 }
 
-fn bind_on(p: Peer, store: SessionStore, id: String) -> Pid {
+fn bind_on(p: Peer, store: SessionStore, id: String) -> Socket {
   peer.on(p, fn() {
-    spawn_bound(fn() { session.bind_current_process(store, id) })
+    // The holder ends with the peer (see holder.gleam).
+    let h = holder.start()
+    let pid =
+      holder.run(h, fn() {
+        spawn_bound(fn() { session.bind_current_process(store, id) })
+      })
+    Socket(holder: h, pid:)
   })
 }
 
+/// Whether `p` sees `expected` bound processes for the session, re-checked
+/// on each join and leave of its pg group.
 fn bound_seen_from(p: Peer, name: String, id: String, expected: Int) -> Bool {
-  peer.eventually(
-    fn() {
-      peer.on(p, fn() { bound_everywhere("external:" <> name, id) }) == expected
-    },
+  let namespace = "external:" <> name
+  let group = #(atom.create("brazier_session"), namespace, id)
+  peer.until(
+    p,
+    peer.pg_changes("brazier_session_pg", group),
+    fn() { bound_everywhere(namespace, id) == expected },
     wait_ms,
   )
 }
 
-fn revoked_on(p: Peer, id: String, reason: String) -> Bool {
-  peer.eventually(
-    fn() { peer.on(p, fn() { list.contains(revocations(), #(id, reason)) }) },
-    wait_ms,
-  )
+/// Whether `socket` on `p` is told its session was revoked for `reason`.
+fn revoked_on(p: Peer, socket: Socket, id: String, reason: String) -> Bool {
+  peer.on(p, fn() {
+    holder.run(socket.holder, fn() {
+      await_revoked(socket.pid, id, reason, wait_ms)
+    })
+  })
+  == Ok(Nil)
 }
 
 /// Regression: logout on node A closes the session's sockets on node B.
@@ -78,11 +101,11 @@ pub fn logout_on_one_node_revokes_on_another_test_() -> peer.Timeout {
   let store_b = start_store(b, name, db)
 
   let s = peer.on(a, fn() { session.create(store_a) })
-  let _socket = bind_on(b, store_b, s.id)
+  let socket = bind_on(b, store_b, s.id)
   assert bound_seen_from(a, name, s.id, 1)
 
   peer.on(a, fn() { session.delete(store_a, s.id) })
-  assert revoked_on(b, s.id, "deleted")
+  assert revoked_on(b, socket, s.id, "deleted")
   assert peer.on(b, fn() { session.get(store_b, s.id) }) == None
 }
 
@@ -104,10 +127,10 @@ pub fn revocation_during_partition_is_enforced_on_heal_test_() -> peer.Timeout {
 
   let s = peer.on(a, fn() { session.create(store_a) })
   let kept = peer.on(a, fn() { session.create(store_a) })
-  let _socket = bind_on(b, store_b, s.id)
+  let socket = bind_on(b, store_b, s.id)
   let _kept_socket = bind_on(b, store_b, kept.id)
   assert bound_seen_from(a, name, s.id, 1)
-  peer.on(b, fn() { record_events([["brazier", "session", "revoked"]]) })
+  let revoked = relay.events(b, [["brazier", "session", "revoked"]])
 
   peer.partition(a, b)
   // A no longer sees B's socket, so the logout cannot reach it.
@@ -118,21 +141,19 @@ pub fn revocation_during_partition_is_enforced_on_heal_test_() -> peer.Timeout {
   assert peer.on(b, fn() { session.get(store_b, s.id) }) == None
 
   peer.heal(a, b)
-  assert revoked_on(b, s.id, "deleted")
+  assert revoked_on(b, socket, s.id, "deleted")
   // The live session's socket is left alone.
   assert peer.on(b, fn() { session.get(store_b, kept.id) }) == Some(kept)
   assert !list.any(peer.on(b, revocations), fn(r) { r.0 == kept.id })
   // The re-check reports its revocation, once: the kept session is live.
   // The event comes after the socket is told (the re-check logs how many
-  // sockets it notified, then emits), so the socket seeing the revocation
-  // does not mean the event is recorded yet: wait for it.
-  assert peer.eventually(fn() { revoked_events(b) != [] }, wait_ms)
-  assert revoked_events(b) == [Event("brazier.session.revoked", "", "recheck")]
-}
-
-fn revoked_events(p: Peer) -> List(RecordedEvent) {
-  peer.on(p, recorded_events)
-  |> list.filter(fn(e) { e.name == "brazier.session.revoked" })
+  // sockets it notified, then emits), so wait for it.
+  let assert Ok(event) = relay.next_event(b, revoked, wait_ms)
+    as "the re-check emits brazier.session.revoked"
+  assert telemetry.string(event, "reason") == Ok("recheck")
+  assert telemetry.string(event, "node") == Error(Nil)
+  // Only one: no second revocation was relayed behind it.
+  assert relay.pending_events(b, revoked) == 0
 }
 
 /// Sessions on an External backend are the same session on every node.
@@ -217,11 +238,13 @@ fn spawn_bound(bind: fn() -> Nil) -> Pid
 @external(erlang, "brazier_session_test_ffi", "revocations")
 fn revocations() -> List(#(String, String))
 
-@external(erlang, "brazier_cluster_test_ffi", "record_events")
-fn record_events(names: List(List(String))) -> Nil
-
-@external(erlang, "brazier_cluster_test_ffi", "recorded_events")
-fn recorded_events() -> List(RecordedEvent)
+@external(erlang, "brazier_session_test_ffi", "await_revoked")
+fn await_revoked(
+  pid: Pid,
+  id: String,
+  reason: String,
+  timeout_ms: Int,
+) -> Result(Nil, List(#(String, String)))
 
 @external(erlang, "brazier_session_test_ffi", "bound_everywhere")
 fn bound_everywhere(namespace: String, id: String) -> Int

@@ -9,6 +9,7 @@
 import brazier/effect
 import brazier/error
 import brazier/internal/context
+import brazier/monitored
 import brazier/runtime
 import brazier/telemetry.{type Event}
 import brazier/transport
@@ -31,7 +32,7 @@ pub type Msg {
 }
 
 fn context_for(path: String) -> context.Context {
-  let assert Ok(parsed) = uri.parse(path)
+  let assert Ok(parsed) = uri.parse(path) as "uri.parse succeeds"
   context.new(
     uri: uri.Uri(
       ..uri.empty,
@@ -153,15 +154,10 @@ fn runtime_events() -> List(List(String)) {
   ])
 }
 
-fn listen() -> #(String, Subject(Event)) {
-  let assert Ok(Nil) = telemetry.start()
-  let id = "runtime_telemetry_" <> int.to_string(unique_integer())
-  let events = process.new_subject()
-  let assert Ok(Nil) =
-    telemetry.attach(id, runtime_events(), fn(event) {
-      process.send(events, event)
-    })
-  #(id, events)
+/// Run `run` with every runtime event forwarded to it; the handler is
+/// detached afterwards even if `run` crashes.
+fn listen(run: fn(Subject(Event)) -> a) -> a {
+  monitored.listening(runtime_events(), run)
 }
 
 /// The first event matching `matches`; others are skipped.
@@ -188,12 +184,16 @@ fn stop_of(
 
 fn assert_tags(event: Event, label: String, connection_id: String) -> Nil {
   let assert Ok("/*") = telemetry.string(event, "route")
+    as "telemetry.string succeeds"
   let assert Ok(event_label) = telemetry.string(event, "event")
-  let assert True = event_label == label
+    as "telemetry.string succeeds"
+  assert event_label == label
   let assert Ok(conn) = telemetry.string(event, "connection_id")
-  let assert True = conn == connection_id
+    as "telemetry.string succeeds"
+  assert conn == connection_id
   let assert Ok(duration) = telemetry.int(event, "duration")
-  let assert True = duration >= 0
+    as "telemetry.int succeeds"
+  assert duration >= 0
   Nil
 }
 
@@ -203,32 +203,30 @@ fn patch_bytes(event: Event) -> Int {
   bytes
 }
 
-fn shutdown(id: String, session: Session) -> Nil {
+fn shutdown(session: Session) -> Nil {
   process.send(session.runtime, runtime.Shutdown)
-  let assert Ok(Nil) = telemetry.detach(id)
-  Nil
 }
 
 // --- mount ------------------------------------------------------------------
 
 pub fn mount_is_a_span_without_a_connection_test() {
-  let #(id, events) = listen()
+  use events <- listen()
   let assert Ok(subject) = runtime.start(config(option.None), context_for("/"))
     as "the test runtime must start"
   let start =
     expect(events, fn(e) { e.name == ["brazier", "runtime", "mount", "start"] })
   let assert Ok("mount") = telemetry.string(start, "event")
+    as "telemetry.string succeeds"
   let stop = stop_of(events, "mount", "none")
   assert_tags(stop, "mount", "none")
   process.send(subject, runtime.Shutdown)
-  let assert Ok(Nil) = telemetry.detach(id)
 }
 
 // --- handle_event and render ------------------------------------------------
 
 pub fn decoded_event_reports_its_constructor_test() {
   let session = joined(option.None)
-  let #(id, events) = listen()
+  use events <- listen()
   click(session, "increment")
   assert_tags(
     stop_of(events, "handle_event", session.conn_id),
@@ -237,13 +235,13 @@ pub fn decoded_event_reports_its_constructor_test() {
   )
   let render = stop_of(events, "render", session.conn_id)
   assert_tags(render, "increment", session.conn_id)
-  let assert True = patch_bytes(render) > 0
-  shutdown(id, session)
+  assert patch_bytes(render) > 0
+  shutdown(session)
 }
 
 pub fn undecodable_event_reports_unknown_test() {
   let session = joined(option.None)
-  let #(id, events) = listen()
+  use events <- listen()
   // The handler id is client-chosen: it never becomes a tag.
   click(session, "handler_" <> int.to_string(unique_integer()))
   assert_tags(
@@ -251,12 +249,12 @@ pub fn undecodable_event_reports_unknown_test() {
     "unknown",
     session.conn_id,
   )
-  shutdown(id, session)
+  shutdown(session)
 }
 
 pub fn batch_reports_each_event_and_one_render_test() {
   let session = joined(option.None)
-  let #(id, events) = listen()
+  use events <- listen()
   let increment = #("click", "increment", "{}", "0", 1, "")
   process.send(
     session.runtime,
@@ -274,34 +272,34 @@ pub fn batch_reports_each_event_and_one_render_test() {
   assert_tags(third, "increment", session.conn_id)
   let render = stop_of(events, "render", session.conn_id)
   assert_tags(render, "batch", session.conn_id)
-  let assert True = patch_bytes(render) > 0
-  shutdown(id, session)
+  assert patch_bytes(render) > 0
+  shutdown(session)
 }
 
 pub fn effect_update_renders_without_a_connection_test() {
   let session = joined(option.None)
-  let #(id, events) = listen()
+  use events <- listen()
   process.send(session.runtime, runtime.EffectDispatched(SetCount(9)))
   let render = stop_of(events, "render", "none")
   assert_tags(render, "set_count", "none")
-  let assert True = patch_bytes(render) > 0
-  shutdown(id, session)
+  assert patch_bytes(render) > 0
+  shutdown(session)
 }
 
 pub fn unchanged_model_renders_zero_bytes_test() {
   let session = joined(option.None)
-  let #(id, events) = listen()
+  use events <- listen()
   // The model is already 0: nothing to patch.
   process.send(session.runtime, runtime.EffectDispatched(SetCount(0)))
   let render = stop_of(events, "render", "none")
-  let assert 0 = patch_bytes(render)
-  shutdown(id, session)
+  let assert 0 = patch_bytes(render) as "patch_bytes returns 0"
+  shutdown(session)
 }
 
 pub fn no_render_span_without_joined_connections_test() {
   let assert Ok(subject) = runtime.start(config(option.None), context_for("/"))
     as "the test runtime must start"
-  let #(id, events) = listen()
+  use events <- listen()
   process.send(subject, runtime.EffectDispatched(Increment))
   process.send(subject, runtime.Shutdown)
   // Events from one process arrive in order: the stop comes first only
@@ -312,14 +310,14 @@ pub fn no_render_span_without_joined_connections_test() {
       || e.name == ["brazier", "runtime", "stop"]
     })
   let assert ["brazier", "runtime", "stop"] = next.name
-  let assert Ok(Nil) = telemetry.detach(id)
+    as "next.name is ['brazier', 'runtime', 'stop']"
 }
 
 // --- navigate ---------------------------------------------------------------
 
 pub fn routed_navigation_reports_the_route_message_test() {
   let session = joined(option.Some(parse_page))
-  let #(id, events) = listen()
+  use events <- listen()
   process.send(
     session.runtime,
     runtime.ClientNavigated(conn_id: session.conn_id, path: "/settings"),
@@ -331,13 +329,13 @@ pub fn routed_navigation_reports_the_route_message_test() {
   )
   let render = stop_of(events, "render", session.conn_id)
   assert_tags(render, "visit", session.conn_id)
-  let assert True = patch_bytes(render) > 0
-  shutdown(id, session)
+  assert patch_bytes(render) > 0
+  shutdown(session)
 }
 
 pub fn unroutable_navigation_reports_unknown_test() {
   let session = joined(option.Some(parse_page))
-  let #(id, events) = listen()
+  use events <- listen()
   process.send(
     session.runtime,
     runtime.ClientNavigated(conn_id: session.conn_id, path: "/nope"),
@@ -349,12 +347,13 @@ pub fn unroutable_navigation_reports_unknown_test() {
   )
   let assert Ok(transport.SendHardNavigate(path: "/nope")) =
     process.receive(session.transport, 2000)
-  shutdown(id, session)
+    as "process.receive succeeds"
+  shutdown(session)
 }
 
 pub fn navigation_without_router_reports_unknown_test() {
   let session = joined(option.None)
-  let #(id, events) = listen()
+  use events <- listen()
   process.send(
     session.runtime,
     runtime.ClientNavigated(conn_id: session.conn_id, path: "/elsewhere"),
@@ -364,26 +363,27 @@ pub fn navigation_without_router_reports_unknown_test() {
     "unknown",
     session.conn_id,
   )
-  shutdown(id, session)
+  shutdown(session)
 }
 
 // --- stop -------------------------------------------------------------------
 
 pub fn shutdown_reports_uptime_test() {
   let session = joined(option.None)
-  let #(id, events) = listen()
+  use events <- listen()
   let monitor = process.monitor(process.subject_owner(session.runtime) |> owner)
   process.send(session.runtime, runtime.Shutdown)
   let stop = expect(events, fn(e) { e.name == ["brazier", "runtime", "stop"] })
   let assert Ok("shutdown") = telemetry.string(stop, "reason")
+    as "telemetry.string succeeds"
   let assert Ok(uptime) = telemetry.int(stop, "uptime")
-  let assert True = uptime > 0
-  let down =
-    process.new_selector()
-    |> process.select_specific_monitor(monitor, fn(d) { d })
-  let assert Ok(_) = process.selector_receive(down, 2000)
-    as "the runtime exits after shutdown"
-  let assert Ok(Nil) = telemetry.detach(id)
+    as "telemetry.int succeeds"
+  let assert True = uptime > 0 as "a runtime that ran reports a positive uptime"
+  // Shutdown ends the actor with `actor.stop()`, an exit with reason
+  // `normal`; any other reason is a crash during shutdown. The monitor was
+  // taken before Shutdown was sent, so `down_reason` sees the real reason.
+  let reason = monitored.down_reason(monitor, "the shut-down runtime")
+  assert reason == process.Normal
 }
 
 fn owner(result: Result(process.Pid, Nil)) -> process.Pid {
