@@ -77,6 +77,12 @@ forwarding headers) and runs the pipeline on it, at three points:
 | A client `navigate` (link click, back/forward, `router.push`/`replace`) | the target path | `hard_navigate` to it: the browser loads it over HTTP and gets the middleware's answer |
 | A `join` for a page other than the upgrade's | the joined path | `hard_navigate`, as for `navigate` |
 
+A browser does not show a page the status of a refused upgrade: the client
+sees a socket that closes before it opens, keeps reconnecting with backoff,
+and from the third such close in a row logs an error (see
+[WIRE_PROTOCOL.md](WIRE_PROTOCOL.md#client-connection-behaviour)). Reloading
+the page shows the middleware's answer over HTTP.
+
 The page is admitted when the pipeline reaches the handler (some middleware
 calls `next` all the way through); any response a middleware returns
 instead is a refusal. A refused navigation is logged as a warning and emits

@@ -235,6 +235,11 @@ class FakeElement extends FakeNode {
     if (index < 0) throw new Error("fake DOM: removeChild of a node that is not a child");
     this.childNodes.splice(index, 1);
     child.parentNode = null;
+    // As in a browser, taking the focused element (or an ancestor of it)
+    // out of the document moves focus to the body; insertBefore of an
+    // attached node does this too, since it removes the node first.
+    const active = globalThis.document && document.activeElement;
+    if (active && (active === child || (child.contains && child.contains(active)))) document.activeElement = null;
     return child;
   }
   cloneNode(deep) {
@@ -293,6 +298,10 @@ class FakeElement extends FakeNode {
   }
   focus() {
     document.activeElement = this;
+  }
+  setSelectionRange(start, end) {
+    this.selectionStart = start;
+    this.selectionEnd = end;
   }
 }
 
@@ -366,9 +375,19 @@ let windowListeners = [];
 const historyLog = { pushed: [], replaced: [] };
 
 function setPath(path) {
-  const q = path.indexOf("?");
-  location.pathname = q < 0 ? path : path.slice(0, q);
-  location.search = q < 0 ? "" : path.slice(q);
+  const h = path.indexOf("#");
+  location.hash = h < 0 ? "" : path.slice(h);
+  const rest = h < 0 ? path : path.slice(0, h);
+  const q = rest.indexOf("?");
+  location.pathname = q < 0 ? rest : rest.slice(0, q);
+  location.search = q < 0 ? "" : rest.slice(q);
+}
+
+// Back or forward to `path`: the browser sets the URL, then fires popstate
+// on window.
+function popTo(path) {
+  setPath(path);
+  for (const l of windowListeners.filter((l) => l.name === "popstate")) l.fn({ type: "popstate", state: null });
 }
 
 // Dispatch a DOM event the way the browser does for listeners on document:
@@ -1611,6 +1630,339 @@ scenario("a dev reload message reloads the page every time, outside the reload g
     assert.equal(reloads, 1, `rebuild ${i + 1} reloads`);
   }
   assert.equal(storage.getItem("brazier:reloads"), null, "a dev reload is not counted by the guard");
+});
+
+// --- hook lifecycle on an element that stays ---
+// LiveView's View.performPatch: a phx-hook removed from, or renamed on, an
+// element the patch keeps destroys the hook; a new name mounts its hook.
+scenario("a hook element that stays but loses or renames its hook unmounts the old hook", async () => {
+  const view = (model) => ({
+    html:
+      `<div id="h" class="${model.c}"${model.hook ? ` data-brazier-hook="${model.hook}"` : ""}>` +
+      `<span id="inner"${model.innerHook ? ' data-brazier-hook="probe"' : ""}></span></div>`,
+    handlers: [],
+  });
+  await loadRuntime({ view });
+  const s = sockets[0];
+  s.open();
+  const calls = [];
+  window.brazierClient.registerHook("probe", probeHook(calls));
+  window.brazierClient.registerHook("other", {
+    mount: (node) => calls.push("mount other " + node.id),
+    unmount: (node) => calls.push("unmount other " + node.id),
+  });
+  let version = 0;
+  const render = (model) => sync(s, version++, model);
+  render({ hook: "probe", c: "a" });
+  const h = el("#h");
+  assert.deepEqual(calls.splice(0), ["mount h"]);
+  render({ hook: null, c: "a" });
+  assert.deepEqual(calls.splice(0), ["unmount h"], "removing the hook attribute unmounts the hook");
+  assert.equal(el("#h"), h, "the element itself stays");
+  render({ hook: null, c: "b" });
+  assert.deepEqual(calls.splice(0), [], "an element without a hook calls no hook");
+  render({ hook: "probe", c: "b" });
+  assert.deepEqual(calls.splice(0), ["mount h"], "the attribute added back mounts the hook again");
+  render({ hook: "other", c: "c" });
+  assert.deepEqual(calls.splice(0), ["unmount h", "mount other h"], "a renamed hook unmounts the old one, then mounts the new one");
+  assert.equal(el("#h"), h, "the element stays across the rename");
+  render({ hook: null, c: "c", innerHook: true });
+  assert.deepEqual(calls.splice(0), ["unmount other h", "mount inner"]);
+  render({ hook: null, c: "c" });
+  assert.deepEqual(calls.splice(0), ["unmount inner"], "a nested element that stays loses its hook too");
+  assert.equal(root.querySelectorAll("[data-brazier-hook]").length, 0);
+});
+
+// --- in-page fragment links ---
+// LiveView's DOM.isNewPageClick and Turbo's same-page anchors: a link to a
+// fragment of the current page (same pathname and search) is the
+// browser's, and so is the popstate of moving between fragments.
+scenario("in-page fragment links keep the browser's default, and same-page popstate sends nothing", async () => {
+  const links =
+    '<a id="frag" href="#x">x</a>' +
+    '<a id="self" href="/a#y">y</a>' +
+    '<a id="bare" href="#">top</a>' +
+    '<a id="query" href="/a?q=1#z">z</a>' +
+    '<a id="other" href="/b#sec">b</a>';
+  await loadRuntime({ path: "/a", ssr: links, view: () => ({ html: links, handlers: [] }) });
+  const s = sockets[0];
+  s.open();
+  sync(s, 0, {});
+  const navigates = () => s.sent.filter((f) => f.msg.type === "navigate").map((f) => f.msg.path);
+  for (const id of ["frag", "self", "bare"]) {
+    const event = fire(el("#" + id), "click");
+    assert.equal(event.defaultPrevented, false, id + ": the browser scrolls to the fragment");
+  }
+  assert.deepEqual(historyLog.pushed, [], "a fragment link pushes nothing itself");
+  assert.deepEqual(navigates(), [], "a fragment link is not a navigation");
+  popTo("/a#x");
+  popTo("/a");
+  assert.deepEqual(navigates(), [], "back and forward between fragments of the page send nothing");
+  const query = fire(el("#query"), "click");
+  assert.equal(query.defaultPrevented, true, "another search is another page");
+  assert.deepEqual(historyLog.pushed, ["/a?q=1#z"], "the fragment stays in the pushed URL");
+  assert.deepEqual(navigates(), ["/a?q=1"], "the server is sent only the path");
+  assert.equal(fire(el("#frag"), "click").defaultPrevented, false, "#x is now a fragment of /a?q=1");
+  const other = fire(el("#other"), "click");
+  assert.equal(other.defaultPrevented, true);
+  assert.deepEqual(historyLog.pushed, ["/a?q=1#z", "/b#sec"]);
+  assert.deepEqual(navigates(), ["/a?q=1", "/b"]);
+  popTo("/b#elsewhere");
+  assert.deepEqual(navigates(), ["/a?q=1", "/b"], "a fragment change on /b sends nothing");
+  popTo("/a#x");
+  assert.deepEqual(navigates(), ["/a?q=1", "/b", "/a"], "back to another page navigates to its path");
+  popTo("/a#y");
+  assert.deepEqual(navigates(), ["/a?q=1", "/b", "/a"]);
+});
+
+// --- refused upgrades ---
+// A browser reports a refused upgrade (the middleware answering 403, a
+// disallowed origin) only as close 1006 without onopen. The client keeps
+// Phoenix's capped backoff, and from the third such close in a row logs an
+// error naming the likely causes.
+scenario("closes before the socket opens back off to 30s, warn, then log an error from the third in a row", async () => {
+  await loadRuntime();
+  for (let i = 0; i < 7; i++) {
+    sockets[i].serverClose(1006);
+    const delay = reconnectDelay();
+    const base = Math.min(1000 * 2 ** i, 30000);
+    assert.ok(delay >= base && delay < base + 1000, `unopened close #${i + 1}: delay ${delay}`);
+    advance(delay);
+  }
+  assert.equal(sockets.length, 8, "every close schedules exactly one reconnect");
+  const beforeOpening = () => logsMatching("warn", "WebSocket closed before opening (code 1006)").length;
+  assert.equal(beforeOpening(), 2, "the first two unopened closes warn");
+  assert.equal(errorsMatching("The WebSocket upgrade failed").length, 5, "the third and later log an error");
+  assert.equal(errorsMatching("failed 3 times in a row before opening (code 1006)").length, 1);
+  assert.equal(errorsMatching("failed 7 times in a row before opening").length, 1);
+  assert.match(errorsMatching("failed 3 times")[0].text, /refused the upgrade/);
+  assert.equal(reloads, 0, "an unopened close never reloads");
+  assert.ok(!root.hasAttribute("data-brazier-error"));
+  sockets[7].open();
+  sockets[7].serverClose(1006);
+  assert.equal(logsMatching("warn", "WebSocket closed (code 1006); reconnecting").length, 1, "an opened socket's close warns");
+  advance(reconnectDelay());
+  sockets[8].serverClose(1006);
+  assert.equal(beforeOpening(), 3, "an open resets the count of unopened closes");
+  assert.equal(errorsMatching("The WebSocket upgrade failed").length, 5);
+});
+
+// --- keyed children ---
+// morphdom's and idiomorph's id matching, and the keyed children of Lustre
+// and LiveView: a keyed element keeps its identity across any reorder.
+const keyedView = (model) => ({
+  html:
+    "<ul>" + model.items.map(([key, tag]) => `<${tag} data-brazier-key="${key}">${key}</${tag}>`).join("") + "</ul>" +
+    "<div>" + model.inputs.map((k) => `<input id="${k}" name="${k}" value="v${k}" data-brazier-on-input="in">`).join("") + "</div>",
+  handlers: [{ name: "input", id: "in", decode: (e) => ok({ typed: e.target.value }) }],
+});
+
+scenario("keyed children keep their elements across any reorder, focus and typed value included", async () => {
+  await loadRuntime({ view: keyedView });
+  const s = sockets[0];
+  s.open();
+  const keys = Array.from({ length: 20 }, (_, i) => "k" + i);
+  const inputs = Array.from({ length: 10 }, (_, i) => "i" + i);
+  const li = (ks) => ks.map((k) => [k, "li"]);
+  sync(s, 0, { items: li(keys), inputs });
+  const list = () => [...root.childNodes[0].childNodes];
+  const byKey = new Map(list().map((node) => [node.getAttribute("data-brazier-key"), node]));
+  const assertOrder = (expected, what) => {
+    assert.deepEqual(list().map((n) => n.getAttribute("data-brazier-key")), expected.map(([k]) => k), what + ": order");
+    assert.deepEqual(list().map((n) => n.textContent), expected.map(([k]) => k), what + ": text");
+    assert.deepEqual(list().map((n) => n.tagName), expected.map(([, tag]) => tag.toUpperCase()), what + ": tags");
+  };
+  const reversed = li([...keys].reverse());
+  sync(s, 1, { items: reversed, inputs });
+  assertOrder(reversed, "reversed");
+  for (const node of list()) assert.equal(node, byKey.get(node.getAttribute("data-brazier-key")), "a reversal keeps every element");
+  const rotated = li([...keys.slice(1), keys[0]]);
+  sync(s, 2, { items: rotated, inputs });
+  assertOrder(rotated, "rotated");
+  for (const node of list()) assert.equal(node, byKey.get(node.getAttribute("data-brazier-key")), "a rotation keeps every element");
+  // Drop k3 and k4, add n1, move k19 to the front, and render k7 as a <p>.
+  const mixed = [["k19", "li"], ["n1", "li"], ...keys.slice(0, 19).filter((k) => k !== "k3" && k !== "k4").map((k) => [k, k === "k7" ? "p" : "li"])];
+  sync(s, 3, { items: mixed, inputs });
+  assertOrder(mixed, "mixed");
+  for (const node of list()) {
+    const key = node.getAttribute("data-brazier-key");
+    if (key === "n1" || key === "k7") assert.notEqual(node, byKey.get(key), key + " is a new element");
+    else assert.equal(node, byKey.get(key), key + " keeps its element");
+  }
+  assert.ok(!byKey.get("k3").parentNode && !byKey.get("k4").parentNode && !byKey.get("k7").parentNode, "dropped keys are removed");
+  // A duplicate key is a view bug: logged, and only the first keeps the element.
+  const k0 = list().find((n) => n.getAttribute("data-brazier-key") === "k0");
+  sync(s, 4, { items: [["k0", "li"], ["k1", "li"], ["k0", "li"]], inputs });
+  assert.equal(errorsMatching('Duplicate key "k0" among siblings').length, 1);
+  assert.equal(list()[0], k0, "the first k0 keeps its element");
+  assert.notEqual(list()[2], k0, "the second k0 is a new element");
+  assert.equal(list().length, 3);
+  // A focused input that moves keeps focus, selection and the value typed
+  // into it while the server has not acknowledged it.
+  const focused = el("#i5");
+  focused.focus();
+  focused.setSelectionRange(1, 2);
+  focused.value = "typed";
+  fire(focused, "input");
+  assert.equal(s.events().length, 1);
+  const items = [["k0", "li"]];
+  patch(s, 5, [{ op: "replace", path: "/items", value: items }, { op: "replace", path: "/inputs", value: [...inputs].reverse() }], 0);
+  assert.deepEqual([...root.childNodes[1].childNodes].map((n) => n.id), [...inputs].reverse());
+  assert.equal(el("#i5"), focused, "the moved input is the same element");
+  assert.equal(document.activeElement, focused, "the moved input keeps focus");
+  assert.deepEqual([focused.selectionStart, focused.selectionEnd], [1, 2], "and its selection");
+  assert.equal(focused.value, "typed", "an unacknowledged value survives the move");
+  assert.equal(el("#i4").value, "vi4", "the other inputs follow the markup");
+});
+
+// --- random morph equivalence ---
+// Seeded random trees of keyed and unkeyed elements, text and hook elements,
+// each render a mutation of the last (reorders, drops, inserts, tag and hook
+// changes) or a new tree. After every render: the DOM is the markup; every
+// keyed element whose chain of keyed ancestors survives with the same tags
+// is the same element; and the mounted hooks are exactly the hook elements
+// in the DOM. mulberry32 as in apply_equivalence.mjs.
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+const MORPH_TAGS = ["div", "p", "span", "li"];
+const MORPH_KEYS = "abcdefghijkl".split("");
+const MORPH_HOOKS = ["h1", "h2"];
+
+function randomTree(rand, depth) {
+  const pick = (list) => list[Math.floor(rand() * list.length)];
+  const used = new Set();
+  const nodes = [];
+  const count = Math.floor(rand() * 7);
+  for (let i = 0; i < count; i++) nodes.push(randomNode(rand, depth, used, pick));
+  return nodes;
+}
+
+function randomNode(rand, depth, used, pick) {
+  if (rand() < 0.2) return { text: "t" + Math.floor(rand() * 3) };
+  let key = null;
+  if (rand() < 0.6) {
+    const free = MORPH_KEYS.filter((k) => !used.has(k));
+    if (free.length > 0) {
+      key = pick(free);
+      used.add(key);
+    }
+  }
+  return {
+    tag: pick(MORPH_TAGS),
+    key,
+    hook: rand() < 0.25 ? pick(MORPH_HOOKS) : null,
+    v: Math.floor(rand() * 3),
+    children: depth > 0 ? randomTree(rand, depth - 1) : [],
+  };
+}
+
+function mutateTree(rand, nodes, depth) {
+  const pick = (list) => list[Math.floor(rand() * list.length)];
+  let out = nodes.map((n) => {
+    if (n.text !== undefined) return rand() < 0.2 ? { text: "t" + Math.floor(rand() * 3) } : n;
+    return {
+      ...n,
+      tag: rand() < 0.1 ? pick(MORPH_TAGS) : n.tag,
+      hook: rand() < 0.15 ? (n.hook ? null : pick(MORPH_HOOKS)) : n.hook,
+      v: rand() < 0.3 ? Math.floor(rand() * 3) : n.v,
+      children: depth > 0 ? mutateTree(rand, n.children, depth - 1) : n.children,
+    };
+  });
+  out = out.filter(() => rand() >= 0.15);
+  if (rand() < 0.5) {
+    for (let i = out.length - 1; i > 0; i--) {
+      const j = Math.floor(rand() * (i + 1));
+      [out[i], out[j]] = [out[j], out[i]];
+    }
+  }
+  const used = new Set(out.filter((n) => n.key).map((n) => n.key));
+  const inserts = Math.floor(rand() * 3);
+  for (let i = 0; i < inserts; i++) out.splice(Math.floor(rand() * (out.length + 1)), 0, randomNode(rand, depth, used, pick));
+  return out;
+}
+
+function treeHtml(nodes) {
+  return nodes
+    .map((n) => {
+      if (n.text !== undefined) return n.text;
+      const key = n.key ? ` data-brazier-key="${n.key}"` : "";
+      const hook = n.hook ? ` data-brazier-hook="${n.hook}"` : "";
+      return `<${n.tag}${key}${hook} data-v="${n.v}">${treeHtml(n.children)}</${n.tag}>`;
+    })
+    .join("");
+}
+
+function serializeDom(node) {
+  if (node.nodeType === 3) return node.textContent;
+  const attrs = node.attributes.map((a) => ` ${a.name}="${a.value}"`).sort().join("");
+  const tag = node.tagName.toLowerCase();
+  return `<${tag}${attrs}>${node.childNodes.map(serializeDom).join("")}</${tag}>`;
+}
+
+// Every keyed element reached through keyed elements only, by key path.
+function keyedPaths(parent, prefix = "", out = new Map()) {
+  for (const c of parent.childNodes) {
+    if (c.nodeType !== 1) continue;
+    const key = c.getAttribute("data-brazier-key");
+    if (key === null) continue;
+    const path = prefix + "/" + key;
+    out.set(path, c);
+    keyedPaths(c, path, out);
+  }
+  return out;
+}
+
+scenario("random morphs reproduce the markup, keep surviving keyed elements and track every hook", async () => {
+  for (const seed of [1, 7, 42, 2026, 31337]) {
+    const rand = mulberry32(seed);
+    await loadRuntime({ view: (model) => ({ html: treeHtml(model.tree), handlers: [] }) });
+    const s = sockets[0];
+    s.open();
+    const mounted = new Map();
+    for (const name of MORPH_HOOKS) {
+      window.brazierClient.registerHook(name, {
+        mount(node) {
+          assert.ok(!mounted.has(node), `seed ${seed}: ${name} mounted on an element that already has a hook`);
+          mounted.set(node, name);
+        },
+        unmount(node) {
+          assert.equal(mounted.get(node), name, `seed ${seed}: ${name} unmounted from an element it is not mounted on`);
+          mounted.delete(node);
+        },
+      });
+    }
+    let tree = randomTree(rand, 3);
+    for (let version = 0; version < 200; version++) {
+      const before = keyedPaths(root);
+      sync(s, version, { tree });
+      const what = `seed ${seed}, render ${version}`;
+      const expected = createElement("div");
+      parseInto(expected, treeHtml(tree));
+      assert.equal(root.childNodes.map(serializeDom).join(""), expected.childNodes.map(serializeDom).join(""), what + ": the DOM is the markup");
+      const after = keyedPaths(root);
+      for (const [path, old] of before) {
+        const kept = [...path.matchAll(/\/[^/]+/g)].every((m) => {
+          const prefix = path.slice(0, m.index + m[0].length);
+          return after.has(prefix) && after.get(prefix).tagName === before.get(prefix).tagName;
+        });
+        if (kept) assert.equal(after.get(path), old, `${what}: keyed element ${path} keeps its element`);
+      }
+      const hookElements = root.querySelectorAll("[data-brazier-hook]");
+      assert.equal(mounted.size, hookElements.length, what + ": one mounted hook per hook element");
+      for (const node of hookElements) assert.equal(mounted.get(node), node.getAttribute("data-brazier-hook"), what + ": each hook element runs its hook");
+      tree = rand() < 0.2 ? randomTree(rand, 3) : mutateTree(rand, tree, 3);
+    }
+    assert.equal(errorsMatching("").length, 0, `seed ${seed}: no render logged an error`);
+  }
 });
 
 let failures = 0;

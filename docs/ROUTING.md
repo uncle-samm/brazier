@@ -176,6 +176,14 @@ WebSocket. A link opens a normal page load instead when it has a modifier key
 held, a `target` other than `_self`, a `download` attribute, or a
 `data-brazier-external` attribute. Links to other hosts are not intercepted.
 
+A link to a fragment of the current page (`#section`, `/this/page#section`
+or a bare `#`: the same path and query) is left to the browser, which
+scrolls to the anchor; nothing is sent. Back and forward between fragments
+of one page send nothing either. A link to another page's fragment
+(`/docs#install`) navigates live: the pushed URL keeps the fragment, and the
+server is sent only the path. The client does not scroll to that fragment
+after the new page renders. This is LiveView's rule (`DOM.isNewPageClick`).
+
 Each live navigation (a link, back/forward, `router.push` or
 `router.replace`) passes the app's middleware first, on a `GET` of the
 target page with the connection's headers, just as a page load would. When

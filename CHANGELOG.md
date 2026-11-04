@@ -526,6 +526,33 @@ with its own changelog, so they are not listed here.
   (`disconnect_nodes/1` excludes a node instead of disconnecting it), and
   Mnesia likewise ignores connected nodes outside `db_nodes`. A process
   waiting for a node to pass the check keeps waiting through a rejection.
+- (Wave 4) A client hook element that stays in the page but loses its
+  `data-brazier-hook`, or names another hook, now unmounts the old hook
+  (and mounts the new one). Before, the old hook stayed mounted and a hook
+  added back later never mounted again. This is LiveView's
+  `View.performPatch`, which destroys a removed or changed `phx-hook`.
+- (Wave 4) Clicking an in-page fragment link (`#section`, `/this/page#x` or
+  `#`) is left to the browser, which scrolls to the anchor; the client no
+  longer prevents it. Back and forward between fragments of the same page
+  send no `navigate`. A link to another page's fragment keeps the fragment
+  in the pushed URL and sends the server only the path. This is LiveView's
+  `DOM.isNewPageClick` and its popstate rule.
+- (Wave 4) Keyed children (`data-brazier-key`, or `id`) are matched by key
+  at any distance, so a reorder moves elements instead of rebuilding them:
+  every keyed element keeps its identity, focus, selection and mounted hook
+  (morphdom's and idiomorph's id matching). A key rendered with another tag
+  is a new element; before, the old element kept its old tag. A key
+  repeated among siblings is logged as an error, and only the first keeps
+  the element. A focused input that moves keeps its unacknowledged value.
+- (Wave 4) A WebSocket that closes before it opens (how a browser reports a
+  refused upgrade, an unreachable server, or a disallowed origin) still
+  reconnects with the capped backoff, and from the third such close in a
+  row logs an error that names those causes, instead of a warning each
+  time. An opened socket resets the count. A seeded random morph test in
+  the client harness checks that the DOM matches the markup, keyed elements
+  survive, and mounted hooks match hook elements after every render.
+- (Audit TS-12) Every `let assert` in `runtime_versioning_test` has an `as`
+  message.
 
 ### Removed
 
