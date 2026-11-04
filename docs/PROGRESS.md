@@ -727,15 +727,15 @@
 
 ### Milestone 118 (proposed, after the M117 merge)
 - [ ] Perf re-baseline, deferred from M117 final verification: `make bench-baseline` on an idle machine (no other agents, no audio apps), then `make bench-check` against it must pass. The gate's spread rule stays as it is.
-- [ ] Server-to-hook push (Modorra R1), following LiveView `push_event`:
-  - API: `effect.push_hook(hook_id, name, json)` on the server and `handleEvent` in `registerHook`;
-  - delivered after the same update's patch, fire-and-forget;
-  - bounded per update, with an overflow failing loudly;
-  - a push to a hook that isn't mounted is reported, not dropped;
-  - it is a wire addition, so it needs a CHANGELOG **Wire break:** entry.
-  - Waiting on Modorra's answers: which widgets need it, whether it must survive a reconnect, and whether a stream primitive fits better.
+- [ ] LiveView-style streams (Modorra R1, answered 2026-11-04), following `stream`, `stream_insert`, `stream_delete` and `limit`:
+  - keyed items sent as ops (insert, update, delete, reset), not kept in the synced model;
+  - inserting an existing key updates it in place (Modorra's chunked turn output, keyed `agent_id:seq`);
+  - `limit` trims on the client; ops are bounded server-side, and an op over the frame limit fails loudly;
+  - after a reconnect the stream starts empty, and the app's init refills it (Modorra refetches from its last seq over HTTP, so there is no replay buffer);
+  - it is a wire addition, so it needs a CHANGELOG **Wire break:** entry;
+  - write a design in `docs/design/` and post it to Modorra before building.
+- Decision, 2026-11-05: `effect.push_hook` (LiveView `push_event`) is parked. Modorra's only use case, streamed turn output, is covered by streams, and the terminal and diffs have their own channels.
 - [ ] Array diff detects a shift. Today a sliding window (drop from the front and append in one update) matches no prefix or suffix, so the diff pairs elements by index and replaces the whole array on every event. Detect a small shift k (old[k..] == new[..n-k]), so the diff becomes k `remove` ops plus an `append`. Check Myers / LiveView streams first. The Erlang and JS diffs must stay op-for-op identical (equivalence harness).
-- [ ] Decide on LiveView-style streams (keyed insert and delete with a `limit`, items not kept in the model) once Modorra answers R1 question 3.
 
 
 ### Earlier milestones (1–116)
