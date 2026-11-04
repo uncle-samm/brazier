@@ -122,9 +122,16 @@ pub fn revocation_during_partition_is_enforced_on_heal_test_() -> peer.Timeout {
   assert peer.on(b, fn() { session.get(store_b, kept.id) }) == Some(kept)
   assert !list.any(peer.on(b, revocations), fn(r) { r.0 == kept.id })
   // The re-check reports its revocation, once: the kept session is live.
-  let revoked = peer.on(b, recorded_events)
-  assert list.filter(revoked, fn(e) { e.name == "beacon.session.revoked" })
-    == [Event("beacon.session.revoked", "", "recheck")]
+  // The event comes after the socket is told (the re-check logs how many
+  // sockets it notified, then emits), so the socket seeing the revocation
+  // does not mean the event is recorded yet: wait for it.
+  assert peer.eventually(fn() { revoked_events(b) != [] }, wait_ms)
+  assert revoked_events(b) == [Event("beacon.session.revoked", "", "recheck")]
+}
+
+fn revoked_events(p: Peer) -> List(RecordedEvent) {
+  peer.on(p, recorded_events)
+  |> list.filter(fn(e) { e.name == "beacon.session.revoked" })
 }
 
 /// Sessions on an External backend are the same session on every node.

@@ -640,9 +640,12 @@ new ref as a join:
   then down and permanently down at once, which reports its entries as
   leaves. The new replica's entries arrive as joins when B gets them, with
   the transfer at the next clock sample or as later deltas.
-- **On A,** a session that follows the topic gets the leaves when it sees
-  the old shard go (the paragraph above). A session that tracks there
-  tracks again after its backoff, and its join arrives when it does.
+- **On A,** a session that follows the topic gets the leaves from the
+  read it does once the new shard is up (the paragraph above). A session
+  that tracks there tracks again after its backoff, and its join arrives
+  when it does. A diff of the new shard that reaches the session before
+  that read is not reported on its own: the read covers it, so a join
+  that came first is reported in one message with the leave.
 
 The leave and the join are separate messages when they are not queued at
 the same time, and one coalesced message when they are. Either way the

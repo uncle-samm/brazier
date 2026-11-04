@@ -1147,8 +1147,24 @@ fn report_diffs(
   case diffs {
     [] -> Ok(state)
     [Diff(topic:, ..), ..] ->
-      case dict.get(state.known, topic) {
-        Error(Nil) -> {
+      case set.contains(state.pending, topic), dict.get(state.known, topic) {
+        // The topic's shard went down and the retry has not reconciled it
+        // yet. The retry's read comes after these diffs (a shard writes its
+        // table before it delivers), so it reports what they hold. Applying
+        // them now would report the new shard's joins before the old
+        // shard's leaves, which only that reconcile reports.
+        True, _ -> {
+          log.debug(
+            "beacon.presence",
+            "Presence watcher leaving "
+              <> int.to_string(list.length(diffs))
+              <> " diffs of "
+              <> topic
+              <> " to the reconcile after its shard restart",
+          )
+          Ok(state)
+        }
+        False, Error(Nil) -> {
           // Delivered before this watcher unsubscribed from the topic.
           log.debug(
             "beacon.presence",
@@ -1159,7 +1175,7 @@ fn report_diffs(
           )
           Ok(state)
         }
-        Ok(known) -> {
+        False, Ok(known) -> {
           let #(known, joins, leaves) =
             list.fold(diffs, #(known, dict.new(), dict.new()), apply_diff)
           report(state, topic, dict.values(joins), dict.values(leaves))

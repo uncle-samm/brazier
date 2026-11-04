@@ -198,6 +198,10 @@ with its own changelog, so they are not listed here.
 
 ### Fixed
 
+- (WS10b) After a shard restart, a session on the shard's node that follows
+  the topic could get the new entry's join before the old entry's leave.
+  The new shard's diffs that arrive before the session's read of the
+  restarted shard are left to that read, which reports both in one message.
 - (WS10b) A listener restarted under load could fail to bind its port with
   `eaddrinuse` and use up the restart tolerance of the application tree. The
   listen socket now has an owner process of its own

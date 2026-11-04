@@ -278,3 +278,71 @@ pub fn retracked_entry_leaves_and_joins_for_every_watcher_test_() -> peer.Timeou
   assert_leave_then_join(b, on_b, own)
   Nil
 }
+
+/// The race behind the test above, made certain. A watcher on A is held
+/// still while A's lobby shard restarts and the tracking session tracks
+/// itself again, so the new shard's join is queued behind the old shard's
+/// DOWN when it runs. The join must not be reported before the leave: the
+/// watcher reports both from the read it does once the shard is back.
+pub fn queued_join_waits_for_the_leave_of_the_restarted_shard_test_() -> peer.Timeout {
+  use <- Timeout(60)
+  use peers <- peer.with_cluster(1, "beacon_ws10b_restart_queued")
+  let assert [a] = peers
+  start_tracker(a)
+  let tracked = start_session(a, topic, [])
+  let own = first_ref(a, tracked)
+  let on_a = start_session(a, "", [topic])
+  let assert True = first_ref(a, on_a) == own
+
+  let retracked =
+    peer.on(a, fn() {
+      let w = watcher(on_a)
+      suspend(w)
+      let assert Ok(shard) = presence.shard_pid(tracker(), topic)
+      process.kill(shard)
+      let retracked =
+        peer.eventually(
+          fn() {
+            case presence.list(tracker(), topic) {
+              // The shard is restarting.
+              Error(presence.TrackerDown) -> False
+              listed -> {
+                let assert Ok(entries) = listed as "the lobby can be listed"
+                case refs_of_me(entries) {
+                  [ref] -> ref != own
+                  _ -> False
+                }
+              }
+            }
+          },
+          receive_ms,
+        )
+      resume(w)
+      retracked
+    })
+  let assert True = retracked as "the session never tracked itself again"
+
+  let #(diffs, new) = collect_until_new_ref(a, on_a, own, [])
+  let assert [diff] = diffs as "the leave and the join come in one message"
+  let assert True = refs_of_me(diff.leaves) == [own]
+  let assert True = refs_of_me(diff.joins) == [new]
+  Nil
+}
+
+/// The session's presence watcher; call on the session's node.
+fn watcher(session: Session) -> process.Pid {
+  // INVARIANT: a started runtime's subject is owned by its actor.
+  let assert Ok(runtime) = process.subject_owner(session.runtime)
+  let assert Ok(pid) = watcher_of(runtime)
+    as "the runtime has no presence watcher"
+  pid
+}
+
+@external(erlang, "beacon_presence_watch_test_ffi", "watcher_of")
+fn watcher_of(runtime: process.Pid) -> Result(process.Pid, Nil)
+
+@external(erlang, "beacon_presence_watch_test_ffi", "suspend")
+fn suspend(pid: process.Pid) -> Nil
+
+@external(erlang, "beacon_presence_watch_test_ffi", "resume")
+fn resume(pid: process.Pid) -> Nil

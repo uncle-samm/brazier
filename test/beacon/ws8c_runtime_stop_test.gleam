@@ -170,6 +170,10 @@ pub fn failing_linked_process_reports_stop_with_exit_test() {
   // The runtime left with the signal's reason, as an untrapped link would.
   let assert process.Abnormal(reason) = await_down(monitor)
   let assert Ok("ws8c linked owner fails") = decode.run(reason, decode.string)
+    as {
+      "the runtime must leave with the signal's reason, not "
+      <> string.inspect(reason)
+    }
   let assert Error(Nil) = process.receive(events, 0)
     as "an exit signal reports one stop"
   let assert Ok(Nil) = telemetry.detach(id)
