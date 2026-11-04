@@ -19,6 +19,7 @@
     registry_running/0,
     bind_process/3,
     bound_process_count/2,
+    is_bound/3,
     notify_revoked/3,
     notify_revoked_local/3,
     local_bound_sessions/1,
@@ -207,6 +208,15 @@ registry_running() ->
 
 group(Namespace, SessionId) ->
     {brazier_session, Namespace, SessionId}.
+
+%% Whether Pid is bound to the session on this node. A process cannot have
+%% been bound while the scope is not running: bind_process/3 crashes then.
+is_bound(Namespace, SessionId, Pid) ->
+    case registry_running() of
+        false -> false;
+        true ->
+            lists:member(Pid, pg:get_local_members(?PG_SCOPE, group(Namespace, SessionId)))
+    end.
 
 %% Idempotently bind Pid to the session. Returns the local member count.
 %% Crashes when the scope is not running: binding would silently not happen.

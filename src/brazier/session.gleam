@@ -1299,7 +1299,7 @@ fn ffi_registry_running() -> Bool
 @external(erlang, "brazier_session_ffi", "bind_process")
 fn bind_process(namespace: String, session_id: String, pid: Pid) -> Int
 
-@external(erlang, "brazier_session_binding_ffi", "is_bound")
+@external(erlang, "brazier_session_ffi", "is_bound")
 fn is_bound(namespace: String, session_id: String, pid: Pid) -> Bool
 
 @external(erlang, "brazier_session_ffi", "bound_process_count")
