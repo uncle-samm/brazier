@@ -39,10 +39,48 @@ import gleam/option.{None, Some}
 import gleam/result
 import gleam/string
 
-/// Why a store could not be created. Names must be 1-255 bytes of
-/// `[A-Za-z0-9_-]` once prefixed (they become ETS table atoms).
-pub type StoreError =
-  state_manager.EtsError
+/// Why a store could not be created or reused. `name` is the store's
+/// table name: the store name with its prefix (`beacon_store_` for a
+/// `Store`, `beacon_ls_` for a `ListStore`), which must be 1-255 bytes of
+/// `[A-Za-z0-9_-]` (it becomes an ETS table atom).
+pub type StoreError {
+  /// The name is empty, too long, or has a character outside
+  /// `[A-Za-z0-9_-]`.
+  InvalidName(name: String, reason: String)
+  /// A table with this name already exists with a different type.
+  TableTypeMismatch(name: String, expected: String, found: String)
+  /// The table owner could not create the table, for example because it
+  /// crashed owning tables and the application has not restarted.
+  TableOwnerUnavailable(name: String, reason: String)
+}
+
+/// A human-readable description of a store error, for logs and messages.
+pub fn describe_error(err: StoreError) -> String {
+  case err {
+    InvalidName(name:, reason:) ->
+      "invalid store name \"" <> name <> "\": " <> reason
+    TableTypeMismatch(name:, expected:, found:) ->
+      "store table \""
+      <> name
+      <> "\" already exists as "
+      <> found
+      <> ", expected "
+      <> expected
+    TableOwnerUnavailable(name:, reason:) ->
+      "table owner could not create \"" <> name <> "\": " <> reason
+  }
+}
+
+fn from_ets_error(err: state_manager.EtsError) -> StoreError {
+  case err {
+    state_manager.InvalidTableName(name:, reason:) ->
+      InvalidName(name:, reason:)
+    state_manager.TableTypeMismatch(name:, expected:, found:) ->
+      TableTypeMismatch(name:, expected:, found:)
+    state_manager.TableOwnerUnavailable(name:, reason:) ->
+      TableOwnerUnavailable(name:, reason:)
+  }
+}
 
 /// Where a store's data lives.
 pub type Mode {
@@ -139,7 +177,8 @@ fn start_replica(
   replicated.start(kind, name, config)
   |> result.map_error(fn(err) {
     case err {
-      replicated.InvalidName(err) -> InvalidStore(err)
+      replicated.InvalidName(name:, reason:) ->
+        InvalidStore(InvalidName(name:, reason:))
       replicated.InvalidConfig(reason) -> InvalidConfig(reason)
       replicated.StartFailed(reason) -> StartFailed(reason)
     }
@@ -164,17 +203,14 @@ fn open_table(
   case name {
     "" -> {
       let err =
-        state_manager.InvalidTableName(
-          name: name,
-          reason: "Invalid name: must not be empty",
-        )
-      log.error(
-        "beacon.store",
-        "Cannot open store: " <> state_manager.describe_ets_error(err),
-      )
+        InvalidName(name: name, reason: "Invalid name: must not be empty")
+      log.error("beacon.store", "Cannot open store: " <> describe_error(err))
       Error(err)
     }
-    _ -> state_manager.ensure_table(prefix <> name, table_type)
+    _ ->
+      // ensure_table logs the failure with the table name.
+      state_manager.ensure_table(prefix <> name, table_type)
+      |> result.map_error(from_ets_error)
   }
 }
 

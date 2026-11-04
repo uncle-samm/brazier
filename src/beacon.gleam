@@ -466,9 +466,11 @@ pub fn presence(
 /// )
 /// ```
 ///
-/// It and `presence` set the same thing: the later call replaces the
-/// earlier. An invalid topic (empty, or over `presence.max_topic_bytes`)
-/// fails the session's start, or stops it later, with a logged error.
+/// It, `presence` and `track_and_watch_presence` set the same thing: the
+/// later call replaces the earlier. To track and watch, use
+/// `track_and_watch_presence`. An invalid topic (empty, or over
+/// `presence.max_topic_bytes`) fails the session's start, or stops it
+/// later, with a logged error.
 /// Start fails when the tracker configuration is invalid.
 pub fn watch_presence(
   app: App(state, model, local, msg),
@@ -478,6 +480,39 @@ pub fn watch_presence(
 ) -> App(state, model, local, msg) {
   let watching =
     presence_watch.new_watching(tracker, fn(_state) { [] }, watch, on_presence)
+  App(..app, presence: Some(watching))
+}
+
+/// `presence` and `watch_presence` together: every session tracks what
+/// `track` returns for its state and also follows the topics `watch`
+/// returns, without being on them. A chat room that shows who is in the
+/// room and how many are in the lobby uses this. Both lists are computed
+/// after every update. A topic that is both tracked and watched is followed
+/// once, so its diffs arrive once. The diffs, limits and failures are those
+/// of `presence` and `watch_presence`.
+///
+/// ```gleam
+/// beacon.application(init:, update:, view:)
+/// |> beacon.track_and_watch_presence(
+///   tracker: presence.new("online", encode_user, user_decoder()),
+///   track: fn(model) {
+///     [presence.Tracking(topic: "room:" <> model.room, key: model.user, meta: model.profile)]
+///   },
+///   watch: fn(_model) { ["lobby"] },
+///   on_presence: PresenceChanged,
+/// )
+/// ```
+///
+/// It, `presence` and `watch_presence` set the same thing: the later call
+/// replaces the earlier.
+pub fn track_and_watch_presence(
+  app: App(state, model, local, msg),
+  tracker tracker: beacon_presence.PresenceConfig(meta),
+  track track: fn(state) -> List(beacon_presence.Tracking(meta)),
+  watch watch: fn(state) -> List(String),
+  on_presence on_presence: fn(presence_sync.Diff(meta)) -> msg,
+) -> App(state, model, local, msg) {
+  let watching = presence_watch.new_watching(tracker, track, watch, on_presence)
   App(..app, presence: Some(watching))
 }
 
@@ -516,9 +551,12 @@ pub fn notification_payload(
 
 // ===== Start =====
 
-/// Start the app on `port` under its supervision tree and block forever.
-/// If the tree gives up (a child keeps crashing), the calling process
-/// crashes with the reason instead of running on without it.
+/// Start the app on `port` under its supervision tree and block while it
+/// runs (`application.wait_forever`). It returns `Error` when the app cannot
+/// start, and `Ok(Nil)` once it has stopped: after SIGTERM, when the
+/// listener has drained its connections, or when the tree was stopped
+/// elsewhere. If the tree gives up (a child keeps crashing), the calling
+/// process crashes with the reason instead of running on without it.
 ///
 /// The server codec and the client bundle are build artifacts of
 /// `gleam run -m beacon/build` (or `gleam run -m beacon/dev`); starting

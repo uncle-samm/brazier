@@ -32,6 +32,48 @@ in this order:
    `beacon.watch_presence(..)` is set.
 5. The HTTP and WebSocket listener.
 
+<!-- docs-check: wrap
+import beacon
+import beacon/effect.{type Effect}
+import beacon/element.{type Element}
+import beacon/presence
+import beacon/presence/sync
+import beacon/cluster
+
+pub fn main(
+  discovery: cluster.Discovery,
+  secret_key: String,
+  online: presence.PresenceConfig(String),
+) {
+  {{block}}
+}
+
+pub type Model {
+  Model(room: String, user: String, status: String)
+}
+
+pub type Msg {
+  PresenceChanged(sync.Diff(String))
+}
+
+fn init(_ctx: beacon.Context) -> Result(#(Model, Effect(Msg)), beacon.InitError) {
+  Ok(#(Model(room: "1", user: "ada", status: "online"), effect.none()))
+}
+
+fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
+  case msg {
+    PresenceChanged(_) -> #(model, effect.none())
+  }
+}
+
+fn view(model: Model) -> Element(Msg) {
+  element.text(model.user)
+}
+
+fn track(model: Model) -> List(presence.Tracking(String)) {
+  [presence.Tracking(topic: "room:" <> model.room, key: model.user, meta: model.status)]
+}
+-->
 ```gleam
 beacon.application(init:, update:, view:)
 |> beacon.cluster(cluster.new(discovery, secret_key: secret_key))
@@ -148,6 +190,13 @@ and logged at info level.
 
 To run a production node over an insecure setup on purpose, say why:
 
+<!-- docs-check: wrap
+import beacon/cluster
+
+pub fn config(discovery: cluster.Discovery, secret: String) -> cluster.ClusterConfig {
+  {{block}}
+}
+-->
 ```gleam
 cluster.new(discovery, secret_key: secret)
 |> cluster.allow_insecure_distribution("single-host demo, loopback only")
@@ -159,18 +208,49 @@ reason. If distribution is not started at all, the result is
 
 ## The cluster manager
 
+<!-- docs-check: wrap
+import beacon/effect.{type Effect}
+import beacon/element.{type Element}
+
+{{block}}
+
+pub type Model {
+  Model(count: Int)
+}
+
+pub type Msg {
+  Increment
+}
+
+fn init(_ctx: beacon.Context) -> Result(#(Model, Effect(Msg)), beacon.InitError) {
+  Ok(#(Model(count: 0), effect.none()))
+}
+
+fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
+  case msg {
+    Increment -> #(Model(count: model.count + 1), effect.none())
+  }
+}
+
+fn view(_model: Model) -> Element(Msg) {
+  element.text("counter")
+}
+-->
 ```gleam
+import beacon
 import beacon/cluster
 
-let config =
-  cluster.new(
-    cluster.Dns(query: "app.internal", basename: "app", poll_ms: 5000),
-    secret_key: secret_key,
-  )
+pub fn start(secret_key: String) {
+  let config =
+    cluster.new(
+      cluster.Dns(query: "app.internal", basename: "app", poll_ms: 5000),
+      secret_key: secret_key,
+    )
 
-beacon.application(init:, update:, view:)
-|> beacon.cluster(config)
-|> beacon.start(8080)
+  beacon.application(init:, update:, view:)
+  |> beacon.cluster(config)
+  |> beacon.start(8080)
+}
 ```
 
 `beacon.cluster` runs the manager in the application's supervision tree,
@@ -269,6 +349,15 @@ Presence is the better fit for "who is here".
 
 ## Replicated stores
 
+<!-- docs-check: wrap
+import beacon/store
+import beacon/store/replicated
+
+pub fn open_cart() -> store.Store(Int) {
+  {{block}}
+  cart
+}
+-->
 ```gleam
 let assert Ok(cart) =
   store.open("cart", store.Replicated(replicated.default_config()))
@@ -400,6 +489,14 @@ A session store has one of two backends.
   - A storage error is logged and returned as `SessionBackendFailed`. The
     session is never treated as valid.
 
+<!-- docs-check: wrap
+import beacon/session
+
+pub fn start(postgres_backend: session.ExternalBackend) -> session.SessionStore {
+  {{block}}
+  store
+}
+-->
 ```gleam
 let assert Ok(store) =
   session.start_store(session.External(postgres_backend), session.default_store_config())
@@ -430,30 +527,74 @@ Most apps track their sessions with `beacon.presence`. The tracker runs in
 the application's supervision tree, and each session declares what it is
 present as from its state:
 
+<!-- docs-check: wrap
+import beacon/effect.{type Effect}
+import beacon/element.{type Element}
+import gleam/dynamic/decode
+import gleam/json
+
+{{block}}
+
+pub type Model {
+  Model(
+    room: String,
+    user: String,
+    profile: Profile,
+    online: List(sync.Entry(Profile)),
+  )
+}
+
+pub type Profile {
+  Profile(name: String)
+}
+
+fn init(_ctx: beacon.Context) -> Result(#(Model, Effect(Msg)), beacon.InitError) {
+  let profile = Profile(name: "Ada")
+  Ok(#(Model(room: "1", user: "ada", profile:, online: []), effect.none()))
+}
+
+fn view(model: Model) -> Element(Msg) {
+  element.text(model.profile.name)
+}
+
+fn encode_profile(profile: Profile) -> json.Json {
+  json.object([#("name", json.string(profile.name))])
+}
+
+fn profile_decoder() -> decode.Decoder(Profile) {
+  use name <- decode.field("name", decode.string)
+  decode.success(Profile(name:))
+}
+-->
 ```gleam
+import beacon
 import beacon/presence
 import beacon/presence/sync
 
 pub type Msg {
   PresenceChanged(sync.Diff(Profile))
-  // ...
 }
 
-let online = presence.new("online", encode_user, user_decoder())
+pub fn main() {
+  let online = presence.new("online", encode_profile, profile_decoder())
 
-beacon.application(init:, update:, view:)
-|> beacon.presence(
-  tracker: online,
-  track: fn(model) {
-    [presence.Tracking(topic: "room:" <> model.room, key: model.user, meta: model.profile)]
-  },
-  on_presence: PresenceChanged,
-)
-|> beacon.start(8080)
+  beacon.application(init:, update:, view:)
+  |> beacon.presence(
+    tracker: online,
+    track: fn(model) {
+      [presence.Tracking(topic: "room:" <> model.room, key: model.user, meta: model.profile)]
+    },
+    on_presence: PresenceChanged,
+  )
+  |> beacon.start(8080)
+}
 
-// In update:
-PresenceChanged(diff) ->
-  #(Model(..model, online: sync.merge(model.online, diff)), effect.none())
+fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
+  case msg {
+    PresenceChanged(diff) ->
+      #(Model(..model, online: sync.merge(model.online, diff)), effect.none())
+  }
+}
 ```
 
 `Diff`, `Entry` and `Meta` are in `beacon/presence/sync`, which runs in the
@@ -469,7 +610,7 @@ each room and who is typing this way.
   topic lists everyone already there as joins. Up to 100 queued changes
   of a topic are coalesced into one message. `sync.merge` applies a diff
   to a list (Phoenix's `syncDiff`).
-- **Shard restarts are invisible to the app.** When a tracker shard
+- **Shard restarts are handled for the app.** When a tracker shard
   restarts, the session tracks its entries again (with backoff) and gets
   one message with the old entry leaving and the new one joining.
   Entries of other nodes do not flap. The new shard starts empty and
@@ -483,7 +624,56 @@ each room and who is typing this way.
   heard from the node for `down_period`, or when it has not synced
   within `down_period`. The last case is logged as a warning.
   Entries of this node that the old shard held are reported as leaves at
-  once. Their processes track again with new refs.
+  once. Their processes track again with new refs. What other sessions
+  see of that is below.
+
+#### What other sessions see when a shard restarts
+
+When the shard of node A restarts, every entry it held is a presence that
+has ended, on every node. A session that tracks itself there tracks again
+under a new ref, and that is a new presence. So every session that follows
+the topic, on A or on another node, gets the old ref as a leave and the
+new ref as a join:
+
+- **On another node B,** the shard of B sees A's new shard as a new
+  replica of A (a new `vsn`) at its first heartbeat. The old replica is
+  then down and permanently down at once, which reports its entries as
+  leaves. The new replica's entries arrive as joins when B gets them, with
+  the transfer at the next clock sample or as later deltas.
+- **On A,** a session that follows the topic gets the leaves when it sees
+  the old shard go (the paragraph above). A session that tracks there
+  tracks again after its backoff, and its join arrives when it does.
+
+The leave and the join are separate messages when they are not queued at
+the same time, and one coalesced message when they are. Either way the
+leave comes first, and `sync.merge` ends with the new ref only. A list
+keyed by `key` (as Phoenix's JavaScript `Presence.list` is) shows the key
+throughout when both arrive in one message, and is without it in between
+when they do not.
+
+This is Phoenix.Tracker's model, kept on purpose:
+
+- A presence is identified by its ref (`phx_ref`), not its key: a key can
+  be on a topic many times (two tabs), and a tracking made again may carry
+  a different meta. Merging the old ref into the new one would need a
+  rule Phoenix does not have.
+- `Phoenix.Tracker.Shard.handle_heartbeat` treats a known node with a new
+  `vsn` as down, then permanently down, then up: the old replica's entries
+  leave at once, and the new replica's join when they replicate. Beacon's
+  shard does the same (`beacon_presence_shard.erl`, `handle_heartbeat`).
+- Holding the leaves until the entries come back would not be bounded by
+  anything the watcher can know. Only Beacon sessions track again, a
+  process that called `presence.track` itself does not, and a session may
+  have ended meanwhile. Phoenix does not track again at all: the shard
+  links its tracked processes, so a shard crash ends them, and their
+  clients join again. A watcher that held leaves would show entries that
+  may never return, and the delay before it gave up would be a guess.
+
+The suspects described above are different: they are entries that did
+not end, held only until the new shard has synced with their node, which
+the shard reports.
+
+`ws10b_presence_restart_semantics_test` checks this on two nodes.
 - **Failures stop the session loudly.** A tracking the tracker refuses (a
   limit, an invalid topic or key, the same key twice on a topic), a
   tracker that stays down, or the loss of the session's PubSub partition
@@ -496,6 +686,39 @@ A session that only shows who is here, such as a dashboard or a lobby
 list, uses `beacon.watch_presence`. It follows the topics `watch` returns
 for its state and tracks nothing, so it never appears in a list:
 
+<!-- docs-check: wrap
+import beacon
+import beacon/effect.{type Effect}
+import beacon/element.{type Element}
+import beacon/presence
+import beacon/presence/sync
+
+pub fn main(online: presence.PresenceConfig(String)) {
+  {{block}}
+}
+
+pub type Model {
+  Model(room: String, user: String, status: String)
+}
+
+pub type Msg {
+  PresenceChanged(sync.Diff(String))
+}
+
+fn init(_ctx: beacon.Context) -> Result(#(Model, Effect(Msg)), beacon.InitError) {
+  Ok(#(Model(room: "1", user: "ada", status: "online"), effect.none()))
+}
+
+fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
+  case msg {
+    PresenceChanged(_) -> #(model, effect.none())
+  }
+}
+
+fn view(model: Model) -> Element(Msg) {
+  element.text(model.user)
+}
+-->
 ```gleam
 beacon.application(init:, update:, view:)
 |> beacon.watch_presence(
@@ -514,26 +737,108 @@ leaves. A topic listed twice is followed once. An invalid topic (empty, or
 over `presence.max_topic_bytes`) fails the session's start, or stops the
 session later, with a logged error.
 
-`beacon.presence` and `beacon.watch_presence` set the same thing. When both
-are called, the later call wins. A session that tracks itself already
-hears its tracked topics, so it does not also need to watch them.
+### Tracking and watching
+
+A session that is on some topics and follows others, such as a user in a
+room who also sees the lobby, uses `beacon.track_and_watch_presence`:
+
+<!-- docs-check: wrap
+import beacon
+import beacon/effect.{type Effect}
+import beacon/element.{type Element}
+import beacon/presence
+import beacon/presence/sync
+
+pub fn main(online: presence.PresenceConfig(String)) {
+  {{block}}
+}
+
+pub type Model {
+  Model(room: String, user: String, status: String)
+}
+
+pub type Msg {
+  PresenceChanged(sync.Diff(String))
+}
+
+fn init(_ctx: beacon.Context) -> Result(#(Model, Effect(Msg)), beacon.InitError) {
+  Ok(#(Model(room: "1", user: "ada", status: "online"), effect.none()))
+}
+
+fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
+  case msg {
+    PresenceChanged(_) -> #(model, effect.none())
+  }
+}
+
+fn view(model: Model) -> Element(Msg) {
+  element.text(model.user)
+}
+-->
+```gleam
+beacon.application(init:, update:, view:)
+|> beacon.track_and_watch_presence(
+  tracker: online,
+  track: fn(model) {
+    [presence.Tracking(topic: "room:" <> model.room, key: model.user, meta: model.status)]
+  },
+  watch: fn(_model) { ["lobby"] },
+  on_presence: PresenceChanged,
+)
+```
+
+Its topics are those `track` returns plus those `watch` returns, each
+followed once. The session appears only on its tracked topics.
+
+`beacon.presence`, `beacon.watch_presence` and
+`beacon.track_and_watch_presence` set the same thing. When more than one
+is called, the last call wins. A session that tracks itself already hears
+its tracked topics, so it does not also need to watch them.
 
 ### The tracker API
 
 The rest of this section describes the tracker itself, for processes that
 are not Beacon sessions.
 
+<!-- docs-check: wrap
+import gleam/dynamic/decode
+import gleam/json
+
+{{block}}
+
+pub type UserMeta {
+  UserMeta(status: String)
+}
+
+fn encode_user_meta(meta: UserMeta) -> json.Json {
+  json.object([#("status", json.string(meta.status))])
+}
+
+fn user_meta_decoder() -> decode.Decoder(UserMeta) {
+  use status <- decode.field("status", decode.string)
+  decode.success(UserMeta(status:))
+}
+-->
 ```gleam
 import beacon/presence
 
-let config = presence.new("users", encode_user_meta, user_meta_decoder)
-let assert Ok(child) = presence.supervised(config)
-let assert Ok(users) = presence.handle(config)
+fn users_config() -> presence.PresenceConfig(UserMeta) {
+  presence.new("users", encode_user_meta, user_meta_decoder())
+}
 
-// In the process to track (for example a connection's runtime):
-let assert Ok(_ref) = presence.track(users, "room:42", user_id, UserMeta(status: "online"))
-let assert Ok(Nil) = presence.subscribe(users, "room:42")
-let assert Ok(entries) = presence.list(users, "room:42")
+/// The tracker's child, for your supervisor.
+pub fn users_child() {
+  presence.supervised(users_config())
+}
+
+/// In the process to track (for example a connection's runtime).
+pub fn join_room(user_id: String) {
+  let assert Ok(users) = presence.handle(users_config())
+  let assert Ok(_ref) =
+    presence.track(users, "room:42", user_id, UserMeta(status: "online"))
+  let assert Ok(Nil) = presence.subscribe(users, "room:42")
+  presence.list(users, "room:42")
+}
 ```
 
 - `track`, `update`, `untrack` and `untrack_all` act on the calling

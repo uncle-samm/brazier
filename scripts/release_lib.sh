@@ -62,6 +62,32 @@ release_version() {
   printf '%s\n' "$version"
 }
 
+# Refuses unless the Hex tarball TARBALL (an outer tar holding
+# contents.tar.gz) contains each FILE, a path relative to the package root.
+release_require_tarball_file() {
+  local tarball="$1"
+  shift
+  if [ ! -f "$tarball" ]; then release_refuse "$tarball was not built"; fi
+  if ! python3 - "$tarball" "$@" <<'PY'
+import io
+import sys
+import tarfile
+
+with tarfile.open(sys.argv[1]) as outer:
+    member = outer.extractfile("contents.tar.gz")
+    if member is None:
+        sys.exit(sys.argv[1] + " has no contents.tar.gz")
+    with tarfile.open(fileobj=io.BytesIO(member.read()), mode="r:gz") as inner:
+        names = set(inner.getnames())
+missing = [path for path in sys.argv[2:] if path not in names]
+if missing:
+    sys.exit(sys.argv[1] + " is missing " + ", ".join(missing))
+PY
+  then
+    release_refuse "the Hex tarball does not contain what the package needs"
+  fi
+}
+
 # Refuses unless CHANGELOG.md has a `## [VERSION]` heading (optionally
 # followed by ` - YYYY-MM-DD`).
 release_require_changelog_heading() {

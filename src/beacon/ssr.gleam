@@ -172,10 +172,22 @@ pub type RenderedPage {
 ///    `error.unavailable`); its reason is logged, never rendered. A crash
 ///    in `init` propagates, and the transport answers it with 500.
 /// 4. Apply the route message through `update` (effects dropped likewise).
-/// 5. Render `view` and wrap it in the HTML document with the client script.
+/// 5. Render `view` and wrap it in the HTML document with the client script
+///    named by the app's manifest (`client_assets_dir`). A missing or
+///    damaged manifest or bundle is a 500 static error page.
 pub fn render_page(
   config: SsrConfig(state, msg),
   req: Request(body),
+) -> RenderedPage {
+  render_page_from(config, req, client_assets_dir())
+}
+
+/// `render_page` with the client bundle read from `assets_dir` instead of
+/// the app's `priv/static`.
+pub fn render_page_from(
+  config: SsrConfig(state, msg),
+  req: Request(body),
+  assets_dir: String,
 ) -> RenderedPage {
   let page_uri = request.to_uri(req)
   let path = describe_uri(page_uri)
@@ -223,7 +235,7 @@ pub fn render_page(
                   routed
                 }
               }
-              render_state(config, state, path)
+              render_state(config, state, path, assets_dir)
             }
           }
         }
@@ -300,13 +312,14 @@ fn render_state(
   config: SsrConfig(state, msg),
   state: state,
   path: String,
+  assets_dir: String,
 ) -> RenderedPage {
   let view_html = element.to_string(config.view(state))
   let model_json = case config.recovery_encoder {
     Some(encode) -> Some(encode(state))
     None -> None
   }
-  case client_bundle_name(client_assets_dir()) {
+  case client_bundle_name(assets_dir) {
     Ok(bundle) -> {
       let html =
         build_html_document(

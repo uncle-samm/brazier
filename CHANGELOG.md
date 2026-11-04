@@ -54,6 +54,15 @@ with its own changelog, so they are not listed here.
   clear the cookie when the session store fails.
 - (WS8a) `cluster.new` takes `secret_key`. Presence `members`, `list` and
   `get_by_key` return a `Result`.
+- (WS10b) A join token that does not verify, a token model that `restore`
+  cannot decode, and a missing token while state recovery is enabled refuse
+  the connection before `init` runs: the socket closes with 4400 and the
+  browser reloads the page. The session no longer continues from `init`'s
+  state. State recovery with an empty secret key fails the runtime's start.
+- (WS10b) `store.StoreError` is a store type, `InvalidName`,
+  `TableTypeMismatch` or `TableOwnerUnavailable`, not an alias of the
+  internal `state_manager.EtsError`. `replicated.InvalidName` carries
+  `name` and `reason`.
 
 ### Added
 
@@ -99,6 +108,14 @@ with its own changelog, so they are not listed here.
   in the docs. It also compiles every Gleam sample in them with zero
   warnings, except samples marked as fragments.
 - (WS10) `make publish-dry-run`, and a release gate in `scripts/publish.sh`.
+- (WS10b) `store.describe_error`.
+- (WS10b) `beacon.track_and_watch_presence`: a session tracks itself on
+  the topics `track` returns and follows the topics `watch` returns.
+- (WS10b) `beacon/rate_limit` is public, since `middleware.rate_limit` takes
+  its `RateLimiter`; `rate_limit.config` and `rate_limit.max_keys` read a
+  limiter's settings.
+- (WS10b) `[beacon, subscription, changed]` telemetry: a runtime's PubSub
+  listener joined or left a topic.
 
 ### Changed
 
@@ -131,6 +148,24 @@ with its own changelog, so they are not listed here.
   to `docs/archive/`.
 - (WS10) The release scripts are strict bash. `run_canonical_cdp.sh` is now
   `run_all_cdp.sh --canonical`.
+- (WS10b) Every example's `main` crashes when `beacon.start` returns an
+  error, so `gleam run` without `gleam run -m beacon/build` first exits with
+  status 1 and names the missing artifact; before, it exited 0 in silence.
+  The examples ship an inline SVG favicon, so the browser requests no
+  `/favicon.ico`.
+- (WS10b) The Hex package carries the client runtime: `scripts/publish.sh`
+  copies `beacon_client/src` to `priv/beacon_client_src` for the tarball and
+  checks the tarball holds it, and `beacon/build` reads the runtime from
+  there when the app gets Beacon from Hex. Before, an app on the Hex package
+  could not build its client bundle.
+- (WS10b) The examples' generated `src/beacon_codec.gleam` and
+  `priv/static/` bundles are no longer tracked; build an example before its
+  first run.
+- (WS10b) CI runs `scripts/check_docs.sh` and the CDP suite at the mobile
+  viewport as well as the desktop one. The samples in CLUSTERING, TELEMETRY,
+  ERROR_HANDLING and TESTING are compiled too, and ERROR_HANDLING describes
+  the transport, rate limit, join token and model size errors as the code
+  raises them.
 
 ### Removed
 
@@ -165,6 +200,9 @@ with its own changelog, so they are not listed here.
 - (WS7) `javascript:` URLs are filtered from URL attributes.
 - (WS8a) Cluster peers are checked with an HMAC hello/ack. A production node
   refuses to run without secure distribution.
+- (WS10b) `examples/auth_workspace` checks its login form against a random
+  per-browser token in an HttpOnly cookie (a double-submit cookie), renewed
+  at each login, instead of a constant that protected nothing.
 
 ## Before Milestone 117 (never released)
 

@@ -14,7 +14,7 @@ The simplest Beacon app: a counter built with `beacon.simple`.
 
 ```bash
 cd examples/counter
-gleam run -m beacon/build   # after changing the source
+gleam run -m beacon/build   # first, and after every change
 gleam run
 ```
 

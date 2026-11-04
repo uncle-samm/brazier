@@ -20,6 +20,10 @@ import gleam/int
 import gleam/list
 import gleam/string
 
+/// The tab icon, inline so the browser does not request `/favicon.ico`.
+const favicon =
+  "<link rel=\"icon\" href=\"data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='7' fill='%23f59e0b'/></svg>\">"
+
 // --- Types ---
 
 pub type Todo {
@@ -419,15 +423,18 @@ fn filter_button(
 
 pub fn main() {
   let changes = store.new_list("todo_changes")
-  beacon.full_application(
-    init: fn(_ctx) { init(changes) },
-    update: fn(model, msg) { update(changes, model, msg) },
-    sync:,
-    local: local.layer(init: init_local, update: update_local),
-    view:,
-  )
-  |> beacon.title(fn(_model) { "Todo App" })
-  |> beacon.subscriptions(fn(_model) { [store.list_topic(changes)] })
-  |> beacon.on_notify(fn(_topic) { TodosChanged })
-  |> beacon.start(8080)
+  let assert Ok(Nil) =
+    beacon.full_application(
+      init: fn(_ctx) { init(changes) },
+      update: fn(model, msg) { update(changes, model, msg) },
+      sync:,
+      local: local.layer(init: init_local, update: update_local),
+      view:,
+    )
+    |> beacon.title(fn(_model) { "Todo App" })
+    |> beacon.subscriptions(fn(_model) { [store.list_topic(changes)] })
+    |> beacon.on_notify(fn(_topic) { TodosChanged })
+    |> beacon.head_html(favicon)
+    |> beacon.start(8080)
+    as "beacon.start failed (it logs the error)"
 }

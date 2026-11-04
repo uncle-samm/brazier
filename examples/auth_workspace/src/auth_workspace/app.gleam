@@ -9,8 +9,6 @@ import beacon/event
 import beacon/html
 import gleam/int
 
-pub const login_csrf_token = "auth-workspace-login-csrf"
-
 pub type Route {
   Home
   Login
@@ -30,7 +28,9 @@ pub type Account {
 }
 
 pub type Viewer {
-  Guest
+  /// `login_csrf` is this browser's login CSRF token, read from its
+  /// `auth_workspace_login_csrf` cookie; the login form posts it back.
+  Guest(login_csrf: String)
   SignedIn(Account)
 }
 
@@ -91,10 +91,10 @@ pub fn parse_role(value: String) -> Result(Role, Nil) {
   }
 }
 
-pub fn guest_model() -> Model {
+pub fn guest_model(login_csrf: String) -> Model {
   Model(
     route: Home,
-    viewer: Guest,
+    viewer: Guest(login_csrf:),
     status: "Sign in to open the workspace",
     saved_profiles: 0,
     admin_events: 0,
@@ -126,14 +126,14 @@ pub fn view(model: Model, _local: Nil) -> Element(Msg) {
     [
       html.h1([], [html.text("Auth Workspace")]),
       case model.viewer {
-        Guest -> login_view(model)
+        Guest(login_csrf:) -> login_view(model, login_csrf)
         SignedIn(account) -> workspace_view(model, account)
       },
     ],
   )
 }
 
-fn login_view(model: Model) -> Element(Msg) {
+fn login_view(model: Model, login_csrf: String) -> Element(Msg) {
   html.section(
     [
       attribute.data("testid", "login-panel"),
@@ -162,7 +162,8 @@ fn login_view(model: Model) -> Element(Msg) {
           html.input([
             attribute.type_("hidden"),
             attribute.name("csrf"),
-            attribute.value(login_csrf_token),
+            attribute.value(login_csrf),
+            attribute.data("testid", "login-csrf"),
           ]),
           html.label([attribute.for("login-username")], [
             html.text("Username"),

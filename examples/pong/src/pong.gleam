@@ -14,6 +14,10 @@ import beacon/html
 import beacon/log
 import gleam/int
 
+/// The tab icon, inline so the browser does not request `/favicon.ico`.
+const favicon =
+  "<link rel=\"icon\" href=\"data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='7' fill='%23f59e0b'/></svg>\">"
+
 const width = 600
 
 const height = 400
@@ -325,7 +329,10 @@ fn px(value: Int) -> String {
 }
 
 pub fn main() {
-  beacon.application(init:, update:, view:)
-  |> beacon.title(fn(_model) { "Beacon Pong" })
-  |> beacon.start(8080)
+  let assert Ok(Nil) =
+    beacon.application(init:, update:, view:)
+    |> beacon.title(fn(_model) { "Beacon Pong" })
+    |> beacon.head_html(favicon)
+    |> beacon.start(8080)
+    as "beacon.start failed (it logs the error)"
 }

@@ -989,6 +989,33 @@ fn join_and_receive(
 
 const recovery_secret = "runtime-test-secret-key-0123456789"
 
+/// A join whose token fails the check is refused loudly: an `error` frame,
+/// and the connection stays unjoined (its events are rejected), never a
+/// model sync with the init state.
+fn assert_join_refused(
+  subject: process.Subject(runtime.RuntimeMessage(CounterMsg)),
+  conn_id: String,
+  transport_subject: process.Subject(transport.InternalMessage),
+  first: transport.InternalMessage,
+) -> Nil {
+  let assert transport.SendError(reason: "join refused") = first
+  process.send(
+    subject,
+    runtime.ClientEventReceived(
+      conn_id: conn_id,
+      event_name: "click",
+      handler_id: "increment",
+      event_data: "{}",
+      target_path: "",
+      clock: 1,
+      ops: "",
+    ),
+  )
+  let assert Ok(transport.SendError(reason: "event received before join")) =
+    process.receive(transport_subject, await.deadline_ms)
+  Nil
+}
+
 pub fn state_recovery_rejects_token_signed_with_other_secret_test() {
   let assert Ok(subject) =
     runtime.start(recovery_config(recovery_secret), test_context())
@@ -998,9 +1025,8 @@ pub fn state_recovery_rejects_token_signed_with_other_secret_test() {
       fn(m: CounterModel) { int.to_string(m.count) },
       "some-other-secret-key-0123456789",
     )
-  let #(_, first) = join_and_receive(subject, "forged_conn", token)
-  let assert transport.SendModelSync(model_json: "0", version: 0, ack_clock: 0) =
-    first
+  let #(conn, first) = join_and_receive(subject, "forged_conn", token)
+  assert_join_refused(subject, "forged_conn", conn, first)
 }
 
 pub fn state_recovery_rejects_tampered_token_test() {
@@ -1013,20 +1039,40 @@ pub fn state_recovery_rejects_tampered_token_test() {
       recovery_secret,
     )
   let tampered = token <> "x"
-  let #(_, first) = join_and_receive(subject, "tampered_conn", tampered)
-  let assert transport.SendModelSync(model_json: "0", ..) = first
+  let #(conn, first) = join_and_receive(subject, "tampered_conn", tampered)
+  assert_join_refused(subject, "tampered_conn", conn, first)
 }
 
-pub fn state_recovery_ignores_token_when_secret_empty_test() {
-  let assert Ok(subject) = runtime.start(recovery_config(""), test_context())
-  let token =
-    runtime.create_state_token(
-      CounterModel(count: 3),
-      fn(m: CounterModel) { int.to_string(m.count) },
-      "",
+/// No token can verify with an empty secret, so state recovery without one
+/// is a configuration error at start, not a silently ignored token.
+pub fn state_recovery_with_empty_secret_refuses_to_start_test() {
+  let assert Error(error.ConfigError(reason: reason)) =
+    runtime.start(recovery_config(""), test_context())
+  let assert True = string.contains(reason, "secret key is empty")
+}
+
+/// With state recovery enabled a join must carry a token: the server
+/// render always sets one, and joining with the init state instead would
+/// hide that the browser lost it.
+pub fn state_recovery_refuses_join_without_token_test() {
+  let assert Ok(subject) =
+    runtime.start(recovery_config(recovery_secret), test_context())
+  let #(conn, first) = join_and_receive(subject, "no_token_conn", "")
+  assert_join_refused(subject, "no_token_conn", conn, first)
+}
+
+/// Without state recovery a missing token is fine (it would carry nothing),
+/// but a token that does not verify still refuses the join.
+pub fn join_without_recovery_refuses_bad_token_test() {
+  let assert Ok(subject) =
+    runtime.start(
+      runtime.RuntimeConfig(..counter_config(), secret_key: recovery_secret),
+      test_context(),
     )
-  let #(_, first) = join_and_receive(subject, "empty_secret_conn", token)
-  let assert transport.SendModelSync(model_json: "0", ..) = first
+  let #(_, first) = join_and_receive(subject, "plain_conn", "")
+  let assert transport.SendModelSync(..) = first
+  let #(conn, first) = join_and_receive(subject, "bad_conn", "garbage")
+  assert_join_refused(subject, "bad_conn", conn, first)
 }
 
 pub fn state_recovery_rejects_session_bound_token_without_session_test() {
@@ -1039,8 +1085,8 @@ pub fn state_recovery_rejects_session_bound_token_without_session_test() {
       option.Some("3"),
       ssr_now(),
     )
-  let #(_, first) = join_and_receive(subject, "unbound_conn", token)
-  let assert transport.SendModelSync(model_json: "0", ..) = first
+  let #(conn, first) = join_and_receive(subject, "unbound_conn", token)
+  assert_join_refused(subject, "unbound_conn", conn, first)
 }
 
 pub fn state_recovery_rejects_token_for_other_session_test() {
@@ -1070,8 +1116,8 @@ pub fn state_recovery_rejects_token_for_other_session_test() {
       session_fingerprint: ssr.fingerprint_session_id("session-b"),
     ),
   )
-  let assert Ok(transport.SendModelSync(model_json: "0", ..)) =
-    process.receive(transport_subject, await.deadline_ms)
+  let assert Ok(first) = process.receive(transport_subject, await.deadline_ms)
+  assert_join_refused(subject, "other_session", transport_subject, first)
 }
 
 pub fn state_recovery_rejects_expired_token_test() {
@@ -1085,8 +1131,8 @@ pub fn state_recovery_rejects_expired_token_test() {
       option.Some("3"),
       ssr_now() - 172_800,
     )
-  let #(_, first) = join_and_receive(subject, "expired_conn", token)
-  let assert transport.SendModelSync(model_json: "0", ..) = first
+  let #(conn, first) = join_and_receive(subject, "expired_conn", token)
+  assert_join_refused(subject, "expired_conn", conn, first)
 }
 
 pub fn state_recovery_rejects_model_the_deserializer_refuses_test() {
@@ -1099,8 +1145,8 @@ pub fn state_recovery_rejects_model_the_deserializer_refuses_test() {
       option.Some("not-a-number"),
       ssr_now(),
     )
-  let #(_, first) = join_and_receive(subject, "bad_model_conn", token)
-  let assert transport.SendModelSync(model_json: "0", ..) = first
+  let #(conn, first) = join_and_receive(subject, "bad_model_conn", token)
+  assert_join_refused(subject, "bad_model_conn", conn, first)
 }
 
 pub fn state_recovery_only_applies_to_first_join_test() {
@@ -1108,7 +1154,10 @@ pub fn state_recovery_only_applies_to_first_join_test() {
   // the first connection is already looking at.
   let assert Ok(subject) =
     runtime.start(recovery_config(recovery_secret), test_context())
-  let #(_, first) = join_and_receive(subject, "first_conn", "")
+  // The first join's token carries no model: nothing to recover.
+  let modelless =
+    ssr.sign_join_token(recovery_secret, "", option.None, ssr_now())
+  let #(_, first) = join_and_receive(subject, "first_conn", modelless)
   let assert transport.SendModelSync(model_json: "0", ..) = first
   let token =
     runtime.create_state_token(
@@ -2267,5 +2316,128 @@ pub fn join_recovers_state_from_httponly_cookie_test() {
   )
   let assert Ok(first) = process.receive(transport_subject, await.deadline_ms)
   let assert True = has_count_sync([first], 77)
+  shutdown()
+}
+
+fn cookie_recovery_config(
+  secret: String,
+  init_ran: process.Subject(Nil),
+) -> runtime.RuntimeConfig(CounterModel, CounterMsg) {
+  runtime.RuntimeConfig(
+    ..counter_config(),
+    init: fn(ctx) {
+      process.send(init_ran, Nil)
+      counter_init(ctx)
+    },
+    restore_model: option.Some(fn(raw: String) {
+      case int.parse(raw) {
+        Ok(count) -> Ok(CounterModel(count: count))
+        Error(Nil) -> Error("invalid count")
+      }
+    }),
+    secret_key: secret,
+  )
+}
+
+/// Start a session-path runtime with `cookie` on the upgrade request and
+/// assert it is refused for its join token: 4400 (via `InitRejected` with
+/// `runtime.join_token_refused_status`), before `init` runs and before any
+/// frame is sent.
+fn assert_cookie_refused(
+  config: runtime.RuntimeConfig(CounterModel, CounterMsg),
+  init_ran: process.Subject(Nil),
+  cookie: Option(String),
+) -> Nil {
+  let req = case cookie {
+    option.Some(token) ->
+      ws_request(option.Some("path=%2F"))
+      |> request.set_header("cookie", ssr.session_cookie_name <> "=" <> token)
+    option.None -> ws_request(option.Some("path=%2F"))
+  }
+  let transport_subject = process.new_subject()
+  let assert Error(error.InitRejected(refusal)) =
+    runtime.start_and_connect_with_request(
+      config,
+      "refused_cookie_conn",
+      transport_subject,
+      req,
+    )
+  let assert 400 = error.init_error_status(refusal)
+  let assert 4400 = error.init_close_code(refusal)
+  let assert True =
+    string.contains(error.init_error_reason(refusal), "join token refused")
+  // Refused before init: no init ran and nothing was sent.
+  let assert Error(Nil) = process.receive(init_ran, 0)
+  let assert Error(Nil) = process.receive(transport_subject, 0)
+  Nil
+}
+
+const cookie_secret = "runtime-cookie-secret-at-least-32-chars!!"
+
+pub fn session_join_refuses_token_signed_with_other_secret_test() {
+  let init_ran = process.new_subject()
+  let token =
+    runtime.create_state_token(
+      CounterModel(count: 77),
+      fn(m: CounterModel) { int.to_string(m.count) },
+      "an-older-process-secret-at-least-32-chars",
+    )
+  assert_cookie_refused(
+    cookie_recovery_config(cookie_secret, init_ran),
+    init_ran,
+    option.Some(token),
+  )
+}
+
+pub fn session_join_refuses_model_that_does_not_restore_test() {
+  let init_ran = process.new_subject()
+  let token =
+    ssr.sign_join_token(
+      cookie_secret,
+      "",
+      option.Some("not-a-count"),
+      ssr_now(),
+    )
+  assert_cookie_refused(
+    cookie_recovery_config(cookie_secret, init_ran),
+    init_ran,
+    option.Some(token),
+  )
+}
+
+pub fn session_join_refuses_missing_cookie_with_recovery_test() {
+  let init_ran = process.new_subject()
+  assert_cookie_refused(
+    cookie_recovery_config(cookie_secret, init_ran),
+    init_ran,
+    option.None,
+  )
+}
+
+pub fn session_join_refuses_expired_token_without_recovery_test() {
+  let init_ran = process.new_subject()
+  let config =
+    runtime.RuntimeConfig(
+      ..cookie_recovery_config(cookie_secret, init_ran),
+      restore_model: option.None,
+    )
+  let token =
+    ssr.sign_join_token(cookie_secret, "", option.None, ssr_now() - 172_800)
+  assert_cookie_refused(config, init_ran, option.Some(token))
+}
+
+/// Without state recovery a session-path connection needs no cookie.
+pub fn session_join_without_cookie_or_recovery_starts_test() {
+  let transport_subject = process.new_subject()
+  let assert Ok(#(on_event, shutdown)) =
+    runtime.start_and_connect_with_request(
+      runtime.RuntimeConfig(..counter_config(), secret_key: cookie_secret),
+      "no_cookie_conn",
+      transport_subject,
+      ws_request(option.Some("path=%2F")),
+    )
+  on_event("no_cookie_conn", transport.ClientJoin(token: "", path: "/"))
+  let assert Ok(transport.SendModelSync(..)) =
+    process.receive(transport_subject, await.deadline_ms)
   shutdown()
 }

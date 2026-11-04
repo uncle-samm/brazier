@@ -19,7 +19,7 @@ server, and the browser only renders.
 
 ```bash
 cd examples/pong
-gleam run -m beacon/build   # after changing the source
+gleam run -m beacon/build   # first, and after every change
 gleam run
 ```
 

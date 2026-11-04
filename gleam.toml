@@ -14,7 +14,6 @@ internal_modules = [
   "beacon/debug",
   "beacon/internal/*",
   "beacon/patch",
-  "beacon/rate_limit",
   "beacon/runtime",
   "beacon/ssr",
   "beacon/state_manager",

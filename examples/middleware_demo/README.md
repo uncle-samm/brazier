@@ -20,7 +20,7 @@ Route-scoped HTTP middleware around a `beacon.simple` counter.
 
 ```bash
 cd examples/middleware_demo
-gleam run -m beacon/build   # after changing the source
+gleam run -m beacon/build   # first, and after every change
 gleam run -m app
 ```
 

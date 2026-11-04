@@ -15,7 +15,7 @@ checks.
 | `examples/routed` | Explicit imported route modules with root-owned `Model`/`Msg` |
 | `examples/routed_workspace` | Explicit route-aware app with Local/model state |
 | `examples/route_server_workspace` | Explicit route mini-apps with route-local private `Server` state |
-| `examples/auth_workspace` | API login/logout, HttpOnly auth cookie, CSRF, `ws_auth` with `auth.allow_guests_ws`, `init` through `auth.init_from_session`, a role-gated route, route-aware SSR, and server-private session state |
+| `examples/auth_workspace` | API login/logout, HttpOnly auth cookie, a per-browser login CSRF cookie, CSRF-checked API writes (`auth.protect_api_with_csrf`), `ws_auth` with `auth.allow_guests_ws`, `init` through `auth.init_from_session`, a role-gated route, route-aware SSR, and server-private session state |
 
 ## Required Checks
 
@@ -122,8 +122,11 @@ explicitly when the CI image does not expose the defaults.
 following guarantees:
 
 - `/login` renders without an authenticated session.
-- `POST /api/login` requires the login CSRF field, creates a server-side session,
-  and sets `beacon_session` as an HttpOnly cookie.
+- Each browser gets a random login CSRF token in the HttpOnly
+  `auth_workspace_login_csrf` cookie on a page load, and the login form
+  carries it. `POST /api/login` answers 403 unless the form's `csrf` field
+  matches that cookie; on success it creates a server-side session, sets
+  `beacon_session` as an HttpOnly cookie and deletes the login CSRF cookie.
 - `GET /api/me` requires `beacon_session`.
 - `POST /api/profile` requires the authenticated session and matching CSRF token.
 - `POST /api/logout` requires CSRF, deletes the server session, and clears the cookie.

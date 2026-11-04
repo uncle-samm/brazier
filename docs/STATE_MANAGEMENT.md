@@ -141,9 +141,23 @@ state is the model, pass `function.identity`.
 - The token is signed with the app's secret key. Recovery after a restart or
   on another node needs the same `beacon.secret_key` on every node (see
   [DEPLOYMENT.md](DEPLOYMENT.md#secret-key)).
-- A token whose model does not decode is logged as a warning, and the session
-  continues with the state `init` returned.
-- Without `with_state_recovery` the session starts from `init`.
+- The join token is checked before `init` runs. A token that does not verify
+  (malformed, signed with another key, older than 24 hours, or issued to
+  another browser session), a token whose model `restore` cannot decode, and
+  a missing token while recovery is enabled refuse the connection. The
+  refusal is logged as a warning, the WebSocket closes with **4400**, and the
+  browser reloads the page, whose server render issues a fresh token (at most
+  3 reloads per tab within 60 seconds, then the page shows an error state).
+  The session never continues from `init`'s state in place of a token it
+  could not use. LiveView does the same with a stale session token: it
+  refuses the join and the client reloads.
+- An open tab whose server was restarted without a fixed `beacon.secret_key`
+  therefore reloads once on reconnect: the new process generated a new key.
+- Recovery with an empty secret key is a configuration error: the runtime
+  refuses to start.
+- Without `with_state_recovery` the session starts from `init`. A missing
+  token is then fine, but a token that does not verify still refuses the
+  connection the same way.
 
 ## Local State (Zero Traffic)
 
@@ -266,7 +280,6 @@ Store names are developer-chosen constants: 1-255 bytes of `[A-Za-z0-9_-]`
 <!-- docs-check: wrap
 import beacon/log
 import beacon/store
-import gleam/string
 
 pub fn open_named(name: String) -> Nil {
   {{block}}
@@ -279,14 +292,15 @@ fn use_store(s: store.Store(String)) -> Nil {
 ```gleam
 case store.try_new(name) {
   Ok(s) -> use_store(s)
-  Error(err) -> log.error("app", "store " <> name <> ": " <> string.inspect(err))
+  Error(err) -> log.error("app", store.describe_error(err))
 }
 ```
 
-`store.StoreError` is an alias of a type in an internal module, so an app
-cannot name its constructors (an invalid name, a table that exists with the
-other type, or a table owner that could not create the table) without
-importing that module.
+`store.StoreError` is `InvalidName` (empty, too long, or a character
+outside `[A-Za-z0-9_-]`), `TableTypeMismatch` (a table of that name exists
+with the other type) or `TableOwnerUnavailable`. Its `name` is the table
+name, the store name with its prefix (`beacon_store_` or `beacon_ls_`),
+which counts toward the 255 bytes.
 
 A `Store` and a `ListStore` with the same name are separate tables, but they
 share the PubSub topic `"store:" <> name`.
@@ -498,8 +512,9 @@ on a topic, on every node, from each session's state. Every join and leave
 arrives as an `on_presence(diff)` message, and `sync.merge` (from
 `beacon/presence/sync`) applies it to the list the session keeps.
 `beacon.watch_presence(tracker:, watch:, on_presence:)` gets the same
-messages for the topics `watch` returns without tracking the session. See
-[CLUSTERING.md](CLUSTERING.md#session-presence).
+messages for the topics `watch` returns without tracking the session.
+`beacon.track_and_watch_presence(tracker:, track:, watch:, on_presence:)`
+does both. See [CLUSTERING.md](CLUSTERING.md#session-presence).
 
 ## Cross-Route State Sharing
 

@@ -15,6 +15,10 @@ import beacon/log
 import gleam/int
 import gleam/list
 
+/// The tab icon, inline so the browser does not request `/favicon.ico`.
+const favicon =
+  "<link rel=\"icon\" href=\"data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='7' fill='%23f59e0b'/></svg>\">"
+
 const signing_key = "beacon_private_session_signing_key_must_not_ship"
 
 const transfer_amount = 25
@@ -225,7 +229,10 @@ pub fn view(model: Model, _local: Nil) -> Element(Msg) {
 }
 
 pub fn main() {
-  beacon.full_application(init:, update:, sync:, local: local.none(), view:)
-  |> beacon.title(fn(_model) { "Private Session" })
-  |> beacon.start(8080)
+  let assert Ok(Nil) =
+    beacon.full_application(init:, update:, sync:, local: local.none(), view:)
+    |> beacon.title(fn(_model) { "Private Session" })
+    |> beacon.head_html(favicon)
+    |> beacon.start(8080)
+    as "beacon.start failed (it logs the error)"
 }

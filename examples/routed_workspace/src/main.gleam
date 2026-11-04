@@ -21,6 +21,10 @@ import gleam/list
 import gleam/string
 import gleam/uri.{type Uri}
 
+/// The tab icon, inline so the browser does not request `/favicon.ico`.
+const favicon =
+  "<link rel=\"icon\" href=\"data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='7' fill='%23f59e0b'/></svg>\">"
+
 const lanes = ["todo", "doing", "done"]
 
 const roles = ["owner", "operator", "viewer"]
@@ -671,14 +675,17 @@ fn bool_text(value: Bool) -> String {
 // --- Start ---
 
 pub fn main() {
-  beacon.full_application(
-    init:,
-    update:,
-    sync:,
-    local: local.layer(init: init_local, update: update_local),
-    view:,
-  )
-  |> beacon.with_router(parse: parse_route, on_change: RouteChanged)
-  |> beacon.title(fn(_model) { "Beacon Routed Workspace" })
-  |> beacon.start(8080)
+  let assert Ok(Nil) =
+    beacon.full_application(
+      init:,
+      update:,
+      sync:,
+      local: local.layer(init: init_local, update: update_local),
+      view:,
+    )
+    |> beacon.with_router(parse: parse_route, on_change: RouteChanged)
+    |> beacon.title(fn(_model) { "Beacon Routed Workspace" })
+    |> beacon.head_html(favicon)
+    |> beacon.start(8080)
+    as "beacon.start failed (it logs the error)"
 }

@@ -27,7 +27,7 @@ between sessions.
 
 ```bash
 cd examples/multi_kanban
-gleam run -m beacon/build   # after changing the source
+gleam run -m beacon/build   # first, and after every change
 gleam run
 ```
 

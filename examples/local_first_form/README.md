@@ -15,7 +15,7 @@ It exercises:
 
 ```sh
 cd examples/local_first_form
-gleam run -m beacon/build   # after changing the source
+gleam run -m beacon/build   # first, and after every change
 gleam run -m local_first_form
 ```
 

@@ -192,25 +192,84 @@ fn parse_package(
 /// - A path dependency uses that path, relative to `project_dir`.
 /// - A Hex or git dependency uses `build/packages/beacon`, which must exist.
 pub fn beacon_root(project_dir: String) -> Result(String, String) {
+  locate_beacon(project_dir)
+  |> result.map(fn(found) { found.0 })
+}
+
+/// The directory holding the client runtime (`beacon_client_ffi.mjs` and
+/// `beacon_client/*.mjs`) for the project at `project_dir`.
+///
+/// - A checkout of the Beacon repository (the repository itself, a path
+///   dependency, or a git dependency) has it at `beacon_client/src`.
+/// - A Hex package has it at `priv/beacon_client_src`, because a Hex
+///   tarball carries only `src` and `priv`; `scripts/publish.sh` copies
+///   `beacon_client/src` there before it builds the tarball.
+///
+/// A directory without `beacon_client_ffi.mjs` is an error naming it.
+pub fn client_runtime_dir(project_dir: String) -> Result(String, String) {
+  use #(root, layout) <- result.try(locate_beacon(project_dir))
+  let dir = case layout {
+    Checkout -> join(root, "beacon_client/src")
+    HexPackage -> join(root, hex_client_runtime_dir)
+  }
+  let marker = join(dir, "beacon_client_ffi.mjs")
+  case simplifile.is_file(marker) {
+    Ok(True) -> {
+      log.debug("beacon.build.project_toml", "Client runtime at " <> dir)
+      Ok(dir)
+    }
+    Ok(False) ->
+      Error(
+        "Beacon client runtime not found: "
+        <> marker
+        <> " does not exist. "
+        <> case layout {
+          Checkout -> "The Beacon checkout is incomplete."
+          HexPackage ->
+            "The beacon package was published without it; publish with scripts/publish.sh."
+        },
+      )
+    Error(err) ->
+      Error("Cannot check " <> marker <> ": " <> simplifile.describe_error(err))
+  }
+}
+
+/// Where a Hex package of Beacon carries the client runtime, relative to
+/// the package root.
+pub const hex_client_runtime_dir = "priv/beacon_client_src"
+
+/// How a project gets Beacon's sources.
+type Layout {
+  /// The whole repository: Beacon itself, a path or a git dependency.
+  Checkout
+  /// A package downloaded from Hex: only `src`, `priv` and metadata.
+  HexPackage
+}
+
+/// Find Beacon's root for the project at `project_dir`, and its layout.
+/// The root must hold `src/beacon/element.gleam`.
+fn locate_beacon(project_dir: String) -> Result(#(String, Layout), String) {
   let toml_path = join(project_dir, "gleam.toml")
   use project <- result.try(read_project(toml_path))
   let root = case project.name, dict.get(project.dependencies, "beacon") {
-    "beacon", _ -> Ok(project_dir)
-    _, Ok(PathRequirement(path:)) -> Ok(join(project_dir, path))
-    _, Ok(HexRequirement(..)) | _, Ok(GitRequirement(..)) ->
-      Ok(join(project_dir, "build/packages/beacon"))
+    "beacon", _ -> Ok(#(project_dir, Checkout))
+    _, Ok(PathRequirement(path:)) -> Ok(#(join(project_dir, path), Checkout))
+    _, Ok(GitRequirement(..)) ->
+      Ok(#(join(project_dir, "build/packages/beacon"), Checkout))
+    _, Ok(HexRequirement(..)) ->
+      Ok(#(join(project_dir, "build/packages/beacon"), HexPackage))
     _, Error(Nil) ->
       Error(
         toml_path
         <> " does not list `beacon` under [dependencies]. Add it before running the Beacon build.",
       )
   }
-  use root <- result.try(root)
+  use #(root, layout) <- result.try(root)
   let marker = join(root, "src/beacon/element.gleam")
   case simplifile.is_file(marker) {
     Ok(True) -> {
       log.debug("beacon.build.project_toml", "Beacon sources at " <> root)
-      Ok(root)
+      Ok(#(root, layout))
     }
     Ok(False) ->
       Error(

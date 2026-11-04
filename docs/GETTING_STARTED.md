@@ -65,9 +65,11 @@ pub fn view(model: Model) -> Element(Msg) {
 }
 
 pub fn main() {
-  beacon.simple(init:, update:, view:)
-  |> beacon.title(fn(_model) { "My Counter" })
-  |> beacon.start(8080)
+  let assert Ok(Nil) =
+    beacon.simple(init:, update:, view:)
+    |> beacon.title(fn(_model) { "My Counter" })
+    |> beacon.start(8080)
+    as "beacon.start failed (it logs the error)"
 }
 ```
 
@@ -80,8 +82,9 @@ whenever a `.gleam` file changes:
 gleam run -m beacon/dev
 ```
 
-To run without dev mode, build first and then run. `beacon.start` returns an
-error without the build's output:
+To run without dev mode, build first and then run. Without the build's
+output, `beacon.start` logs and returns an error that names the missing
+artifact, and `main` crashes on it, so `gleam run` exits with status 1:
 
 ```bash
 gleam run -m beacon/build

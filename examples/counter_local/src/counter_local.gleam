@@ -11,6 +11,10 @@ import beacon/html
 import beacon/local
 import gleam/int
 
+/// The tab icon, inline so the browser does not request `/favicon.ico`.
+const favicon =
+  "<link rel=\"icon\" href=\"data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='7' fill='%23f59e0b'/></svg>\">"
+
 /// Synced state, held by the server.
 pub type Model {
   Model(count: Int)
@@ -95,13 +99,16 @@ pub fn view(model: Model, local: Local) -> Element(Msg) {
 }
 
 pub fn main() {
-  beacon.full_application(
-    init:,
-    update:,
-    sync:,
-    local: local.layer(init: init_local, update: update_local),
-    view:,
-  )
-  |> beacon.title(fn(_model) { "Counter with Local State" })
-  |> beacon.start(8080)
+  let assert Ok(Nil) =
+    beacon.full_application(
+      init:,
+      update:,
+      sync:,
+      local: local.layer(init: init_local, update: update_local),
+      view:,
+    )
+    |> beacon.title(fn(_model) { "Counter with Local State" })
+    |> beacon.head_html(favicon)
+    |> beacon.start(8080)
+    as "beacon.start failed (it logs the error)"
 }

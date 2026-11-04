@@ -10,6 +10,7 @@ import beacon/effect
 import beacon/error
 import beacon/pubsub
 import beacon/runtime
+import beacon/ssr
 import beacon/test_ctx
 import beacon/transport
 import gleam/erlang/process.{type Subject}
@@ -242,7 +243,14 @@ pub fn rejoin_is_full_resync_and_never_resets_state_test() {
       restore_model: Some(fn(_json) { Ok(Model(count: 99, blob: "", path: "")) }),
     )
   let assert Ok(rt) = runtime.start(cfg, test_ctx.root())
-  let s = join(rt, "c", "")
+  // With state recovery every first join carries a token; this one has no
+  // model, so the session starts from init.
+  let s = connect(rt, "c")
+  let modelless = ssr.sign_join_token(secret, "", None, now_seconds())
+  process.send(
+    rt,
+    runtime.ClientJoined(conn_id: "c", token: modelless, path: ""),
+  )
   let assert transport.SendModelSync(version: 0, ack_clock: 0, ..) = next(s)
   event(rt, "c", "inc", 1)
   let assert transport.SendPatch(version: 1, ack_clock: 1, ..) = next(s)
@@ -517,12 +525,16 @@ pub fn join_reconciles_dynamic_subscriptions_test() {
   let assert transport.SendModelSync(model_json: json, ..) = next(s)
   let assert True = string.contains(json, "\"count\":5")
   wait_for_topics(computed, ["rv_join_topic_5"])
-  wait_until("the listener to join rv_join_topic_5", fn() {
-    pubsub.subscriber_count("rv_join_topic_5") == 1
-  })
-  wait_until("the listener to leave rv_join_topic_0", fn() {
-    pubsub.subscriber_count("rv_join_topic_0") == 0
-  })
+  await.until_telemetry(
+    [subscription_changed],
+    "the listener to join rv_join_topic_5",
+    fn() { pubsub.subscriber_count("rv_join_topic_5") == 1 },
+  )
+  await.until_telemetry(
+    [subscription_changed],
+    "the listener to leave rv_join_topic_0",
+    fn() { pubsub.subscriber_count("rv_join_topic_0") == 0 },
+  )
   process.send(rt, runtime.Shutdown)
 }
 
@@ -534,45 +546,11 @@ fn wait_for_topics(computed: Subject(List(String)), expected: List(String)) {
   }
 }
 
-/// Re-check a condition owned by another process until it holds, yielding
-/// between checks, and crash naming `what` at the shared deadline.
-///
-/// This is a poll, kept only because nothing observable marks the moment
-/// the runtime's PubSub listener applies a subscription change: it is a
-/// plain receive loop (no sys barrier), and pubsub.subscribe is an ETS
-/// insert in the listener itself, with no message or telemetry event.
-/// It needs a source hook to become event-driven (see docs/TESTING.md).
-fn wait_until(what: String, condition: fn() -> Bool) -> Nil {
-  poll_until(what, condition, monotonic_ms() + await.deadline_ms)
-}
+/// The runtime's PubSub listener emits this after each pg join or leave.
+const subscription_changed = ["beacon", "subscription", "changed"]
 
-fn poll_until(what: String, condition: fn() -> Bool, deadline: Int) -> Nil {
-  case condition(), monotonic_ms() >= deadline {
-    True, _ -> Nil
-    False, True ->
-      panic as {
-        "timed out after "
-        <> int.to_string(await.deadline_ms)
-        <> " ms waiting for "
-        <> what
-      }
-    False, False -> {
-      let _ = process.receive(process.new_subject(), 2)
-      poll_until(what, condition, deadline)
-    }
-  }
-}
-
-fn monotonic_ms() -> Int {
-  monotonic_time(Millisecond)
-}
-
-type MillisecondUnit {
-  Millisecond
-}
-
-@external(erlang, "erlang", "monotonic_time")
-fn monotonic_time(unit: MillisecondUnit) -> Int
+@external(erlang, "beacon_ssr_ffi", "system_time_seconds")
+fn now_seconds() -> Int
 
 // --- snapshot diffs ---
 

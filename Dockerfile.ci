@@ -73,5 +73,6 @@ RUN set -eu; \
 # before the Gleam suite (whose node-driven tests would fail too). Each
 # step must exit 0 for the next to run, and the job takes the first
 # non-zero exit. The build must be warning-free (CLAUDE.md, Definition of
-# Done), so warnings fail it.
-CMD ["sh", "-lc", "gleam format --check src test && node --version && make test-client && gleam build --warnings-as-errors && gleam test && gleam run -m beacon/lint"]
+# Done), so warnings fail it. The docs check runs last: it compiles every
+# Gleam sample in the docs against the API the steps before it checked.
+CMD ["sh", "-lc", "gleam format --check src test && node --version && make test-client && gleam build --warnings-as-errors && gleam test && gleam run -m beacon/lint && scripts/check_docs.sh"]

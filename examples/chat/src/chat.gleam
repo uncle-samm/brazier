@@ -30,6 +30,10 @@ import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/string
 
+/// The tab icon, inline so the browser does not request `/favicon.ico`.
+const favicon =
+  "<link rel=\"icon\" href=\"data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='7' fill='%23f59e0b'/></svg>\">"
+
 pub type ChatMessage {
   ChatMessage(sender: String, text: String)
 }
@@ -595,22 +599,25 @@ fn view_typing(typing: List(String)) -> Element(Msg) {
 
 pub fn main() {
   let messages = store.new_list("chat_messages")
-  beacon.full_application(
-    init:,
-    update: fn(session, msg) { update(messages, session, msg) },
-    sync:,
-    local: local.layer(init: init_local, update: update_local),
-    view:,
-  )
-  |> beacon.title(fn(_model) { "Beacon Chat" })
-  |> beacon.subscriptions(fn(session: Session) {
-    [room_topic(session.model.room)]
-  })
-  |> beacon.on_notify(Notified)
-  |> beacon.presence(
-    tracker: presence.new(tracker_name, encode_member, member_decoder()),
-    track:,
-    on_presence: PresenceChanged,
-  )
-  |> beacon.start(8080)
+  let assert Ok(Nil) =
+    beacon.full_application(
+      init:,
+      update: fn(session, msg) { update(messages, session, msg) },
+      sync:,
+      local: local.layer(init: init_local, update: update_local),
+      view:,
+    )
+    |> beacon.title(fn(_model) { "Beacon Chat" })
+    |> beacon.subscriptions(fn(session: Session) {
+      [room_topic(session.model.room)]
+    })
+    |> beacon.on_notify(Notified)
+    |> beacon.presence(
+      tracker: presence.new(tracker_name, encode_member, member_decoder()),
+      track:,
+      on_presence: PresenceChanged,
+    )
+    |> beacon.head_html(favicon)
+    |> beacon.start(8080)
+    as "beacon.start failed (it logs the error)"
 }

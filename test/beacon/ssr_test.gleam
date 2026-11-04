@@ -190,6 +190,40 @@ fn with_assets_dir(
   result
 }
 
+/// A page whose client bundle cannot be named is a static 500: no script,
+/// no join cookie. Nothing falls back to Beacon's own bundle.
+fn assert_render_refused(dir: String) -> Nil {
+  let page = ssr.render_page_from(test_config(), request.new(), dir)
+  let assert 500 = page.status
+  let assert False = page.join_cookie
+  let assert False = str_contains(page.html, "<script")
+  let assert True = str_contains(page.html, "Internal Server Error")
+  Nil
+}
+
+pub fn render_page_without_manifest_is_500_test() {
+  use dir <- with_assets_dir(option.None, [bundle])
+  assert_render_refused(dir)
+}
+
+pub fn render_page_with_manifest_naming_missing_bundle_is_500_test() {
+  use dir <- with_assets_dir(option.Some(bundle), [])
+  assert_render_refused(dir)
+}
+
+pub fn render_page_with_invalid_bundle_name_is_500_test() {
+  use dir <- with_assets_dir(option.Some("../secret.js"), ["../secret.js"])
+  assert_render_refused(dir)
+}
+
+pub fn render_page_from_serves_the_named_bundle_test() {
+  use dir <- with_assets_dir(option.Some(bundle <> "\n"), [bundle])
+  let page = ssr.render_page_from(test_config(), request.new(), dir)
+  let assert 200 = page.status
+  let assert True = page.join_cookie
+  let assert True = str_contains(page.html, bundle)
+}
+
 pub fn client_assets_dir_is_the_apps_priv_static_test() {
   let assert "priv/static" = ssr.client_assets_dir()
 }

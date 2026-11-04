@@ -73,7 +73,9 @@ fn io_violation(
 }
 
 /// Lint Markdown documentation for stale public model language.
-/// `docs/PROGRESS.md` is historical by design and is intentionally excluded.
+/// Every file named `PROGRESS.md`, at any depth, is excluded: these are
+/// progress logs (`docs/PROGRESS.md` and the archived
+/// `docs/archive/PROGRESS.md`) that record old names on purpose.
 pub fn lint_docs_directory(dir: String) -> List(Violation) {
   log.info("beacon.lint", "Linting docs directory: " <> dir)
   case simplifile.read_directory(dir) {

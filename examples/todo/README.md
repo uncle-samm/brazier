@@ -19,7 +19,7 @@ A shared todo list built with `beacon.full_application`.
 
 ```bash
 cd examples/todo
-gleam run -m beacon/build   # after changing the source
+gleam run -m beacon/build   # first, and after every change
 gleam run
 ```
 

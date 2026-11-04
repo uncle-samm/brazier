@@ -18,6 +18,10 @@ import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/string
 
+/// The tab icon, inline so the browser does not request `/favicon.ico`.
+const favicon =
+  "<link rel=\"icon\" href=\"data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='7' fill='%23f59e0b'/></svg>\">"
+
 // --- Types ---
 
 /// Synced to the browser: `num_rows` rows of one value per column.
@@ -381,15 +385,18 @@ fn render_cell(
 
 pub fn main() {
   let cells = store.new("spreadsheet_cells")
-  beacon.full_application(
-    init: fn(_ctx) { init(cells) },
-    update: fn(model, msg) { update(cells, model, msg) },
-    sync:,
-    local: local.layer(init: init_local, update: update_local),
-    view:,
-  )
-  |> beacon.title(fn(_model) { "Spreadsheet" })
-  |> beacon.subscriptions(fn(_model) { [store.topic(cells)] })
-  |> beacon.on_notify(fn(_topic) { CellsChanged })
-  |> beacon.start(8080)
+  let assert Ok(Nil) =
+    beacon.full_application(
+      init: fn(_ctx) { init(cells) },
+      update: fn(model, msg) { update(cells, model, msg) },
+      sync:,
+      local: local.layer(init: init_local, update: update_local),
+      view:,
+    )
+    |> beacon.title(fn(_model) { "Spreadsheet" })
+    |> beacon.subscriptions(fn(_model) { [store.topic(cells)] })
+    |> beacon.on_notify(fn(_topic) { CellsChanged })
+    |> beacon.head_html(favicon)
+    |> beacon.start(8080)
+    as "beacon.start failed (it logs the error)"
 }

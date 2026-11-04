@@ -25,7 +25,7 @@ built with `beacon.full_application` and a `local.layer`.
 
 ```bash
 cd examples/snake
-gleam run -m beacon/build   # after changing the source
+gleam run -m beacon/build   # first, and after every change
 gleam run
 ```
 

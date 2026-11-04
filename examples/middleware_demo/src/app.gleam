@@ -19,6 +19,10 @@ import gleam/http/request
 import gleam/http/response
 import gleam/int
 
+/// The tab icon, inline so the browser does not request `/favicon.ico`.
+const favicon =
+  "<link rel=\"icon\" href=\"data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='7' fill='%23f59e0b'/></svg>\">"
+
 pub type Model {
   Model(count: Int)
 }
@@ -178,22 +182,25 @@ fn block_writes() -> middleware.Middleware {
 }
 
 pub fn main() {
-  beacon.simple(init:, update:, view:)
-  |> beacon.title(fn(_model) { "Middleware Demo" })
-  // Secure headers are already on by default; these run after them.
-  |> beacon.with_middleware(
-    middleware.group([
-      middleware.request_id(),
-      // Health probes are frequent, so they stay out of the request log.
-      middleware.except("/healthz", middleware.logger()),
-    ]),
-  )
-  |> beacon.with_middleware(middleware.at("/healthz", health_handler()))
-  |> beacon.with_middleware(middleware.only("/admin", require_admin()))
-  |> beacon.with_middleware(middleware.only("/api", api_version()))
-  |> beacon.with_middleware(middleware.only(
-    "/api",
-    middleware.methods([http.Post, http.Put], block_writes()),
-  ))
-  |> beacon.start(8080)
+  let assert Ok(Nil) =
+    beacon.simple(init:, update:, view:)
+    |> beacon.title(fn(_model) { "Middleware Demo" })
+    // Secure headers are already on by default; these run after them.
+    |> beacon.with_middleware(
+      middleware.group([
+        middleware.request_id(),
+        // Health probes are frequent, so they stay out of the request log.
+        middleware.except("/healthz", middleware.logger()),
+      ]),
+    )
+    |> beacon.with_middleware(middleware.at("/healthz", health_handler()))
+    |> beacon.with_middleware(middleware.only("/admin", require_admin()))
+    |> beacon.with_middleware(middleware.only("/api", api_version()))
+    |> beacon.with_middleware(middleware.only(
+      "/api",
+      middleware.methods([http.Post, http.Put], block_writes()),
+    ))
+    |> beacon.head_html(favicon)
+    |> beacon.start(8080)
+    as "beacon.start failed (it logs the error)"
 }

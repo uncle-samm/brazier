@@ -101,6 +101,17 @@ pub fn reset_clears_the_key_test() {
   let assert rate_limit.Allowed(remaining: 0) = rate_limit.check(limiter, "k")
 }
 
+pub fn config_and_max_keys_report_the_settings_test() {
+  let config = rate_limit.RateLimitConfig(max_requests: 7, window_seconds: 30)
+  let assert Ok(limiter) =
+    rate_limit.new_with_max_keys("test_settings_" <> unique_id(), config, 5)
+  let assert True = rate_limit.config(limiter) == config
+  let assert 5 = rate_limit.max_keys(limiter)
+  let assert Ok(default) =
+    rate_limit.new("test_default_cap_" <> unique_id(), config)
+  let assert True = rate_limit.max_keys(default) == rate_limit.default_max_keys
+}
+
 // --- Bounded memory ---
 
 pub fn key_cap_refuses_new_keys_but_keeps_counting_known_ones_test() {

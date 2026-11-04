@@ -21,7 +21,7 @@ A `beacon.simple` app whose Model is built from types in other modules.
 
 ```bash
 cd examples/domains
-gleam run -m beacon/build   # after changing the source
+gleam run -m beacon/build   # first, and after every change
 gleam run -m app
 ```
 

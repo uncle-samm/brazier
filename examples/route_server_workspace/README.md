@@ -23,7 +23,7 @@ Routed pages that are components with private server state.
 
 ```bash
 cd examples/route_server_workspace
-gleam run -m beacon/build   # after changing the source
+gleam run -m beacon/build   # first, and after every change
 gleam run -m main
 ```
 

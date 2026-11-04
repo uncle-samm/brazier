@@ -10,6 +10,9 @@
 /// called `new`: create limiters from a long-lived process (your `main`, or
 /// a supervised worker), never from a request handler.
 ///
+/// Pass a limiter to `middleware.rate_limit` to limit HTTP requests per
+/// client IP, or call `check` from your own code.
+///
 /// Reference: Phoenix rate limiting (Hammer's fixed-window ETS backend),
 /// OWASP rate limiting guidelines.
 import beacon/log
@@ -29,7 +32,8 @@ pub type RateLimitConfig {
 /// Default hard cap on live counters per limiter.
 pub const default_max_keys = 100_000
 
-/// A running rate limiter.
+/// A running rate limiter. Create one with `new` or `new_with_max_keys`,
+/// which validate the settings; read them with `config` and `max_keys`.
 pub type RateLimiter {
   RateLimiter(handle: Handle, config: RateLimitConfig, max_keys: Int)
 }
@@ -183,7 +187,18 @@ pub fn sweep(limiter: RateLimiter) -> Result(Int, Nil) {
   }
 }
 
+/// The limiter's settings.
+pub fn config(limiter: RateLimiter) -> RateLimitConfig {
+  limiter.config
+}
+
+/// The limiter's cap on live counters.
+pub fn max_keys(limiter: RateLimiter) -> Int {
+  limiter.max_keys
+}
+
 /// The owner process of the limiter's table.
+@internal
 pub fn owner(limiter: RateLimiter) -> process.Pid {
   ffi_owner(limiter.handle)
 }

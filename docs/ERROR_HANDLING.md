@@ -57,29 +57,75 @@ process failing) emits it with reason `exit`. See
 
 ## Transport Errors
 
-Malformed messages get a `ServerError` response. Oversized messages (above 64KB) are rejected with `"Message too large"`.
+A text message that does not decode gets an `error` frame with the reason
+`Invalid message`; the raw text is never logged or echoed, only its size.
+After `ws_max_decode_errors` (default 10) such messages the connection
+closes with 1008. A message over `max_message_bytes` (default 64 KB)
+closes the connection with 1009 ("message too big"), checked from the frame
+header before the payload is buffered. See [SECURITY.md](SECURITY.md).
 
 ## Rate Limiting
 
-Exceeding `max_events_per_second` (default 50) returns `{"type":"error","reason":"Rate limited"}`. Heartbeats are exempt. The window resets every second.
+Each connection may send `max_events_per_second` events per one-second
+window (default 50); each event in a batch counts. An event over the budget
+is dropped and answered with `{"type":"error","reason":"Rate limited"}`.
+Heartbeats have their own limit of 2 per second: one over it is not acked.
+Every rejection counts as a violation, and a connection with more than
+`ws_max_rate_violations` (default 100) closes with 1008. A new window
+resets the budget and forgives earlier violations.
 
-## Token Expiration
+## Join Tokens
 
-Tokens expire after 24 hours. Expired or invalid tokens are rejected and logged;
-the connection must rejoin with a valid session.
+A join token lives 24 hours. A token that does not verify (malformed, badly
+signed, expired, or issued to another browser session), a token model that
+`restore` refuses, and a missing token while state recovery is enabled each
+refuse the connection
+before `init` runs: the socket closes with 4400 and the browser reloads the
+page for a fresh token. The refusal is logged with its reason.
 
 ## Model Size Limits
 
-Serialized model checked before broadcast: above 1MB logs a warning; above 5MB skips broadcast entirely.
+The client-visible model JSON is measured before it is sent. Over 1 MB logs
+a warning. Over 5 MB logs an error, sends nothing but an `error` frame
+(`Model too large: ...`) to the affected connections, and drops the cached
+model, so they resync with a full model once it shrinks.
 
-## View Crashes
+## Crashes in `update` and the View
 
-View rendering is wrapped in `rescue`. On crash: error logged, `ServerError` sent to client, runtime continues. Subsequent events and joins still work.
+There is no rescue around `update` or the view: a crash in either is a
+runtime crash (see [Runtime Crashes](#runtime-crashes)). Return an error
+value from `update` instead of crashing when the failure is expected.
 
 ## Handling Errors in Update
 
-Match on `Result` in update. For effects that can fail, dispatch error messages back:
+Match on `Result` in `update`. For effects that can fail, send an error
+message back:
 
+<!-- docs-check: wrap
+import beacon/effect.{type Effect}
+import gleam/option.{type Option, Some}
+
+pub type Model {
+  Model(name: String, saved: Bool, error: Option(String))
+}
+
+pub type Msg {
+  Save
+}
+
+fn validate(model: Model) -> Result(Model, String) {
+  case model.name {
+    "" -> Error("a name is required")
+    _ -> Ok(model)
+  }
+}
+
+pub fn run(model: Model) -> #(Model, Effect(Msg)) {
+  update(model, Save)
+}
+
+{{block}}
+-->
 ```gleam
 fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
   case msg {

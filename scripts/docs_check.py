@@ -47,12 +47,6 @@ NOT_COMPILED = {
     "docs/archive/PROGRESS.md": "historical progress log (Milestones 1-116), copied verbatim",
     "docs/design/API_REDESIGN.md": "historical design record; its samples show the proposal as decided on 2026-11-02",
     "docs/design/CLUSTER_PRESENCE_TELEMETRY.md": "historical design record; its samples show the proposal as decided",
-    # Owned by other Milestone 117 workstreams while WS10a runs; WS10b adds
-    # the markers and removes these four entries.
-    "docs/CLUSTERING.md": "owned by WS8c during Milestone 117; markers land in WS10b",
-    "docs/ERROR_HANDLING.md": "owned by WS8c during Milestone 117; markers land in WS10b",
-    "docs/TELEMETRY.md": "owned by WS8c during Milestone 117; markers land in WS10b",
-    "docs/TESTING.md": "owned by WS9 during Milestone 117; markers land in WS10b",
 }
 
 # Docs whose links are not checked, and why.

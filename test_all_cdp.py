@@ -232,9 +232,11 @@ def record_cdp_message(data):
             browser_errors.append(str(description))
         elif method == "Log.entryAdded":
             entry = data.get("params", {}).get("entry", {})
-            # The examples ship no favicon. Chrome requests /favicon.ico on
-            # its own (not the page or Beacon), so that one 404 is not an app
-            # error. It is still logged in verbose mode.
+            # The examples' pages carry an inline icon, but pages Beacon
+            # renders without the app's head (error pages) do not, and on
+            # those Chrome requests /favicon.ico on its own (not the page or
+            # Beacon), so that one 404 is not an app error. It is still
+            # logged in verbose mode.
             if (entry.get("source") == "network"
                     and str(entry.get("url", "")).endswith("/favicon.ico")):
                 vlog(f"Ignoring browser favicon request: {entry.get('text')}")
@@ -1906,12 +1908,29 @@ print("-- 21: Auth Workspace --")
 if start_example("auth_workspace", module="auth_workspace"):
     navigate("/login")
     check("Sign in" in str(text()), "SSR: login page renders")
+    login_csrf = evl('document.querySelector(\'[data-testid="login-csrf"]\')?.value || ""')
+    check(len(str(login_csrf)) >= 32, f"Login form carries a random per-browser CSRF token ({len(str(login_csrf))} chars)")
+    LOGIN_STATUS_JS = """
+      fetch('/api/login', {
+        method: 'POST',
+        headers: {'content-type': 'application/x-www-form-urlencoded'},
+        credentials: 'same-origin',
+        body: %s
+      }).then(r => String(r.status))
+    """
+    check(str(evl_async(LOGIN_STATUS_JS % "'username=ada&csrf=auth-workspace-login-csrf'")) == "403",
+          "Login refuses the old constant CSRF token (403)")
+    check(str(evl_async(LOGIN_STATUS_JS % "'username=ada'")) == "403",
+          "Login refuses a form without the CSRF field (403)")
+    wrong_csrf_body = "'username=ada&csrf=' + 'x'.repeat(%d)" % len(str(login_csrf))
+    check(str(evl_async(LOGIN_STATUS_JS % wrong_csrf_body)) == "403",
+          "Login refuses a CSRF field that does not match the cookie (403)")
     login_result = evl_async("""
       fetch('/api/login', {
         method: 'POST',
         headers: {'content-type': 'application/x-www-form-urlencoded'},
         credentials: 'same-origin',
-        body: 'username=ada&csrf=auth-workspace-login-csrf'
+        body: 'username=ada&csrf=' + encodeURIComponent(document.querySelector('[data-testid="login-csrf"]').value)
       }).then(async r => {
         const body = await r.text();
         localStorage.setItem('authCsrf', JSON.parse(body).csrf);
@@ -1967,6 +1986,8 @@ if start_example("auth_workspace", module="auth_workspace"):
         .then(r => r.text())
     """)
     check("Sign in" in str(logged_out_html), "Logout clears session before next SSR")
+    check('data-testid="login-csrf"' in str(logged_out_html) and str(login_csrf) not in str(logged_out_html),
+          "Login renewed the login CSRF token: the next guest page has a new one")
     check(errors() == "0", f"Zero errors ({error_list()})")
 stop_server(); print()
 

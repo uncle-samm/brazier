@@ -146,6 +146,7 @@ pub fn catalogue() -> List(List(String)) {
     ["session", "contention"],
     ["pubsub", "broadcast"],
     ["pubsub", "forward", "overloaded"],
+    ["subscription", "changed"],
     ["cluster", "node", "up"],
     ["cluster", "node", "down"],
     ["cluster", "peer", "rejected"],
@@ -189,6 +190,11 @@ pub type SessionEvent {
   Revoked
   Expired
   Contention
+}
+
+pub type SubscriptionAction {
+  Subscribe
+  Unsubscribe
 }
 
 pub type NodeDirection {
@@ -360,6 +366,16 @@ pub fn pubsub_broadcast(
 @external(erlang, "beacon_telemetry_ffi", "pubsub_forward_overloaded")
 @internal
 pub fn pubsub_forward_overloaded(queue_len: Int, shard: Int) -> Nil
+
+/// `[beacon, subscription, changed]`: a runtime's PubSub listener joined
+/// or left a topic. `subscriptions` is the listener's topic count after
+/// the change. The topic is not reported: app topics often name a user.
+@external(erlang, "beacon_telemetry_ffi", "subscription_changed")
+@internal
+pub fn subscription_changed(
+  action: SubscriptionAction,
+  subscriptions: Int,
+) -> Nil
 
 /// `[beacon, cluster, node, up | down]`.
 @external(erlang, "beacon_telemetry_ffi", "cluster_node")

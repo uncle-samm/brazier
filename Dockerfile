@@ -65,8 +65,10 @@ RUN chmod 0755 /app/start
 USER beacon
 EXPOSE 8080
 
-# Beacon has no built-in health route; this checks that the app serves its
-# page. Add a dedicated route (see docs/DEPLOYMENT.md) for real deployments.
+# Beacon answers /health with 200 (see docs/DEPLOYMENT.md), but that only
+# shows the listener is up. This check requests / instead, which renders the
+# app's first page, so it also fails when the app cannot render it. Use
+# /health for a cheaper liveness check.
 # 127.0.0.1, not localhost: Alpine resolves localhost to ::1 first and the
 # server listens on IPv4.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \

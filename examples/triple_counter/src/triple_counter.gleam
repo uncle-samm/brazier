@@ -18,6 +18,10 @@ import beacon/store.{type ListStore}
 import gleam/int
 import gleam/list
 
+/// The tab icon, inline so the browser does not request `/favicon.ico`.
+const favicon =
+  "<link rel=\"icon\" href=\"data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='7' fill='%23f59e0b'/></svg>\">"
+
 /// Synced to the browser.
 pub type Model {
   Model(
@@ -203,15 +207,18 @@ fn counter_panel(
 
 pub fn main() {
   let deltas = store.new_list("shared_counter")
-  beacon.full_application(
-    init: fn(_ctx) { init(deltas) },
-    update: fn(model, msg) { update(deltas, model, msg) },
-    sync:,
-    local: local.layer(init: init_local, update: update_local),
-    view:,
-  )
-  |> beacon.title(fn(_model) { "Triple Counter" })
-  |> beacon.subscriptions(fn(_model) { [store.list_topic(deltas)] })
-  |> beacon.on_notify(fn(_topic) { SharedChanged })
-  |> beacon.start(8080)
+  let assert Ok(Nil) =
+    beacon.full_application(
+      init: fn(_ctx) { init(deltas) },
+      update: fn(model, msg) { update(deltas, model, msg) },
+      sync:,
+      local: local.layer(init: init_local, update: update_local),
+      view:,
+    )
+    |> beacon.title(fn(_model) { "Triple Counter" })
+    |> beacon.subscriptions(fn(_model) { [store.list_topic(deltas)] })
+    |> beacon.on_notify(fn(_topic) { SharedChanged })
+    |> beacon.head_html(favicon)
+    |> beacon.start(8080)
+    as "beacon.start failed (it logs the error)"
 }

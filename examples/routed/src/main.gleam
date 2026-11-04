@@ -19,6 +19,10 @@ import routed/pages/home
 import routed/pages/settings
 import routed/pages/stats
 
+/// The tab icon, inline so the browser does not request `/favicon.ico`.
+const favicon =
+  "<link rel=\"icon\" href=\"data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='7' fill='%23f59e0b'/></svg>\">"
+
 const max_name_length = 100
 
 pub type Route {
@@ -134,8 +138,11 @@ pub fn view(model: Model) -> Element(Msg) {
 }
 
 pub fn main() {
-  beacon.application(init:, update:, view:)
-  |> beacon.with_router(parse: parse_route, on_change: RouteChanged)
-  |> beacon.title(fn(_model) { "Beacon Routed" })
-  |> beacon.start(8080)
+  let assert Ok(Nil) =
+    beacon.application(init:, update:, view:)
+    |> beacon.with_router(parse: parse_route, on_change: RouteChanged)
+    |> beacon.title(fn(_model) { "Beacon Routed" })
+    |> beacon.head_html(favicon)
+    |> beacon.start(8080)
+    as "beacon.start failed (it logs the error)"
 }
