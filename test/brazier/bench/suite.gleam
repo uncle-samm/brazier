@@ -15,6 +15,11 @@
 ////   200-item model. Pipelined cost per event (median of the rounds) when
 ////   every event changes the model (patch) and when none does (empty
 ////   acknowledgement), and the p50/p99 of one event at a time.
+//// - runtime list: the runtime's changed events against a model whose list
+////   encodes to about 50 KB or 500 KB, so one changed field costs whatever
+////   the per-event work on the whole model costs (encode, diff, patch).
+//// - wire: a server message encoded into the WebSocket frame handed to the
+////   socket, for a one-op patch and for a model_sync of the 50 KB model.
 //// - pubsub: one broadcast timed until every one of S subscribers has it.
 //// - store: put/get/delete timed in blocks of 1000 operations.
 //// - crdt append: one value appended to a replicated list key that holds
@@ -40,6 +45,8 @@ import brazier/store/hlc
 import brazier/test_ctx
 import brazier/transport
 import brazier/transport/server.{type Connection, Bytes}
+import brazier/transport/ws
+import gleam/bit_array
 import gleam/bytes_tree
 import gleam/erlang/process
 import gleam/http/request.{type Request}
@@ -72,6 +79,21 @@ const runtime_items = 200
 const runtime_events = 2000
 
 const runtime_warmup_rounds = 1
+
+/// The large-model runtime scenarios: #(name, items, events per round).
+/// Every item encodes to `list_item_bytes` + 3 bytes (quotes and comma), so
+/// 1000 items are about 50 KB of JSON and 10000 about 500 KB. Fewer events
+/// per round for the larger model keep a round near a second.
+const list_models = [#("list_50kb", 1000, 200), #("list_500kb", 10_000, 40)]
+
+const list_item_bytes = 48
+
+/// Frames per timed block of the wire scenario, and the blocks timed.
+const wire_block = 200
+
+const wire_warmup_blocks = 5
+
+const wire_blocks = 50
 
 const pubsub_subscribers = [1, 100, 1000]
 
@@ -150,12 +172,15 @@ pub fn run() -> Result(report.Report, String) {
     use Nil <- result.try(expect_empty_mailbox("ws"))
     use rt <- result.try(runtime_scenario())
     use Nil <- result.try(expect_empty_mailbox("runtime"))
+    use rl <- result.try(runtime_list_scenario())
+    use Nil <- result.try(expect_empty_mailbox("runtime list"))
+    use wire <- result.try(wire_scenario())
     use ps <- result.try(pubsub_scenario())
     use Nil <- result.try(expect_empty_mailbox("pubsub"))
     use st <- result.try(store_scenario())
     use Nil <- result.try(expect_empty_mailbox("store"))
     use ca <- result.try(crdt_append_scenario())
-    Ok(list.flatten([http, ws, rt, ps, st, ca]))
+    Ok(list.flatten([http, ws, rt, rl, wire, ps, st, ca]))
   }
   log.set_level(logging.Info)
   let stopped =
@@ -299,22 +324,11 @@ type BenchMsg {
   Nothing
 }
 
-fn runtime_config() -> runtime.RuntimeConfig(BenchModel, BenchMsg) {
+fn runtime_config(
+  items: List(String),
+) -> runtime.RuntimeConfig(BenchModel, BenchMsg) {
   runtime.RuntimeConfig(
-    init: fn(_ctx) {
-      Ok(#(
-        BenchModel(
-          count: 0,
-          items: int.range(
-            from: runtime_items,
-            to: 0,
-            with: [],
-            run: fn(acc, i) { ["item-number-" <> int.to_string(i), ..acc] },
-          ),
-        ),
-        effect.none(),
-      ))
-    },
+    init: fn(_ctx) { Ok(#(BenchModel(count: 0, items: items), effect.none())) },
     update: fn(model: BenchModel, msg: BenchMsg) {
       case msg {
         Bump -> #(BenchModel(..model, count: model.count + 1), effect.none())
@@ -328,13 +342,7 @@ fn runtime_config() -> runtime.RuntimeConfig(BenchModel, BenchMsg) {
         _ -> Error(error.RuntimeError(reason: "unknown handler " <> handler_id))
       }
     },
-    encode_model: fn(model: BenchModel) {
-      json.object([
-        #("count", json.int(model.count)),
-        #("items", json.array(model.items, json.string)),
-      ])
-      |> json.to_string
-    },
+    encode_model: encode_bench_model,
     route: option.None,
     restore_model: option.None,
     dynamic_subscriptions: option.None,
@@ -344,6 +352,28 @@ fn runtime_config() -> runtime.RuntimeConfig(BenchModel, BenchMsg) {
     presence: option.None,
     title: option.None,
   )
+}
+
+fn encode_bench_model(model: BenchModel) -> String {
+  json.object([
+    #("count", json.int(model.count)),
+    #("items", json.array(model.items, json.string)),
+  ])
+  |> json.to_string
+}
+
+/// The 200 short items of the runtime scenario.
+fn runtime_scenario_items() -> List(String) {
+  int.range(from: runtime_items, to: 0, with: [], run: fn(acc, i) {
+    ["item-number-" <> int.to_string(i), ..acc]
+  })
+}
+
+/// `count` items of exactly `list_item_bytes` bytes each.
+fn list_items(count: Int) -> List(String) {
+  int.range(from: count, to: 0, with: [], run: fn(acc, i) {
+    [string.pad_start(int.to_string(i), list_item_bytes, "x"), ..acc]
+  })
 }
 
 type Runtime {
@@ -357,46 +387,82 @@ fn runtime_scenario() -> Result(List(Metric), String) {
   list.try_map([#("changed", "bump"), #("unchanged", "nothing")], fn(kind) {
     let #(name, handler_id) = kind
     {
-      use rt <- result.try(start_runtime())
-      let outcome = {
-        // Clocks run on across rounds; every round starts after the last
-        // acknowledgement of the one before.
-        use #(clock, _) <- result.try(
-          repeat_from(runtime_warmup_rounds, 0, fn(clock) {
-            pipelined(rt, handler_id, clock)
-          }),
-        )
-        use #(clock, per_event) <- result.try(
-          repeat_from(rounds, clock, fn(clock) {
-            gc()
-            pipelined(rt, handler_id, clock)
-          }),
-        )
-        use latencies <- result.try(sequential(rt, handler_id, clock))
-        use cost <- result.try(
-          stats.median(per_event) |> result.replace_error("no rounds"),
-        )
-        use latency <- result.try(
-          stats.summarize(latencies) |> result.replace_error("no latencies"),
-        )
-        let prefix = "runtime." <> name
-        Ok([
-          Metric(prefix <> ".pipelined", "us/event", LowerIsBetter, cost),
-          Metric(prefix <> ".latency_p50", "us", LowerIsBetter, latency.median),
-          Metric(prefix <> ".latency_p99", "us", LowerIsBetter, latency.p99),
-        ])
-      }
-      process.send(rt.subject, runtime.Shutdown)
-      outcome
+      runtime_rounds(
+        "runtime." <> name,
+        runtime_scenario_items(),
+        handler_id,
+        runtime_events,
+      )
     }
     |> result.map_error(fn(reason) { "runtime." <> name <> ": " <> reason })
   })
   |> result.map(list.flatten)
 }
 
-fn start_runtime() -> Result(Runtime, String) {
+/// The changed-event rounds against the large list models. The model is
+/// checked to encode to at least its nominal size, so the metric's name
+/// stays true.
+fn runtime_list_scenario() -> Result(List(Metric), String) {
+  list.try_map(list_models, fn(shape) {
+    let #(name, count, events) = shape
+    let items = list_items(count)
+    let bytes =
+      string.byte_size(encode_bench_model(BenchModel(count: 0, items: items)))
+    {
+      use <- check(
+        bytes >= count * { list_item_bytes + 2 },
+        "the model encodes to only " <> int.to_string(bytes) <> " bytes",
+      )
+      runtime_rounds("runtime." <> name <> ".changed", items, "bump", events)
+    }
+    |> result.map_error(fn(reason) { "runtime." <> name <> ": " <> reason })
+  })
+  |> result.map(list.flatten)
+}
+
+/// Warm-up and measured pipelined rounds of `events` events, then `events`
+/// sequential ones, on a fresh runtime holding `items`.
+fn runtime_rounds(
+  prefix: String,
+  items: List(String),
+  handler_id: String,
+  events: Int,
+) -> Result(List(Metric), String) {
+  use rt <- result.try(start_runtime(items))
+  let outcome = {
+    // Clocks run on across rounds; every round starts after the last
+    // acknowledgement of the one before.
+    use #(clock, _) <- result.try(
+      repeat_from(runtime_warmup_rounds, 0, fn(clock) {
+        pipelined(rt, handler_id, clock, events)
+      }),
+    )
+    use #(clock, per_event) <- result.try(
+      repeat_from(rounds, clock, fn(clock) {
+        gc()
+        pipelined(rt, handler_id, clock, events)
+      }),
+    )
+    use latencies <- result.try(sequential(rt, handler_id, clock, events))
+    use cost <- result.try(
+      stats.median(per_event) |> result.replace_error("no rounds"),
+    )
+    use latency <- result.try(
+      stats.summarize(latencies) |> result.replace_error("no latencies"),
+    )
+    Ok([
+      Metric(prefix <> ".pipelined", "us/event", LowerIsBetter, cost),
+      Metric(prefix <> ".latency_p50", "us", LowerIsBetter, latency.median),
+      Metric(prefix <> ".latency_p99", "us", LowerIsBetter, latency.p99),
+    ])
+  }
+  process.send(rt.subject, runtime.Shutdown)
+  outcome
+}
+
+fn start_runtime(items: List(String)) -> Result(Runtime, String) {
   use subject <- result.try(
-    runtime.start(runtime_config(), test_ctx.root())
+    runtime.start(runtime_config(items), test_ctx.root())
     |> result.map_error(fn(e) { "start: " <> string_of(e) }),
   )
   let transport_subject = process.new_subject()
@@ -415,33 +481,35 @@ fn start_runtime() -> Result(Runtime, String) {
   Ok(rt)
 }
 
-/// Send `runtime_events` events without waiting, then wait for the last
-/// one's acknowledgement. Returns the last clock and microseconds per event.
+/// Send `events` events without waiting, then wait for the last one's
+/// acknowledgement. Returns the last clock and microseconds per event.
 fn pipelined(
   rt: Runtime,
   handler_id: String,
   after: Int,
+  events: Int,
 ) -> Result(#(Int, Float), String) {
-  let last = after + runtime_events
+  let last = after + events
   let start = now_ns()
   int.range(from: after + 1, to: last + 1, with: Nil, run: fn(_, clock) {
     send_event(rt, handler_id, clock)
   })
   use Nil <- result.try(await_ack(rt, last))
   let elapsed_us = int.to_float(now_ns() - start) /. 1000.0
-  Ok(#(last, elapsed_us /. int.to_float(runtime_events)))
+  Ok(#(last, elapsed_us /. int.to_float(events)))
 }
 
-/// Send `runtime_events` events one at a time, timing each from its send
-/// to its acknowledgement (microseconds).
+/// Send `events` events one at a time, timing each from its send to its
+/// acknowledgement (microseconds).
 fn sequential(
   rt: Runtime,
   handler_id: String,
   after: Int,
+  events: Int,
 ) -> Result(List(Float), String) {
   int.range(
     from: after + 1,
-    to: after + runtime_events + 1,
+    to: after + events + 1,
     with: Ok([]),
     run: fn(acc, clock) {
       use latencies <- result.try(acc)
@@ -493,6 +561,82 @@ fn await_ack(rt: Runtime, clock: Int) -> Result(Nil, String) {
         "no acknowledgement of clock " <> int.to_string(clock) <> " in time",
       )
   }
+}
+
+// --- wire ---
+
+/// Encode a one-op patch and a model_sync of the 50 KB list model into the
+/// frame the transport hands the socket, in blocks of `wire_block`.
+/// Nanoseconds per frame, median and p99 over the blocks.
+fn wire_scenario() -> Result(List(Metric), String) {
+  let model_json =
+    encode_bench_model(BenchModel(count: 0, items: list_items(1000)))
+  let ops_json = "[{\"op\":\"replace\",\"path\":\"/count\",\"value\":12345}]"
+  let messages = [
+    #(
+      "wire.patch",
+      transport.ServerPatch(
+        ops_json: ops_json,
+        version: 12_345,
+        ack_clock: 12_345,
+      ),
+      string.byte_size(ops_json),
+    ),
+    #(
+      "wire.model_sync_50kb",
+      transport.ServerModelSync(
+        model_json: model_json,
+        version: 12_345,
+        ack_clock: 12_345,
+      ),
+      string.byte_size(model_json),
+    ),
+  ]
+  list.try_map(messages, fn(entry) {
+    let #(name, msg, payload_bytes) = entry
+    let block = fn() { wire_block_round(msg, payload_bytes) }
+    {
+      use _ <- result.try(repeat(wire_warmup_blocks, block))
+      gc()
+      use per_frame <- result.try(repeat(wire_blocks, block))
+      use summary <- result.try(
+        stats.summarize(per_frame) |> result.replace_error("no blocks"),
+      )
+      Ok([
+        Metric(name <> ".median", "ns/frame", LowerIsBetter, summary.median),
+        Metric(name <> ".p99", "ns/frame", LowerIsBetter, summary.p99),
+      ])
+    }
+    |> result.map_error(fn(reason) { name <> ": " <> reason })
+  })
+  |> result.map(list.flatten)
+}
+
+/// Encode `msg` into a frame `wire_block` times; nanoseconds per frame,
+/// after checking every frame holds at least the payload and a header.
+fn wire_block_round(
+  msg: transport.ServerMessage,
+  payload_bytes: Int,
+) -> Result(Float, String) {
+  let t0 = now_ns()
+  let short =
+    int.range(from: 0, to: wire_block, with: 0, run: fn(short, _) {
+      case wire_frame_bytes(msg) >= payload_bytes + 2 {
+        True -> short
+        False -> short + 1
+      }
+    })
+  let t1 = now_ns()
+  use <- check(
+    short == 0,
+    int.to_string(short) <> " frames are shorter than their payload",
+  )
+  Ok(int.to_float(t1 - t0) /. int.to_float(wire_block))
+}
+
+/// The size of the frame the transport writes for `msg`.
+fn wire_frame_bytes(msg: transport.ServerMessage) -> Int {
+  bit_array.byte_size(ws.encode_text(transport.encode_server_message(msg)))
 }
 
 // --- pubsub ---
