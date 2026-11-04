@@ -25,7 +25,7 @@ import brazier/transport/server.{
 }
 import brazier/transport/ws
 import gleam/bit_array
-import gleam/bytes_tree
+import gleam/bytes_tree.{type BytesTree}
 import gleam/dynamic.{type Dynamic}
 import gleam/dynamic/decode
 import gleam/erlang/process
@@ -39,6 +39,7 @@ import gleam/option.{type Option, None, Some}
 import gleam/otp/supervision
 import gleam/result
 import gleam/string
+import gleam/string_tree.{type StringTree}
 import gleam/uri
 import simplifile
 
@@ -95,9 +96,16 @@ pub type ServerMessage {
   ServerError(reason: String)
   /// Authoritative Model state from server.
   /// Client renders the view locally from this state.
+  /// Invariant: `model_json` is one complete, valid JSON value. It is
+  /// embedded raw in the frame (`"model":{...}`), so invalid text would
+  /// corrupt the whole frame. The runtime only sends text it decoded into a
+  /// `patch.Snapshot`.
   ServerModelSync(model_json: String, version: Int, ack_clock: Int)
   /// Incremental model patch — only changed fields.
   /// Client applies ops to its cached model JSON instead of replacing entirely.
+  /// Invariant: `ops_json` is one valid JSON array of RFC 6902 operations,
+  /// embedded raw in the frame (`"ops":[...]`). The runtime only sends the
+  /// output of `patch.diff_snapshots` or the literal `[]`.
   ServerPatch(ops_json: String, version: Int, ack_clock: Int)
   /// Server-initiated navigation (redirect via pushState).
   ServerNavigate(path: String)
@@ -121,9 +129,11 @@ pub type InternalMessage {
   SendMount(payload: String)
   /// An error needs to be sent to the client.
   SendError(reason: String)
-  /// Send authoritative Model state to the client.
+  /// Send authoritative Model state to the client. `model_json` must be
+  /// one valid JSON value; see `ServerModelSync`.
   SendModelSync(model_json: String, version: Int, ack_clock: Int)
-  /// Send incremental model patch to the client.
+  /// Send incremental model patch to the client. `ops_json` must be one
+  /// valid JSON array; see `ServerPatch`.
   SendPatch(ops_json: String, version: Int, ack_clock: Int)
   /// Send navigation redirect to the client (pushState).
   SendNavigate(path: String)
@@ -661,71 +671,80 @@ fn release_connection_slot(context: String) -> Nil {
   )
 }
 
-/// Encode a ServerMessage to JSON string for sending over the wire.
+/// Encode a ServerMessage to the JSON text sent over the wire.
 pub fn encode_server_message(msg: ServerMessage) -> String {
-  case msg {
+  encode_server_message_tree(msg) |> string_tree.to_string
+}
+
+/// Encode a ServerMessage to the JSON text sent over the wire, as a string
+/// tree the socket writes without flattening it into one binary.
+///
+/// The model of a `model_sync` and the ops of a `patch` are already JSON
+/// text, and they are embedded raw: `"model":{...}` and `"ops":[...]`,
+/// not re-encoded as JSON strings. That relies on the invariant documented
+/// on `ServerModelSync` and `ServerPatch`: the text is one valid JSON value.
+/// Field order is fixed (type, model or ops, version, ack_clock).
+///
+/// Reference: Phoenix.Socket.V2.JSONSerializer, whose `encode!` returns
+/// iodata with the already-encoded payload spliced in; LiveView sends its
+/// rendered diff as a JSON object inside the reply, never as a string.
+pub fn encode_server_message_tree(msg: ServerMessage) -> StringTree {
+  let document = case msg {
     ServerMount(payload) ->
       json.object([
         #("type", json.string("mount")),
         #("payload", json.string(payload)),
       ])
-      |> json.to_string
-    ServerHeartbeatAck ->
-      json.object([#("type", json.string("heartbeat_ack"))])
-      |> json.to_string
+    ServerHeartbeatAck -> json.object([#("type", json.string("heartbeat_ack"))])
     ServerError(reason) ->
       json.object([
         #("type", json.string("error")),
         #("reason", json.string(reason)),
       ])
-      |> json.to_string
     ServerModelSync(model_json, version, ack_clock) ->
       json.object([
         #("type", json.string("model_sync")),
-        #("model", json.string(model_json)),
+        #("model", json_raw(model_json)),
         #("version", json.int(version)),
         #("ack_clock", json.int(ack_clock)),
       ])
-      |> json.to_string
     ServerPatch(ops_json, version, ack_clock) ->
-      // ops_json is already a JSON-encoded array string — embed it raw
       json.object([
         #("type", json.string("patch")),
-        #("ops", json.string(ops_json)),
+        #("ops", json_raw(ops_json)),
         #("version", json.int(version)),
         #("ack_clock", json.int(ack_clock)),
       ])
-      |> json.to_string
     ServerNavigate(path) ->
       json.object([
         #("type", json.string("navigate")),
         #("path", json.string(path)),
       ])
-      |> json.to_string
     ServerReplaceNavigate(path) ->
       json.object([
         #("type", json.string("navigate")),
         #("path", json.string(path)),
         #("replace", json.bool(True)),
       ])
-      |> json.to_string
     ServerHardNavigate(path) ->
       json.object([
         #("type", json.string("hard_navigate")),
         #("path", json.string(path)),
       ])
-      |> json.to_string
-    ServerReload ->
-      json.object([#("type", json.string("reload"))])
-      |> json.to_string
+    ServerReload -> json.object([#("type", json.string("reload"))])
     ServerTitle(title) ->
       json.object([
         #("type", json.string("title")),
         #("title", json.string(title)),
       ])
-      |> json.to_string
   }
+  json.to_string_tree(document)
 }
+
+/// Splice text that is already one complete JSON value into a document
+/// unchanged (gleam_json's `Json` is iodata on Erlang).
+@external(erlang, "brazier_transport_ffi", "json_raw")
+fn json_raw(json_text: String) -> json.Json
 
 /// A decoded client message and, for a `join`, the build id it carries:
 /// the hash of the client bundle its page loaded (`brazier_client_<hash>.js`),
@@ -857,8 +876,8 @@ fn send_ws_message(
   state: ConnectionState,
   msg: ServerMessage,
 ) -> Result(ConnectionState, String) {
-  let encoded = encode_server_message(msg)
-  case send_counted(state, ws.encode_text(encoded)) {
+  let frame = ws.encode_text_tree(encode_server_message_tree(msg))
+  case send_counted(state, frame) {
     Ok(sent_state) -> {
       log.debug("brazier.transport", "Sent message to " <> state.id)
       Ok(sent_state)
@@ -874,22 +893,28 @@ fn send_ws_message(
 }
 
 /// Write one encoded frame and count it in the connection's totals.
+/// The frame is iodata: gen_tcp writes it as an I/O vector, so a large
+/// model binary inside it is never copied into a flat frame.
 fn send_counted(
   state: ConnectionState,
-  frame: BitArray,
+  frame: BytesTree,
 ) -> Result(ConnectionState, String) {
-  case server.send_bytes(state.socket, frame) {
+  case send_tree(state.socket, frame) {
     Ok(Nil) ->
       Ok(
         ConnectionState(
           ..state,
           frames_out: state.frames_out + 1,
-          bytes_out: state.bytes_out + bit_array.byte_size(frame),
+          bytes_out: state.bytes_out + bytes_tree.byte_size(frame),
         ),
       )
     Error(reason) -> Error(reason)
   }
 }
+
+/// Write iodata to the socket (`gen_tcp:send/2` accepts any iodata).
+@external(erlang, "brazier_transport_ffi", "tcp_send")
+fn send_tree(socket: Socket, data: BytesTree) -> Result(Nil, String)
 
 /// Send a message; a failed send stops the connection.
 fn send_or_stop(state: ConnectionState, msg: ServerMessage) -> Next {
@@ -906,7 +931,7 @@ fn send_frame_or_stop(
   frame: BitArray,
   what: String,
 ) -> Next {
-  case send_counted(state, frame) {
+  case send_counted(state, bytes_tree.from_bit_array(frame)) {
     Ok(sent_state) -> {
       log.debug("brazier.transport", "Sent " <> what <> " to " <> state.id)
       Continue(sent_state)
@@ -1940,7 +1965,7 @@ fn stop_connection(
   }
   let state = case frame {
     Some(bytes) ->
-      case send_counted(state, bytes) {
+      case send_counted(state, bytes_tree.from_bit_array(bytes)) {
         Ok(sent_state) -> sent_state
         Error(send_reason) -> {
           log.warning(

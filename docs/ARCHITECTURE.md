@@ -170,7 +170,8 @@ send budget and reconnect backoff, mirroring `patch.gleam`.
 
 The app's own code reaches the runtime through the generated entry module
 `brazier_app_entry` (`build/client_entry.gleam`). The runtime checks these
-exports at startup: `decode_model`, `init_local`, `render`, `lookup_handler`,
+exports at startup: `decode_model` (which takes the parsed `model` value of
+a `model_sync`, not JSON text), `init_local`, `render`, `lookup_handler`,
 `run_handler`, `handler_options`, `event_names`, `update_local`,
 `encode_msg`, `same_model` and `is_simple`. A `simple` app also exports
 `update`.
@@ -252,14 +253,25 @@ JSON text frames over `/ws`. Full examples are in
 
 | `type` | Variant | Fields | Purpose |
 |---|---|---|---|
-| `model_sync` | `ServerModelSync` | model, version, ack_clock | The full model |
-| `patch` | `ServerPatch` | ops, version, ack_clock | JSON Patch of the model |
+| `model_sync` | `ServerModelSync` | model, version, ack_clock | The full model, a raw JSON value |
+| `patch` | `ServerPatch` | ops, version, ack_clock | JSON Patch of the model, a raw JSON array |
 | `navigate` | `ServerNavigate`, `ServerReplaceNavigate` | path, replace | `router.push` / `router.replace` |
 | `hard_navigate` | `ServerHardNavigate` | path | `router.redirect`, or an unrouted path |
 | `error` | `ServerError` | reason | A refused event or other error |
 | `heartbeat_ack` | `ServerHeartbeatAck` | | Heartbeat reply |
 | `reload` | `ServerReload` | | Dev mode: a rebuild finished, reload the page |
 | `mount` | `ServerMount` | payload | Not sent to browser clients; the client logs and ignores it |
+
+`model` and `ops` are written into the frame as they are, not re-encoded as
+JSON strings (as Phoenix's V2 serializer embeds a reply's payload). The
+runtime guarantees each is one valid JSON value: the model JSON is checked
+before it is cached (`patch.Snapshot`) and the ops come from diffing two
+snapshots. `transport.encode_server_message_tree` builds the frame text as a
+`StringTree`, `ws.encode_text_tree` puts the WebSocket header in front of it
+(cowlib's `[Header, Payload]`), and the socket writes the iodata without
+flattening it, so a large model is not copied into a new binary. The browser
+parses each frame once and hands the parsed `model` to the generated
+`decode_model`.
 
 ## Transport (`transport.gleam`, `transport/`)
 

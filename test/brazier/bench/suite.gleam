@@ -46,7 +46,6 @@ import brazier/test_ctx
 import brazier/transport
 import brazier/transport/server.{type Connection, Bytes}
 import brazier/transport/ws
-import gleam/bit_array
 import gleam/bytes_tree
 import gleam/erlang/process
 import gleam/http/request.{type Request}
@@ -634,9 +633,12 @@ fn wire_block_round(
   Ok(int.to_float(t1 - t0) /. int.to_float(wire_block))
 }
 
-/// The size of the frame the transport writes for `msg`.
+/// The size of the frame the transport writes for `msg`: the iodata frame
+/// `send_ws_message` hands `gen_tcp:send/2`, measured with `iolist_size`.
 fn wire_frame_bytes(msg: transport.ServerMessage) -> Int {
-  bit_array.byte_size(ws.encode_text(transport.encode_server_message(msg)))
+  bytes_tree.byte_size(
+    ws.encode_text_tree(transport.encode_server_message_tree(msg)),
+  )
 }
 
 // --- pubsub ---

@@ -183,7 +183,7 @@ pub fn ws_connect_and_receive_model_sync_test() {
   // Receive authoritative model state. SSR already supplied first HTML.
   let assert Ok(response) = ws_recv(socket, 3000)
   let assert True = string.contains(response, "\"type\":\"model_sync\"")
-  let assert True = string.contains(response, "\\\"count\\\":0")
+  let assert True = string.contains(response, "\"model\":{\"count\":0}")
   let assert False = string.contains(response, "\"type\":\"mount\"")
   // The page title follows the join's model_sync.
   let assert Ok(title) = ws_recv(socket, 3000)
@@ -223,7 +223,7 @@ pub fn two_connections_have_independent_state_test() {
   let assert Ok(Nil) = ws_send(socket_a, "{\"type\":\"join\"}")
   let assert Ok(sync_a) = ws_recv(socket_a, 3000)
   let assert True = string.contains(sync_a, "\"type\":\"model_sync\"")
-  let assert True = string.contains(sync_a, "\\\"count\\\":0")
+  let assert True = string.contains(sync_a, "\"model\":{\"count\":0}")
   let assert False = string.contains(sync_a, "\"type\":\"mount\"")
   let assert Ok(title_a) = ws_recv(socket_a, 3000)
   let assert True = string.contains(title_a, "\"type\":\"title\"")
@@ -231,7 +231,7 @@ pub fn two_connections_have_independent_state_test() {
   let assert Ok(Nil) = ws_send(socket_b, "{\"type\":\"join\"}")
   let assert Ok(sync_b) = ws_recv(socket_b, 3000)
   let assert True = string.contains(sync_b, "\"type\":\"model_sync\"")
-  let assert True = string.contains(sync_b, "\\\"count\\\":0")
+  let assert True = string.contains(sync_b, "\"model\":{\"count\":0}")
   let assert False = string.contains(sync_b, "\"type\":\"mount\"")
   let assert Ok(title_b) = ws_recv(socket_b, 3000)
   let assert True = string.contains(title_b, "\"type\":\"title\"")
@@ -265,9 +265,9 @@ pub fn two_connections_have_independent_state_test() {
 }
 
 /// The patch op that sets the model's count, as it appears inside a
-/// patch message (the ops array is carried as a JSON string).
+/// patch message (the ops array is embedded raw in the frame).
 fn count_is(n: Int) -> String {
-  "{\\\"op\\\":\\\"replace\\\",\\\"path\\\":\\\"/count\\\",\\\"value\\\":"
+  "{\"op\":\"replace\",\"path\":\"/count\",\"value\":"
   <> int.to_string(n)
   <> "}"
 }

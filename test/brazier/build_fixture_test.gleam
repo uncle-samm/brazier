@@ -404,7 +404,7 @@ const fail = (what) => {
   console.error(what);
   process.exit(1);
 };
-const read = (name) => readFileSync(dir + '/' + name, 'utf8');
+const read = (name) => JSON.parse(readFileSync(dir + '/' + name, 'utf8'));
 
 const decoded = entry.decode_model(read('server.json'));
 if (!decoded.isOk()) fail('decode_model failed: ' + decoded[0]);

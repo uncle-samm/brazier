@@ -424,8 +424,8 @@ pub fn sim_concurrent_mutation_test() {
 // ===== State Correctness Test =====
 
 /// The model a fresh counter connection syncs: `encode_model` output,
-/// carried as a JSON string inside the model_sync message.
-const initial_count_sync = "\"model\":\"{\\\"count\\\":0}\""
+/// embedded raw as the model_sync message's `model` value.
+const initial_count_sync = "\"model\":{\"count\":0}"
 
 fn fresh_connection_sees(expected: String) -> scenario.Scenario {
   scenario.Scenario(name: "fresh_connection", actions: [
@@ -445,10 +445,10 @@ pub fn sim_state_correctness_test() {
   let assert 10 = run.metrics.events_sent
   let assert 10 = run.metrics.patches_received
   // The last patch moves the model to the tenth increment. Its ops are a
-  // JSON array carried as a JSON string, hence the escaped quotes.
+  // JSON array embedded raw in the frame.
   assert_contains(
     run.metrics.last_payload,
-    "{\\\"op\\\":\\\"replace\\\",\\\"path\\\":\\\"/count\\\",\\\"value\\\":10}",
+    "\"ops\":[{\"op\":\"replace\",\"path\":\"/count\",\"value\":10}]",
   )
 
   // A fresh connection has its own runtime and starts from zero.

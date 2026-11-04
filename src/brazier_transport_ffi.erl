@@ -25,7 +25,9 @@
 -export([
     ws_parse_frame/2,
     ws_encode_frame/2,
+    ws_encode_frame_iodata/2,
     ws_encode_close/2,
+    json_raw/1,
     ws_is_valid_utf8/1,
     ws_decode_key/1,
     ws_set_send_timeout/2,
@@ -763,6 +765,33 @@ ws_encode_frame(Opcode, Payload) when is_integer(Opcode), is_binary(Payload) ->
         true ->
             <<1:1, 0:3, Opcode:4, 0:1, 127:7, Len:64, Payload/binary>>
     end.
+
+%% Encode one unfragmented server frame as iodata: [Header, Payload].
+%% The payload is never copied into a new binary; gen_tcp:send/2 hands
+%% the list to the socket as an I/O vector, so a large refc binary in the
+%% payload (a model JSON) goes out by reference.
+%% Reference: cowlib cow_ws:frame/2 returns [Header, Payload] iodata.
+ws_encode_frame_iodata(Opcode, Payload) when is_integer(Opcode) ->
+    Len = iolist_size(Payload),
+    Header = if
+        Len < 126 ->
+            <<1:1, 0:3, Opcode:4, 0:1, Len:7>>;
+        Len < 65536 ->
+            <<1:1, 0:3, Opcode:4, 0:1, 126:7, Len:16>>;
+        true ->
+            <<1:1, 0:3, Opcode:4, 0:1, 127:7, Len:64>>
+    end,
+    [Header, Payload].
+
+%% A JSON value whose text the caller already holds: gleam_json's Json is
+%% iodata, so the text is spliced into the enclosing document unchanged.
+%% The caller guarantees the binary is one complete JSON value; the
+%% transport only passes text the runtime decoded (patch.Snapshot) or
+%% encoded (patch.diff_snapshots) itself.
+%% Reference: Phoenix.Socket.V2.JSONSerializer embeds encoded payloads
+%% as iodata rather than re-encoding them.
+json_raw(Json) when is_binary(Json) ->
+    Json.
 
 %% Encode a close frame carrying a status code and reason (§5.5.1).
 %% The caller guarantees byte_size(Reason) =< 123 so the payload fits a
