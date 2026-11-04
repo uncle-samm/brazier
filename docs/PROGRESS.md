@@ -401,6 +401,8 @@
       - stale "signed" wording in `config.gleam:12` and `cluster.gleam:132`;
       - `X-Forwarded-Proto` is read whatever header is configured, and `Forwarded` `proto=` is never read;
       - `transport.trusted_proxies(limits)` parses the list again on every call.
+    - The `config.gleam:12` wording is fixed (faab3a0). The `cluster.gleam` wording was already fixed by fix-cluster.
+  - [ ] W4 monitor-race sweep (test files only), started early from faab3a0 because it shares no files with W2-A. It covers the STAB-1 monitor races in `store_test`, `ws8c_ets_owner_test` and `cluster/app_tree_test`, plus pubsub test isolation.
 - [ ] Final verification: build (zero warnings), tests, all examples, CDP browser suite, perf baselines
 
 **Decisions (Milestone 117, coordinator):**
