@@ -81,7 +81,7 @@ fn watching() -> presence_watch.Watch(Model, Msg) {
         Error(error.RuntimeError(reason: "no client events: " <> handler_id))
       },
     )
-  let config =
+  let assert Ok(config) =
     brazier.simple(
       init: fn(_ctx) { Ok(Model(watched: [], online: dict.new())) },
       update: fn(model, _msg) { model },
@@ -94,6 +94,7 @@ fn watching() -> presence_watch.Watch(Model, Msg) {
       on_presence: Online,
     )
     |> brazier.to_config(codec, 8080)
+    as "the app has a secret key"
   let assert Some(watch) = config.presence as "watch_presence sets presence"
   watch
 }
@@ -261,7 +262,7 @@ fn watcher(session: Session) -> Pid {
 /// Joins and leaves after that arrive one by one.
 pub fn watches_without_tracking_test_() -> peer.Timeout {
   use <- Timeout(60)
-  use peers <- peer.with_cluster(2, "brazier_ws8c_watch_only")
+  use peers <- peer.with_members(2, "brazier_ws8c_watch_only")
   let assert [a, b] = peers
   start_tracker(a)
   start_tracker(b)
@@ -299,7 +300,7 @@ pub fn watches_without_tracking_test_() -> peer.Timeout {
 /// with `brazier.presence`: up to 100 deliveries per message.
 pub fn queued_changes_are_coalesced_test_() -> peer.Timeout {
   use <- Timeout(60)
-  use peers <- peer.with_cluster(1, "brazier_ws8c_watch_coalesce")
+  use peers <- peer.with_members(1, "brazier_ws8c_watch_coalesce")
   let assert [a] = peers
   start_tracker(a)
   let viewer = start_session(a, ["lobby"])
@@ -345,7 +346,7 @@ pub fn queued_changes_are_coalesced_test_() -> peer.Timeout {
 /// diff) was on the way before it.
 pub fn watched_topics_follow_the_state_test_() -> peer.Timeout {
   use <- Timeout(60)
-  use peers <- peer.with_cluster(1, "brazier_ws8c_watch_move")
+  use peers <- peer.with_members(1, "brazier_ws8c_watch_move")
   let assert [a] = peers
   start_tracker(a)
   let _ann = track_on(a, "lobby", "ann")
@@ -409,7 +410,7 @@ pub fn watched_topics_follow_the_state_test_() -> peer.Timeout {
 /// up with B. The next change after that is the next thing it sees.
 pub fn shard_restart_does_not_flap_remote_entries_test_() -> peer.Timeout {
   use <- Timeout(60)
-  use peers <- peer.with_cluster(2, "brazier_ws8c_watch_restart")
+  use peers <- peer.with_members(2, "brazier_ws8c_watch_restart")
   let assert [a, b] = peers
   start_tracker(a)
   start_tracker(b)
@@ -439,7 +440,7 @@ pub fn shard_restart_does_not_flap_remote_entries_test_() -> peer.Timeout {
 /// (the exit of its watcher, which the runtime is linked to).
 pub fn invalid_watched_topic_fails_test_() -> peer.Timeout {
   use <- Timeout(60)
-  use peers <- peer.with_cluster(1, "brazier_ws8c_watch_invalid")
+  use peers <- peer.with_members(1, "brazier_ws8c_watch_invalid")
   let assert [a] = peers
   start_tracker(a)
 

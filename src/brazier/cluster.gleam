@@ -10,15 +10,23 @@
 //// - logs node up/down and emits `[brazier, cluster, node, up | down]` and
 ////   `[brazier, cluster, connect, failed]`;
 //// - checks every connected peer: nodes exchange
-////   HMAC-SHA256(secret_key, "brazier-cluster-v1") and a protocol version.
-////   A peer whose key differs, or that does not answer within
+////   HMAC-SHA256(secret_key, "brazier-cluster-v1") and a protocol version,
+////   where `secret_key` is the application's own secret key (one key per
+////   deployment; the purpose label keeps the MAC apart from token
+////   signatures). A peer whose key differs, or that does not answer within
 ////   `peer_check_timeout`, is disconnected and reported with
 ////   `[brazier, cluster, peer, rejected]`. This catches two deployments
 ////   sharing a cookie by mistake; it is not a defence against a node that
 ////   holds the cookie, which can run any code here.
+//// - keeps the cluster's membership: PubSub, replicated stores, presence
+////   and session revocation exchange messages only with peers that passed
+////   the check (`members`), and drop what any other node sends. Without a
+////   running manager no remote node is a member.
 ////
 //// In production (`BRAZIER_ENV=prod`) `start` refuses plain TCP
-//// distribution and cookies shorter than 32 bytes unless the config carries
+//// distribution, cookies shorter than 32 bytes and TLS distribution that
+//// does not verify peers (server `verify_peer` and `fail_if_no_peer_cert`,
+//// client `verify_peer`) unless the config carries
 //// `allow_insecure_distribution(reason)`.
 ////
 //// Discovery follows libcluster's Epmd and DNSPoll strategies.
@@ -76,13 +84,13 @@ pub type Resolver =
 pub opaque type ClusterConfig {
   ClusterConfig(
     discovery: Discovery,
-    secret_key: String,
     initial_ms: Int,
     max_ms: Int,
     check_timeout_ms: Int,
     resolver: Resolver,
     resolve_timeout_ms: Int,
     max_dns_nodes: Int,
+    max_discovered_nodes: Int,
     insecure_reason: Option(String),
   )
 }
@@ -98,13 +106,32 @@ type ManagerConfig {
     resolver: Resolver,
     resolve_timeout_ms: Int,
     max_dns_nodes: Int,
+    max_discovered_nodes: Int,
   )
 }
 
 /// Facts about this node's distribution, read by `start`.
 @internal
 pub type Distribution {
-  Distribution(alive: Bool, proto_dist: String, cookie_bytes: Int)
+  Distribution(
+    alive: Bool,
+    proto_dist: String,
+    cookie_bytes: Int,
+    /// The peer verification options of TLS distribution, or why the
+    /// `-ssl_dist_optfile` could not be read.
+    tls_verify: Result(TlsVerify, String),
+  )
+}
+
+/// Whether TLS distribution verifies its peers: the server side asks for
+/// and requires a client certificate, the client side checks the server's.
+@internal
+pub type TlsVerify {
+  TlsVerify(
+    server_verify_peer: Bool,
+    server_fail_if_no_peer_cert: Bool,
+    client_verify_peer: Bool,
+  )
 }
 
 /// The delay window for a static reconnect after `attempt` failures.
@@ -122,33 +149,34 @@ const max_static_nodes = 1024
 
 const max_node_name_bytes = 255
 
+/// A DNS node name is `basename@<address>`; the longest address is 64
+/// bytes, so this keeps the name within `max_node_name_bytes`.
+const max_basename_bytes = 190
+
 const max_wait_ms = 3_600_000
 
 /// Production cookies must be at least this long (a 32-byte random cookie
 /// is not guessable; short ones like "secret" are).
 pub const min_cookie_bytes = 32
 
-/// A cluster config with `discovery`. `secret_key` is the application's
-/// secret key (the one that signs session tokens): every node of one
-/// deployment must use the same one, and the peer check rejects nodes that
-/// do not.
+/// A cluster config with `discovery`. The peer check uses the
+/// application's secret key, which `start` and `supervised` take (the
+/// application passes its own): every node of one deployment must use the
+/// same one, and the peer check rejects nodes that do not.
 ///
 /// Defaults: reconnect backoff 1s doubling to 30s, peer check timeout 5s,
-/// the system DNS resolver with a 10s timeout, and at most 256 nodes per
-/// DNS answer.
-pub fn new(
-  discovery: Discovery,
-  secret_key secret_key: String,
-) -> ClusterConfig {
+/// the system DNS resolver with a 10s timeout, at most 256 nodes per DNS
+/// answer and 16384 DNS node names over the VM's life.
+pub fn new(discovery: Discovery) -> ClusterConfig {
   ClusterConfig(
     discovery: discovery,
-    secret_key: secret_key,
     initial_ms: 1000,
     max_ms: 30_000,
     check_timeout_ms: 5000,
     resolver: resolve_dns,
     resolve_timeout_ms: 10_000,
     max_dns_nodes: 256,
+    max_discovered_nodes: 16_384,
     insecure_reason: None,
   )
 }
@@ -190,15 +218,29 @@ pub fn max_dns_nodes(c: ClusterConfig, max: Int) -> ClusterConfig {
   ClusterConfig(..c, max_dns_nodes: max)
 }
 
+/// The most node names DNS discovery may make over the life of the VM.
+/// Node names are atoms, which are never freed, so a DNS answer that keeps
+/// changing would otherwise grow the atom table without bound. Past the
+/// limit new addresses are not connected to (error log and
+/// `[brazier, cluster, connect, failed]`); addresses already named still
+/// are. The count survives manager restarts.
+pub fn max_discovered_nodes(c: ClusterConfig, max: Int) -> ClusterConfig {
+  ClusterConfig(..c, max_discovered_nodes: max)
+}
+
 /// How long a newly connected peer has to pass the peer check.
 pub fn peer_check_timeout(c: ClusterConfig, timeout_ms: Int) -> ClusterConfig {
   ClusterConfig(..c, check_timeout_ms: timeout_ms)
 }
 
 /// Check the config and this node's distribution, then start the cluster
-/// manager, not linked to the caller.
-pub fn start(c: ClusterConfig) -> Result(Nil, ClusterError) {
-  use manager <- result.try(prepare(c))
+/// manager, not linked to the caller. `secret_key` is the application's
+/// secret key (at least `config.min_secret_key_bytes`).
+pub fn start(
+  c: ClusterConfig,
+  secret_key secret_key: String,
+) -> Result(Nil, ClusterError) {
+  use manager <- result.try(prepare(c, secret_key))
   case start_ffi(manager) {
     Ok(Nil) -> {
       log.info(module_name, "Cluster manager running on " <> self_name())
@@ -212,8 +254,9 @@ pub fn start(c: ClusterConfig) -> Result(Nil, ClusterError) {
 /// supervisor. The checks run when the specification is built.
 pub fn supervised(
   c: ClusterConfig,
+  secret_key secret_key: String,
 ) -> Result(supervision.ChildSpecification(Nil), ClusterError) {
-  use manager <- result.try(prepare(c))
+  use manager <- result.try(prepare(c, secret_key))
   Ok(
     supervision.worker(fn() {
       case start_link_ffi(manager) {
@@ -248,13 +291,17 @@ pub fn describe(e: ClusterError) -> String {
   }
 }
 
-fn prepare(c: ClusterConfig) -> Result(ManagerConfig, ClusterError) {
+fn prepare(
+  c: ClusterConfig,
+  secret_key: String,
+) -> Result(ManagerConfig, ClusterError) {
   // BRAZIER_ENV decides whether production rules apply: a deployment that
   // still sets it under its pre-rename name must not start as dev.
   use Nil <- result.try(
     config.refuse_renamed_env(config.framework_env_vars)
     |> result.map_error(fn(e) { InvalidConfig(error.to_string(e)) }),
   )
+  use Nil <- result.try(validate_secret_key(secret_key))
   use c <- result.try(validate(c))
   use Nil <- result.try(check_distribution(
     distribution_ffi(),
@@ -263,14 +310,23 @@ fn prepare(c: ClusterConfig) -> Result(ManagerConfig, ClusterError) {
   ))
   Ok(ManagerConfig(
     discovery: c.discovery,
-    mac: peer_mac(c.secret_key),
+    mac: peer_mac(secret_key),
     check_timeout_ms: c.check_timeout_ms,
     initial_ms: c.initial_ms,
     max_ms: c.max_ms,
     resolver: c.resolver,
     resolve_timeout_ms: c.resolve_timeout_ms,
     max_dns_nodes: c.max_dns_nodes,
+    max_discovered_nodes: c.max_discovered_nodes,
   ))
+}
+
+/// The application's secret key, checked as the application checks it.
+@internal
+pub fn validate_secret_key(secret_key: String) -> Result(Nil, ClusterError) {
+  config.validate_secret_key(secret_key)
+  |> result.map(fn(_) { Nil })
+  |> result.map_error(fn(e) { invalid(error.to_string(e)) })
 }
 
 /// The value both sides of the peer check send.
@@ -309,6 +365,10 @@ pub fn check_distribution(
           <> int.to_string(min_cookie_bytes),
         ]
       },
+      case dist.proto_dist {
+        "inet_tls" | "inet6_tls" -> tls_verify_problems(dist.tls_verify)
+        _ -> []
+      },
     ])
   case production, problems, insecure_reason {
     _, [], _ -> Ok(Nil)
@@ -338,12 +398,38 @@ pub fn check_distribution(
   }
 }
 
+/// TLS that does not verify peers encrypts traffic to anyone: a node
+/// without the cluster's certificate could join. Each missing option is
+/// named so the fix is plain.
+fn tls_verify_problems(tls: Result(TlsVerify, String)) -> List(String) {
+  case tls {
+    Error(reason) -> ["the TLS distribution options cannot be read: " <> reason]
+    Ok(TlsVerify(server_verify, server_fail, client_verify)) ->
+      list.flatten([
+        case server_verify {
+          True -> []
+          False -> [
+            "TLS distribution does not verify clients: set {verify, verify_peer} in the server options (ssl_dist_optfile) or -ssl_dist_opt server_verify verify_peer",
+          ]
+        },
+        case server_fail {
+          True -> []
+          False -> [
+            "TLS distribution accepts clients without a certificate: set {fail_if_no_peer_cert, true} in the server options (ssl_dist_optfile) or -ssl_dist_opt server_fail_if_no_peer_cert true",
+          ]
+        },
+        case client_verify {
+          True -> []
+          False -> [
+            "TLS distribution does not verify servers: set {verify, verify_peer} in the client options (ssl_dist_optfile) or -ssl_dist_opt client_verify verify_peer",
+          ]
+        },
+      ])
+  }
+}
+
 @internal
 pub fn validate(c: ClusterConfig) -> Result(ClusterConfig, ClusterError) {
-  use _ <- result.try(
-    config.validate_secret_key(c.secret_key)
-    |> result.map_error(fn(e) { invalid(error.to_string(e)) }),
-  )
   use Nil <- result.try(validate_discovery(c.discovery))
   use Nil <- result.try(in_range(
     "connect_backoff max_ms",
@@ -370,6 +456,12 @@ pub fn validate(c: ClusterConfig) -> Result(ClusterConfig, ClusterError) {
     60_000,
   ))
   use Nil <- result.try(in_range("max_dns_nodes", c.max_dns_nodes, 1, 4096))
+  use Nil <- result.try(in_range(
+    "max_discovered_nodes",
+    c.max_discovered_nodes,
+    1,
+    1_000_000,
+  ))
   case c.insecure_reason {
     Some("") -> Error(invalid("allow_insecure_distribution needs a reason"))
     Some(_) | None -> Ok(c)
@@ -405,6 +497,12 @@ fn validate_discovery(d: Discovery) -> Result(Nil, ClusterError) {
         _, True -> Error(invalid("Dns basename must not contain @"))
         _, False -> Ok(Nil)
       })
+      use Nil <- result.try(in_range(
+        "Dns basename length in bytes",
+        bit_array.byte_size(<<basename:utf8>>),
+        1,
+        max_basename_bytes,
+      ))
       in_range("Dns poll_ms", poll_ms, 10, max_wait_ms)
     }
   }

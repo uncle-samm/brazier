@@ -8,6 +8,11 @@
 %% caller's shard on each remote node (brazier_pubsub_worker), so a topic
 %% with 10k subscribers on a node costs one cross-node message, not 10k.
 %%
+%% Remote nodes are cluster members only: a node that has not passed the
+%% cluster manager's peer check (brazier_cluster_ffi:verified/1) gets no
+%% forward, and its workers drop the ones it sends. The forward is
+%% {forward_to_local, FromNode, Topic, Message} so the receiver can check.
+%%
 %% Subscribers receive {brazier_pubsub, Topic, Message}. brazier_subscription_ffi
 %% and the runtime listener depend on that exact shape.
 
@@ -342,13 +347,23 @@ direct_broadcast(Node, Topic, Message, Config) ->
                 [] ->
                     NotConnected;
                 [Worker | _] ->
-                    case erlang:send(Worker, {forward_to_local, Topic, Message}, [noconnect]) of
-                        noconnect ->
-                            NotConnected;
-                        ok ->
-                            brazier_telemetry_ffi:pubsub_broadcast(0, 1, <<"direct">>),
-                            {ok, nil}
-                    end
+                    direct_forward(Node, Worker, Topic, Message, NotConnected)
+            end
+    end.
+
+direct_forward(Node, Worker, Topic, Message, NotConnected) ->
+    case brazier_cluster_ffi:verified(Node) of
+        false ->
+            brazier_log_ffi:warning(<<"brazier.pubsub">>, "Direct broadcast on ~ts to ~p refused: it is not a "
+                                   "verified cluster member", [Topic, Node]),
+            {error, {node_not_verified, atom_to_binary(Node, utf8)}};
+        true ->
+            case erlang:send(Worker, {forward_to_local, node(), Topic, Message}, [noconnect]) of
+                noconnect ->
+                    NotConnected;
+                ok ->
+                    brazier_telemetry_ffi:pubsub_broadcast(0, 1, <<"direct">>),
+                    {ok, nil}
             end
     end.
 
@@ -379,12 +394,16 @@ lookup_partition(Table, Topic) ->
             []
     end.
 
-%% Forwarding workers of the caller's shard on remote nodes. The shard is
-%% picked from the caller's pid, so one sender's broadcasts keep their order.
+%% Forwarding workers of the caller's shard on cluster members. The shard
+%% is picked from the caller's pid, so one sender's broadcasts keep their
+%% order. pg lists the workers of every connected node; a node that has not
+%% passed the peer check is skipped (Phoenix.PubSub sends to the pg members
+%% it sees; here pg membership alone is not trusted).
 remote_workers(Config) ->
     case shard_members(Config) of
         {error, Reason} -> {error, Reason};
-        {ok, Members} -> {ok, [W || W <- Members, node(W) =/= node()]}
+        {ok, Members} ->
+            {ok, [W || W <- Members, node(W) =/= node(), brazier_cluster_ffi:verified(node(W))]}
     end.
 
 shard_members(#{pool_size := PoolSize}) ->
@@ -405,7 +424,7 @@ shard_members(#{pool_size := PoolSize}) ->
 %% node is going down and pg will remove it.
 forward(Workers, Topic, Message) ->
     lists:foldl(fun(Worker, Sent) ->
-        case erlang:send(Worker, {forward_to_local, Topic, Message}, [noconnect]) of
+        case erlang:send(Worker, {forward_to_local, node(), Topic, Message}, [noconnect]) of
             ok ->
                 Sent + 1;
             noconnect ->

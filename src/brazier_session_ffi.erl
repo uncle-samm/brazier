@@ -150,6 +150,14 @@ constant_time_equal(_, _) ->
 %% for a shared (External) store, so a revocation on one node reaches the
 %% sockets bound on all of them (pg:get_members is cluster-wide).
 %%
+%% pg lists the members of every connected node, but a revocation goes only
+%% to processes on this node and on verified cluster members
+%% (brazier_cluster_ffi:verified/1): members on any other node are skipped
+%% and counted in a warning. A revocation is a plain message, which names no
+%% sender node, so the receiving side cannot check it; every Brazier node
+%% gates its own sends, so two nodes that do not verify each other exchange
+%% no revocations in either direction.
+%%
 %% Ownership: `brazier.start` (application.start_supervised) starts the scope
 %% with start_registry_link/0 as a child of the root supervision tree, before
 %% the HTTP listener. Without the tree (application.start, tests, embedding)
@@ -225,13 +233,27 @@ bound_process_count(Namespace, SessionId) ->
     length(local_members(group(Namespace, SessionId))).
 
 %% Send {brazier_session_revoked, SessionId, Reason} to every bound process on
-%% every connected node. Returns the number of processes notified.
+%% this node and on every verified cluster member. Returns the number of
+%% processes notified.
 notify_revoked(Namespace, SessionId, Reason) ->
     Members = case registry_running() of
         true -> pg:get_members(?PG_SCOPE, group(Namespace, SessionId));
         false -> []
     end,
-    send_revoked(Members, SessionId, Reason).
+    {Allowed, Skipped} = lists:partition(fun(Pid) -> member_node(node(Pid)) end, Members),
+    case Skipped of
+        [] ->
+            ok;
+        _ ->
+            brazier_log_ffi:warning(<<"brazier.session">>,
+                                   "Revocation skipped ~b bound process(es) on ~p: not verified "
+                                   "cluster members",
+                                   [length(Skipped), lists:usort([node(Pid) || Pid <- Skipped])])
+    end,
+    send_revoked(Allowed, SessionId, Reason).
+
+member_node(Node) when Node =:= node() -> true;
+member_node(Node) -> brazier_cluster_ffi:verified(Node).
 
 %% The same, for processes on this node only (the nodeup re-check).
 notify_revoked_local(Namespace, SessionId, Reason) ->
@@ -264,8 +286,11 @@ local_bound_sessions(Namespace) ->
 %% An unlinked process per store that
 %%   - runs SweepFun every IntervalMs (timer via send_after, so other
 %%     messages do not postpone the sweep), and
-%%   - runs RecheckFun(Node) when a node connects (net_kernel:monitor_nodes),
-%%     coalescing nodeups that are already queued into one re-check;
+%%   - runs RecheckFun(Node) when a connected node (net_kernel:monitor_nodes)
+%%     passes the cluster peer check (brazier_cluster_ffi:await_verified/1):
+%%     revocations travel only between members, so that is when the ones
+%%     missed while apart can be caught up. Verified events already queued
+%%     are coalesced into one re-check;
 %% and exits when Owner (the process that created the store) exits.
 %% Unlinked so a crash never kills the owner; monitored so it never outlives
 %% the store. A crash inside either fun is logged and the loop continues:
@@ -292,7 +317,10 @@ maintenance_loop(Ref, IntervalMs, SweepFun, RecheckFun) ->
             erlang:send_after(IntervalMs, self(), brazier_session_sweep),
             maintenance_loop(Ref, IntervalMs, SweepFun, RecheckFun);
         {nodeup, Node} ->
-            Last = drain_nodeups(Node),
+            await_member(Node),
+            maintenance_loop(Ref, IntervalMs, SweepFun, RecheckFun);
+        {brazier_cluster_peer_verified, Node} ->
+            Last = drain_verified(Node),
             run_guarded(recheck, fun() -> RecheckFun(Last) end),
             maintenance_loop(Ref, IntervalMs, SweepFun, RecheckFun);
         {nodedown, _Node} ->
@@ -305,10 +333,23 @@ maintenance_loop(Ref, IntervalMs, SweepFun, RecheckFun) ->
             maintenance_loop(Ref, IntervalMs, SweepFun, RecheckFun)
     end.
 
-%% Take the nodeups already in the mailbox; one re-check covers them all.
-drain_nodeups(Node) ->
+await_member(Node) ->
+    case brazier_cluster_ffi:await_verified(Node) of
+        {ok, nil} ->
+            brazier_log_ffi:debug(<<"brazier.session">>,
+                                 "~p connected; re-checking bound sessions once it is verified",
+                                 [Node]);
+        {error, not_started} ->
+            brazier_log_ffi:warning(<<"brazier.session">>,
+                                   "~p connected, but no cluster manager runs here: revocations "
+                                   "are not exchanged with it and no re-check runs", [Node])
+    end.
+
+%% Take the verified events already in the mailbox; one re-check covers
+%% them all.
+drain_verified(Node) ->
     receive
-        {nodeup, Next} -> drain_nodeups(Next)
+        {brazier_cluster_peer_verified, Next} -> drain_verified(Next)
     after 0 -> Node
     end.
 
