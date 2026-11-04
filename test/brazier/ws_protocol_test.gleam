@@ -669,6 +669,32 @@ pub fn forwarded_https_from_trusted_proxy_matches_https_origin_test() {
   raw_close(probe.socket)
 }
 
+/// Behind a proxy that sets `Forwarded`, its `proto=` is the scheme, and an
+/// `X-Forwarded-Proto` the client slipped through is not.
+pub fn forwarded_proto_from_trusted_proxy_decides_the_origin_scheme_test() {
+  let limits =
+    transport.SecurityLimits(
+      ..behind_proxy_limits(),
+      forwarding_header: ip.Forwarded,
+    )
+  let server = start_server(limits, None)
+  let https_origin = "https://" <> host_header(server.port)
+  let headers =
+    upgrade_headers(server.port)
+    |> with_header("Forwarded", "for=203.0.113.7;proto=https")
+    |> with_header("Origin", https_origin)
+  let probe = open_with(server, headers)
+  raw_close(probe.socket)
+  let spoofed =
+    upgrade_headers(server.port)
+    |> with_header("Forwarded", "for=203.0.113.7;proto=http")
+    |> with_header("X-Forwarded-Proto", "https")
+    |> with_header("Origin", https_origin)
+  let #(socket, head) = raw_upgrade(server.port, spoofed)
+  let assert "403" = status_of(head)
+  raw_close(socket)
+}
+
 /// Regression: X-Forwarded-Proto was believed from any client, so a direct
 /// attacker could claim https and pass an https Origin check.
 pub fn forwarded_https_from_untrusted_peer_is_ignored_test() {

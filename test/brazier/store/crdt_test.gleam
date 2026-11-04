@@ -3,8 +3,9 @@
 //// which is kept here verbatim as the oracle (`oracle_*`). The histories
 //// come from fixed seeds, so every failure names a reproducible seed and
 //// step. The single-case tests in store_replicated_test cover the
-//// documented behaviour; this module covers the join's algebra and the
-//// cost of appending.
+//// documented behaviour; this module covers the join's algebra, the cost
+//// of appending, and the compaction of the causal context (against the
+//// sorting compaction it replaced, `oracle_compact`).
 
 import brazier/store/crdt.{
   type Change, type Context, type Delta, type Dot, type Dots, type State, Added,
@@ -290,9 +291,12 @@ fn check_same(
   check_invariants(label, new.0)
 }
 
-/// No key is kept with no dots, `size` counts the live dots, and the
-/// context has observed every live dot.
+/// No key is kept with no dots, `size` counts the live dots, the context
+/// has observed every live dot, and the context is compacted (what
+/// `union_context` relies on to merge without sorting the cloud).
 fn check_invariants(label: String, state: State(Int)) -> Nil {
+  assert oracle_compact(state.context) == state.context
+    as { label <> ": the context is not compacted" }
   let live =
     dict.fold(state.entries, 0, fn(live, key, dots) {
       assert !dict.is_empty(dots) as { label <> ": " <> key <> " has no dots" }
@@ -684,6 +688,173 @@ pub fn a_clock_never_covers_counters_below_one_test() {
         <> " values"
       }
     assert after.entries == state.entries
+  })
+}
+
+// --- Compacting the causal context --------------------------------------
+
+/// A delta that carries only a context (no key), so a join merges contexts
+/// and nothing else.
+fn context_delta(
+  clock: List(#(crdt.Replica, Int)),
+  cloud: List(Dot),
+) -> Delta(Int) {
+  Delta(
+    entries: dict.new(),
+    context: Context(clock: dict.from_list(clock), cloud: set.from_list(cloud)),
+    topics: [],
+  )
+}
+
+/// One value on ra, and a context that has seen every even counter of rb
+/// from 2 to `2 * gaps`: `gaps` cloud dots that stay out of order.
+fn gappy_state(gaps: Int) -> State(Int) {
+  let cloud =
+    int.range(from: 1, to: gaps + 1, with: [], run: fn(cloud, i) {
+      [Dot(rb, 2 * i), ..cloud]
+    })
+  let state = crdt.join(list_key(1), context_delta([], cloud)).0
+  assert set.size(state.context.cloud) == gaps
+  state
+}
+
+/// rb's write of counter 1, the dot just below the first gap.
+fn gap_fill() -> Delta(Int) {
+  let dot = Dot(rb, 1)
+  let entry = crdt.Entry(value: 1, ts: ts(1), topics: [])
+  Delta(
+    entries: dict.from_list([#("k", dict.from_list([#(dot, entry)]))]),
+    context: Context(clock: dict.new(), cloud: set.from_list([dot])),
+    topics: [],
+  )
+}
+
+const rc = Replica(node: "c@host", incarnation: 1)
+
+/// Merging a context used to sort the state's whole cloud on every join,
+/// O(|cloud| log |cloud|) for a one-dot delta. It now costs the same on a
+/// cloud of 10 dots as on one of 10,000: for a write from a new replica,
+/// and for one that fills a gap (two dots move into the clock).
+pub fn merging_a_delta_does_not_grow_with_the_state_cloud_test() {
+  let small = gappy_state(10)
+  let large = gappy_state(10_000)
+  let #(_, fresh, _) = crdt.put(crdt.new(), rc, "k", 1, ts(1), [])
+  let examples = [
+    #("a new replica's write", fresh),
+    #("a gap fill", gap_fill()),
+  ]
+  list.each(examples, fn(example) {
+    let #(label, delta) = example
+    let cost = fn(state) { reductions(fn() { crdt.join(state, delta) }) }
+    let small_cost = cost(small)
+    let large_cost = cost(large)
+    assert large_cost < small_cost * 3 + 200
+      as {
+        label
+        <> " on a cloud of 10,000 dots cost "
+        <> int.to_string(large_cost)
+        <> " reductions, on 10 dots "
+        <> int.to_string(small_cost)
+      }
+    // The sort is what the bound catches: the old compaction grows.
+    let oracle_cost = reductions(fn() { oracle_join(large, delta) })
+    assert oracle_cost > large_cost * 10
+      as {
+        label
+        <> ": the sorting oracle cost only "
+        <> int.to_string(oracle_cost)
+        <> " reductions"
+      }
+    check_same(label, crdt.join(large, delta), oracle_join(large, delta))
+  })
+  // The gap fill moved rb's counters 1 and 2 into the clock.
+  let joined = crdt.join(large, gap_fill()).0
+  assert dict.get(joined.context.clock, rb) == Ok(2)
+  assert set.size(joined.context.cloud) == 9999
+}
+
+/// A clock that covers some of the state's cloud drops those dots, by
+/// probing each newly covered counter (a raise smaller than the cloud) or
+/// by one scan of the cloud (a larger raise); cloud dots that continue the
+/// clock carry it across the dots already seen. Each matches the sorting
+/// oracle.
+pub fn a_clock_raise_drops_the_cloud_dots_it_covers_test() {
+  // rb's counters 2, 4, ..., 40: 20 cloud dots, and no clock entry.
+  let state = gappy_state(20)
+  let examples = [
+    // 10 probes, fewer than the 20 cloud dots: drops 2..10.
+    #("probe", rb, context_delta([#(rb, 10)], []), Ok(10), 15),
+    // 100 counters, more than the cloud: one scan drops them all.
+    #("scan", rb, context_delta([#(rb, 100)], []), Ok(100), 0),
+    // Fills 1 and 3: the clock runs 1..4 and stops at the gap before 6.
+    #("chain", rb, context_delta([], [Dot(rb, 1), Dot(rb, 3)]), Ok(4), 18),
+    // Raises to 7 (drops 2, 4, 6) and fills 9: the clock runs to 10.
+    #("raise and fill", rb, context_delta([#(rb, 7)], [Dot(rb, 9)]), Ok(10), 15),
+    // A clock below 0 for a replica the state lacks: -1 continues it, 1
+    // stays in the cloud.
+    #(
+      "below zero",
+      rc,
+      context_delta([#(ra, 1), #(rc, -2)], [Dot(rc, -1), Dot(rc, 1)]),
+      Ok(-1),
+      21,
+    ),
+  ]
+  list.each(examples, fn(example) {
+    let #(label, replica, delta, clock, cloud) = example
+    let #(joined, changes) = crdt.join(state, delta)
+    check_same(label, #(joined, changes), oracle_join(state, delta))
+    assert dict.get(joined.context.clock, replica) == clock
+      as { label <> ": wrong clock" }
+    assert set.size(joined.context.cloud) == cloud
+      as {
+        label
+        <> ": "
+        <> int.to_string(set.size(joined.context.cloud))
+        <> " cloud dots"
+      }
+  })
+}
+
+/// Random contexts with large clouds, malformed counters and clock raises
+/// of every size, joined into states whose clouds grow: the result equals
+/// the sorting oracle's on every one, and stays compacted.
+pub fn random_contexts_compact_as_the_sorting_oracle_does_test() {
+  list.each(history_seeds, fn(seed) {
+    let #(_last, _rng) =
+      int.range(
+        from: 0,
+        to: 100,
+        with: #(crdt.new(), Rng(seed)),
+        run: fn(acc, i) {
+          let #(state, rng) = acc
+          let label =
+            "seed " <> int.to_string(seed) <> " context " <> int.to_string(i)
+          let #(clock_count, rng) = next(rng, 3)
+          let #(clock, rng) =
+            repeat_pick(clock_count, rng, fn(rng) {
+              let #(replica, rng) = pick_replica(rng)
+              let #(max, rng) = next(rng, 63)
+              #(#(replica, max - 2), rng)
+            })
+          let #(cloud_count, rng) = next(rng, 30)
+          let #(cloud, rng) =
+            repeat_pick(cloud_count, rng, fn(rng) {
+              let #(replica, rng) = pick_replica(rng)
+              let #(counter, rng) = next(rng, 64)
+              #(Dot(replica:, counter: counter - 2), rng)
+            })
+          let delta = context_delta(clock, cloud)
+          let joined =
+            same_join(label, crdt.join(state, delta), oracle_join(state, delta))
+          // Start again now and then, so low clocks meet big clouds.
+          case i % 25 {
+            24 -> #(crdt.new(), rng)
+            _ -> #(joined, rng)
+          }
+        },
+      )
+    Nil
   })
 }
 

@@ -22,6 +22,7 @@
 /// Patterns follow Plug.Upload (random names, exclusive create, an empty
 /// filename means no file was chosen) and Phoenix `send_download`
 /// (RFC 6266 attachment headers).
+import brazier/internal/log_path
 import brazier/log
 import brazier/transport/http as transport_http
 import brazier/transport/server.{type Connection, type ResponseBody, Bytes}
@@ -267,7 +268,7 @@ pub fn validate(
       log.warning(
         "brazier.upload",
         "Rejected upload field="
-          <> file.field_name
+          <> string.inspect(file.field_name)
           <> " filename="
           <> string.inspect(file.filename)
           <> ": "
@@ -293,7 +294,10 @@ pub fn read_multipart(
     Error(reason) -> {
       log.warning(
         "brazier.upload",
-        "Cannot read multipart body for " <> req.path <> ": " <> reason,
+        "Cannot read multipart body for "
+          <> log_path.describe(req.path)
+          <> ": "
+          <> reason,
       )
       Error(BodyReadError(reason))
     }
@@ -653,7 +657,9 @@ fn parse_segments(
         Ok(EmptyFile(name)) -> {
           log.debug(
             "brazier.upload",
-            "Field " <> name <> " has no file chosen; skipping it",
+            "Field "
+              <> string.inspect(name)
+              <> " has no file chosen; skipping it",
           )
           parse_segments(rest, config, fields, files)
         }
@@ -716,7 +722,8 @@ fn parse_part(part: BitArray) -> Result(Part, UploadError) {
     Error(Nil) ->
       case bit_array.to_string(data) {
         Ok(value) -> Ok(Field(name, value))
-        Error(Nil) -> Error(ParseError("field " <> name <> " is not UTF-8"))
+        Error(Nil) ->
+          Error(ParseError("field " <> string.inspect(name) <> " is not UTF-8"))
       }
     // An empty filename is a file input with nothing chosen (Plug skips it).
     Ok("") -> Ok(EmptyFile(name))
@@ -795,12 +802,16 @@ fn parse_params(
           case string.trim_start(after) {
             "\"" <> quoted ->
               case string.split_once(quoted, "\"") {
-                Error(Nil) -> Error("unterminated quoted parameter " <> key)
+                Error(Nil) ->
+                  Error("unterminated quoted parameter " <> string.inspect(key))
                 Ok(#(value, tail)) ->
                   case string.trim_start(tail) {
                     "" -> Ok(list.reverse([#(key, value), ..acc]))
                     ";" <> more -> parse_params(more, [#(key, value), ..acc])
-                    _ -> Error("garbage after quoted parameter " <> key)
+                    _ ->
+                      Error(
+                        "garbage after quoted parameter " <> string.inspect(key),
+                      )
                   }
               }
             unquoted ->

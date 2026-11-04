@@ -408,6 +408,12 @@ with its own changelog, so they are not listed here.
   covered only through the cloud. The bench suite has a new
   `store.crdt_append.{10,1000,10000}` case; its metrics need a re-baseline
   before `brazier_bench_check` accepts them.
+- Merging a delta into a replicated store no longer sorts the replica's
+  whole causal-context cloud (the dots seen out of order). Only the
+  replicas the delta names are compacted, from their clock upwards, so a
+  one-dot delta against a 10,000-dot cloud fell from about 1.3 million
+  reductions to the cost of the same merge against a 10-dot cloud. The
+  result is the one the sort gave, checked against it as an oracle.
 - (Audit TS-9) The listener parses `ws_allowed_origins` and
   `allowed_hosts` once, when it starts, as Phoenix compiles `check_origin`,
   and refuses to start with an invalid entry. Origins used to be parsed on
@@ -495,6 +501,11 @@ with its own changelog, so they are not listed here.
 - (Audit TS-12) Every `let assert` in `brazier/cluster`, `brazier/pubsub`
   and the cluster tests has an `as` message. `let assert True = e` in those
   tests is now `assert e`.
+- (Audit TS-12) `brazier/lint` has a `let-assert-message` rule: a
+  `let assert` in `src/` without an `as` message, or with an empty one, is
+  a violation, and the last ten such asserts have messages. The lint also
+  skipped every directory named `build`, so `src/brazier/build` was never
+  linted; only the `build` next to a `gleam.toml` is skipped now.
 - (TS-3) The client defaulted a missing `ack_clock`, and a missing event
   clock, to 0. Now a `model_sync` or `patch` without a valid `ack_clock` (a
   non-negative integer) is a protocol error, logged, that requests a full
@@ -526,6 +537,22 @@ with its own changelog, so they are not listed here.
   (`disconnect_nodes/1` excludes a node instead of disconnecting it), and
   Mnesia likewise ignores connected nodes outside `db_nodes`. A process
   waiting for a node to pass the check keeps waiting through a rejection.
+- The client bundle cache could serve a stale bundle. It checked an entry
+  against the file's size and mtime only, so a same-size rewrite in the
+  same second, or a rename of a new file with the same size and mtime over
+  the old one, kept the old bytes and ETag. An entry is now checked against
+  the size, mtime, ctime, inode and device, and one recorded less than 2 s
+  after the file's last change is rebuilt rather than trusted (git's
+  racy-clean rule, `Documentation/technical/racy-git.txt`), the rule the
+  static digest cache already follows. The recording time is taken before
+  the read. `static.load_client_asset_at` takes the time and reports
+  whether the entry was used or why it was rebuilt; misses are logged at
+  debug.
+- The CDP suite's `stop_server` only logged a page that did not unload, in
+  verbose mode. Now that, an output reader that outlives the server, and a
+  port still open are each recorded as a failure, and `stop_server` returns
+  False, so `start_example` does not start the next example against a page
+  still connected to the old server.
 
 ### Removed
 
@@ -562,6 +589,15 @@ with its own changelog, so they are not listed here.
   trusted proxy that passes the other one through is logged at warning
   (Plug.RewriteOn; Rails `RemoteIp`, `IpSpoofAttackError`; RFC 7239
   section 7.4).
+- A replicated store checks every field of a delta or full state from
+  another member (keys, dots, replicas, timestamps, topics, the clock and
+  cloud, and that each live dot is covered by its own context) before it
+  reads or joins it. A malformed payload is refused, logged at error with
+  the failing field and reported in the `[brazier, store, sync]` span with
+  `entries` 0; the replica keeps its state. It used to read the payload
+  unchecked, so a malformed term from a verified member crashed the
+  replica or was joined (Phoenix.Tracker validates a replica's message
+  before merging it).
 - (Final audit SEC-7) An `allow_guests_ws` socket that was bound to a
   signed-in session became a guest on recheck once the session was deleted,
   expired or lost its user, so a revocation that sent no notice left it
@@ -664,6 +700,26 @@ with its own changelog, so they are not listed here.
   a navigation target) is quoted with `string.inspect` in the transport,
   runtime, router and `middleware.logger` logs, and a path is logged
   without its query and fragment, so a CR or LF cannot forge a log line.
+- (Audit SEC-11) The rest of the client paths are quoted too: static
+  serving, the HTTP head and body-length logs, multipart upload logs and
+  errors (field names and parameter keys), client-IP resolution, and an
+  invalid `Content-Length` value. Filesystem paths built from a request are
+  quoted with `string.inspect`.
+- (SEC-4 follow-up) The scheme comes from the configured forwarding header
+  only. `X-Forwarded-Proto` was read whatever `forwarding_header` said, so
+  behind a proxy that sets `Forwarded` a client could send its own
+  `X-Forwarded-Proto: https`, and `Forwarded` `proto=` was never read. Now
+  `ip.Forwarded` reads the `proto=` of the client's element (the one the
+  address walk stops at), `ip.XForwardedFor` reads `X-Forwarded-Proto`, and
+  `ip.NoForwardingHeader` is always `http` (before, a listed proxy's
+  `X-Forwarded-Proto` was believed). A repeated `proto=` in one element is
+  rejected (RFC 7239 section 4). `ip.client_scheme` is the rule;
+  `client.scheme_from` calls it. Plug.RewriteOn and Django's
+  `SECURE_PROXY_SSL_HEADER` likewise read only the header they are given.
+- (TS-9 follow-up) The listener parses `trusted_proxies` once, when it
+  starts, with the origins and hosts, and refuses to start on a bad entry;
+  WebSocket upgrades no longer parse the list again for the client address
+  and the Origin check's scheme.
 - (Audit SEC-17) State recovery no longer lets a join token decide the
   server state: `restore` receives the state this connection's `init` and
   route produced, and only the client-visible model comes from the token.

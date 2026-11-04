@@ -101,7 +101,7 @@ pub fn scheme_ignores_forwarded_proto_from_untrusted_peer_test() {
 
 pub fn scheme_honours_forwarded_proto_from_trusted_proxy_test() {
   let assert Ok(trusted) =
-    ip.parse_trusted_proxies(["10.0.0.0/8"], ip.NoForwardingHeader)
+    ip.parse_trusted_proxies(["10.0.0.0/8"], ip.XForwardedFor)
   let assert Ok("http") = client.scheme_from("10.0.0.1", [], trusted)
   let assert Ok("https") =
     client.scheme_from("10.0.0.1", [#("x-forwarded-proto", "https")], trusted)
@@ -115,7 +115,7 @@ pub fn scheme_honours_forwarded_proto_from_trusted_proxy_test() {
 
 pub fn scheme_rejects_bad_forwarded_proto_from_trusted_proxy_test() {
   let assert Ok(trusted) =
-    ip.parse_trusted_proxies(["10.0.0.0/8"], ip.NoForwardingHeader)
+    ip.parse_trusted_proxies(["10.0.0.0/8"], ip.XForwardedFor)
   let assert Error(_) =
     client.scheme_from("10.0.0.1", [#("x-forwarded-proto", "gopher")], trusted)
   let assert Error(_) =

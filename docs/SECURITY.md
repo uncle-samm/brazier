@@ -175,8 +175,8 @@ entry of `ws_allowed_origins`; scheme, host and port must all match, with the
 default port applied (80 for `http`, 443 for `https`):
 
 - the request's host and port come from its `Host` header;
-- its scheme is `http`, or the `X-Forwarded-Proto` a trusted proxy sent (see
-  Trusted Proxies);
+- its scheme is `http`, or the scheme a trusted proxy sent in the configured
+  forwarding header (see Trusted Proxies);
 - a missing `Origin`, one that does not parse (empty, no scheme,
   protocol-relative, a path), an unusable `Host` and any mismatch get 403.
 
@@ -248,11 +248,11 @@ The limiter (`brazier/rate_limit`) is a fixed-window counter in an ETS table own
 
 ## Trusted Proxies
 
-`SecurityLimits.trusted_proxies` lists the reverse proxies (addresses or CIDRs such as `"10.0.0.0/8"`, `"fd00::/8"`) that Brazier believes. `SecurityLimits.forwarding_header` names the one header those proxies set to name the client: `ip.Forwarded`, `ip.XForwardedFor` or `ip.NoForwardingHeader` (the default). Both are validated at startup: an invalid entry, or a forwarding header with no trusted proxies (it would never be read), refuses to start. `brazier/transport/client` is the single resolver used by the HTTP rate limiter, the per-IP WebSocket cap and the WebSocket Origin check:
+`SecurityLimits.trusted_proxies` lists the reverse proxies (addresses or CIDRs such as `"10.0.0.0/8"`, `"fd00::/8"`) that Brazier believes. `SecurityLimits.forwarding_header` names the one header those proxies set to name the client: `ip.Forwarded`, `ip.XForwardedFor` or `ip.NoForwardingHeader` (the default). Both are parsed once, when the listener starts, and every request uses that parse: an invalid entry, or a forwarding header with no trusted proxies (it would never be read), refuses to start. `brazier/transport/client` is the single resolver used by the HTTP rate limiter, the per-IP WebSocket cap and the WebSocket Origin check:
 
 - **Client IP:** the socket peer, unless the peer is a trusted proxy and a forwarding header is configured. Then it is the right-most hop of that header that is not itself a trusted proxy (RFC 7239 section 7.4; the Plug `RemoteIp` / Rails `remote_ip` rule). A client can prepend hops but cannot forge the ones its proxies append. A malformed hop stops the walk at the last trusted address and is logged.
 - **One header, chosen by the operator:** Brazier never picks between `Forwarded` and `X-Forwarded-For`. A proxy usually sets only one of them and passes the other through from the client untouched, so preferring either would let a client name its own address whenever the proxy does not set the preferred one. This follows `Plug.RewriteOn`, which rewrites only from the headers the app lists, and Rails `RemoteIp`, which treats disagreeing client headers as a spoof (`IpSpoofAttackError`). The other header is never read; when a trusted proxy passes one through, the request is served and a warning names the ignored value (the configured proxy never sets it, so it came from the client or from a proxy that is set up differently from `forwarding_header`). With `ip.NoForwardingHeader`, both are ignored and logged at debug.
-- **Scheme:** `http` (Brazier does not terminate TLS), unless a trusted proxy sends `X-Forwarded-Proto`, which must then be `http` or `https`; anything else, or several of the header, rejects the request. From an untrusted peer the header is ignored, so a direct client cannot claim `https` to pass an `https://` Origin check.
+- **Scheme:** `http` (Brazier does not terminate TLS), unless a trusted proxy sends one in the configured header: with `ip.Forwarded`, the `proto=` of the element that names the client (the element the address walk stops at, which the outermost trusted proxy appended); with `ip.XForwardedFor`, the left-most value of `X-Forwarded-Proto`, as Django's `SECURE_PROXY_SSL_HEADER` reads it. The other header is never read (a warning names an `X-Forwarded-Proto` that reaches a `Forwarded` deployment), and with `ip.NoForwardingHeader` the scheme is always `http`, as `Plug.RewriteOn` rewrites the scheme only from the headers it is given. The scheme must be `http` or `https`; anything else, several `X-Forwarded-Proto` headers, or several `proto=` in one element rejects the request. From an untrusted peer nothing is read, so a direct client cannot claim `https` to pass an `https://` Origin check.
 
 With the default empty list, no forwarding header is ever honoured. Use the same settings for `middleware.rate_limit_behind_proxies` via `ip.parse_trusted_proxies(entries, header)` (or `transport.trusted_proxies(limits)`).
 

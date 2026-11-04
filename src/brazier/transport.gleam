@@ -208,14 +208,15 @@ pub type SecurityLimits {
     /// `BRAZIER_SHUTDOWN_TIMEOUT` overrides it for an application. Default:
     /// 5000.
     drain_timeout_ms: Int,
-    /// Reverse proxies (IP addresses or CIDRs) whose `forwarding_header`
-    /// and X-Forwarded-Proto are believed. Empty means the socket peer
-    /// address is always the client address. Default: [].
+    /// Reverse proxies (IP addresses or CIDRs) whose `forwarding_header` is
+    /// believed. Parsed once, when the listener starts. Empty means the
+    /// socket peer address is always the client address. Default: [].
     trusted_proxies: List(String),
-    /// The one header the `trusted_proxies` set to name the client:
-    /// `ip.Forwarded`, `ip.XForwardedFor` or `ip.NoForwardingHeader`. The
-    /// other header is never read. A header with no trusted proxies is
-    /// refused. Default: `ip.NoForwardingHeader`.
+    /// The one header the `trusted_proxies` set to name the client and its
+    /// scheme: `ip.Forwarded` (`for=` and `proto=`), `ip.XForwardedFor`
+    /// (with `X-Forwarded-Proto`) or `ip.NoForwardingHeader` (the peer, over
+    /// `http`). The other header is never read. A header with no trusted
+    /// proxies is refused. Default: `ip.NoForwardingHeader`.
     forwarding_header: ip.ForwardingHeader,
     // WebSocket limits
     /// Maximum concurrent WebSocket connections per peer IP (per listener).
@@ -339,7 +340,11 @@ pub fn validate_security_limits(limits: SecurityLimits) -> Result(Nil, String) {
 /// What a listener parsed from its limits once, when it started, for every
 /// connection it serves (TS-9: nothing is re-parsed per request).
 type Guards {
-  Guards(origins: AllowedOrigins, hosts: AllowedHosts)
+  Guards(
+    origins: AllowedOrigins,
+    hosts: AllowedHosts,
+    trusted: ip.TrustedProxies,
+  )
 }
 
 fn check_security_limits(
@@ -411,9 +416,8 @@ fn check_security_limits(
     use _ <- result.try(validate_drain_timeout(limits.drain_timeout_ms))
     // HTTP limits: a typo in the proxy list must never silently change who
     // is trusted.
-    use _ <- result.try(
+    use trusted <- result.try(
       ip.parse_trusted_proxies(limits.trusted_proxies, limits.forwarding_header)
-      |> result.map(fn(_) { Nil })
       |> result.map_error(fn(reason) { "trusted_proxies: " <> reason }),
     )
     use origins <- result.try(parse_allowed_origins(limits.ws_allowed_origins))
@@ -421,7 +425,7 @@ fn check_security_limits(
       limits.allowed_hosts,
       production: production,
     ))
-    Ok(Guards(origins: origins, hosts: hosts))
+    Ok(Guards(origins: origins, hosts: hosts, trusted: trusted))
   }
   case outcome {
     Ok(guards) -> {
@@ -435,10 +439,12 @@ fn check_security_limits(
   }
 }
 
-/// The parsed `trusted_proxies` of validated limits.
-/// `validate_security_limits` (run when the listener starts) has already
-/// rejected any unparsable entry, so an error here means the limits were
-/// built without validation; it is logged and the caller must refuse.
+/// Parse the `trusted_proxies` and `forwarding_header` of limits, for
+/// `middleware.rate_limit_behind_proxies`. Call it once, when building the
+/// middleware: it parses the list on every call. The listener parses its
+/// own copy once when it starts and refuses to start on a bad entry.
+/// `validate_security_limits` rejects the same entries, so an error here
+/// means the limits were never validated; it is logged.
 pub fn trusted_proxies(
   limits: SecurityLimits,
 ) -> Result(ip.TrustedProxies, String) {
@@ -2340,14 +2346,14 @@ fn parse_port(text: String) -> Result(Int, String) {
   }
 }
 
-/// The scheme the client used to reach us. X-Forwarded-Proto is honoured
-/// only from a trusted proxy (`brazier/transport/client`); otherwise plain
-/// http (Brazier itself does not terminate TLS).
+/// The scheme the client used to reach us. The configured forwarding
+/// header's scheme is honoured only from a trusted proxy
+/// (`brazier/transport/client`); otherwise plain http (Brazier itself does
+/// not terminate TLS).
 fn request_scheme(
   req: Request(Connection),
-  limits: SecurityLimits,
+  trusted: ip.TrustedProxies,
 ) -> Result(String, String) {
-  use trusted <- result.try(trusted_proxies(limits))
   client.scheme(req, trusted)
 }
 
@@ -2356,9 +2362,8 @@ fn request_scheme(
 fn ws_client_ip(
   socket: Socket,
   req: Request(Connection),
-  limits: SecurityLimits,
+  trusted: ip.TrustedProxies,
 ) -> Result(String, String) {
-  use trusted <- result.try(trusted_proxies(limits))
   client.ip_for_socket(socket, req.headers, trusted)
 }
 
@@ -2588,8 +2593,7 @@ fn check_host(
 /// SECURITY: Origin validation is the primary CSRF defense for WebSocket connections.
 fn check_origin(
   req: Request(Connection),
-  limits: SecurityLimits,
-  allowed_origins: AllowedOrigins,
+  guards: Guards,
 ) -> Result(Nil, String) {
   case request.get_header(req, "origin") {
     Error(Nil) -> {
@@ -2604,13 +2608,13 @@ fn check_origin(
         Ok(h) -> h
         Error(Nil) -> ""
       }
-      case request_scheme(req, limits) {
+      case request_scheme(req, guards.trusted) {
         Error(reason) -> {
           log.warning("brazier.transport", "Origin check failed: " <> reason)
           Error(reason)
         }
         Ok(scheme) ->
-          origin_allowed(origin, scheme, request_host, allowed_origins)
+          origin_allowed(origin, scheme, request_host, guards.origins)
       }
     }
   }
@@ -2721,10 +2725,9 @@ fn handle_ws_request(
   page: LivePage,
 ) -> UpgradeOutcome {
   let conn_id = generate_connection_id()
-  // The limits were validated once, when the listener started
-  // (`prepare_listener` refuses to build a handler otherwise), and this
-  // function is reachable only through that handler.
-  case ws_client_ip(socket, req, config.security_limits) {
+  // The trusted proxies were parsed once, when the listener started
+  // (`prepare_listener` refuses to build a handler otherwise).
+  case ws_client_ip(socket, req, guards.trusted) {
     Error(reason) -> {
       // The peer is already gone: nobody to answer.
       log.warning(
@@ -2822,7 +2825,7 @@ fn authorize_ws_request(
       reason,
     )
   }
-  case check_origin(req, config.security_limits, guards.origins) {
+  case check_origin(req, guards) {
     Error(reason) ->
       reject(
         "rejected_origin",

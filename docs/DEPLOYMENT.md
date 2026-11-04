@@ -202,11 +202,19 @@ are in [SECURITY.md](SECURITY.md#trusted-proxies); for deployment:
   in `allowed_hosts` (see [Allowed Hosts](#allowed-hosts)), and the
   WebSocket Origin check compares the browser's `Origin` with the request's
   scheme, `Host` and port; Brazier does not read `X-Forwarded-Host`.
-- **`X-Forwarded-Proto`**: the proxy must send `https` for HTTPS clients.
-  Brazier reads it only from a trusted proxy. Without it the request's scheme is
-  `http`, and a browser on `https://` fails the Origin check with 403. Several
-  `X-Forwarded-Proto` headers, or a value other than `http` or `https`, reject
-  the request.
+- **Scheme**: the proxy must tell Brazier that a client used `https`, in the
+  header `forwarding_header` names and no other: with `ip.Forwarded`, the
+  `proto=` of the element it appends for the client (nginx
+  `proxy_set_header Forwarded "for=$remote_addr;proto=$scheme"`); with
+  `ip.XForwardedFor`, `X-Forwarded-Proto` (nginx
+  `proxy_set_header X-Forwarded-Proto $scheme`, which overwrites any value
+  the client sent; the left-most value is read). The other header is ignored
+  with a warning, and with `ip.NoForwardingHeader` the scheme is always
+  `http`. Brazier reads the scheme only from a trusted proxy. Without one the
+  request's scheme is `http`, and a browser on `https://` fails the Origin
+  check with 403. A scheme other than `http` or `https`, several
+  `X-Forwarded-Proto` headers, or several `proto=` in one `Forwarded` element
+  reject the request.
 - **`ws_allowed_origins`**: add an origin here only when pages served from a
   different origin open the socket. The request's own origin is always
   allowed. Entries are bare `scheme://host[:port]` origins; an entry with a
@@ -222,7 +230,8 @@ are in [SECURITY.md](SECURITY.md#trusted-proxies); for deployment:
     address and both caps apply to all clients together.
 - **Rate limiting**: `middleware.rate_limit` keys on the socket peer; behind a
   proxy use `middleware.rate_limit_behind_proxies(limiter, trusted)` with the
-  same list (`transport.trusted_proxies(limits)`). See
+  same list (`transport.trusted_proxies(limits)`, called once when the
+  pipeline is built; the listener parses its own copy once at start). See
   [MIDDLEWARE.md](MIDDLEWARE.md).
 - **HSTS**: add `middleware.hsts(...)` once the site is served over HTTPS
   (see [SECURITY.md](SECURITY.md#secure-headers)).

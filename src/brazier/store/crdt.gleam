@@ -385,32 +385,135 @@ fn next_dot(context: Context, replica: Replica) -> Dot {
 /// moves a dot from the cloud into the clock when every lower counter of
 /// its replica is already there).
 fn context_of(dots: List(Dot)) -> Context {
-  compact(Context(clock: dict.new(), cloud: set.from_list(dots)))
+  union_context(
+    empty_context(),
+    Context(clock: dict.new(), cloud: set.from_list(dots)),
+  )
 }
 
+/// The compacted union of a compacted context `a` (a state's context: every
+/// context this module builds is compacted) and any context `b`.
+///
+/// *Compacted* means: no cloud dot is at or below its replica's clock (0
+/// when the replica has no entry), and no cloud dot is the counter right
+/// after it, so the clock cannot be extended. Given that of `a`, only the
+/// replicas `b` names can change, and only by the dots `b` brings: the
+/// cloud dots of `a` its clock now covers are dropped, `b`'s cloud dots
+/// above the clock are added, and each named replica's clock is extended
+/// while the next counter is in the cloud. The cost is
+/// O(|b| + min(counters b's clock newly covers, |a.cloud|) + dots absorbed
+/// into the clock), not O(|a.cloud| log |a.cloud|): the cloud of a state is
+/// never sorted, and is walked only when `b`'s clock newly covers more
+/// counters than the cloud holds. The result is exactly the one
+/// sorting the whole cloud gives (the oracle in crdt_test), and is
+/// compacted again, so the invariant holds for every state.
+///
+/// The compaction rule is the one of Almeida, Shoker and Baquero (a dot
+/// joins the version vector once every lower counter of its replica has
+/// been seen); applying it only to the replicas a delta names is what keeps
+/// a join's cost following the delta, as `join_keys` does for the dots.
 fn union_context(a: Context, b: Context) -> Context {
   let clock = dict.combine(a.clock, b.clock, fn(x, y) { int.max(x, y) })
-  compact(Context(clock: clock, cloud: set.union(a.cloud, b.cloud)))
-}
-
-/// Move every cloud dot that extends its replica's clock into the clock and
-/// drop the cloud dots the clock already covers.
-fn compact(context: Context) -> Context {
-  let sorted = list.sort(set.to_list(context.cloud), compare_dots)
-  let #(clock, cloud) =
-    list.fold(sorted, #(context.clock, set.new()), fn(acc, dot) {
-      let #(clock, cloud) = acc
-      let max = case dict.get(clock, dot.replica) {
-        Ok(max) -> max
-        Error(Nil) -> 0
-      }
-      case dot.counter <= max, dot.counter == max + 1 {
-        True, _ -> acc
-        False, True -> #(dict.insert(clock, dot.replica, dot.counter), cloud)
-        False, False -> #(clock, set.insert(cloud, dot))
+  let cloud = drop_covered(a, b.clock)
+  // Every replica `b` names is a candidate for extension: its clock may
+  // have moved (up, or for a replica `a` lacked, below 0) or its cloud
+  // grown.
+  let #(cloud, touched) =
+    set.fold(b.cloud, #(cloud, dict.keys(b.clock)), fn(acc, dot) {
+      let #(cloud, touched) = acc
+      case dot.counter <= clock_or_zero(clock, dot.replica) {
+        True -> acc
+        False -> #(set.insert(cloud, dot), [dot.replica, ..touched])
       }
     })
-  Context(clock: clock, cloud: cloud)
+  let #(clock, cloud) =
+    list.fold(touched, #(clock, cloud), fn(acc, replica) {
+      let #(clock, cloud) = acc
+      extend(clock, cloud, replica)
+    })
+  Context(clock:, cloud:)
+}
+
+/// The cloud of `a` without the dots `clock` (another context's clock)
+/// covers and `a.clock` did not. Probes each newly covered counter, or
+/// scans the cloud once when that is fewer steps.
+fn drop_covered(a: Context, clock: Dict(Replica, Int)) -> Set(Dot) {
+  let raised =
+    dict.fold(clock, [], fn(raised, replica, max) {
+      let old = clock_or_zero(a.clock, replica)
+      case max > old {
+        True -> [#(replica, old, max), ..raised]
+        False -> raised
+      }
+    })
+  let probes =
+    list.fold(raised, 0, fn(probes, raise) { probes + raise.2 - raise.1 })
+  case raised, probes <= set.size(a.cloud) {
+    [], _ -> a.cloud
+    _, True ->
+      list.fold(raised, a.cloud, fn(cloud, raise) {
+        let #(replica, old, max) = raise
+        drop_counters(cloud, replica, old + 1, max)
+      })
+    _, False -> {
+      let raised =
+        list.fold(raised, dict.new(), fn(raised, raise) {
+          dict.insert(raised, raise.0, raise.2)
+        })
+      set.filter(a.cloud, fn(dot) {
+        case dict.get(raised, dot.replica) {
+          Ok(max) -> dot.counter > max
+          Error(Nil) -> True
+        }
+      })
+    }
+  }
+}
+
+fn drop_counters(
+  cloud: Set(Dot),
+  replica: Replica,
+  counter: Int,
+  max: Int,
+) -> Set(Dot) {
+  case counter > max {
+    True -> cloud
+    False ->
+      drop_counters(
+        set.delete(cloud, Dot(replica:, counter:)),
+        replica,
+        counter + 1,
+        max,
+      )
+  }
+}
+
+/// Move the cloud dots that continue `replica`'s clock into the clock, one
+/// counter at a time. A replica with no entry starts at 0 and gets one
+/// only if its counter 1 is in the cloud.
+fn extend(
+  clock: Dict(Replica, Int),
+  cloud: Set(Dot),
+  replica: Replica,
+) -> #(Dict(Replica, Int), Set(Dot)) {
+  let max = clock_or_zero(clock, replica)
+  let next = Dot(replica:, counter: max + 1)
+  case set.contains(cloud, next) {
+    False -> #(clock, cloud)
+    True ->
+      extend(
+        dict.insert(clock, replica, next.counter),
+        set.delete(cloud, next),
+        replica,
+      )
+  }
+}
+
+fn clock_or_zero(clock: Dict(Replica, Int), replica: Replica) -> Int {
+  case dict.get(clock, replica) {
+    Ok(max) -> max
+    Error(Nil) -> 0
+  }
 }
 
 // --- Reads ---

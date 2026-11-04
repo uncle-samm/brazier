@@ -14,9 +14,11 @@
 ///    (`stale-docs-model`)
 /// 7. No pre-rename project name in `src/`, `test/` and `examples/`
 ///    (`stale-name`, see `lint_stale_names`)
-/// 8. Every file must be readable and parse; failures are violations
+/// 8. Every `let assert` in `src/` has a non-empty `as "..."` message
+///    (`let-assert-message`, see `check_let_assert_messages`)
+/// 9. Every file must be readable and parse; failures are violations
 ///
-/// The AST rules (1, 2 and 4) visit every statement and expression of a
+/// The AST rules (1, 2, 4 and 8) visit every statement and expression of a
 /// function body at any depth (see `body_nodes`): code inside `use`
 /// callbacks, `assert`s, case guards, record updates, captures, bit arrays
 /// and `as` messages is checked like any other.
@@ -54,7 +56,7 @@ pub fn lint_directory(dir: String) -> List(Violation) {
       let violations =
         list.flat_map(entries, fn(entry) {
           let path = dir <> "/" <> entry
-          case should_skip_entry(entry), simplifile.is_directory(path) {
+          case should_skip_entry(dir, entry), simplifile.is_directory(path) {
             True, _ -> []
             False, Ok(True) -> lint_directory(path)
             False, Ok(False) -> {
@@ -96,7 +98,7 @@ pub fn lint_docs_directory(dir: String) -> List(Violation) {
     Ok(entries) ->
       list.flat_map(entries, fn(entry) {
         let path = dir <> "/" <> entry
-        case should_skip_entry(entry), simplifile.is_directory(path) {
+        case should_skip_entry(dir, entry), simplifile.is_directory(path) {
           True, _ -> []
           False, Ok(True) -> lint_docs_directory(path)
           False, Ok(False) -> {
@@ -179,7 +181,7 @@ pub fn lint_names_directory(dir: String) -> List(Violation) {
     Ok(entries) ->
       list.flat_map(entries, fn(entry) {
         let path = dir <> "/" <> entry
-        case should_skip_entry(entry), simplifile.is_directory(path) {
+        case should_skip_entry(dir, entry), simplifile.is_directory(path) {
           True, _ -> []
           False, Ok(True) -> lint_names_directory(path)
           False, Ok(False) ->
@@ -277,11 +279,35 @@ fn occurrences(haystack: String, needle: String) -> Int {
   list.length(string.split(haystack, needle)) - 1
 }
 
-fn should_skip_entry(entry: String) -> Bool {
-  entry == "build"
-  || entry == ".venv"
-  || entry == "node_modules"
-  || entry == "priv"
+/// Generated or vendored directories the lint does not read. A `build`
+/// directory is skipped only when it is Gleam's build output, the one next
+/// to a `gleam.toml`: `src/brazier/build` holds Brazier's own build tool
+/// and is linted like any other source directory.
+fn should_skip_entry(dir: String, entry: String) -> Bool {
+  case entry {
+    "build" -> is_project_root(dir)
+    ".venv" | "node_modules" | "priv" -> True
+    _ -> False
+  }
+}
+
+fn is_project_root(dir: String) -> Bool {
+  case simplifile.is_file(dir <> "/gleam.toml") {
+    Ok(found) -> found
+    Error(err) -> {
+      // The directory was just listed, so a stat failure here is an I/O
+      // error worth reporting; the walk then descends into `build` and
+      // reports what it cannot read there.
+      log.error(
+        "brazier.lint",
+        "Cannot stat "
+          <> dir
+          <> "/gleam.toml: "
+          <> simplifile.describe_error(err),
+      )
+      False
+    }
+  }
 }
 
 /// Lint a single Gleam source file.
@@ -307,13 +333,16 @@ pub fn lint_source(file_path: String, source: String) -> List(Violation) {
         check_no_degraded_path_phrases(file_path, source)
       let deprecated_route_violations =
         check_deprecated_route_api(file_path, source)
-      list.append(
-        list.append(
-          list.append(todo_violations, logging_violations),
-          degraded_path_violations,
-        ),
-        list.append(deprecated_route_violations, discard_violations),
-      )
+      let assert_message_violations =
+        check_let_assert_messages(file_path, source, module)
+      list.flatten([
+        todo_violations,
+        logging_violations,
+        degraded_path_violations,
+        deprecated_route_violations,
+        discard_violations,
+        assert_message_violations,
+      ])
     }
     Error(err) -> {
       let message = source_location.describe_parse_error(file_path, source, err)
@@ -743,6 +772,73 @@ fn is_log_call(node: Node) -> Bool {
       ..,
     )) -> True
     ExpressionNode(..) | StatementNode(..) -> False
+  }
+}
+
+/// Flag every `let assert` in `src/` that has no `as "..."` message, or whose
+/// message is an empty string literal (TIGERSTYLE §3, TS-12). The message is
+/// what the crash report shows, so it must name the invariant that failed.
+/// A message built from an expression is accepted: the linter cannot know
+/// its value, and the compiler already checks it is a `String`.
+fn check_let_assert_messages(
+  file_path: String,
+  source: String,
+  module: glance.Module,
+) -> List(Violation) {
+  case string.starts_with(file_path, "src/") {
+    False -> []
+    True ->
+      list.flat_map(module.functions, fn(def) {
+        let func = def.definition
+        body_nodes(func.body)
+        |> list.flat_map(fn(node) {
+          let_assert_violation(file_path, source, func.name, node)
+        })
+      })
+  }
+}
+
+fn let_assert_violation(
+  file_path: String,
+  source: String,
+  func_name: String,
+  node: Node,
+) -> List(Violation) {
+  let problem = case node {
+    StatementNode(glance.Assignment(
+      kind: glance.LetAssert(message: option.None),
+      location:,
+      ..,
+    )) -> Ok(#(location, "has no `as \"...\"` message"))
+    StatementNode(glance.Assignment(
+      kind: glance.LetAssert(message: option.Some(glance.String(value:, ..))),
+      location:,
+      ..,
+    )) ->
+      case string.trim(value) {
+        "" -> Ok(#(location, "has an empty `as` message"))
+        _ -> Error(Nil)
+      }
+    StatementNode(glance.Assignment(..))
+    | StatementNode(glance.Use(..))
+    | StatementNode(glance.Assert(..))
+    | StatementNode(glance.Expression(..))
+    | ExpressionNode(..) -> Error(Nil)
+  }
+  case problem {
+    Error(Nil) -> []
+    Ok(#(location, what)) -> [
+      Violation(
+        file: file_path,
+        location: source_location.format_span(source, location),
+        rule: "let-assert-message",
+        message: "`let assert` in `"
+          <> func_name
+          <> "` "
+          <> what
+          <> ". Add `as \"...\"` stating the invariant and why it holds.",
+      ),
+    ]
   }
 }
 
