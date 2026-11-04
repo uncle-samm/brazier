@@ -78,6 +78,8 @@ fn start(dir: String) -> server.Listener {
       security_limits: transport.SecurityLimits(
         ..transport.default_security_limits(),
         body_read_timeout_ms: 500,
+        // The raw requests below name the host "test".
+        allowed_hosts: ["test"],
       ),
       api_handler: Some(handler(dir)),
     )

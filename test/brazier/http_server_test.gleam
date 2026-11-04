@@ -82,6 +82,9 @@ fn fast_limits() -> transport.SecurityLimits {
     keepalive_idle_timeout_ms: 300,
     body_read_timeout_ms: 300,
     request_timeout_ms: 2000,
+    // The raw requests below name the hosts "x" and "test"; an
+    // absolute-form target names example.com.
+    allowed_hosts: ["x", "test", "example.com"],
   )
 }
 

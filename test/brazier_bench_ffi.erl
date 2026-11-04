@@ -104,7 +104,7 @@ http_client(Port, Requests, TimeoutMs) ->
                          [binary, {active, false}, {packet, raw}, {nodelay, true}],
                          TimeoutMs) of
         {ok, Socket} ->
-            Request = <<"GET /bench HTTP/1.1\r\nHost: bench\r\n\r\n">>,
+            Request = <<"GET /bench HTTP/1.1\r\nHost: localhost\r\n\r\n">>,
             Result = http_loop(Socket, Request, Requests, TimeoutMs, []),
             ok = gen_tcp:close(Socket),
             Result;

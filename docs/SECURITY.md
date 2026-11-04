@@ -7,8 +7,10 @@ Brazier includes built-in security protections across the transport, middleware,
 The `SecurityLimits` type in `brazier/transport` controls connection-level
 protections. `transport.validate_security_limits` checks it when the listener
 starts; an invalid value (a non-positive size or interval, a timer too large
-for `erlang:send_after/3`, a malformed trusted proxy or allowed origin)
-refuses to start.
+for `erlang:send_after/3`, a malformed trusted proxy, allowed origin or
+allowed host, an empty `allowed_hosts` in production) refuses to start. The
+origin and host lists are parsed once, when the listener starts, as Phoenix
+compiles its `check_origin` list once.
 
 <!-- docs-check: fragment an excerpt of the SecurityLimits type in brazier/transport, defaults as comments -->
 ```gleam
@@ -43,6 +45,7 @@ pub type SecurityLimits {
     ws_max_decode_errors: Int,        // 10
     ws_max_rate_violations: Int,      // 100
     ws_allowed_origins: List(String), // []
+    allowed_hosts: List(String),      // []: localhost names in development; required in production
   )
 }
 ```
@@ -142,6 +145,10 @@ answers with an HTTP status and no socket is opened:
 
 | Check | Refusal |
 |-------|---------|
+| `Host` in `allowed_hosts` (see [Allowed Hosts](#allowed-hosts)) | 400 |
+| No request body, and no bytes sent before the handshake answer | 400 |
+| A `path` query parameter naming a local page path | 400 |
+| The app's middleware, run on a `GET` of that page (see [The Live Page and Middleware](#the-live-page-and-middleware)) | the middleware's response |
 | Global `max_connections` | 503 |
 | `max_ws_connections_per_ip`, keyed on the client address resolved through `trusted_proxies` | 429 |
 | Origin (below) | 403 |
@@ -174,8 +181,62 @@ default port applied (80 for `http`, 443 for `https`):
   protocol-relative, a path), an unusable `Host` and any mismatch get 403.
 
 Non-browser clients must send an explicit `Origin`. `ws_allowed_origins`
-entries are bare `scheme://host[:port]` origins, validated at startup: an
-entry with a path, or one that does not parse, refuses to start.
+entries are bare `scheme://host[:port]` origins, parsed once when the
+listener starts: an entry with a path, or one that does not parse, refuses
+to start.
+
+The origin check alone does not stop DNS rebinding: a page on
+`evil.example` whose name is rebound to this server's address is
+same-origin with itself, so its upgrade carries `Origin:
+http://evil.example` and `Host: evil.example`, which match. The host check
+below refuses it.
+
+## Allowed Hosts
+
+`SecurityLimits.allowed_hosts` lists the host names the server answers to,
+as Django's `ALLOWED_HOSTS` does. Every HTTP request and every WebSocket
+upgrade whose `Host` header names another host gets 400 (upgrade result
+`rejected_host`), before any middleware or handler runs.
+
+- `"example.com"`, `"127.0.0.1"`, `"[::1]"` match that host only.
+- `".example.com"` matches `example.com` and every subdomain.
+- `"*"` matches every host, which turns the check off; the listener logs a
+  warning when it starts.
+- The port is not compared, case is ignored, and one trailing dot of the
+  request's host (`example.com.`) is dropped.
+- An entry with a port, a scheme or path, a `*` inside a name or a
+  trailing dot refuses to start.
+- An empty list means `transport.development_allowed_hosts`
+  (`[".localhost", "127.0.0.1", "[::1]"]`) in development. In production
+  (`BRAZIER_ENV=production`) the listener refuses to start with an empty
+  list, and the error names the setting. See
+  [DEPLOYMENT.md](DEPLOYMENT.md#allowed-hosts).
+- A request with no `Host` passes (only HTTP/1.0 can omit it; HTTP/1.1
+  without exactly one `Host` is already refused). Browsers always send it,
+  so a rebound page cannot use this.
+
+## The Live Page and Middleware
+
+The app's middleware decides who may see a page, and a live session must
+not reach a page the middleware refuses over HTTP. Following Phoenix
+LiveView, which runs a `live_session`'s `on_mount` hooks at the first mount
+and again at every live navigation, the same pipeline gates the live page:
+
+- **Upgrade.** The upgrade's `path` query parameter is required and must be
+  a local path (the [Navigation Targets](#navigation-targets) rule);
+  otherwise 400 (`rejected_path`). A `GET` of that page, with the upgrade's
+  headers and cookies, is run through the middleware; when the pipeline
+  does not reach the handler, the upgrade gets the middleware's response
+  (`rejected_middleware`) and no runtime starts.
+- **Navigation and join.** Every `navigate`, and every `join` for a page
+  other than the one the connection was admitted for, runs the same gate.
+  A refused page is answered with `hard_navigate` to it: the browser loads
+  it over HTTP, where the middleware answers it (a redirect to sign in, a
+  403). The refusal emits `[brazier, ws, navigation_refused]`. A path that
+  is not local gets `error "Invalid page path"`.
+
+The gate runs the middleware for its decision only: a response it builds
+for the gated page is not sent over the socket.
 
 ## Rate Limiting
 
@@ -268,7 +329,7 @@ HSTS is opt-in because Brazier does not terminate TLS: add `middleware.hsts(31_5
 
 ## Route Scoping
 
-`middleware.only`, `middleware.at` and `middleware.except` compare paths segment by segment, the way the routers read them, not as raw string prefixes. `only("/admin", mw)` covers `/admin` and `/admin/users` but not `/administrator`. A path is read both with empty segments dropped (page routing) and with dot segments resolved (API routing): `only` and `at` apply when either reading matches, and `except` skips the middleware only when both readings are under the prefix. So `//admin` still gets `only("/admin", auth)`, and `/public/../admin` still gets `except("/public", auth)`.
+`middleware.only`, `middleware.at` and `middleware.except` compare paths segment by segment, the way the routers read them, not as raw string prefixes. `only("/admin", mw)` covers `/admin` and `/admin/users` but not `/administrator`. A path is read four ways: with empty segments dropped, with dot segments resolved (API routing), and both again after percent-decoding (page routing decodes segments, so `/%61dmin` is the `admin` route). `only` and `at` apply when any reading matches, and `except` skips the middleware only when every reading is under the prefix. So `//admin` and `/%61dmin` still get `only("/admin", auth)`, and `/public/../admin` and `/public/%2E%2E/admin` still get `except("/public", auth)`. A path that does not percent-decode has no decoded reading; the page router answers it with 400 before an app sees it.
 
 ## Join Tokens
 
@@ -276,9 +337,9 @@ SSR pages set a signed join token in the HttpOnly `brazier_join_token` cookie; s
 
 The token must fit in a cookie: a browser drops a cookie over 4096 bytes. A page whose token is over `ssr.join_token_cookie_budget_bytes` (3800 bytes) is refused with a plain-text 500 and no cookie, the error is logged with the token size, and `[brazier, ssr, join_token, too_large]` is emitted. The model is never dropped to make the token fit: the session would then restart from `init` on its next reconnect with nothing to say why. Keep the client-visible model small, or do not use state recovery.
 
-While state recovery is enabled, the runtime refuses a join (4400, the browser reloads for a fresh token) whose token is missing, does not verify, carries no model, or carries a model `restore` cannot decode. See [ERROR_HANDLING.md](ERROR_HANDLING.md#join-tokens).
+While state recovery is enabled, the runtime refuses a join (4400, the browser reloads for a fresh token) whose token is missing, does not verify, carries no model, or carries a model the codec cannot decode or `restore` refuses. The signature, age and session are checked before `init` runs; the model is restored after it. See [ERROR_HANDLING.md](ERROR_HANDLING.md#join-tokens).
 
-**What state recovery restores.** A recovered model is the client-visible model as it was when the page was rendered, up to 24 hours earlier. The `restore` function builds the session's state from it alone: it does not see the state the current `init` built, nor the request. So never put authorization (a role, a permission, a user id that grants access) in the client-visible model with recovery on: a reconnect would bring back what the page had, even if it was revoked since. Keep it in server state that `update` re-reads (the session store, or a database), as LiveView re-runs `mount` on every reconnect and reloads the user from the session there.
+**What state recovery restores.** A recovered model is the client-visible model as it was when the page was rendered, up to 24 hours earlier. As LiveView re-runs `mount` on every reconnect and reloads the user from the session there, Brazier runs `init` and the initial route for the reconnecting connection first, with the current request and session, and then calls `restore(model, fresh)` with the recovered model and the state they built. Take authorization (a role, a permission, the signed-in user) from `fresh`, never from the recovered model: the model brings back what the page had, even if it was revoked since. A `restore` that copies only the client-visible fields onto `fresh` (`Session(..fresh, model: model)`) keeps every server-only field current.
 
 The cookie is `HttpOnly`, `SameSite=Lax`, path `/`, and has `Max-Age=86400`. JavaScript cannot read it, so XSS cannot directly steal the join token from DOM state.
 
@@ -488,6 +549,20 @@ The client applies the same rule, with the same reasons, to the `navigate`
 and `hard_navigate` frames. It then refuses a path that
 `new URL(path, location.origin)` resolves to another origin. `router_test`
 holds the server's and the client's verdicts equal on every case.
+
+## Client Text in Logs
+
+The transport, the runtime, the router and `middleware.logger` quote what
+the client chose with `string.inspect` when they log it, so a newline or
+control character in it cannot forge a second log line: event names and
+message types, `Origin` and `Host` header values, and the scheme and port
+parsed from them. A path they log (the transport's static and error
+responses, a `join` or `navigate` path, a `router.push` target, a refused
+hard navigation) loses its query and fragment before it is quoted, since
+those can carry tokens or personal data, as LiveView's `filter_parameters`
+keeps such values out of its logs: `router.push("/reset?token=...")` is
+logged as `"/reset"`. `test/brazier/log_forging_test.gleam` holds these
+rules.
 
 ## Model Patches
 

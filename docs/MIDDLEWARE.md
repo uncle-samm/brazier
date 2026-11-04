@@ -7,9 +7,7 @@ Brazier's middleware system processes HTTP requests and responses. Middleware ca
 A `Middleware` takes a request and a `next` function, returning a response.
 Add one to an app with `brazier.with_middleware(app, mw)`; they run in the order
 they are added, before the app's API routes, the framework routes
-(`/health`, the client bundle, `/static`) and page rendering. They also run on
-a WebSocket upgrade request: a middleware that answers instead of calling
-`next` refuses the upgrade with its response.
+(`/health`, the client bundle, `/static`) and page rendering.
 `brazier.simple`, `brazier.application` and `brazier.full_application` start with
 `secure_headers()` already in the list.
 
@@ -65,6 +63,45 @@ pub fn start() -> Result(Nil, BrazierError) {
 name already in use are errors. `middleware.pipeline(middlewares, handler)`
 chains middleware around a handler of your own, in the same order.
 
+## The Live Page
+
+The middleware also decides which pages a live session may show, so a
+WebSocket cannot reach a page the middleware refuses over HTTP. It runs on
+the page, not on the `/ws` request: Brazier builds a `GET` of the page with
+the connection's upgrade headers (its cookies, `Authorization` and
+forwarding headers) and runs the pipeline on it, at three points:
+
+| When | Page | Refusal |
+|------|------|---------|
+| The WebSocket upgrade | the upgrade's required `path` query parameter (`/ws?path=%2Fadmin`) | the upgrade gets the middleware's response; no runtime starts (upgrade result `rejected_middleware`) |
+| A client `navigate` (link click, back/forward, `router.push`/`replace`) | the target path | `hard_navigate` to it: the browser loads it over HTTP and gets the middleware's answer |
+| A `join` for a page other than the upgrade's | the joined path | `hard_navigate`, as for `navigate` |
+
+The page is admitted when the pipeline reaches the handler (some middleware
+calls `next` all the way through); any response a middleware returns
+instead is a refusal. A refused navigation is logged as a warning and emits
+`[brazier, ws, navigation_refused]` (see
+[TELEMETRY.md](TELEMETRY.md#event-catalogue)); the runtime never sees it,
+so no `on_change` runs. A `path` that is not a same-origin path (see
+[SECURITY.md](SECURITY.md#navigation-targets)) gets 400 on the upgrade
+(`rejected_path`) and an `error` frame on `navigate` or `join`.
+
+This follows Phoenix LiveView, which runs a `live_session`'s `on_mount`
+hooks at the connected mount and at every live navigation, and answers an
+unauthorized navigation with a full page load through the router's plugs.
+
+Consequences for a middleware:
+
+- It sees the method `GET` and the page's path and query, plus the upgrade
+  request's headers, including `Upgrade: websocket`. It must decide from
+  the request alone: a response it builds (headers, cookies, a body) is not
+  sent for a navigation, and `next`'s response is not the page.
+- It runs once per navigation, so a rate limiter in the pipeline counts
+  live navigations as page loads.
+- Nothing runs on the `/ws` request itself: `middleware.only("/ws", ..)`
+  never applies. Check the socket with `brazier.ws_auth` (see
+  [SECURITY.md](SECURITY.md#websocket-authentication)).
+
 ## Built-in Middleware
 
 | Function | Description |
@@ -72,7 +109,7 @@ chains middleware around a handler of your own, in the same order.
 | `secure_headers()` | Sets CSP, X-Frame-Options, and other security headers (in every app's list from the start) |
 | `logger()` | Logs request method, path, and response status |
 | `rate_limit(limiter)` | Returns 429 (with `Retry-After`) when a client exceeds the configured rate. Keys on the socket peer IP; forwarding headers are ignored |
-| `rate_limit_behind_proxies(limiter, trusted)` | Like `rate_limit`, but the client is resolved through trusted proxies (right-most untrusted `Forwarded` / `X-Forwarded-For` hop). See SECURITY.md, Trusted Proxies |
+| `rate_limit_behind_proxies(limiter, trusted)` | Like `rate_limit`, but the client is resolved through trusted proxies (the right-most untrusted hop of the one forwarding header `trusted` names). See SECURITY.md, Trusted Proxies |
 | `hsts(max_age_seconds, include_subdomains)` | Sets `Strict-Transport-Security`. Returns `Result` (negative max-age is an error). Use only behind HTTPS |
 | `compress()` | Gzip-compresses text responses when client sends `Accept-Encoding: gzip`. A file body (a static file sent with `sendfile`) is passed through uncompressed |
 | `request_id()` | Generates a unique `x-request-id` response header |
@@ -108,9 +145,13 @@ middleware.group([mw1, mw2]),                   // several as one
 ```
 
 Paths are matched on segment boundaries, the way the routers read them:
-`only("/admin", ..)` does not match `/administrator`, and empty segments and
-dot segments are normalised, so `//admin` and `/public/../admin` cannot slip
-past a scoped auth middleware. A trailing slash is ignored.
+`only("/admin", ..)` does not match `/administrator`. A path is read with
+empty segments dropped, with dot segments resolved, and both again after
+percent-decoding (the page router decodes segments, so `/%61dmin` is the
+`admin` page). `only` and `at` apply when any reading matches, and `except`
+skips its middleware only when every reading is under the prefix, so
+`//admin`, `/%61dmin`, `/public/../admin` and `/public/%2E%2E/admin` cannot
+slip past a scoped auth middleware. A trailing slash is ignored.
 
 Route-aware apps use the same `brazier.with_middleware` builder because there
 is only one app startup path.

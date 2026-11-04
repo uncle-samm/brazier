@@ -253,6 +253,9 @@ fn documented() -> List(Documented) {
       "kind", "connection_id",
     ]),
     Plain(["ws", "backpressure"], ["queue_len"], ["reason", "connection_id"]),
+    Plain(["ws", "navigation_refused"], ["count"], [
+      "kind", "status", "connection_id",
+    ]),
     runtime("mount"),
     runtime("handle_event"),
     runtime("navigate"),
@@ -359,6 +362,7 @@ fn emit_everything() -> Nil {
   telemetry.ws_close(100, 1, 2, 30, 40, 1000, "normal", "c1")
   telemetry.ws_rate_limited(5, "event", "c1")
   telemetry.ws_backpressure(9, "outbound_queue", "c1")
+  telemetry.ws_navigation_refused("navigate", 403, "c1")
   list.each(
     [telemetry.Mount, telemetry.HandleEvent, telemetry.Navigate],
     fn(kind) {

@@ -63,7 +63,7 @@ same key with a purpose label (see [CLUSTERING.md](CLUSTERING.md)).
 GET /path ──► middleware ──► api_routes? ──► static? ──► SSR (dead render)
                                                           │ init(ctx) → route msg → view → HTML
                                                           │ + join-token cookie + <script bundle>
-browser loads bundle ──► WS /ws?path=/path ──► ws_auth? ──► runtime process
+browser loads bundle ──► WS /ws?path=/path ──► middleware (GET /path) ──► ws_auth? ──► runtime process
                                                           │ init(ctx) → route msg
                                                           │ ◄── join
                                                           │ ──► model_sync (full model JSON)
@@ -103,8 +103,12 @@ page from another build is closed with 4409 `stale build` and reloads, and
 an unreadable manifest closes with 1011. A join from the current build (or
 one with no build id, which is logged as a warning) goes to the runtime,
 which answers with a `model_sync` of the encoded model. With state recovery,
-a verified join token on the first join replaces the model that `init`
-produced. See [WIRE_PROTOCOL.md](WIRE_PROTOCOL.md#close-codes).
+the join token is verified before `init` runs, and its model is decoded and
+handed to the app's `restore` with the state `init` and the route produced.
+Before the upgrade, and on every live navigation or join to another page,
+the middleware runs on a `GET` of the page (see
+[MIDDLEWARE.md](MIDDLEWARE.md#the-live-page)). See
+[WIRE_PROTOCOL.md](WIRE_PROTOCOL.md#close-codes).
 
 ### 3. Events
 

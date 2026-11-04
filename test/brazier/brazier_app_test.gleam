@@ -225,14 +225,17 @@ pub fn state_recovery_decodes_and_restores_test() {
       view: fn(model, _local) { element.text(int.to_string(model)) },
     )
     |> keyed
-    |> brazier.with_state_recovery(restore: fn(model) {
-      State(count: model, secret: "restored")
+    |> brazier.with_state_recovery(restore: fn(model, fresh: State) {
+      // The server-only field comes from the fresh state init built.
+      State(..fresh, count: model)
     })
     |> config
   let assert Some(restore) = cfg.restore_model
-  let assert Ok(State(count: 42, secret: "restored")) = restore("42")
+    as "with_state_recovery sets restore_model"
+  let fresh = State(count: 0, secret: "from init")
+  let assert Ok(State(count: 42, secret: "from init")) = restore("42", fresh)
   // A model the codec cannot decode is an error, not a default state.
-  let assert Error("not an int: {\"x\":1}") = restore("{\"x\":1}")
+  let assert Error("not an int: {\"x\":1}") = restore("{\"x\":1}", fresh)
 }
 
 // --- presence ---

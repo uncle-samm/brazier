@@ -7,6 +7,7 @@
 ///
 /// Reference: Wisp middleware, Phoenix plugs, Express middleware.
 import brazier/internal/http_status
+import brazier/internal/log_path
 import brazier/ip
 import brazier/log
 import brazier/rate_limit
@@ -57,7 +58,8 @@ pub fn logger() -> Middleware {
     next: fn(Request(Connection)) -> Response(ResponseBody),
   ) -> Response(ResponseBody) {
     let method = http.method_to_string(req.method)
-    let path = req.path
+    // The path is client text: quoted, without its query (log_path).
+    let path = log_path.describe(req.path)
     log.info("brazier.middleware", method <> " " <> path)
     let resp = next(req)
     log.info(
@@ -235,10 +237,11 @@ pub fn rate_limit(limiter: rate_limit.RateLimiter) -> Middleware {
 }
 
 /// Rate limiting keyed on the client IP resolved through trusted proxies:
-/// forwarding headers are honoured only when the socket peer is one of
-/// `trusted`, and the client is the right-most hop that is not a trusted
-/// proxy. Build `trusted` with `ip.parse_trusted_proxies` (use the same
-/// list as `SecurityLimits.trusted_proxies`).
+/// only the forwarding header that `trusted` names is read, only when the
+/// socket peer is one of its proxies, and the client is the right-most hop
+/// that is not a trusted proxy. Build `trusted` with
+/// `ip.parse_trusted_proxies` or `transport.trusted_proxies(limits)`, so it
+/// matches `SecurityLimits.trusted_proxies` and `forwarding_header`.
 pub fn rate_limit_behind_proxies(
   limiter: rate_limit.RateLimiter,
   trusted: ip.TrustedProxies,
@@ -284,7 +287,10 @@ pub fn request_id() -> Middleware {
     next: fn(Request(Connection)) -> Response(ResponseBody),
   ) -> Response(ResponseBody) {
     let id = generate_request_id()
-    log.debug("brazier.middleware", "Request " <> id <> ": " <> req.path)
+    log.debug(
+      "brazier.middleware",
+      "Request " <> id <> ": " <> log_path.describe(req.path),
+    )
     let resp = next(req)
     resp
     |> response.set_header("x-request-id", id)
@@ -311,8 +317,10 @@ pub fn request_id() -> Middleware {
 /// a bad Content-Length with 400 and treat a missing one as an empty body;
 /// Plug.Parsers answers an oversized body with 413.
 pub fn body_parser(max_bytes: Int) -> Middleware {
-  // A negative limit is a programming error: no request could pass.
+  // Invariant: the limit is developer configuration, and a negative one is
+  // a programming error (no request could pass), so it crashes at setup.
   let assert True = max_bytes >= 0
+    as "middleware.body_parser: max_bytes must be at least 0"
   fn(
     req: Request(Connection),
     next: fn(Request(Connection)) -> Response(ResponseBody),
@@ -419,14 +427,16 @@ fn gzip_compress(data: BitArray) -> BitArray
 //
 // Paths are compared segment by segment, the way the routers see them, not
 // as raw strings: `only("/admin", ..)` covers `/admin` and `/admin/users`
-// but not `/administrator`, and `//admin` or `/public/../admin` cannot slip
-// past it. A request path is read two ways — raw segments with empty ones
-// dropped (page routing, `route.parse_path`) and dot-segment-resolved
-// segments (API routing, `request.path_segments`) — and each combinator
-// picks the conservative answer for its purpose.
+// but not `/administrator`, and `//admin`, `/public/../admin` or `/%61dmin`
+// cannot slip past it. A request path is read four ways: raw segments with
+// empty ones dropped, dot-segment-resolved segments (API routing,
+// `request.path_segments`), and both of those again after percent-decoding
+// (page routing: `router.segments` decodes, so `/%61dmin` is the `admin`
+// route). Each combinator picks the conservative answer for its purpose,
+// so another reading can only make a middleware apply to more requests.
 
 /// Apply middleware only when the request path is `prefix` or below it
-/// (segment boundary). Applied when either reading of the path matches.
+/// (segment boundary). Applied when any reading of the path matches.
 ///
 /// ```gleam
 /// middleware.only("/admin", auth.require_auth(store))
@@ -450,7 +460,7 @@ pub fn only(prefix: String, mw: Middleware) -> Middleware {
 }
 
 /// Apply middleware only when the request path is exactly `path`
-/// (ignoring empty segments and a trailing slash). Applied when either
+/// (ignoring empty segments and a trailing slash). Applied when any
 /// reading of the path matches.
 ///
 /// ```gleam
@@ -471,8 +481,8 @@ pub fn at(path: String, mw: Middleware) -> Middleware {
 
 /// Apply middleware to all paths EXCEPT `prefix` and below it (segment
 /// boundary). Useful for skipping auth on public routes. The middleware is
-/// skipped only when BOTH readings of the path are under the prefix, so
-/// `/public/../admin` still gets it.
+/// skipped only when EVERY reading of the path is under the prefix, so
+/// `/public/../admin` and `/public/%2E%2E/admin` still get it.
 ///
 /// ```gleam
 /// middleware.except("/public", auth.require_auth(store))
@@ -495,7 +505,16 @@ pub fn except(prefix: String, mw: Middleware) -> Middleware {
 }
 
 fn path_readings(path: String) -> List(List(String)) {
-  [raw_segments(path), uri.path_segments(path)]
+  // A path that does not percent-decode has no decoded reading: Brazier
+  // answers it with 400 before an app's router sees it
+  // (`internal/uri_check`), and an API handler sees only the raw path.
+  let decoded = case uri.percent_decode(path) {
+    Ok(decoded) -> [decoded]
+    Error(Nil) -> []
+  }
+  list.flat_map([path, ..decoded], fn(reading) {
+    [raw_segments(reading), uri.path_segments(reading)]
+  })
 }
 
 fn raw_segments(path: String) -> List(String) {

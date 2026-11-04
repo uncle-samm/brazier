@@ -63,6 +63,7 @@ import brazier/cookie
 import brazier/effect.{type Effect}
 import brazier/error
 import brazier/internal/context.{type Context}
+import brazier/internal/local_path
 import brazier/internal/log_path
 import brazier/internal/presence_watch
 import brazier/internal/uri_check
@@ -204,8 +205,9 @@ pub type RuntimeState(model, msg) {
     self: Subject(RuntimeMessage(msg)),
     /// Client-visible model encoder (the generated codec over `sync`).
     model_encoder: fn(model) -> String,
-    /// Rebuild the server state from join-token model JSON (state recovery).
-    restore_model: Option(fn(String) -> Result(model, String)),
+    /// Rebuild the server state from join-token model JSON and the state
+    /// `init` built (state recovery).
+    restore_model: Option(fn(String, model) -> Result(model, String)),
     /// Secret key for join tokens.
     secret_key: String,
     /// The app's `parse` composed with `on_change`, when it has a router.
@@ -253,8 +255,10 @@ pub type RuntimeConfig(state, msg) {
     decode_event: fn(String, String, String, String) ->
       Result(msg, error.BrazierError),
     /// Rebuild the server state from the client-visible model JSON carried
-    /// by a join token. Set only when the app opted into state recovery.
-    restore_model: Option(fn(String) -> Result(state, String)),
+    /// by a join token and the fresh state `init` (and the initial route)
+    /// built for this connection, as LiveView re-runs `mount` on a
+    /// reconnect. Set only when the app opted into state recovery.
+    restore_model: Option(fn(String, state) -> Result(state, String)),
     /// The app's `parse` composed with `on_change`, when it has a router.
     route: Option(fn(Uri) -> Result(msg, Nil)),
     /// Dynamic subscription function: given the current state, returns
@@ -327,7 +331,7 @@ fn start_for(
   config: RuntimeConfig(model, msg),
   ctx: Context,
   connection_id: String,
-  recovered: Option(model),
+  recovered: Option(Recovery(model)),
 ) -> Result(Subject(RuntimeMessage(msg)), error.BrazierError) {
   let page_uri = context.uri(ctx)
   use Nil <- result.try(check_recovery_config(config))
@@ -359,34 +363,64 @@ type Mounted(model, msg) {
 }
 
 /// A runtime that does not start is logged once, here, where the cause is
-/// known: by `mount`, `start_presence` or `spawn_actor`, with the page and
-/// connection. The callers up to the transport only pass the error on (the
-/// transport logs the close it answers with at info).
+/// known: by `mount`, `refuse_join_token`, `start_presence` or
+/// `spawn_actor`, with the page and connection. The callers up to the
+/// transport only pass the error on (the transport logs the close it
+/// answers with at info).
 fn start_actor(
   config: RuntimeConfig(model, msg),
   ctx: Context,
   page_uri: Uri,
   connection_id: String,
-  recovered: Option(model),
+  recovered: Option(Recovery(model)),
 ) -> Result(Subject(RuntimeMessage(msg)), error.BrazierError) {
   let started_at = monotonic_time()
   use mounted <- result.try(mount(config, ctx, page_uri, connection_id))
-  // `init` and the initial route still run (their effects and route
-  // message stand); the recovered model replaces the state they built,
-  // before presence, subscriptions and effect messages first see it.
-  let mounted = case recovered {
-    None -> mounted
-    Some(model) -> {
-      log.info(
+  // `init` and the initial route run first, as LiveView re-runs `mount` on
+  // a reconnect: their effects and route message stand, and `restore` gets
+  // the recovered model with the fresh state they built (SEC-17), before
+  // presence, subscriptions and effect messages first see the state.
+  use mounted <- result.try(case recovered {
+    None -> Ok(mounted)
+    Some(recovery) ->
+      restore_mounted(recovery, mounted, page_uri, connection_id)
+  })
+  spawn_actor(config, mounted, page_uri, started_at, connection_id)
+}
+
+/// Put the recovered model in place of the mounted one. `restore` is app
+/// code running in the connection's handler, so a crash in it is caught
+/// and closes the socket with 1011, as a crash in `init` does; a model it
+/// refuses closes with 4400 so the browser reloads for a fresh token.
+fn restore_mounted(
+  recovery: Recovery(model),
+  mounted: Mounted(model, msg),
+  page_uri: Uri,
+  connection_id: String,
+) -> Result(Mounted(model, msg), error.BrazierError) {
+  let restored =
+    run_guarded(fn() {
+      restore_recovered(recovery, mounted.model, connection_id)
+    })
+  case restored {
+    Ok(Ok(model)) -> Ok(Mounted(..mounted, model: model))
+    Ok(Error(reason)) ->
+      Error(refuse_join_token(connection_id, page_uri, reason))
+    Error(#(crash, stacktrace)) -> {
+      log.error(
         "brazier.runtime",
-        "Starting connection "
+        "restore crashed for "
+          <> describe_uri(page_uri)
+          <> " (connection "
           <> connection_id
-          <> " from the model recovered from its join token",
+          <> "): "
+          <> crash
+          <> "\n"
+          <> stacktrace,
       )
-      Mounted(..mounted, model: model)
+      Error(error.RuntimeError(reason: "restore crashed: " <> crash))
     }
   }
-  spawn_actor(config, mounted, page_uri, started_at, connection_id)
 }
 
 /// Run the app's `init` and initial route in the calling process (the
@@ -1015,6 +1049,31 @@ type JoinToken {
 /// code read here).
 pub const join_token_refused_status = 400
 
+/// Log and build the error of a connection refused for its join token
+/// (`join_token_refused_status`).
+fn refuse_join_token(
+  conn_id: transport.ConnectionId,
+  page_uri: Uri,
+  reason: String,
+) -> error.BrazierError {
+  log.warning(
+    "brazier.runtime",
+    "Refusing connection "
+      <> conn_id
+      <> " for "
+      <> describe_uri(page_uri)
+      <> ": "
+      <> reason
+      <> " (close "
+      <> int.to_string(error.init_close_code_base + join_token_refused_status)
+      <> ": the browser reloads the page for a fresh token)",
+  )
+  error.InitRejected(error.refuse(
+    join_token_refused_status,
+    "join token refused: " <> reason,
+  ))
+}
+
 /// Join (or rejoin) a connection.
 ///
 /// - First join of a connection: its join token is checked (see
@@ -1138,7 +1197,7 @@ fn recover_at_join(
         True -> None
         False -> state.restore_model
       }
-      use recovered <- result.map(check_join_token(
+      use recovered <- result.try(check_join_token(
         restore,
         option.is_some(state.restore_model),
         state.secret_key,
@@ -1147,38 +1206,79 @@ fn recover_at_join(
         conn_id,
       ))
       case recovered {
-        Some(model) -> RuntimeState(..state, model: model)
-        None -> state
+        // No connection has joined the runtime yet, so its state is the
+        // one `init` built when it started (plus any messages its effects
+        // dispatched since). `restore` runs in the actor: a crash in it
+        // crashes the runtime, as a crash in `update` does.
+        Some(recovery) -> {
+          use model <- result.map(restore_recovered(
+            recovery,
+            state.model,
+            conn_id,
+          ))
+          RuntimeState(..state, model: model)
+        }
+        None -> Ok(state)
       }
     }
   }
 }
 
-/// Check a join token. `Ok(Some(model))` is the model recovered from it,
-/// `Ok(None)` a token with nothing to recover (or none, without state
+/// The model a verified join token carries, waiting for the fresh state
+/// `init` builds: `restore` gets both (SEC-17).
+type Recovery(model) {
+  Recovery(
+    restore: fn(String, model) -> Result(model, String),
+    model_json: String,
+  )
+}
+
+/// Run the app's `restore` on a recovered model and the fresh state.
+fn restore_recovered(
+  recovery: Recovery(model),
+  fresh: model,
+  conn_id: transport.ConnectionId,
+) -> Result(model, String) {
+  case recovery.restore(recovery.model_json, fresh) {
+    Ok(model) -> {
+      log.info(
+        "brazier.runtime",
+        "State recovered from the join token for " <> conn_id,
+      )
+      Ok(model)
+    }
+    Error(reason) ->
+      Error("the join token's model does not restore: " <> reason)
+  }
+}
+
+/// Check a join token. `Ok(Some(recovery))` is the model to recover from
+/// it, `Ok(None)` a token with nothing to recover (or none, without state
 /// recovery), and `Error(reason)` a join that must be refused:
 ///
 /// - a token that does not verify: malformed, signed with another key (an
 ///   older server process with a generated secret), expired, or issued to
 ///   another browser session;
-/// - a token whose model `restore` refuses (the model's shape changed);
 /// - no token while state recovery is enabled: the server render always
 ///   sets the cookie, so its absence means the browser did not keep it;
 /// - a token without a model while state recovery is enabled: the server
 ///   render always puts the model in (it refuses the page when the model is
 ///   too large for a cookie), so the token was minted without recovery.
 ///
+/// A model that `restore` refuses (its shape changed) is refused too, by
+/// `restore_recovered`, once `init` has built the fresh state.
+///
 /// `restore` is `None` when no model is to be recovered (recovery disabled,
 /// or the runtime already joined a connection); `recovery_enabled` says
 /// whether the app opted into state recovery at all.
 fn check_join_token(
-  restore: Option(fn(String) -> Result(model, String)),
+  restore: Option(fn(String, model) -> Result(model, String)),
   recovery_enabled: Bool,
   secret_key: String,
   token: String,
   session_fingerprint: String,
   conn_id: transport.ConnectionId,
-) -> Result(Option(model), String) {
+) -> Result(Option(Recovery(model)), String) {
   case token, recovery_enabled {
     "", False -> {
       log.debug("brazier.runtime", "No join token for " <> conn_id)
@@ -1220,18 +1320,15 @@ fn check_join_token(
         // the session's state.
         Some(_), None ->
           Error("state recovery is enabled and the join token carries no model")
-        Some(restore), Some(model_json) ->
-          case restore(model_json) {
-            Ok(model) -> {
-              log.info(
-                "brazier.runtime",
-                "State recovered from the join token for " <> conn_id,
-              )
-              Ok(Some(model))
-            }
-            Error(reason) ->
-              Error("the join token's model does not restore: " <> reason)
-          }
+        Some(restore), Some(model_json) -> {
+          log.debug(
+            "brazier.runtime",
+            "Join token from "
+              <> conn_id
+              <> " verified; its model is restored once init has run",
+          )
+          Ok(Some(Recovery(restore: restore, model_json: model_json)))
+        }
       }
     }
   }
@@ -1393,8 +1490,8 @@ fn ack_if_unchanged(
 
 /// Why a client-reported path cannot be routed in place.
 type PathProblem {
-  /// Not a same-origin path (`/…`, not `//…`): never navigated to.
-  NotLocal
+  /// Not a same-origin path (`internal/local_path`): never navigated to.
+  NotLocal(reason: String)
   /// A path whose encoding does not decode: the dead render answers 400.
   BadEncoding(reason: String)
   /// A path the app's `parse` does not accept: the dead render answers 404.
@@ -1408,13 +1505,10 @@ fn route_for_path(
   page_uri: Uri,
   path: String,
 ) -> Result(msg, PathProblem) {
+  use Nil <- result.try(local_path.check(path) |> result.map_error(NotLocal))
   use parsed <- result.try(
-    case string.starts_with(path, "/") && !string.starts_with(path, "//") {
-      False -> Error(NotLocal)
-      True ->
-        uri.parse(path)
-        |> result.replace_error(BadEncoding("the path does not parse as a URL"))
-    },
+    uri.parse(path)
+    |> result.replace_error(BadEncoding("the path does not parse as a URL")),
   )
   let target = uri.Uri(..page_uri, path: parsed.path, query: parsed.query)
   use Nil <- result.try(
@@ -1484,18 +1578,22 @@ fn refuse_navigation(
     }
     Unroutable(problem) ->
       case problem {
-        NotLocal -> {
+        NotLocal(reason) -> {
           log.warning(
             "brazier.runtime",
             "Navigation from "
               <> conn_id
-              <> " to a non-local path refused: "
+              <> " to a non-local path refused ("
+              <> reason
+              <> "): "
               <> log_path(path),
           )
           send_to_conn_id(
             state,
             conn_id,
-            transport.SendError(reason: "navigation path must start with /"),
+            transport.SendError(
+              reason: "navigation path must be a same-origin path",
+            ),
           )
           state
         }
@@ -1527,12 +1625,35 @@ fn refuse_navigation(
   }
 }
 
+/// Send a hard navigation to `path`: the browser loads it. Only a
+/// same-origin path is ever sent (`internal/local_path`); every caller has
+/// already checked it, so another path is a bug in the runtime, which is
+/// logged as an error and answered with an error, never sent.
 fn hard_navigate(
   state: RuntimeState(model, msg),
   conn_id: transport.ConnectionId,
   path: String,
 ) -> RuntimeState(model, msg) {
-  send_to_conn_id(state, conn_id, transport.SendHardNavigate(path: path))
+  case local_path.check(path) {
+    Ok(Nil) ->
+      send_to_conn_id(state, conn_id, transport.SendHardNavigate(path: path))
+    Error(reason) -> {
+      log.error(
+        "brazier.runtime",
+        "Refusing to send a hard navigation to "
+          <> conn_id
+          <> " for "
+          <> log_path(path)
+          <> ": not a same-origin path, "
+          <> reason,
+      )
+      send_to_conn_id(
+        state,
+        conn_id,
+        transport.SendError(reason: "Invalid page path"),
+      )
+    }
+  }
   state
 }
 
@@ -1576,7 +1697,8 @@ fn route_join(
           }
         Error(problem) -> {
           let reason = case problem {
-            NotLocal -> "join path must start with /"
+            NotLocal(reason) ->
+              "join path is not a same-origin path: " <> reason
             BadEncoding(reason) ->
               "join path has an invalid encoding: " <> reason
             UnknownRoute -> "no route for the joined path " <> log_path(path)
@@ -2378,8 +2500,9 @@ pub fn start_and_connect(
 /// check refuses the connection with
 /// `error.InitRejected(error.refuse(join_token_refused_status, _))`, so
 /// the socket closes with 4400 and the browser reloads the page for a
-/// fresh token. A model recovered from the token replaces the state `init`
-/// built before the runtime starts.
+/// fresh token. A model recovered from the token goes to the app's
+/// `restore` with the state `init` built, before the runtime starts; a
+/// model `restore` refuses is refused the same way.
 pub fn start_and_connect_with_request(
   config: RuntimeConfig(model, msg),
   conn_id: transport.ConnectionId,
@@ -2409,28 +2532,8 @@ pub fn start_and_connect_with_request(
           conn_id,
         )
       {
-        Error(reason) -> {
-          log.warning(
-            "brazier.runtime",
-            "Refusing connection "
-              <> conn_id
-              <> " for "
-              <> describe_uri(context.uri(ctx))
-              <> ": "
-              <> reason
-              <> " (close "
-              <> int.to_string(
-              error.init_close_code_base + join_token_refused_status,
-            )
-              <> ": the browser reloads the page for a fresh token)",
-          )
-          Error(
-            error.InitRejected(error.refuse(
-              join_token_refused_status,
-              "join token refused: " <> reason,
-            )),
-          )
-        }
+        Error(reason) ->
+          Error(refuse_join_token(conn_id, context.uri(ctx), reason))
         Ok(recovered) ->
           spawn_and_connect(
             config,
@@ -2445,7 +2548,8 @@ pub fn start_and_connect_with_request(
   }
 }
 
-/// The Context for a connected mount, from the upgrade request.
+/// The Context for a connected mount, from the upgrade request. Its page is
+/// `transport.get_upgrade_page`, the page the transport gated the upgrade on.
 @internal
 pub fn connected_context(
   req: request.Request(server.Connection),
@@ -2454,35 +2558,9 @@ pub fn connected_context(
     "brazier.runtime",
     "Building connected context from upgrade request " <> log_path(req.path),
   )
-  use pairs <- result.try(
-    request.get_query(req)
-    |> result.replace_error("the WebSocket URL's query string does not parse"),
-  )
-  use page_path <- result.try(
-    list.key_find(pairs, "path")
-    |> result.replace_error(
-      "the WebSocket URL has no path parameter (expected /ws?path=<page path>)",
-    ),
-  )
-  use parsed <- result.try(
-    case
-      string.starts_with(page_path, "/") && !string.starts_with(page_path, "//")
-    {
-      False ->
-        Error(
-          "the WebSocket path parameter is not a local path: "
-          <> string.inspect(page_path),
-        )
-      True ->
-        uri.parse(page_path)
-        |> result.replace_error(
-          "the WebSocket path parameter does not parse: "
-          <> string.inspect(page_path),
-        )
-    },
-  )
+  use page <- result.try(transport.get_upgrade_page(req))
   let page_uri =
-    uri.Uri(..request.to_uri(req), path: parsed.path, query: parsed.query)
+    uri.Uri(..request.to_uri(req), path: page.path, query: page.query)
   Ok(context.new(
     uri: page_uri,
     cookies: cookie.parse(req),
@@ -2497,7 +2575,7 @@ fn spawn_and_connect(
   conn_id: transport.ConnectionId,
   transport_subject: process.Subject(transport.InternalMessage),
   token_checked: Bool,
-  recovered: Option(model),
+  recovered: Option(Recovery(model)),
 ) -> Result(
   #(fn(transport.ConnectionId, transport.ClientMessage) -> Nil, fn() -> Nil),
   error.BrazierError,

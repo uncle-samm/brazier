@@ -284,7 +284,7 @@
       - W2-A owns transport, runtime, middleware, router and the client JS. It takes SEC-2, SEC-16, SEC-11 transport part, TS-9, SEC-17 recovery, the runtime's own local-path checks, the `hard_navigate` echo and the link-click origin check;
       - W2-B owns ip, transport/client, auth and session. It takes SEC-4, SEC-7, TS-4 session clock and TS-8, with call-site edits only in transport.gleam.
       - Both may make small edits to `brazier.gleam` and `application.gleam`, which fix-cluster also edits; the coordinator resolves those merges. Neither touches the `.erl` files fix-cluster owns.
-    - Wave 3: wire and encoding performance, PERF-2 and PERF-6. Raw JSON envelopes need a wire version bump.
+    - Wave 3: wire and encoding performance, PERF-2 and PERF-6. Raw JSON envelopes need a wire version bump. Started 2026-11-04 at the commit after 4678b0f as one agent (w3-wire-perf), because both findings cross the runtime-to-transport boundary. It runs alongside the W4 monitor-race sweep, which touches only tests that are not runtime, transport or client tests.
     - Wave 4: PERF-9, which closes the bench gate's gaps (benches for large models, SSR, static files, client render and CRDT; no ungated metrics) and re-baselines. Then a sweep of the remaining TS-12 items.
     - PERF-11 (about 0.5µs of telemetry span cost per event with no handler) is accepted within the overhead budget already recorded, and is not fixed.
   - [x] fix-crdt (PERF-7), merged as 461baf2.
@@ -401,6 +401,29 @@
       - stale "signed" wording in `config.gleam:12` and `cluster.gleam:132`;
       - `X-Forwarded-Proto` is read whatever header is configured, and `Forwarded` `proto=` is never read;
       - `transport.trusted_proxies(limits)` parses the list again on every call.
+    - The `config.gleam:12` wording is fixed (faab3a0). The `cluster.gleam` wording was already fixed by fix-cluster.
+  - [x] W2-A w2a-route-gate (SEC-2, SEC-16, TS-9, SEC-11 transport part, SEC-17 recovery, the local-path checks, `hard_navigate` validation, the link-click origin check), merged as 4678b0f.
+    - SEC-2: the middleware pipeline runs on a GET of the page, carrying the upgrade's headers, at three points: the upgrade (the `path` parameter is required, and a refusal returns the middleware's own response), every `navigate`, and a `join` for another page. Refusing a navigate or join sends `hard_navigate`, so the dead render serves the middleware's answer. A refusal also emits `[brazier, ws, navigation_refused]`. Scoped middleware also matches the percent-decoded path. This follows LiveView's `live_session`/`on_mount` and the navigation checks in `Phoenix.LiveView.Channel`.
+    - The runtime's own path checks now go through `internal/local_path`, so there is one rule. `hard_navigate` targets are validated, and the client's link interception compares full origins.
+    - SEC-16: `SecurityLimits.allowed_hosts` is checked on every HTTP request and on the upgrade. It follows Django's `ALLOWED_HOSTS` rules: a leading `.` matches subdomains, `*` matches any host, and port and case are ignored. In development an empty list means the localhost names; with `BRAZIER_ENV=production`, an empty list refuses to start. The tests include a rebinding probe where both `Origin` and `Host` are evil.example.
+    - TS-9: origins and hosts are parsed once when the listener starts, and a bad entry refuses the start.
+    - SEC-11: client text in transport, runtime, router and `middleware.logger` logs is quoted, and paths go through `log_path`.
+    - SEC-17: `with_state_recovery` takes `restore: fn(model, fresh_state) -> state`. Signature, age and session are checked before `init`; the model is decoded and restored after `init` and the route have run. A model that does not decode closes with 4400. A crash in `restore` is logged with its stacktrace and closes with 1011.
+    - Merge: CHANGELOG, plus one STATE_MANAGEMENT.md hunk. That hunk kept W2-A's refusal text and the coordinator's TS-2 wording (a server restarted with a different key, since there is no generated key any more).
+    - Coordinator verify on the merge of 8b7067a into the branch (f3c8928): clean build with zero warnings, format and lint clean, 1682 tests passing in each of 3 runs, docs check OK (73 modules), test-client OK (46 FFI scenarios), and all 24 examples build. 13 of the examples first hit the Hex API rate limit when built in a loop from the fresh worktree, then built one at a time.
+    - Coordinator fix: the `rate_limit_behind_proxies` doc comment and its MIDDLEWARE.md row now say that only the configured forwarding header is read (9ad65f0). ARCHITECTURE.md:265 no longer carries that wording.
+    - Decisions:
+      - accepted the breaking change to the `with_state_recovery` signature (listed under Breaking);
+      - accepted that the middleware gate runs before the connection, per-IP and origin checks. Middleware is the app's own code, and a refused client still gets the cheap response the middleware chooses;
+      - in production every listed caller, including health checks, must send an allowed `Host`. DEPLOYMENT.md says so.
+    - Follow-ups:
+      - whether the client retries a `rejected_middleware` upgrade forever (check in the CDP run);
+      - the committed client bundle in `priv/static` was not regenerated (check in final verification);
+      - the client calls `preventDefault` on `href="#x"` links;
+      - raw paths are still logged in `ssr.gleam`, `static.gleam`, `transport/http.gleam`, `upload.gleam` and `transport/client.gleam`;
+      - a cascade of `CloseForBackpressure` closes appeared once when many tests failed together;
+      - `trusted_proxies` is still parsed on every request.
+  - [ ] W4 monitor-race sweep (test files only), started early from faab3a0 because it shares no files with W2-A. It covers the STAB-1 monitor races in `store_test`, `ws8c_ets_owner_test` and `cluster/app_tree_test`, plus pubsub test isolation.
 - [ ] Final verification: build (zero warnings), tests, all examples, CDP browser suite, perf baselines
 
 **Decisions (Milestone 117, coordinator):**

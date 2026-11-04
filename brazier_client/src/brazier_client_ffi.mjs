@@ -1213,11 +1213,21 @@ function setupNavigation() {
     if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
     const a = e.target && e.target.closest ? e.target.closest("a[href]") : null;
     if (!a) return;
-    if (a.hostname.toLowerCase() !== location.hostname.toLowerCase()) return;
+    // Same origin means the same scheme, host and port: a link to another
+    // port or to https from http is another site, which the browser loads.
+    const href = a.getAttribute("href");
+    let url;
+    try {
+      url = new URL(href, location.origin + location.pathname + location.search);
+    } catch (err) {
+      console.warn("[brazier] Link not intercepted: its href does not parse (" + err.message + "):", JSON.stringify(href));
+      return;
+    }
+    if (url.origin !== location.origin) return;
     if (a.hasAttribute("data-brazier-external") || a.hasAttribute("download")) return;
     if (a.target && a.target !== "_self") return;
     e.preventDefault();
-    const path = a.pathname + a.search;
+    const path = url.pathname + url.search;
     if (path === currentPath()) return;
     leaveRoute(path);
     history.pushState(null, "", path);

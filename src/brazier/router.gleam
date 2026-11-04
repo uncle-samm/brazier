@@ -13,21 +13,21 @@
 /// Reference: LiveView `handle_params/3`, `push_patch`, `push_navigate`,
 /// `redirect`.
 import brazier/effect.{type Effect}
+import brazier/internal/local_path
+import brazier/internal/log_path
 import brazier/log
 import brazier/transport
 import gleam/erlang/process.{type Subject}
 import gleam/int
 import gleam/list
 import gleam/option.{None, Some}
-import gleam/string
 import gleam/uri.{type Uri}
 
 /// The percent-decoded path segments, with empty and dot segments removed:
 /// `/users/J%C3%BCrgen/` → `["users", "Jürgen"]`.
 ///
 /// Brazier only passes URIs whose encoding it checked to `parse`; calling
-/// this on
-/// an unchecked URI with invalid percent-encoding crashes.
+/// this on an unchecked URI with invalid percent-encoding crashes.
 pub fn segments(uri: Uri) -> List(String) {
   uri.path_segments(uri.path)
   |> list.map(fn(segment) {
@@ -82,40 +82,12 @@ pub fn redirect(url: String) -> Effect(msg) {
 /// `/\evil.com` and `/<tab>/evil.com` both load `evil.com`. The rule is
 /// Phoenix's `validate_local_url` (no leading `//`, no `\`, no `/%09`) plus
 /// every ASCII control character. The client checks the same rule, and also
-/// resolves the path against its own origin.
+/// resolves the path against its own origin. The transport and the runtime
+/// apply the same rule (`internal/local_path`) to the paths a client mounts
+/// and navigates to.
 @internal
 pub fn check_local_path(path: String) -> Result(Nil, String) {
-  case path {
-    "//" <> _ | "/\\" <> _ ->
-      Error("it starts with two slashes, which a browser reads as another host")
-    "/" <> _ ->
-      case
-        string.contains(path, "\\"),
-        string.contains(path, "/%09"),
-        has_control_character(path)
-      {
-        True, _, _ ->
-          Error("it contains a backslash, which a browser reads as \"/\"")
-        _, True, _ ->
-          Error("it contains \"/%09\", an encoded tab some browsers strip")
-        _, _, True ->
-          Error(
-            "it contains a control character, which a browser may strip (a tab between two slashes leaves \"//\")",
-          )
-        False, False, False -> Ok(Nil)
-      }
-    _ -> Error("it does not start with \"/\"")
-  }
-}
-
-/// Whether `text` holds an ASCII control character (U+0000 to U+001F, or
-/// U+007F).
-fn has_control_character(text: String) -> Bool {
-  string.to_utf_codepoints(text)
-  |> list.any(fn(codepoint) {
-    let code = string.utf_codepoint_to_int(codepoint)
-    code < 0x20 || code == 0x7F
-  })
+  local_path.check(path)
 }
 
 fn navigation_effect(
@@ -131,7 +103,7 @@ fn navigation_effect(
           "router."
             <> kind
             <> " needs a same-origin path starting with \"/\"; refusing "
-            <> string.inspect(path)
+            <> log_path.describe(path)
             <> ": "
             <> reason,
         )
@@ -143,7 +115,7 @@ fn navigation_effect(
               "router."
                 <> kind
                 <> " to "
-                <> path
+                <> log_path.describe(path)
                 <> " has no connection to navigate (effect not run by a session runtime, or the session has no connection)",
             )
           targets -> {
@@ -152,7 +124,7 @@ fn navigation_effect(
               "router."
                 <> kind
                 <> " to "
-                <> path
+                <> log_path.describe(path)
                 <> " on "
                 <> int.to_string(list.length(targets))
                 <> " connection(s)",
