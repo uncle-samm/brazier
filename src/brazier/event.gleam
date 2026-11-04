@@ -24,6 +24,7 @@ pub fn on(name: String, handler: Decoder(msg)) -> Attribute(msg) {
   // Invariant: event names are literals in application code. A name that
   // could break out of the `data-brazier-on-<name>` attribute is a bug.
   let assert True = render.is_valid_event_name(name)
+    as "brazier/event.on: event names are literals in the view, a-z A-Z 0-9 - _"
   attribute.from_attr(render.Event(name, render.handler(handler)))
 }
 
@@ -44,6 +45,7 @@ pub fn stop_propagation(event: Attribute(msg)) -> Attribute(msg) {
 pub fn debounce(event: Attribute(msg), ms: Int) -> Attribute(msg) {
   // Invariant: a delay is a literal in application code.
   let assert True = ms >= 0
+    as "brazier/event.debounce: the delay is a literal in the view and at least 0 ms"
   modify(event, fn(handler) {
     render.Handler(..handler, debounce_ms: ms, throttle_ms: 0)
   })
@@ -54,6 +56,7 @@ pub fn debounce(event: Attribute(msg), ms: Int) -> Attribute(msg) {
 pub fn throttle(event: Attribute(msg), ms: Int) -> Attribute(msg) {
   // Invariant: a delay is a literal in application code.
   let assert True = ms >= 0
+    as "brazier/event.throttle: the window is a literal in the view and at least 0 ms"
   modify(event, fn(handler) {
     render.Handler(..handler, throttle_ms: ms, debounce_ms: 0)
   })
@@ -66,6 +69,7 @@ fn modify(
   // Invariant: the modifiers above are applied to the result of `on` or an
   // `on_*` helper. Applying one to a plain attribute is a bug in the view.
   let assert render.Event(name, handler) = attribute.to_attr(event)
+    as "brazier/event: a modifier is applied to the result of `on` or an `on_*` helper, not a plain attribute"
   attribute.from_attr(render.Event(name, f(handler)))
 }
 

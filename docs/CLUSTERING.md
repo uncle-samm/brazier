@@ -528,6 +528,16 @@ out of range, and `store.open` returns `Error(InvalidConfig(_))` for them.
   logged at error level. The replica keeps its state. Its digest still
   differs, so the next exchange retries and logs again until the
   configurations agree or the data shrinks.
+- **A malformed payload is refused before it is read.** Every field of a
+  delta or full state from another member is checked first: each key and
+  topic is a UTF-8 string, each dot names a replica (a non-empty node name
+  and an incarnation of at least 0) and a counter of at least 1, each entry
+  has a well-formed timestamp, the context's clock and cloud are well
+  formed, and every live dot is covered by the payload's own context. A
+  full state carries no delta topics and no key without values. A payload
+  that fails is refused and logged at error level with the field that
+  failed; the replica keeps its state and keeps running. Values are not
+  checked: a replicated store holds any term.
 
 Every node must open a store with the same configuration. A node that
 opens a name already open with another configuration, or in the other mode,
@@ -553,7 +563,8 @@ gets `Error(InvalidConfig(_))`.
 - Every remote merge (delta or full state, accepted or refused) runs in a
   `[brazier, store, sync]` span. The stop event's `entries` is the number of
   entries the payload carried and `bytes` its size; `peer` is the sending
-  node. See [TELEMETRY.md](TELEMETRY.md).
+  node. A malformed payload reports `entries` 0, since its entries cannot
+  be counted. See [TELEMETRY.md](TELEMETRY.md).
 
 ### Caveats
 
