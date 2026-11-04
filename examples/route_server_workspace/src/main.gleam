@@ -7,6 +7,7 @@
 /// reaches, so the pages' signing keys never reach the browser.
 import brazier
 import brazier/attribute
+import brazier/config
 import brazier/effect.{type Effect}
 import brazier/element.{type Element}
 import brazier/html
@@ -153,11 +154,14 @@ pub fn view(model: Model, _local: Nil) -> Element(Msg) {
 }
 
 pub fn main() {
+  let assert Ok(secret_key) = config.secret_key()
+    as "SECRET_KEY must be set to a private key of at least 32 bytes (config.secret_key logs why it was refused)"
   let assert Ok(Nil) =
     brazier.full_application(init:, update:, sync:, local: local.none(), view:)
     |> brazier.with_router(parse: parse_route, on_change: RouteChanged)
     |> brazier.title(fn(_model) { "Route Server Workspace" })
     |> brazier.head_html(favicon)
+    |> brazier.secret_key(secret_key)
     |> brazier.start(8080)
     as "brazier.start failed (it logs the error)"
 }

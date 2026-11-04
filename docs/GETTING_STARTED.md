@@ -30,6 +30,7 @@ brazier = { path = "../brazier" }
 ```gleam
 // src/my_app.gleam
 import brazier
+import brazier/config
 import brazier/element.{type Element}
 import brazier/event
 import brazier/html
@@ -65,20 +66,29 @@ pub fn view(model: Model) -> Element(Msg) {
 }
 
 pub fn main() {
+  let assert Ok(secret_key) = config.secret_key()
+    as "SECRET_KEY must be set to a private key of at least 32 bytes (config.secret_key logs why it was refused)"
   let assert Ok(Nil) =
     brazier.simple(init:, update:, view:)
     |> brazier.title(fn(_model) { "My Counter" })
+    |> brazier.secret_key(secret_key)
     |> brazier.start(8080)
     as "brazier.start failed (it logs the error)"
 }
 ```
 
+Every app needs a secret key: `brazier.start` refuses an app without
+`brazier.secret_key` and does not generate one. The later samples leave it
+out to stay short; see [Configuration](#configuration).
+
 ### 4. Run it
 
-During development, run dev mode. It builds the app, starts it, and rebuilds
-whenever a `.gleam` file changes:
+Set `SECRET_KEY` first. Keep the same value across restarts, because a new
+key invalidates the tokens of open tabs. During development, run dev mode. It
+builds the app, starts it, and rebuilds whenever a `.gleam` file changes:
 
 ```bash
+export SECRET_KEY="$(openssl rand -base64 48)"
 gleam run -m brazier/dev
 ```
 
@@ -905,10 +915,11 @@ All three take same-origin paths only (see
 ### Configuration
 
 `brazier.start(app, port)` uses the port it is given, and signs tokens with
-the key from `brazier.secret_key(key)`. Without one it generates a random key
-and logs a warning: tokens then stop working after a restart. Read both from
-the environment with `brazier/config`; each function logs and returns an
-`Error` for a bad value:
+the key from `brazier.secret_key(key)`. The key is required. Without one,
+`start` logs and returns a `ConfigError` that names `brazier.secret_key` and
+`SECRET_KEY`. The same key keys the cluster peer check, so every node of a
+deployment must use the same one. Read both from the environment with
+`brazier/config`; each function logs and returns an `Error` for a bad value:
 
 | Function | Variable | Behaviour |
 |----------|----------|-----------|

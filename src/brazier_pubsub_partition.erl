@@ -14,22 +14,32 @@
 %% exit arrives here as an 'EXIT' message and its rows are removed. The link
 %% runs both ways: when the partition dies its tables die with it, and its
 %% subscribers are stopped with it instead of silently missing broadcasts.
+%%
+%% The partition starts unnamed and registers its name as the last step of
+%% init, after its tables exist: a subscriber that finds the name finds the
+%% tables, and brazier_pubsub_ffi:subscribe/1 rechecks the name after its
+%% link and its inserts so it never writes rows that a restarted partition
+%% would not own (Registry resolves partitions the same way, through a
+%% name that exists only once the partition is ready).
 
 -export([start_link/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 start_link(Index, Config) ->
-    #{partition_names := Names} = Config,
-    gen_server:start_link({local, element(Index, Names)}, ?MODULE, {Index, Config}, []).
+    gen_server:start_link(?MODULE, {Index, Config}, []).
 
 init({Index, Config}) ->
     process_flag(trap_exit, true),
-    #{keys := KeysTables, pids := PidsTables} = Config,
+    #{keys := KeysTables, pids := PidsTables, partition_names := Names} = Config,
     Keys = element(Index, KeysTables),
     Pids = element(Index, PidsTables),
     Keys = ets:new(Keys, [duplicate_bag, public, named_table,
                           {read_concurrency, true}, {write_concurrency, true}]),
     Pids = ets:new(Pids, [duplicate_bag, public, named_table, {write_concurrency, true}]),
+    %% INVARIANT: only this partition's incarnations take this name, and the
+    %% previous one is dead (the supervisor restarts a child after its
+    %% exit), so the name is free; a crash here is a supervisor bug.
+    true = register(element(Index, Names), self()),
     brazier_log_ffi:debug(<<"brazier.pubsub">>, "Partition ~b started", [Index]),
     {ok, #{index => Index, keys => Keys, pids => Pids}}.
 

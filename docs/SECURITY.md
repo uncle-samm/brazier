@@ -289,9 +289,13 @@ the formerly built-in dev secret with a `ConfigError` before any process is
 started or port bound. The key is never logged. `config.secret_key()` reads
 `SECRET_KEY` and applies the same check; there is no default.
 
-`brazier.start` generates a random per-process key when none is set, and warns at
-startup: tokens then die on restart and differ between nodes. Set an explicit
-key for production (generate one with `openssl rand -base64 48`); the full
+The key is required. `brazier.start` refuses an app without
+`brazier.secret_key` with a `ConfigError` that names the setting and the
+`SECRET_KEY` variable. It never generates a key, because a generated key
+would end every token at a restart and differ between nodes. The app has one
+key. The cluster peer check derives its MAC from it with a purpose label
+(`HMAC-SHA256(secret_key, "brazier-cluster-v1")`), so no token signature
+equals the MAC. Generate a key with `openssl rand -base64 48`. The full
 `main` is in [DEPLOYMENT.md](DEPLOYMENT.md#secret-key):
 
 <!-- docs-check: wrap
@@ -499,3 +503,12 @@ whole. The server's `patch.unsafe_keys()` is the canonical list, and
 The build compiles to JavaScript only the code the browser runs: what `view` reaches, plus `init_local` and `update_local` of a `local.layer`, plus `update` for `brazier.simple`. Each reached definition is sliced out of its source file and its imports regenerated, so a function, constant, type or import that the browser does not reach never appears in the bundle. A reference from browser code into a server-only Brazier module (for example `brazier/store`, `brazier/effect` or `brazier/session`) fails the build with the call site.
 
 At runtime, a `full_application` sends the browser only what `sync(state)` returns. Keep secrets, session ids and private records in the server state outside the synced model; `examples/privacy_demo` and `examples/route_server_workspace` show the pattern.
+
+## Clustering
+
+Erlang distribution has no permission model: a node that holds the cookie can run any code on every node. [CLUSTERING.md](CLUSTERING.md#security-first-what-distribution-means) has the full setup. Brazier enforces this much:
+
+- **Production distribution.** With `BRAZIER_ENV=prod`, the cluster manager refuses to start over plain TCP, with a cookie shorter than 32 bytes, or with TLS that does not verify peers. Verifying peers means server `verify_peer` with `fail_if_no_peer_cert`, and client `verify_peer`. `allow_insecure_distribution(reason)` overrides the refusal and logs the reason.
+- **Verified membership.** A connected node becomes a member only after it proves it holds the app's secret key (the peer check). PubSub, replicated stores, presence and session revocation send to members only and drop what other nodes send. There is no fallback to every connected node (see [Membership](CLUSTERING.md#membership)). This keeps a deployment that shares a cookie by mistake out of the data. It does not stop a node with the cookie, which can run code directly.
+- **The MAC is a secret.** The peer-check MAC is derived from the secret key with a purpose label. It is never logged. The manager's `format_status` shows it, and any MAC in a message it holds, as `redacted`. A malformed hello is logged with only its tag, size and sender.
+- **Atoms from DNS are bounded.** DNS discovery makes node names (atoms, never freed) only from well-formed IP addresses. It makes at most `max_discovered_nodes` of them over the VM's life.

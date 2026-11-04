@@ -187,7 +187,7 @@ pub fn start(config: AppConfig(state, msg)) -> Result(App, error.BrazierError) {
   use Nil <- result.try(case config.cluster {
     None -> Ok(Nil)
     Some(cluster_config) ->
-      cluster.start(cluster_config)
+      cluster.start(cluster_config, secret_key: config.secret_key)
       |> result.map_error(fn(reason) {
         config_error(
           "Cluster manager failed to start: " <> cluster.describe(reason),
@@ -266,7 +266,7 @@ pub fn start_supervised(
   use cluster_child <- result.try(case config.cluster {
     None -> Ok(None)
     Some(cluster_config) ->
-      cluster.supervised(cluster_config)
+      cluster.supervised(cluster_config, secret_key: config.secret_key)
       |> result.map(Some)
       |> result.map_error(fn(reason) {
         config_error(

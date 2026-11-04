@@ -10,7 +10,10 @@
 %%                              jitter (initial doubling to max).
 %%   {dns, Query, Base, PollMs} every PollMs resolve Query (A + AAAA, or the
 %%                              injected resolver) and connect to Base@Addr
-%%                              for each address not yet connected.
+%%                              for each address not yet connected. Only
+%%                              IP addresses become node names, and at most
+%%                              max_discovered_nodes new names are ever made
+%%                              on one VM (node names are atoms).
 %%   no_discovery               only report and check nodes that connect.
 %%
 %% Connection attempts and DNS lookups run in short-lived monitored
@@ -33,16 +36,42 @@
 %% misconfiguration (two deployments sharing a cookie), not an attacker.
 %%
 %% Verified peers are listed in the protected table brazier_cluster_members
-%% so members/0 reads them without a call.
+%% so members/0 and verified/1 read them without a call. The table is the
+%% cluster's membership: PubSub, replicated stores, presence and session
+%% revocation send only to verified nodes and drop what unverified nodes
+%% send (brazier_cluster_ffi:verified/1). A node is verified per
+%% connection: its row is removed when it is rejected or goes down, and a
+%% reconnect is checked again.
+%%
+%% Processes that sync with a peer when it joins (store replicas, session
+%% maintenance) call brazier_cluster_ffi:await_verified/1 on nodeup and get
+%% {brazier_cluster_peer_verified, Node} once the node passes the check,
+%% instead of syncing on nodeup (Phoenix.Tracker replicates only with
+%% replicas it has heard from). The interest is one-shot and dropped when
+%% the node is rejected or goes down: a node that never passes is never
+%% synced with.
+%%
+%% Timers carry their reference ({timeout, TRef, {peer_check, Node}} from
+%% erlang:start_timer/3), and the peer check timeout acts only when it is
+%% the timer of the node's current pending check: a timer of an earlier
+%% connection that fired as the node reconnected is stale and ignored.
 
 -export([start_link/1, init/1, handle_call/3, handle_cast/2, handle_info/2,
-         terminate/2, backoff_window/3]).
+         terminate/2, format_status/1, backoff_window/3]).
 
 -define(NAME, brazier_cluster).
 -define(MEMBERS, brazier_cluster_members).
 -define(PROTOCOL_VERSION, 1).
 %% Exponent cap, so 2^attempt stays small; max_ms bounds the delay anyway.
 -define(MAX_EXPONENT, 30).
+%% The VM-wide count of node-name atoms DNS discovery created (atoms are
+%% never freed, so the count only grows, across manager restarts).
+-define(DNS_ATOMS, {brazier_cluster, dns_node_atoms}).
+%% The longest address text a DNS answer may hold (an IPv6 address with
+%% an IPv4 tail is 45 characters).
+-define(MAX_ADDRESS_BYTES, 64).
+%% format_status/1 scrubs this deep; anything deeper is replaced whole.
+-define(REDACT_DEPTH, 64).
 
 start_link(Config) ->
     gen_server:start_link({local, ?NAME}, ?MODULE, Config, []).
@@ -68,7 +97,12 @@ init(Config = #{discovery := Discovery}) ->
         %% Node => {pending, TRef} | verified
         peers => #{},
         %% MonitorRef => {connect, Node} | {resolve, Pid, TimeoutRef}
-        jobs => #{}
+        jobs => #{},
+        %% Node => [Pid]: processes told when Node passes the check. Only
+        %% connected nodes have interests, and they are dropped when the
+        %% node is verified, rejected or goes down, so this stays bounded.
+        interests => #{},
+        dns_atoms => dns_atom_counter()
     },
     brazier_log_ffi:info(<<"brazier.cluster">>, "Cluster manager started on ~p (~ts)",
                         [node(), describe_discovery(Discovery)]),
@@ -84,8 +118,10 @@ handle_call(Request, From, State) ->
     brazier_log_ffi:warning(<<"brazier.cluster">>, "Unexpected call ~p from ~p", [Request, From]),
     {reply, {error, unknown_call}, State}.
 
+handle_cast({await_verified, Node, Pid}, State) when is_atom(Node), is_pid(Pid) ->
+    {noreply, await_verified(Node, Pid, State)};
 handle_cast(Request, State) ->
-    brazier_log_ffi:warning(<<"brazier.cluster">>, "Unexpected cast ~p", [Request]),
+    brazier_log_ffi:warning(<<"brazier.cluster">>, "Unexpected cast ~0P", [Request, 10]),
     {noreply, State}.
 
 handle_info({nodeup, Node, _Info}, State) ->
@@ -97,23 +133,44 @@ handle_info({nodedown, Node, Info}, State) ->
     brazier_log_ffi:warning(<<"brazier.cluster">>, "Node down: ~p (~ts)", [Node, Reason]),
     ok = brazier_telemetry_ffi:cluster_node(node_down, atom_to_binary(Node), Reason),
     {noreply, retry_target(Node, peer_down(Node, State))};
-handle_info({brazier_cluster_hello, Node, Version, Mac}, State) when is_atom(Node) ->
-    case check(Node, Version, Mac, State) of
+handle_info({brazier_cluster_hello, Node, Version, Mac}, State)
+        when is_atom(Node), is_integer(Version), is_binary(Mac) ->
+    case connected_peer(brazier_cluster_hello, Node) andalso check(Node, Version, Mac, State) of
+        false ->
+            {noreply, State};
         {verified, State1 = #{mac := Own}} ->
             {?NAME, Node} ! {brazier_cluster_hello_ack, node(), ?PROTOCOL_VERSION, Own},
             {noreply, State1};
         {rejected, State1} ->
             {noreply, State1}
     end;
-handle_info({brazier_cluster_hello_ack, Node, Version, Mac}, State) when is_atom(Node) ->
-    {_, State1} = check(Node, Version, Mac, State),
-    {noreply, State1};
-handle_info({peer_check_timeout, Node}, State = #{peers := Peers}) ->
+handle_info({brazier_cluster_hello_ack, Node, Version, Mac}, State)
+        when is_atom(Node), is_integer(Version), is_binary(Mac) ->
+    case connected_peer(brazier_cluster_hello_ack, Node) andalso check(Node, Version, Mac, State) of
+        false -> {noreply, State};
+        {_, State1} -> {noreply, State1}
+    end;
+handle_info(Message, State) when is_tuple(Message), tuple_size(Message) >= 1,
+                                 (element(1, Message) =:= brazier_cluster_hello orelse
+                                  element(1, Message) =:= brazier_cluster_hello_ack) ->
+    %% Never logged as a whole: a malformed hello may still carry a MAC.
+    From = case tuple_size(Message) >= 2 andalso element(2, Message) of
+               Node when is_atom(Node), Node =/= false -> Node;
+               _ -> unknown
+           end,
+    brazier_log_ffi:warning(<<"brazier.cluster">>, "Dropping a malformed ~p (~b elements) from ~p",
+                           [element(1, Message), tuple_size(Message), From]),
+    {noreply, State};
+handle_info({timeout, TRef, {peer_check, Node}}, State = #{peers := Peers}) ->
     case maps:get(Node, Peers, none) of
-        {pending, _} ->
+        {pending, TRef} ->
             {noreply, reject(Node, <<"no hello within the peer check timeout">>, State)};
-        _ ->
-            %% Verified or gone since the timer was set; cancel_timer races.
+        Current ->
+            %% The timer of an earlier connection of Node (it went down and
+            %% came back, or was verified, as the timer fired): the current
+            %% connection has its own timer, or needs none.
+            brazier_log_ffi:debug(<<"brazier.cluster">>, "Ignoring a stale peer check timer for ~p (~p)",
+                                 [Node, peer_status(Current)]),
             {noreply, State}
     end;
 handle_info({connect, Node}, State) ->
@@ -138,8 +195,47 @@ handle_info({'DOWN', Ref, process, _Pid, Result}, State = #{jobs := Jobs}) ->
             {noreply, State}
     end;
 handle_info(Message, State) ->
-    brazier_log_ffi:warning(<<"brazier.cluster">>, "Unexpected message ~p", [Message]),
+    brazier_log_ffi:warning(<<"brazier.cluster">>, "Unexpected message ~0P", [Message, 10]),
     {noreply, State}.
+
+%% The MAC is the HMAC of the secret key: never print it. gen_server calls
+%% this for sys:get_status/1 and for its crash report, whose last message,
+%% reason (a stack's arguments hold the state) and sys log may each carry
+%% the own MAC or a peer's (in a hello), so every value is scrubbed.
+format_status(Status) ->
+    Own = case Status of
+              #{state := #{mac := Mac}} -> Mac;
+              _ -> none
+          end,
+    maps:map(fun(_Key, Value) -> redact(Value, Own, ?REDACT_DEPTH) end, Status).
+
+redact(_Term, _Own, 0) ->
+    redacted;
+redact(Own, Own, _Depth) when is_binary(Own) ->
+    redacted;
+redact(Map, Own, Depth) when is_map(Map) ->
+    maps:map(fun
+        (mac, _Mac) -> redacted;
+        (_Key, Value) -> redact(Value, Own, Depth - 1)
+    end, Map);
+redact({Tag, Node, Version, _Mac}, _Own, _Depth) when Tag =:= brazier_cluster_hello;
+                                                     Tag =:= brazier_cluster_hello_ack ->
+    {Tag, Node, Version, redacted};
+redact(Tuple, _Own, _Depth) when tuple_size(Tuple) >= 1,
+                                 (element(1, Tuple) =:= brazier_cluster_hello orelse
+                                  element(1, Tuple) =:= brazier_cluster_hello_ack) ->
+    {element(1, Tuple), redacted};
+redact(Tuple, Own, Depth) when is_tuple(Tuple) ->
+    list_to_tuple([redact(E, Own, Depth - 1) || E <- tuple_to_list(Tuple)]);
+redact(List, Own, Depth) when is_list(List) ->
+    redact_list(List, Own, Depth);
+redact(Term, _Own, _Depth) ->
+    Term.
+
+%% Element by element, so an improper list keeps its tail.
+redact_list([], _Own, _Depth) -> [];
+redact_list([Head | Tail], Own, Depth) -> [redact(Head, Own, Depth - 1) | redact_list(Tail, Own, Depth)];
+redact_list(Tail, Own, Depth) -> redact(Tail, Own, Depth - 1).
 
 terminate(Reason, #{jobs := Jobs}) ->
     brazier_log_ffi:info(<<"brazier.cluster">>, "Cluster manager stopping: ~p", [Reason]),
@@ -156,19 +252,88 @@ peer_up(Node, State = #{peers := Peers, mac := Mac, check_timeout_ms := Timeout}
         verified ->
             %% Its hello arrived before our nodeup.
             State;
-        _ ->
-            TRef = erlang:send_after(Timeout, self(), {peer_check_timeout, Node}),
+        {pending, Old} ->
+            %% A node that connected between monitor_nodes/2 and nodes()
+            %% in init is checked twice; the newer timer replaces the old.
+            cancel(Old),
+            TRef = erlang:start_timer(Timeout, self(), {peer_check, Node}),
+            State#{peers := Peers#{Node => {pending, TRef}}};
+        none ->
+            TRef = erlang:start_timer(Timeout, self(), {peer_check, Node}),
             State#{peers := Peers#{Node => {pending, TRef}}}
     end.
 
 peer_down(Node, State = #{peers := Peers}) ->
+    State1 = drop_interests(Node, State),
     case maps:take(Node, Peers) of
         {{pending, TRef}, Rest} ->
             cancel(TRef),
-            State#{peers := Rest};
+            State1#{peers := Rest};
         {verified, Rest} ->
             true = ets:delete(?MEMBERS, Node),
-            State#{peers := Rest};
+            State1#{peers := Rest};
+        error ->
+            State1
+    end.
+
+peer_status(verified) -> verified;
+peer_status({pending, _}) -> pending_newer_check;
+peer_status(none) -> not_connected.
+
+%% A hello or ack names its sender; one from a node that is not connected
+%% (a forged FromNode, or a message that outlived its connection) must not
+%% create a member row.
+connected_peer(Tag, Node) ->
+    case lists:member(Node, nodes()) of
+        true ->
+            true;
+        false ->
+            brazier_log_ffi:warning(<<"brazier.cluster">>, "Dropping a ~p naming ~p, which is not connected",
+                                   [Tag, Node]),
+            false
+    end.
+
+%% --- Verified-peer interests ---
+
+await_verified(Node, Pid, State = #{peers := Peers, interests := Interests}) ->
+    case maps:get(Node, Peers, none) of
+        verified ->
+            Pid ! {brazier_cluster_peer_verified, Node},
+            State;
+        _ ->
+            case lists:member(Node, nodes()) of
+                true ->
+                    %% Pending, or connected and its nodeup not yet handled
+                    %% here (the caller saw its own nodeup first).
+                    Waiting = maps:get(Node, Interests, []),
+                    case lists:member(Pid, Waiting) of
+                        true -> State;
+                        false -> State#{interests := Interests#{Node => [Pid | Waiting]}}
+                    end;
+                false ->
+                    brazier_log_ffi:debug(<<"brazier.cluster">>, "Not waiting for ~p for ~p: it is not "
+                                         "connected", [Node, Pid]),
+                    State
+            end
+    end.
+
+notify_verified(Node, State = #{interests := Interests}) ->
+    case maps:take(Node, Interests) of
+        {Waiting, Rest} ->
+            [Pid ! {brazier_cluster_peer_verified, Node} || Pid <- Waiting],
+            brazier_log_ffi:debug(<<"brazier.cluster">>, "Told ~b processes that ~p is verified",
+                                 [length(Waiting), Node]),
+            State#{interests := Rest};
+        error ->
+            State
+    end.
+
+drop_interests(Node, State = #{interests := Interests}) ->
+    case maps:take(Node, Interests) of
+        {Waiting, Rest} ->
+            brazier_log_ffi:debug(<<"brazier.cluster">>, "Dropping ~b waits for ~p: it was not verified",
+                                 [length(Waiting), Node]),
+            State#{interests := Rest};
         error ->
             State
     end.
@@ -184,7 +349,8 @@ check(Node, ?PROTOCOL_VERSION, TheirMac, State = #{mac := Mac, peers := Peers})
             end,
             true = ets:insert(?MEMBERS, {Node, erlang:system_time(millisecond)}),
             brazier_log_ffi:info(<<"brazier.cluster">>, "Peer verified: ~p", [Node]),
-            {verified, reset_attempts(Node, State#{peers := Peers#{Node => verified}})};
+            State1 = reset_attempts(Node, State#{peers := Peers#{Node => verified}}),
+            {verified, notify_verified(Node, State1)};
         false ->
             {rejected, reject(Node, <<"secret key mismatch">>, State)}
     end;
@@ -288,11 +454,92 @@ connect_discovered(Query, Base, Addresses, State = #{max_dns_nodes := Max}) ->
             ok = brazier_telemetry_ffi:cluster_connect_failed(Query, Reason),
             State;
         true ->
+            {Valid, Invalid} = canonical_addresses(Unique),
+            ok = report_invalid(Query, Invalid),
+            {Nodes, Refused} = node_atoms(Base, lists:usort(Valid), State),
+            ok = report_refused(Query, Refused, State),
             Connected = nodes(),
-            Nodes = [binary_to_atom(<<Base/binary, "@", A/binary>>) || A <- Unique],
             brazier_log_ffi:debug(<<"brazier.cluster">>, "DNS ~ts -> ~p", [Query, Nodes]),
             lists:foldl(fun(N, S) -> start_connect(N, S) end, State,
                         [N || N <- Nodes, N =/= node(), not lists:member(N, Connected)])
+    end.
+
+%% A node name is an atom, and atoms are never freed: only a well-formed
+%% IP address (in its canonical text, so one address is one name) becomes
+%% part of one. Anything else in the answer is dropped.
+canonical_addresses(Addresses) ->
+    lists:foldr(fun(A, {Valid, Invalid}) ->
+                        case canonical_address(A) of
+                            {ok, Canonical} -> {[Canonical | Valid], Invalid};
+                            {error, invalid} -> {Valid, [A | Invalid]}
+                        end
+                end, {[], []}, Addresses).
+
+canonical_address(A) when is_binary(A), byte_size(A) =< ?MAX_ADDRESS_BYTES ->
+    case inet:parse_strict_address(binary_to_list(A)) of
+        {ok, Ip} -> {ok, list_to_binary(inet:ntoa(Ip))};
+        {error, einval} -> {error, invalid}
+    end;
+canonical_address(_) ->
+    {error, invalid}.
+
+report_invalid(_Query, []) ->
+    ok;
+report_invalid(Query, Invalid = [First | _]) ->
+    Shown = case is_binary(First) of
+                true -> binary:part(First, 0, min(byte_size(First), ?MAX_ADDRESS_BYTES));
+                false -> not_a_binary
+            end,
+    brazier_log_ffi:error(<<"brazier.cluster">>, "DNS lookup of ~ts returned ~b entries that are not IP "
+                         "addresses (first: ~0p); skipping them", [Query, length(Invalid), Shown]),
+    brazier_telemetry_ffi:cluster_connect_failed(Query, format({invalid_addresses, length(Invalid)})).
+
+%% The node names for Addresses. A name that is already an atom costs
+%% nothing; a new one counts against max_discovered_nodes for the life of
+%% the VM (the count survives manager restarts), and past it no new name
+%% is made: a DNS answer that keeps changing cannot exhaust the atom table.
+node_atoms(Base, Addresses, #{dns_atoms := Counter, max_discovered_nodes := Cap}) ->
+    lists:foldr(fun(A, {Nodes, Refused}) ->
+                        Name = <<Base/binary, "@", A/binary>>,
+                        case existing_atom(Name) of
+                            {ok, Node} ->
+                                {[Node | Nodes], Refused};
+                            {error, new} ->
+                                case atomics:get(Counter, 1) < Cap of
+                                    true ->
+                                        ok = atomics:add(Counter, 1, 1),
+                                        {[binary_to_atom(Name) | Nodes], Refused};
+                                    false ->
+                                        {Nodes, Refused + 1}
+                                end
+                        end
+                end, {[], 0}, Addresses).
+
+existing_atom(Name) ->
+    try binary_to_existing_atom(Name) of
+        Atom -> {ok, Atom}
+    catch
+        error:badarg -> {error, new}
+    end.
+
+report_refused(_Query, 0, _State) ->
+    ok;
+report_refused(Query, Refused, #{max_discovered_nodes := Cap}) ->
+    brazier_log_ffi:error(<<"brazier.cluster">>, "DNS lookup of ~ts named ~b new nodes past "
+                         "max_discovered_nodes (~b node names made over this VM's life); not "
+                         "connecting to them", [Query, Refused, Cap]),
+    brazier_telemetry_ffi:cluster_connect_failed(Query, format({max_discovered_nodes, Cap, Refused})).
+
+%% The VM-wide count of node names DNS discovery made, created by the first
+%% manager to start on this VM.
+dns_atom_counter() ->
+    case persistent_term:get(?DNS_ATOMS, none) of
+        none ->
+            Counter = atomics:new(1, [{signed, false}]),
+            ok = persistent_term:put(?DNS_ATOMS, Counter),
+            Counter;
+        Counter ->
+            Counter
     end.
 
 connect_failed(Node, Reason, State = #{discovery := Discovery}) ->

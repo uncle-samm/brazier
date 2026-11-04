@@ -358,8 +358,12 @@ pub fn security_limits(
   App(..app, security_limits: limits)
 }
 
-/// The secret key for signed tokens: at least 32 bytes. Without one, a
-/// random key is generated at start (tokens then do not survive a restart).
+/// The app's secret key, required: at least 32 bytes. It signs join and
+/// session tokens, and the cluster peer check derives its key from it with
+/// a purpose label, so every node of a cluster needs the same one. Read it
+/// from the environment with `config.secret_key()` (`SECRET_KEY`). `start`
+/// refuses an app without one: a generated key would invalidate every token
+/// at each restart and make every node's key different.
 pub fn secret_key(
   app: App(state, model, local, msg),
   key: String,
@@ -579,7 +583,7 @@ pub fn start(
       Error(err)
     }
     Ok(codec) -> {
-      let config = to_config(app, codec, port)
+      use config <- result.try(to_config(app, codec, port))
       case application.start_supervised(config) {
         Ok(_app) -> {
           log.info(
@@ -595,17 +599,19 @@ pub fn start(
   }
 }
 
-/// The application config for an app and its codec.
+/// The application config for an app and its codec. Fails when the app has
+/// no `secret_key`.
 @internal
 pub fn to_config(
   app: App(state, model, local, msg),
   codec: runtime.GeneratedCodec(model, msg),
   port: Int,
-) -> application.AppConfig(state, msg) {
+) -> Result(application.AppConfig(state, msg), error.BrazierError) {
+  use secret_key <- result.try(require_secret_key(app.secret_key))
   let sync = app.sync
   let init_local = local.init(app.local)
   let encode_model = fn(state) { codec.encode_model(sync(state)) }
-  application.AppConfig(
+  Ok(application.AppConfig(
     port: port,
     init: app.init,
     update: app.update,
@@ -622,10 +628,7 @@ pub fn to_config(
         Some(fn(json) { codec.decode_model(json) |> result.map(restore) })
     },
     route: app.route,
-    secret_key: case app.secret_key {
-      Some(key) -> key
-      None -> generate_secret()
-    },
+    secret_key: secret_key,
     middlewares: app.middlewares,
     static_dir: app.static_dir,
     dynamic_subscriptions: app.subscriptions,
@@ -639,22 +642,27 @@ pub fn to_config(
     pubsub: app.pubsub,
     cluster: app.cluster,
     presence: app.presence,
-  )
+  ))
 }
 
 // === Internal ===
 
-fn generate_secret() -> String {
-  let secret = do_generate_strong_secret()
-  log.warning(
-    "brazier",
-    "Using auto-generated secret_key — tokens will be invalid after restart. Set explicit secret_key() for production.",
-  )
-  secret
-}
+/// The reason `start` gives for an app without a secret key.
+@internal
+pub const missing_secret_key_reason =
+  "the app has no secret_key: set one with brazier.secret_key(app, key), for example from the SECRET_KEY environment variable through config.secret_key() (generate it with `openssl rand -base64 48`)"
 
-@external(erlang, "brazier_application_ffi", "generate_strong_secret")
-fn do_generate_strong_secret() -> String
+fn require_secret_key(
+  key: Option(String),
+) -> Result(String, error.BrazierError) {
+  case key {
+    Some(key) -> Ok(key)
+    None -> {
+      log.error("brazier", missing_secret_key_reason)
+      Error(error.ConfigError(reason: missing_secret_key_reason))
+    }
+  }
+}
 
 const client_manifest = "priv/static/brazier_client.manifest"
 

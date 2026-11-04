@@ -5,8 +5,8 @@
 
 -include_lib("kernel/include/inet.hrl").
 
--export([start/1, start_link/1, stop/0, members/0, distribution/0,
-         resolve_dns/1, backoff_window/3]).
+-export([start/1, start_link/1, stop/0, members/0, verified/1, verified_nodes/0,
+         await_verified/1, distribution/0, tls_verify/2, resolve_dns/1, backoff_window/3]).
 
 -define(NAME, brazier_cluster).
 -define(MEMBERS, brazier_cluster_members).
@@ -67,7 +67,39 @@ members() ->
         error:badarg -> {error, not_started}
     end.
 
-%% {Alive, ProtoDist, CookieBytes}. The cookie itself never leaves here.
+%% Whether Node may exchange cluster traffic with this node: it is this node,
+%% or a connected peer that passed the peer check. Without a running
+%% manager no remote node is verified (fail closed: no table, no members).
+verified(Node) when Node =:= node() ->
+    true;
+verified(Node) ->
+    try ets:member(?MEMBERS, Node)
+    catch
+        error:badarg -> false
+    end.
+
+%% Verified peers (not this node), unsorted. [] without a manager.
+verified_nodes() ->
+    try ets:tab2list(?MEMBERS) of
+        Rows -> [Node || {Node, _VerifiedAt} <- Rows]
+    catch
+        error:badarg -> []
+    end.
+
+%% Ask the manager to send {brazier_cluster_peer_verified, Node} to the
+%% caller once Node passes the peer check (at once if it has). Nothing is
+%% sent if Node is not connected, or is rejected or goes down first.
+await_verified(Node) when is_atom(Node) ->
+    case whereis(?NAME) of
+        undefined ->
+            {error, not_started};
+        Pid ->
+            ok = gen_server:cast(Pid, {await_verified, Node, self()}),
+            {ok, nil}
+    end.
+
+%% {distribution, Alive, ProtoDist, CookieBytes, TlsVerify}. The cookie
+%% itself never leaves here.
 distribution() ->
     Alive = erlang:is_alive(),
     Proto = case init:get_argument(proto_dist) of
@@ -78,7 +110,47 @@ distribution() ->
                       true -> byte_size(atom_to_binary(erlang:get_cookie()));
                       false -> 0
                   end,
-    {distribution, Alive, Proto, CookieBytes}.
+    TlsVerify = tls_verify(init:get_argument(ssl_dist_optfile), init:get_argument(ssl_dist_opt)),
+    {distribution, Alive, Proto, CookieBytes, TlsVerify}.
+
+%% The peer verification options of TLS distribution, from the arguments
+%% init:get_argument/1 returned for -ssl_dist_optfile and -ssl_dist_opt.
+%% OTP reads the option file instead of every -ssl_dist_opt when both are
+%% given (inet_tls_dist), so this does too. {ok, {tls_verify,
+%% ServerVerifyPeer, ServerFailIfNoPeerCert, ClientVerifyPeer}} or {error,
+%% Description} when the option file cannot be read.
+tls_verify({ok, [[Path | _] | _]}, _Opts) ->
+    case file:consult(Path) of
+        {ok, [Terms]} when is_list(Terms) ->
+            Server = proplist(server, Terms),
+            Client = proplist(client, Terms),
+            {ok, {tls_verify,
+                  proplists:get_value(verify, Server) =:= verify_peer,
+                  proplists:get_value(fail_if_no_peer_cert, Server) =:= true,
+                  proplists:get_value(verify, Client) =:= verify_peer}};
+        {ok, Other} ->
+            {error, format({ssl_dist_optfile_not_one_list, Path, length(Other)})};
+        {error, Reason} ->
+            {error, format({ssl_dist_optfile_unreadable, Path, Reason})}
+    end;
+tls_verify(_NoOptfile, {ok, Groups}) ->
+    Pairs = pairs(lists:append(Groups)),
+    {ok, {tls_verify,
+          proplists:get_value("server_verify", Pairs) =:= "verify_peer",
+          proplists:get_value("server_fail_if_no_peer_cert", Pairs) =:= "true",
+          proplists:get_value("client_verify", Pairs) =:= "verify_peer"}};
+tls_verify(_NoOptfile, error) ->
+    {ok, {tls_verify, false, false, false}}.
+
+proplist(Key, Terms) ->
+    case proplists:get_value(Key, Terms, []) of
+        Opts when is_list(Opts) -> Opts;
+        _ -> []
+    end.
+
+%% -ssl_dist_opt takes Key Value pairs; an odd trailing key has no value.
+pairs([Key, Value | Rest]) -> [{Key, Value} | pairs(Rest)];
+pairs(_) -> [].
 
 %% The default DNS resolver: A and AAAA records of Query, as address
 %% strings. An error only when both lookups fail (a name with only A or
@@ -107,7 +179,7 @@ backoff_window(Attempt, InitialMs, MaxMs) ->
 
 %% The Gleam ManagerConfig record, as the manager's map.
 config_map({manager_config, Discovery, Mac, CheckTimeoutMs, InitialMs, MaxMs, Resolver,
-            ResolveTimeoutMs, MaxDnsNodes}) ->
+            ResolveTimeoutMs, MaxDnsNodes, MaxDiscoveredNodes}) ->
     #{discovery => discovery(Discovery),
       mac => Mac,
       check_timeout_ms => CheckTimeoutMs,
@@ -115,7 +187,8 @@ config_map({manager_config, Discovery, Mac, CheckTimeoutMs, InitialMs, MaxMs, Re
       max_ms => MaxMs,
       resolver => Resolver,
       resolve_timeout_ms => ResolveTimeoutMs,
-      max_dns_nodes => MaxDnsNodes}.
+      max_dns_nodes => MaxDnsNodes,
+      max_discovered_nodes => MaxDiscoveredNodes}.
 
 %% Static node names were validated (count and length bounded) by
 %% brazier/cluster, so creating their atoms is bounded too.

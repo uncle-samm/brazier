@@ -85,7 +85,7 @@ fn tracking_and_watching() -> presence_watch.Watch(Model, Msg) {
         Error(error.RuntimeError(reason: "no client events: " <> handler_id))
       },
     )
-  let config =
+  let assert Ok(config) =
     brazier.simple(
       init: fn(_ctx) { Ok(Model(room: "", watched: [], online: dict.new())) },
       update: fn(model, _msg) { model },
@@ -101,6 +101,7 @@ fn tracking_and_watching() -> presence_watch.Watch(Model, Msg) {
       on_presence: Online,
     )
     |> brazier.to_config(codec, 8080)
+    as "the app has a secret key"
   let assert Some(watch) = config.presence
     as "track_and_watch_presence sets presence"
   watch

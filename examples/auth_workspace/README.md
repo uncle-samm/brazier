@@ -37,6 +37,7 @@ Cookie sessions, CSRF-protected API routes and a role-gated page, on a
 
 ```sh
 cd examples/auth_workspace
+export SECRET_KEY="$(openssl rand -base64 48)"   # once per shell
 gleam run -m brazier/build   # first, and after every change
 gleam run -m auth_workspace
 ```

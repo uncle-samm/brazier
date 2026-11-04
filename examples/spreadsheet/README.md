@@ -20,6 +20,7 @@ An editable 10x5 grid shared by every open tab, built with
 
 ```bash
 cd examples/spreadsheet
+export SECRET_KEY="$(openssl rand -base64 48)"   # once per shell
 gleam run -m brazier/build   # first, and after every change
 gleam run
 ```

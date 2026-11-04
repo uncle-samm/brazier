@@ -51,9 +51,11 @@ supervision tree with `application.start_supervised` (see
 `application.wait_forever` until a SIGTERM drains the node or the tree
 exits. It does not read environment variables; apps read them with
 `brazier/config` (`config.port()`, `config.secret_key()`,
-`config.is_production()`). Without `brazier.secret_key`, start generates a
-random key and logs a warning; `start_supervised` refuses a weak key before
-it starts any process.
+`config.is_production()`). The secret key is required. Without
+`brazier.secret_key`, start logs and returns a `ConfigError` that names the
+setting and `SECRET_KEY`. `start_supervised` refuses a weak key before it
+starts any process. The cluster manager derives its peer-check MAC from the
+same key with a purpose label (see [CLUSTERING.md](CLUSTERING.md)).
 
 ## Request Lifecycle
 

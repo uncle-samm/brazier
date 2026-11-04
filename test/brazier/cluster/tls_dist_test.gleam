@@ -19,7 +19,7 @@ const secret = "cluster-tls-secret-0123456789-abcdefghijklmnopqrstuvwxyz"
 pub fn tls_nodes_connect_test_() -> peer.Timeout {
   use <- Timeout(90)
   use peers <- peer.with_cluster_args(2, "brazier_tls_ok", tls_args("node"))
-  let assert [a, b] = peers
+  let assert [a, b] = peers as "the cluster starts two peers"
   assert peer.on(a, nodes) == [peer.node(b)]
   let b_node = peer.node(b)
   assert peer.on(a, fn() { dist_protocol(b_node) }) == Ok("tls")
@@ -28,7 +28,7 @@ pub fn tls_nodes_connect_test_() -> peer.Timeout {
     peer.on(p, fn() { putenv("BRAZIER_ENV", "prod") })
     let outcome =
       peer.on(p, fn() {
-        cluster.start(cluster.new(cluster.NoDiscovery, secret_key: secret))
+        cluster.start(cluster.new(cluster.NoDiscovery), secret_key: secret)
       })
     assert outcome == Ok(Nil)
   })
@@ -43,14 +43,14 @@ pub fn tls_nodes_connect_test_() -> peer.Timeout {
 pub fn node_without_certificate_is_refused_test_() -> peer.Timeout {
   use <- Timeout(90)
   use peers <- peer.with_cluster_args(1, "brazier_tls_nocert", tls_args("node"))
-  let assert [a] = peers
+  let assert [a] = peers as "the cluster starts one peer"
   let no_cert = peer.add_peer_args(a, "brazier_tls_nocert_x", no_cert_args())
-  let assert Error(_) = peer.connect(no_cert, a)
-  let assert Error(_) = peer.connect(a, no_cert)
+  let assert Error(_) = peer.connect(no_cert, a) as "peer.connect returns Error"
+  let assert Error(_) = peer.connect(a, no_cert) as "peer.connect returns Error"
 
   let plain = peer.add_peer(a, "brazier_tls_plain")
-  let assert Error(_) = peer.connect(plain, a)
-  let assert Error(_) = peer.connect(a, plain)
+  let assert Error(_) = peer.connect(plain, a) as "peer.connect returns Error"
+  let assert Error(_) = peer.connect(a, plain) as "peer.connect returns Error"
   assert peer.on(a, nodes) == []
 }
 
@@ -59,10 +59,10 @@ pub fn node_without_certificate_is_refused_test_() -> peer.Timeout {
 pub fn certificate_from_another_ca_is_refused_test_() -> peer.Timeout {
   use <- Timeout(90)
   use peers <- peer.with_cluster_args(1, "brazier_tls_rogue", tls_args("node"))
-  let assert [a] = peers
+  let assert [a] = peers as "the cluster starts one peer"
   let rogue = peer.add_peer_args(a, "brazier_tls_rogue_x", tls_args("rogue"))
-  let assert Error(_) = peer.connect(rogue, a)
-  let assert Error(_) = peer.connect(a, rogue)
+  let assert Error(_) = peer.connect(rogue, a) as "peer.connect returns Error"
+  let assert Error(_) = peer.connect(a, rogue) as "peer.connect returns Error"
   assert peer.on(a, nodes) == []
   // Sanity check: a valid node still joins the same node.
   let good = peer.add_peer_args(a, "brazier_tls_rogue_ok", tls_args("node"))

@@ -14,6 +14,7 @@ The simplest Brazier app: a counter built with `brazier.simple`.
 
 ```bash
 cd examples/counter
+export SECRET_KEY="$(openssl rand -base64 48)"   # once per shell
 gleam run -m brazier/build   # first, and after every change
 gleam run
 ```

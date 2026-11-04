@@ -64,9 +64,15 @@ an empty key, a shorter key and the old published dev secret with a
 openssl rand -base64 48
 ```
 
-Without `brazier.secret_key`, `brazier.start` generates a random key per process
-and logs a warning. That key changes on restart (invalidating every token) and
-differs between nodes, so always set an explicit key in production:
+The key is required in every environment, including development. Without
+`brazier.secret_key`, `brazier.start` logs and returns a `ConfigError` that
+names `brazier.secret_key` and `SECRET_KEY`. Brazier never generates a key:
+a generated key would change on every restart, invalidating every token, and
+would differ between nodes. It is the one secret an app configures. The
+cluster peer check derives its MAC from it with a purpose label
+(`HMAC-SHA256(secret_key, "brazier-cluster-v1")`), so the MAC is never a
+token signature. Every node of one deployment needs the same key (see
+[CLUSTERING.md](CLUSTERING.md#the-peer-check)). Read it from the environment:
 
 <!-- docs-check: wrap
 {{block}}
