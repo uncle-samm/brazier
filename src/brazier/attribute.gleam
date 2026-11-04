@@ -30,18 +30,27 @@ pub fn from_attr(attr: render.Attr(msg)) -> Attribute(msg) {
 
 /// An attribute with any name.
 ///
-/// Inline event attributes such as `onclick` are not attributes: use
-/// `brazier/event`. Passing one, or a name with characters outside
-/// `a-z A-Z 0-9 - _ : .`, is a programming error and crashes.
+/// These are programming errors and crash:
+///
+/// - an inline event attribute such as `onclick`: use `brazier/event`;
+/// - `srcdoc`: use `unsafe_srcdoc`;
+/// - `attributeName` with a value containing `href` (`href`,
+///   `xlink:href`): an SVG `<animate>` or `<set>` targeting a link's URL
+///   would change it after the URL policy has checked it;
+/// - a name with characters outside `a-z A-Z 0-9 - _ : .`.
+///
+/// Names match case-insensitively, as HTML attribute names do.
 ///
 /// URL attributes (`href`, `src`, `action`, `formaction`, `poster`, `cite`,
 /// `xlink:href`) go through the URL policy. A refused value produces no
 /// attribute and logs a warning.
 pub fn attribute(name: String, value: String) -> Attribute(msg) {
   // Invariant: attribute names come from application code, not user input.
-  // An inline event handler name or a name that could break out of the tag
-  // is a bug in the view, so it crashes rather than rendering.
-  let assert True = render.is_valid_attribute_name(name)
+  // An inline event handler, `srcdoc`, an animation of `href` or a name that
+  // could break out of the tag is a bug in the view, so it crashes rather
+  // than rendering.
+  let assert True = render.is_allowed_attribute(name, value)
+    as "brazier/attribute.attribute: attribute refused by the name policy (on*, srcdoc, attributeName=href, or characters outside a-z A-Z 0-9 - _ : .)"
   case url.check(name, value) {
     Ok(value) -> Attribute(render.Attribute(name, value))
     Error(blocked) -> {
@@ -57,6 +66,18 @@ pub fn attribute(name: String, value: String) -> Attribute(msg) {
       Attribute(render.NoAttribute)
     }
   }
+}
+
+/// An `<iframe>` `srcdoc` attribute: `html` is the whole document the
+/// iframe shows. Its markup is not escaped or checked, and unless the
+/// iframe has a `sandbox` attribute without `allow-scripts` and
+/// `allow-same-origin` together, its scripts run with the page's origin.
+/// Like `element.unsafe_raw_html`, never pass it text that a user controls.
+///
+/// The value is attribute-escaped, as every value is; the browser decodes
+/// it back to `html`.
+pub fn unsafe_srcdoc(html: String) -> Attribute(msg) {
+  Attribute(render.UnsafeSrcdoc(html))
 }
 
 /// An attribute that renders nothing.

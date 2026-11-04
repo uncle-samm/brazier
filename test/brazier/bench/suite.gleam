@@ -17,6 +17,9 @@
 ////   acknowledgement), and the p50/p99 of one event at a time.
 //// - pubsub: one broadcast timed until every one of S subscribers has it.
 //// - store: put/get/delete timed in blocks of 1000 operations.
+//// - crdt append: one value appended to a replicated list key that holds
+////   10, 1000 or 10000 values (brazier/store/crdt, the work the replica
+////   server and every receiving node do per write), in blocks of 1000.
 ////
 //// Every generator checks every answer it times (brazier_bench_ffi): a
 //// failure is an Error naming it, never a fast number. Logging is set to
@@ -32,6 +35,8 @@ import brazier/log
 import brazier/runtime
 import brazier/sim/test_app
 import brazier/store
+import brazier/store/crdt
+import brazier/store/hlc
 import brazier/test_ctx
 import brazier/transport
 import brazier/transport/server.{type Connection, Bytes}
@@ -149,7 +154,8 @@ pub fn run() -> Result(report.Report, String) {
     use Nil <- result.try(expect_empty_mailbox("pubsub"))
     use st <- result.try(store_scenario())
     use Nil <- result.try(expect_empty_mailbox("store"))
-    Ok(list.flatten([http, ws, rt, ps, st]))
+    use ca <- result.try(crdt_append_scenario())
+    Ok(list.flatten([http, ws, rt, ps, st, ca]))
   }
   log.set_level(logging.Info)
   let stopped =
@@ -594,6 +600,72 @@ fn store_block_round(
   use <- check(store.count(bench_store) == 0, "the deletes left entries behind")
   let per_op = fn(ns) { int.to_float(ns) /. int.to_float(store_block) }
   Ok(#(per_op(t1 - t0), per_op(t2 - t1), per_op(t3 - t2)))
+}
+
+// --- crdt append ---
+
+const crdt_append_sizes = [10, 1000, 10_000]
+
+const crdt_append_warmup_blocks = 5
+
+const crdt_append_blocks = 50
+
+fn crdt_append_scenario() -> Result(List(Metric), String) {
+  let replica = crdt.Replica(node: "bench@host", incarnation: 1)
+  list.try_map(crdt_append_sizes, fn(values) {
+    let name = "store.crdt_append." <> int.to_string(values)
+    let items =
+      int.range(from: values - 1, to: -1, with: [], run: fn(items, i) {
+        [
+          #(i, hlc.Timestamp(wall_ms: i, logical: 0, node: replica.node)),
+          ..items
+        ]
+      })
+    let #(base, _, _) = crdt.append(crdt.new(), replica, "room", items, [])
+    let block = fn() { crdt_append_block(base, replica, values) }
+    use _ <- result.try(repeat(crdt_append_warmup_blocks, block))
+    gc()
+    use per_op <- result.try(repeat(crdt_append_blocks, block))
+    use summary <- result.try(
+      stats.summarize(per_op) |> result.replace_error(name <> ": no blocks"),
+    )
+    Ok([
+      Metric(name <> ".median", "ns/op", LowerIsBetter, summary.median),
+      Metric(name <> ".p99", "ns/op", LowerIsBetter, summary.p99),
+    ])
+  })
+  |> result.map(list.flatten)
+  |> result.map_error(fn(reason) { "crdt append: " <> reason })
+}
+
+/// Append one value to `base` (a key of `values` values) `store_block`
+/// times; nanoseconds per append, after checking every append kept the
+/// values and added one.
+fn crdt_append_block(
+  base: crdt.State(Int),
+  replica: crdt.Replica,
+  values: Int,
+) -> Result(Float, String) {
+  let at = hlc.Timestamp(wall_ms: values, logical: 0, node: replica.node)
+  let t0 = now_ns()
+  let grown =
+    int.range(from: 0, to: store_block, with: 0, run: fn(grown, i) {
+      let #(next, _, _) = crdt.append(base, replica, "room", [#(-i, at)], [])
+      case crdt.size(next) == values + 1 {
+        True -> grown + 1
+        False -> grown
+      }
+    })
+  let t1 = now_ns()
+  use <- check(
+    grown == store_block,
+    int.to_string(store_block - grown)
+      <> " appends to "
+      <> int.to_string(values)
+      <> " values did not leave "
+      <> int.to_string(values + 1),
+  )
+  Ok(int.to_float(t1 - t0) /. int.to_float(store_block))
 }
 
 // --- helpers ---

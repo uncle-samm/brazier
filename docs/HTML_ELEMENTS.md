@@ -42,7 +42,6 @@ Elements take `(attributes: List(Attribute(msg)), children: List(Element(msg)))`
 | `element.text(content)` | Escaped text |
 | `element.none()` | Renders nothing; use it for conditional content |
 | `element.keyed(key, child)` | Gives `child` an identity (`data-brazier-key`) so the browser keeps or replaces its DOM node by key instead of by position |
-| `element.memo(key, deps, child)` | The browser skips the subtree while `deps` are unchanged |
 | `element.map(element, f)` | Changes the message type, for child modules |
 | `element.unsafe_raw_html(html)` | Inserts HTML without escaping or the URL policy |
 | `element.to_string(element)` | Renders to an HTML string |
@@ -112,7 +111,8 @@ html.ul([], list.map(model.items, fn(item) {
 
 **`element.unsafe_raw_html(html)`** never escapes. Pass it only HTML you
 produced or sanitized yourself, such as rendered markdown output, never text
-a user controls.
+a user controls. Its counterpart for an `<iframe>` document is
+`attribute.unsafe_srcdoc(html)`.
 
 ## Attributes (`brazier/attribute`)
 
@@ -136,11 +136,26 @@ a user controls.
 | `attribute.draggable(True)` | `draggable="true"` (`"false"` for `False`) |
 | `attribute.boolean("hidden", True)` | any boolean attribute |
 | `attribute.attribute("k", "v")` | `k="v"` |
+| `attribute.unsafe_srcdoc(html)` | `srcdoc="..."`: the iframe's whole document, not checked |
 | `attribute.none()` | nothing |
 
-`attribute.attribute(name, value)` crashes on an inline event name such as
-`onclick` or a name with characters outside `a-z A-Z 0-9 - _ : .`: use
-`brazier/event` for handlers.
+`attribute.attribute(name, value)` crashes on:
+
+- an inline event name such as `onclick`: use `brazier/event` for handlers;
+- `srcdoc`: use `attribute.unsafe_srcdoc`, which says what it does;
+- `attributeName` with a value containing `href`, which would let an SVG
+  animation rewrite a link after the URL policy checked it (see
+  [SVG.md](SVG.md#animation));
+- a name with characters outside `a-z A-Z 0-9 - _ : .`.
+
+Names match case-insensitively, so `SrcDoc` and `ONCLICK` crash too.
+
+**`attribute.unsafe_srcdoc(html)`** gives an `<iframe>` a whole document.
+The value is attribute-escaped, as every value is, and the browser decodes it
+back to `html`, so its markup runs as a page. Unless the iframe has a
+`sandbox` attribute without `allow-scripts` and `allow-same-origin`
+together, its scripts run with your page's origin. Never pass it text a user
+controls.
 
 ### URL attributes
 
@@ -149,7 +164,8 @@ same names through `attribute.attribute`, plus `xlink:href`) go through the
 URL policy. Relative URLs, `http:`, `https:`, `mailto:` and `tel:` are
 allowed, and `src` also accepts `data:image/png`, `gif`, `jpeg` and `webp`.
 Any other value, such as `javascript:alert(1)`, drops the attribute and logs
-a warning. See [SECURITY.md](SECURITY.md#url-policy).
+a warning. The scheme is read as a browser reads it, one code point at a
+time. See [SECURITY.md](SECURITY.md#url-policy).
 
 ### Client hooks
 

@@ -108,6 +108,12 @@ with its own changelog, so they are not listed here.
   `LimiterTimeout(timeout_ms)` (the owner is alive but did not answer) or
   `LimiterCallFailed(reason)` (the owner exited during the call).
   `rate_limit.describe_error` renders one for logs.
+- (Final audit) `element.memo` is removed (see Removed).
+  `attribute.attribute` crashes on `srcdoc` (use `attribute.unsafe_srcdoc`)
+  and on `attributeName` with a value containing `href`, and rendering
+  crashes on an attribute that reaches it with a refused name.
+  `middleware.default_csp` no longer allows inline scripts, any `ws:`/`wss:`
+  host or `avatars.githubusercontent.com` (see Changed).
 
 ### Added
 
@@ -174,6 +180,8 @@ with its own changelog, so they are not listed here.
 - (WS10b) `window.__beaconOutboundPendingForTest()` behind
   `__BEACON_ENABLE_TEST_HOOKS`: the client's queued and scheduled sends, for
   browser tests that wait on the client instead of a quiet period.
+- (Final audit) `attribute.unsafe_srcdoc(html)`: an `<iframe>` `srcdoc`,
+  named for what it does like `element.unsafe_raw_html`.
 
 ### Changed
 
@@ -275,6 +283,31 @@ with its own changelog, so they are not listed here.
   round of 100 connect/disconnect cycles keeps no ETS table, ETS object or
   atom, besides no process. Before, it measured memory and asserted nothing
   about it.
+- (Final audit) `middleware.default_csp` is `default-src 'self'; script-src
+  'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:;
+  connect-src 'self'; frame-ancestors 'self'; object-src 'none'; base-uri
+  'self'`. Brazier renders no inline script, so `'unsafe-inline'` in
+  `script-src` only helped injected markup. `connect-src 'self'` covers the
+  same-origin WebSocket in CSP Level 3; Safari 15 and earlier need the
+  app's own `wss://host` through `secure_headers_with_csp`.
+- (Final audit) Rendering is faster: the name checks and the HTML escapers
+  are FFI (`brazier_render_ffi.erl` and `.mjs`) that scan bytes or code
+  units in one pass, as Phoenix.HTML escapes, instead of splitting into
+  graphemes and chaining `string.replace`. A 1000-row table renders about
+  2.3 times faster on Erlang; escaping is about 8 times faster. The client
+  build copies the framework's JavaScript FFI files into the client project
+  and fails when one is missing.
+- (PERF-7) Appending to a replicated list store, and merging that append on
+  every other node, no longer costs time in proportion to the values already
+  under the key. On a 10,000-value key an append fell from about 2,200 µs to
+  about 1 µs. `crdt.join` now only looks at the dots the delta's causal
+  context covers, the delta-state rule of Almeida, Shoker and Baquero (2018).
+  `crdt.join_full` gives the same results and is still linear. `crdt.join`
+  returns its changes in no particular order. A clock entry now covers only
+  counters from 1 up, so a malformed peer dot with counter 0 or below is
+  covered only through the cloud. The bench suite has a new
+  `store.crdt_append.{10,1000,10000}` case; its metrics need a re-baseline
+  before `brazier_bench_check` accepts them.
 
 ### Fixed
 
@@ -338,6 +371,9 @@ with its own changelog, so they are not listed here.
 - (WS10b) Dev mode's polling watcher. Without `fswatch` (macOS) or
   `inotifywait` (Linux) dev mode now exits with status 1 and names the package
   to install.
+- (Final audit) `element.memo` and `render.Memo`. Nothing read its key or
+  dependencies, on the server or in the browser, so it skipped no work. Remove
+  the call and keep its child.
 
 ### Security
 
@@ -364,6 +400,17 @@ with its own changelog, so they are not listed here.
 - (WS10b) `examples/auth_workspace` checks its login form against a random
   per-browser token in an HttpOnly cookie (a double-submit cookie), renewed
   at each login, instead of a constant that protected nothing.
+- (Final audit) On Erlang the HTML escapers missed a `"`, `&` or `<` that a
+  combining mark followed (`string.replace` matches whole graphemes), so a
+  value such as `x"` + U+0301 + ` onmouseover=...` closed its attribute and
+  added a handler in server-rendered HTML. The escapers now work on bytes.
+- (Final audit) The URL policy reads the scheme by code point, as the
+  WHATWG URL parser does. A combining mark after the `:` (`javascript:` +
+  U+0E33) hid the colon from the grapheme-based reader, so the value passed
+  as relative and the browser ran it.
+- (Final audit) `srcdoc` and an SVG `attributeName` targeting `href` or
+  `xlink:href` are refused, as DOMPurify refuses them: both put markup or a
+  URL in the page past the URL policy.
 
 ## Before Milestone 117 (never released)
 

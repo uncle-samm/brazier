@@ -10,8 +10,8 @@
 ///   holding only those definitions (see `brazier/build/reach`), plus the
 ///   JavaScript FFI files their externals load.
 /// - The Brazier modules those import (`brazier/element`, `brazier/html`, ...),
-///   copied from Brazier's sources, and a generated `brazier/log` (see
-///   `client_shim`).
+///   copied from Brazier's sources with the JavaScript FFI files their
+///   externals load, and a generated `brazier/log` (see `client_shim`).
 /// - The client runtime: `brazier_client_ffi.mjs` and the
 ///   `brazier_client/*.mjs` modules.
 /// - `src/brazier_app_entry.gleam`, the interface the runtime calls.
@@ -28,10 +28,12 @@ import brazier/build/discovery.{type AppModule}
 import brazier/build/files
 import brazier/build/program
 import brazier/build/project_toml.{type LockedPackage}
+import brazier/build/reach
 import brazier/build/sources
 import brazier/log
 import gleam/dict.{type Dict}
 import gleam/list
+import gleam/option
 import gleam/result
 import gleam/set.{type Set}
 import gleam/string
@@ -158,6 +160,7 @@ fn project_files(
       ..list.map(analysis.client, fn(emitted) { emitted.source })
     ]),
   )
+  use framework_ffi <- result.try(framework_ffi_files(brazier_root, framework))
   use runtime <- result.try(runtime_files(runtime_dir))
   let project_files =
     list.flatten([
@@ -166,6 +169,7 @@ fn project_files(
       }),
       ffi,
       list.map(framework, fn(s) { #(module_file(s.0), s.1) }),
+      framework_ffi,
       [
         #(module_file("brazier/log"), client_shim.log_module),
         #(module_file(client_entry.module_path), entry_module),
@@ -181,9 +185,71 @@ fn project_files(
       <> string.inspect(list.length(ffi))
       <> " FFI files, "
       <> string.inspect(list.length(framework))
-      <> " framework modules",
+      <> " framework modules, "
+      <> string.inspect(list.length(framework_ffi))
+      <> " framework FFI files",
   )
   Ok(project_files)
+}
+
+/// The JavaScript FFI files that the `@external(javascript, ...)` attributes
+/// of the copied framework modules load, read from Brazier's sources at
+/// `brazier_root/src`, at the same path in the client project. A referenced
+/// file that does not exist is a build error: the client project cannot
+/// compile without it.
+pub fn framework_ffi_files(
+  brazier_root: String,
+  framework: List(sources.Source),
+) -> Result(List(#(String, String)), String) {
+  use externals <- result.try(
+    list.try_map(framework, fn(source) {
+      let #(module_path, text) = source
+      use module <- result.try(analyzer.parse(module_path <> ".gleam", text))
+      module.functions
+      |> list.filter_map(fn(def) {
+        option.to_result(reach.javascript_external(def.attributes), Nil)
+      })
+      |> list.try_map(fn(external) {
+        reach.resolve_ffi_path(module_path, external.0)
+        |> result.map(fn(path) { #(path, module_path) })
+      })
+    })
+    |> result.map(list.flatten),
+  )
+  externals
+  |> list.group(fn(external) { external.0 })
+  |> dict.to_list
+  |> list.sort(fn(a, b) { string.compare(a.0, b.0) })
+  |> list.try_map(fn(entry) {
+    let #(path, users) = entry
+    let users =
+      users
+      |> list.map(fn(user) { "`" <> user.1 <> "`" })
+      |> list.unique
+      |> list.sort(string.compare)
+    let file = files.join(brazier_root, "src/" <> path)
+    use exists <- result.try(files.is_file(file))
+    case exists {
+      True -> {
+        use text <- result.map(files.read(file))
+        log.debug(
+          "brazier.build.client_bundle",
+          "Framework FFI file " <> path <> " copied from " <> file,
+        )
+        #("src/" <> path, text)
+      }
+      False ->
+        Error(
+          "The JavaScript FFI file "
+          <> file
+          <> ", loaded by an @external(javascript, ...) attribute in "
+          <> string.join(users, ", ")
+          <> ", does not exist. The Brazier sources at "
+          <> brazier_root
+          <> " are incomplete.",
+        )
+    }
+  })
 }
 
 /// The client runtime from `runtime_src`: the FFI module and every `.mjs`

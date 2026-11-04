@@ -6,15 +6,16 @@
 /// element's position in the tree.
 ///
 /// Position ids are the child indices from the root, joined with `.`: the
-/// root element is `"0"`, its second child is `"0.1"`. Keyed and memo nodes
-/// are transparent and do not add a level. Every child consumes an index,
+/// root element is `"0"`, its second child is `"0.1"`. Keyed nodes are
+/// transparent and do not add a level. Every child consumes an index,
 /// including text and `none`, so a conditional `none` does not shift its
 /// siblings' ids. The same tree therefore yields the same ids on the server
 /// and in the browser, which is what lets an event fired before hydration be
 /// replayed against the handler table built after it.
 ///
 /// The module is target-neutral: it is compiled to JavaScript for the
-/// client bundle and to Erlang for SSR.
+/// client bundle and to Erlang for SSR. Name checks and escaping, which run
+/// for every node, are in `brazier_render_ffi` on each target.
 ///
 /// Reference: Lustre's `vdom/vnode` and `vdom/vattr`, LiveView's
 /// `phx-click` bindings.
@@ -37,9 +38,6 @@ pub type Node(msg) {
   /// A node whose rendered element carries `data-brazier-key`, so the client
   /// morph keeps its DOM identity across reorders.
   Keyed(key: String, child: Node(msg))
-  /// A memoised child. Rendering is transparent; the key and dependencies are
-  /// kept for the client morph.
-  Memo(key: String, deps: List(String), child: Node(msg))
   /// Renders nothing.
   Nothing
   /// HTML injected without escaping or URL checks.
@@ -52,6 +50,10 @@ pub type Attr(msg) {
   Attribute(name: String, value: String)
   /// An event listener.
   Event(name: String, handler: Handler(msg))
+  /// An `<iframe srcdoc>` document from `attribute.unsafe_srcdoc`. It
+  /// renders as `srcdoc`, which the name policy refuses for `Attribute`; the
+  /// value is escaped like any attribute value.
+  UnsafeSrcdoc(html: String)
   /// Renders nothing. Produced for a refused URL value or a false boolean.
   NoAttribute
 }
@@ -146,7 +148,6 @@ pub fn map_node(node: Node(a), f: fn(a) -> b) -> Node(b) {
     Nothing -> Nothing
     RawHtml(html) -> RawHtml(html)
     Keyed(key, child) -> Keyed(key, map_node(child, f))
-    Memo(key, deps, child) -> Memo(key, deps, map_node(child, f))
     Element(tag, attributes, children) ->
       Element(
         tag,
@@ -160,6 +161,7 @@ pub fn map_node(node: Node(a), f: fn(a) -> b) -> Node(b) {
 pub fn map_attr(attr: Attr(a), f: fn(a) -> b) -> Attr(b) {
   case attr {
     Attribute(name, value) -> Attribute(name, value)
+    UnsafeSrcdoc(html) -> UnsafeSrcdoc(html)
     NoAttribute -> NoAttribute
     Event(name, Handler(decoder, prevent, stop, debounce, throttle)) ->
       Event(
@@ -193,11 +195,13 @@ fn walk(
     RawHtml(raw) -> #(string_tree.append(html, raw), handlers)
     Text(content) -> #(string_tree.append(html, escape_html(content)), handlers)
     Keyed(key, child) -> walk(add_key(child, key), id, html, handlers)
-    Memo(_key, _deps, child) -> walk(child, id, html, handlers)
     Element(tag, attributes, children) -> {
-      // Invariant: `Element` is built only by `brazier/element.element` (and the
-      // html/svg helpers that call it), which asserts the same check.
+      // Invariant: `brazier/element.element` (and the html/svg helpers that
+      // call it) asserts the same check. The constructors of this module are
+      // public, so a tree built directly is checked again here: a tag that
+      // could break out of the markup is a bug in the view.
       let assert True = is_valid_tag_name(tag)
+        as "brazier/internal/render: tag names are a-z A-Z 0-9 - _ : ."
       let #(plain, events) = collect_attributes(attributes)
       let handlers =
         list.fold(events, handlers, fn(acc, event) {
@@ -249,7 +253,6 @@ fn add_key(node: Node(msg), key: String) -> Node(msg) {
           )
       }
     Keyed(inner, child) -> Keyed(inner, child)
-    Memo(memo_key, deps, child) -> Memo(memo_key, deps, add_key(child, key))
     Text(_) | Nothing | RawHtml(_) -> node
   }
 }
@@ -258,6 +261,7 @@ fn has_attribute(attributes: List(Attr(msg)), name: String) -> Bool {
   list.any(attributes, fn(attr) {
     case attr {
       Attribute(attr_name, _) -> attr_name == name
+      UnsafeSrcdoc(_) -> name == "srcdoc"
       Event(_, _) | NoAttribute -> False
     }
   })
@@ -276,15 +280,25 @@ fn collect_attributes(
       let #(plain, events) = acc
       case attr {
         NoAttribute -> acc
-        Attribute(name, value) ->
+        UnsafeSrcdoc(html) -> #(merge_plain(plain, "srcdoc", html), events)
+        Attribute(name, value) -> {
+          // Invariant: `brazier/attribute.attribute` asserts the same check.
+          // The constructors of this module are public, so an attribute
+          // built directly is checked again here: an inline event handler,
+          // `srcdoc` or an animation of `href` is a bug in the view.
+          let assert True = is_allowed_attribute(name, value)
+            as "brazier/internal/render: attribute refused by the name policy (on*, srcdoc, attributeName=href, or characters outside a-z A-Z 0-9 - _ : .)"
           case checked_value(name, value) {
             Error(Nil) -> acc
             Ok(value) -> #(merge_plain(plain, name, value), events)
           }
+        }
         Event(name, handler) -> {
-          // Invariant: events are built only by `brazier/event.on`, which
-          // asserts the same check.
+          // Invariant: `brazier/event.on` asserts the same check. The
+          // constructors of this module are public, so an event built
+          // directly is checked again here.
           let assert True = is_valid_event_name(name)
+            as "brazier/internal/render: event names are a-z A-Z 0-9 - _"
           let others =
             list.filter(events, fn(entry: #(String, Handler(msg))) {
               entry.0 != name
@@ -385,45 +399,68 @@ fn append_events(
 
 // --- Names and escaping ---
 
-/// Whether `name` is safe to render as an attribute name. Inline event
-/// attributes (`onclick`, `onload`, ...) are refused: events go through
-/// `brazier/event`.
+/// Whether `name` is safe to render as an attribute name: one or more of
+/// `a-z A-Z 0-9 - _ : .`, and not refused by name. Matching is
+/// case-insensitive, as HTML attribute names are. Refused:
+///
+/// - inline event attributes (`onclick`, `onload`, ...): events go through
+///   `brazier/event`;
+/// - `srcdoc`, whose value is a whole HTML document that runs with the
+///   page's origin unless the iframe is sandboxed. Use
+///   `attribute.unsafe_srcdoc`.
 pub fn is_valid_attribute_name(name: String) -> Bool {
-  name != ""
-  && !string.starts_with(string.lowercase(name), "on")
-  && list.all(string.to_graphemes(name), is_name_grapheme)
+  is_markup_name(name) && !is_refused_name(string.lowercase(name))
 }
 
-/// Whether `tag` is safe to render as a tag name.
-pub fn is_valid_tag_name(tag: String) -> Bool {
-  tag != "" && list.all(string.to_graphemes(tag), is_name_grapheme)
-}
-
-/// Whether `name` is safe to use as an event name. Event names become part
-/// of an attribute name (`data-brazier-on-<name>`), so `:` is not allowed:
-/// it separates the name from the id in a handler key.
-pub fn is_valid_event_name(name: String) -> Bool {
-  name != ""
-  && list.all(string.to_graphemes(name), fn(grapheme) {
-    grapheme != ":" && grapheme != "." && is_name_grapheme(grapheme)
-  })
-}
-
-fn is_name_grapheme(grapheme: String) -> Bool {
-  case grapheme {
-    "-" | "_" | ":" | "." -> True
-    _ ->
-      case string.to_utf_codepoints(grapheme) {
-        [codepoint] -> {
-          let code = string.utf_codepoint_to_int(codepoint)
-          { code >= 0x30 && code <= 0x39 }
-          || { code >= 0x41 && code <= 0x5a }
-          || { code >= 0x61 && code <= 0x7a }
-        }
-        _ -> False
-      }
+/// Whether attribute `name` may carry `value`: the name is valid, and the
+/// attribute is not an SVG animation target of `href` or `xlink:href`. An
+/// `<animate>` or `<set>` with `attributeName="href"` rewrites a link's URL
+/// in the browser after the URL policy has checked it, so any
+/// `attributeName` whose value contains `href` (in any case) is refused.
+///
+/// Reference: DOMPurify refuses `attributeName` values matching `href`
+/// (GHSA-c6gr-qvv4-5v3f).
+pub fn is_allowed_attribute(name: String, value: String) -> Bool {
+  is_markup_name(name)
+  && {
+    let lower = string.lowercase(name)
+    !is_refused_name(lower)
+    && !{
+      lower == "attributename"
+      && string.contains(string.lowercase(value), "href")
+    }
   }
 }
+
+/// `lower` is an ASCII-only lowercase name.
+fn is_refused_name(lower: String) -> Bool {
+  string.starts_with(lower, "on") || lower == "srcdoc"
+}
+
+/// Whether `tag` is safe to render as a tag name: one or more of
+/// `a-z A-Z 0-9 - _ : .`.
+pub fn is_valid_tag_name(tag: String) -> Bool {
+  is_markup_name(tag)
+}
+
+/// Whether `name` is safe to use as an event name: one or more of
+/// `a-z A-Z 0-9 - _`. Event names become part of an attribute name
+/// (`data-brazier-on-<name>`), so `:` is not allowed: it separates the name
+/// from the id in a handler key.
+pub fn is_valid_event_name(name: String) -> Bool {
+  is_event_name(name)
+}
+
+/// One or more of `a-z A-Z 0-9 - _ : .`, scanned byte by byte (code unit by
+/// code unit on JavaScript): every non-ASCII character refuses the name.
+@external(erlang, "brazier_render_ffi", "is_markup_name")
+@external(javascript, "../../brazier_render_ffi.mjs", "is_markup_name")
+fn is_markup_name(name: String) -> Bool
+
+/// One or more of `a-z A-Z 0-9 - _`, scanned like `is_markup_name`.
+@external(erlang, "brazier_render_ffi", "is_event_name")
+@external(javascript, "../../brazier_render_ffi.mjs", "is_event_name")
+fn is_event_name(name: String) -> Bool
 
 fn is_void_element(tag: String) -> Bool {
   case tag {
@@ -445,19 +482,14 @@ fn is_void_element(tag: String) -> Bool {
   }
 }
 
-/// Escape text content.
-pub fn escape_html(text: String) -> String {
-  text
-  |> string.replace("&", "&amp;")
-  |> string.replace("<", "&lt;")
-  |> string.replace(">", "&gt;")
-}
+/// Escape text content: `&`, `<` and `>`. A text with none of them is
+/// returned as it is; otherwise the escape is one pass.
+@external(erlang, "brazier_render_ffi", "escape_html")
+@external(javascript, "../../brazier_render_ffi.mjs", "escape_html")
+pub fn escape_html(text: String) -> String
 
-/// Escape an attribute value.
-pub fn escape_attr(text: String) -> String {
-  text
-  |> string.replace("&", "&amp;")
-  |> string.replace("\"", "&quot;")
-  |> string.replace("<", "&lt;")
-  |> string.replace(">", "&gt;")
-}
+/// Escape an attribute value: `&`, `"`, `<` and `>`. Values are always
+/// double-quoted, so `'` is left as it is.
+@external(erlang, "brazier_render_ffi", "escape_attr")
+@external(javascript, "../../brazier_render_ffi.mjs", "escape_attr")
+pub fn escape_attr(text: String) -> String
