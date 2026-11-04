@@ -529,6 +529,7 @@ fn or_crash(op: String, outcome: Result(Nil, WriteError)) -> Nil {
   // INVARIANT: the caller chose the API without an error value; a write it
   // believes happened must not be silently dropped.
   let assert Ok(Nil) = outcome
+    as "deliberate crash: a store write with no error channel failed (logged above)"
   Nil
 }
 
@@ -543,6 +544,7 @@ fn replicated_read(outcome: Result(a, String)) -> a {
   // INVARIANT: answering "missing" or "empty" for a store that is down
   // would show the caller data that does not exist.
   let assert Ok(value) = outcome
+    as "deliberate crash: a replicated store read failed while the replica is down (logged above)"
   value
 }
 
@@ -565,6 +567,7 @@ fn notify(topic: String) -> Nil {
   // INVARIANT: the write has happened; a watcher that is never told would
   // show stale data forever, so a failed notification crashes the writer.
   let assert Ok(Nil) = outcome
+    as "deliberate crash: a store change notification failed after the write (logged above)"
   Nil
 }
 

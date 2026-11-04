@@ -233,7 +233,7 @@ connection and exactly 0 kept processes.
 
 ## How We Enforce This
 
-1. **Custom linter** (`gleam run -m brazier/lint`, `src/brazier/lint.gleam`) — parses the source and reports `todo`, `panic`, `let _ =` discards, degraded-path phrases, public functions in key modules that never log, and the pre-rename project name; the rules are listed at the top of `lint.gleam`
+1. **Custom linter** (`gleam run -m brazier/lint`, `src/brazier/lint.gleam`) — parses the source and reports `todo`, `panic`, `let _ =` discards, `let assert` without an `as` message in `src/`, degraded-path phrases, public functions in key modules that never log, and the pre-rename project name; the rules are listed at the top of `lint.gleam`
 2. **Simulation tests** (`test/brazier/sim/`) — real connections, fault injection, leak detection
 3. **Code review** — every `Error(_) -> Nil` is a red flag
 4. **CI** — `gleam build` (zero warnings) + `gleam test` (all pass) + linter (zero violations)
