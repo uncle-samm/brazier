@@ -187,8 +187,10 @@ held, a `target` other than `_self`, a `download` attribute, or a
 | `router.redirect(url)` | `redirect` | Full page load; ends the session |
 
 All three take same-origin paths only (`/users/7?tab=posts`, never `//host`,
-an absolute URL, `javascript:` or `data:`). Any other value is logged as an
-error and not sent. Use `redirect` when the browser must make a real HTTP
+`/\host`, an absolute URL, `javascript:` or `data:`). A path with a `\`, an
+ASCII control character or `/%09` is refused too, because a browser can read
+it as `//host` (see [Navigation Targets](SECURITY.md#navigation-targets)).
+Any other value is logged as an error, with the reason, and not sent. Use `redirect` when the browser must make a real HTTP
 request, for example to receive a `Set-Cookie` header after login.
 
 <!-- docs-check: wrap

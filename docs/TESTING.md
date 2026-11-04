@@ -29,6 +29,9 @@ tests depend on it:
   (`patch_safety.mjs`, which also prints the client's unsafe-key list for
   comparison with the server's) and the comparison of its apply engine with
   the per-op copying engine it replaced (`apply_equivalence.mjs`).
+- `router_test`: runs the client's navigation-path rule on the server's
+  cases (`local_path_parity.mjs`) and holds every verdict equal to
+  `router.check_local_path`'s.
 - `runtime_versioning_test`: runs the client sync state machine
   (`sync_vectors.mjs`) and its FFI harness (`ffi_harness.mjs`).
 - `build_fixture_test`: also needs **npx**, which runs the pinned esbuild
