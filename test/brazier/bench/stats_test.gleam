@@ -43,6 +43,7 @@ pub fn percentile_of_nothing_is_an_error_test() {
 
 pub fn summarize_reports_every_order_statistic_test() {
   let assert Ok(summary) = stats.summarize([3.0, 9.0, 1.0, 5.0, 7.0])
+    as "five samples summarize"
   assert summary
     == stats.Summary(count: 5, min: 1.0, median: 5.0, p99: 9.0, max: 9.0)
 }

@@ -1,9 +1,11 @@
 # Performance
 
-Brazier has one benchmark suite. It measures the HTTP listener, WebSocket
-event round trips, the runtime actor, PubSub fan-out and the store. Its
-baseline is committed, and `make bench-check` fails when a metric regresses
-past its tolerance.
+Brazier has one benchmark suite. It measures the HTTP listener, static
+files, gzip, server rendering, WebSocket event round trips, the runtime
+actor, the wire encoding, PubSub fan-out, the store, presence and the
+browser client's render and patch work. Its baseline is committed, and
+`make bench-check` fails when a metric regresses past its tolerance, and
+when any metric cannot be gated.
 
 Benchmarks are not tests. `gleam test` never runs them: no bench module has
 a `_test` suffix. The generators still check every answer they time
@@ -15,8 +17,11 @@ failure, not a misleadingly fast number.
 | Command | What it does |
 |---------|--------------|
 | `make bench` | One run. Prints every metric and writes `build/bench/latest.json`. |
-| `make bench-check` | `BRAZIER_BENCH_RUNS` runs (default 3), combined by median and compared with `bench/baselines.json`. Exits non-zero on a regression, a missing or new metric, or a different machine. |
-| `make bench-baseline` | `BRAZIER_BENCH_RUNS` runs (default 5, minimum 3) back to back, written to `bench/baselines.json`. |
+| `make bench-check` | `BRAZIER_BENCH_RUNS` runs (default 3), combined by median and compared with `bench/baselines.json`. Exits non-zero on a regression, a metric too noisy to gate, a metric missing from the baseline or from the run, a metric whose unit or direction changed, or a different machine. |
+| `make bench-baseline` | `BRAZIER_BENCH_RUNS` runs (default 5, minimum 3) back to back, written to `bench/baselines.json` with the load average before and after. Refuses, writing `build/bench/refused_baseline.json` instead, when any metric is too noisy to gate. |
+
+Each invocation first prepares the fixtures once: it writes the static
+files and builds the client fixture app. That work is not part of any run.
 
 Run `bench-baseline` on an otherwise idle machine. Commit the new
 `bench/baselines.json` together with the change that moved the numbers,
@@ -28,53 +33,134 @@ compared. Baselines do not transfer between machines.
 
 ## Scenarios
 
-The suite lives in `test/brazier/bench/suite.gleam`, with the generators in
-`test/brazier_bench_ffi.erl`. It starts its own counter app on an
-OS-assigned port. Every scenario is warmed up before it is measured.
-Logging is raised to `warning` once the app is up, so the numbers measure
-the framework, not the console.
+The suite lives in `test/brazier/bench/suite.gleam`, which runs the
+scenarios of `http_bench.gleam`, `presence_bench.gleam` and
+`client_bench.gleam` beside its own. The generators are in
+`test/brazier_bench_ffi.erl`. Each HTTP scenario starts its own listener,
+and the ws scenario its own counter app, on an OS-assigned port. Every
+scenario is warmed up before it is measured. Logging is raised to `warning`
+once the app is up, so the numbers measure the framework, not the console.
+
+Every timed answer is checked. An HTTP scenario first sends one probe whose
+whole response is compared with what it must be (status, headers, body
+bytes), then checks every timed response's status, length and named
+headers against the probe. A wrong answer fails the run with a reason.
+
+The HTTP scenarios run 15 measured rounds after 2 warm-up rounds. A round takes 0.1 to 0.5 s, so a burst of outside load must last several seconds to cover the eight rounds that move a median.
 
 | Scenario | Load | Metrics |
 |----------|------|---------|
-| http | 8 keep-alive clients, 2000 requests per round, 5 rounds against `/bench` | requests/s (median of rounds); per-request p50/p99 |
-| ws | N joined connections × 200 events each, for N = 1, 10, 100. Each event is timed from its send to the patch that acknowledges its clock. | events/s (median of rounds); per-event p50/p99 |
-| runtime | Events pushed straight into a runtime actor holding a 200-item model, 2000 per round. `changed`: every event changes the model and gets a patch. `unchanged`: none does, and each gets an empty acknowledgement. | pipelined µs/event (median of rounds); p50/p99 of one event at a time |
-| runtime list | As `runtime` `changed`, against a model whose list encodes to about 50 KB (1000 items, 200 events per round) and 500 KB (10000 items, 40 events per round). Each event changes one field, so the metric is the cost of the work done on the whole model. | pipelined µs/event (median of rounds); p50/p99 of one event at a time |
-| wire | A one-op `patch` and a `model_sync` of the 50 KB model, each encoded into the frame `send_ws_message` hands `gen_tcp:send/2`, in blocks | ns/frame median and p99 over the blocks |
-| pubsub | 1000 broadcasts to S subscribers (S = 1, 100, 1000), each timed until every subscriber has it | p50/p99 |
-| store | put/get/delete, timed in 50 blocks of 1000 operations | ns/op median and p99 over the blocks |
+| http | 8 keep-alive clients, 2000 requests per round against `/bench`, a 2-byte answer | requests/s and per-request p50/p99, each the median over rounds |
+| static | `brazier/static` serving a 100 KB file (8 clients × 500 requests) and a 10 MB file (4 clients × 25), sent with sendfile (`.200`), and the same files revalidated with the probe's ETag (`.304`, 8 clients × 1000, timed first). The run fails unless the file's digest comes from the digest cache, as it does in production once a file is older than the cache's racy window. | requests/s and per-request p50/p99, each the median over rounds |
+| gzip | A 100 KB HTML body through `middleware.compress` with `Accept-Encoding: gzip`, 8 clients × 100. The probe gunzips the body, compares it with the original and checks it compressed to under half. | requests/s and per-request p50/p99, each the median over rounds |
+| ssr | `ssr.render_page` of a 100-row (8 × 800 requests) and a 1000-row (8 × 50) view with a click handler per row, as `brazier.start` serves the first page. The probe checks every row and the client bundle's script tag. | requests/s and per-request p50/p99, each the median over rounds |
+| ws | N joined connections × 200 events each, for N = 1, 10, 100, in 25, 15 and 5 measured rounds. Each event is timed from its send to the patch that acknowledges its clock. | events/s and per-event p50/p99, each the median over rounds |
+| runtime | Events pushed straight into a runtime actor holding a 200-item model, 2000 per round. `changed`: every event changes the model and gets a patch. `unchanged`: none does, and each gets an empty acknowledgement. | pipelined µs/event (median of rounds); p50/p99 of one event at a time, by round |
+| runtime list | As `runtime` `changed`, against a model whose list encodes to about 50 KB (1000 items, 200 events per round, 1000 sequential) and 500 KB (10000 items, 40 per round, 300 sequential). Each event changes one field, so the metric is the cost of the work done on the whole model. | pipelined µs/event (median of rounds); p50/p99 of one event at a time, by round |
+| wire | A one-op `patch` and a `model_sync` of the 50 KB model, each encoded into the frame `send_ws_message` hands `gen_tcp:send/2`, in 500 blocks of 200 | ns/frame median and p99 of the block timings, by round |
+| pubsub | Broadcasts to S subscribers, each timed until every subscriber has it: 20000 to 1, 2000 to 100, 1000 to 1000 | µs p50/p99, by round |
+| store | put/get/delete, timed in 50 blocks of 1000 operations | ns/op median and p99 of the block timings, by round |
+| crdt append | One value appended to a replicated list key holding 10, 1000 or 10000 values (`brazier/store/crdt`, the work the replica server and every receiving node do per write), in 50 blocks of 1000 | ns/op median and p99 of the block timings, by round |
+| presence | A `brazier/presence` tracker with a room of 10 entries and one of 10000 (100 holder processes × 100 keys), filled before anything is timed. `track`/`untrack`: 10000 of each, each timed until the subscriber has the diff naming exactly that key. `list`: the whole room, checked to hold every entry, 2000 times for 10 entries and 50 for 10000. | µs median and p99, by round |
+| client | The browser client's work for a 100- and a 1000-row model, in node, with the client entry a real `build.build` produces. `render`: `render` and `event_names`, what `renderNow` does before the DOM morph (2000 and 400 calls). `patch`: `handlePatch` before the morph, that is `JSON.parse` of the ops, `applyOps`, `decode_model`, `render` and `event_names`, for a patch that changes every tenth label and the selection. The client's HTML must equal the server's before and after the patch. | µs median and p99, by round |
 
-After each scenario the bench process must have an empty mailbox (see
-[the mailbox leak](#the-mailbox-leak)). A stray message fails the run and
-names the scenario.
+The client scenario does not measure the DOM morph: node has no DOM. The
+morph needs a browser measurement over CDP.
+
+Every percentile is taken per round. A metric's median (p50) and p99 are
+the medians over rounds of each round's median and p99, as a throughput is
+the median round's. They are not percentiles of the pooled samples of every
+round:
+
+- The round-based scenarios (http, static, gzip, ssr, ws) use their own
+  rounds.
+- The scenarios that time one long sequence (runtime sequential events,
+  wire, pubsub, store, crdt append, presence, client) cut it, in the order
+  it was taken, into 5 equal consecutive rounds
+  (`measure.percentiles_by_round`).
+
+On a shared machine a burst of outside load can slow part of one round, and
+pooled, that round's slow samples become the run's p99. A nearest-rank p99
+over 50 block timings is the slowest block, so one preempted block set it.
+A slowdown in the code shows in every round's p99, so it moves their
+median. A burst in fewer than half the rounds does not move it. This is the
+per-iteration statistic that criterion and JMH report. `measure_test.gleam`
+checks both cases.
+
+Each scenario runs in a fresh process (`measure.isolated`). The bench
+process holds the prepared fixtures and every earlier run's results, so
+its heap grows run over run, and a scenario timed in it pays for
+collecting that heap. Timed in the bench process, `pubsub.fanout.1.p99`
+rose in every one of five runs (2.7, 3.3, 3.8, 4.8, 5.5 µs). The same
+fan-out on its own in a VM held at 2.0–2.7 µs over eight runs.
+`wire.patch`, `wire.model_sync_50kb` and `store.crdt_append.1000` drifted
+up by 10–15% the same way. With isolation, VM memory after each run holds
+at about 59 MB instead of climbing from 59 to 80 MB, and the drift is
+gone. Benchee runs each scenario in its own process for the same reason.
+
+When a scenario finishes, both its process and the bench process must have
+an empty mailbox (see [the mailbox leak](#the-mailbox-leak)). A stray
+message fails the run and names the scenario. After every run the suite
+prints a census of the VM: processes, ports, ETS tables, memory and atoms.
+A scenario that leaks one of these shows as a count that grows run over
+run.
 
 ## Tolerances
 
 For each metric the baseline records the median, min and max of its runs.
-Spread is (max − min) / median. Each metric's tolerance is then
+Spread is (max − min) / median. A metric is gated when its spread is
+under 50%, and its tolerance is then
 
-    tolerance = max(25%, 2 × spread)
+    tolerance = max(25%, spread)
 
-and it is not gated at all when that tolerance would exceed 100%.
+A metric whose spread is 50% or more has no tolerance. `make
+bench-baseline` refuses to write a baseline that holds one, and names
+each such metric with its spread. The fix is more samples for that
+metric, not a wider rule.
 
 A check fails a gated metric that is worse than its baseline median by
 more than its tolerance. Worse means slower. For lower-is-better metrics
 the ratio is value / median. For higher-is-better ones it is
 median / value, so a 25% tolerance fails a throughput below median / 1.25.
+A value exactly at the limit passes.
+
+`make bench-check` fails, naming the metric, in each of these cases:
+
+| Verdict | When |
+|---------|------|
+| regressed | worse than the baseline median by more than the tolerance |
+| too noisy | the baseline has no tolerance for it (a baseline from before this rule, or edited by hand) |
+| missing | in the baseline but not measured by this run |
+| unexpected | measured but not in the baseline |
+| redefined | its unit or direction differs from the baseline's |
+
+A different machine fails before any metric is compared.
 
 Why these numbers:
 
-- **2 × spread.** Five back-to-back runs see less variation than separate
-  sessions do, so the observed range is doubled.
+- **A 1.5× slowdown fails every gated metric.** The spread must be under
+  50%, so every tolerance is under 50%, and a ratio of 1.5 is past it.
+  This is why the tolerance is the spread itself and not a multiple of
+  it: with 2 × spread, any metric with a spread of 25% or more would pass
+  a 1.5× slowdown. The unit tests check this at the widest gated spread,
+  49%.
+- **Spread as the margin.** A check compares the median of 3 runs. That
+  median falls outside the baseline's own range only when two of the
+  three runs do, so a tolerance equal to the observed range does not fail
+  unchanged code on one bad run.
 - **25% floor.** Back-to-back runs never see drift between sessions
   (thermal state, other load, power management), and that drift is
   large. The old `brazier_runtime_bench` was rerun in this session on
   source unchanged since commit efc9412, which had recorded it at
   45–47 µs/event for changed events. It measured 58–61 µs/event, +28%
-  for the same code. A tighter floor would fail unchanged code.
-- **100% ceiling.** A tolerance above 100% lets a 2× slowdown pass, so it
-  cannot catch a regression. Those metrics are reported with their spread
-  but never fail a check.
+  for the same code. A tighter floor would fail unchanged code. Under the
+  load the 2026-11-04 baseline was taken in, four of its 87 metrics
+  spread past the floor, the widest `pubsub.fanout.1.p99` at 37%.
+- **50% bound, strict.** A metric whose own runs differ by half its median
+  cannot tell a 1.5× regression from noise. Reporting it without gating
+  it would let any slowdown through, so it is refused instead. Each
+  scenario's sample count is set so that its p99 settles under the bound:
+  a p99 over 1000 samples is moved by any 10 slow ones.
 - **What the floor gives up.** A regression under 25% passes
   `bench-check`. The roughly 10% cost of the WS8b telemetry spans is an
   example. A change suspected of costing that much has to be measured
@@ -83,82 +169,131 @@ Why these numbers:
 
 ## Baseline
 
-`bench/baselines.json`, 5 runs, measured 2026-11-03.
+`bench/baselines.json`, 5 runs, recorded 2026-11-04T21:05:39Z by `make
+bench-baseline`. Every one of its 87 metrics is gated.
 
 - **Machine:** Apple M2 Pro, 10 logical processors and 10 schedulers
   online, OTP 28, erts 16.3, aarch64-apple-darwin.
-- **Not an idle machine:** the 1-minute load average was about 5.9,
-  because other agents' builds and tests were running. Re-baseline on an
-  idle machine when one is available.
+- **Not an idle machine:** the load average (1, 5 and 15 minutes) was
+  2.18 3.82 4.95 before the runs and 8.18 7.02 6.14
+  after, because other agents' builds and tests were running. The file
+  records both under `conditions`. This baseline is to be replaced by one
+  taken on an idle machine; until then, treat a failure near the limit as
+  a reason to rerun on a quiet machine before blaming the code.
 
 | Metric | Median | Range | Spread | Tolerance |
 |--------|--------|-------|--------|-----------|
-| `http.keepalive.8c.throughput` | 51398 req/s | 49740..52149 | 4.7% | 25% |
-| `http.keepalive.8c.latency_p50` | 149 µs | 147..154 | 4.7% | 25% |
-| `http.keepalive.8c.latency_p99` | 263 µs | 255..290 | 13.3% | 26.6% |
-| `ws.1x200.throughput` | 12587 events/s | 11464..15375 | 31.1% | 62.1% |
-| `ws.1x200.latency_p50` | 75.5 µs | 71..84 | 17.2% | 34.4% |
-| `ws.1x200.latency_p99` | 126 µs | 106..266 | 127% | not gated |
-| `ws.10x200.throughput` | 48452 events/s | 46965..49219 | 4.7% | 25% |
-| `ws.10x200.latency_p50` | 198 µs | 196..200 | 2.0% | 25% |
-| `ws.10x200.latency_p99` | 331 µs | 321..343 | 6.6% | 25% |
-| `ws.100x200.throughput` | 56967 events/s | 55661..58654 | 5.3% | 25% |
-| `ws.100x200.latency_p50` | 1577 µs | 1545..1618 | 4.6% | 25% |
-| `ws.100x200.latency_p99` | 4323 µs | 3996..4516 | 12.0% | 25% |
-| `runtime.changed.pipelined` | 60.3 µs/event | 57.2..61.9 | 7.8% | 25% |
-| `runtime.changed.latency_p50` | 49.2 µs | 49.0..51.2 | 4.5% | 25% |
-| `runtime.changed.latency_p99` | 68.8 µs | 66.7..75.9 | 13.3% | 26.7% |
-| `runtime.unchanged.pipelined` | 24.7 µs/event | 22.4..26.8 | 17.5% | 35% |
-| `runtime.unchanged.latency_p50` | 19.3 µs | 19.3..19.3 | 0.2% | 25% |
-| `runtime.unchanged.latency_p99` | 28.7 µs | 25.9..31.5 | 19.5% | 39% |
-| `runtime.list_50kb.changed.pipelined` | 147.7 µs/event | 147.0..152.3 | 3.6% | 25% |
-| `runtime.list_50kb.changed.latency_p50` | 150.7 µs | 150.0..151.0 | 0.6% | 25% |
-| `runtime.list_50kb.changed.latency_p99` | 202.8 µs | 184.2..206.8 | 11.2% | 25% |
-| `runtime.list_500kb.changed.pipelined` | 1864 µs/event | 1827..1874 | 2.5% | 25% |
-| `runtime.list_500kb.changed.latency_p50` | 1877 µs | 1832..1908 | 4.0% | 25% |
-| `runtime.list_500kb.changed.latency_p99` | 2343 µs | 2303..2416 | 4.8% | 25% |
-| `wire.patch.median` | 317 ns/frame | 312..363 | 16.1% | 32.2% |
-| `wire.patch.p99` | 386 ns/frame | 359..706 | 90.1% | not gated |
-| `wire.model_sync_50kb.median` | 328 ns/frame | 315..418 | 31.5% | 62.9% |
-| `wire.model_sync_50kb.p99` | 455 ns/frame | 368..1071 | 155% | not gated |
-| `pubsub.fanout.1.p50` | 1.92 µs | 1.92..1.92 | 0.1% | 25% |
-| `pubsub.fanout.1.p99` | 3.58 µs | 2.92..3.96 | 29.1% | 58.1% |
-| `pubsub.fanout.100.p50` | 148.4 µs | 127.9..153.5 | 17.3% | 34.5% |
-| `pubsub.fanout.100.p99` | 315.6 µs | 273.1..347.8 | 23.6% | 47.3% |
-| `pubsub.fanout.1000.p50` | 1708 µs | 1442..1721 | 16.3% | 32.7% |
-| `pubsub.fanout.1000.p99` | 2272 µs | 2103..2755 | 28.7% | 57.4% |
-| `store.put.median` | 1565 ns/op | 1534..1581 | 3.0% | 25% |
-| `store.put.p99` | 1658 ns/op | 1583..1720 | 8.2% | 25% |
-| `store.get.median` | 292.8 ns/op | 285.9..298.2 | 4.2% | 25% |
-| `store.get.p99` | 323.5 ns/op | 316.3..337.1 | 6.4% | 25% |
-| `store.delete.median` | 1575 ns/op | 1515..1602 | 5.5% | 25% |
-| `store.delete.p99` | 1689 ns/op | 1652..1779 | 7.5% | 25% |
+| `http.keepalive.8c.throughput` | 61910 req/s | 61353..62696 | 2.2% | 25% |
+| `http.keepalive.8c.latency_p50` | 124.0 µs | 122.0..125.0 | 2.4% | 25% |
+| `http.keepalive.8c.latency_p99` | 225.0 µs | 222.0..229.0 | 3.1% | 25% |
+| `http.static.100kb.200.throughput` | 14054 req/s | 13958..14233 | 2.0% | 25% |
+| `http.static.100kb.200.latency_p50` | 555.5 µs | 552.0..561.0 | 1.6% | 25% |
+| `http.static.100kb.200.latency_p99` | 839.0 µs | 826.0..844.0 | 2.1% | 25% |
+| `http.static.100kb.304.throughput` | 21930 req/s | 21286..22896 | 7.3% | 25% |
+| `http.static.100kb.304.latency_p50` | 354.0 µs | 337.0..365.0 | 7.9% | 25% |
+| `http.static.100kb.304.latency_p99` | 575.0 µs | 537.0..592.0 | 9.6% | 25% |
+| `http.static.10mb.200.throughput` | 812.9 req/s | 805.6..817.6 | 1.5% | 25% |
+| `http.static.10mb.200.latency_p50` | 4738 µs | 4674..4802 | 2.7% | 25% |
+| `http.static.10mb.200.latency_p99` | 6549 µs | 6447..6562 | 1.8% | 25% |
+| `http.static.10mb.304.throughput` | 22223 req/s | 21065..23160 | 9.4% | 25% |
+| `http.static.10mb.304.latency_p50` | 347.0 µs | 332.0..368.0 | 10.4% | 25% |
+| `http.static.10mb.304.latency_p99` | 565.0 µs | 553.0..607.0 | 9.6% | 25% |
+| `http.gzip_100kb.throughput` | 7336 req/s | 7290..7462 | 2.4% | 25% |
+| `http.gzip_100kb.latency_p50` | 1016 µs | 1004..1033 | 2.9% | 25% |
+| `http.gzip_100kb.latency_p99` | 1643 µs | 1624..1649 | 1.5% | 25% |
+| `ssr.rows_100.throughput` | 7505 req/s | 7434..7647 | 2.8% | 25% |
+| `ssr.rows_100.latency_p50` | 1043 µs | 1024..1052 | 2.7% | 25% |
+| `ssr.rows_100.latency_p99` | 1555 µs | 1518..1597 | 5.1% | 25% |
+| `ssr.rows_1000.throughput` | 943.9 req/s | 919.7..950.7 | 3.3% | 25% |
+| `ssr.rows_1000.latency_p50` | 7930 µs | 7905..7986 | 1.0% | 25% |
+| `ssr.rows_1000.latency_p99` | 15012 µs | 14068..16435 | 15.8% | 25% |
+| `ws.1x200.throughput` | 15518 events/s | 15378..15598 | 1.4% | 25% |
+| `ws.1x200.latency_p50` | 62.0 µs | 61.5..62.5 | 1.6% | 25% |
+| `ws.1x200.latency_p99` | 101.0 µs | 97.0..102.0 | 5.0% | 25% |
+| `ws.10x200.throughput` | 60080 events/s | 59643..61497 | 3.1% | 25% |
+| `ws.10x200.latency_p50` | 158.0 µs | 155.0..159.0 | 2.5% | 25% |
+| `ws.10x200.latency_p99` | 276.0 µs | 263.0..282.0 | 6.9% | 25% |
+| `ws.100x200.throughput` | 71213 events/s | 70762..71929 | 1.6% | 25% |
+| `ws.100x200.latency_p50` | 1316 µs | 1307..1326 | 1.4% | 25% |
+| `ws.100x200.latency_p99` | 2910 µs | 2848..2937 | 3.1% | 25% |
+| `runtime.changed.pipelined` | 31.6 µs/event | 31.5..31.9 | 1.2% | 25% |
+| `runtime.changed.latency_p50` | 25.3 µs | 25.2..25.3 | 0.3% | 25% |
+| `runtime.changed.latency_p99` | 44.5 µs | 39.3..51.1 | 26.5% | 26.5% |
+| `runtime.unchanged.pipelined` | 17.8 µs/event | 17.0..21.2 | 23.4% | 25% |
+| `runtime.unchanged.latency_p50` | 13.5 µs | 13.4..13.5 | 0.6% | 25% |
+| `runtime.unchanged.latency_p99` | 25.1 µs | 24.4..26.2 | 7.3% | 25% |
+| `runtime.list_50kb.changed.pipelined` | 147.7 µs/event | 145.5..148.5 | 2.1% | 25% |
+| `runtime.list_50kb.changed.latency_p50` | 151.0 µs | 151.0..151.3 | 0.2% | 25% |
+| `runtime.list_50kb.changed.latency_p99` | 189.4 µs | 175.7..198.0 | 11.8% | 25% |
+| `runtime.list_500kb.changed.pipelined` | 1816 µs/event | 1739..1828 | 4.9% | 25% |
+| `runtime.list_500kb.changed.latency_p50` | 1825 µs | 1738..1844 | 5.8% | 25% |
+| `runtime.list_500kb.changed.latency_p99` | 2350 µs | 2314..2387 | 3.1% | 25% |
+| `wire.patch.median` | 320.2 ns/frame | 318.7..321.9 | 1.0% | 25% |
+| `wire.patch.p99` | 441.9 ns/frame | 419.4..467.5 | 10.9% | 25% |
+| `wire.model_sync_50kb.median` | 316.3 ns/frame | 314.8..328.9 | 4.4% | 25% |
+| `wire.model_sync_50kb.p99` | 416.9 ns/frame | 404.4..465.6 | 14.7% | 25% |
+| `pubsub.fanout.1.p50` | 1.38 µs | 1.33..1.38 | 3.0% | 25% |
+| `pubsub.fanout.1.p99` | 2.83 µs | 2.46..3.50 | 36.8% | 36.8% |
+| `pubsub.fanout.100.p50` | 105.3 µs | 100.9..105.9 | 4.7% | 25% |
+| `pubsub.fanout.100.p99` | 232.4 µs | 221.8..244.3 | 9.6% | 25% |
+| `pubsub.fanout.1000.p50` | 1287 µs | 1239..1307 | 5.3% | 25% |
+| `pubsub.fanout.1000.p99` | 1677 µs | 1654..1687 | 2.0% | 25% |
+| `store.put.median` | 1014 ns/op | 1004..1029 | 2.5% | 25% |
+| `store.put.p99` | 1159 ns/op | 1095..1166 | 6.1% | 25% |
+| `store.get.median` | 132.3 ns/op | 131.2..138.6 | 5.6% | 25% |
+| `store.get.p99` | 151.8 ns/op | 139.8..164.4 | 16.2% | 25% |
+| `store.delete.median` | 994.5 ns/op | 986.5..1054 | 6.8% | 25% |
+| `store.delete.p99` | 1125 ns/op | 1098..1160 | 5.5% | 25% |
+| `store.crdt_append.10.median` | 816.4 ns/op | 801.5..822.2 | 2.5% | 25% |
+| `store.crdt_append.10.p99` | 896.5 ns/op | 844.2..973.6 | 14.4% | 25% |
+| `store.crdt_append.1000.median` | 489.1 ns/op | 486.2..489.9 | 0.7% | 25% |
+| `store.crdt_append.1000.p99` | 535.2 ns/op | 530.0..545.9 | 3.0% | 25% |
+| `store.crdt_append.10000.median` | 538.7 ns/op | 529.0..546.8 | 3.3% | 25% |
+| `store.crdt_append.10000.p99` | 597.5 ns/op | 573.0..612.0 | 6.5% | 25% |
+| `presence.track.10.median` | 5.29 µs | 5.25..5.33 | 1.6% | 25% |
+| `presence.track.10.p99` | 18.9 µs | 17.8..20.2 | 13.0% | 25% |
+| `presence.untrack.10.median` | 3.38 µs | 3.33..3.38 | 1.2% | 25% |
+| `presence.untrack.10.p99` | 15.5 µs | 13.2..17.4 | 26.8% | 26.8% |
+| `presence.list.10.median` | 3.42 µs | 3.38..3.42 | 1.2% | 25% |
+| `presence.list.10.p99` | 10.6 µs | 9.67..13.0 | 31.4% | 31.4% |
+| `presence.track.10000.median` | 5.88 µs | 5.67..6.04 | 6.4% | 25% |
+| `presence.track.10000.p99` | 17.3 µs | 15.0..17.8 | 16.2% | 25% |
+| `presence.untrack.10000.median` | 4.04 µs | 3.88..4.08 | 5.1% | 25% |
+| `presence.untrack.10000.p99` | 12.8 µs | 11.1..13.1 | 16.0% | 25% |
+| `presence.list.10000.median` | 5890 µs | 5197..6125 | 15.8% | 25% |
+| `presence.list.10000.p99` | 7479 µs | 6930..7671 | 9.9% | 25% |
+| `client.render.rows_100.median` | 156.2 µs | 155.5..157.3 | 1.1% | 25% |
+| `client.render.rows_100.p99` | 308.7 µs | 305.6..323.8 | 5.9% | 25% |
+| `client.patch.rows_100.median` | 260.4 µs | 259.7..261.6 | 0.7% | 25% |
+| `client.patch.rows_100.p99` | 412.4 µs | 408.2..439.2 | 7.5% | 25% |
+| `client.render.rows_1000.median` | 1647 µs | 1634..1664 | 1.8% | 25% |
+| `client.render.rows_1000.p99` | 2872 µs | 2742..2928 | 6.5% | 25% |
+| `client.patch.rows_1000.median` | 2765 µs | 2745..2788 | 1.5% | 25% |
+| `client.patch.rows_1000.p99` | 4054 µs | 3952..4154 | 5.0% | 25% |
 
-The `runtime.list_*` and `wire.*` rows were added on 2026-11-04 from a
-5-run `make bench-baseline` (load average about 6 to 9); the other rows
-were kept as measured. The `wire` numbers stay flat with model size because
-the frame is iodata: the model JSON goes into it as the binary the runtime
-already holds, so the cost of copying it into the socket, paid in the kernel
-by both the old and the new frame, is not in the metric. The flat encoding
-these rows replaced measured 117 µs per 50 KB `model_sync` and about 1 µs
-per patch.
-
-Two `make bench-check` runs after this baseline both passed. In each, the
-only line not marked as passing was the informational line for the
-ungated `ws.1x200.latency_p99`.
+A `make bench-check` right after this baseline passed, under a load
+average of 7 to 9. Its worst metric was `pubsub.fanout.1.p99`, at 1.15×
+its median against a limit of 1.37×; every other metric was within 1.07×.
 
 Some notes on reading the numbers:
 
-- **The ws.1x200 rows** measure one connection, so they are one scheduler
-  waiting on one socket. Their spread comes from scheduler placement and
-  wake-up, not from Brazier. 10 and 100 connections are the stable ws
-  numbers.
+- **The `wire` numbers stay flat with model size** because the frame is
+  iodata: the model JSON goes into it as the binary the runtime already
+  holds, so the cost of copying it into the socket, paid in the kernel by
+  both the old and the new frame, is not in the metric. The flat encoding
+  these rows replaced measured 117 µs per 50 KB `model_sync` and about
+  1 µs per patch.
+- **Growth with size.** SSR and the node client both scale linearly with
+  rows: `ssr.rows_1000` is about 8 ms a page against 1 ms at 100 rows,
+  and `client.patch.rows_1000` about 2.8 ms. `presence.list.10000` is
+  about 5.9 ms, a full copy of 10,000 presences, while `track` and
+  `untrack` stay flat at 4 to 6 µs.
 - **Repeated p50 values.** On Darwin, `erlang:monotonic_time` ticks at
   about 41.67 ns, so every timing is a whole number of ticks. A
   percentile taken over thousands of samples from a tight distribution
   often lands on the same tick in every run. That, not a perfectly quiet
-  machine, is why `pubsub.fanout.1.p50` and
-  `runtime.unchanged.latency_p50` show near-zero spreads.
+  machine, is why `runtime.changed.latency_p50` and
+  `runtime.list_50kb.changed.latency_p50` show near-zero spreads.
 
 ## Runtime re-measurement
 

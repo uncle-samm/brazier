@@ -395,8 +395,86 @@ For Boxd-style VM fan-out:
 
 Benchmarks are not tests and never run in `gleam test`. Use `make bench`,
 `make bench-check` and `make bench-baseline`. See
-[PERFORMANCE.md](PERFORMANCE.md) for the scenarios, the committed
-baseline and how tolerances are chosen.
+[PERFORMANCE.md](PERFORMANCE.md) for every scenario's load, the committed
+baseline and the numbers.
+
+The benches, under `test/brazier/bench/`:
+
+| Module | Scenarios |
+|--------|-----------|
+| `http_bench.gleam` | keep-alive `/bench`; static files of 100 KB and 10 MB, served (200) and revalidated (304); gzip of a 100 KB body; SSR of 100 and 1000 rows |
+| `suite.gleam` | ws round trips; the runtime actor; the wire encoding; PubSub fan-out; the store; the replicated list append at 10, 1000 and 10000 values |
+| `presence_bench.gleam` | track, untrack and list in rooms of 10 and 10000 entries |
+| `client_bench.gleam` | the browser client's render and patch path for 100 and 1000 rows, in node, against a fixture app built with `build.build` |
+
+Each bench checks what it times, so a broken path is an error, not a fast
+number:
+
+- every HTTP answer is checked against a probe whose full response was
+  verified;
+- a static file must be served from the digest cache;
+- a gzip body must decompress to the original;
+- an SSR page must hold every row;
+- a presence diff must name exactly the key that was tracked;
+- the client's HTML must equal the server's.
+
+The client bench does not time the DOM morph, which needs a browser.
+
+Each scenario runs in a fresh process (`measure.isolated`), so it is not
+timed through the bench process's heap, which grows run over run. Every
+p50 or p99 is the median over rounds of each round's p50 or p99, so a
+burst of outside load in one round does not set it. A scenario that times
+one long sequence cuts it into 5 consecutive rounds.
+
+### The gate
+
+`make bench-check` combines 3 runs by median and fails when any metric
+fails. A metric fails when it is:
+
+- worse than the baseline median by more than its tolerance;
+- too noisy to gate;
+- in the baseline but not measured;
+- measured but not in the baseline;
+- changed in unit or direction.
+
+A baseline (`make bench-baseline`, 5 runs) gives each metric the tolerance
+max(25%, spread), where spread is (max − min) / median. It gates only
+metrics whose spread is under 50%, and it refuses to write a baseline with
+a metric it cannot gate.
+
+The numbers are chosen so that a 1.5× regression on any gated metric
+fails:
+
+- **25% floor.** The same code drifts by up to 28% between sessions. Under
+  load, the medians of 5 back-to-back runs spread up to 22%. A smaller
+  floor fails unchanged code.
+- **Strict 50% bound on spread.** Every tolerance is under 50%, so a ratio
+  of 1.5 is always past it. The tolerance is the spread itself, not a
+  multiple of it, for the same reason.
+
+`test/brazier/bench/report_test.gleam` tests these rules:
+
+- a missing baseline entry, a metric missing from the run and an empty
+  baseline;
+- a spread exactly at the 50% bound (ungated, and a check fails it), at
+  49% (gated) and at 150%;
+- a value exactly at the limit (passes) and just past it (fails);
+- a 1.5× slowdown at the widest gated spread;
+- a changed unit;
+- a baseline file whose tolerance does not follow the rule.
+
+`cli_test.gleam` tests that a missing baseline file is an error that says
+how to make one.
+
+`measure_test.gleam` tests the per-round latency rule:
+
+- one round slowed tenfold out of three does not move the p99;
+- every round slowed 2× moves the p50 and the p99 2×;
+- a round with the wrong number of latencies, no rounds, or a round that
+  took no time is an error;
+- cut into 5 rounds, a sequence with two rounds slowed tenfold keeps its
+  median and p99, while three or five slowed rounds move the p99 1.5×;
+- a sample count that does not split into 5 equal rounds is an error.
 
 ## CI
 
