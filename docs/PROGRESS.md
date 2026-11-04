@@ -366,6 +366,24 @@
     - Follow-ups:
       - the STAB-1 monitor race also exists in `store_test.gleam:29` and `:134`, `ws8c_ets_owner_test.gleam:68` and `cluster/app_tree_test.gleam:371` (wave 4 sweep);
       - `docs/DEPLOYMENT.md:56` still says "Join tokens and session tokens".
+  - [x] fix-cluster (TS-2, SEC-3, SEC-8, SEC-9, SEC-10, STAB-3, STAB-4), merged as fa8369c.
+    - SEC-3: cluster PubSub, presence and store-replica messages from a node that is not a verified member are dropped and logged. `brazier_cluster_ffi:verified/1` fails closed when no cluster manager is running. Fake peers in single-node tests become members only through the test-only `with_verified/2` in `test/brazier_presence_test_ffi.erl`, which owns a protected table and cleans it up in `after`, with bounded waits.
+    - TS-2: `to_config` requires a secret key. `cluster.supervised` and `cluster.start` take `secret_key:`. The cluster MAC key is HMAC-SHA256(secret_key, "brazier-cluster-v1"), derived the way Plug.Crypto's KeyGenerator derives keys, so it is never the raw secret.
+    - SEC-8/9/10: the peer check is signed with that key, discovery holds at most `max_discovered_nodes` (default 16384), and plain-TCP distribution refuses to start in production unless the app calls `allow_insecure_distribution(reason)`.
+    - STAB-3/STAB-4: membership changes are serialised through the manager, and a verified row is removed on nodedown.
+    - Coordinator verify on the merge of 0a1ef08 into the branch (e365789): clean build with zero warnings, format and lint clean, 1639 tests passing in each of 3 runs, docs check OK, test-client OK (45 FFI scenarios, patch safety, apply equivalence).
+    - Decisions:
+      - no fallback when no manager is running: no remote node is a member;
+      - accepted the edits outside the agent's file list (pubsub_worker.erl, pubsub.gleam, application.gleam, brazier_application_ffi.erl, the examples' cluster calls, READMEs, test_all_cdp.py, tests, GETTING_STARTED, ARCHITECTURE, STATE_MANAGEMENT), because they follow from the new `secret_key:` argument and the SEC-3 gate;
+      - commit 47a3516's message overstates the TLS refusal: it applies only in production, and `allow_insecure_distribution(reason)` overrides it. The docs say this correctly.
+    - Follow-ups:
+      - session pg group names contain session ids, which any connected node can list;
+      - await interests are lost when the manager restarts;
+      - between a disconnect and the nodedown, a stale verified row remains;
+      - a revocation can be lost while only one side has verified the other;
+      - a remaining STAB-3 race from the asynchronous link signal;
+      - the membership churn test survives some mutants;
+      - 2 `pubsub_test` failures during the agent's work came from subscriptions left by failing tests; pubsub tests should clean up in `after` (wave 4 sweep).
 - [ ] Final verification: build (zero warnings), tests, all examples, CDP browser suite, perf baselines
 
 **Decisions (Milestone 117, coordinator):**
