@@ -38,16 +38,22 @@ constructors and started with `beacon.start(app, port)`:
 
 Builder functions add the rest: `with_router`, `title`, `subscriptions`,
 `on_notify`, `on_notification`, `head_html`, `api_routes`, `ws_auth`,
-`security_limits`, `secret_key`, `with_middleware`, `static_dir`, `dev_mode`
-and `with_state_recovery`.
+`security_limits`, `secret_key`, `with_middleware`, `static_dir`, `dev_mode`,
+`pubsub_config`, `cluster`, `presence`, `watch_presence` and
+`with_state_recovery`.
 
 `beacon.start` checks for the build artifacts (`priv/static/beacon_client.manifest`
 must name a bundle that exists, and the generated `beacon_codec` module must
-load), composes the app with its `sync` and local layer into an
-`application.AppConfig`, and starts the listener. It does not read
-environment variables; apps read them with `beacon/config` (`config.port()`,
-`config.secret_key()`, `config.is_production()`). Without
-`beacon.secret_key`, start generates a random key and logs a warning.
+load) and returns the error when one is missing. It then composes the app
+with its `sync` and local layer into an `application.AppConfig`, starts the
+supervision tree with `application.start_supervised` (see
+[Supervision](#supervision-applicationgleam)), and blocks in
+`application.wait_forever` until a SIGTERM drains the node or the tree
+exits. It does not read environment variables; apps read them with
+`beacon/config` (`config.port()`, `config.secret_key()`,
+`config.is_production()`). Without `beacon.secret_key`, start generates a
+random key and logs a warning; `start_supervised` refuses a weak key before
+it starts any process.
 
 ## Request Lifecycle
 
@@ -81,14 +87,22 @@ On HTTP GET, after middleware, API routes and static files, `ssr.gleam`:
 
 ### 2. Live mount (`runtime.gleam`)
 
-`application.gleam` spawns one runtime actor per WebSocket connection
-(`runtime.connect_transport_per_connection`). The runtime runs `init(ctx)`
-and the route message again, performs their effects, and answers the
-client's `join` with a `model_sync` of the encoded model. When `init` refuses,
-no runtime starts and the socket closes with `4000 + status`; when it
-crashes, the socket closes with 1011. With state
-recovery, a verified join token restores the model instead of running
-`init`.
+The transport starts one runtime actor per WebSocket connection, right after
+the upgrade, through the factory that `application.gleam` builds with
+`runtime.connect_transport_per_connection`. The runtime runs `init(ctx)` and
+the route message again and performs their effects. When `init` refuses, no
+runtime starts and the socket closes with `4000 + status` and the reason
+`init refused`; any other startup failure (a crash in `init`, an invalid page
+URL, a refused presence track) closes it with 1011 `startup failure`.
+
+The client then sends `join` with the content hash of the bundle it runs.
+The transport compares it with the bundle `beacon_client.manifest` names: a
+page from another build is closed with 4409 `stale build` and reloads, and
+an unreadable manifest closes with 1011. A join from the current build (or
+one with no build id, which is logged as a warning) goes to the runtime,
+which answers with a `model_sync` of the encoded model. With state recovery,
+a verified join token on the first join replaces the model that `init`
+produced. See [WIRE_PROTOCOL.md](WIRE_PROTOCOL.md#close-codes).
 
 ### 3. Events
 
@@ -165,14 +179,17 @@ exports at startup: `decode_model`, `init_local`, `render`, `lookup_handler`,
   `model_sync`.
 - **Connection.** Heartbeats every 30 s, a client send budget, reconnect
   with exponential backoff and jitter. Close codes 4400 to 4499 (an `init`
-  refusal with a client error, 4401 for a revoked session) stop reconnecting
-  and reload the page, at most 3 times per tab within 60 s (counted in
-  `sessionStorage`); after that the page shows an error state.
+  refusal with a client error, 4401 for a revoked session, 4409 for a page
+  from another build) stop reconnecting and reload the page, at most 3 times
+  per tab within 60 s (counted in `sessionStorage`); after that the page
+  shows an error state. A 1001 (the server is draining) reconnects. Dev
+  mode's `reload` message reloads the page every time, outside that guard.
 
 ## Build (`build.gleam`, `build/`)
 
 `gleam run -m beacon/build` (or `gleam run -m beacon/dev`, which rebuilds and
-hot-reloads on change) runs, from the app project:
+hot-reloads on change, then sends every open page a `reload`) runs, from the
+app project:
 
 1. **Discovery** (`discovery`, `sources`, `app_call`): find the app module,
    whose `pub fn main` reaches a `beacon.simple`, `beacon.application` or
@@ -198,7 +215,9 @@ hot-reloads on change) runs, from the app project:
    `beacon_app_entry.gleam`, with packages pinned to `manifest.toml`. Compile
    it, bundle it with the pinned esbuild, and write
    `priv/static/beacon_client_<hash>.js` and the manifest. A failure deletes
-   the manifest, so `beacon.start` refuses stale artifacts.
+   the manifest, so `beacon.start` refuses stale artifacts. The `<hash>` is
+   the build id the client sends in `join`, so a running server closes a
+   page from an older bundle with 4409 and the page reloads.
 
 `gleam run -m beacon/build/runtime_bundle` rebuilds the repository's
 prebuilt runtime bundle from `beacon_client/src`.
@@ -212,7 +231,7 @@ JSON text frames over `/ws`. Full examples are in
 
 | `type` | Variant | Fields | Purpose |
 |---|---|---|---|
-| `join` | `ClientJoin` | token, path | Live mount; the recovery token comes from the HttpOnly cookie |
+| `join` | `ClientJoin` | token, path | Live mount; the recovery token comes from the HttpOnly cookie. The frame's `build` (the bundle's content hash) is checked by the transport and not passed on |
 | `event` | `ClientEvent` | name, handler_id, data, target_path, clock, ops | A forwarded Msg in `data`; `ops` are untrusted hints |
 | `event_batch` | `ClientEventBatch` | events | A bounded batch of events |
 | `navigate` | `ClientNavigate` | path | Client navigation |
@@ -229,7 +248,7 @@ JSON text frames over `/ws`. Full examples are in
 | `hard_navigate` | `ServerHardNavigate` | path | `router.redirect`, or an unrouted path |
 | `error` | `ServerError` | reason | A refused event or other error |
 | `heartbeat_ack` | `ServerHeartbeatAck` | | Heartbeat reply |
-| `reload` | `ServerReload` | | Dev mode: reload the page |
+| `reload` | `ServerReload` | | Dev mode: a rebuild finished, reload the page |
 | `mount` | `ServerMount` | payload | Not sent to browser clients; the client logs and ignores it |
 
 ## Transport (`transport.gleam`, `transport/`)
@@ -238,30 +257,65 @@ Beacon has its own HTTP/1.1 and WebSocket server on `gen_tcp`
 (`transport/server.gleam`, `http.gleam`, `ws.gleam`, `client.gleam` and the
 `beacon_http_*` Erlang modules), with one process per connection.
 `transport.SecurityLimits` bounds everything that comes from the network:
-message size (64 KB), events per second (50), connections (10,000 total, per
-IP for HTTP and WebSocket), header counts and sizes, body size and read
-timeouts, keep-alive, WebSocket ping/pong and idle timeouts, the outbound
-queue, and decode errors. Forwarding headers are honoured only from
+message size (64 KB), events per second (50), connections (10,000 in all,
+256 per peer IP, 100 WebSockets per client IP), header counts and sizes,
+body size and read timeouts, keep-alive, WebSocket ping/pong and idle
+timeouts, the outbound queue, and decode errors. The listener validates the
+limits once, when it starts. Forwarding headers are honoured only from
 `trusted_proxies`. The WebSocket upgrade checks the origin and runs the
 optional `ws_auth` hook, which is rechecked every
 `ws_auth_recheck_interval_ms`. See [SECURITY.md](SECURITY.md).
 
-A listener is a `RestForOne` pair: the connection registry
-(`beacon_http_conns`, which links every connection process) and the
-acceptors. Stopping it stops the acceptors first; the registry then sends
-each connection `{beacon_http_drain, Registry}` and waits up to
-`drain_timeout_ms` for them to exit. A WebSocket closes with 1001, an HTTP
-response in progress is sent with `Connection: close`, and an idle
-keep-alive connection closes. Whatever remains is killed.
+An HTTP request goes through the middleware, then the API routes, then the
+framework routes: `/health` (GET and HEAD only), the client bundle, the
+static directory, and the page. A path under the static prefix names a file
+or nothing: a miss is 404, never the page. Static files are sent with
+`file:sendfile` from a `server.File(path, offset, length)` body, which
+`middleware.compress` passes through; the client bundle is served from an
+in-memory cache of its raw and gzip bodies. The connection loop classifies
+a request body before the handler's response is written and reads it only
+after: a refusal such as an early 413 is sent at once, a small leftover body
+is then read and dropped so the connection can be reused, and a connection
+that closes instead half-closes and drains the peer for up to 1 s or 1 MiB
+(Cowboy's linger), so the client reads the response.
+
+A listener is a small `RestForOne` tree modelled on Ranch's, with the listen
+socket in a process of its own as in Thousand Island:
+
+1. **The connection owner** (`beacon_http_conns`) links every connection
+   process and keeps the slot counts in its ETS table: connections in all
+   and per peer IP, taken when an acceptor hands over a socket, and
+   WebSockets per client IP (the forwarded client behind a trusted proxy),
+   taken at the upgrade. A handler's slots are released when its socket
+   closes, and on its `EXIT` in any case, so a crash never leaks one. The
+   counts live and die with the listener.
+2. **The listen-socket owner** (`beacon_http_listen_socket`) opens the
+   socket, traps exits and closes it in `terminate`. The runtime closes a
+   port asynchronously after its owner exits, so without this a listener
+   restarted at once could find its port still bound (`eaddrinuse`).
+3. **The acceptors** (`beacon_http_acceptors_sup`, one-for-one), which accept
+   on that socket.
+
+Stopping a listener stops the acceptors first, then closes the listen
+socket, then drains: the connection owner sends each connection
+`{beacon_http_drain, Owner}` and waits up to `drain_timeout_ms` for them to
+exit, with no polling. A WebSocket closes with 1001, an HTTP response in
+progress is sent with `connection: close`, and an idle keep-alive connection
+closes. Whatever remains is killed and logged.
 
 Erlang modules log through `beacon_log_ffi`, which formats the message and
-logs it with the same module tag and format as `beacon/log`.
+logs it with the same module tag and format as `beacon/log`, and carries the
+tag in the log metadata (`beacon_context`). The build's `exit_failure` is the
+one exception: it prints its reason to standard error and halts.
 
 ## Supervision (`application.gleam`)
 
-`beacon.start` runs `application.start_supervised`: one root supervisor with
-the `RestForOne` strategy, so a crashing child restarts with every child
-after it and never one before it. The children, in start order:
+`beacon.start` runs `application.start_supervised`. Before it starts any
+process, it refuses a weak secret key, and PubSub, a cluster manager, a
+session scope or a presence tracker already running on the node outside a
+tree (the tree must own them). It then starts one root supervisor with the
+`RestForOne` strategy, so a crashing child restarts with every child after
+it and never one before it. The children, in start order:
 
 1. **The ETS table owner** (`state_manager.table_owner_supervised`). It owns
    every local store's table, so it comes first: no other child's restart

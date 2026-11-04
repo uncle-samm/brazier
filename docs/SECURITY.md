@@ -66,18 +66,28 @@ follows the cowboy/ranch and Plug conventions:
 - **Keep-alive:** `Connection: close` from either side and HTTP/1.0 without
   `keep-alive` close the connection after the response, which then carries
   `Connection: close`. `HEAD` responses keep `Content-Length` with no body.
-  An unread small body is discarded so the connection can be reused; a large
-  one closes it.
-- **Connections:** a supervised tracker owns the connection slots; a slot is
-  released when its process exits for any reason. Connections over
-  `max_connections` or `max_connections_per_ip` get 503 and are closed.
+  The response is written before any unread body is touched, so a refusal
+  such as 413 reaches the client at once. Afterwards an unread body of at
+  most 64 KiB is discarded so the connection can be reused; a larger one, or
+  any unread body of an `Expect: 100-continue` request, closes it.
+- **Closing:** a connection the server ends after a response is half-closed
+  and drained for at most 1 s or 1 MiB before the socket closes, so unread
+  request bytes do not make the kernel reset the connection and destroy the
+  response (cowboy's `linger_timeout`).
+- **Connections:** the listener's connection owner (`beacon_http_conns`)
+  holds the connection slots, per peer IP and in all, and the WebSocket
+  slots per client IP; a slot is released when its process exits for any
+  reason. Connections over `max_connections` or `max_connections_per_ip` get
+  503 and are closed.
 - **Supervision:** acceptors run under an OTP supervisor and are restarted
   (and logged) when they crash; a crashing handler gets 500 and closes only
-  its own connection.
-- **Shutdown:** a stopping listener first stops accepting, then gives open
-  connections `drain_timeout_ms` (0 kills them at once; at most
-  4294967295) to finish, and kills the rest. `BEACON_SHUTDOWN_TIMEOUT`
-  overrides it. See [DEPLOYMENT.md](DEPLOYMENT.md#graceful-shutdown).
+  its own connection. The listen socket has its own owner process, which
+  closes it when the listener stops, so the port is free again at once.
+- **Shutdown:** a stopping listener first stops its acceptors and closes the
+  listen socket, then gives open connections `drain_timeout_ms` (0 kills
+  them at once; at most 4294967295) to finish, and kills the rest.
+  `BEACON_SHUTDOWN_TIMEOUT` overrides it. See
+  [DEPLOYMENT.md](DEPLOYMENT.md#graceful-shutdown).
 
 A seeded raw-socket fuzz test (`test/beacon/http_fuzz_test.gleam`) sends
 mutated and random requests and checks that the server never crashes, hangs,
@@ -328,7 +338,8 @@ with a user, and binds the socket's process to that session. Logout, session
 rotation or expiry closes the socket at once with close code 4401, and the
 check is repeated every `ws_auth_recheck_interval_ms`. On 4401 the browser
 logs an error, never reconnects with the revoked session, and reloads the
-page.
+page. The reload guard allows at most 3 such reloads per tab within 60 s;
+past that the page shows an error and stops.
 
 `protect_ws` refuses guests. An app that serves a guest page uses
 `auth.allow_guests_ws(store, config)` instead (see `examples/auth_workspace`).
