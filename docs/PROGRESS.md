@@ -280,7 +280,10 @@
       - fix-cluster: TS-2, SEC-3, SEC-8, SEC-9, SEC-10, STAB-3, STAB-4;
       - fix-static-tooling: PERF-3/SEC-15, PERF-10, PERF-13, TS-4 HTTP part, TS-5, TS-6, TS-7, TS-13 and the stale-name lint rule;
       - fix-crdt: PERF-7.
-    - Wave 2: transport and auth. Covers SEC-2, SEC-4, SEC-7, SEC-16, SEC-11 transport part, TS-4 session-store clock, TS-8 and TS-9.
+    - Wave 2: transport and auth. Covers SEC-2, SEC-4, SEC-7, SEC-16, SEC-11 transport part, TS-4 session-store clock, TS-8 and TS-9. Started 2026-11-04 at 0a1ef08 as two agents, while fix-cluster was still running:
+      - W2-A owns transport, runtime, middleware, router and the client JS. It takes SEC-2, SEC-16, SEC-11 transport part, TS-9, SEC-17 recovery, the runtime's own local-path checks, the `hard_navigate` echo and the link-click origin check;
+      - W2-B owns ip, transport/client, auth and session. It takes SEC-4, SEC-7, TS-4 session clock and TS-8, with call-site edits only in transport.gleam.
+      - Both may make small edits to `brazier.gleam` and `application.gleam`, which fix-cluster also edits; the coordinator resolves those merges. Neither touches the `.erl` files fix-cluster owns.
     - Wave 3: wire and encoding performance, PERF-2 and PERF-6. Raw JSON envelopes need a wire version bump.
     - Wave 4: PERF-9, which closes the bench gate's gaps (benches for large models, SSR, static files, client render and CRDT; no ungated metrics) and re-baselines. Then a sweep of the remaining TS-12 items.
     - PERF-11 (about 0.5µs of telemetry span cost per event with no handler) is accepted within the overhead budget already recorded, and is not fixed.
