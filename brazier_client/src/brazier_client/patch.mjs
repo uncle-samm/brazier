@@ -21,8 +21,16 @@
 // module, handler.gleam and brazier_client_ffi.mjs, and the rules must be
 // testable without a DOM (brazier_client/test/sync_vectors.mjs).
 
-// Keys that must never be set via patch operations to prevent prototype pollution.
-const UNSAFE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+/**
+ * Keys no patch path may pass through: on a JS object a path through one can
+ * reach Object.prototype (prototype pollution). Mirrors unsafe_keys/0 in
+ * src/brazier_patch_ffi.erl, the canonical list; test/brazier/patch_test.gleam
+ * asserts the two are equal. Neither diff emits a path through one (the
+ * object holding a changed unsafe key is replaced whole) and both appliers
+ * refuse one.
+ */
+export const UNSAFE_PATCH_KEYS = Object.freeze(["__proto__", "constructor", "prototype"]);
+const UNSAFE_KEYS = new Set(UNSAFE_PATCH_KEYS);
 
 /** Error thrown for any patch that cannot be applied exactly. */
 export class PatchError extends Error {
@@ -37,10 +45,6 @@ export class PatchError extends Error {
  * Mirrors diff_values/3 in brazier_patch_ffi.erl.
  */
 export function diffModels(oldModel, newModel) {
-  if (containsUnsafeKey(oldModel) || containsUnsafeKey(newModel)) {
-    if (deepEqual(oldModel, newModel)) return [];
-    return [{ op: "replace", path: "", value: newModel }];
-  }
   const ops = [];
   diffValues(oldModel, newModel, "", ops);
   return ops;
@@ -61,7 +65,14 @@ function diffValues(oldVal, newVal, path, ops) {
   }
 }
 
+// Mirrors diff_maps/3: when an unsafe key is added, removed or changed, the
+// object holding it (the nearest safe parent) is replaced whole, so no path
+// ever passes through an unsafe key.
 function diffObject(oldObj, newObj, basePath, ops) {
+  if (touchesUnsafeKey(oldObj, newObj)) {
+    ops.push({ op: "replace", path: basePath, value: newObj });
+    return;
+  }
   const oldKeys = Object.keys(oldObj).sort(compareKeys);
   for (const key of oldKeys) {
     if (!Object.prototype.hasOwnProperty.call(newObj, key)) {
@@ -77,6 +88,18 @@ function diffObject(oldObj, newObj, basePath, ops) {
       diffValues(oldObj[key], newObj[key], path, ops);
     }
   }
+}
+
+// True when an unsafe key was added, removed or changed. Mirrors
+// touches_unsafe_key/2: a lookup per unsafe key, never a walk of the keys.
+function touchesUnsafeKey(oldObj, newObj) {
+  for (const key of UNSAFE_PATCH_KEYS) {
+    const inOld = Object.prototype.hasOwnProperty.call(oldObj, key);
+    const inNew = Object.prototype.hasOwnProperty.call(newObj, key);
+    if (inOld !== inNew) return true;
+    if (inOld && !deepEqual(oldObj[key], newObj[key])) return true;
+  }
+  return false;
 }
 
 // Erlang sorts binary map keys bytewise; compare UTF-8 bytes to match.
@@ -201,6 +224,17 @@ export function parsePath(path) {
 }
 
 // === Apply Engine ===
+//
+// Copy-on-write once per container per patch. Copying every container on an
+// op's path for EVERY op (a slice or spread per level) made a patch of k ops
+// on an n-element array cost O(k * n) in copies alone. applyOps now records
+// the containers it copied during the call in a WeakSet: the first op that
+// walks through a container copies it shallowly and links the copy into its
+// (already copied) parent; later ops edit the copy in place. The input
+// model and the op values are never in that set, so neither is ever
+// mutated: a throwing op leaves the cached model intact and the partial
+// copies are dropped. Pattern: Immer's copy-on-write drafts (copy on first
+// write, hand back the copies), without proxies.
 
 /**
  * Apply patch operations to a model. Returns a new value — the input is not
@@ -210,14 +244,15 @@ export function applyOps(model, ops) {
   if (!Array.isArray(ops)) {
     throw new PatchError("Patch ops must be an array");
   }
+  const owned = new WeakSet();
   let result = model;
   for (let i = 0; i < ops.length; i++) {
-    result = applyOp(result, ops[i]);
+    result = applyOp(result, ops[i], owned);
   }
   return result;
 }
 
-function applyOp(model, op) {
+function applyOp(model, op, owned) {
   if (!isObject(op) || typeof op.op !== "string") {
     throw new PatchError(`Malformed patch op: ${JSON.stringify(op)}`);
   }
@@ -226,24 +261,23 @@ function applyOp(model, op) {
   switch (op.op) {
     case "replace":
       requireValue(op);
-      return updateAt(model, tokens, (parent, token) => replaceIn(parent, token, op.value), op.value);
+      if (tokens.length === 0) return op.value;
+      return editAt(model, tokens, owned, (parent, token) => replaceIn(parent, token, op.value));
     case "add":
       requireValue(op);
-      return updateAt(model, tokens, (parent, token) => addIn(parent, token, op.value), op.value);
+      if (tokens.length === 0) return op.value;
+      return editAt(model, tokens, owned, (parent, token) => addIn(parent, token, op.value));
     case "remove":
       if (tokens.length === 0) throw new PatchError("Cannot remove the document root");
-      return updateAt(model, tokens, removeIn, undefined);
+      return editAt(model, tokens, owned, removeIn);
     case "append":
       if (!Array.isArray(op.value)) {
         throw new PatchError(`append value must be an array at ${JSON.stringify(op.path)}`);
       }
-      if (tokens.length === 0) return appendTo(model, op.value, op.path);
-      return updateAt(
-        model,
-        tokens,
-        (parent, token) => replaceIn(parent, token, appendTo(getIn(parent, token), op.value, op.path)),
-        undefined,
-      );
+      if (tokens.length === 0) return appendTo(model, op.value, op.path, owned);
+      return editAt(model, tokens, owned, (parent, token) => {
+        parent[token] = appendTo(getIn(parent, token), op.value, op.path, owned);
+      });
     default:
       throw new PatchError(`Unknown patch op: ${JSON.stringify(op.op)}`);
   }
@@ -255,13 +289,34 @@ function requireValue(op) {
   }
 }
 
-// Copy-on-write walk to the parent of the last token.
-function updateAt(node, tokens, fn, rootValue) {
-  if (tokens.length === 0) return rootValue;
-  if (tokens.length === 1) return fn(node, tokens[0]);
-  const [token, ...rest] = tokens;
-  const child = getIn(node, token);
-  return replaceIn(node, token, updateAt(child, rest, fn, rootValue));
+// Walk to the parent of the last token, owning every container on the way,
+// and run edit(parent, lastToken) on the owned parent. Returns the owned root.
+// `parent[token] = child` is safe: getIn validated the token (an existing
+// member, or a canonical array index) and assertSafeSegments refused the
+// unsafe keys, so it can never reach an inherited accessor.
+function editAt(model, tokens, owned, edit) {
+  const root = own(model, owned);
+  let parent = root;
+  for (let i = 0; i < tokens.length - 1; i++) {
+    const token = tokens[i];
+    const child = own(getIn(parent, token), owned);
+    parent[token] = child;
+    parent = child;
+  }
+  edit(parent, tokens[tokens.length - 1]);
+  return root;
+}
+
+// The copy of a container this patch may edit in place. Scalars pass
+// through (the next step refuses them as non-containers).
+function own(value, owned) {
+  if (typeof value !== "object" || value === null || owned.has(value)) return value;
+  // Spread, never Object.assign: JSON.parse makes a "__proto__" key an own
+  // data property, and assign would call the inherited __proto__ setter
+  // (prototype change) instead of copying it.
+  const copy = Array.isArray(value) ? value.slice() : { ...value };
+  owned.add(copy);
+  return copy;
 }
 
 function getIn(node, token) {
@@ -275,62 +330,67 @@ function getIn(node, token) {
   throw new PatchError(`Cannot traverse ${JSON.stringify(token)} into a non-container`);
 }
 
+// The edits below mutate `node`, which editAt has made an owned copy.
+
 function replaceIn(node, token, value) {
   if (Array.isArray(node)) {
-    const index = existingIndex(node, token);
-    const copy = node.slice();
-    copy[index] = value;
-    return copy;
+    node[existingIndex(node, token)] = value;
+    return;
   }
   if (isObject(node)) {
     if (!Object.prototype.hasOwnProperty.call(node, token)) {
       throw new PatchError(`Missing member ${JSON.stringify(token)}`);
     }
-    return { ...node, [token]: value };
+    node[token] = value;
+    return;
   }
   throw new PatchError(`Cannot replace ${JSON.stringify(token)} in a non-container`);
 }
 
 function addIn(node, token, value) {
   if (Array.isArray(node)) {
-    if (token === "-") return node.concat([value]);
+    if (token === "-") {
+      node.push(value);
+      return;
+    }
     const index = parseIndex(token);
     if (index > node.length) {
       throw new PatchError(`Array index ${token} out of bounds (length ${node.length})`);
     }
-    const copy = node.slice();
-    copy.splice(index, 0, value);
-    return copy;
+    node.splice(index, 0, value);
+    return;
   }
   if (isObject(node)) {
-    return { ...node, [token]: value };
+    node[token] = value;
+    return;
   }
   throw new PatchError(`Cannot add ${JSON.stringify(token)} to a non-container`);
 }
 
 function removeIn(node, token) {
   if (Array.isArray(node)) {
-    const index = existingIndex(node, token);
-    const copy = node.slice();
-    copy.splice(index, 1);
-    return copy;
+    node.splice(existingIndex(node, token), 1);
+    return;
   }
   if (isObject(node)) {
     if (!Object.prototype.hasOwnProperty.call(node, token)) {
       throw new PatchError(`Missing member ${JSON.stringify(token)}`);
     }
-    const copy = { ...node };
-    delete copy[token];
-    return copy;
+    delete node[token];
+    return;
   }
   throw new PatchError(`Cannot remove ${JSON.stringify(token)} from a non-container`);
 }
 
-function appendTo(node, items, path) {
+// Push the items onto an owned copy of the target array and return it. A
+// loop, not push(...items): spreading a long list overflows the call stack.
+function appendTo(node, items, path, owned) {
   if (!Array.isArray(node)) {
     throw new PatchError(`append target ${JSON.stringify(path)} is not an array`);
   }
-  return node.concat(items);
+  const target = own(node, owned);
+  for (let i = 0; i < items.length; i++) target.push(items[i]);
+  return target;
 }
 
 function existingIndex(arr, token) {
@@ -355,22 +415,6 @@ function assertSafeSegments(segments) {
       throw new PatchError(`Unsafe patch path segment: ${segments[i]}`);
     }
   }
-}
-
-function containsUnsafeKey(value) {
-  if (typeof value !== "object" || value === null) return false;
-  if (Array.isArray(value)) {
-    for (let i = 0; i < value.length; i++) {
-      if (containsUnsafeKey(value[i])) return true;
-    }
-    return false;
-  }
-  const keys = Object.keys(value);
-  for (let i = 0; i < keys.length; i++) {
-    const key = keys[i];
-    if (UNSAFE_KEYS.has(key) || containsUnsafeKey(value[key])) return true;
-  }
-  return false;
 }
 
 // === Wire sync policy ===

@@ -414,7 +414,115 @@ fn invalid_vectors() -> List(#(String, String, String)) {
       "{\"op\":\"replace\",\"path\":\"/a\",\"value\":2}",
     ),
     #("op not object", "{\"a\":1}", "[1]"),
+    #(
+      "unsafe segment",
+      "{\"a\":{}}",
+      "[{\"op\":\"add\",\"path\":\"/a/__proto__\",\"value\":{\"polluted\":true}}]",
+    ),
+    #(
+      "unsafe segment mid-path",
+      "{\"constructor\":{\"prototype\":{}}}",
+      "[{\"op\":\"replace\",\"path\":\"/constructor/prototype/x\",\"value\":1}]",
+    ),
   ]
+}
+
+// === Unsafe keys (SEC-14) ===
+
+pub fn diff_replaces_nearest_safe_parent_of_changed_unsafe_key_test() {
+  log.configure()
+  let old = "{\"a\":{\"constructor\":1,\"b\":1},\"z\":1}"
+  let new = "{\"a\":{\"constructor\":2,\"b\":1},\"z\":1}"
+  let ops = patch.diff(old, new)
+  ops
+  |> should.equal(
+    "[{\"op\":\"replace\",\"path\":\"/a\",\"value\":{\"b\":1,\"constructor\":2}}]",
+  )
+  let assert Ok(result) = patch.apply_ops(old, ops)
+  canonical(result) |> should.equal(canonical(new))
+}
+
+pub fn diff_replaces_root_when_root_unsafe_key_is_added_test() {
+  log.configure()
+  let ops = patch.diff("{}", "{\"__proto__\":{\"polluted\":true}}")
+  ops
+  |> should.equal(
+    "[{\"op\":\"replace\",\"path\":\"\",\"value\":{\"__proto__\":{\"polluted\":true}}}]",
+  )
+}
+
+pub fn diff_replaces_parent_when_unsafe_key_is_removed_test() {
+  log.configure()
+  let ops =
+    patch.diff(
+      "{\"list\":[{\"prototype\":1,\"k\":1}]}",
+      "{\"list\":[{\"k\":1}]}",
+    )
+  ops
+  |> should.equal(
+    "[{\"op\":\"replace\",\"path\":\"/list/0\",\"value\":{\"k\":1}}]",
+  )
+}
+
+pub fn diff_keeps_targeted_ops_when_unsafe_key_is_unchanged_test() {
+  log.configure()
+  // An unsafe key that did not change forces nothing: the sibling that did
+  // change gets its own op, and no path passes through the unsafe key.
+  let ops =
+    patch.diff(
+      "{\"constructor\":{\"x\":1},\"b\":1}",
+      "{\"constructor\":{\"x\":1},\"b\":2}",
+    )
+  ops |> should.equal("[{\"op\":\"replace\",\"path\":\"/b\",\"value\":2}]")
+}
+
+pub fn apply_refuses_unsafe_segment_test() {
+  log.configure()
+  let assert Error(reason) =
+    patch.apply_ops(
+      "{\"a\":{}}",
+      "[{\"op\":\"add\",\"path\":\"/a/prototype\",\"value\":1}]",
+    )
+  reason |> string.contains("unsafe_path_segment") |> should.be_true
+}
+
+// === Apply engine equivalence (PERF-8) ===
+
+/// The zipper apply engine against the list-rebuilding engine it replaced
+/// (kept as a reference in brazier_patch_test_ffi.erl): every seeded random
+/// patch must give the same JSON or the same error reason on both.
+pub fn apply_engine_matches_reference_on_random_patches_test() {
+  log.configure()
+  let #(applied, refused) =
+    int.range(from: 1, to: 2001, with: #(0, 0), run: fn(counts, seed) {
+      let #(applied, refused) = counts
+      case compare_apply(seed) {
+        Ok(True) -> #(applied + 1, refused)
+        Ok(False) -> #(applied, refused + 1)
+        Error(details) ->
+          panic as { "seed " <> int.to_string(seed) <> ": " <> details }
+      }
+    })
+  // Both outcomes must be exercised in quantity, or the comparison is weak.
+  let assert True = applied > 1000 as "most random patches must apply"
+  let assert True = refused > 100 as "some random patches must be refused"
+}
+
+@external(erlang, "brazier_patch_test_ffi", "compare_apply")
+fn compare_apply(seed: Int) -> Result(Bool, String)
+
+/// The client's copy-once applyOps against the per-op copying engine it
+/// replaced, on seeded random patches, with the input and op values checked
+/// unmutated (brazier_client/test/apply_equivalence.mjs).
+pub fn client_apply_engine_matches_reference_test() {
+  case run_node("brazier_client/test/apply_equivalence.mjs", "") {
+    Ok(output) -> {
+      let assert True = string.contains(output, "apply equivalence ok")
+        as { "unexpected apply equivalence output: " <> output }
+      Nil
+    }
+    Error(output) -> panic as { "client apply equivalence failed: " <> output }
+  }
 }
 
 pub fn apply_rejects_every_invalid_vector_test() {
@@ -608,12 +716,24 @@ pub fn client_applies_server_diffs_test() {
 }
 
 /// The client refuses prototype-polluting paths, escapes "/" in keys, and
-/// replaces a model holding an unsafe key at the root
-/// (brazier_client/test/patch_safety.mjs).
+/// replaces the nearest safe parent of a changed unsafe key
+/// (brazier_client/test/patch_safety.mjs). Its unsafe-key list must equal
+/// the server's canonical one.
 pub fn client_patch_safety_test() {
   case run_node("brazier_client/test/patch_safety.mjs", "") {
     Ok(output) -> {
-      let assert True = string.contains(output, "patch safety ok: 5 checks")
+      let assert True = string.contains(output, "patch safety ok: 9 checks")
+        as { "unexpected patch safety output: " <> output }
+      let server_keys =
+        json.to_string(json.array(patch.unsafe_keys(), json.string))
+      let assert True =
+        string.contains(output, "unsafe keys: " <> server_keys <> "\n")
+        as {
+          "client UNSAFE_PATCH_KEYS differ from the server's "
+          <> server_keys
+          <> ": "
+          <> output
+        }
       Nil
     }
     Error(output) -> panic as { "client patch safety failed: " <> output }

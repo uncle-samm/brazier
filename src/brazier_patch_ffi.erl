@@ -1,6 +1,6 @@
 -module(brazier_patch_ffi).
 -export([diff_json/2, apply_json_ops/2, is_empty_ops/1, merge_ops_json/1, count_ops/1,
-         escape_segment/1, parse_pointer/1]).
+         escape_segment/1, parse_pointer/1, unsafe_keys/0]).
 
 %% Brazier state-sync patches.
 %%
@@ -14,7 +14,16 @@
 %% MUST implement exactly the same semantics. Both sides are exercised against
 %% the same randomly generated vectors by test/brazier/patch_test.gleam.
 %%
-%% Reference: RFC 6901, RFC 6902.
+%% Unsafe keys: unsafe_keys/0 below is THE canonical list. patch.mjs mirrors
+%% it as UNSAFE_PATCH_KEYS, and test/brazier/patch_test.gleam asserts the two
+%% are equal. Neither diff ever emits a path through an unsafe key (the
+%% nearest safe parent is replaced instead) and both appliers refuse one.
+%% On the JS client a path through "__proto__", "constructor" or "prototype"
+%% could reach Object.prototype (prototype pollution); the server refuses it
+%% too so both sides keep exactly the same semantics.
+%%
+%% Reference: RFC 6901, RFC 6902; the unsafe keys are the ones the OWASP
+%% prototype-pollution guidance and lodash's `baseSet` guard refuse.
 
 %% Diff two JSON strings and produce patch operations.
 %% Returns a JSON-encoded string of the ops array.
@@ -128,8 +137,19 @@ replace_op(Path, Value) ->
 
 %% Diff two maps: remove deleted keys, add new keys, recurse into shared keys.
 %% Keys are visited in sorted order so the output is deterministic.
+%%
+%% A path through an unsafe key (see unsafe_keys/0) is never emitted: when an
+%% unsafe key is added, removed or changed, the map holding it (the nearest
+%% safe parent) is replaced whole. Both appliers refuse such paths, so an
+%% op through one would force every client into a full resync.
 -spec diff_maps(map(), map(), binary()) -> list().
 diff_maps(Old, New, BasePath) ->
+    case touches_unsafe_key(Old, New) of
+        true -> [replace_op(BasePath, New)];
+        false -> diff_safe_maps(Old, New, BasePath)
+    end.
+
+diff_safe_maps(Old, New, BasePath) ->
     RemovedOps = [#{<<"op">> => <<"remove">>, <<"path">> => child_path(BasePath, Key)}
                   || Key <- lists:sort(maps:keys(Old)), not maps:is_key(Key, New)],
     ChangedOps = lists:flatmap(
@@ -145,6 +165,11 @@ diff_maps(Old, New, BasePath) ->
         end,
         lists:sort(maps:keys(New))),
     RemovedOps ++ ChangedOps.
+
+%% True when an unsafe key was added, removed or changed between two maps.
+%% Three lookups per map, never a walk of the keys.
+touches_unsafe_key(Old, New) ->
+    lists:any(fun(Key) -> maps:find(Key, Old) =/= maps:find(Key, New) end, unsafe_keys()).
 
 %% Diff two arrays.
 %%
@@ -214,109 +239,186 @@ diff_paired([OldVal | OldRest], [NewVal | NewRest], Path, Index) ->
         ++ diff_paired(OldRest, NewRest, Path, Index + 1).
 
 %% === Apply Engine ===
+%%
+%% A patch can carry thousands of ops against one array (the diff of a long
+%% list emits one op per changed element). Rebuilding the list for every op
+%% (lists:split/2, ++, length/1, lists:nth/2) made a patch cost O(ops * n).
+%% Instead every container an op walks through is opened ONCE per patch and
+%% closed back into plain JSON terms after the last op:
+%%
+%%   - a list becomes a zipper (Huet, "The Zipper", JFP 1997):
+%%     {'$open_list', RevBefore, After, Index, Len, HasOpen}. The element at
+%%     Index is the head of After and RevBefore holds the elements before it
+%%     in reverse. Len is tracked so bounds checks never call length/1, and
+%%     HasOpen says whether any element may itself be open.
+%%   - a map becomes {'$open_map', Map, OpenKeys}; OpenKeys holds the keys
+%%     whose values are open.
+%%
+%% Moving the cursor costs the distance moved, so the ascending pairs, the
+%% descending removes and the ascending inserts the diff emits cost
+%% O(n + ops) per array instead of O(ops * n). The tagged tuples never occur
+%% in decoded JSON (json:decode/1 yields only maps, lists, binaries, numbers
+%% and atoms), so an open container is never confused with a model value.
+%% The error terms are exactly those of the list-rebuilding engine; the
+%% randomized comparison in test/brazier/patch_test.gleam holds them equal.
 
 -spec apply_ops_list(term(), list()) -> term().
-apply_ops_list(Model, []) ->
-    Model;
-apply_ops_list(Model, [Op | Rest]) ->
-    apply_ops_list(apply_single_op(Model, Op), Rest).
+apply_ops_list(Model, Ops) ->
+    close(lists:foldl(fun(Op, Root) -> apply_single_op(Root, Op) end, Model, Ops)).
 
 -spec apply_single_op(term(), term()) -> term().
-apply_single_op(Model, #{<<"op">> := <<"replace">>, <<"path">> := Path, <<"value">> := Value}) ->
-    update_at(Model, parse_path(Path), fun(Container, Token) -> replace_in(Container, Token, Value) end, Value);
-apply_single_op(Model, #{<<"op">> := <<"add">>, <<"path">> := Path, <<"value">> := Value}) ->
-    update_at(Model, parse_path(Path), fun(Container, Token) -> add_in(Container, Token, Value) end, Value);
-apply_single_op(Model, #{<<"op">> := <<"remove">>, <<"path">> := Path}) ->
-    case parse_path(Path) of
+apply_single_op(Root, #{<<"op">> := <<"replace">>, <<"path">> := Path, <<"value">> := Value}) ->
+    update_at(Root, safe_path(Path), fun(Container, Token) -> replace_in(Container, Token, Value) end, Value);
+apply_single_op(Root, #{<<"op">> := <<"add">>, <<"path">> := Path, <<"value">> := Value}) ->
+    update_at(Root, safe_path(Path), fun(Container, Token) -> add_in(Container, Token, Value) end, Value);
+apply_single_op(Root, #{<<"op">> := <<"remove">>, <<"path">> := Path}) ->
+    case safe_path(Path) of
         [] -> erlang:error({cannot_remove_root, Path});
-        Tokens -> update_at(Model, Tokens, fun remove_in/2, undefined)
+        Tokens -> update_at(Root, Tokens, fun remove_in/2, undefined)
     end;
-apply_single_op(Model, #{<<"op">> := <<"append">>, <<"path">> := Path, <<"value">> := Items})
+apply_single_op(Root, #{<<"op">> := <<"append">>, <<"path">> := Path, <<"value">> := Items})
         when is_list(Items) ->
-    case parse_path(Path) of
-        [] -> append_to(Model, Items, Path);
+    case safe_path(Path) of
+        [] -> append_to(Root, Items, Path);
         Tokens ->
-            update_at(Model, Tokens,
+            update_at(Root, Tokens,
                       fun(Container, Token) ->
-                          Current = get_in(Container, Token),
-                          replace_in(Container, Token, append_to(Current, Items, Path))
+                          {Current, Seeked} = get_in(Container, Token),
+                          replace_in(Seeked, Token, append_to(Current, Items, Path))
                       end,
                       undefined)
     end;
-apply_single_op(_Model, Op) ->
+apply_single_op(_Root, Op) ->
     erlang:error({unknown_or_malformed_op, Op}).
 
-%% Walk to the parent of the final token and apply Fun(Parent, LastToken).
-%% An empty token list means the whole document: RootValue is returned.
-update_at(_Model, [], _Fun, RootValue) ->
-    RootValue;
-update_at(Model, [Token], Fun, _RootValue) ->
-    Fun(Model, Token);
-update_at(Model, [Token | Rest], Fun, RootValue) ->
-    Child = get_in(Model, Token),
-    replace_in(Model, Token, update_at(Child, Rest, Fun, RootValue)).
+%% Parse a pointer and refuse any token on the unsafe-key list.
+safe_path(Path) ->
+    Tokens = parse_path(Path),
+    case [Token || Token <- Tokens, lists:member(Token, unsafe_keys())] of
+        [] -> Tokens;
+        [Unsafe | _] -> erlang:error({unsafe_path_segment, Unsafe})
+    end.
 
-get_in(Map, Key) when is_map(Map) ->
+%% Keys a patch path must never pass through. THE canonical list: patch.mjs
+%% mirrors it as UNSAFE_PATCH_KEYS and patch_test.gleam asserts equality.
+-spec unsafe_keys() -> list(binary()).
+unsafe_keys() ->
+    [<<"__proto__">>, <<"constructor">>, <<"prototype">>].
+
+%% Walk to the parent of the final token, opening each container on the way,
+%% and apply Fun(OpenParent, LastToken). An empty token list means the whole
+%% document: RootValue is returned.
+update_at(_Node, [], _Fun, RootValue) ->
+    RootValue;
+update_at(Node, [Token], Fun, _RootValue) ->
+    Fun(open(Node, Token), Token);
+update_at(Node, [Token | Rest], Fun, RootValue) ->
+    {Child, Seeked} = get_in(open(Node, Token), Token),
+    replace_in(Seeked, Token, update_at(Child, Rest, Fun, RootValue)).
+
+%% Open a container for in-place editing within this patch. An already open
+%% container is returned as is; a scalar cannot be traversed.
+open({'$open_list', _, _, _, _, _} = Open, _Token) -> Open;
+open({'$open_map', _, _} = Open, _Token) -> Open;
+open(Map, _Token) when is_map(Map) -> {'$open_map', Map, #{}};
+open(List, _Token) when is_list(List) -> {'$open_list', [], List, 0, length(List), false};
+open(Other, Token) -> erlang:error({not_a_container, Token, Other}).
+
+is_open({'$open_list', _, _, _, _, _}) -> true;
+is_open({'$open_map', _, _}) -> true;
+is_open(_) -> false.
+
+%% Close an open container (and every open container inside it) back into a
+%% plain JSON term. A plain value never holds an open one, so it is returned
+%% as is without a walk.
+close({'$open_list', RevBefore, After, _Index, _Len, false}) ->
+    lists:reverse(RevBefore, After);
+close({'$open_list', RevBefore, After, _Index, _Len, true}) ->
+    [close(Element) || Element <- lists:reverse(RevBefore, After)];
+close({'$open_map', Map, OpenKeys}) ->
+    %% `:=` crashes if an open key is missing: OpenKeys must be a subset of
+    %% the map's keys, an invariant replace_in/add_in/remove_in maintain.
+    maps:fold(fun(Key, true, Acc) -> Acc#{Key := close(maps:get(Key, Acc))} end, Map, OpenKeys);
+close(Value) ->
+    Value.
+
+%% Move a zipper's cursor to Target (0 =< Target =< Len).
+seek({'$open_list', RevBefore, After, Index, Len, HasOpen}, Target) ->
+    {RevBefore1, After1} = move(RevBefore, After, Index, Target),
+    {'$open_list', RevBefore1, After1, Target, Len, HasOpen}.
+
+move(RevBefore, After, Index, Index) ->
+    {RevBefore, After};
+move(RevBefore, [Element | After], Index, Target) when Index < Target ->
+    move([Element | RevBefore], After, Index + 1, Target);
+move([Element | RevBefore], After, Index, Target) when Index > Target ->
+    move(RevBefore, [Element | After], Index - 1, Target).
+
+%% Look up a child. Returns {Child, Open}: Open is the container with its
+%% cursor moved onto the child, so the replace_in/3 that follows is O(1).
+get_in({'$open_map', Map, _} = Open, Key) ->
     case maps:find(Key, Map) of
-        {ok, Value} -> Value;
+        {ok, Value} -> {Value, Open};
         error -> erlang:error({missing_member, Key})
     end;
-get_in(List, Token) when is_list(List) ->
-    Index = existing_index(List, Token),
-    lists:nth(Index + 1, List);
-get_in(Other, Token) ->
-    erlang:error({not_a_container, Token, Other}).
+get_in({'$open_list', _, _, _, Len, _} = Open, Token) ->
+    {'$open_list', _, [Value | _], _, _, _} = Seeked = seek(Open, existing_index(Token, Len)),
+    {Value, Seeked}.
 
-replace_in(Map, Key, Value) when is_map(Map) ->
+replace_in({'$open_map', Map, OpenKeys}, Key, Value) ->
     case maps:is_key(Key, Map) of
-        true -> maps:put(Key, Value, Map);
+        true -> {'$open_map', maps:put(Key, Value, Map), track_open(Key, Value, OpenKeys)};
         false -> erlang:error({missing_member, Key})
     end;
-replace_in(List, Token, Value) when is_list(List) ->
-    Index = existing_index(List, Token),
-    {Before, [_ | After]} = lists:split(Index, List),
-    Before ++ [Value | After];
-replace_in(Other, Token, _Value) ->
-    erlang:error({not_a_container, Token, Other}).
+replace_in({'$open_list', _, _, _, Len, _} = Open, Token, Value) ->
+    {'$open_list', RevBefore, [_ | After], Index, Len, HasOpen} = seek(Open, existing_index(Token, Len)),
+    {'$open_list', RevBefore, [Value | After], Index, Len, HasOpen orelse is_open(Value)}.
 
-add_in(Map, Key, Value) when is_map(Map) ->
-    maps:put(Key, Value, Map);
-add_in(List, <<"-">>, Value) when is_list(List) ->
-    List ++ [Value];
-add_in(List, Token, Value) when is_list(List) ->
+add_in({'$open_map', Map, OpenKeys}, Key, Value) ->
+    {'$open_map', maps:put(Key, Value, Map), track_open(Key, Value, OpenKeys)};
+add_in({'$open_list', _, _, _, Len, _} = Open, <<"-">>, Value) ->
+    insert_at(Open, Len, Value);
+add_in({'$open_list', _, _, _, Len, _} = Open, Token, Value) ->
     Index = parse_index(Token),
-    case Index =< length(List) of
-        true ->
-            {Before, After} = lists:split(Index, List),
-            Before ++ [Value | After];
-        false ->
-            erlang:error({index_out_of_bounds, Token, length(List)})
-    end;
-add_in(Other, Token, _Value) ->
-    erlang:error({not_a_container, Token, Other}).
+    case Index =< Len of
+        true -> insert_at(Open, Index, Value);
+        false -> erlang:error({index_out_of_bounds, Token, Len})
+    end.
 
-remove_in(Map, Key) when is_map(Map) ->
+insert_at(Open, Index, Value) ->
+    {'$open_list', RevBefore, After, Index, Len, HasOpen} = seek(Open, Index),
+    {'$open_list', RevBefore, [Value | After], Index, Len + 1, HasOpen orelse is_open(Value)}.
+
+remove_in({'$open_map', Map, OpenKeys}, Key) ->
     case maps:is_key(Key, Map) of
-        true -> maps:remove(Key, Map);
+        true -> {'$open_map', maps:remove(Key, Map), maps:remove(Key, OpenKeys)};
         false -> erlang:error({missing_member, Key})
     end;
-remove_in(List, Token) when is_list(List) ->
-    Index = existing_index(List, Token),
-    {Before, [_ | After]} = lists:split(Index, List),
-    Before ++ After;
-remove_in(Other, Token) ->
-    erlang:error({not_a_container, Token, Other}).
+remove_in({'$open_list', _, _, _, Len, _} = Open, Token) ->
+    {'$open_list', RevBefore, [_ | After], Index, Len, HasOpen} = seek(Open, existing_index(Token, Len)),
+    {'$open_list', RevBefore, After, Index, Len - 1, HasOpen}.
 
-append_to(List, Items, _Path) when is_list(List) ->
-    List ++ Items;
+track_open(Key, Value, OpenKeys) ->
+    case is_open(Value) of
+        true -> OpenKeys#{Key => true};
+        false -> maps:remove(Key, OpenKeys)
+    end.
+
+%% Concatenate Items onto the end of a list target. The cursor moves to the
+%% end once; Items become the tail without copying the list.
+append_to({'$open_list', _, _, _, Len, _} = Open, Items, _Path) ->
+    {'$open_list', RevBefore, [], Len, Len, HasOpen} = seek(Open, Len),
+    {'$open_list', RevBefore, Items, Len, Len + length(Items), HasOpen};
+append_to(List, Items, Path) when is_list(List) ->
+    append_to(open(List, Path), Items, Path);
 append_to(Other, _Items, Path) ->
-    erlang:error({append_target_not_array, Path, Other}).
+    erlang:error({append_target_not_array, Path, close(Other)}).
 
-existing_index(List, Token) ->
+existing_index(Token, Len) ->
     Index = parse_index(Token),
-    case Index < length(List) of
+    case Index < Len of
         true -> Index;
-        false -> erlang:error({index_out_of_bounds, Token, length(List)})
+        false -> erlang:error({index_out_of_bounds, Token, Len})
     end.
 
 %% RFC 6901 array index: "0" or a decimal without leading zeros.
