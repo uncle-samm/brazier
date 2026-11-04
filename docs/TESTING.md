@@ -88,6 +88,7 @@ message is done.
 
 Example: a runtime test, connected through a fake transport subject:
 
+<!-- docs-check: fragment uses the test-only helpers in test/beacon (test_ctx, await), which apps cannot import -->
 ```gleam
 let assert Ok(rt) = runtime.start(config, test_ctx.root())
 let transport_subject = process.new_subject()
@@ -119,6 +120,7 @@ every log event the calling process emitted while it ran, as
 primary logger level so that debug events are captured. `log_capture.has`
 checks for a level plus message fragments.
 
+<!-- docs-check: fragment uses the test-only helpers in test/beacon (log_capture), which apps cannot import -->
 ```gleam
 let #(Nil, logs) = log_capture.capture(fn() { log.warning("my_mod", "slow") })
 assert logs == [Captured(level: "warning", message: "[my_mod] slow")]
@@ -132,6 +134,11 @@ that level for every test that runs after it.
 
 Round-trip the wire protocol, including malformed and hostile input:
 
+<!-- docs-check: wrap
+import beacon/transport
+
+{{block}}
+-->
 ```gleam
 pub fn decode_heartbeat_test() {
   let assert Ok(transport.ClientHeartbeat) =
@@ -152,6 +159,7 @@ The security transport tests cover:
 These tests drive real WebSocket connections against an app started on an
 OS-assigned port:
 
+<!-- docs-check: fragment uses the test-only helpers in test/beacon (sim/test_app, sim/pool, sim/metrics, sim/teardown), which apps cannot import -->
 ```gleam
 let assert Ok(app) = test_app.start_counter_app()
 let mt = metrics.new()

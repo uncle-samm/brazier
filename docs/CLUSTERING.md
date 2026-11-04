@@ -32,6 +32,48 @@ in this order:
    `beacon.watch_presence(..)` is set.
 5. The HTTP and WebSocket listener.
 
+<!-- docs-check: wrap
+import beacon
+import beacon/effect.{type Effect}
+import beacon/element.{type Element}
+import beacon/presence
+import beacon/presence/sync
+import beacon/cluster
+
+pub fn main(
+  discovery: cluster.Discovery,
+  secret_key: String,
+  online: presence.PresenceConfig(String),
+) {
+  {{block}}
+}
+
+pub type Model {
+  Model(room: String, user: String, status: String)
+}
+
+pub type Msg {
+  PresenceChanged(sync.Diff(String))
+}
+
+fn init(_ctx: beacon.Context) -> Result(#(Model, Effect(Msg)), beacon.InitError) {
+  Ok(#(Model(room: "1", user: "ada", status: "online"), effect.none()))
+}
+
+fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
+  case msg {
+    PresenceChanged(_) -> #(model, effect.none())
+  }
+}
+
+fn view(model: Model) -> Element(Msg) {
+  element.text(model.user)
+}
+
+fn track(model: Model) -> List(presence.Tracking(String)) {
+  [presence.Tracking(topic: "room:" <> model.room, key: model.user, meta: model.status)]
+}
+-->
 ```gleam
 beacon.application(init:, update:, view:)
 |> beacon.cluster(cluster.new(discovery, secret_key: secret_key))
@@ -148,6 +190,13 @@ and logged at info level.
 
 To run a production node over an insecure setup on purpose, say why:
 
+<!-- docs-check: wrap
+import beacon/cluster
+
+pub fn config(discovery: cluster.Discovery, secret: String) -> cluster.ClusterConfig {
+  {{block}}
+}
+-->
 ```gleam
 cluster.new(discovery, secret_key: secret)
 |> cluster.allow_insecure_distribution("single-host demo, loopback only")
@@ -159,18 +208,49 @@ reason. If distribution is not started at all, the result is
 
 ## The cluster manager
 
+<!-- docs-check: wrap
+import beacon/effect.{type Effect}
+import beacon/element.{type Element}
+
+{{block}}
+
+pub type Model {
+  Model(count: Int)
+}
+
+pub type Msg {
+  Increment
+}
+
+fn init(_ctx: beacon.Context) -> Result(#(Model, Effect(Msg)), beacon.InitError) {
+  Ok(#(Model(count: 0), effect.none()))
+}
+
+fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
+  case msg {
+    Increment -> #(Model(count: model.count + 1), effect.none())
+  }
+}
+
+fn view(_model: Model) -> Element(Msg) {
+  element.text("counter")
+}
+-->
 ```gleam
+import beacon
 import beacon/cluster
 
-let config =
-  cluster.new(
-    cluster.Dns(query: "app.internal", basename: "app", poll_ms: 5000),
-    secret_key: secret_key,
-  )
+pub fn start(secret_key: String) {
+  let config =
+    cluster.new(
+      cluster.Dns(query: "app.internal", basename: "app", poll_ms: 5000),
+      secret_key: secret_key,
+    )
 
-beacon.application(init:, update:, view:)
-|> beacon.cluster(config)
-|> beacon.start(8080)
+  beacon.application(init:, update:, view:)
+  |> beacon.cluster(config)
+  |> beacon.start(8080)
+}
 ```
 
 `beacon.cluster` runs the manager in the application's supervision tree,
@@ -269,6 +349,15 @@ Presence is the better fit for "who is here".
 
 ## Replicated stores
 
+<!-- docs-check: wrap
+import beacon/store
+import beacon/store/replicated
+
+pub fn open_cart() -> store.Store(Int) {
+  {{block}}
+  cart
+}
+-->
 ```gleam
 let assert Ok(cart) =
   store.open("cart", store.Replicated(replicated.default_config()))
@@ -400,6 +489,14 @@ A session store has one of two backends.
   - A storage error is logged and returned as `SessionBackendFailed`. The
     session is never treated as valid.
 
+<!-- docs-check: wrap
+import beacon/session
+
+pub fn start(postgres_backend: session.ExternalBackend) -> session.SessionStore {
+  {{block}}
+  store
+}
+-->
 ```gleam
 let assert Ok(store) =
   session.start_store(session.External(postgres_backend), session.default_store_config())
@@ -430,30 +527,74 @@ Most apps track their sessions with `beacon.presence`. The tracker runs in
 the application's supervision tree, and each session declares what it is
 present as from its state:
 
+<!-- docs-check: wrap
+import beacon/effect.{type Effect}
+import beacon/element.{type Element}
+import gleam/dynamic/decode
+import gleam/json
+
+{{block}}
+
+pub type Model {
+  Model(
+    room: String,
+    user: String,
+    profile: Profile,
+    online: List(sync.Entry(Profile)),
+  )
+}
+
+pub type Profile {
+  Profile(name: String)
+}
+
+fn init(_ctx: beacon.Context) -> Result(#(Model, Effect(Msg)), beacon.InitError) {
+  let profile = Profile(name: "Ada")
+  Ok(#(Model(room: "1", user: "ada", profile:, online: []), effect.none()))
+}
+
+fn view(model: Model) -> Element(Msg) {
+  element.text(model.profile.name)
+}
+
+fn encode_profile(profile: Profile) -> json.Json {
+  json.object([#("name", json.string(profile.name))])
+}
+
+fn profile_decoder() -> decode.Decoder(Profile) {
+  use name <- decode.field("name", decode.string)
+  decode.success(Profile(name:))
+}
+-->
 ```gleam
+import beacon
 import beacon/presence
 import beacon/presence/sync
 
 pub type Msg {
   PresenceChanged(sync.Diff(Profile))
-  // ...
 }
 
-let online = presence.new("online", encode_user, user_decoder())
+pub fn main() {
+  let online = presence.new("online", encode_profile, profile_decoder())
 
-beacon.application(init:, update:, view:)
-|> beacon.presence(
-  tracker: online,
-  track: fn(model) {
-    [presence.Tracking(topic: "room:" <> model.room, key: model.user, meta: model.profile)]
-  },
-  on_presence: PresenceChanged,
-)
-|> beacon.start(8080)
+  beacon.application(init:, update:, view:)
+  |> beacon.presence(
+    tracker: online,
+    track: fn(model) {
+      [presence.Tracking(topic: "room:" <> model.room, key: model.user, meta: model.profile)]
+    },
+    on_presence: PresenceChanged,
+  )
+  |> beacon.start(8080)
+}
 
-// In update:
-PresenceChanged(diff) ->
-  #(Model(..model, online: sync.merge(model.online, diff)), effect.none())
+fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
+  case msg {
+    PresenceChanged(diff) ->
+      #(Model(..model, online: sync.merge(model.online, diff)), effect.none())
+  }
+}
 ```
 
 `Diff`, `Entry` and `Meta` are in `beacon/presence/sync`, which runs in the
@@ -545,6 +686,39 @@ A session that only shows who is here, such as a dashboard or a lobby
 list, uses `beacon.watch_presence`. It follows the topics `watch` returns
 for its state and tracks nothing, so it never appears in a list:
 
+<!-- docs-check: wrap
+import beacon
+import beacon/effect.{type Effect}
+import beacon/element.{type Element}
+import beacon/presence
+import beacon/presence/sync
+
+pub fn main(online: presence.PresenceConfig(String)) {
+  {{block}}
+}
+
+pub type Model {
+  Model(room: String, user: String, status: String)
+}
+
+pub type Msg {
+  PresenceChanged(sync.Diff(String))
+}
+
+fn init(_ctx: beacon.Context) -> Result(#(Model, Effect(Msg)), beacon.InitError) {
+  Ok(#(Model(room: "1", user: "ada", status: "online"), effect.none()))
+}
+
+fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
+  case msg {
+    PresenceChanged(_) -> #(model, effect.none())
+  }
+}
+
+fn view(model: Model) -> Element(Msg) {
+  element.text(model.user)
+}
+-->
 ```gleam
 beacon.application(init:, update:, view:)
 |> beacon.watch_presence(
@@ -568,6 +742,39 @@ session later, with a logged error.
 A session that is on some topics and follows others, such as a user in a
 room who also sees the lobby, uses `beacon.track_and_watch_presence`:
 
+<!-- docs-check: wrap
+import beacon
+import beacon/effect.{type Effect}
+import beacon/element.{type Element}
+import beacon/presence
+import beacon/presence/sync
+
+pub fn main(online: presence.PresenceConfig(String)) {
+  {{block}}
+}
+
+pub type Model {
+  Model(room: String, user: String, status: String)
+}
+
+pub type Msg {
+  PresenceChanged(sync.Diff(String))
+}
+
+fn init(_ctx: beacon.Context) -> Result(#(Model, Effect(Msg)), beacon.InitError) {
+  Ok(#(Model(room: "1", user: "ada", status: "online"), effect.none()))
+}
+
+fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
+  case msg {
+    PresenceChanged(_) -> #(model, effect.none())
+  }
+}
+
+fn view(model: Model) -> Element(Msg) {
+  element.text(model.user)
+}
+-->
 ```gleam
 beacon.application(init:, update:, view:)
 |> beacon.track_and_watch_presence(
@@ -593,17 +800,45 @@ its tracked topics, so it does not also need to watch them.
 The rest of this section describes the tracker itself, for processes that
 are not Beacon sessions.
 
+<!-- docs-check: wrap
+import gleam/dynamic/decode
+import gleam/json
+
+{{block}}
+
+pub type UserMeta {
+  UserMeta(status: String)
+}
+
+fn encode_user_meta(meta: UserMeta) -> json.Json {
+  json.object([#("status", json.string(meta.status))])
+}
+
+fn user_meta_decoder() -> decode.Decoder(UserMeta) {
+  use status <- decode.field("status", decode.string)
+  decode.success(UserMeta(status:))
+}
+-->
 ```gleam
 import beacon/presence
 
-let config = presence.new("users", encode_user_meta, user_meta_decoder)
-let assert Ok(child) = presence.supervised(config)
-let assert Ok(users) = presence.handle(config)
+fn users_config() -> presence.PresenceConfig(UserMeta) {
+  presence.new("users", encode_user_meta, user_meta_decoder())
+}
 
-// In the process to track (for example a connection's runtime):
-let assert Ok(_ref) = presence.track(users, "room:42", user_id, UserMeta(status: "online"))
-let assert Ok(Nil) = presence.subscribe(users, "room:42")
-let assert Ok(entries) = presence.list(users, "room:42")
+/// The tracker's child, for your supervisor.
+pub fn users_child() {
+  presence.supervised(users_config())
+}
+
+/// In the process to track (for example a connection's runtime).
+pub fn join_room(user_id: String) {
+  let assert Ok(users) = presence.handle(users_config())
+  let assert Ok(_ref) =
+    presence.track(users, "room:42", user_id, UserMeta(status: "online"))
+  let assert Ok(Nil) = presence.subscribe(users, "room:42")
+  presence.list(users, "room:42")
+}
 ```
 
 - `track`, `update`, `untrack` and `untrack_all` act on the calling

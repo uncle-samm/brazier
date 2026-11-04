@@ -15,7 +15,7 @@ checks.
 | `examples/routed` | Explicit imported route modules with root-owned `Model`/`Msg` |
 | `examples/routed_workspace` | Explicit route-aware app with Local/model state |
 | `examples/route_server_workspace` | Explicit route mini-apps with route-local private `Server` state |
-| `examples/auth_workspace` | API login/logout, HttpOnly auth cookie, CSRF, `ws_auth` with `auth.allow_guests_ws`, `init` through `auth.init_from_session`, a role-gated route, route-aware SSR, and server-private session state |
+| `examples/auth_workspace` | API login/logout, HttpOnly auth cookie, a per-browser login CSRF cookie, CSRF-checked API writes (`auth.protect_api_with_csrf`), `ws_auth` with `auth.allow_guests_ws`, `init` through `auth.init_from_session`, a role-gated route, route-aware SSR, and server-private session state |
 
 ## Required Checks
 
