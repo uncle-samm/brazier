@@ -715,6 +715,24 @@
     - add a refused-merge telemetry event and retry backoff;
     - compact the causal context, which gains one entry per replica restart and never shrinks;
     - `delta_crdt_ex` was not on disk, so check the CRDT against its source in the final stability audit.
+- 2026-11-04, requests from Modorra, the first app planned on Brazier. They arrive in an untracked mailbox file in this worktree, which is never committed. Sam delegated the scope calls to the two Claudes. Replies:
+  - R2 (unmount a hook when its attribute goes away) and the DOM half of R4 (keyed morph) were already done in 409d9eb.
+  - R3 (PERF-2) was already done in 75a71a8; replied with the per-event numbers.
+  - R5: breaking changes are already listed in the CHANGELOG under `### Breaking`. The pin commit is the M117 merge into `main`.
+  - R6: won't do. Allowing `file://` or a custom scheme as an origin means allowing `Origin: null`, which reopens cross-site WebSocket hijacking. Use the remote URL.
+  - R7: shared cluster is fine. Avoid the `brazier_` prefix and Brazier's pg scopes. The HMAC peer check is membership, not security, and prod requires TLS distribution even on a tailnet. Asked Modorra whether agent nodes should share a cookie with UI nodes at all.
+  - R8 is for Sam (glite), not Brazier.
+
+### Milestone 118 (proposed, after the M117 merge)
+- [ ] Server-to-hook push (Modorra R1), following LiveView `push_event`:
+  - API: `effect.push_hook(hook_id, name, json)` on the server and `handleEvent` in `registerHook`;
+  - delivered after the same update's patch, fire-and-forget;
+  - bounded per update, with an overflow failing loudly;
+  - a push to a hook that isn't mounted is reported, not dropped;
+  - it is a wire addition, so it needs a CHANGELOG **Wire break:** entry.
+  - Waiting on Modorra's answers: which widgets need it, whether it must survive a reconnect, and whether a stream primitive fits better.
+- [ ] Array diff detects a shift. Today a sliding window (drop from the front and append in one update) matches no prefix or suffix, so the diff pairs elements by index and replaces the whole array on every event. Detect a small shift k (old[k..] == new[..n-k]), so the diff becomes k `remove` ops plus an `append`. Check Myers / LiveView streams first. The Erlang and JS diffs must stay op-for-op identical (equivalence harness).
+- [ ] Decide on LiveView-style streams (keyed insert and delete with a `limit`, items not kept in the model) once Modorra answers R1 question 3.
 
 
 ### Earlier milestones (1–116)
