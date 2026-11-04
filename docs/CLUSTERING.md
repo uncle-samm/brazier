@@ -477,6 +477,10 @@ is the one in [STATE_MANAGEMENT.md](STATE_MANAGEMENT.md#replicated-stores).
    each replica broadcasts a digest of its state. A replica whose digest
    differs asks the sender for its full state and merges it. This repairs
    any delta lost to a netsplit, a crash or an overloaded PubSub forwarder.
+   The digest is the XOR of a SHA-256 hash of each live entry, clock entry
+   and cloud dot, as Riak's TicTac anti-entropy trees hash their segments.
+   Every merge folds in the hashes of what it adds and removes, so a tick
+   costs the same whatever the store's size.
 4. A replica that starts asks every peer for its full state at once. This
    covers a node joining, a node rejoining after a crash, and a replica
    restarted by its supervisor. It also asks a node for its full state
@@ -563,8 +567,11 @@ gets `Error(InvalidConfig(_))`.
 - Every remote merge (delta or full state, accepted or refused) runs in a
   `[brazier, store, sync]` span. The stop event's `entries` is the number of
   entries the payload carried and `bytes` its size; `peer` is the sending
-  node. A malformed payload reports `entries` 0, since its entries cannot
-  be counted. See [TELEMETRY.md](TELEMETRY.md).
+  node. Its `result` is `ok`, `malformed`, `too_large` or
+  `too_many_entries`, and `reason` names the malformed field or the limit
+  (`max_delta_bytes`, `max_sync_bytes`, `max_entries`), or is `none`. A
+  malformed payload reports `entries` 0, since its entries cannot be
+  counted. See [TELEMETRY.md](TELEMETRY.md).
 
 ### Caveats
 

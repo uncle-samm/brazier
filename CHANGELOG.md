@@ -179,6 +179,18 @@ with its own changelog, so they are not listed here.
   crash. `patch.is_empty`, `patch.diff_json` and `patch.merge_ops_json`
   are removed. The runtime's cached model is
   `FullModelCache(snapshot: patch.Snapshot)`.
+- (M117 follow-up) `brazier/store/crdt.fingerprint` is removed: a state
+  carries its anti-entropy digest (`State(.., digest:)`, read with
+  `crdt.digest`, checked with `crdt.recompute_digest`). The digest a replica
+  broadcasts is a different value from the old sorted-fingerprint hash, so
+  a cluster mixing builds from before and after this change full-syncs on
+  every tick until every node runs the same build.
+- (M117 follow-up) `brazier/build/program.absolute_path` returns
+  `Result(String, String)`, and the resolver passed to
+  `project_toml.pinned_dependency_line` returns one too.
+- (M117 follow-up) `telemetry.store_sync_span`'s function returns
+  `#(result, entries, bytes, outcome, reason)`: the outcome and reason are
+  the stop event's `result` and `reason` metadata.
 
 ### Added
 
@@ -247,6 +259,13 @@ with its own changelog, so they are not listed here.
   browser tests that wait on the client instead of a quiet period.
 - (Final audit) `attribute.unsafe_srcdoc(html)`: an `<iframe>` `srcdoc`,
   named for what it does like `element.unsafe_raw_html`.
+- (M117 follow-up) The `[brazier, store, sync]` stop event carries `result`
+  (`ok`, `malformed`, `too_large` or `too_many_entries`) and `reason` (the
+  failing field of a malformed payload, or the limit a refused one broke:
+  `max_delta_bytes`, `max_sync_bytes`, `max_entries`; `none` when merged),
+  with the store and the peer node, so a refused payload is told apart from
+  an empty one. Phoenix puts the outcome in the stop metadata the same
+  way, as `[brazier, ws, upgrade]` does.
 
 ### Changed
 
@@ -599,6 +618,19 @@ with its own changelog, so they are not listed here.
   port still open are each recorded as a failure, and `stop_server` returns
   False, so `start_example` does not start the next example against a page
   still connected to the old server.
+- (M117 follow-up) A replicated store's digest is kept up to date by every
+  merge instead of computed on each sync tick: the XOR of a SHA-256 hash of
+  each live entry, clock entry and cloud dot, updated with the elements a
+  merge adds and removes (Riak's TicTac AAE `leveled_tictac`;
+  delta_crdt_ex updates its MerkleMap on every change). A tick used to sort
+  and hash the whole state, O(n log n); it is now O(1), and a write costs a
+  few hashes more.
+- (M117 follow-up) `brazier/build/program.absolute_path` reads the current
+  directory itself and returns its error (`Cannot resolve PATH: cannot read
+  the current directory: REASON`, logged at error) when the directory was
+  deleted under the VM or is no longer searchable. `filename:absname/1`
+  crashed the build with a `badmatch` there, behind an `Ok` the FFI spec
+  promised always.
 
 ### Removed
 
@@ -640,7 +672,8 @@ with its own changelog, so they are not listed here.
   cloud, and that each live dot is covered by its own context) before it
   reads or joins it. A malformed payload is refused, logged at error with
   the failing field and reported in the `[brazier, store, sync]` span with
-  `entries` 0; the replica keeps its state. It used to read the payload
+  `entries` 0, `result` `malformed` and the field as `reason`; the replica
+  keeps its state. It used to read the payload
   unchecked, so a malformed term from a verified member crashed the
   replica or was joined (Phoenix.Tracker validates a replica's message
   before merging it).

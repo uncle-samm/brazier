@@ -554,6 +554,23 @@
       - a stray `[brazier, ws, upgrade, stop]` handler leaks, most likely from allowed_hosts_test or live_page_gate_test;
       - `peer.eventually` polls remain in cluster_test (21) and membership_test (10);
       - `brazier_cluster_test_ffi` counters notify no one and `recorded` races between senders; `counted_events` races too.
+  - [x] w5-store-build, merged as 4817e5f (branch `m117-store-crdt-build`, commits ce7943a and 64cb30c).
+    - A refused replica payload is reported on the `[brazier, store, sync]` stop event:
+      - `result` is `ok`, `malformed`, `too_large` or `too_many_entries`, and `reason` names the failing field or limit (the Phoenix and `[brazier, ws, upgrade]` convention of putting the outcome on stop metadata);
+      - the decision is made in `brazier_store_replica:admit/4`;
+      - the 2-node validation test now waits on the event.
+    - The CRDT digest is incremental:
+      - `crdt.State` carries the XOR of SHA-256 hashes of each live (key, dot), clock entry and cloud dot, updated by every join (Riak TicTac AAE, delta_crdt_ex MerkleMap);
+      - `crdt.fingerprint` is removed;
+      - the old sorted fingerprint is kept as a test oracle. A 20 seeds × 500 steps property test on 3 replicas checks that digests are equal exactly when fingerprints are, and the oracle join checks the cached digest against `recompute_digest`;
+      - a write plus digest costs 969 reductions on 10 keys and on 10,000, against about 1.2M before.
+    - `program.absolute_path` returns `Result`: `filename:absname/1` crashes when the current directory has been deleted (`enoent`) or can't be searched (`eacces`), and this is now an error, logged. A test covers a deleted cwd.
+    - Coordinator verify on the merge of 136a22b into the branch (8c21e0c): clean build with zero warnings, format and lint clean, 1743 tests passing in each of 3 runs, and docs check OK (73 modules).
+    - Decisions:
+      - the agent made a small edit outside its files, to `brazier_telemetry_ffi.erl` and `telemetry.gleam`, because the store span callback now returns `result` and `reason`;
+      - the digest changed on the wire between replicas, so a cluster mixing builds full-syncs until every node runs the same build. This is noted in the CHANGELOG; nothing has been released;
+      - the XOR digest resists accidental collisions only, which is enough because members trust each other (documented on `crdt.digest`). A keyed hash would be needed if untrusted members ever became possible.
+    - Follow-up: the `store.crdt_append.*` bench baselines shift by about 2µs per write. The final-verification re-baseline covers it.
 - [ ] Final verification: build (zero warnings), tests, all examples, CDP browser suite, perf baselines
 
 **Decisions (Milestone 117, coordinator):**

@@ -354,7 +354,9 @@ fn documented() -> List(Documented) {
     Plain(["effect", "background", "rejected"], [], ["limit"]),
     Plain(["ssr", "join_token", "too_large"], ["bytes"], ["budget"]),
     Plain(["store", "write"], ["count"], ["store", "op", "mode"]),
-    Span(["store", "sync"], ["store", "peer"], ["entries", "bytes"], []),
+    Span(["store", "sync"], ["store", "peer"], ["entries", "bytes"], [
+      "result", "reason",
+    ]),
     session("created"),
     session("revoked"),
     session("expired"),
@@ -471,7 +473,7 @@ fn emit_everything() -> Nil {
   telemetry.ssr_join_token_too_large(4000, 3800)
   telemetry.store_write(1, "counter", "put", "local")
   let sync = fn(run) { telemetry.store_sync_span("counter", "b@host", run) }
-  let assert 6 = sync(fn() { #(6, 10, 100) }) as "sync returns 6"
+  let assert 6 = sync(fn() { #(6, 10, 100, "ok", "none") }) as "sync returns 6"
   crash(fn() { sync(fn() { panic as "sync crashed" }) })
   list.each(
     [

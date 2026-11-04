@@ -82,6 +82,63 @@ pub fn every_malformed_payload_is_refused_with_its_field_named_test() {
   })
 }
 
+/// How a replica admits a payload before joining it
+/// (brazier_store_replica:admit/4): the result and reason it puts on the
+/// `[brazier, store, sync]` stop event, and the entries it reports.
+type Admission {
+  Admitted(entries: Int)
+  Refused(entries: Int, result: String, reason: String)
+}
+
+pub fn a_malformed_payload_is_refused_with_its_field_as_reason_test() {
+  list.each(malformed_payloads(), fn(entry) {
+    let #(label, what, payload, fragment) = entry
+    let bytes = 100
+    case admit(what, payload, bytes, 1_000_000) {
+      Refused(entries: 0, result: "malformed", reason:) ->
+        case string.contains(reason, fragment) {
+          True -> Nil
+          False ->
+            panic as {
+              label
+              <> ": reason "
+              <> string.inspect(reason)
+              <> " does not name "
+              <> string.inspect(fragment)
+            }
+        }
+      other -> panic as { label <> ": admitted as " <> string.inspect(other) }
+    }
+  })
+}
+
+pub fn a_payload_over_its_byte_limit_is_refused_as_too_large_test() {
+  let #(s1, put, _) = crdt.put(crdt.new(), ra, "k", "v", ts(10, ra.node), [])
+  let #(_s2, second, _) = crdt.put(s1, ra, "j", "w", ts(11, ra.node), [])
+  // The limit is inclusive: a payload of exactly the limit is admitted.
+  assert admit(Delta, put, 500, 500) == Admitted(entries: 1)
+  assert admit(Delta, put, 501, 500)
+    == Refused(entries: 1, result: "too_large", reason: "max_delta_bytes")
+  let full = crdt.to_delta(crdt.join(s1, second).0)
+  assert admit(Sync, full, 4000, 4000) == Admitted(entries: 2)
+  assert admit(Sync, full, 4001, 4000)
+    == Refused(entries: 2, result: "too_large", reason: "max_sync_bytes")
+}
+
+/// A malformed payload is refused as malformed even when it is also too
+/// large: its entries cannot be counted, and its field is the reason.
+pub fn a_malformed_payload_over_its_limit_is_refused_as_malformed_test() {
+  let payload = dynamic.string("nope")
+  let assert Error(reason) = check_payload(Delta, payload)
+    as "a string is not a delta"
+  assert admit(Delta, payload, 10_000, 10)
+    == Refused(entries: 0, result: "malformed", reason:)
+    as "malformed is checked before size"
+}
+
+@external(erlang, "brazier_store_replica", "admit")
+fn admit(what: What, payload: payload, bytes: Int, max_bytes: Int) -> Admission
+
 @external(erlang, "brazier_store_replica", "check_payload")
 fn check_payload(what: What, payload: payload) -> Result(Nil, String)
 
