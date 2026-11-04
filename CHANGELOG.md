@@ -408,6 +408,12 @@ with its own changelog, so they are not listed here.
   covered only through the cloud. The bench suite has a new
   `store.crdt_append.{10,1000,10000}` case; its metrics need a re-baseline
   before `brazier_bench_check` accepts them.
+- Merging a delta into a replicated store no longer sorts the replica's
+  whole causal-context cloud (the dots seen out of order). Only the
+  replicas the delta names are compacted, from their clock upwards, so a
+  one-dot delta against a 10,000-dot cloud fell from about 1.3 million
+  reductions to the cost of the same merge against a 10-dot cloud. The
+  result is the one the sort gave, checked against it as an oracle.
 - (Audit TS-9) The listener parses `ws_allowed_origins` and
   `allowed_hosts` once, when it starts, as Phoenix compiles `check_origin`,
   and refuses to start with an invalid entry. Origins used to be parsed on
