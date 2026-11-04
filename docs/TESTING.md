@@ -86,6 +86,22 @@ A bounded wait for *nothing* to arrive is still a time window. Use one
 only after a barrier proves that the work which could produce the
 message is done.
 
+### Instead of a sleep
+
+When the thing under test depends on time, or on a process being slow,
+make that state happen rather than waiting for it:
+
+| Situation | Do this | Example |
+|-----------|---------|---------|
+| Code compares against the clock (windows, TTLs, staleness) | Take the time as an `@internal` argument and pass a later one. | `rate_limit.sweep_with(limiter, now + 2, _)`; `static.file_digest_at(path, now, _)` |
+| A call must time out | `sys:suspend` the server, make the call with a short timeout, then `sys:resume` it. | `sweep_of_a_suspended_owner_is_a_timeout_test` |
+| Something must happen after a message has arrived | `erlang:trace(Pid, true, ['receive'])` and wait for the trace message. | `sweep_of_an_owner_that_dies_mid_call_is_a_call_failure_test` kills the owner once the call is in its mailbox |
+| A client must be slow (slowloris) | Send a byte each time `gen_tcp:recv` times out, until the server answers. | `slow_headers_get_408_test` (`drip_until_answer`) |
+| A process must have handled earlier messages | `await.barrier`. | see the table above |
+
+The fixtures for these are in `test/brazier_rate_limit_test_ffi.erl` and
+`test/brazier_http_raw_ffi.erl`.
+
 Example: a runtime test, connected through a fake transport subject:
 
 <!-- docs-check: fragment uses the test-only helpers in test/brazier (test_ctx, await), which apps cannot import -->
@@ -388,7 +404,6 @@ These are the waits that remain, and why.
 
 | Where | Wait | Why it stays |
 |-------|------|--------------|
-| `rate_limit_test` sweep | `process.sleep(1100)` | Rate-limit windows are wall-clock seconds; the window rolling over is under test. |
 | `ws_protocol_test` idle timeout | 4 × `process.sleep(550)` | Wall-clock time must pass the idle timeout while only heartbeats arrive. |
 | `ws_protocol_test` idle session | `process.sleep(80)` | The session idle TTL is wall-clock time, and the store has no clock to advance. |
 | `brazier/stress` | `hold_duration_ms` | Holding connections open is the load being measured (0 in tests). |

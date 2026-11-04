@@ -1,5 +1,7 @@
 import brazier/lint
 import gleam/list
+import gleam/string
+import simplifile
 
 pub fn clean_code_no_violations_test() {
   let source =
@@ -294,6 +296,219 @@ Use start_router with route files.
   let assert True = list.any(violations, fn(v) { v.rule == "stale-docs-model" })
 }
 
+// --- The AST rules see every node ---
+
+// Each body puts a `todo` where the old walker did not look: it skipped
+// `use` and `assert` statements, `as` messages, captures, record updates,
+// tuple indexes, bit arrays, case guards, list tails and `echo`.
+pub fn todo_is_found_in_every_kind_of_node_test() {
+  let bodies = [
+    #("use", "use x <- result.try(todo)\n  x"),
+    #("assert", "assert todo"),
+    #("let assert message", "let assert Ok(x) = y as todo\n  x"),
+    #("assert message", "assert y as todo"),
+    #("capture", "f(todo, _)"),
+    #("record update", "Model(..m, count: todo)"),
+    #("tuple index", "#(todo, 1).0"),
+    #("bit array value", "<<todo:int>>"),
+    #("bit array size", "<<1:size(todo)>>"),
+    #("case guard", "case 1 {\n    _ if todo -> 1\n  }"),
+    #("list tail", "[1, ..todo]"),
+    #("echo", "echo todo"),
+    #("panic message", "panic as todo"),
+    #("todo message", "todo as todo"),
+  ]
+  list.each(bodies, fn(body) {
+    let #(name, code) = body
+    let source = "pub fn f() {\n  " <> code <> "\n}\n"
+    let todos =
+      lint.lint_source("src/brazier/other.gleam", source)
+      |> list.filter(fn(v) { v.rule == "no-todo" })
+    assert list.length(todos) >= 1 as name
+  })
+}
+
+pub fn panic_in_a_use_callback_is_found_test() {
+  let source =
+    "
+pub fn f() {
+  use x <- result.try(fn() { panic }())
+  x
+}
+"
+  let assert [v] = lint.lint_source("src/brazier/other.gleam", source)
+    as "exactly the one panic is a violation"
+  assert v.rule == "no-panic"
+}
+
+pub fn a_log_inside_a_use_statement_counts_test() {
+  let source =
+    "
+import brazier/log
+pub fn handle() {
+  use <- defer(fn() { log.info(\"mod\", \"done\") })
+  Nil
+}
+"
+  assert lint.lint_source("src/brazier/transport.gleam", source) == []
+}
+
+pub fn a_log_inside_a_tuple_counts_test() {
+  let source =
+    "
+import brazier/log
+pub fn handle() {
+  #(log.info(\"mod\", \"msg\"), 1)
+}
+"
+  assert lint.lint_source("src/brazier/runtime.gleam", source) == []
+}
+
+pub fn a_log_capture_is_not_a_log_call_test() {
+  // A capture makes a function; it does not log.
+  let source =
+    "
+import brazier/log
+pub fn handle() {
+  log.info(\"mod\", _)
+}
+"
+  let assert [v] = lint.lint_source("src/brazier/runtime.gleam", source)
+    as "the capture alone does not satisfy the rule"
+  assert v.rule == "public-fn-must-log"
+}
+
+pub fn discard_inside_an_echo_is_found_test() {
+  let source =
+    "
+pub fn save() {
+  echo {
+    let _ = write()
+    1
+  }
+}
+"
+  let assert [v] = lint.lint_source("src/brazier/other.gleam", source)
+    as "the discard inside the echoed block is the one violation"
+  assert v.rule == "no-discarded-result"
+  assert v.location == "4:5"
+}
+
+pub fn discard_inside_a_list_tail_is_found_test() {
+  let source =
+    "
+pub fn save() {
+  [1, ..{
+    let _ = write()
+    []
+  }]
+}
+"
+  let violations = lint.lint_source("src/brazier/other.gleam", source)
+  assert list.map(violations, fn(v) { v.rule }) == ["no-discarded-result"]
+}
+
+// --- Stale pre-rename names ---
+
+// Built from parts so this file does not itself contain the old name.
+const old = "bea" <> "con"
+
+const old_upper = "BEA" <> "CON"
+
+pub fn old_name_in_src_is_a_violation_test() {
+  let source = "pub fn f() {\n  // see " <> old <> "/runtime\n  1\n}\n"
+  let assert [v] = lint.lint_stale_names("src/brazier/other.gleam", source)
+    as "the one line with the old name is flagged"
+  assert v.rule == "stale-name"
+  assert v.location == "line 2"
+}
+
+pub fn old_name_in_any_case_is_a_violation_test() {
+  let lines = [
+    old,
+    old_upper,
+    "B" <> string.drop_start(old, 1),
+    "data-" <> old <> "-key",
+    "__" <> "B" <> string.drop_start(old, 1) <> "_x",
+  ]
+  list.each(lines, fn(line) {
+    let violations = lint.lint_stale_names("examples/app/src/app.gleam", line)
+    assert list.length(violations) == 1 as line
+  })
+}
+
+pub fn config_may_name_what_it_refuses_test() {
+  let source =
+    "const published_dev_secret = \""
+    <> old
+    <> "-dev-secret-change-in-production\"\n"
+    <> "/// `"
+    <> old
+    <> "` to `brazier` (2026-11-04).\n"
+    <> "const renamed_env_prefix = \""
+    <> old_upper
+    <> "_\"\n"
+    <> "// "
+    <> old_upper
+    <> "_ENV is refused.\n"
+  assert lint.lint_stale_names("src/brazier/config.gleam", source) == []
+  // The same lines anywhere else in src are stale.
+  assert list.length(lint.lint_stale_names("src/brazier/other.gleam", source))
+    == 4
+}
+
+pub fn tests_may_name_the_refused_variables_and_secret_test() {
+  let source =
+    "putenv(\""
+    <> old_upper
+    <> "_ENV\", \"prod\")\n"
+    <> "start(\""
+    <> old
+    <> "-dev-secret-change-in-production\")\n"
+  assert lint.lint_stale_names("test/brazier/config_test.gleam", source) == []
+  // The rename comment is allowed only in config.gleam.
+  let comment = "// `" <> old <> "` to `brazier`\n"
+  let assert [_] = lint.lint_stale_names("test/brazier/x_test.gleam", comment)
+    as "the rename comment is stale outside config.gleam"
+  // A prefix not followed by a variable name is not a variable.
+  let prefix = "let p = \"" <> old_upper <> "_\"\n"
+  let assert [_] = lint.lint_stale_names("test/brazier/x_test.gleam", prefix)
+    as "a bare prefix is allowed only in config.gleam"
+}
+
+pub fn an_allowed_use_does_not_excuse_a_stale_one_on_its_line_test() {
+  let line = "putenv(\"" <> old_upper <> "_ENV\", \"" <> old <> "\")"
+  let assert [_] = lint.lint_stale_names("test/brazier/x_test.gleam", line)
+    as "two uses of the old name, one allowed, is one violation"
+}
+
+pub fn names_directory_reads_text_files_at_any_depth_test() {
+  let root = "build/lint_names_test_" <> unique_ref()
+  let assert Ok(Nil) = simplifile.create_directory_all(root <> "/nested")
+    as "the build directory is writable"
+  let stale = "%% " <> old <> "_ffi\n"
+  let assert Ok(Nil) = simplifile.write(root <> "/nested/x_ffi.erl", stale)
+    as "the build directory is writable"
+  let assert Ok(Nil) =
+    simplifile.write(root <> "/clean.gleam", "pub fn f() { 1 }\n")
+    as "the build directory is writable"
+  // Not a text source: never read.
+  let assert Ok(Nil) = simplifile.write(root <> "/node.pem", stale)
+    as "the build directory is writable"
+  let violations = lint.lint_names_directory(root)
+  let assert Ok(Nil) = simplifile.delete(root)
+    as "the test removes only the directory it created"
+  let assert [v] = violations as "only the .erl file has the old name"
+  assert v.file == root <> "/nested/x_ffi.erl"
+  assert v.location == "line 1"
+}
+
+pub fn names_directory_that_does_not_exist_is_a_violation_test() {
+  let assert [v] = lint.lint_names_directory("test/fixtures/no_such_dir")
+    as "a missing directory is reported, not skipped"
+  assert v.rule == "unreadable-path"
+}
+
 // --- Helper ---
 
 fn str_contains(haystack: String, needle: String) -> Bool {
@@ -302,3 +517,6 @@ fn str_contains(haystack: String, needle: String) -> Bool {
 
 @external(erlang, "brazier_test_ffi", "string_contains")
 fn do_str_contains(haystack: String, needle: String) -> Bool
+
+@external(erlang, "brazier_test_ffi", "unique_ref")
+fn unique_ref() -> String
