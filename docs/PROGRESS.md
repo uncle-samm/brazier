@@ -587,6 +587,27 @@
       - 2 `peer.eventually` polls remain in store_replica_validation_test;
       - `await_restart` spins on `yield`;
       - mailbox residue (messages a test leaves in the shared eunit process) in build_handshake, child_module, dev_reload, router, runtime_test, runtime_versioning, ws_protocol, presence_test and session_security tests.
+  - [x] w5-transport-client, merged as 7156412 (branch `m117-transport-followups`, commits 248f4f5, 65dd6c5, 2432d12 and ae2f796).
+    - Refused WS mount: when middleware refuses a mount on the upgrade, the server completes the handshake and closes with `4600 middleware refused <status>`. 4600–4699 is a new band for transport refusals, on which the client neither reloads nor reconnects (4400–4499 still reload, 4500–4599 still reconnect). The upgrade checks run host, framing/path, caps, origin, `ws_auth`, `validate_upgrade`, then the middleware gate. Breaking, in the CHANGELOG.
+    - Event `ops` travel as raw JSON instead of a JSON string inside the frame. Breaking on the wire: an older client gets 4409 and reloads.
+    - Fragment scroll: `navigate` carries an optional `clock` (absent means 0), the server acks every navigation (an unchanged one with an empty ack), and `router.push` strips the fragment. The client keeps a pending `{hash, clock}` and scrolls once a `model_sync`, patch or ack at that clock or later is applied: to the element with that `id`, else `<a name>`, else the top of the page with a console warning.
+    - Log once: `ip.client` resolves the client address and scheme from one parse of the forwarding header, so a bad hop is logged once per upgrade, and `prepare_listener` no longer logs a refused limit or static config a second time. `client.scheme`, `request_scheme` and `ws_client_ip` were removed as dead. `test/brazier/log_once_test.gleam` asserts exactly one line per case; putting the second parse back fails 4 of its tests.
+    - Bundle: `brazier_client_5e36facf8e217dc4.js` (a rebuild is byte-identical).
+    - Agent gates: 24/24 examples built one at a time with zero warnings, and CDP desktop passed 625 of 625.
+    - Coordinator verify on the merge of 6ff96b5 into the branch (3681ee4): clean build with zero warnings, format and lint clean, 1908 tests passing in each of 3 runs, docs check OK (73 modules), and test-client OK (58 scenarios, 9 patch-safety checks, 2450/550 apply equivalence). The new per-module telemetry-handler check from w5-test-hygiene passes for the new test modules.
+    - Decisions:
+      - middleware runs after the origin, auth and handshake checks, so the `/ws` HTTP telemetry covers only upgrades that pass them; a refused upgrade's span includes a linger of at most 1 s;
+      - the navigate `clock` is additive, and the new ack changes the frame counts tests see (`runtime_versioning_test` replays 10 frames, not 9);
+      - the listener checks the static config only after the security limits pass;
+      - the agent made the smallest forced edits outside its files (the `clock: 0` field and signature updates in ten test files, `live_page_gate_test`, and 2 lines of `test/brazier/bench/suite.gleam`, which w4-bench-gate owns).
+    - The coordinator removed the stale `docs/TODO.md` item about `ws_client_ip` re-parsing `trusted_proxies` on every upgrade: the listener parses them once, in `validate_security_limits`.
+    - Follow-ups:
+      - a navigation refused with an `error` frame gets no ack, so its pending scroll fires on the next event's ack instead;
+      - a navigation without a hash does not scroll to the top (LiveView does this only for redirects);
+      - the non-monotonic clock warning says "event clock" for navigations too;
+      - `middleware.rate_limit_behind_proxies` resolves the client again on the WS middleware gate, so a malformed hop can still be logged a second time on that path;
+      - `ip.parse_trusted_proxies` and `parse_allowed_hosts` log their own line before "Invalid security limits" (two different lines for one refusal);
+      - no CDP scenario covers the fragment scroll yet; only the ffi harness does.
 - [ ] Final verification: build (zero warnings), tests, all examples, CDP browser suite, perf baselines
 
 **Decisions (Milestone 117, coordinator):**
