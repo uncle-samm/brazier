@@ -86,7 +86,7 @@ fn presence_of_app() -> presence_watch.Watch(Model, Msg) {
         Error(error.RuntimeError(reason: "no client events: " <> handler_id))
       },
     )
-  let config =
+  let assert Ok(config) =
     brazier.simple(
       init: fn(_ctx) { Ok(Model(room: "", watched: [], online: dict.new())) },
       update: fn(model, _msg) { model },
@@ -105,6 +105,7 @@ fn presence_of_app() -> presence_watch.Watch(Model, Msg) {
       on_presence: Online,
     )
     |> brazier.to_config(codec, 8080)
+    as "the app has a secret key"
   let assert Some(watch) = config.presence
     as "track_and_watch_presence sets presence"
   watch
@@ -257,7 +258,7 @@ fn assert_leave_then_join(p: Peer, session: Session, old: String) -> Nil {
 /// each see the old ref leave and the new ref join.
 pub fn retracked_entry_leaves_and_joins_for_every_watcher_test_() -> peer.Timeout {
   use <- Timeout(60)
-  use peers <- peer.with_cluster(2, "brazier_ws10b_restart_semantics")
+  use peers <- peer.with_members(2, "brazier_ws10b_restart_semantics")
   let assert [a, b] = peers
   start_tracker(a)
   start_tracker(b)
@@ -286,7 +287,7 @@ pub fn retracked_entry_leaves_and_joins_for_every_watcher_test_() -> peer.Timeou
 /// watcher reports both from the read it does once the shard is back.
 pub fn queued_join_waits_for_the_leave_of_the_restarted_shard_test_() -> peer.Timeout {
   use <- Timeout(60)
-  use peers <- peer.with_cluster(1, "brazier_ws10b_restart_queued")
+  use peers <- peer.with_members(1, "brazier_ws10b_restart_queued")
   let assert [a] = peers
   start_tracker(a)
   let tracked = start_session(a, topic, [])

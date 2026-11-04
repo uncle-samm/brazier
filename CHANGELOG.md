@@ -109,6 +109,20 @@ with its own changelog, so they are not listed here.
   `TableTypeMismatch` or `TableOwnerUnavailable`, not an alias of the
   internal `state_manager.EtsError`. `replicated.InvalidName` carries
   `name` and `reason`.
+- (Audit TS-2) The secret key is required. `brazier.start` refuses an app
+  without `brazier.secret_key` with a `ConfigError` that names the setting
+  and `SECRET_KEY`. It no longer generates a random key per process with a
+  warning. Every example reads `SECRET_KEY` through `config.secret_key()`.
+- (Audit TS-2) `cluster.new(discovery)` no longer takes `secret_key`.
+  `cluster.start` and `cluster.supervised` take `secret_key:`, and a
+  Brazier app passes its own key. The app now has one key, and the peer
+  check derives its MAC from it with the purpose label
+  `"brazier-cluster-v1"`.
+- (Audit SEC-3) `pubsub.direct_broadcast` to a connected node that has not
+  passed the cluster peer check returns `Error(NodeNotVerified(node))`.
+- (Audit SEC-8) With `BRAZIER_ENV=prod`, TLS distribution without peer
+  verification is refused. The server needs `verify_peer` and
+  `fail_if_no_peer_cert`, and the client needs `verify_peer`.
 - (Audit TS-7) `rate_limit.reset`, `rate_limit.key_count` and
   `rate_limit.sweep` return `Error(rate_limit.LimiterError)` instead of
   `Error(Nil)`: `LimiterNotRunning` (the owner and its table are gone),
@@ -399,6 +413,20 @@ with its own changelog, so they are not listed here.
   subscribed to its topic. Under `beacon/dev` every WebSocket handler now
   subscribes to `beacon:dev:reload`, and each rebuild sends every open page a
   `reload`. A handler that cannot subscribe closes 1011.
+- (Audit STAB-3) A PubSub partition registered its name before it created
+  its tables. A subscribe in that window, or during a partition restart,
+  crashed with `badarg` or `noproc`, or left rows in a table that no
+  process owned. The partition now registers after its tables exist.
+  `subscribe` links to the partition it looked up, then checks the name
+  again after inserting. A partition that is gone or was replaced makes
+  `subscribe` return `Error(NotStarted)` with a warning, not crash.
+- (Audit STAB-4) A peer-check timer of an earlier connection could fire
+  after the node reconnected and reject the new connection early. Timers
+  now carry their reference and act only when they belong to the node's
+  current check.
+- (Audit TS-12) Every `let assert` in `brazier/cluster`, `brazier/pubsub`
+  and the cluster tests has an `as` message. `let assert True = e` in those
+  tests is now `assert e`.
 - (TS-3) The client defaulted a missing `ack_clock`, and a missing event
   clock, to 0. Now a `model_sync` or `patch` without a valid `ack_clock` (a
   non-negative integer) is a protocol error, logged, that requests a full
@@ -471,6 +499,18 @@ with its own changelog, so they are not listed here.
 - (WS10b) `examples/auth_workspace` checks its login form against a random
   per-browser token in an HttpOnly cookie (a double-submit cookie), renewed
   at each login, instead of a constant that protected nothing.
+- (Audit SEC-3) Cluster traffic is gated on verified membership. PubSub,
+  replicated stores, presence and session revocation send only to nodes
+  that passed the peer check, and drop what any other connected node sends.
+  There is no fallback to every connected node. Stores and session
+  maintenance sync with a node when it is verified, not on `nodeup`.
+- (Audit SEC-9) DNS discovery makes node names only from well-formed IP
+  addresses, in canonical form, and logs the entries it drops. A
+  `max_discovered_nodes` cap (default 16,384) bounds the node-name atoms it
+  makes over the VM's life. The `basename` is at most 190 bytes.
+- (Audit SEC-10) The cluster manager's `format_status` shows its MAC, and
+  any MAC in a message it holds, as `redacted`. A malformed hello is logged
+  with its tag, size and sender only.
 - (SEC-5) `router.push`, `router.replace` and `router.redirect` refuse
   paths a browser resolves to another host. The URL parser reads `\` as
   `/` and strips tab, newline and carriage return, so `/\evil.example` and

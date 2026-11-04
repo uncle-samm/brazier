@@ -621,8 +621,12 @@ pub fn supervised_tracker_test() {
 }
 
 // --- Replicas (fake peers) --------------------------------------------------
+//
+// A shard takes replication messages only from verified cluster members, so
+// each of these tests counts the fake node as one (with_verified).
 
 pub fn remote_entries_join_go_down_and_permdown_test() {
+  use <- with_verified(["fake@host"])
   let p = start_fast(unique_name())
   subscribe(p, "room")
   let ref = fake_ref("fake@host", 1)
@@ -642,6 +646,7 @@ pub fn remote_entries_join_go_down_and_permdown_test() {
 }
 
 pub fn heartbeat_brings_a_down_replica_back_test() {
+  use <- with_verified(["fake@host"])
   let p =
     start(
       config(unique_name())
@@ -661,6 +666,7 @@ pub fn heartbeat_brings_a_down_replica_back_test() {
 }
 
 pub fn graceful_permdown_drops_entries_at_once_test() {
+  use <- with_verified(["fake@host"])
   let p = start(config(unique_name()))
   let ref = fake_ref("fake@host", 1)
   send_peer(p, transfer_ack(ref, 1, "room", [#("remote", "\"hi\"")]))
@@ -675,6 +681,7 @@ pub fn graceful_permdown_drops_entries_at_once_test() {
 }
 
 pub fn new_version_replaces_the_old_replica_test() {
+  use <- with_verified(["fake@host"])
   let p = start(config(unique_name()))
   subscribe(p, "room")
   send_peer(
@@ -697,6 +704,7 @@ pub fn new_version_replaces_the_old_replica_test() {
 }
 
 pub fn pool_size_mismatch_is_ignored_and_logged_once_test() {
+  use <- with_verified(["fake@host"])
   let p = start(config(unique_name()))
   let ref = fake_ref("fake@host", 1)
   let #(_, lines) =
@@ -716,6 +724,7 @@ pub fn pool_size_mismatch_is_ignored_and_logged_once_test() {
 }
 
 pub fn oversized_transfer_is_rejected_test() {
+  use <- with_verified(["fake@host"])
   let p = start(config(unique_name()) |> presence.max_transfer_entries(2))
   let ref = fake_ref("fake@host", 1)
   let #(_, lines) =
@@ -742,7 +751,28 @@ pub fn oversized_transfer_is_rejected_test() {
   let assert Ok(Nil) = presence.stop(p)
 }
 
+pub fn peer_messages_from_a_non_member_are_dropped_test() {
+  let p = start(config(unique_name()))
+  let ref = fake_ref("fake@host", 1)
+  let #(_, lines) =
+    log_capture.capture(fn() {
+      send_peer(p, transfer_ack(ref, 1, "room", [#("remote", "\"hi\"")]))
+      send_peer(p, heartbeat(ref, 1))
+      replicas(p)
+    })
+  assert replicas(p) == []
+  let assert Ok([]) = presence.list(p, "room")
+  let dropped =
+    list.filter(lines, fn(line) {
+      line.level == "warning"
+      && string.contains(line.message, "fake@host: not a verified")
+    })
+  assert list.length(dropped) == 2
+  let assert Ok(Nil) = presence.stop(p)
+}
+
 pub fn malformed_peer_messages_are_logged_test() {
+  use <- with_verified(["fake@host"])
   let p = start(config(unique_name()))
   let #(_, lines) =
     log_capture.capture(fn() {
@@ -792,6 +822,10 @@ fn unique_integer() -> Int
 
 @external(erlang, "brazier_presence_test_ffi", "malformed_messages")
 fn malformed_messages() -> List(Dynamic)
+
+/// Run `run` with `nodes` counted as verified cluster members.
+@external(erlang, "brazier_presence_test_ffi", "with_verified")
+fn with_verified(nodes: List(String), run: fn() -> a) -> a
 
 @external(erlang, "brazier_pubsub_test_ffi", "pause")
 fn pause(ms: Int) -> Nil

@@ -27,6 +27,7 @@ between sessions.
 
 ```bash
 cd examples/multi_kanban
+export SECRET_KEY="$(openssl rand -base64 48)"   # once per shell
 gleam run -m brazier/build   # first, and after every change
 gleam run
 ```

@@ -39,8 +39,6 @@ pub type Msg {
   Inc
 }
 
-const secret = "app-tree-test-secret-key-0123456789abcdef"
-
 fn config() -> application.AppConfig(Model, Msg) {
   app_config_fixture.new(
     port: 0,
@@ -61,7 +59,7 @@ fn config() -> application.AppConfig(Model, Msg) {
 fn clustered_config() -> application.AppConfig(Model, Msg) {
   application.AppConfig(
     ..config(),
-    cluster: Some(cluster.new(cluster.NoDiscovery, secret_key: secret)),
+    cluster: Some(cluster.new(cluster.NoDiscovery)),
   )
 }
 
@@ -83,6 +81,7 @@ fn presence_config(
 fn tracker_running(p: Peer) -> Bool {
   peer.on(p, fn() {
     let assert Ok(tracker) = presence.handle(tracker_config())
+      as "presence.handle succeeds"
     presence.running(tracker)
   })
 }
@@ -94,6 +93,7 @@ fn start_tree(p: Peer, config: application.AppConfig(Model, Msg)) -> App {
     let holder = holder.start()
     let assert Ok(app) =
       holder.run(holder, fn() { application.start_supervised(config) })
+      as "application.start_supervised succeeds"
     app
   })
 }
@@ -112,6 +112,7 @@ fn crash_child(p: Peer, app: App, index: Int) -> #(List(Pid), List(Pid)) {
   peer.on(p, fn() {
     let before = children(app.supervisor_pid)
     let assert Ok(victim) = list.drop(before, index) |> list.first
+      as "list.drop succeeds"
     crash(app.supervisor_pid, victim)
     await_restart(app.supervisor_pid, index, victim)
     // Every later child is restarted before the supervisor answers calls
@@ -128,67 +129,75 @@ fn kept(before: List(Pid), after: List(Pid)) -> List(Bool) {
 pub fn tree_runs_children_in_order_test_() -> peer.Timeout {
   use <- Timeout(60)
   use peers <- peer.with_cluster(1, "brazier_tree_order")
-  let assert [p] = peers
+  let assert [p] = peers as "the cluster starts one peer"
   let app = start_tree(p, clustered_config())
   let assert [_ets_owner, pubsub_sup, cluster_manager, scope, listener] =
     children_on(p, app)
+    as "the application tree has five children"
   let assert Ok(named_pubsub) =
     peer.on(p, fn() { whereis_name("brazier_pubsub_sup") })
+    as "whereis_name succeeds"
   let assert Ok(named_cluster) =
     peer.on(p, fn() { whereis_name("brazier_cluster") })
+    as "whereis_name succeeds"
   let assert Ok(named_scope) =
     peer.on(p, fn() { whereis_name("brazier_session_pg") })
-  let assert True = pubsub_sup == named_pubsub
-  let assert True = cluster_manager == named_cluster
-  let assert True = scope == named_scope
-  let assert True = listener == server.get_supervisor(app.listener)
-  let assert True = get_ok(p, app)
+    as "whereis_name succeeds"
+  assert pubsub_sup == named_pubsub
+  assert cluster_manager == named_cluster
+  assert scope == named_scope
+  assert listener == server.get_supervisor(app.listener)
+  assert get_ok(p, app)
   Nil
 }
 
 pub fn listener_crash_restarts_only_the_listener_test_() -> peer.Timeout {
   use <- Timeout(60)
   use peers <- peer.with_cluster(1, "brazier_tree_listener")
-  let assert [p] = peers
+  let assert [p] = peers as "the cluster starts one peer"
   let app = start_tree(p, clustered_config())
   let #(before, after) = crash_child(p, app, 4)
   let assert [True, True, True, True, False] = kept(before, after)
+    as "kept reports one flag per child"
   // The restarted listener binds the same port again.
-  let assert True = get_ok(p, app)
+  assert get_ok(p, app)
   Nil
 }
 
 pub fn session_scope_crash_restarts_scope_and_listener_test_() -> peer.Timeout {
   use <- Timeout(60)
   use peers <- peer.with_cluster(1, "brazier_tree_scope")
-  let assert [p] = peers
+  let assert [p] = peers as "the cluster starts one peer"
   let app = start_tree(p, clustered_config())
   let #(before, after) = crash_child(p, app, 3)
   let assert [True, True, True, False, False] = kept(before, after)
-  let assert True = peer.on(p, session.registry_running)
-  let assert True = get_ok(p, app)
+    as "kept reports one flag per child"
+  assert peer.on(p, session.registry_running)
+  assert get_ok(p, app)
   Nil
 }
 
 pub fn cluster_crash_restarts_everything_after_it_test_() -> peer.Timeout {
   use <- Timeout(60)
   use peers <- peer.with_cluster(1, "brazier_tree_cluster")
-  let assert [p] = peers
+  let assert [p] = peers as "the cluster starts one peer"
   let app = start_tree(p, clustered_config())
   let #(before, after) = crash_child(p, app, 2)
   let assert [True, True, False, False, False] = kept(before, after)
-  let assert Ok(_) = peer.on(p, cluster.members)
-  let assert True = get_ok(p, app)
+    as "kept reports one flag per child"
+  let assert Ok(_) = peer.on(p, cluster.members) as "cluster.members succeeds"
+  assert get_ok(p, app)
   Nil
 }
 
 pub fn pubsub_crash_restarts_the_whole_tree_test_() -> peer.Timeout {
   use <- Timeout(60)
   use peers <- peer.with_cluster(1, "brazier_tree_pubsub")
-  let assert [p] = peers
+  let assert [p] = peers as "the cluster starts one peer"
   let app = start_tree(p, clustered_config())
   let #(before, after) = crash_child(p, app, 1)
   let assert [True, False, False, False, False] = kept(before, after)
+    as "kept reports one flag per child"
   // PubSub works again: a subscriber on the new partitions gets broadcasts.
   let assert Ok("hello") =
     peer.on(p, fn() {
@@ -196,48 +205,55 @@ pub fn pubsub_crash_restarts_the_whole_tree_test_() -> peer.Timeout {
       pubsub.broadcast("tree:check", "hello")
       receive_broadcast("tree:check", 5000)
     })
-  let assert True = get_ok(p, app)
+    as "pubsub.subscribe succeeds"
+  assert get_ok(p, app)
   Nil
 }
 
 pub fn tree_without_cluster_has_four_children_test_() -> peer.Timeout {
   use <- Timeout(60)
   use peers <- peer.with_cluster(1, "brazier_tree_nocluster")
-  let assert [p] = peers
+  let assert [p] = peers as "the cluster starts one peer"
   let app = start_tree(p, config())
   let assert [_ets_owner, _pubsub, _scope, _listener] = children_on(p, app)
+    as "the application tree has four children"
   let #(before, after) = crash_child(p, app, 2)
   let assert [True, True, False, False] = kept(before, after)
-  let assert True = get_ok(p, app)
+    as "kept reports one flag per child"
+  assert get_ok(p, app)
   Nil
 }
 
 pub fn tree_with_presence_runs_the_tracker_before_the_listener_test_() -> peer.Timeout {
   use <- Timeout(60)
   use peers <- peer.with_cluster(1, "brazier_tree_presence")
-  let assert [p] = peers
+  let assert [p] = peers as "the cluster starts one peer"
   let app = start_tree(p, presence_config(tracker_config()))
   let assert [_ets_owner, _pubsub, _cluster, scope, tracker, listener] =
     children_on(p, app)
+    as "the application tree has six children"
   let assert Ok(named_scope) =
     peer.on(p, fn() { whereis_name("brazier_session_pg") })
+    as "whereis_name succeeds"
   let assert Ok(named_tracker) =
     peer.on(p, fn() { whereis_name("brazier_presence_tree_sup") })
-  let assert True = scope == named_scope
-  let assert True = tracker == named_tracker
-  let assert True = listener == server.get_supervisor(app.listener)
+    as "whereis_name succeeds"
+  assert scope == named_scope
+  assert tracker == named_tracker
+  assert listener == server.get_supervisor(app.listener)
   // A tracker crash restarts the tracker and the listener only.
   let #(before, after) = crash_child(p, app, 4)
   let assert [True, True, True, True, False, False] = kept(before, after)
-  let assert True = tracker_running(p)
-  let assert True = get_ok(p, app)
+    as "kept reports one flag per child"
+  assert tracker_running(p)
+  assert get_ok(p, app)
   Nil
 }
 
 pub fn supervised_start_refuses_unsupervised_tracker_test_() -> peer.Timeout {
   use <- Timeout(60)
   use peers <- peer.with_cluster(1, "brazier_tree_refuse_tracker")
-  let assert [p] = peers
+  let assert [p] = peers as "the cluster starts one peer"
   let outcome =
     peer.on(p, fn() {
       // The tracker runs over PubSub, so both run unsupervised.
@@ -245,23 +261,24 @@ pub fn supervised_start_refuses_unsupervised_tracker_test_() -> peer.Timeout {
       holder.run(holder, pubsub.start)
       let assert Ok(_) =
         holder.run(holder, fn() { presence.start(tracker_config()) })
+        as "presence.start succeeds"
       holder.run(holder, fn() {
         application.start_supervised(presence_config(tracker_config()))
       })
     })
   let assert Error(error.ConfigError(reason)) = outcome
-  let assert True =
-    string.contains(reason, "presence tracker is already running")
+    as "the start is refused with a ConfigError"
+  assert string.contains(reason, "presence tracker is already running")
   // Nothing of the refused tree started; the unsupervised tracker runs on.
-  let assert False = peer.on(p, session.registry_running)
-  let assert True = tracker_running(p)
+  assert !peer.on(p, session.registry_running)
+  assert tracker_running(p)
   Nil
 }
 
 pub fn supervised_start_refuses_invalid_presence_config_test_() -> peer.Timeout {
   use <- Timeout(60)
   use peers <- peer.with_cluster(1, "brazier_tree_bad_tracker")
-  let assert [p] = peers
+  let assert [p] = peers as "the cluster starts one peer"
   let outcome =
     peer.on(p, fn() {
       let holder = holder.start()
@@ -272,53 +289,59 @@ pub fn supervised_start_refuses_invalid_presence_config_test_() -> peer.Timeout 
       })
     })
   let assert Error(error.ConfigError(reason)) = outcome
-  let assert True = string.contains(reason, "Invalid presence configuration")
+    as "the start is refused with a ConfigError"
+  assert string.contains(reason, "Invalid presence configuration")
   let assert Error(_) = peer.on(p, pubsub.running_config)
-  let assert False = peer.on(p, session.registry_running)
+    as "pubsub.running_config returns Error"
+  assert !peer.on(p, session.registry_running)
   Nil
 }
 
 pub fn stop_leaves_no_processes_or_ports_test_() -> peer.Timeout {
   use <- Timeout(60)
   use peers <- peer.with_cluster(1, "brazier_tree_stop")
-  let assert [p] = peers
+  let assert [p] = peers as "the cluster starts one peer"
   let leftovers =
     peer.on(p, fn() {
       // Started once per node and kept: the logger configuration and the
       // telemetry application are not part of the tree.
       log.configure()
-      let assert Ok(Nil) = telemetry.start()
+      let assert Ok(Nil) = telemetry.start() as "telemetry.start succeeds"
       let holder = holder.start()
       let before = snapshot()
       let assert Ok(app) =
         holder.run(holder, fn() {
           application.start_supervised(clustered_config())
         })
-      let assert Ok(200) = http_status(app.port)
+        as "application.start_supervised succeeds"
+      let assert Ok(200) = http_status(app.port) as "http_status succeeds"
       let assert Ok(Nil) = holder.run(holder, fn() { application.stop(app) })
+        as "application.stop succeeds"
       // The holder (linked to the root supervisor) survives a normal stop.
-      let assert True = process.is_alive(holder.pid)
+      assert process.is_alive(holder.pid)
       // Stopping twice is an error, not a silent no-op.
       let assert Error(error.ConfigError(reason)) = application.stop(app)
-      let assert True = string.contains(reason, "is not running")
+        as "application.stop returns Error(ConfigError)"
+      assert string.contains(reason, "is not running")
       // The port is free again and nothing of the tree is left.
-      let assert Error(_) = http_status(app.port)
-      let assert False = session.registry_running()
+      let assert Error(_) = http_status(app.port) as "http_status returns Error"
+      assert !session.registry_running()
       let assert Error(_) = pubsub.running_config()
-      let assert Error(_) = cluster.members()
+        as "pubsub.running_config returns Error"
+      let assert Error(_) = cluster.members() as "cluster.members returns Error"
       leftovers(before)
     })
-  let assert [] = leftovers
+  let assert [] = leftovers as "leftovers returns an empty list"
   // The node can start a fresh tree afterwards.
   let app = start_tree(p, clustered_config())
-  let assert True = get_ok(p, app)
+  assert get_ok(p, app)
   Nil
 }
 
 pub fn supervised_start_refuses_unsupervised_infrastructure_test_() -> peer.Timeout {
   use <- Timeout(60)
   use peers <- peer.with_cluster(1, "brazier_tree_refuse")
-  let assert [p] = peers
+  let assert [p] = peers as "the cluster starts one peer"
   let #(outcome, lines) =
     peer.on(p, fn() {
       let holder = holder.start()
@@ -328,18 +351,18 @@ pub fn supervised_start_refuses_unsupervised_infrastructure_test_() -> peer.Time
       })
     })
   let assert Error(error.ConfigError(reason)) = outcome
-  let assert True = string.contains(reason, "PubSub is already running")
-  let assert True =
-    log_capture.contains(lines, "error", "PubSub is already running")
+    as "the start is refused with a ConfigError"
+  assert string.contains(reason, "PubSub is already running")
+  assert log_capture.contains(lines, "error", "PubSub is already running")
   // Nothing of the refused tree started.
-  let assert False = peer.on(p, session.registry_running)
+  assert !peer.on(p, session.registry_running)
   Nil
 }
 
 pub fn supervised_start_refuses_unsupervised_session_scope_test_() -> peer.Timeout {
   use <- Timeout(60)
   use peers <- peer.with_cluster(1, "brazier_tree_refuse_scope")
-  let assert [p] = peers
+  let assert [p] = peers as "the cluster starts one peer"
   let outcome =
     peer.on(p, fn() {
       session.ensure_registry()
@@ -347,8 +370,10 @@ pub fn supervised_start_refuses_unsupervised_session_scope_test_() -> peer.Timeo
       holder.run(holder, fn() { application.start_supervised(config()) })
     })
   let assert Error(error.ConfigError(reason)) = outcome
-  let assert True = string.contains(reason, "session scope is already running")
+    as "the start is refused with a ConfigError"
+  assert string.contains(reason, "session scope is already running")
   let assert Error(_) = peer.on(p, pubsub.running_config)
+    as "pubsub.running_config returns Error"
   Nil
 }
 
@@ -358,18 +383,20 @@ pub fn supervised_start_refuses_unsupervised_session_scope_test_() -> peer.Timeo
 pub fn wait_forever_crashes_when_the_tree_gives_up_test_() -> peer.Timeout {
   use <- Timeout(60)
   use peers <- peer.with_cluster(1, "brazier_tree_giveup")
-  let assert [p] = peers
+  let assert [p] = peers as "the cluster starts one peer"
   let reason =
     peer.on(p, fn() {
       let started = process.new_subject()
       let waiter =
         process.spawn_unlinked(fn() {
           let assert Ok(app) = application.start_supervised(config())
+            as "application.start_supervised succeeds"
           process.send(started, app)
           application.wait_forever()
         })
       let monitor = process.monitor(waiter)
       let assert Ok(app) = process.receive(started, 10_000)
+        as "process.receive succeeds"
       // The default tolerance is 2 restarts in 5 seconds: the third crash
       // inside the window makes the supervisor give up.
       list.each([1, 2], fn(_) {
@@ -383,15 +410,17 @@ pub fn wait_forever_crashes_when_the_tree_gives_up_test_() -> peer.Timeout {
         |> process.select_specific_monitor(monitor, fn(down) { down })
       let assert Ok(process.ProcessDown(reason: reason, ..)) =
         process.selector_receive(down, 10_000)
+        as "process.selector_receive succeeds"
       string.inspect(reason)
     })
-  let assert True = string.contains(reason, "Linked application process exited")
-  let assert True = string.contains(reason, "shutdown")
+  assert string.contains(reason, "Linked application process exited")
+  assert string.contains(reason, "shutdown")
   Nil
 }
 
 fn listener_pid(app: App) -> Pid {
   let assert [_, _, _, listener] = children(app.supervisor_pid)
+    as "the application tree has four children"
   listener
 }
 

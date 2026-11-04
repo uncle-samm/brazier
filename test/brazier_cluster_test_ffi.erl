@@ -10,7 +10,12 @@
          remote_worker_nodes/1, count_events/1, counted_events/0,
          registered/1, alive/1, kill/1, wait_down/2, record_event/4,
          record_events/1, recorded_events/0, record_named_event/4, putenv/2,
-         dist_protocol/1, dist_optfile/1]).
+         dist_protocol/1, dist_optfile/1, no_argument/0, option_groups/1,
+         write_optfile/1, atom_exists/1, state_holds/1, status_holds/1,
+         send_marked_hellos/1, manager_suspend/0, manager_resume/0, manager_barrier/0,
+         pending_check/1, nodeup_queued/1, send_check_timeout/2, reconnect/1,
+         forge_forward/3, deliver_forged/2, store_message_from/1,
+         presence_message_from/1, partition_churn/3]).
 
 -define(EVENTS, brazier_test_counted_events).
 
@@ -250,6 +255,22 @@ dist_optfile(Cert) ->
     ok = file:write_file(Path, io_lib:format("~p.~n", [Terms])),
     unicode:characters_to_binary(Path).
 
+%% What init:get_argument/1 returns for a flag that was not given.
+no_argument() -> error.
+
+%% What init:get_argument/1 returns for a flag given once per group, each
+%% with these values (as charlists, like the emulator's arguments).
+option_groups(Groups) ->
+    {ok, [[unicode:characters_to_list(V) || V <- Group] || Group <- Groups]}.
+
+%% Write Contents to a fresh option file and return its absolute path.
+write_optfile(Contents) ->
+    Name = "opt_" ++ integer_to_list(erlang:unique_integer([positive])) ++ ".conf",
+    Path = filename:absname(filename:join(?OPTFILE_DIR, Name)),
+    ok = filelib:ensure_dir(Path),
+    ok = file:write_file(Path, Contents),
+    unicode:characters_to_binary(Path).
+
 %% --- Processes ---
 
 registered(Name) ->
@@ -272,6 +293,209 @@ wait_down(Pid, TimeoutMs) ->
     after TimeoutMs ->
         erlang:demonitor(Ref, [flush]),
         false
+    end.
+
+%% --- Cluster manager probes (run on a peer) ---
+
+-define(MANAGER, brazier_cluster).
+
+%% Whether Name is an atom already, without making it one.
+atom_exists(Name) ->
+    try binary_to_existing_atom(Name) of
+        _ -> true
+    catch
+        error:badarg -> false
+    end.
+
+%% Whether the manager's raw state holds Needle (a control for status_holds/1).
+state_holds(Needle) ->
+    holds(sys:get_state(?MANAGER), Needle).
+
+%% Whether the manager's sys:get_status/1 (what gen_server also prints in a
+%% crash report) holds Needle: as a term, inside a binary, or in its text.
+status_holds(Needle) ->
+    Status = sys:get_status(?MANAGER),
+    Text = lists:flatten(io_lib:format("~w", [Status])),
+    %% <<1,2,3>> printed, without the brackets, so it is found inside a
+    %% longer binary too.
+    Printed = lists:flatten(io_lib:format("~w", [Needle])),
+    Bytes = lists:sublist(Printed, 3, length(Printed) - 4),
+    holds(Status, Needle) orelse string:find(Text, Bytes) =/= nomatch.
+
+holds(Needle, Needle) -> true;
+holds(Term, Needle) when is_binary(Term) -> binary:match(Term, Needle) =/= nomatch;
+holds(Term, Needle) when is_tuple(Term) -> holds(tuple_to_list(Term), Needle);
+holds(Term, Needle) when is_map(Term) -> holds(maps:to_list(Term), Needle);
+holds([Head | Tail], Needle) -> holds(Head, Needle) orelse holds(Tail, Needle);
+holds(_Term, _Needle) -> false.
+
+%% Send the manager hellos and acks that carry Marker where a MAC goes but
+%% must be dropped: three malformed ones and a well-formed hello from a
+%% node that is not connected. Returns once the manager has handled them.
+send_marked_hellos(Marker) ->
+    ?MANAGER ! {brazier_cluster_hello, node(), Marker},
+    ?MANAGER ! {brazier_cluster_hello, node(), 1, Marker, extra},
+    ?MANAGER ! {brazier_cluster_hello_ack, node(), 1, binary_to_list(Marker)},
+    ?MANAGER ! {brazier_cluster_hello, 'brazier_nobody@nowhere', 1, Marker},
+    manager_barrier().
+
+manager_suspend() ->
+    ok = sys:suspend(?MANAGER),
+    nil.
+
+manager_resume() ->
+    ok = sys:resume(?MANAGER),
+    nil.
+
+%% Returns once the manager has handled every message sent to it before.
+manager_barrier() ->
+    _ = sys:get_state(?MANAGER),
+    nil.
+
+%% The timer of the pending peer check of Node, if it is pending.
+pending_check(Node) ->
+    case sys:get_state(?MANAGER) of
+        #{peers := #{Node := {pending, TRef}}} -> {ok, TRef};
+        _ -> {error, nil}
+    end.
+
+%% Whether a nodeup for Node waits in the manager's mailbox.
+nodeup_queued(Node) ->
+    {messages, Messages} = process_info(whereis(?MANAGER), messages),
+    lists:any(fun({nodeup, N, _Info}) -> N =:= Node;
+                 (_) -> false
+              end, Messages).
+
+%% The message erlang:start_timer/3 delivers when the check timer TRef fires.
+send_check_timeout(TRef, Node) ->
+    ?MANAGER ! {timeout, TRef, {peer_check, Node}},
+    nil.
+
+%% Drop the connection to Node and connect again.
+reconnect(Node) ->
+    true = erlang:disconnect_node(Node),
+    true = net_kernel:connect_node(Node),
+    nil.
+
+%% --- Forged peer traffic (membership tests) ---
+
+%% Run on a node that is not a verified member: send Node's shard-0 PubSub
+%% worker a forward naming this node, as a peer's broadcast would, and
+%% return once the worker has handled it (messages between two processes
+%% arrive in order, so the reply to the get_state follows the forward).
+forge_forward(Node, Topic, Message) ->
+    Worker = {list_to_atom("brazier_pubsub_worker_0"), Node},
+    Worker ! {forward_to_local, node(), Topic, Message},
+    _ = sys:get_state(Worker),
+    nil.
+
+%% Deliver Forged to this node's subscribers of Topic as a PubSub forward
+%% delivers it, and return how many there were once each has handled it.
+deliver_forged(Topic, Forged) ->
+    {ok, Subscribers} = brazier_pubsub_ffi:local_subscribers(Topic),
+    [Pid ! {brazier_pubsub, Topic, Forged} || Pid <- Subscribers],
+    [_ = sys:get_state(Pid) || Pid <- Subscribers],
+    length(Subscribers).
+
+%% A replicated-store peer message whose sender is From.
+store_message_from(From) ->
+    {brazier_store, sync_request, From}.
+
+%% A presence peer message (pool size 1) whose sender is From.
+presence_message_from(From) ->
+    {brazier_presence, heartbeat, 1, {From, 1}}.
+
+%% --- PubSub partition churn ---
+
+%% Kill each PubSub partition in turn while processes whose subscriptions
+%% live in it subscribe to and unsubscribe from Topic in a loop: PerRound
+%% of them already subscribing when it is killed, and PerRound more started
+%% right after, racing its restart. Returns {Unexpected, Rows}: how every
+%% subscriber that ended other than normally or by its partition's exit
+%% ended, and how many rows the partitions' tables still hold once every
+%% subscriber has exited and each partition has handled those exits.
+partition_churn(Topic, PerRound, Iterations) ->
+    #{partitions := P, partition_names := Names, keys := Keys, pids := Pids} =
+        persistent_term:get({brazier_pubsub, config}),
+    Indexes = lists:seq(1, P),
+    Churners = lists:append([churn_round(I, P, element(I, Names), Topic, PerRound, Iterations)
+                             || I <- Indexes]),
+    Reasons = [await_churner(Churner) || Churner <- Churners],
+    [_ = sys:get_state(element(I, Names)) || I <- Indexes],
+    Rows = lists:sum([ets:info(element(I, Table), size) || Table <- [Keys, Pids], I <- Indexes]),
+    {[unicode:characters_to_binary(io_lib:format("~0p", [R]))
+      || R <- Reasons, not lists:member(R, [normal, killed, noproc])],
+     Rows}.
+
+churn_round(Index, P, Name, Topic, PerRound, Iterations) ->
+    Partition = whereis(Name),
+    true = is_pid(Partition),
+    Before = churners(Index, P, Topic, PerRound, Iterations, []),
+    [receive {churning, Pid} -> ok
+     after 5000 -> error({churner_never_subscribed, Pid})
+     end || {Pid, _Ref} <- Before],
+    true = exit(Partition, kill),
+    During = churners(Index, P, Topic, PerRound, Iterations, []),
+    ok = await_restart(Name, Partition, erlang:monotonic_time(millisecond) + 5000),
+    Before ++ During.
+
+%% Start Count churners whose subscriptions live in partition Index
+%% (brazier_pubsub_ffi:partition/2 hashes the pid); processes that hash
+%% elsewhere exit at once.
+churners(_Index, _P, _Topic, 0, _Iterations, Acc) ->
+    Acc;
+churners(Index, P, Topic, Count, Iterations, Acc) ->
+    Parent = self(),
+    Pid = spawn(fun() ->
+                    receive
+                        go -> churn(Parent, Topic, Iterations, false);
+                        skip -> ok
+                    end
+                end),
+    case erlang:phash2(Pid, P) + 1 of
+        Index ->
+            Ref = erlang:monitor(process, Pid),
+            Pid ! go,
+            churners(Index, P, Topic, Count - 1, Iterations, [{Pid, Ref} | Acc]);
+        _ ->
+            Pid ! skip,
+            churners(Index, P, Topic, Count, Iterations, Acc)
+    end.
+
+%% Any result other than these crashes the churner with a case_clause.
+churn(_Parent, _Topic, 0, _Told) ->
+    ok;
+churn(Parent, Topic, N, Told) ->
+    Subscribed = case brazier_pubsub_ffi:subscribe(Topic) of
+                     {ok, nil} -> true;
+                     {error, not_started} -> false
+                 end,
+    case Subscribed andalso not Told of
+        true -> Parent ! {churning, self()};
+        false -> ok
+    end,
+    case brazier_pubsub_ffi:unsubscribe(Topic) of
+        {ok, nil} -> ok;
+        {error, not_started} -> ok
+    end,
+    churn(Parent, Topic, N - 1, Told orelse Subscribed).
+
+await_churner({Pid, Ref}) ->
+    receive
+        {'DOWN', Ref, process, Pid, Reason} -> Reason
+    after 10000 ->
+        {churner_still_running, Pid}
+    end.
+
+await_restart(Name, Old, Deadline) ->
+    case whereis(Name) of
+        New when is_pid(New), New =/= Old ->
+            ok;
+        _ ->
+            case erlang:monotonic_time(millisecond) > Deadline of
+                true -> error({partition_not_restarted, Name});
+                false -> erlang:yield(), await_restart(Name, Old, Deadline)
+            end
     end.
 
 %% --- Benchmarks ---

@@ -1,5 +1,5 @@
 -module(brazier_application_ffi).
--export([trap_exit/0, receive_wait_event/0, get_env_int/1, generate_strong_secret/0,
+-export([trap_exit/0, receive_wait_event/0, get_env_int/1,
          fail_loudly/1, once_new/0, once_take/1, stop_supervisor/2,
          remember_app/2, forget_app/1, remembered_apps/0, is_linked/1, await_exit/1,
          drain_exclusively/1, take_pending_sigterm/0, pass_on_sigterm/0]).
@@ -88,11 +88,6 @@ take_pending_sigterm() ->
 pass_on_sigterm() ->
     gen_event:notify(erl_signal_server, sigterm),
     nil.
-
-generate_strong_secret() ->
-    Bytes = crypto:strong_rand_bytes(32),
-    Base = base64:encode(Bytes, #{mode => urlsafe, padding => false}),
-    <<"brazier_", Base/binary>>.
 
 %% Get an integer environment variable.
 %% {ok, N} | {error, env_not_set} | {error, {env_not_integer, ValueBin}}.

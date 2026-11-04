@@ -41,7 +41,7 @@ fn start_on(
 ) -> Presence(String) {
   peer.on(p, fn() {
     pubsub.start()
-    let assert Ok(tracker) = presence.start(config)
+    let assert Ok(tracker) = presence.start(config) as "presence.start succeeds"
     tracker
   })
 }
@@ -52,7 +52,7 @@ fn start_all(
 ) -> Presence(String) {
   let trackers = list.map(peers, start_on(_, config))
   // INVARIANT: every node computes the same handle from the same config.
-  let assert [tracker, ..] = trackers
+  let assert [tracker, ..] = trackers as "trackers returns a non-empty list"
   tracker
 }
 
@@ -68,6 +68,7 @@ fn track_on(
     let h = holder.start()
     let assert Ok(_) =
       holder.run(h, fn() { presence.track(tracker, topic, key, meta) })
+      as "presence.track succeeds"
     h
   })
 }
@@ -84,6 +85,7 @@ fn seen(
 ) -> List(#(String, String)) {
   peer.on(p, fn() {
     let assert Ok(entries) = presence.list(tracker, topic)
+      as "presence.list succeeds"
     list.flat_map(entries, fn(entry) {
       list.map(entry.metas, fn(meta) { #(entry.key, meta.node) })
     })
@@ -109,6 +111,7 @@ fn replicas(
 ) -> List(#(String, presence.ReplicaStatus)) {
   peer.on(p, fn() {
     let assert Ok(replicas) = presence.replicas(tracker, "any")
+      as "presence.replicas succeeds"
     replicas
   })
 }
@@ -134,6 +137,7 @@ fn diffs(
     |> list.map(fn(message) {
       let assert Ok(Diff(_, joins, leaves)) =
         presence.decode_diff(tracker, message)
+        as "presence.decode_diff succeeds"
       #(flatten(joins), flatten(leaves))
     })
   })
@@ -151,8 +155,8 @@ fn flatten(entries: List(sync.Entry(String))) -> List(String) {
 /// and each node reports the joins to its diff subscribers.
 pub fn cross_node_track_test_() -> peer.Timeout {
   use <- Timeout(60)
-  use peers <- peer.with_cluster(3, "brazier_pr_cross")
-  let assert [a, b, c] = peers
+  use peers <- peer.with_members(3, "brazier_pr_cross")
+  let assert [a, b, c] = peers as "the cluster starts three peers"
   let tracker = start_all(peers, fast_config())
   let recorder = record_diffs(c, tracker, "room")
   let _ = track_on(a, tracker, "room", "alice", "online")
@@ -172,6 +176,7 @@ pub fn cross_node_track_test_() -> peer.Timeout {
   assert joined == ["alice=online", "bob=away"]
   let assert Ok(Entry("bob", [meta])) =
     peer.on(c, fn() { presence.get_by_key(tracker, "room", "bob") })
+    as "presence.get_by_key succeeds"
   assert meta.value == "away"
   assert meta.node == node_name(b)
 }
@@ -179,8 +184,8 @@ pub fn cross_node_track_test_() -> peer.Timeout {
 /// A tracked process that exits leaves on every node.
 pub fn leave_on_process_exit_test_() -> peer.Timeout {
   use <- Timeout(60)
-  use peers <- peer.with_cluster(2, "brazier_pr_exit")
-  let assert [a, b] = peers
+  use peers <- peer.with_members(2, "brazier_pr_exit")
+  let assert [a, b] = peers as "the cluster starts two peers"
   let tracker = start_all(peers, fast_config())
   let h = track_on(a, tracker, "room", "alice", "online")
   assert sees(b, tracker, "room", ["alice"])
@@ -193,8 +198,8 @@ pub fn leave_on_process_exit_test_() -> peer.Timeout {
 /// waits for the remote node, so no heartbeat carries two of them.
 pub fn diffs_arrive_in_order_remotely_test_() -> peer.Timeout {
   use <- Timeout(60)
-  use peers <- peer.with_cluster(2, "brazier_pr_order")
-  let assert [a, b] = peers
+  use peers <- peer.with_members(2, "brazier_pr_order")
+  let assert [a, b] = peers as "the cluster starts two peers"
   let tracker = start_all(peers, fast_config())
   let recorder = record_diffs(b, tracker, "room")
   let h = track_on(a, tracker, "room", "alice", "v1")
@@ -207,12 +212,15 @@ pub fn diffs_arrive_in_order_remotely_test_() -> peer.Timeout {
   step(1)
   let assert Ok(_) =
     run_on(a, h, fn() { presence.update(tracker, "room", "alice", "v2") })
+    as "presence.update succeeds"
   step(2)
   let assert Ok(_) =
     run_on(a, h, fn() { presence.update(tracker, "room", "alice", "v3") })
+    as "presence.update succeeds"
   step(3)
   let assert Ok(Nil) =
     run_on(a, h, fn() { presence.untrack(tracker, "room", "alice") })
+    as "presence.untrack succeeds"
   step(4)
   assert diffs(b, tracker, recorder)
     == [
@@ -227,16 +235,19 @@ pub fn diffs_arrive_in_order_remotely_test_() -> peer.Timeout {
 /// state.
 pub fn rapid_changes_converge_test_() -> peer.Timeout {
   use <- Timeout(60)
-  use peers <- peer.with_cluster(2, "brazier_pr_rapid")
-  let assert [a, b] = peers
+  use peers <- peer.with_members(2, "brazier_pr_rapid")
+  let assert [a, b] = peers as "the cluster starts two peers"
   let tracker = start_all(peers, fast_config())
   let h = track_on(a, tracker, "room", "alice", "v1")
   run_on(a, h, fn() {
     list.each(["v2", "v3", "v4"], fn(value) {
       let assert Ok(_) = presence.update(tracker, "room", "alice", value)
+        as "presence.update succeeds"
     })
     let assert Ok(_) = presence.track(tracker, "room", "bob", "b")
+      as "presence.track succeeds"
     let assert Ok(Nil) = presence.untrack(tracker, "room", "bob")
+      as "presence.untrack succeeds"
     Nil
   })
   assert peer.eventually(
@@ -263,8 +274,8 @@ fn result_values(
 /// transfer.
 pub fn late_node_receives_a_transfer_test_() -> peer.Timeout {
   use <- Timeout(60)
-  use peers <- peer.with_cluster(2, "brazier_pr_late")
-  let assert [a, b] = peers
+  use peers <- peer.with_members(2, "brazier_pr_late")
+  let assert [a, b] = peers as "the cluster starts two peers"
   let tracker = start_on(a, fast_config())
   let _ = track_on(a, tracker, "room", "alice", "online")
   let _ = track_on(a, tracker, "room", "bob", "online")
@@ -282,6 +293,7 @@ pub fn late_node_receives_a_transfer_test_() -> peer.Timeout {
 
 fn shard_has_delta(tracker: Presence(String), topic: String) -> Bool {
   let assert Ok(shard) = presence.shard_pid(tracker, topic)
+    as "presence.shard_pid succeeds"
   shard_has_delta_ffi(shard)
 }
 
@@ -291,8 +303,8 @@ fn shard_has_delta(tracker: Presence(String), topic: String) -> Bool {
 /// permanently down after permdown_period (forgotten).
 pub fn crashed_node_goes_down_then_permdown_test_() -> peer.Timeout {
   use <- Timeout(60)
-  use peers <- peer.with_cluster(3, "brazier_pr_crash")
-  let assert [a, b, c] = peers
+  use peers <- peer.with_members(3, "brazier_pr_crash")
+  let assert [a, b, c] = peers as "the cluster starts three peers"
   let tracker = start_all(peers, fast_config())
   let _ = track_on(a, tracker, "room", "alice", "online")
   let _ = track_on(c, tracker, "room", "carol", "online")
@@ -317,8 +329,8 @@ pub fn crashed_node_goes_down_then_permdown_test_() -> peer.Timeout {
 /// both sides converge, including changes made during the split.
 pub fn netsplit_and_heal_test_() -> peer.Timeout {
   use <- Timeout(60)
-  use peers <- peer.with_cluster(2, "brazier_pr_split")
-  let assert [a, b] = peers
+  use peers <- peer.with_members(2, "brazier_pr_split")
+  let assert [a, b] = peers as "the cluster starts two peers"
   let tracker =
     start_all(peers, fast_config() |> presence.permdown_period(60_000))
   let _ = track_on(a, tracker, "room", "alice", "a")
@@ -332,6 +344,7 @@ pub fn netsplit_and_heal_test_() -> peer.Timeout {
   let _ = track_on(a, tracker, "room", "carol", "c")
   let assert Ok(Nil) =
     run_on(b, bob, fn() { presence.untrack(tracker, "room", "bob") })
+    as "presence.untrack succeeds"
   let _ = track_on(b, tracker, "room", "dave", "d")
 
   peer.heal(a, b)
@@ -343,8 +356,8 @@ pub fn netsplit_and_heal_test_() -> peer.Timeout {
 /// version's entries at once, and processes that track again reappear.
 pub fn restarted_shard_is_a_new_replica_test_() -> peer.Timeout {
   use <- Timeout(60)
-  use peers <- peer.with_cluster(2, "brazier_pr_restart")
-  let assert [a, b] = peers
+  use peers <- peer.with_members(2, "brazier_pr_restart")
+  let assert [a, b] = peers as "the cluster starts two peers"
   // Long periods: only the new version can explain the entries leaving.
   let config =
     fast_config()
@@ -357,6 +370,7 @@ pub fn restarted_shard_is_a_new_replica_test_() -> peer.Timeout {
   let old =
     peer.on(a, fn() {
       let assert Ok(shard) = presence.shard_pid(tracker, "room")
+        as "presence.shard_pid succeeds"
       process.kill(shard)
       shard
     })
@@ -370,6 +384,7 @@ pub fn restarted_shard_is_a_new_replica_test_() -> peer.Timeout {
   assert sees(b, tracker, "room", [])
   let assert Ok(_) =
     run_on(a, h, fn() { presence.track(tracker, "room", "alice", "v2") })
+    as "presence.track succeeds"
   assert sees(b, tracker, "room", ["alice"])
   assert replicas(b, tracker) == [#(node_name(a), Up)]
 }
@@ -385,8 +400,8 @@ fn is_new(outcome: Result(Pid, presence.PresenceError), old: Pid) -> Bool {
 /// instead of after down_period.
 pub fn graceful_stop_drops_entries_at_once_test_() -> peer.Timeout {
   use <- Timeout(60)
-  use peers <- peer.with_cluster(2, "brazier_pr_graceful")
-  let assert [a, b] = peers
+  use peers <- peer.with_members(2, "brazier_pr_graceful")
+  let assert [a, b] = peers as "the cluster starts two peers"
   let config =
     fast_config()
     |> presence.down_period(30_000)
@@ -398,6 +413,7 @@ pub fn graceful_stop_drops_entries_at_once_test_() -> peer.Timeout {
   assert replicas(b, tracker) == [#(node_name(a), Up)]
 
   let assert Ok(Nil) = peer.on(a, fn() { presence.stop(tracker) })
+    as "presence.stop succeeds"
   assert sees(b, tracker, "room", ["bob"])
   assert replicas(b, tracker) == []
 }
@@ -407,8 +423,8 @@ pub fn graceful_stop_drops_entries_at_once_test_() -> peer.Timeout {
 /// Remote entries count towards a shard's entry limit.
 pub fn shard_limit_counts_remote_entries_test_() -> peer.Timeout {
   use <- Timeout(60)
-  use peers <- peer.with_cluster(2, "brazier_pr_limit")
-  let assert [a, b] = peers
+  use peers <- peer.with_members(2, "brazier_pr_limit")
+  let assert [a, b] = peers as "the cluster starts two peers"
   let tracker =
     start_all(peers, fast_config() |> presence.max_entries_per_shard(2))
   let _ = track_on(a, tracker, "room", "alice", "a")
@@ -427,13 +443,14 @@ pub fn shard_limit_counts_remote_entries_test_() -> peer.Timeout {
 /// rather than merged.
 pub fn oversized_transfer_is_rejected_test_() -> peer.Timeout {
   use <- Timeout(60)
-  use peers <- peer.with_cluster(2, "brazier_pr_transfer")
-  let assert [a, b] = peers
+  use peers <- peer.with_members(2, "brazier_pr_transfer")
+  let assert [a, b] = peers as "the cluster starts two peers"
   let tracker = start_on(a, fast_config())
   let h = peer.on(a, holder.start)
   run_on(a, h, fn() {
     list.each(["k1", "k2", "k3"], fn(key) {
       let assert Ok(_) = presence.track(tracker, "room", key, "m")
+        as "presence.track succeeds"
     })
   })
   // A's heartbeat has sent the changes, to nobody: B can only get them
@@ -459,7 +476,7 @@ pub fn oversized_transfer_is_rejected_test_() -> peer.Timeout {
 /// 10,000 entries tracked across 3 nodes, until every node lists them all.
 pub fn presence_convergence_benchmark_test_() -> peer.Timeout {
   use <- Timeout(120)
-  use peers <- peer.with_cluster(3, "brazier_pr_bench")
+  use peers <- peer.with_members(3, "brazier_pr_bench")
   let config =
     presence.new(name, json.string, decode.string)
     |> presence.broadcast_period(50)
@@ -479,6 +496,7 @@ pub fn presence_convergence_benchmark_test_() -> peer.Timeout {
           int.range(from: 0, to: per_node, with: Nil, run: fn(_, i) {
             let key = int.to_string(index) <> "-" <> int.to_string(i)
             let assert Ok(_) = presence.track(tracker, "bench", key, "m")
+              as "presence.track succeeds"
             Nil
           })
           now_us() - began
@@ -490,6 +508,7 @@ pub fn presence_convergence_benchmark_test_() -> peer.Timeout {
       list.all(peers, fn(p) {
         peer.on(p, fn() {
           let assert Ok(entries) = presence.list(tracker, "bench")
+            as "presence.list succeeds"
           list.length(entries)
         })
         == total

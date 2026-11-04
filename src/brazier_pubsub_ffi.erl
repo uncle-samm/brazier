@@ -8,6 +8,11 @@
 %% caller's shard on each remote node (brazier_pubsub_worker), so a topic
 %% with 10k subscribers on a node costs one cross-node message, not 10k.
 %%
+%% Remote nodes are cluster members only: a node that has not passed the
+%% cluster manager's peer check (brazier_cluster_ffi:verified/1) gets no
+%% forward, and its workers drop the ones it sends. The forward is
+%% {forward_to_local, FromNode, Topic, Message} so the receiver can check.
+%%
 %% Subscribers receive {brazier_pubsub, Topic, Message}. brazier_subscription_ffi
 %% and the runtime listener depend on that exact shape.
 
@@ -149,25 +154,106 @@ subscribe(Topic, Config) ->
     case partition(Self, Config) of
         {error, Reason} ->
             {error, Reason};
-        {ok, PartitionPid, Keys, Pids} ->
+        {ok, PartitionPid, Name, Keys, Pids} ->
             #{max_topics_per_subscriber := Max} = Config,
-            Existing = ets:lookup(Pids, Self),
-            case lists:keymember(Topic, 2, Existing) of
-                true ->
-                    {ok, nil};
-                false when length(Existing) >= Max ->
-                    brazier_log_ffi:warning(<<"brazier.pubsub">>, "~p refused a subscription to ~ts: it already "
-                                           "has ~b topics (limit ~b)", [Self, Topic, length(Existing), Max]),
-                    {error, {too_many_subscriptions, Max}};
-                false ->
-                    %% Link before inserting (Registry.register/3 order) so
-                    %% the partition always sees the subscriber exit.
-                    true = link(PartitionPid),
-                    true = ets:insert(Pids, {Self, Topic}),
-                    true = ets:insert(Keys, {Topic, Self}),
-                    {ok, nil}
+            case lookup_own(Pids, Self) of
+                {error, not_started} ->
+                    restarting(PartitionPid, Self, Topic);
+                {ok, Existing} ->
+                    case lists:keymember(Topic, 2, Existing) of
+                        true ->
+                            {ok, nil};
+                        false when length(Existing) >= Max ->
+                            brazier_log_ffi:warning(<<"brazier.pubsub">>, "~p refused a subscription to ~ts: it "
+                                                   "already has ~b topics (limit ~b)",
+                                                   [Self, Topic, length(Existing), Max]),
+                            {error, {too_many_subscriptions, Max}};
+                        false ->
+                            insert_subscription({PartitionPid, Name}, Keys, Pids, Self, Topic, Existing)
+                    end
             end
     end.
+
+%% Link before inserting (Registry.register/3 order) so the partition always
+%% sees the subscriber exit. The partition registers its name only after
+%% its tables exist, and the name goes when it dies, so:
+%%   - after the link, the name still naming PartitionPid means the link is
+%%     to the live partition that owns the tables;
+%%   - after the inserts, it still naming PartitionPid means the rows went
+%%     into that partition's tables, not into those of a successor that
+%%     took the same table names after PartitionPid died (they would be
+%%     orphans: no partition linked to this process would remove them).
+insert_subscription({PartitionPid, Name}, Keys, Pids, Self, Topic, Existing) ->
+    case link_partition(PartitionPid) of
+        dead ->
+            restarting(PartitionPid, Self, Topic);
+        linked ->
+            insert_linked({PartitionPid, Name}, Keys, Pids, Self, Topic, Existing)
+    end.
+
+%% link/1 to a process that is gone fails with noproc in a caller that does
+%% not trap exits (one that does gets {'EXIT', Pid, noproc} and the name
+%% check below sees the partition is gone).
+link_partition(PartitionPid) ->
+    try link(PartitionPid) of
+        true -> linked
+    catch
+        error:noproc -> dead
+    end.
+
+insert_linked({PartitionPid, Name}, Keys, Pids, Self, Topic, Existing) ->
+    case whereis(Name) =:= PartitionPid of
+        false ->
+            unlink_unless_subscribed(PartitionPid, Existing),
+            restarting(PartitionPid, Self, Topic);
+        true ->
+            Inserted = try
+                           true = ets:insert(Pids, {Self, Topic}),
+                           true = ets:insert(Keys, {Topic, Self}),
+                           inserted
+                       catch
+                           %% PartitionPid died between the check and the
+                           %% inserts, and no successor has made the tables.
+                           error:badarg -> no_table
+                       end,
+            case Inserted =:= inserted andalso whereis(Name) =:= PartitionPid of
+                true ->
+                    {ok, nil};
+                false ->
+                    ok = remove_rows(Keys, Pids, Self, Topic),
+                    unlink_unless_subscribed(PartitionPid, Existing),
+                    restarting(PartitionPid, Self, Topic)
+            end
+    end.
+
+restarting(PartitionPid, Self, Topic) ->
+    brazier_log_ffi:warning(<<"brazier.pubsub">>, "Partition ~p is restarting; ~p did not subscribe to ~ts",
+                           [PartitionPid, Self, Topic]),
+    {error, not_started}.
+
+%% The subscriber's rows in its partition; the table is missing while the
+%% partition restarts.
+lookup_own(Pids, Self) ->
+    try ets:lookup(Pids, Self) of
+        Rows -> {ok, Rows}
+    catch
+        error:badarg -> {error, not_started}
+    end.
+
+%% Undo inserts that may have landed in a successor's tables, or half of
+%% them; a missing table holds nothing to remove.
+remove_rows(Keys, Pids, Self, Topic) ->
+    [try true = ets:delete_object(Table, Row)
+     catch error:badarg -> true
+     end || {Table, Row} <- [{Pids, {Self, Topic}}, {Keys, {Topic, Self}}]],
+    ok.
+
+%% The link is shared by every topic the process holds in this partition.
+unlink_unless_subscribed(PartitionPid, []) ->
+    true = unlink(PartitionPid),
+    ok;
+unlink_unless_subscribed(_PartitionPid, [_ | _]) ->
+    ok.
 
 unsubscribe(Topic) ->
     with_topic(Topic, fun(Config) -> unsubscribe(Topic, Config) end).
@@ -177,17 +263,23 @@ unsubscribe(Topic, Config) ->
     case partition(Self, Config) of
         {error, Reason} ->
             {error, Reason};
-        {ok, PartitionPid, Keys, Pids} ->
-            true = ets:delete_object(Pids, {Self, Topic}),
-            true = ets:delete_object(Keys, {Topic, Self}),
-            case ets:member(Pids, Self) of
-                true -> ok;
-                false -> true = unlink(PartitionPid)
-            end,
-            {ok, nil}
+        {ok, PartitionPid, _Name, Keys, Pids} ->
+            ok = remove_rows(Keys, Pids, Self, Topic),
+            case lookup_own(Pids, Self) of
+                {ok, [_ | _]} ->
+                    {ok, nil};
+                {ok, []} ->
+                    true = unlink(PartitionPid),
+                    {ok, nil};
+                {error, not_started} ->
+                    %% PartitionPid died after the lookup: its tables, and
+                    %% the rows in them, went with it.
+                    restarting(PartitionPid, Self, Topic)
+            end
     end.
 
-%% The partition that owns Pid's subscriptions: {ok, PartitionPid, Keys, Pids}.
+%% The partition that owns Pid's subscriptions:
+%% {ok, PartitionPid, Name, Keys, Pids}.
 partition(Pid, Config) ->
     #{partitions := P, partition_names := Names, keys := KeysTables, pids := PidsTables} = Config,
     Index = erlang:phash2(Pid, P) + 1,
@@ -197,7 +289,7 @@ partition(Pid, Config) ->
                                    "subscriptions until it is back", [Index, Pid]),
             {error, not_started};
         PartitionPid ->
-            {ok, PartitionPid, element(Index, KeysTables), element(Index, PidsTables)}
+            {ok, PartitionPid, element(Index, Names), element(Index, KeysTables), element(Index, PidsTables)}
     end.
 
 %% The partition process Pid's subscriptions live in. A subscriber can
@@ -207,7 +299,7 @@ partition_for(Pid) ->
         {error, not_started} -> {error, not_started};
         {ok, Config} ->
             case partition(Pid, Config) of
-                {ok, PartitionPid, _Keys, _Pids} -> {ok, PartitionPid};
+                {ok, PartitionPid, _Name, _Keys, _Pids} -> {ok, PartitionPid};
                 {error, Reason} -> {error, Reason}
             end
     end.
@@ -255,13 +347,23 @@ direct_broadcast(Node, Topic, Message, Config) ->
                 [] ->
                     NotConnected;
                 [Worker | _] ->
-                    case erlang:send(Worker, {forward_to_local, Topic, Message}, [noconnect]) of
-                        noconnect ->
-                            NotConnected;
-                        ok ->
-                            brazier_telemetry_ffi:pubsub_broadcast(0, 1, <<"direct">>),
-                            {ok, nil}
-                    end
+                    direct_forward(Node, Worker, Topic, Message, NotConnected)
+            end
+    end.
+
+direct_forward(Node, Worker, Topic, Message, NotConnected) ->
+    case brazier_cluster_ffi:verified(Node) of
+        false ->
+            brazier_log_ffi:warning(<<"brazier.pubsub">>, "Direct broadcast on ~ts to ~p refused: it is not a "
+                                   "verified cluster member", [Topic, Node]),
+            {error, {node_not_verified, atom_to_binary(Node, utf8)}};
+        true ->
+            case erlang:send(Worker, {forward_to_local, node(), Topic, Message}, [noconnect]) of
+                noconnect ->
+                    NotConnected;
+                ok ->
+                    brazier_telemetry_ffi:pubsub_broadcast(0, 1, <<"direct">>),
+                    {ok, nil}
             end
     end.
 
@@ -292,12 +394,16 @@ lookup_partition(Table, Topic) ->
             []
     end.
 
-%% Forwarding workers of the caller's shard on remote nodes. The shard is
-%% picked from the caller's pid, so one sender's broadcasts keep their order.
+%% Forwarding workers of the caller's shard on cluster members. The shard
+%% is picked from the caller's pid, so one sender's broadcasts keep their
+%% order. pg lists the workers of every connected node; a node that has not
+%% passed the peer check is skipped (Phoenix.PubSub sends to the pg members
+%% it sees; here pg membership alone is not trusted).
 remote_workers(Config) ->
     case shard_members(Config) of
         {error, Reason} -> {error, Reason};
-        {ok, Members} -> {ok, [W || W <- Members, node(W) =/= node()]}
+        {ok, Members} ->
+            {ok, [W || W <- Members, node(W) =/= node(), brazier_cluster_ffi:verified(node(W))]}
     end.
 
 shard_members(#{pool_size := PoolSize}) ->
@@ -318,7 +424,7 @@ shard_members(#{pool_size := PoolSize}) ->
 %% node is going down and pg will remove it.
 forward(Workers, Topic, Message) ->
     lists:foldl(fun(Worker, Sent) ->
-        case erlang:send(Worker, {forward_to_local, Topic, Message}, [noconnect]) of
+        case erlang:send(Worker, {forward_to_local, node(), Topic, Message}, [noconnect]) of
             ok ->
                 Sent + 1;
             noconnect ->

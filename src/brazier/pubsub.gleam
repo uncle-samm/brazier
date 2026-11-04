@@ -1,4 +1,4 @@
-/// PubSub: publish/subscribe across processes and across connected nodes.
+/// PubSub: publish/subscribe across processes and across cluster members.
 ///
 /// A port of Phoenix.PubSub with its pg adapter:
 ///
@@ -10,6 +10,10 @@
 ///   `broadcast` delivers locally, then sends ONE forward to the worker of
 ///   the caller's shard on each remote node, which delivers to its own local
 ///   subscribers. `pool_size` must be the same on every node.
+/// - **Membership.** Forwards go only to nodes that passed the cluster
+///   manager's peer check (`brazier/cluster`), and a worker drops (and
+///   logs) a forward from any other node. Without a running cluster
+///   manager, broadcasts stay on this node.
 /// - **Delivery shape.** Subscribers receive
 ///   `{brazier_pubsub, Topic, Message}`.
 /// - **Partition links.** A subscriber is linked to its registry partition,
@@ -51,6 +55,9 @@ pub type PubSubError {
   /// `direct_broadcast` targeted a node that is not connected or runs no
   /// PubSub worker for this shard.
   NodeNotConnected(node: String)
+  /// `direct_broadcast` targeted a connected node that has not passed the
+  /// cluster peer check (or no cluster manager runs here).
+  NodeNotVerified(node: String)
   /// The calling process already holds the maximum number of topics.
   TooManySubscriptions(limit: Int)
   /// The configuration is invalid, or differs from the running one.
@@ -190,6 +197,7 @@ pub fn start() -> Nil {
   // INVARIANT: default_config() is always valid: every field is a constant
   // inside its range, and partitions is clamped.
   let assert Ok(config) = validate_config(config)
+    as "default_config() is a valid PubSub config"
   let outcome = ensure_started_ffi(config)
   case outcome {
     Ok(Nil) -> Nil
@@ -201,7 +209,7 @@ pub fn start() -> Nil {
   }
   // INVARIANT: the original start() has no way to report an error, and
   // without PubSub no subscription or broadcast can work: crash loudly.
-  let assert Ok(Nil) = outcome
+  let assert Ok(Nil) = outcome as "PubSub failed to start"
   Nil
 }
 
@@ -272,12 +280,12 @@ pub fn unsubscribe(topic: Topic) -> Nil {
 // --- Broadcasts ---
 
 /// Deliver `message` to every subscriber of `topic` on this node and on
-/// every connected node.
+/// every cluster member (connected nodes that passed the peer check).
 pub fn try_broadcast(topic: Topic, message: msg) -> Result(Nil, PubSubError) {
   broadcast_ffi(topic, message)
 }
 
-/// Broadcast to every subscriber on every connected node. Crashes on any
+/// Broadcast to every subscriber on every cluster member. Crashes on any
 /// error.
 pub fn broadcast(topic: Topic, message: msg) -> Nil {
   or_crash("broadcast", topic, try_broadcast(topic, message))
@@ -289,7 +297,8 @@ pub fn local_broadcast(topic: Topic, message: msg) -> Result(Nil, PubSubError) {
 }
 
 /// Deliver `message` to the subscribers of `topic` on `target` only.
-/// Returns `Error(NodeNotConnected(_))` if `target` is not connected.
+/// Returns `Error(NodeNotConnected(_))` if `target` is not connected, and
+/// `Error(NodeNotVerified(_))` if it has not passed the cluster peer check.
 pub fn direct_broadcast(
   target: Node,
   topic: Topic,
@@ -334,6 +343,7 @@ pub fn describe(error: PubSubError) -> String {
       <> " bytes"
     NotStarted -> "PubSub is not running on this node"
     NodeNotConnected(node) -> "node not connected: " <> node
+    NodeNotVerified(node) -> "node is not a verified cluster member: " <> node
     TooManySubscriptions(limit) ->
       "too many subscriptions (limit " <> int.to_string(limit) <> ")"
     InvalidConfig(reason) -> "invalid PubSub config: " <> reason
@@ -357,7 +367,7 @@ fn or_crash(
   }
   // INVARIANT: the Nil-returning API has no way to report an error, and a
   // lost subscription or broadcast must not go unnoticed: crash loudly.
-  let assert Ok(Nil) = outcome
+  let assert Ok(Nil) = outcome as "a PubSub subscription or broadcast failed"
   Nil
 }
 

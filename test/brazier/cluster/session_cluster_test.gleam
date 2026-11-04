@@ -39,6 +39,7 @@ fn start_store(p: Peer, name: String, db: Node) -> SessionStore {
       owned(fn() {
         session.start_store(External(ext), session.default_store_config())
       })
+      as "session.start_store succeeds"
     store
   })
 }
@@ -68,8 +69,8 @@ fn revoked_on(p: Peer, id: String, reason: String) -> Bool {
 /// Regression: logout on node A closes the session's sockets on node B.
 pub fn logout_on_one_node_revokes_on_another_test_() -> peer.Timeout {
   use <- Timeout(60)
-  use peers <- peer.with_cluster(2, "brazier_sess_logout")
-  let assert [a, b] = peers
+  use peers <- peer.with_members(2, "brazier_sess_logout")
+  let assert [a, b] = peers as "the cluster starts two peers"
   let name = "logout"
   let db = peer.node(a)
   peer.on(a, fn() { start_db(name) })
@@ -89,12 +90,12 @@ pub fn logout_on_one_node_revokes_on_another_test_() -> peer.Timeout {
 /// reconnect, the other side re-checks its bound sessions and revokes it.
 pub fn revocation_during_partition_is_enforced_on_heal_test_() -> peer.Timeout {
   use <- Timeout(90)
-  use peers <- peer.with_cluster_args(
+  use peers <- peer.with_members_args(
     3,
     "brazier_sess_split",
     partial_partitions,
   )
-  let assert [a, b, c] = peers
+  let assert [a, b, c] = peers as "the cluster starts three peers"
   let name = "split"
   let db = peer.node(c)
   peer.on(c, fn() { start_db(name) })
@@ -137,8 +138,8 @@ fn revoked_events(p: Peer) -> List(RecordedEvent) {
 /// Sessions on an External backend are the same session on every node.
 pub fn external_backend_works_from_both_nodes_test_() -> peer.Timeout {
   use <- Timeout(60)
-  use peers <- peer.with_cluster(2, "brazier_sess_shared")
-  let assert [a, b] = peers
+  use peers <- peer.with_members(2, "brazier_sess_shared")
+  let assert [a, b] = peers as "the cluster starts two peers"
   let name = "shared"
   let db = peer.node(a)
   peer.on(a, fn() { start_db(name) })
@@ -153,9 +154,11 @@ pub fn external_backend_works_from_both_nodes_test_() -> peer.Timeout {
 
   let assert Ok(written) =
     peer.on(b, fn() { session.set(store_b, s, "role", "admin") })
+    as "session.set succeeds"
   assert peer.on(a, fn() { session.get(store_a, s.id) }) == Some(written)
 
   let assert Ok(fresh) = peer.on(b, fn() { session.rotate(store_b, s.id) })
+    as "session.rotate succeeds"
   assert peer.on(a, fn() { session.get(store_a, s.id) }) == None
   assert peer.on(a, fn() { session.get(store_a, fresh.id) }) == Some(fresh)
   assert peer.on(a, fn() { session.count(store_a) }) == 1
@@ -169,8 +172,8 @@ pub fn external_backend_works_from_both_nodes_test_() -> peer.Timeout {
 /// missing session, and the sockets stay bound.
 pub fn database_node_down_is_a_backend_failure_test_() -> peer.Timeout {
   use <- Timeout(60)
-  use peers <- peer.with_cluster(2, "brazier_sess_dbdown")
-  let assert [a, b] = peers
+  use peers <- peer.with_members(2, "brazier_sess_dbdown")
+  let assert [a, b] = peers as "the cluster starts two peers"
   let name = "dbdown"
   let db = peer.node(b)
   peer.on(b, fn() { start_db(name) })
@@ -179,6 +182,7 @@ pub fn database_node_down_is_a_backend_failure_test_() -> peer.Timeout {
   peer.crash(b)
   let assert Error(session.SessionBackendFailed(_)) =
     peer.on(a, fn() { session.fetch(store_a, s.id) })
+    as "session.fetch returns Error(SessionBackendFailed)"
   Nil
 }
 
@@ -186,8 +190,8 @@ pub fn database_node_down_is_a_backend_failure_test_() -> peer.Timeout {
 /// not exist on the other nodes.
 pub fn local_ets_store_warns_when_clustered_test_() -> peer.Timeout {
   use <- Timeout(60)
-  use peers <- peer.with_cluster(1, "brazier_sess_warn")
-  let assert [a] = peers
+  use peers <- peer.with_members(1, "brazier_sess_warn")
+  let assert [a] = peers as "the cluster starts one peer"
   let #(_, lines) =
     peer.on(a, fn() {
       log_capture.capture(fn() { owned(fn() { session.new_store("warned") }) })

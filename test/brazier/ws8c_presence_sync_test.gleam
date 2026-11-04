@@ -1,7 +1,9 @@
 //// The shard's sync waiters (brazier_presence_shard, "Sync waiters"),
 //// driven on one node by fake peers (see brazier_presence_test_ffi): a
 //// process asks when the shard has caught up with some nodes and gets one
-//// answer per node, after the diffs of what the shard learnt before.
+//// answer per node, after the diffs of what the shard learnt before. A
+//// shard takes replication messages only from verified cluster members, so
+//// the tests that hear from the ghost count it as one (with_verified).
 
 import brazier/cluster/log_capture
 import brazier/presence.{type Presence, Down}
@@ -56,6 +58,7 @@ fn answer(shard: Pid) -> Result(#(String, String), Nil) {
 /// The answer only comes once the transfer brought its entry, and after
 /// the diff of that entry.
 pub fn synced_comes_after_the_entries_it_waited_for_test() {
+  use <- with_verified(["ghost@host"])
   let p = start(5000)
   let _ = flush_diffs()
   let assert Ok(Nil) = presence.subscribe(p, "room")
@@ -75,6 +78,7 @@ pub fn synced_comes_after_the_entries_it_waited_for_test() {
 
 /// A node the shard knows and holds everything of is answered at once.
 pub fn synced_at_once_when_already_caught_up_test() {
+  use <- with_verified(["ghost@host"])
   let p = start(5000)
   let ghost = fake_ref("ghost@host", 1)
   send_peer(p, transfer_ack(ghost, 1, "room", [#("remote", "\"hi\"")]))
@@ -97,6 +101,7 @@ pub fn absent_for_a_node_never_heard_from_test() {
 /// A node whose replica is down is answered at once: its entries are
 /// hidden, so a watcher holding them reports them gone.
 pub fn down_for_a_node_that_is_down_test() {
+  use <- with_verified(["ghost@host"])
   let p = start(100)
   let ghost = fake_ref("ghost@host", 1)
   send_peer(p, transfer_ack(ghost, 1, "room", [#("remote", "\"hi\"")]))
@@ -114,6 +119,7 @@ pub fn down_for_a_node_that_is_down_test() {
 /// (it answers no transfer request): the waiter is told `timeout` after
 /// down_period, and the shard logs it.
 pub fn timeout_when_the_node_never_catches_up_test() {
+  use <- with_verified(["ghost@host"])
   let p = start(300)
   let ghost = fake_ref("ghost@host", 1)
   send_peer(p, heartbeat_at(ghost, 1, 5))
@@ -211,6 +217,9 @@ fn send_peer_ffi(shard: Pid, topic: String, message: Dynamic) -> Nil
 
 @external(erlang, "brazier_presence_test_ffi", "flush_diffs")
 fn flush_diffs() -> Int
+
+@external(erlang, "brazier_presence_test_ffi", "with_verified")
+fn with_verified(nodes: List(String), run: fn() -> a) -> a
 
 @external(erlang, "brazier_presence_test_ffi", "unique_positive")
 fn unique_integer() -> Int

@@ -15,6 +15,7 @@ It exercises:
 
 ```sh
 cd examples/local_first_form
+export SECRET_KEY="$(openssl rand -base64 48)"   # once per shell
 gleam run -m brazier/build   # first, and after every change
 gleam run -m local_first_form
 ```

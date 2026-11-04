@@ -23,6 +23,7 @@ Real-time chat with a deterministic server-side streaming response.
 
 ```bash
 cd examples/ai_chat
+export SECRET_KEY="$(openssl rand -base64 48)"   # once per shell
 gleam run -m brazier/build   # first, and after every change
 gleam run -m ai_chat
 ```

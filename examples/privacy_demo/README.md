@@ -20,6 +20,7 @@ Shows how `brazier.full_application` keeps secrets on the server.
 
 ```bash
 cd examples/privacy_demo
+export SECRET_KEY="$(openssl rand -base64 48)"   # once per shell
 gleam run -m brazier/build   # first, and after every change
 gleam run -m privacy_demo
 ```
