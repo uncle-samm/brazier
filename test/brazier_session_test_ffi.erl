@@ -8,9 +8,12 @@
 %% operation return an error.
 %%
 %% Bound processes (spawn_bound/1) record every revocation they receive in a
-%% per-node table read back with revocations/0.
+%% per-node table read back with revocations/0, and also tell the process
+%% that spawned them, so a test on the same node waits for one with
+%% await_revoked/4 instead of polling the table.
 -export([start_db/1, backend/2, set_failing/3, owned/1, spawn_bound/1,
-         revocations/0, bound_everywhere/2, raises/1, system_now/0,
+         revocations/0, await_revoked/4, bound_everywhere/2, raises/1,
+         system_now/0,
          db_create/2, db_fetch/2, db_touch/3, db_replace/3, db_delete/2,
          db_delete_version/3, db_expired/4, db_count/1]).
 
@@ -127,11 +130,12 @@ db_count(Table) ->
 owned(Fun) ->
     Parent = self(),
     Ref = make_ref(),
-    Pid = spawn(fun() ->
+    %% spawn_monitor: a Fun that crashes at once reports its own reason,
+    %% never noproc.
+    {Pid, MRef} = spawn_monitor(fun() ->
         Parent ! {Ref, Fun()},
         receive stop -> ok end
     end),
-    MRef = erlang:monitor(process, Pid),
     receive
         {Ref, Result} ->
             erlang:demonitor(MRef, [flush]),
@@ -158,12 +162,11 @@ spawn_bound(Bind) ->
     ensure_revoked_table(),
     Parent = self(),
     Ref = make_ref(),
-    Pid = spawn(fun() ->
+    {Pid, MRef} = spawn_monitor(fun() ->
         nil = Bind(),
         Parent ! {Ref, bound},
-        bound_loop()
+        bound_loop(Parent)
     end),
-    MRef = erlang:monitor(process, Pid),
     receive
         {Ref, bound} ->
             erlang:demonitor(MRef, [flush]),
@@ -174,11 +177,15 @@ spawn_bound(Bind) ->
         erlang:error(bind_timeout)
     end.
 
-bound_loop() ->
+%% Parent may be an erpc worker that has already exited (a bound process
+%% spawned on a peer node); a send to it is then dropped, and the table is
+%% what such tests read.
+bound_loop(Parent) ->
     receive
         {brazier_session_revoked, Id, Reason} ->
             true = ets:insert(?REVOKED, {Id, Reason}),
-            bound_loop();
+            Parent ! {brazier_session_test_revoked, self(), Id, Reason},
+            bound_loop(Parent);
         stop ->
             ok
     end.
@@ -186,6 +193,26 @@ bound_loop() ->
 revocations() ->
     ensure_revoked_table(),
     lists:sort(ets:tab2list(?REVOKED)).
+
+%% Wait for the bound process Pid (spawned by the caller) to receive the
+%% revocation {Id, Reason}: {ok, nil}, or {error, Others} with the other
+%% revocations Pid reported before the deadline. Only Pid's reports match,
+%% so a revocation recorded by an earlier test never satisfies this one.
+await_revoked(Pid, Id, Reason, TimeoutMs) ->
+    Deadline = erlang:monotonic_time(millisecond) + TimeoutMs,
+    await_revoked(Pid, Id, Reason, Deadline, []).
+
+await_revoked(Pid, Id, Reason, Deadline, Others) ->
+    Remaining = max(0, Deadline - erlang:monotonic_time(millisecond)),
+    receive
+        {brazier_session_test_revoked, Pid, Id, Reason} ->
+            {ok, nil};
+        {brazier_session_test_revoked, Pid, OtherId, OtherReason} ->
+            await_revoked(Pid, Id, Reason, Deadline,
+                          [{OtherId, OtherReason} | Others])
+    after Remaining ->
+        {error, lists:reverse(Others)}
+    end.
 
 %% Bound processes for a session on every node this node sees.
 bound_everywhere(Namespace, Id) ->

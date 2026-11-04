@@ -4,8 +4,14 @@
 //// answer per node, after the diffs of what the shard learnt before. A
 //// shard takes replication messages only from verified cluster members, so
 //// the tests that hear from the ghost count it as one (with_verified).
+////
+//// Every presence is stopped after its test even when the test fails
+//// (with_presence), and nothing polls: a test waits for the shard's own
+//// heartbeat ticks (await.watch_info) or for its answer.
 
+import brazier/await
 import brazier/cluster/log_capture
+import brazier/monitored
 import brazier/presence.{type Presence, Down}
 import brazier/pubsub
 import gleam/dynamic.{type Dynamic}
@@ -33,6 +39,22 @@ fn start(down_period: Int) -> Presence(String) {
   p
 }
 
+/// Run `body` with a fresh presence and stop it afterwards, even when
+/// `body` fails: a shard left running keeps heartbeating every 20 ms for
+/// the rest of the test run.
+fn with_presence(down_period: Int, body: fn(Presence(String)) -> a) -> a {
+  let p = start(down_period)
+  use <- monitored.with_cleanup(fn() {
+    let assert Ok(Nil) = presence.stop(p) as "stopping the test's presence"
+    Nil
+  })
+  body(p)
+}
+
+/// The number of 20 ms heartbeat ticks that fit in `wait_ms`: the bound
+/// for a test that waits tick by tick.
+const max_ticks = 250
+
 fn shard(p: Presence(String)) -> Pid {
   let assert Ok(shard) = presence.shard_pid(p, "room")
   shard
@@ -58,9 +80,12 @@ fn answer(shard: Pid) -> Result(#(String, String), Nil) {
 /// The answer only comes once the transfer brought its entry, and after
 /// the diff of that entry.
 pub fn synced_comes_after_the_entries_it_waited_for_test() {
+  // Isolated: it subscribes the test process, whose mailbox then gets the
+  // diffs. In eunit's shared process a failure here would leave that
+  // subscription, and its diffs, to the next tests.
+  use <- monitored.isolated
   use <- with_verified(["ghost@host"])
-  let p = start(5000)
-  let _ = flush_diffs()
+  use p <- with_presence(5000)
   let assert Ok(Nil) = presence.subscribe(p, "room")
   let ghost = fake_ref("ghost@host", 1)
   send_peer(p, heartbeat_at(ghost, 1, 1))
@@ -73,46 +98,47 @@ pub fn synced_comes_after_the_entries_it_waited_for_test() {
   let assert Ok("diff") = receive_any(wait_ms)
   let assert Ok(#("ghost@host", "synced")) = answer(shard(p))
   let assert Ok(Nil) = presence.unsubscribe(p, "room")
-  let assert Ok(Nil) = presence.stop(p)
 }
 
 /// A node the shard knows and holds everything of is answered at once.
 pub fn synced_at_once_when_already_caught_up_test() {
   use <- with_verified(["ghost@host"])
-  let p = start(5000)
+  use p <- with_presence(5000)
   let ghost = fake_ref("ghost@host", 1)
   send_peer(p, transfer_ack(ghost, 1, "room", [#("remote", "\"hi\"")]))
   send_peer(p, heartbeat_at(ghost, 1, 1))
   await_sync(shard(p), ["ghost@host"])
   let assert Ok(_) = presence.replicas(p, "room")
   let assert Ok(#("ghost@host", "synced")) = receive_synced(shard(p), 0)
-  let assert Ok(Nil) = presence.stop(p)
 }
 
 /// A node never heard from is absent once down_period has passed since the
 /// shard started (the rule that would mark it down had it been known).
 pub fn absent_for_a_node_never_heard_from_test() {
-  let p = start(100)
+  use p <- with_presence(100)
   await_sync(shard(p), ["nobody@host"])
   let assert Ok(#("nobody@host", "absent")) = answer(shard(p))
-  let assert Ok(Nil) = presence.stop(p)
 }
 
 /// A node whose replica is down is answered at once: its entries are
 /// hidden, so a watcher holding them reports them gone.
 pub fn down_for_a_node_that_is_down_test() {
   use <- with_verified(["ghost@host"])
-  let p = start(100)
+  use p <- with_presence(100)
+  let tick = await.watch_info(shard(p), "heartbeat")
   let ghost = fake_ref("ghost@host", 1)
   send_peer(p, transfer_ack(ghost, 1, "room", [#("remote", "\"hi\"")]))
-  let assert True =
-    eventually(
-      fn() { presence.replicas(p, "room") == Ok([#("ghost@host", Down)]) },
-      wait_ms,
-    )
+  // The shard marks a silent replica down on a heartbeat tick, once
+  // down_period has passed: check after each tick.
+  await.until_info(
+    tick,
+    shard(p),
+    fn() { presence.replicas(p, "room") == Ok([#("ghost@host", Down)]) },
+    max_ticks,
+    "the ghost's replica marked down",
+  )
   await_sync(shard(p), ["ghost@host"])
   let assert Ok(#("ghost@host", "down")) = answer(shard(p))
-  let assert Ok(Nil) = presence.stop(p)
 }
 
 /// The ghost keeps heartbeating a clock the shard never catches up with
@@ -120,40 +146,44 @@ pub fn down_for_a_node_that_is_down_test() {
 /// down_period, and the shard logs it.
 pub fn timeout_when_the_node_never_catches_up_test() {
   use <- with_verified(["ghost@host"])
-  let p = start(300)
+  use p <- with_presence(300)
+  let tick = await.watch_info(shard(p), "heartbeat")
   let ghost = fake_ref("ghost@host", 1)
   send_peer(p, heartbeat_at(ghost, 1, 5))
   let #(answered, lines) =
     log_capture.capture(fn() {
       await_sync(shard(p), ["ghost@host"])
-      keep_alive_until_answered(p, ghost, 60)
+      keep_alive_until_answered(p, tick, ghost, max_ticks)
     })
   let assert Ok(#("ghost@host", "timeout")) = answered
   let assert True =
     log_capture.contains(lines, "warning", "did not sync with ghost@host")
-  let assert Ok(Nil) = presence.stop(p)
 }
 
-/// Heartbeat every 50ms (the receive's timeout paces it) until the shard
-/// answers, at most `rounds` times.
+/// Heartbeat as the ghost once per shard heartbeat tick, so the shard never
+/// marks it down, until the shard answers, at most `ticks` times. The shard
+/// answers while handling a tick, and `expect_info` returns once it has, so
+/// a 0 ms receive sees any answer.
 fn keep_alive_until_answered(
   p: Presence(String),
+  tick: await.InfoWatch,
   ghost: Ref,
-  rounds: Int,
+  ticks: Int,
 ) -> Result(#(String, String), Nil) {
-  case receive_synced(shard(p), 50) {
+  case receive_synced(shard(p), 0) {
     Ok(answered) -> Ok(answered)
-    Error(Nil) if rounds <= 0 -> Error(Nil)
+    Error(Nil) if ticks <= 0 -> Error(Nil)
     Error(Nil) -> {
+      await.expect_info(tick, shard(p), "a shard heartbeat tick")
       send_peer(p, heartbeat_at(ghost, 1, 5))
-      keep_alive_until_answered(p, ghost, rounds - 1)
+      keep_alive_until_answered(p, tick, ghost, ticks - 1)
     }
   }
 }
 
 /// Several nodes in one request get one answer each; duplicates are one.
 pub fn one_answer_per_distinct_node_test() {
-  let p = start(100)
+  use p <- with_presence(100)
   await_sync(shard(p), ["b@host", "a@host", "b@host"])
   let assert Ok(first) = answer(shard(p))
   let assert Ok(second) = answer(shard(p))
@@ -162,13 +192,12 @@ pub fn one_answer_per_distinct_node_test() {
     || [first, second] == [#("b@host", "absent"), #("a@host", "absent")]
   let assert Ok(_) = presence.replicas(p, "room")
   let assert Error(Nil) = receive_synced(shard(p), 0)
-  let assert Ok(Nil) = presence.stop(p)
 }
 
 /// Requests with nodes that are not binaries, or without a list, are
 /// logged and ignored; the shard keeps running and answers the next one.
 pub fn malformed_requests_are_logged_and_ignored_test() {
-  let p = start(100)
+  use p <- with_presence(100)
   let before = shard(p)
   let tag = atom.create("brazier_presence_await_sync")
   let #(_, lines) =
@@ -184,19 +213,6 @@ pub fn malformed_requests_are_logged_and_ignored_test() {
   await_sync(before, ["a@host"])
   let assert Ok(#("a@host", "absent")) = answer(before)
   let assert True = shard(p) == before
-  let assert Ok(Nil) = presence.stop(p)
-}
-
-/// Poll `check` every 5ms until it holds or `timeout_ms` passes.
-fn eventually(check: fn() -> Bool, timeout_ms: Int) -> Bool {
-  case check() {
-    True -> True
-    False if timeout_ms <= 0 -> False
-    False -> {
-      pause(5)
-      eventually(check, timeout_ms - 5)
-    }
-  }
 }
 
 // --- FFI ----------------------------------------------------------------------
@@ -214,9 +230,6 @@ fn transfer_ack(
 
 @external(erlang, "brazier_presence_test_ffi", "send_peer")
 fn send_peer_ffi(shard: Pid, topic: String, message: Dynamic) -> Nil
-
-@external(erlang, "brazier_presence_test_ffi", "flush_diffs")
-fn flush_diffs() -> Int
 
 @external(erlang, "brazier_presence_test_ffi", "with_verified")
 fn with_verified(nodes: List(String), run: fn() -> a) -> a
@@ -238,6 +251,3 @@ fn receive_synced(shard: Pid, timeout_ms: Int) -> Result(#(String, String), Nil)
 
 @external(erlang, "brazier_ws8c_presence_sync_ffi", "receive_any")
 fn receive_any(timeout_ms: Int) -> Result(String, Nil)
-
-@external(erlang, "brazier_pubsub_test_ffi", "pause")
-fn pause(ms: Int) -> Nil

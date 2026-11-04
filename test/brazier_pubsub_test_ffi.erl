@@ -1,9 +1,5 @@
 -module(brazier_pubsub_test_ffi).
--export([receive_pubsub/1, node_named/1, linked/2, rescue/1, pause/1]).
-
-%% Wait Ms milliseconds between polls of a condition with a deadline.
-pause(Ms) ->
-    receive after Ms -> nil end.
+-export([receive_pubsub/1, node_named/1, linked/2, rescue/1]).
 
 %% Receive one PubSub delivery: {ok, {Topic, Message}}, or {error, nil}
 %% after TimeoutMs.

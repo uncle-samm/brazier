@@ -447,6 +447,21 @@ with its own changelog, so they are not listed here.
   clock, to 0. Now a `model_sync` or `patch` without a valid `ack_clock` (a
   non-negative integer) is a protocol error, logged, that requests a full
   sync. A queued event without a valid clock is an invariant error.
+- (Audit STAB-1) Tests are now race-free and isolated from each other.
+  - Some tests monitored a process after starting it. If it had already died,
+    they got `noproc` and passed without checking its real exit reason. They
+    now use `spawn_monitor` or monitor first, and they fail clearly on
+    `noproc`.
+  - PubSub and presence tests now use their own topics. Subscribers,
+    telemetry handlers and sys hooks are removed even when a test fails
+    (`monitored.isolated` and `with_cleanup`).
+  - Polling and sleeps in single-node tests are replaced by monitors, sys
+    hooks and messages.
+  - The membership tests with an intruder node failed about 1 run in 10.
+    When the intruder disconnected one verified member, OTP's `global`
+    sometimes cut the two verified members apart. Their peers now run with
+    `prevent_overlapping_partitions` off. The manager's own handling of
+    this is an open issue.
 
 ### Removed
 

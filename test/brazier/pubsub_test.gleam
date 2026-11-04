@@ -2,7 +2,9 @@
 //// partition kills, overload, a stopped registry) is covered with real
 //// peer nodes in test/brazier/cluster/pubsub_cluster_test.gleam.
 
+import brazier/await
 import brazier/cluster/log_capture
+import brazier/monitored
 import brazier/pubsub.{
   InvalidConfig, InvalidTopic, NodeNotConnected, TooManySubscriptions,
 }
@@ -55,22 +57,25 @@ fn forward_loop(out: Subject(Delivery)) -> Nil {
 
 fn await_ready(ready: Subject(Pid)) -> Pid {
   let assert Ok(pid) = process.receive(ready, 1000)
+    as "a subscriber did not subscribe within 1 s"
   pid
 }
 
-/// Poll `check` every 5ms until it holds or `timeout_ms` passes.
-fn eventually(check: fn() -> Bool, timeout_ms: Int) -> Bool {
-  case check() {
-    True -> True
-    False ->
-      case timeout_ms <= 0 {
-        True -> False
-        False -> {
-          pause(5)
-          eventually(check, timeout_ms - 5)
-        }
-      }
-  }
+/// Start one subscriber per entry of `topics`, wait until all have
+/// subscribed, and run `body` with their pids. The subscribers are
+/// unlinked, so they are killed after `body` even when it fails: otherwise
+/// a failed test leaves them subscribed for 60 s, forwarding to a subject
+/// of eunit's shared test process.
+fn with_subscribers(
+  topics: List(List(String)),
+  out: Subject(Delivery),
+  body: fn(List(Pid)) -> a,
+) -> a {
+  let ready = process.new_subject()
+  let pids = list.map(topics, fn(each) { spawn_subscriber(each, ready, out) })
+  use <- monitored.with_cleanup(fn() { list.each(pids, process.kill) })
+  list.each(pids, fn(_) { await_ready(ready) })
+  body(pids)
 }
 
 fn string_message(delivery: Delivery) -> String {
@@ -133,14 +138,8 @@ pub fn invalid_configs_are_rejected_test() {
 pub fn broadcast_delivers_to_every_subscriber_once_test() {
   pubsub.start()
   let topic = unique("fanout")
-  let ready = process.new_subject()
   let out = process.new_subject()
-  let subscribers = [
-    spawn_subscriber([topic], ready, out),
-    spawn_subscriber([topic], ready, out),
-    spawn_subscriber([topic], ready, out),
-  ]
-  list.each(subscribers, fn(_) { await_ready(ready) })
+  use subscribers <- with_subscribers([[topic], [topic], [topic]], out)
   let assert 3 = pubsub.subscriber_count(topic)
 
   pubsub.broadcast(topic, "hello")
@@ -155,7 +154,6 @@ pub fn broadcast_delivers_to_every_subscriber_once_test() {
       |> list.map(string_message)
   })
   let assert True = list.all(deliveries, fn(d) { d.topic == topic })
-  list.each(subscribers, process.kill)
 }
 
 fn collect(
@@ -175,10 +173,9 @@ fn collect(
 pub fn subscribing_twice_is_one_subscription_test() {
   pubsub.start()
   let topic = unique("twice")
-  let ready = process.new_subject()
   let out = process.new_subject()
-  let pid = spawn_subscriber([topic, topic], ready, out)
-  let _ = await_ready(ready)
+  use pids <- with_subscribers([[topic, topic]], out)
+  let assert [pid] = pids
   let assert 1 = pubsub.subscriber_count(topic)
   let assert Ok([subscriber]) = pubsub.local_subscribers(topic)
   let assert True = subscriber == pid
@@ -186,10 +183,14 @@ pub fn subscribing_twice_is_one_subscription_test() {
   let assert Ok(Nil) = pubsub.try_broadcast(topic, "once")
   let assert Ok(Nil) = pubsub.try_broadcast(topic, "end")
   let assert ["once", "end"] = list.map(collect(out, 2, []), string_message)
-  process.kill(pid)
 }
 
+// The tests that subscribe the test process itself run isolated: a failed
+// assertion would otherwise leave eunit's shared test process subscribed
+// and linked to a partition for the rest of the module.
+
 pub fn unsubscribe_stops_delivery_and_unlinks_test() {
+  use <- monitored.isolated
   pubsub.start()
   let topic = unique("unsub")
   let assert Ok(Nil) = pubsub.try_subscribe(topic)
@@ -208,6 +209,7 @@ pub fn unsubscribe_stops_delivery_and_unlinks_test() {
 }
 
 pub fn unsubscribe_keeps_link_while_other_topics_remain_test() {
+  use <- monitored.isolated
   pubsub.start()
   let first = unique("keep_a")
   let second = unique("keep_b")
@@ -227,46 +229,39 @@ pub fn subscriber_exit_removes_its_subscriptions_test() {
   pubsub.start()
   let topic_a = unique("exit_a")
   let topic_b = unique("exit_b")
-  let ready = process.new_subject()
   let out = process.new_subject()
-  let pid = spawn_subscriber([topic_a, topic_b], ready, out)
-  let _ = await_ready(ready)
+  use pids <- with_subscribers([[topic_a, topic_b]], out)
+  let assert [pid] = pids
   let assert 1 = pubsub.subscriber_count(topic_a)
   let assert 1 = pubsub.subscriber_count(topic_b)
 
+  // The subscriber's partition traps its exit and removes its rows when it
+  // handles the 'EXIT': wait for exactly that instead of polling the counts.
+  let assert Ok(partition) = pubsub.partition_for(pid)
+  let exit = await.watch_exit(partition, pid)
+  use <- monitored.with_cleanup(fn() { await.unwatch(exit) })
   process.kill(pid)
-  let assert True =
-    eventually(
-      fn() {
-        pubsub.subscriber_count(topic_a) == 0
-        && pubsub.subscriber_count(topic_b) == 0
-      },
-      1000,
-    )
+  await.expect_info(exit, partition, "the partition handling the kill")
+  let assert 0 = pubsub.subscriber_count(topic_a)
+  let assert 0 = pubsub.subscriber_count(topic_b)
 }
 
 pub fn local_broadcast_delivers_on_this_node_test() {
   pubsub.start()
   let topic = unique("local")
-  let ready = process.new_subject()
   let out = process.new_subject()
-  let pid = spawn_subscriber([topic], ready, out)
-  let _ = await_ready(ready)
+  use _ <- with_subscribers([[topic]], out)
   let assert Ok(Nil) = pubsub.local_broadcast(topic, "here")
   let assert ["here"] = list.map(collect(out, 1, []), string_message)
-  process.kill(pid)
 }
 
 pub fn direct_broadcast_to_this_node_delivers_locally_test() {
   pubsub.start()
   let topic = unique("direct_self")
-  let ready = process.new_subject()
   let out = process.new_subject()
-  let pid = spawn_subscriber([topic], ready, out)
-  let _ = await_ready(ready)
+  use _ <- with_subscribers([[topic]], out)
   let assert Ok(Nil) = pubsub.direct_broadcast(node.self(), topic, "me")
   let assert ["me"] = list.map(collect(out, 1, []), string_message)
-  process.kill(pid)
 }
 
 pub fn direct_broadcast_to_unknown_node_is_an_error_test() {
@@ -278,9 +273,13 @@ pub fn direct_broadcast_to_unknown_node_is_an_error_test() {
 // --- Limits ------------------------------------------------------------------
 
 pub fn topic_length_is_validated_test() {
+  use <- monitored.isolated
   pubsub.start()
   let too_long = string.repeat("x", 256)
-  let longest = string.repeat("y", 255)
+  // Unique, so no other test or run shares the 255-byte topic.
+  let prefix = unique("longest")
+  let longest = prefix <> string.repeat("y", 255 - string.byte_size(prefix))
+  let assert 255 = string.byte_size(longest)
   let assert Error(InvalidTopic("")) = pubsub.try_subscribe("")
   let assert Error(InvalidTopic(_)) = pubsub.try_subscribe(too_long)
   let assert Error(InvalidTopic(_)) = pubsub.try_unsubscribe(too_long)
@@ -358,10 +357,14 @@ pub fn broadcasts_emit_telemetry_with_scope_test() {
         False -> Nil
       }
     })
-  let ready = process.new_subject()
+  // Telemetry handlers are global: detach even when an assertion fails.
+  use <- monitored.with_cleanup(fn() {
+    let assert Ok(Nil) = telemetry.detach(id)
+      as "detaching the test's telemetry handler"
+    Nil
+  })
   let out = process.new_subject()
-  let pid = spawn_subscriber([topic], ready, out)
-  let _ = await_ready(ready)
+  use _ <- with_subscribers([[topic]], out)
 
   let assert Ok(Nil) = pubsub.try_broadcast(topic, 1)
   let assert Ok(cluster) = process.receive(events, 0)
@@ -372,9 +375,6 @@ pub fn broadcasts_emit_telemetry_with_scope_test() {
   let assert Ok(Nil) = pubsub.local_broadcast(topic, 2)
   let assert Ok(local) = process.receive(events, 0)
   let assert Ok("local") = telemetry.string(local, "scope")
-
-  let assert Ok(Nil) = telemetry.detach(id)
-  process.kill(pid)
 }
 
 // --- FFI ---------------------------------------------------------------------
@@ -393,6 +393,3 @@ fn rescue(run: fn() -> a) -> Result(a, String)
 
 @external(erlang, "erlang", "unique_integer")
 fn unique_integer() -> Int
-
-@external(erlang, "brazier_pubsub_test_ffi", "pause")
-fn pause(ms: Int) -> Nil

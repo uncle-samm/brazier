@@ -17,6 +17,7 @@ import brazier/error
 import brazier/html
 import brazier/internal/presence_watch
 import brazier/log
+import brazier/monitored
 import brazier/presence
 import brazier/presence/holder
 import brazier/pubsub
@@ -387,16 +388,21 @@ pub fn wait_forever_crashes_when_the_tree_gives_up_test_() -> peer.Timeout {
   let reason =
     peer.on(p, fn() {
       let started = process.new_subject()
-      let waiter =
-        process.spawn_unlinked(fn() {
+      // Monitored from the spawn: a waiter that crashes while starting
+      // reports its own reason, never `noproc`.
+      let #(_waiter, monitor) =
+        monitored.spawn(fn() {
           let assert Ok(app) = application.start_supervised(config())
             as "application.start_supervised succeeds"
           process.send(started, app)
           application.wait_forever()
         })
-      let monitor = process.monitor(waiter)
-      let assert Ok(app) = process.receive(started, 10_000)
-        as "process.receive succeeds"
+      let assert Ok(Ok(app)) =
+        process.new_selector()
+        |> process.select_map(started, Ok)
+        |> process.select_specific_monitor(monitor, Error)
+        |> process.selector_receive(10_000)
+        as "the tree starts and the waiter is still running"
       // The default tolerance is 2 restarts in 5 seconds: the third crash
       // inside the window makes the supervisor give up.
       list.each([1, 2], fn(_) {
@@ -405,13 +411,8 @@ pub fn wait_forever_crashes_when_the_tree_gives_up_test_() -> peer.Timeout {
         await_restart(app.supervisor_pid, 3, victim)
       })
       crash(app.supervisor_pid, listener_pid(app))
-      let down =
-        process.new_selector()
-        |> process.select_specific_monitor(monitor, fn(down) { down })
-      let assert Ok(process.ProcessDown(reason: reason, ..)) =
-        process.selector_receive(down, 10_000)
-        as "process.selector_receive succeeds"
-      string.inspect(reason)
+      monitored.down_reason(monitor, "the process in wait_forever")
+      |> monitored.describe
     })
   assert string.contains(reason, "Linked application process exited")
   assert string.contains(reason, "shutdown")

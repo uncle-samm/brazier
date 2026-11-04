@@ -16,6 +16,7 @@ import brazier/effect
 import brazier/error
 import brazier/html
 import brazier/log_capture as own_log
+import brazier/monitored
 import brazier/presence/holder
 import brazier/transport/server
 import gleam/bit_array
@@ -210,16 +211,18 @@ pub fn stopping_twice_is_one_warning_test() {
 /// stopping it reports that and forgets the port.
 pub fn stopping_a_dead_tree_forgets_its_port_test() {
   let started = process.new_subject()
-  let starter =
-    process.spawn_unlinked(fn() {
+  // Monitored from the spawn, so its DOWN carries the reason it died with.
+  let #(_starter, starter_monitor) =
+    monitored.spawn(fn() {
       let assert Ok(app) = application.start(config(process.new_subject()))
+        as "the application starts"
       process.send(started, app)
       // Blocks until the kill below takes it down with the tree.
       let never: Subject(Nil) = process.new_subject()
       process.receive_forever(never)
     })
-  let starter_monitor = process.monitor(starter)
   let assert Ok(app) = process.receive(started, 5000)
+    as "the starter reports the started application"
   let supervisor_monitor = process.monitor(app.supervisor_pid)
   process.kill(app.supervisor_pid)
   let assert Ok(process.ProcessDown(reason: process.Killed, ..)) =
@@ -228,13 +231,10 @@ pub fn stopping_a_dead_tree_forgets_its_port_test() {
         |> process.select_specific_monitor(supervisor_monitor, fn(down) { down }),
       5000,
     )
-  // The starter is linked to the listener's supervisor and goes with it.
-  let assert Ok(_) =
-    process.selector_receive(
-      process.new_selector()
-        |> process.select_specific_monitor(starter_monitor, fn(down) { down }),
-      5000,
-    )
+  // The starter is linked to the listener's supervisor and goes with it,
+  // with the supervisor's own reason.
+  let assert process.Killed =
+    monitored.down_reason(starter_monitor, "the starter linked to the tree")
   let #(outcome, lines) = own_log.capture(fn() { application.stop(app) })
   let assert Error(error.ConfigError(reason)) = outcome
   let assert True = string.contains(reason, "its port is forgotten now")
