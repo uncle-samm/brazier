@@ -276,7 +276,8 @@ Notes on individual events:
   refused by a replicated store's limits emits nothing.
 - `[brazier, store, sync]` wraps every remote merge into a replicated
   store, accepted or refused. `entries` and `bytes` describe the payload,
-  and `peer` is the sending node. See
+  and `peer` is the sending node. A payload refused as malformed reports
+  `entries` 0. See
   [CLUSTERING.md](CLUSTERING.md#replicated-stores).
 - `[brazier, pubsub, broadcast]`: for `scope: "cluster"`, `remote_nodes` is
   the number of remote nodes forwarded to, one message each, however many

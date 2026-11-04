@@ -35,10 +35,17 @@
 %% that contained it changes nothing.
 %%
 %% Every remote merge runs inside the [brazier, store, sync] span and is
-%% refused (logged, not merged) when the payload is larger than
-%% max_delta_bytes / max_sync_bytes or would grow the replica past
-%% max_entries. A refused merge leaves the digests different, so the next
-%% exchange retries it, and logs again.
+%% refused (logged, not merged) when the payload is malformed (see
+%% check_payload/2), larger than max_delta_bytes / max_sync_bytes, or would
+%% grow the replica past max_entries. A refused merge leaves the digests
+%% different, so the next exchange retries it, and logs again.
+%%
+%% A peer's payload is checked field by field before anything reads it:
+%% the CRDT functions assume the shapes brazier/store/crdt builds, so a
+%% malformed term from a member (another version, a bug, a hand-sent
+%% message) would crash the replica, or worse be joined and break
+%% convergence on every node it reaches. Phoenix.Tracker likewise matches
+%% the exact shape of every replica message before merging it.
 %%
 %% Remote changes are announced to this node's watchers by local_broadcast
 %% of nil on the store topic, plus the extra topics of every added or
@@ -47,7 +54,8 @@
 
 -export([start/3, start_link/1, stop/1, call/2,
          put/3, remove/3, append/4, config/1, digest/1, size/1,
-         read_get/2, read_get_all/2, read_count/1, names/2]).
+         read_get/2, read_get_all/2, read_count/1, names/2,
+         check_payload/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -define(CRDT, 'brazier@store@crdt').
@@ -406,12 +414,12 @@ peer_message(Message, S) when is_tuple(Message), tuple_size(Message) >= 3,
 peer_message(Message, S) ->
     unexpected_message(Message, S).
 
-member_message({brazier_store, delta, From, Delta}, S)
-  when is_atom(From), element(1, Delta) =:= delta ->
+%% Delta and Full are checked by merge/6 (check_payload/2), so a malformed
+%% one is refused there with an error and its sync span.
+member_message({brazier_store, delta, From, Delta}, S) when is_atom(From) ->
     #{config := {config, _, _, _, MaxDelta, _}} = S,
     merge(S, From, delta, Delta, MaxDelta, fun ?CRDT:join/2);
-member_message({brazier_store, sync, From, Full}, S)
-  when is_atom(From), element(1, Full) =:= delta ->
+member_message({brazier_store, sync, From, Full}, S) when is_atom(From) ->
     #{config := {config, _, _, _, _, MaxSync}} = S,
     brazier_log_ffi:debug(<<"brazier.store">>, "Replica ~ts received the state of ~p", [label(S), From]),
     merge(S, From, sync, Full, MaxSync, fun ?CRDT:join_full/2);
@@ -446,13 +454,25 @@ unexpected_message(Message, S) ->
                            "message ~P", [label(S), Message, 20]),
     S.
 
-%% Merge a delta or a full state from From inside the sync span.
+%% Merge a delta or a full state from From inside the sync span. A
+%% malformed payload is refused before anything reads it: its entries are
+%% reported as 0, since they cannot be counted.
 merge(S = #{name := Name}, From, What, Payload, MaxBytes, Join) ->
     Bytes = erlang:external_size(Payload),
-    Entries = ?CRDT:delta_size(Payload),
-    brazier_telemetry_ffi:store_sync_span(Name, atom_to_binary(From, utf8), fun() ->
-        {checked_merge(S, From, What, Payload, Bytes, MaxBytes, Join), Entries, Bytes}
-    end).
+    Peer = atom_to_binary(From, utf8),
+    case check_payload(What, Payload) of
+        {error, Reason} ->
+            brazier_telemetry_ffi:store_sync_span(Name, Peer, fun() ->
+                brazier_log_ffi:error(<<"brazier.store">>, "Replica ~ts refused a malformed ~p of ~b "
+                                     "bytes from ~p: ~ts", [label(S), What, Bytes, From, Reason]),
+                {S, 0, Bytes}
+            end);
+        {ok, nil} ->
+            Entries = ?CRDT:delta_size(Payload),
+            brazier_telemetry_ffi:store_sync_span(Name, Peer, fun() ->
+                {checked_merge(S, From, What, Payload, Bytes, MaxBytes, Join), Entries, Bytes}
+            end)
+    end.
 
 checked_merge(S, From, What, _Payload, Bytes, MaxBytes, _Join) when Bytes > MaxBytes ->
     brazier_log_ffi:error(<<"brazier.store">>, "Replica ~ts refused a ~p of ~b bytes from ~p "
@@ -496,6 +516,123 @@ advance_clock(S = #{hlc := Hlc}, From, Payload) ->
             end,
             ?HLC:observe(Hlc, Remote, Now)
     end.
+
+%% --- Payload validation ---
+
+%% {ok, nil} when Payload has exactly the shape brazier/store/crdt gives a Delta
+%% (What = delta) or a full state from to_delta (What = sync), else
+%% {error, Reason} naming the first malformed field. Values are any term.
+%%
+%%   Delta    {delta, #{Key => #{Dot => Entry}}, Context, [Topic]}
+%%   Dot      {dot, Replica, Counter}            Counter >= 1
+%%   Replica  {replica, Node, Incarnation}       Node non-empty, Incarnation >= 0
+%%   Entry    {entry, Value, Timestamp, [Topic]}
+%%   Timestamp {timestamp, WallMs, Logical, Node} both >= 0
+%%   Context  {context, #{Replica => Max}, Cloud} Max >= 1, Cloud a set of Dot
+%%
+%% Keys, topics and node names are UTF-8 binaries (Gleam strings). Beyond
+%% the shapes, every live dot must be covered by the payload's own context
+%% (a dot the sender never observed cannot be live there, and joining it
+%% would leave a live dot outside the receiver's context). A full state
+%% carries no delta topics and no key without dots (join never keeps one).
+%% Cloud is a gleam/set, {set, #{Dot => []}} on Erlang; the round trip
+%% test of a real delta (store_replica_payload_test) catches a change of
+%% that representation.
+check_payload(What, Payload) when What =:= delta; What =:= sync ->
+    try validate_payload(What, Payload) of
+        ok -> {ok, nil}
+    catch
+        throw:{brazier_malformed_payload, Reason} -> {error, Reason}
+    end.
+
+validate_payload(What, {delta, Entries, Context, Topics}) when is_map(Entries) ->
+    validate_context(Context),
+    validate_topics(Topics, <<"the delta topics">>, <<"a delta topic">>),
+    case What =:= sync andalso Topics =/= [] of
+        true -> malformed(<<"a full state carries delta topics">>);
+        false -> ok
+    end,
+    maps:foreach(fun(Key, Dots) -> validate_key(What, Key, Dots, Context) end, Entries);
+validate_payload(_What, _Payload) ->
+    malformed(<<"not a {delta, Entries, Context, Topics} tuple with a map of entries">>).
+
+validate_key(What, Key, Dots, Context) ->
+    validate_string(Key, <<"a key">>),
+    case Dots of
+        #{} when What =:= sync, map_size(Dots) =:= 0 ->
+            malformed(<<"a full state names a key with no values">>);
+        #{} ->
+            maps:foreach(fun(Dot, Entry) ->
+                validate_dot(Dot, <<"an entry dot">>),
+                validate_entry(Entry),
+                case ?CRDT:covers(Context, Dot) of
+                    true -> ok;
+                    false -> malformed(<<"a live dot its own context does not cover">>)
+                end
+            end, Dots);
+        _ ->
+            malformed(<<"the values of a key are not a map of dots">>)
+    end.
+
+validate_entry({entry, _Value, Ts, Topics}) ->
+    validate_timestamp(Ts),
+    validate_topics(Topics, <<"the topics of an entry">>, <<"an entry topic">>);
+validate_entry(_) ->
+    malformed(<<"an entry is not {entry, Value, Timestamp, Topics}">>).
+
+validate_timestamp({timestamp, Wall, Logical, Node})
+  when is_integer(Wall), Wall >= 0, is_integer(Logical), Logical >= 0 ->
+    validate_string(Node, <<"a timestamp node">>);
+validate_timestamp(_) ->
+    malformed(<<"a timestamp is not {timestamp, WallMs >= 0, Logical >= 0, Node}">>).
+
+validate_context({context, Clock, {set, Cloud}}) when is_map(Clock), is_map(Cloud) ->
+    maps:foreach(fun(Replica, Max) ->
+        validate_replica(Replica, <<"a clock replica">>),
+        case is_integer(Max) andalso Max >= 1 of
+            true -> ok;
+            false -> malformed(<<"a clock counter is not an integer >= 1">>)
+        end
+    end, Clock),
+    maps:foreach(fun(Dot, Token) ->
+        validate_dot(Dot, <<"a cloud dot">>),
+        case Token of
+            [] -> ok;
+            _ -> malformed(<<"the cloud is not a set">>)
+        end
+    end, Cloud);
+validate_context(_) ->
+    malformed(<<"the context is not {context, Clock, Cloud}">>).
+
+validate_dot({dot, Replica, Counter}, What) when is_integer(Counter), Counter >= 1 ->
+    validate_replica(Replica, What);
+validate_dot(_, What) ->
+    malformed(<<What/binary, " is not {dot, Replica, Counter >= 1}">>).
+
+validate_replica({replica, Node, Incarnation}, What) when is_integer(Incarnation), Incarnation >= 0 ->
+    validate_string(Node, What),
+    case Node of
+        <<>> -> malformed(<<What/binary, " has an empty node name">>);
+        _ -> ok
+    end;
+validate_replica(_, What) ->
+    malformed(<<What/binary, " is not {replica, Node, Incarnation >= 0}">>).
+
+validate_topics(Topics, _ListWhat, What) when is_list(Topics) ->
+    lists:foreach(fun(Topic) -> validate_string(Topic, What) end, Topics);
+validate_topics(_, ListWhat, _What) ->
+    malformed(<<ListWhat/binary, " are not a list">>).
+
+validate_string(Value, What) when is_binary(Value) ->
+    case unicode:characters_to_binary(Value) of
+        Value -> ok;
+        _ -> malformed(<<What/binary, " is not UTF-8">>)
+    end;
+validate_string(_, What) ->
+    malformed(<<What/binary, " is not a string">>).
+
+malformed(Reason) ->
+    throw({brazier_malformed_payload, Reason}).
 
 %% --- ETS mirror ---
 

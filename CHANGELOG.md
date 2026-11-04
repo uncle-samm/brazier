@@ -583,6 +583,15 @@ with its own changelog, so they are not listed here.
   trusted proxy that passes the other one through is logged at warning
   (Plug.RewriteOn; Rails `RemoteIp`, `IpSpoofAttackError`; RFC 7239
   section 7.4).
+- A replicated store checks every field of a delta or full state from
+  another member (keys, dots, replicas, timestamps, topics, the clock and
+  cloud, and that each live dot is covered by its own context) before it
+  reads or joins it. A malformed payload is refused, logged at error with
+  the failing field and reported in the `[brazier, store, sync]` span with
+  `entries` 0; the replica keeps its state. It used to read the payload
+  unchecked, so a malformed term from a verified member crashed the
+  replica or was joined (Phoenix.Tracker validates a replica's message
+  before merging it).
 - (Final audit SEC-7) An `allow_guests_ws` socket that was bound to a
   signed-in session became a guest on recheck once the session was deleted,
   expired or lost its user, so a revocation that sent no notice left it
