@@ -542,6 +542,11 @@ with its own changelog, so they are not listed here.
   the read. `static.load_client_asset_at` takes the time and reports
   whether the entry was used or why it was rebuilt; misses are logged at
   debug.
+- The CDP suite's `stop_server` only logged a page that did not unload, in
+  verbose mode. Now that, an output reader that outlives the server, and a
+  port still open are each recorded as a failure, and `stop_server` returns
+  False, so `start_example` does not start the next example against a page
+  still connected to the old server.
 
 ### Removed
 
