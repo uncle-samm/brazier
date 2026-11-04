@@ -5,20 +5,28 @@
 //// records, per metric, the median of the runs, their range, and the
 //// tolerance a later run is checked against:
 ////
-////     tolerance = max(floor, 2 * (max - min) / median)
+////     spread    = (max - min) / median
+////     tolerance = max(floor, spread)    when spread < max_spread
 ////
-//// The range of a handful of back-to-back runs underestimates how far a
-//// metric wanders between sessions, so the observed spread is doubled, and
-//// never set below `floor` (machine-level noise the runs did not see). A
-//// metric whose tolerance would exceed `ceiling` is too noisy to gate: it
-//// is recorded and reported but never fails a check.
+//// For a lower-is-better metric min <= median, so median * (1 + spread)
+//// is at least the slowest baseline run: a check fails only on a value
+//// worse than every run the baseline saw. `floor` covers the drift between
+//// sessions that back-to-back runs do not see.
+////
+//// A metric whose spread is `max_spread` or more has no tolerance. Such a
+//// metric cannot be gated (with max_spread 0.5, a tolerance that wide
+//// would let a 1.5x slowdown through), and the gate never lets a metric
+//// through ungated: it fails the check with `TooNoisy`, and the baseline
+//// entry point refuses to write such a baseline (`ungated`). The fix is
+//// more samples for that metric, not a looser gate.
 ////
 //// A check passes when it ran on the baseline's machine, produced exactly
-//// the baseline's metrics, and no gated metric is worse than its baseline
-//// median by more than its tolerance. Worse means slower: the ratio is
-//// value / median for lower-is-better metrics and median / value for
-//// higher-is-better ones, so a tolerance of 0.15 fails a latency more than
-//// 15% above its median and a throughput below median / 1.15.
+//// the baseline's metrics, every metric is gated, and none is worse than
+//// its baseline median by more than its tolerance. Worse means slower:
+//// the ratio is value / median for lower-is-better metrics and
+//// median / value for higher-is-better ones, so a tolerance of 0.25 fails
+//// a latency more than 25% above its median and a throughput below
+//// median / 1.25. A value exactly at the limit passes.
 
 import brazier/bench/stats
 import gleam/dict
@@ -48,7 +56,7 @@ pub type Report {
 }
 
 /// One metric's baseline. `tolerance` is None when the metric is too noisy
-/// to gate.
+/// to gate (its spread is at least the baseline's `max_spread`).
 pub type Entry {
   Entry(
     name: String,
@@ -63,12 +71,17 @@ pub type Entry {
 }
 
 /// Several runs on one machine, reduced to one entry per metric.
+/// `conditions` records what the machine was doing while the baseline was
+/// measured (the load average, say); unlike `machine` it is never
+/// compared, only reported, so a reader can judge a baseline taken on a
+/// busy machine.
 pub type Baseline {
   Baseline(
     machine: List(#(String, String)),
+    conditions: List(#(String, String)),
     runs: Int,
     floor: Float,
-    ceiling: Float,
+    max_spread: Float,
     entries: List(Entry),
   )
 }
@@ -79,7 +92,9 @@ pub type Baseline {
 pub type Verdict {
   Within(entry: Entry, value: Float, ratio: Float)
   Regressed(entry: Entry, value: Float, ratio: Float)
-  NotGated(entry: Entry, value: Float, ratio: Float)
+  /// In both, but the baseline's spread is too wide to gate it. Fails:
+  /// an ungated metric would let any slowdown through.
+  TooNoisy(entry: Entry, value: Float, ratio: Float)
   /// In the baseline but not in the run.
   Missing(name: String)
   /// In the run but not in the baseline.
@@ -88,12 +103,14 @@ pub type Verdict {
   Redefined(name: String)
 }
 
-/// A whole check: machine differences (key, baseline, current) and one
-/// verdict per metric.
+/// A whole check: machine differences (key, baseline, current), one
+/// verdict per metric, and the baseline's `max_spread` (for the message
+/// of a `TooNoisy` verdict).
 pub type Comparison {
   Comparison(
     machine_mismatches: List(#(String, String, String)),
     verdicts: List(Verdict),
+    max_spread: Float,
   )
 }
 
@@ -112,15 +129,17 @@ pub fn new_report(
 /// Build a baseline from runs on one machine (see the module docs).
 /// Error when there are fewer than `min_baseline_runs` runs, the runs
 /// disagree on the machine or the metrics, a median is not positive, or
-/// `floor` / `ceiling` are out of order.
+/// `floor` is not positive and below `max_spread`. A metric too noisy to
+/// gate is kept, with no tolerance (see `ungated`).
 pub fn baseline(
   runs: List(Report),
+  conditions: List(#(String, String)),
   floor: Float,
-  ceiling: Float,
+  max_spread: Float,
 ) -> Result(Baseline, String) {
   use <- guard(
-    floor >. 0.0 && ceiling >. floor,
-    "floor must be positive and below ceiling",
+    floor >. 0.0 && max_spread >. floor,
+    "floor must be positive and below max_spread",
   )
   use <- guard(
     list.length(runs) >= min_baseline_runs,
@@ -142,31 +161,41 @@ pub fn baseline(
         template.name <> ": median is not positive",
       )
       let spread = { summary.max -. summary.min } /. summary.median
-      let tolerance = float.max(floor, 2.0 *. spread)
-      Ok(
-        Entry(
-          name: template.name,
-          unit: template.unit,
-          better: template.better,
-          median: summary.median,
-          min: summary.min,
-          max: summary.max,
-          spread: spread,
-          tolerance: case tolerance >. ceiling {
-            True -> None
-            False -> Some(tolerance)
-          },
-        ),
-      )
+      Ok(Entry(
+        name: template.name,
+        unit: template.unit,
+        better: template.better,
+        median: summary.median,
+        min: summary.min,
+        max: summary.max,
+        spread: spread,
+        tolerance: tolerance(spread, floor, max_spread),
+      ))
     }),
   )
   Ok(Baseline(
     machine: machine,
+    conditions: conditions,
     runs: list.length(runs),
     floor: floor,
-    ceiling: ceiling,
+    max_spread: max_spread,
     entries: entries,
   ))
+}
+
+/// max(floor, spread), or None when spread is max_spread or more: the
+/// bound is strict, so the loosest tolerance is below max_spread.
+fn tolerance(spread: Float, floor: Float, max_spread: Float) -> Option(Float) {
+  case spread <. max_spread {
+    True -> Some(float.max(floor, spread))
+    False -> None
+  }
+}
+
+/// The entries too noisy to gate. A baseline with any cannot gate the
+/// suite; `make bench-baseline` refuses to write it.
+pub fn ungated(baseline: Baseline) -> List(Entry) {
+  list.filter(baseline.entries, fn(e) { e.tolerance == None })
 }
 
 /// Reduce several runs on one machine to one report holding each metric's
@@ -269,13 +298,14 @@ pub fn compare(baseline: Baseline, run: Report) -> Comparison {
   Comparison(
     machine_mismatches: machine_mismatches,
     verdicts: list.append(checked, unexpected),
+    max_spread: baseline.max_spread,
   )
 }
 
 fn verdict(entry: Entry, value: Float) -> Verdict {
   let ratio = worse_ratio(entry.better, entry.median, value)
   case entry.tolerance {
-    None -> NotGated(entry, value, ratio)
+    None -> TooNoisy(entry, value, ratio)
     Some(tolerance) ->
       case ratio >. 1.0 +. tolerance {
         True -> Regressed(entry, value, ratio)
@@ -295,13 +325,19 @@ fn worse_ratio(better: Direction, median: Float, value: Float) -> Float {
   }
 }
 
-/// True when the run is on the baseline's machine and no verdict fails.
+/// True when the run is on the baseline's machine and every verdict is
+/// `Within`: a metric that is not gated (too noisy, missing, new or
+/// redefined) fails the check like a regression does.
 pub fn passed(comparison: Comparison) -> Bool {
   comparison.machine_mismatches == []
   && list.all(comparison.verdicts, fn(v) {
     case v {
-      Within(..) | NotGated(..) -> True
-      Regressed(..) | Missing(_) | Unexpected(_) | Redefined(_) -> False
+      Within(..) -> True
+      Regressed(..)
+      | TooNoisy(..)
+      | Missing(_)
+      | Unexpected(_)
+      | Redefined(_) -> False
     }
   })
 }
@@ -320,16 +356,30 @@ pub fn describe(comparison: Comparison) -> String {
           "ok   " <> measured(entry, value, ratio) <> limit(entry)
         Regressed(entry, value, ratio) ->
           "FAIL " <> measured(entry, value, ratio) <> limit(entry)
-        NotGated(entry, value, ratio) ->
-          "info "
+        TooNoisy(entry, value, ratio) ->
+          "FAIL "
           <> measured(entry, value, ratio)
-          <> ", not gated: baseline spread "
+          <> ") is not gated: its baseline spread "
           <> percent(entry.spread)
-          <> ")"
-        Missing(name) -> "FAIL " <> name <> ": in the baseline, not measured"
-        Unexpected(name) -> "FAIL " <> name <> ": measured, not in the baseline"
+          <> " is not below "
+          <> percent(comparison.max_spread)
+          <> "; raise its samples and re-baseline (make bench-baseline)"
+        Missing(name) ->
+          "FAIL "
+          <> name
+          <> ": in the baseline but not measured by this run, so it is "
+          <> "not gated; re-baseline (make bench-baseline) if it was "
+          <> "removed on purpose"
+        Unexpected(name) ->
+          "FAIL "
+          <> name
+          <> ": measured but not in the baseline, so it is not gated; "
+          <> "re-baseline (make bench-baseline)"
         Redefined(name) ->
-          "FAIL " <> name <> ": unit or direction differs from the baseline"
+          "FAIL "
+          <> name
+          <> ": unit or direction differs from the baseline; re-baseline "
+          <> "(make bench-baseline)"
       }
     })
   string.join(list.append(machine, metrics), "\n")
@@ -413,9 +463,10 @@ pub fn decode_report(text: String) -> Result(Report, String) {
 pub fn encode_baseline(baseline: Baseline) -> String {
   json.object([
     #("machine", encode_machine(baseline.machine)),
+    #("conditions", encode_machine(baseline.conditions)),
     #("runs", json.int(baseline.runs)),
     #("floor", json.float(baseline.floor)),
-    #("ceiling", json.float(baseline.ceiling)),
+    #("max_spread", json.float(baseline.max_spread)),
     #(
       "entries",
       json.array(baseline.entries, fn(e) {
@@ -461,11 +512,19 @@ pub fn decode_baseline(text: String) -> Result(Baseline, String) {
   }
   let decoder = {
     use machine <- decode.field("machine", machine_decoder())
+    use conditions <- decode.field("conditions", machine_decoder())
     use runs <- decode.field("runs", decode.int)
     use floor <- decode.field("floor", number_decoder())
-    use ceiling <- decode.field("ceiling", number_decoder())
+    use max_spread <- decode.field("max_spread", number_decoder())
     use entries <- decode.field("entries", decode.list(entry))
-    decode.success(Baseline(machine:, runs:, floor:, ceiling:, entries:))
+    decode.success(Baseline(
+      machine:,
+      conditions:,
+      runs:,
+      floor:,
+      max_spread:,
+      entries:,
+    ))
   }
   use baseline <- result.try(
     json.parse(text, decoder)
@@ -478,6 +537,15 @@ pub fn decode_baseline(text: String) -> Result(Baseline, String) {
   use <- guard(
     list.all(baseline.entries, fn(e) { e.median >. 0.0 }),
     "invalid baseline: a median is not positive",
+  )
+  // A hand-edited tolerance must still follow the rule, or the file
+  // would gate looser than `baseline` ever would.
+  use <- guard(
+    list.all(baseline.entries, fn(e) {
+      e.tolerance == tolerance(e.spread, baseline.floor, baseline.max_spread)
+    }),
+    "invalid baseline: a tolerance does not follow max(floor, spread) "
+      <> "below max_spread",
   )
   Ok(baseline)
 }

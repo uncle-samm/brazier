@@ -3,11 +3,13 @@
 //// `brazier_bench_check` (compare with bench/baselines.json) or
 //// `brazier_bench_baseline` (re-baseline); see docs/PERFORMANCE.md.
 ////
-//// Scenarios, each warmed up before it is measured:
+//// `prepare` runs once per invocation (static files, the client fixture
+//// build); `run` measures every scenario once. Scenarios, each warmed up
+//// before it is measured:
 ////
-//// - http: keep-alive clients against a listener answering `/bench`.
-////   Requests per second (median of the rounds) and per-request latency
-////   (p50/p99 over every request of every measured round).
+//// - http, static, gzip, ssr: brazier/bench/http_bench. Requests per
+////   second (median of the rounds) and per-request latency (p50/p99 over
+////   every request of every measured round).
 //// - ws: N joined connections x M events each, every event timed from its
 ////   send to the patch acknowledging it. Events per second (median of the
 ////   rounds) and per-event latency p50/p99.
@@ -25,6 +27,10 @@
 //// - crdt append: one value appended to a replicated list key that holds
 ////   10, 1000 or 10000 values (brazier/store/crdt, the work the replica
 ////   server and every receiving node do per write), in blocks of 1000.
+//// - presence: brazier/bench/presence_bench, track/untrack/list in rooms
+////   of 10 and 10000 entries.
+//// - client: brazier/bench/client_bench, the browser's render and patch
+////   work for 100 and 1000 rows, in node.
 ////
 //// Every generator checks every answer it times (brazier_bench_ffi): a
 //// failure is an Error naming it, never a fast number. Logging is set to
@@ -32,7 +38,14 @@
 //// console's. Nothing here is a test; gleam test never runs it.
 
 import brazier/application
-import brazier/bench/report.{type Metric, HigherIsBetter, LowerIsBetter, Metric}
+import brazier/bench/client_bench
+import brazier/bench/http_bench
+import brazier/bench/measure.{
+  check, gc, isolated, median_and_p99, now_ns, percentiles_by_round, repeat,
+  repeat_from, rounds, string_of, throughput_and_latency, timeout_ms,
+}
+import brazier/bench/presence_bench
+import brazier/bench/report.{type Metric, LowerIsBetter, Metric}
 import brazier/bench/stats
 import brazier/effect
 import brazier/error
@@ -44,32 +57,23 @@ import brazier/store/crdt
 import brazier/store/hlc
 import brazier/test_ctx
 import brazier/transport
-import brazier/transport/server.{type Connection, Bytes}
 import brazier/transport/ws
 import gleam/bytes_tree
 import gleam/erlang/process
-import gleam/http/request.{type Request}
-import gleam/http/response
 import gleam/int
 import gleam/json
 import gleam/list
-import gleam/option.{None, Some}
+import gleam/option
 import gleam/order
 import gleam/result
 import gleam/string
 import logging
 
-/// Every wait inside a round is bounded by this; a round that misses it
-/// fails the run.
-const timeout_ms = 30_000
-
-const http_clients = 8
-
-const http_requests = 2000
-
-const http_warmup_rounds = 2
-
-const ws_grid = [#(1, 200), #(10, 200), #(100, 200)]
+/// #(connections, events per connection, measured rounds). The latency
+/// p99 is over every event of every round, so the small cells run more
+/// rounds: 1x200 x 5 rounds is 1000 events, whose p99 is its 10 slowest
+/// and moved by any scheduling hiccup.
+const ws_grid = [#(1, 200, 25), #(10, 200, 15), #(100, 200, 5)]
 
 const ws_warmup_rounds = 1
 
@@ -79,11 +83,16 @@ const runtime_events = 2000
 
 const runtime_warmup_rounds = 1
 
-/// The large-model runtime scenarios: #(name, items, events per round).
-/// Every item encodes to `list_item_bytes` + 3 bytes (quotes and comma), so
-/// 1000 items are about 50 KB of JSON and 10000 about 500 KB. Fewer events
-/// per round for the larger model keep a round near a second.
-const list_models = [#("list_50kb", 1000, 200), #("list_500kb", 10_000, 40)]
+/// The large-model runtime scenarios: #(name, items, events per pipelined
+/// round, sequential events). Every item encodes to `list_item_bytes` + 3
+/// bytes (quotes and comma), so 1000 items are about 50 KB of JSON and
+/// 10000 about 500 KB. Fewer events per round for the larger model keep a
+/// round near a second; the sequential events, whose p99 is gated, are
+/// enough for that p99 not to be one of a handful of samples.
+const list_models = [
+  #("list_50kb", 1000, 200, 1000),
+  #("list_500kb", 10_000, 40, 300),
+]
 
 const list_item_bytes = 48
 
@@ -92,15 +101,15 @@ const wire_block = 200
 
 const wire_warmup_blocks = 5
 
-const wire_blocks = 50
+const wire_blocks = 500
 
-const pubsub_subscribers = [1, 100, 1000]
+/// #(subscribers, measured broadcasts). The one-subscriber broadcast takes
+/// about a microsecond, so its p99 needs many more samples to settle.
+const pubsub_fanouts = [#(1, 20_000), #(100, 2000), #(1000, 1000)]
 
 /// Broadcasts to the same subscribers before the measured ones, so the
 /// measured ones reach processes that have already run.
 const pubsub_warmup_broadcasts = 100
-
-const pubsub_broadcasts = 1000
 
 const store_block = 1000
 
@@ -108,28 +117,8 @@ const store_warmup_blocks = 5
 
 const store_blocks = 50
 
-/// Measured rounds per throughput scenario.
-const rounds = 5
-
-@external(erlang, "brazier_bench_ffi", "now_ns")
-fn now_ns() -> Int
-
 @external(erlang, "brazier_bench_ffi", "machine")
 fn machine() -> List(#(String, String))
-
-@external(erlang, "brazier_bench_ffi", "gc")
-fn gc() -> Nil
-
-@external(erlang, "brazier_bench_ffi", "expect_empty_mailbox")
-fn expect_empty_mailbox(scenario: String) -> Result(Nil, String)
-
-@external(erlang, "brazier_bench_ffi", "http_round")
-fn http_round(
-  port: Int,
-  clients: Int,
-  requests: Int,
-  timeout_ms: Int,
-) -> Result(#(Int, List(Int)), String)
 
 @external(erlang, "brazier_bench_ffi", "ws_round")
 fn ws_round(
@@ -149,9 +138,30 @@ fn pubsub_fanout(
   timeout_ms: Int,
 ) -> Result(List(Int), String)
 
+/// What `prepare` made for every run: the static files are on disk, the
+/// client fixture is built.
+pub opaque type Prepared {
+  Prepared(client: client_bench.Fixture)
+}
+
+/// Write the static bench files and build the client fixture. Once per
+/// invocation: the fixture build and the static files' racy window are not
+/// part of any run.
+pub fn prepare() -> Result(Prepared, String) {
+  use Nil <- result.try(
+    http_bench.prepare()
+    |> result.map_error(fn(reason) { "prepare static files: " <> reason }),
+  )
+  use client <- result.try(
+    client_bench.prepare()
+    |> result.map_error(fn(reason) { "prepare client fixture: " <> reason }),
+  )
+  Ok(Prepared(client:))
+}
+
 /// Run every scenario once. Starts (and stops) its own app on an
 /// OS-assigned port.
-pub fn run() -> Result(report.Report, String) {
+pub fn run(prepared: Prepared) -> Result(report.Report, String) {
   use app <- result.try(
     test_app.start_counter_app_with_limits(
       transport.SecurityLimits(
@@ -164,23 +174,23 @@ pub fn run() -> Result(report.Report, String) {
     |> result.map_error(fn(e) { "bench app: " <> error.to_string(e) }),
   )
   log.set_level(logging.Warning)
-  let measured = {
-    use http <- result.try(http_scenario())
-    use Nil <- result.try(expect_empty_mailbox("http"))
-    use ws <- result.try(ws_scenario(app.port))
-    use Nil <- result.try(expect_empty_mailbox("ws"))
-    use rt <- result.try(runtime_scenario())
-    use Nil <- result.try(expect_empty_mailbox("runtime"))
-    use rl <- result.try(runtime_list_scenario())
-    use Nil <- result.try(expect_empty_mailbox("runtime list"))
-    use wire <- result.try(wire_scenario())
-    use ps <- result.try(pubsub_scenario())
-    use Nil <- result.try(expect_empty_mailbox("pubsub"))
-    use st <- result.try(store_scenario())
-    use Nil <- result.try(expect_empty_mailbox("store"))
-    use ca <- result.try(crdt_append_scenario())
-    Ok(list.flatten([http, ws, rt, rl, wire, ps, st, ca]))
-  }
+  // Each scenario runs in a fresh process (measure.isolated), which also
+  // fails the run when it leaves a message in either mailbox.
+  let measured =
+    [
+      #("http", http_bench.run),
+      #("ws", fn() { ws_scenario(app.port) }),
+      #("runtime", runtime_scenario),
+      #("runtime list", runtime_list_scenario),
+      #("wire", wire_scenario),
+      #("pubsub", pubsub_scenario),
+      #("store", store_scenario),
+      #("crdt append", crdt_append_scenario),
+      #("presence", presence_bench.run),
+      #("client", fn() { client_bench.run(prepared.client) }),
+    ]
+    |> list.try_map(fn(scenario) { isolated(scenario.0, scenario.1) })
+    |> result.map(list.flatten)
   log.set_level(logging.Info)
   let stopped =
     application.stop(app)
@@ -192,82 +202,17 @@ pub fn run() -> Result(report.Report, String) {
   }
 }
 
-// --- http ---
-
-fn http_scenario() -> Result(List(Metric), String) {
-  let config =
-    transport.TransportConfig(
-      port: 0,
-      on_connect: fn(_id, _subject) { Nil },
-      on_event: fn(_id, _msg) { Nil },
-      on_disconnect: fn(_id) { Nil },
-      page_html: None,
-      middlewares: [],
-      static_config: None,
-      runtime_factory: None,
-      ws_auth: None,
-      ssr_factory: None,
-      security_limits: transport.SecurityLimits(
-        ..transport.default_security_limits(),
-        max_keepalive_requests: http_requests + 1,
-      ),
-      api_handler: Some(http_handler),
-    )
-  use listener <- result.try(
-    transport.start_listener(config)
-    |> result.map_error(fn(e) { "http listener: " <> string_of(e) }),
-  )
-  let port = server.get_port(listener)
-  let outcome = {
-    use _ <- result.try(
-      repeat(http_warmup_rounds, fn() {
-        http_round(port, http_clients, http_requests, timeout_ms)
-      }),
-    )
-    use samples <- result.try(
-      repeat(rounds, fn() {
-        gc()
-        http_round(port, http_clients, http_requests, timeout_ms)
-      }),
-    )
-    let total = http_clients * http_requests
-    throughput_and_latency(
-      "http.keepalive." <> int.to_string(http_clients) <> "c",
-      "req/s",
-      total,
-      samples,
-    )
-  }
-  server.stop(listener)
-  outcome
-  |> result.map_error(fn(reason) { "http: " <> reason })
-}
-
-fn http_handler(
-  req: Request(Connection),
-) -> option.Option(response.Response(server.ResponseBody)) {
-  case req.path {
-    "/bench" ->
-      Some(
-        response.new(200)
-        |> response.set_header("content-type", "text/plain")
-        |> response.set_body(Bytes(bytes_tree.from_string("ok"))),
-      )
-    _ -> None
-  }
-}
-
 // --- ws ---
 
 fn ws_scenario(port: Int) -> Result(List(Metric), String) {
   list.try_map(ws_grid, fn(cell) {
-    let #(conns, events) = cell
+    let #(conns, events, measured) = cell
     let name = "ws." <> int.to_string(conns) <> "x" <> int.to_string(events)
     let round = fn() { ws_round("localhost", port, conns, events, timeout_ms) }
     {
       use _ <- result.try(repeat(ws_warmup_rounds, round))
       use samples <- result.try(
-        repeat(rounds, fn() {
+        repeat(measured, fn() {
           gc()
           round()
         }),
@@ -277,39 +222,6 @@ fn ws_scenario(port: Int) -> Result(List(Metric), String) {
     |> result.map_error(fn(reason) { name <> ": " <> reason })
   })
   |> result.map(list.flatten)
-}
-
-/// From rounds of #(elapsed_us, latencies_us): the median round's
-/// throughput and the latency p50/p99 over every sample of every round.
-fn throughput_and_latency(
-  name: String,
-  unit: String,
-  per_round: Int,
-  samples: List(#(Int, List(Int))),
-) -> Result(List(Metric), String) {
-  let rates =
-    list.map(samples, fn(sample) {
-      int.to_float(per_round) /. { int.to_float(sample.0) /. 1_000_000.0 }
-    })
-  let latencies = list.flat_map(samples, fn(sample) { sample.1 })
-  use <- check(
-    list.length(latencies) == per_round * list.length(samples),
-    "expected "
-      <> int.to_string(per_round * list.length(samples))
-      <> " latencies, got "
-      <> int.to_string(list.length(latencies)),
-  )
-  use rate <- result.try(
-    stats.median(rates) |> result.replace_error("no rounds"),
-  )
-  use latency <- result.try(
-    stats.summarize_ints(latencies) |> result.replace_error("no latencies"),
-  )
-  Ok([
-    Metric(name <> ".throughput", unit, HigherIsBetter, rate),
-    Metric(name <> ".latency_p50", "us", LowerIsBetter, latency.median),
-    Metric(name <> ".latency_p99", "us", LowerIsBetter, latency.p99),
-  ])
 }
 
 // --- runtime ---
@@ -391,6 +303,7 @@ fn runtime_scenario() -> Result(List(Metric), String) {
         runtime_scenario_items(),
         handler_id,
         runtime_events,
+        runtime_events,
       )
     }
     |> result.map_error(fn(reason) { "runtime." <> name <> ": " <> reason })
@@ -403,7 +316,7 @@ fn runtime_scenario() -> Result(List(Metric), String) {
 /// stays true.
 fn runtime_list_scenario() -> Result(List(Metric), String) {
   list.try_map(list_models, fn(shape) {
-    let #(name, count, events) = shape
+    let #(name, count, events, sequential_events) = shape
     let items = list_items(count)
     let bytes =
       string.byte_size(encode_bench_model(BenchModel(count: 0, items: items)))
@@ -412,20 +325,27 @@ fn runtime_list_scenario() -> Result(List(Metric), String) {
         bytes >= count * { list_item_bytes + 2 },
         "the model encodes to only " <> int.to_string(bytes) <> " bytes",
       )
-      runtime_rounds("runtime." <> name <> ".changed", items, "bump", events)
+      runtime_rounds(
+        "runtime." <> name <> ".changed",
+        items,
+        "bump",
+        events,
+        sequential_events,
+      )
     }
     |> result.map_error(fn(reason) { "runtime." <> name <> ": " <> reason })
   })
   |> result.map(list.flatten)
 }
 
-/// Warm-up and measured pipelined rounds of `events` events, then `events`
-/// sequential ones, on a fresh runtime holding `items`.
+/// Warm-up and measured pipelined rounds of `events` events, then
+/// `sequential_events` sequential ones, on a fresh runtime holding `items`.
 fn runtime_rounds(
   prefix: String,
   items: List(String),
   handler_id: String,
   events: Int,
+  sequential_events: Int,
 ) -> Result(List(Metric), String) {
   use rt <- result.try(start_runtime(items))
   let outcome = {
@@ -442,17 +362,20 @@ fn runtime_rounds(
         pipelined(rt, handler_id, clock, events)
       }),
     )
-    use latencies <- result.try(sequential(rt, handler_id, clock, events))
+    use latencies <- result.try(sequential(
+      rt,
+      handler_id,
+      clock,
+      sequential_events,
+    ))
     use cost <- result.try(
       stats.median(per_event) |> result.replace_error("no rounds"),
     )
-    use latency <- result.try(
-      stats.summarize(latencies) |> result.replace_error("no latencies"),
-    )
+    use #(p50, p99) <- result.try(percentiles_by_round(prefix, latencies))
     Ok([
       Metric(prefix <> ".pipelined", "us/event", LowerIsBetter, cost),
-      Metric(prefix <> ".latency_p50", "us", LowerIsBetter, latency.median),
-      Metric(prefix <> ".latency_p99", "us", LowerIsBetter, latency.p99),
+      Metric(prefix <> ".latency_p50", "us", LowerIsBetter, p50),
+      Metric(prefix <> ".latency_p99", "us", LowerIsBetter, p99),
     ])
   }
   process.send(rt.subject, runtime.Shutdown)
@@ -598,13 +521,7 @@ fn wire_scenario() -> Result(List(Metric), String) {
       use _ <- result.try(repeat(wire_warmup_blocks, block))
       gc()
       use per_frame <- result.try(repeat(wire_blocks, block))
-      use summary <- result.try(
-        stats.summarize(per_frame) |> result.replace_error("no blocks"),
-      )
-      Ok([
-        Metric(name <> ".median", "ns/frame", LowerIsBetter, summary.median),
-        Metric(name <> ".p99", "ns/frame", LowerIsBetter, summary.p99),
-      ])
+      median_and_p99(name, "ns/frame", per_frame)
     }
     |> result.map_error(fn(reason) { name <> ": " <> reason })
   })
@@ -644,7 +561,8 @@ fn wire_frame_bytes(msg: transport.ServerMessage) -> Int {
 // --- pubsub ---
 
 fn pubsub_scenario() -> Result(List(Metric), String) {
-  list.try_map(pubsub_subscribers, fn(subscribers) {
+  list.try_map(pubsub_fanouts, fn(fanout) {
+    let #(subscribers, pubsub_broadcasts) = fanout
     let name = "pubsub.fanout." <> int.to_string(subscribers)
     let topic = "bench:fanout:" <> int.to_string(subscribers)
     {
@@ -663,14 +581,13 @@ fn pubsub_scenario() -> Result(List(Metric), String) {
           <> " samples, got "
           <> int.to_string(list.length(latencies_ns)),
       )
-      use summary <- result.try(
-        list.map(latencies_ns, fn(ns) { int.to_float(ns) /. 1000.0 })
-        |> stats.summarize
-        |> result.replace_error("no samples"),
-      )
+      use #(p50, p99) <- result.try(percentiles_by_round(
+        name,
+        list.map(latencies_ns, fn(ns) { int.to_float(ns) /. 1000.0 }),
+      ))
       Ok([
-        Metric(name <> ".p50", "us", LowerIsBetter, summary.median),
-        Metric(name <> ".p99", "us", LowerIsBetter, summary.p99),
+        Metric(name <> ".p50", "us", LowerIsBetter, p50),
+        Metric(name <> ".p99", "us", LowerIsBetter, p99),
       ])
     }
     |> result.map_error(fn(reason) { name <> ": " <> reason })
@@ -701,18 +618,7 @@ fn store_scenario() -> Result(List(Metric), String) {
     ],
     fn(op) {
       let #(name, per_op) = op
-      use summary <- result.try(
-        stats.summarize(per_op) |> result.replace_error(name <> ": no blocks"),
-      )
-      Ok([
-        Metric(
-          "store." <> name <> ".median",
-          "ns/op",
-          LowerIsBetter,
-          summary.median,
-        ),
-        Metric("store." <> name <> ".p99", "ns/op", LowerIsBetter, summary.p99),
-      ])
+      median_and_p99("store." <> name, "ns/op", per_op)
     },
   )
   |> result.map(list.flatten)
@@ -772,13 +678,7 @@ fn crdt_append_scenario() -> Result(List(Metric), String) {
     use _ <- result.try(repeat(crdt_append_warmup_blocks, block))
     gc()
     use per_op <- result.try(repeat(crdt_append_blocks, block))
-    use summary <- result.try(
-      stats.summarize(per_op) |> result.replace_error(name <> ": no blocks"),
-    )
-    Ok([
-      Metric(name <> ".median", "ns/op", LowerIsBetter, summary.median),
-      Metric(name <> ".p99", "ns/op", LowerIsBetter, summary.p99),
-    ])
+    median_and_p99(name, "ns/op", per_op)
   })
   |> result.map(list.flatten)
   |> result.map_error(fn(reason) { "crdt append: " <> reason })
@@ -815,49 +715,6 @@ fn crdt_append_block(
 }
 
 // --- helpers ---
-
-/// Run `step` `times` times, stopping at the first error.
-fn repeat(
-  times: Int,
-  step: fn() -> Result(a, String),
-) -> Result(List(a), String) {
-  int.range(from: 0, to: times, with: Ok([]), run: fn(acc, _) {
-    use done <- result.try(acc)
-    use value <- result.try(step())
-    Ok([value, ..done])
-  })
-  |> result.map(list.reverse)
-}
-
-/// `repeat` for steps that thread a clock: each step gets the clock the
-/// previous one returned. Returns the last clock and every step's value.
-fn repeat_from(
-  times: Int,
-  clock: Int,
-  step: fn(Int) -> Result(#(Int, a), String),
-) -> Result(#(Int, List(a)), String) {
-  int.range(from: 0, to: times, with: Ok(#(clock, [])), run: fn(acc, _) {
-    use #(clock, done) <- result.try(acc)
-    use #(next, value) <- result.try(step(clock))
-    Ok(#(next, [value, ..done]))
-  })
-  |> result.map(fn(acc) { #(acc.0, list.reverse(acc.1)) })
-}
-
-fn check(
-  condition: Bool,
-  message: String,
-  next: fn() -> Result(a, String),
-) -> Result(a, String) {
-  case condition {
-    True -> next()
-    False -> Error(message)
-  }
-}
-
-fn string_of(value: a) -> String {
-  string.inspect(value)
-}
 
 /// Rendered for reports: `name = value unit`.
 pub fn describe(metric: Metric) -> String {

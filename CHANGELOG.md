@@ -297,6 +297,17 @@ with its own changelog, so they are not listed here.
   browser tests that wait on the client instead of a quiet period.
 - (Final audit) `attribute.unsafe_srcdoc(html)`: an `<iframe>` `srcdoc`,
   named for what it does like `element.unsafe_raw_html`.
+- (PERF-9) Bench scenarios for:
+  - static files of 100 KB and 10 MB, both served and revalidated with a 304
+    from the digest cache
+  - gzip of a 100 KB body
+  - SSR at 100 and 1000 rows
+  - presence track, untrack and list in rooms of 10 and 10000 entries
+  - the browser client's render and patch path at 100 and 1000 rows, run in
+    node against a built fixture app
+
+  Each scenario checks the answers it times. The baseline now records the
+  load average it was taken under.
 - (M117 follow-up) The `[brazier, store, sync]` stop event carries `result`
   (`ok`, `malformed`, `too_large` or `too_many_entries`) and `reason` (the
   failing field of a malformed payload, or the limit a refused one broke:
@@ -306,6 +317,23 @@ with its own changelog, so they are not listed here.
   way, as `[brazier, ws, upgrade]` does.
 
 ### Changed
+
+- (PERF-9) Every bench metric is gated:
+  - A metric's tolerance is max(25%, spread), not max(25%, 2 × spread), so
+    a 1.5× regression fails every gated metric.
+  - A metric whose baseline spread is 50% or more is no longer reported and
+    ignored. `make bench-baseline` refuses to write such a baseline, and
+    `make bench-check` fails on it.
+  - `make bench-check` also fails on a metric missing from the baseline or
+    from the run.
+  - Sample counts were raised until every metric's spread is under 50%.
+  - Every bench p50 and p99 is now the median over rounds of each round's
+    p50 and p99, not a percentile of every sample pooled, so a burst of
+    outside load in one round does not set it. A scenario that times one
+    long sequence cuts it into 5 consecutive rounds.
+  - Each scenario runs in a fresh process. Timed in the bench process,
+    whose heap grows run over run, several metrics drifted upward from run
+    to run.
 
 - The bundle name in `brazier_client.manifest` is cached in
   `persistent_term` and validated by a stat of the manifest, as the client
