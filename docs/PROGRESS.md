@@ -1,4 +1,7 @@
-# Beacon Progress Tracker
+# Brazier Progress Tracker
+
+> The package was named Beacon until 2026-11-04. Entries written before the
+> rename keep the old names (`beacon/*`, `BEACON_*`, `data-beacon-*`).
 
 > **RALPH LOOP: READ THIS FILE FIRST EVERY ITERATION.**
 > This file is the single source of truth for what's done and what's next.
@@ -10,7 +13,7 @@
 **Active Milestone:** 117 — Full Review Remediation
 **Last Completed:** 116 — Review Hardening (CSRF, Timers, Auth, Cookies, Docs)
 **Build Status:** GREEN (zero errors, zero warnings) on Gleam 1.19.2
-**Test Status:** GREEN (1525 tests passed, 0 failures, after the WS10b merges)
+**Test Status:** GREEN (1529 tests passed, 0 failures, after the rename merge)
 **Linter:** PASSING (zero violations)
 
 ### Milestone 117: Full Review Remediation 🚧
@@ -255,7 +258,13 @@
     - Docs:
       - WIRE_PROTOCOL close codes (around 179 and 306–319): 4000+status, 1011, and WS8c's reload behaviour;
       - CLUSTERING/TELEMETRY/ERROR_HANDLING/ARCHITECTURE (ARCHITECTURE lines 45, 88–91, 258 and 263 per the WS1–6 list), and bring them under the docs check.
-- [ ] Rename package `beacon` → `brazier` (confirmed): package name, every `beacon/*` module and `beacon_*` FFI module/atom, the `beacon_client` JS package, the `beacon/build`/`beacon/lint` CLIs, the `data-beacon-*` DOM attributes and wire/log prefixes, pg scopes, cookie names, docs and examples; old names become hard errors (no aliases)
+- [x] Rename package `beacon` → `brazier` (confirmed): package name, every `beacon/*` module and `beacon_*` FFI module/atom, the `beacon_client` JS package, the `beacon/build`/`beacon/lint` CLIs, the `data-beacon-*` DOM attributes and wire/log prefixes, pg scopes, cookie names, docs and examples; old names become hard errors (no aliases)
+  - Merged 2026-11-04 as e57dfaf (branch at 8c0c0a0, plus merges of 4deddc8 and f3a75fa).
+  - Agent gates: a clean build with zero warnings; format clean; `brazier/lint` 0 violations; 1529 tests passing twice; `scripts/check_docs.sh` with 72 sample modules; `make test-client` (39 scenarios, 5 patch-safety checks); all 24 examples built with `brazier/build` and a clean `gleam build`, zero warnings; CDP desktop 625 and mobile 634 scenarios with 0 failures; `make test-flake` 5 of 5; `make bench-check` 29 metrics ok.
+  - Coordinator verify on the merged tree: a clean build with zero warnings, format and lint clean, 1529 tests passing in each of 3 runs, docs check OK.
+  - Old names: `brazier.start`, `start_supervised` and `cluster.start` refuse to start when `BEACON_ENV` or `BEACON_SHUTDOWN_TIMEOUT` is set (one error log per variable naming the new one, then a `ConfigError`; the old value is never read). The bench refuses `BEACON_BENCH_RUNS`, and the scripts and `test_all_cdp.py` refuse any `BEACON_*` (`scripts/refuse_renamed_env.sh`).
+  - Old names left on purpose: the published dev secret `beacon-dev-secret-change-in-production` (refused as a weak key in its real spelling), `gleam.toml` `repo = "beacon"` (the GitHub repository is not renamed), the CHANGELOG history and README rename note, the archived and design docs, and this file's earlier entries.
+  - Follow-ups: an example's client build resolves dependencies from Hex every time, since no manifest is kept for the client project, so parallel builds can hit Hex's rate limit; a lint rule against stale `beacon` names in `src`, `test` and `examples`, with an allowlist for the refusals and the dev secret.
 - [ ] Final read-only audits (security, stability, tigerstyle, performance) and fixes
 - [ ] Final verification: build (zero warnings), tests, all examples, CDP browser suite, perf baselines
 
