@@ -15,6 +15,7 @@
 ///   `http` or `https`.
 ///
 /// Reference: Plug.RewriteOn / RemoteIp, Rails `remote_ip`.
+import brazier/internal/log_path
 import brazier/ip
 import brazier/log
 import brazier/transport/server.{type Connection, type Socket}
@@ -28,7 +29,10 @@ pub fn ip(
   req: Request(Connection),
   trusted: ip.TrustedProxies,
 ) -> Result(String, String) {
-  log.debug("brazier.client", "Resolving client IP for " <> req.path)
+  log.debug(
+    "brazier.client",
+    "Resolving client IP for " <> log_path.describe(req.path),
+  )
   ip_for_socket(req.body.socket, req.headers, trusted)
 }
 

@@ -495,6 +495,11 @@ with its own changelog, so they are not listed here.
 - (Audit TS-12) Every `let assert` in `brazier/cluster`, `brazier/pubsub`
   and the cluster tests has an `as` message. `let assert True = e` in those
   tests is now `assert e`.
+- (Audit TS-12) `brazier/lint` has a `let-assert-message` rule: a
+  `let assert` in `src/` without an `as` message, or with an empty one, is
+  a violation, and the last ten such asserts have messages. The lint also
+  skipped every directory named `build`, so `src/brazier/build` was never
+  linted; only the `build` next to a `gleam.toml` is skipped now.
 - (TS-3) The client defaulted a missing `ack_clock`, and a missing event
   clock, to 0. Now a `model_sync` or `patch` without a valid `ack_clock` (a
   non-negative integer) is a protocol error, logged, that requests a full
@@ -664,6 +669,11 @@ with its own changelog, so they are not listed here.
   a navigation target) is quoted with `string.inspect` in the transport,
   runtime, router and `middleware.logger` logs, and a path is logged
   without its query and fragment, so a CR or LF cannot forge a log line.
+- (Audit SEC-11) The rest of the client paths are quoted too: static
+  serving, the HTTP head and body-length logs, multipart upload logs and
+  errors (field names and parameter keys), client-IP resolution, and an
+  invalid `Content-Length` value. Filesystem paths built from a request are
+  quoted with `string.inspect`.
 - (Audit SEC-17) State recovery no longer lets a join token decide the
   server state: `restore` receives the state this connection's `init` and
   route produced, and only the client-visible model comes from the token.

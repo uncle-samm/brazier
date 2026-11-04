@@ -12,6 +12,7 @@
 /// 304, and `X-Content-Type-Options: nosniff` on every response.
 ///
 /// Reference: Plug.Static, cowboy_static, Phoenix static serving.
+import brazier/internal/log_path
 import brazier/log
 import brazier/transport/server.{type ResponseBody, Bytes, File}
 import gleam/bit_array
@@ -171,18 +172,24 @@ fn serve_with_cache_control(
       let relative = string.drop_start(path, string.length(config.prefix))
       case resolve_relative(relative) {
         Error(NoFile) -> {
-          log.debug("brazier.static", "No file named by: " <> path)
+          log.debug(
+            "brazier.static",
+            "No file named by: " <> log_path.describe(path),
+          )
           Error(Nil)
         }
         Error(Refused(reason)) -> {
           log.warning(
             "brazier.static",
-            "Refused static path " <> path <> ": " <> reason,
+            "Refused static path " <> log_path.describe(path) <> ": " <> reason,
           )
           Ok(plain_response(403, "Forbidden"))
         }
         Error(Undecodable) -> {
-          log.warning("brazier.static", "Undecodable static path: " <> path)
+          log.warning(
+            "brazier.static",
+            "Undecodable static path: " <> log_path.describe(path),
+          )
           Ok(plain_response(400, "Bad Request"))
         }
         Ok(segments) ->
@@ -339,7 +346,10 @@ pub fn file_digest_at(
     Ok(Digest(source: Hashed(reason), ..)) ->
       log.debug(
         "brazier.static",
-        "digest cache miss (" <> hash_reason_name(reason) <> "): " <> path,
+        "digest cache miss ("
+          <> hash_reason_name(reason)
+          <> "): "
+          <> string.inspect(path),
       )
     Ok(Digest(source: Cached, ..)) | Error(_) -> Nil
   }
@@ -375,7 +385,10 @@ fn serve_file(
       let etag = "\"" <> hash <> "\""
       case etag_matches(if_none_match, etag) {
         True -> {
-          log.debug("brazier.static", "304 Not Modified: " <> path)
+          log.debug(
+            "brazier.static",
+            "304 Not Modified: " <> string.inspect(path),
+          )
           Ok(
             response.new(304)
             |> response.set_header("etag", etag)
@@ -387,7 +400,7 @@ fn serve_file(
         False -> {
           log.debug(
             "brazier.static",
-            "Serving: " <> path <> " (" <> mime <> ")",
+            "Serving: " <> string.inspect(path) <> " (" <> mime <> ")",
           )
           Ok(
             response.new(200)
@@ -403,13 +416,16 @@ fn serve_file(
     // A missing path, a directory or a special file is "no such static
     // file": the transport answers 404 for it.
     Error(NotAFile) -> {
-      log.debug("brazier.static", "No regular file at: " <> path)
+      log.debug(
+        "brazier.static",
+        "No regular file at: " <> string.inspect(path),
+      )
       Error(Nil)
     }
     Error(ReadFailed(reason)) -> {
       log.error(
         "brazier.static",
-        "Cannot read static file " <> path <> ": " <> reason,
+        "Cannot read static file " <> string.inspect(path) <> ": " <> reason,
       )
       Ok(plain_response(500, "Internal Server Error"))
     }
@@ -417,7 +433,7 @@ fn serve_file(
       log.error(
         "brazier.static",
         "Cannot serve static file "
-          <> path
+          <> string.inspect(path)
           <> ": digest cache unavailable: "
           <> reason,
       )
@@ -580,13 +596,16 @@ pub fn load_client_asset(path: String) -> Result(ClientAsset, AssetError) {
   case ffi_load_asset(path) {
     Ok(asset) -> Ok(asset)
     Error(AssetNotFound) -> {
-      log.warning("brazier.static", "Client asset not found: " <> path)
+      log.warning(
+        "brazier.static",
+        "Client asset not found: " <> string.inspect(path),
+      )
       Error(AssetNotFound)
     }
     Error(AssetReadFailed(reason)) -> {
       log.error(
         "brazier.static",
-        "Cannot read client asset " <> path <> ": " <> reason,
+        "Cannot read client asset " <> string.inspect(path) <> ": " <> reason,
       )
       Error(AssetReadFailed(reason))
     }
