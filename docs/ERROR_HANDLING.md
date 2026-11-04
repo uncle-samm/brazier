@@ -89,10 +89,17 @@ read its client manifest closes the join with 1011 and logs an error.
 
 A join token lives 24 hours. A token that does not verify (malformed, badly
 signed, expired, or issued to another browser session), a token model that
-`restore` refuses, and a missing token while state recovery is enabled each
-refuse the connection
-before `init` runs: the socket closes with 4400 and the browser reloads the
-page for a fresh token. The refusal is logged with its reason.
+`restore` refuses, and, while state recovery is enabled, a missing token or
+a token without a model each refuse the connection before `init` runs: the
+socket closes with 4400 and the browser reloads the page for a fresh token.
+The refusal is logged with its reason.
+
+A page whose join token would not fit in a cookie (over
+`ssr.join_token_cookie_budget_bytes`, 3800 bytes; the state-recovery model
+is too large) is refused with a plain-text 500 and no cookie. The error log
+names the page and the token size, and `[brazier, ssr, join_token,
+too_large]` is emitted. Keep less client-visible state, or do not use state
+recovery.
 
 ## Model Size Limits
 

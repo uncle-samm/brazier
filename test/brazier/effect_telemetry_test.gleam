@@ -1,6 +1,8 @@
 /// Telemetry emitted by effects: the `[brazier, effect, run]` span around
-/// effect callbacks and `[brazier, effect, timer, rejected]` at the timer
-/// cap.
+/// effect callbacks, and the event each per-runtime cap emits when it
+/// refuses an effect: `[brazier, effect, timer, rejected]` (`every`),
+/// `[brazier, effect, after, rejected]` (`after`) and
+/// `[brazier, effect, background, rejected]` (`background`).
 ///
 /// Sync and keyed callbacks run in the calling process; background work
 /// runs in its own process. Every handler forwards to a subject owned by

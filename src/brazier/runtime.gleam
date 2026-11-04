@@ -63,6 +63,7 @@ import brazier/cookie
 import brazier/effect.{type Effect}
 import brazier/error
 import brazier/internal/context.{type Context}
+import brazier/internal/log_path
 import brazier/internal/presence_watch
 import brazier/internal/uri_check
 import brazier/log
@@ -293,7 +294,8 @@ pub fn start(
 ) -> Result(Subject(RuntimeMessage(msg)), error.BrazierError) {
   log.debug(
     "brazier.runtime",
-    "Starting a runtime outside the transport for " <> context.uri(ctx).path,
+    "Starting a runtime outside the transport for "
+      <> describe_uri(context.uri(ctx)),
   )
   start_for(config, ctx, no_connection, None)
 }
@@ -334,7 +336,7 @@ fn start_for(
       log.error(
         "brazier.runtime",
         "Refusing to start a runtime for "
-          <> uri.to_string(page_uri)
+          <> describe_uri(page_uri)
           <> ": "
           <> reason,
       )
@@ -861,7 +863,7 @@ fn handle_message(
         True -> {
           log.info(
             "brazier.runtime",
-            "Navigation: " <> conn_id <> " → " <> path,
+            "Navigation: " <> conn_id <> " → " <> log_path(path),
           )
           actor.continue(handle_navigation(state, conn_id, path))
         }
@@ -1048,7 +1050,7 @@ fn handle_join(
             "Rejoin from "
               <> conn_id
               <> " path: "
-              <> path
+              <> log_path(path)
               <> " — full resync, join token not used",
           )
           Ok(RuntimeState(..state, joined: set.delete(state.joined, conn_id)))
@@ -1056,7 +1058,7 @@ fn handle_join(
         False -> {
           log.info(
             "brazier.runtime",
-            "Client joined: " <> conn_id <> " path: " <> path,
+            "Client joined: " <> conn_id <> " path: " <> log_path(path),
           )
           recover_at_join(state, conn_id, join_token)
         }
@@ -1161,7 +1163,10 @@ fn recover_at_join(
 ///   another browser session;
 /// - a token whose model `restore` refuses (the model's shape changed);
 /// - no token while state recovery is enabled: the server render always
-///   sets the cookie, so its absence means the browser did not keep it.
+///   sets the cookie, so its absence means the browser did not keep it;
+/// - a token without a model while state recovery is enabled: the server
+///   render always puts the model in (it refuses the page when the model is
+///   too large for a cookie), so the token was minted without recovery.
 ///
 /// `restore` is `None` when no model is to be recovered (recovery disabled,
 /// or the runtime already joined a connection); `recovery_enabled` says
@@ -1208,13 +1213,13 @@ fn check_join_token(
           )
           Ok(None)
         }
-        Some(_), None -> {
-          log.debug(
-            "brazier.runtime",
-            "Join token from " <> conn_id <> " carries no model",
-          )
-          Ok(None)
-        }
+        // The page render puts the model in every join token while state
+        // recovery is on, and refuses a page whose token would not fit in
+        // a cookie. A token without one was minted elsewhere (by a server
+        // without recovery): restarting from `init` would silently lose
+        // the session's state.
+        Some(_), None ->
+          Error("state recovery is enabled and the join token carries no model")
         Some(restore), Some(model_json) ->
           case restore(model_json) {
             Ok(model) -> {
@@ -1470,7 +1475,7 @@ fn refuse_navigation(
       log.warning(
         "brazier.runtime",
         "Navigation to "
-          <> path
+          <> log_path(path)
           <> " from "
           <> conn_id
           <> " but the app has no router; loading the page",
@@ -1485,7 +1490,7 @@ fn refuse_navigation(
             "Navigation from "
               <> conn_id
               <> " to a non-local path refused: "
-              <> string.inspect(path),
+              <> log_path(path),
           )
           send_to_conn_id(
             state,
@@ -1500,7 +1505,7 @@ fn refuse_navigation(
             "Navigation from "
               <> conn_id
               <> " to "
-              <> path
+              <> log_path(path)
               <> " has an invalid encoding ("
               <> reason
               <> "); loading the page",
@@ -1513,7 +1518,7 @@ fn refuse_navigation(
             "Navigation from "
               <> conn_id
               <> " to unknown route "
-              <> path
+              <> log_path(path)
               <> "; loading the page (the server answers 404)",
           )
           hard_navigate(state, conn_id, path)
@@ -1554,7 +1559,9 @@ fn route_join(
             False -> {
               log.debug(
                 "brazier.runtime",
-                "Join path " <> path <> " changes the route; running on_change",
+                "Join path "
+                  <> log_path(path)
+                  <> " changes the route; running on_change",
               )
               let state = RuntimeState(..state, current_route_msg: Some(msg))
               let #(state, _changed) =
@@ -1572,7 +1579,7 @@ fn route_join(
             NotLocal -> "join path must start with /"
             BadEncoding(reason) ->
               "join path has an invalid encoding: " <> reason
-            UnknownRoute -> "no route for the joined path " <> path
+            UnknownRoute -> "no route for the joined path " <> log_path(path)
           }
           log.warning(
             "brazier.runtime",
@@ -1585,12 +1592,14 @@ fn route_join(
   }
 }
 
-/// Path and query for logs.
+/// A page URL for logs: its path only (see `brazier/internal/log_path`).
 fn describe_uri(page_uri: Uri) -> String {
-  case page_uri.query {
-    Some(query) -> page_uri.path <> "?" <> query
-    None -> page_uri.path
-  }
+  log_path.describe_uri(page_uri)
+}
+
+/// A client-supplied page path for logs (see `brazier/internal/log_path`).
+fn log_path(path: String) -> String {
+  log_path.describe(path)
 }
 
 /// Run the update cycle: update model → broadcast the client-visible change
@@ -2443,7 +2452,7 @@ pub fn connected_context(
 ) -> Result(Context, String) {
   log.debug(
     "brazier.runtime",
-    "Building connected context from upgrade request " <> req.path,
+    "Building connected context from upgrade request " <> log_path(req.path),
   )
   use pairs <- result.try(
     request.get_query(req)

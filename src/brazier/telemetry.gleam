@@ -17,8 +17,10 @@
 //// let assert Ok(Nil) =
 ////   telemetry.attach("http-logger", [["brazier", "http", "request", "stop"]], fn(event) {
 ////     let assert Ok(duration) = telemetry.int(event, "duration")
+////       as "every stop event measures its duration"
 ////     io.println("request took " <> int.to_string(duration))
 ////   })
+////   as "the handler id is unique"
 //// ```
 
 import gleam/dict.{type Dict}
@@ -350,10 +352,10 @@ pub fn effect_background_rejected(limit: Int) -> Nil
 
 /// `[brazier, ssr, join_token, too_large]`: a page's join token, carrying
 /// the state-recovery model, is `bytes` long and over the cookie `budget`,
-/// so the page is refused (see `ssr.join_token_cookie_budget_bytes`).
+/// so the page is refused with a 500 (see `ssr.join_token_cookie_budget_bytes`).
 @external(erlang, "brazier_telemetry_ffi", "ssr_join_token_too_large")
 @internal
-pub fn ssr_join_token_too_large(bytes: Int, budget: Int, route: String) -> Nil
+pub fn ssr_join_token_too_large(bytes: Int, budget: Int) -> Nil
 
 /// `[brazier, store, write]`.
 @external(erlang, "brazier_telemetry_ffi", "store_write")

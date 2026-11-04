@@ -377,7 +377,7 @@ fn start_app_server(
       on_disconnect: fn(_id) { Nil },
       page_html: Some(ssr.RenderedPage(
         html: "<html><body>page</body></html>",
-        sign_join_token: fn(_fingerprint) { "" },
+        sign_join_token: fn(_fingerprint) { Ok("") },
         join_cookie: True,
         cookie_secure: False,
         status: 200,

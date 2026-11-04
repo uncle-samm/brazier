@@ -140,6 +140,7 @@ measurements: `system_time` and `monotonic_time` on start, `duration` and
 |---|---|---|---|
 | `[brazier, http, request]` S | `req_body_bytes`, `resp_body_bytes` (stop) | `method`, `connection_id`; `route`, `status` (stop) | yes, `brazier/transport/http.run_handler` |
 | `[brazier, http, connection, accepted \| rejected \| closed]` | `count`, `duration` | `reason` | yes, `brazier_http_acceptor` (accepted, rejected), `brazier_http_conns` (closed) |
+| `[brazier, ssr, join_token, too_large]` | `bytes` | `budget` | yes, `brazier/ssr` |
 | `[brazier, ws, upgrade]` S | none | `route`; `result` (stop) | yes, `brazier/transport` |
 | `[brazier, ws, close]` | `duration`, `frames_in`, `frames_out`, `bytes_in`, `bytes_out` | `close_code`, `reason`, `connection_id` | yes, `brazier/transport` |
 | `[brazier, ws, rate_limited]` | `count`, `violations` | `kind`, `connection_id` | yes, `brazier/transport` |
@@ -186,6 +187,11 @@ Notes on individual events:
   A raw `api_handler` that does not use `api.routes`, and a response an
   HTTP middleware returns without calling `next`, report `"unknown"`. A
   crashed handler reports status 500.
+- `[brazier, ssr, join_token, too_large]` is emitted when a page is refused
+  with a 500 because its join token would not fit in a cookie. `bytes` is the
+  token's size and `budget` the limit,
+  `ssr.join_token_cookie_budget_bytes` (3800). See
+  [SECURITY.md](SECURITY.md#join-tokens).
 - `[brazier, ws, upgrade]` covers the handshake checks and the 101 write.
   `route` is `/ws`. `result` is `ok` or names the refusal:
   `rejected_middleware`, `rejected_early_data`, `rejected_body`,

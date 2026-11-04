@@ -98,7 +98,7 @@ pub fn init_crash_is_logged_once_with_its_context_test() {
   let assert True =
     string.contains(
       line.message,
-      "init or the initial route crashed for / (connection conn_",
+      "init or the initial route crashed for \"/\" (connection conn_",
     )
   let assert True =
     string.contains(line.message, "ws8c init crashes on purpose")

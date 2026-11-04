@@ -68,6 +68,13 @@ with its own changelog, so they are not listed here.
     and the CDP scripts and the bench exit non-zero. The old published dev
     secret `beacon-dev-secret-change-in-production` is still refused as a
     weak key.
+- `ssr.create_session_token`, `ssr.verify_session_token` and
+  `ssr.max_token_lifetime_seconds` (the v1 session token) are removed. Use
+  `ssr.sign_join_token` and `ssr.verify_join_token`; a join token's
+  lifetime is `ssr.join_token_lifetime_seconds`.
+- `RenderedPage.sign_join_token` and `ssr.join_token_for` return
+  `Result(String, ssr.JoinTokenTooLarge)`: a token over the 3800-byte
+  cookie budget is an error, no longer a token with its model dropped.
 - (WS7) The application API was redesigned; see `docs/design/API_REDESIGN.md`.
   - There are three constructors: `beacon.simple`, `beacon.application` and
     `beacon.full_application`. They take a `Context` and the router, and
@@ -171,6 +178,11 @@ with its own changelog, so they are not listed here.
 
 ### Changed
 
+- The bundle name in `brazier_client.manifest` is cached in
+  `persistent_term` and validated by a stat of the manifest, as the client
+  asset cache is: a page render or join no longer reads the manifest. A
+  manifest modified in the second it was read is never trusted (git's
+  racy-clean rule), so a rebuild is always seen.
 - `effect.after` no longer spawns a process. It is an `erlang:send_after`
   into the runtime's own mailbox (LiveView's `Process.send_after(self(), ...)`),
   and its `make_msg` runs in the runtime when it fires. At most 100 timers
@@ -324,6 +336,22 @@ with its own changelog, so they are not listed here.
 
 ### Security
 
+- A page whose join token is over the 3800-byte cookie budget is refused
+  with a 500 and no cookie, logged at error and reported as
+  `[brazier, ssr, join_token, too_large]`. It used to drop the model from
+  the token, so the session silently restarted from `init` on reconnect.
+- With state recovery on, a join token without a model refuses the join
+  (4400, the browser reloads) instead of starting the session from `init`.
+- Signing a join token with an empty secret key crashes instead of minting
+  a token that never verifies; the app already refuses to start without a
+  key.
+- Runtime and SSR logs name a page by its path only: the query string and
+  fragment (which can hold tokens or personal data) are dropped, and the
+  path is quoted with `string.inspect`, so a CR or LF from the browser
+  cannot forge a log line (LiveView's `filter_parameters` keeps such values
+  out of its logs).
+- SECURITY.md documents that state recovery restores the client-visible
+  model up to 24 hours old, and that authorization must not live in it.
 - (WS1) HTTP: request-line forms (absolute URI and `*`); limits on headers,
   bodies and packets; read timeouts against slowloris; HEAD responses carry
   no body.

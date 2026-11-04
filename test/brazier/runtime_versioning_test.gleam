@@ -10,7 +10,6 @@ import brazier/effect
 import brazier/error
 import brazier/pubsub
 import brazier/runtime
-import brazier/ssr
 import brazier/test_ctx
 import brazier/transport
 import gleam/erlang/process.{type Subject}
@@ -241,16 +240,21 @@ pub fn rejoin_is_full_resync_and_never_resets_state_test() {
   let cfg =
     runtime.RuntimeConfig(
       ..config(),
-      restore_model: Some(fn(_json) { Ok(Model(count: 99, blob: "", path: "")) }),
+      restore_model: Some(fn(_json) { Ok(Model(count: 0, blob: "", path: "")) }),
     )
   let assert Ok(rt) = runtime.start(cfg, test_ctx.root())
-  // With state recovery every first join carries a token; this one has no
-  // model, so the session starts from init.
+  // With state recovery every first join carries a token with the model;
+  // this one recovers count 0.
   let s = connect(rt, "c")
-  let modelless = ssr.sign_join_token(secret, "", None, now_seconds())
+  let first_token =
+    runtime.create_state_token(
+      Model(count: 0, blob: "", path: ""),
+      model_json,
+      secret,
+    )
   process.send(
     rt,
-    runtime.ClientJoined(conn_id: "c", token: modelless, path: ""),
+    runtime.ClientJoined(conn_id: "c", token: first_token, path: ""),
   )
   let assert transport.SendModelSync(version: 0, ack_clock: 0, ..) = next(s)
   event(rt, "c", "inc", 1)
@@ -549,9 +553,6 @@ fn wait_for_topics(computed: Subject(List(String)), expected: List(String)) {
 
 /// The runtime's PubSub listener emits this after each pg join or leave.
 const subscription_changed = ["brazier", "subscription", "changed"]
-
-@external(erlang, "brazier_ssr_ffi", "system_time_seconds")
-fn now_seconds() -> Int
 
 // --- snapshot diffs ---
 
