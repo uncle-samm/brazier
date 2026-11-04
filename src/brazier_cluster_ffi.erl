@@ -87,8 +87,10 @@ verified_nodes() ->
     end.
 
 %% Ask the manager to send {brazier_cluster_peer_verified, Node} to the
-%% caller once Node passes the peer check (at once if it has). Nothing is
-%% sent if Node is not connected, or is rejected or goes down first.
+%% caller once Node passes the peer check (at once if it has). A rejected
+%% node stays connected and may still pass on a later hello, so the wait
+%% outlives a rejection. Nothing is sent if Node is not connected, or goes
+%% down before it passes.
 await_verified(Node) when is_atom(Node) ->
     case whereis(?NAME) of
         undefined ->
