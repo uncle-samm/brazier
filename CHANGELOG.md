@@ -265,6 +265,16 @@ with its own changelog, so they are not listed here.
   longer sleep: the sweep takes the time as an argument
   (`rate_limit.sweep_with`), and the slow client sends a byte each time a
   receive times out. `docs/TESTING.md` lists these patterns.
+- (Audit TS-5) The CDP suite stops with a `CdpError` when a `*.enable`
+  command or a viewport setting gets no answer or an error, and when a
+  `Runtime.evaluate` script throws or returns no JSON value. Before, an
+  evaluation returned the strings `"TIMEOUT"`, `"ERR"` or `"EXCEPTION: ..."`,
+  which a check could compare against, and a failed enable went unnoticed.
+  A wait still retries while a navigation replaces the page's context.
+- (Audit TS-6) `sim_memory_leak_test` asserts what it measures: a second
+  round of 100 connect/disconnect cycles keeps no ETS table, ETS object or
+  atom, besides no process. Before, it measured memory and asserted nothing
+  about it.
 
 ### Fixed
 

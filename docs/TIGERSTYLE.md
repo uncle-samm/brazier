@@ -207,8 +207,8 @@ The simulation tests (`test/brazier/sim_test.gleam`, with the harness in
   unknown handlers; the server must survive and leak no process.
 - **Flooding**: 500 events on one connection, past the per-connection rate
   limit.
-- **Leaks**: 100 connect/disconnect cycles, measuring memory and process
-  counts before and after.
+- **Leaks**: rounds of 100 connect/disconnect cycles that must keep no
+  process, ETS table, ETS object or atom.
 
 ### 8. Zero Tolerance for Leaks
 
@@ -228,9 +228,8 @@ let assert True = processes_leaked < 10
 let assert True = processes_leaked == 0
 ```
 
-Not every simulation test meets this rule yet: some still allow a margin of
-leaked processes or failed connections. Each margin is a bug to remove, not
-a tolerance to copy.
+Every simulation test meets this rule: each one asserts no failed
+connection and exactly 0 kept processes.
 
 ## How We Enforce This
 

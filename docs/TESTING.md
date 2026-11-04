@@ -194,8 +194,13 @@ Leak snapshots taken after it measure cleanup that has finished, not
 cleanup that a sleep hoped had finished. See `run_measured` in
 `test/brazier/sim_test.gleam`.
 
-The 1000-connection test requires all 1000 connections to succeed and all
-5000 events to be acknowledged, with no leaked processes.
+Every simulation test ends with `assert_all_clean`: no failed connection
+and exactly 0 processes kept. The 1000-connection test also requires all
+5000 events to be acknowledged. `sim_memory_leak_test` runs two rounds of
+100 connect/disconnect cycles and asserts that the second keeps no ETS
+table, no ETS object and no atom. It logs memory in bytes but does not
+assert it: a heap's size depends on its GC history and an ETS table's on
+its peak load, so no bound on bytes is both stable and tight.
 
 Scenarios:
 
@@ -302,7 +307,13 @@ For each example:
    the port to be released.
 
 The script exits 1 if any check failed (an example that does not start
-counts as a failure) and 0 otherwise.
+counts as a failure) and 0 otherwise. A broken harness stops the run with
+a `CdpError` instead of failing checks one by one: a `*.enable` command
+that gets no answer or an error (the suite would then record no console
+errors or frames, and checks reading them would pass on nothing), or a
+`Runtime.evaluate` whose script throws or returns no JSON value. The one
+error a wait retries is the page's JavaScript context being replaced by a
+navigation (`CdpContextGone`).
 
 ### Waiting
 
