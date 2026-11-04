@@ -248,6 +248,21 @@ with its own changelog, so they are not listed here.
 - (WS10b) A `max_events_per_second` below 50, the rate the generated client
   paces itself for, is logged as a warning when the listener starts. The
   limit is still not advertised to the client, as in Phoenix channels.
+- (PERF-8) A patch with many array ops copies each array once instead of
+  once per op, on the server (`patch.apply`) and in the client. With 4000
+  items and 1300 ops it is 5 to 9 times faster on the server and 3 to 9
+  times faster in the client. A test checks both against the old
+  op-by-op apply.
+- (PERF-1, PERF-15) Client render changes:
+  - A render whose HTML equals the last render's reuses the parsed
+    fragment, which makes it about 2 times faster. It still morphs, so DOM
+    drift is undone.
+  - Hooks are synced only for the elements a morph inserted or changed,
+    not by scanning the whole root. If a hook's unmount removes an element
+    that the morph touched, the render now fails, and the client asks the
+    server for a full sync.
+  - The dev flag is read once, and trace details are built only in dev
+    mode.
 - (Audit PERF-3) A static file's ETag digest is cached in an ETS table
   keyed by path and checked against the file's size, mtime, ctime, inode
   and device, so a repeat request does not read and hash the whole file.
@@ -348,6 +363,10 @@ with its own changelog, so they are not listed here.
   subscribed to its topic. Under `beacon/dev` every WebSocket handler now
   subscribes to `beacon:dev:reload`, and each rebuild sends every open page a
   `reload`. A handler that cannot subscribe closes 1011.
+- (TS-3) The client defaulted a missing `ack_clock`, and a missing event
+  clock, to 0. Now a `model_sync` or `patch` without a valid `ack_clock` (a
+  non-negative integer) is a protocol error, logged, that requests a full
+  sync. A queued event without a valid clock is an invariant error.
 
 ### Removed
 
@@ -400,6 +419,20 @@ with its own changelog, so they are not listed here.
 - (WS10b) `examples/auth_workspace` checks its login form against a random
   per-browser token in an HttpOnly cookie (a double-submit cookie), renewed
   at each login, instead of a constant that protected nothing.
+- (SEC-5) `router.push`, `router.replace` and `router.redirect` refuse
+  paths a browser resolves to another host. The URL parser reads `\` as
+  `/` and strips tab, newline and carriage return, so `/\evil.example` and
+  `/<tab>/evil.example` both loaded evil.example. A path is now refused when
+  it starts with `//` or `/\`, contains a `\`, an ASCII control character or
+  `/%09`. The error log gives the reason. The client applies the same rule
+  to the `navigate` and `hard_navigate` frames, and also refuses a path that
+  `new URL(path, location.origin)` resolves to another origin. A test holds
+  the server's and the client's verdicts equal.
+- (SEC-14) Neither the server's nor the client's diff writes a patch path
+  through `__proto__`, `constructor` or `prototype`. When such a key is
+  added, removed or changed, the object holding it is replaced whole. The
+  server's list of these keys is the canonical one, and a test holds the
+  client's equal to it.
 - (Final audit) On Erlang the HTML escapers missed a `"`, `&` or `<` that a
   combining mark followed (`string.replace` matches whole graphemes), so a
   value such as `x"` + U+0301 + ` onmouseover=...` closed its attribute and

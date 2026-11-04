@@ -449,6 +449,37 @@ The server decodes every event with the generated `brazier_codec.decode_event`. 
 
 An accepted message is still only a request: `update` runs on the server and must check that the session may perform it (for example, that a guest is not sending a signed-in action). With `brazier.simple` the browser runs `update` first for instant feedback, but the server runs it too and its model wins; a mismatch is logged in the browser.
 
+## Navigation Targets
+
+`router.push`, `router.replace` and `router.redirect` send the browser to a
+path, so a path built from user input (a `?next=` parameter) must not become
+an open redirect. A browser's URL parser reads `\` as `/` and strips tab,
+newline and carriage return anywhere in a URL. That means `/\evil.example`
+and `/<tab>/evil.example` load evil.example just as `//evil.example` does.
+The router accepts a path only when all of these hold:
+
+- it starts with `/`, but not with `//` or `/\`;
+- it has no `\`;
+- it has no ASCII control character (U+0000 to U+001F, U+007F);
+- it has no `/%09`, an encoded tab that some browsers strip.
+
+This is Phoenix's `validate_local_url` rule plus the control characters. A
+refused path is logged as an error with the reason and never sent.
+
+The client applies the same rule, with the same reasons, to the `navigate`
+and `hard_navigate` frames. It then refuses a path that
+`new URL(path, location.origin)` resolves to another origin. `router_test`
+holds the server's and the client's verdicts equal on every case.
+
+## Model Patches
+
+A patch path never goes through `__proto__`, `constructor` or `prototype`.
+The client refuses any patch with such a segment, so applying it cannot reach
+`Object.prototype`. The diff never writes one: when such a key is added,
+removed or changed, the server and the client replace the object holding it
+whole. The server's `patch.unsafe_keys()` is the canonical list, and
+`patch_test` holds the client's `UNSAFE_PATCH_KEYS` equal to it.
+
 ## Client Bundle Privacy
 
 The build compiles to JavaScript only the code the browser runs: what `view` reaches, plus `init_local` and `update_local` of a `local.layer`, plus `update` for `brazier.simple`. Each reached definition is sliced out of its source file and its imports regenerated, so a function, constant, type or import that the browser does not reach never appears in the bundle. A reference from browser code into a server-only Brazier module (for example `brazier/store`, `brazier/effect` or `brazier/session`) fails the build with the call site.

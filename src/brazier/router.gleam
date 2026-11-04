@@ -34,6 +34,7 @@ pub fn segments(uri: Uri) -> List(String) {
     // Invariant: Brazier validated every segment (`internal/uri_check`)
     // before calling the app's `parse`, so decoding cannot fail here.
     let assert Ok(decoded) = uri.percent_decode(segment)
+      as "router.segments: a segment does not percent-decode; the URI skipped Brazier's encoding check"
     decoded
   })
 }
@@ -50,6 +51,7 @@ pub fn query(uri: Uri) -> List(#(String, String)) {
       // Invariant: `internal/uri_check` parsed this query before the app's
       // `parse` ran.
       let assert Ok(pairs) = uri.parse_query(query)
+        as "router.query: the query does not parse; the URI skipped Brazier's encoding check"
       pairs
     }
   }
@@ -68,15 +70,52 @@ pub fn replace(path: String) -> Effect(msg) {
 }
 
 /// Load `url` as a new page (a full page load, ending this session).
-/// The client only follows same-origin paths (starting with `/`, not `//`).
+/// `url` must be a same-origin path, as for `push`.
 pub fn redirect(url: String) -> Effect(msg) {
   navigation_effect("redirect", url, transport.SendHardNavigate(path: url))
 }
 
-/// Whether `path` is a same-origin absolute path.
+/// `Ok(Nil)` when `path` is a same-origin absolute path, else why not.
+///
+/// A browser resolves more than `//host` to another origin: it reads `\`
+/// as `/`, and strips tab, newline and carriage return anywhere in a URL, so
+/// `/\evil.com` and `/<tab>/evil.com` both load `evil.com`. The rule is
+/// Phoenix's `validate_local_url` (no leading `//`, no `\`, no `/%09`) plus
+/// every ASCII control character. The client checks the same rule, and also
+/// resolves the path against its own origin.
 @internal
-pub fn is_local_path(path: String) -> Bool {
-  string.starts_with(path, "/") && !string.starts_with(path, "//")
+pub fn check_local_path(path: String) -> Result(Nil, String) {
+  case path {
+    "//" <> _ | "/\\" <> _ ->
+      Error("it starts with two slashes, which a browser reads as another host")
+    "/" <> _ ->
+      case
+        string.contains(path, "\\"),
+        string.contains(path, "/%09"),
+        has_control_character(path)
+      {
+        True, _, _ ->
+          Error("it contains a backslash, which a browser reads as \"/\"")
+        _, True, _ ->
+          Error("it contains \"/%09\", an encoded tab some browsers strip")
+        _, _, True ->
+          Error(
+            "it contains a control character, which a browser may strip (a tab between two slashes leaves \"//\")",
+          )
+        False, False, False -> Ok(Nil)
+      }
+    _ -> Error("it does not start with \"/\"")
+  }
+}
+
+/// Whether `text` holds an ASCII control character (U+0000 to U+001F, or
+/// U+007F).
+fn has_control_character(text: String) -> Bool {
+  string.to_utf_codepoints(text)
+  |> list.any(fn(codepoint) {
+    let code = string.utf_codepoint_to_int(codepoint)
+    code < 0x20 || code == 0x7F
+  })
 }
 
 fn navigation_effect(
@@ -85,16 +124,18 @@ fn navigation_effect(
   message: transport.InternalMessage,
 ) -> Effect(msg) {
   effect.from(fn(_dispatch) {
-    case is_local_path(path) {
-      False ->
+    case check_local_path(path) {
+      Error(reason) ->
         log.error(
           "brazier.routing",
           "router."
             <> kind
             <> " needs a same-origin path starting with \"/\"; refusing "
-            <> string.inspect(path),
+            <> string.inspect(path)
+            <> ": "
+            <> reason,
         )
-      True ->
+      Ok(Nil) ->
         case get_navigation_targets() {
           [] ->
             log.warning(

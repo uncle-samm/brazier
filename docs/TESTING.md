@@ -25,15 +25,21 @@ running it, so a missing node is a test failure, never a skip. Several
 tests depend on it:
 
 - `patch_test`: runs the client's patch application on server-made vectors
-  (`brazier_client/test/patch_vectors.mjs`) and its patch safety checks
-  (`patch_safety.mjs`).
+  (`brazier_client/test/patch_vectors.mjs`), its patch safety checks
+  (`patch_safety.mjs`, which also prints the client's unsafe-key list for
+  comparison with the server's) and the comparison of its apply engine with
+  the per-op copying engine it replaced (`apply_equivalence.mjs`).
+- `router_test`: runs the client's navigation-path rule on the server's
+  cases (`local_path_parity.mjs`) and holds every verdict equal to
+  `router.check_local_path`'s.
 - `runtime_versioning_test`: runs the client sync state machine
   (`sync_vectors.mjs`) and its FFI harness (`ffi_harness.mjs`).
 - `build_fixture_test`: also needs **npx**, which runs the pinned esbuild
   (`esbuild@0.25.12` in `src/brazier/build/program.gleam`) exactly as
   `brazier/build` does. The first run downloads it into the npx cache.
 
-`make test-client` runs `ffi_harness.mjs` and `patch_safety.mjs` directly.
+`make test-client` runs `ffi_harness.mjs`, `patch_safety.mjs` and
+`apply_equivalence.mjs` directly.
 These are the client checks that need no Gleam-generated input. It is the
 quick loop when you are changing `brazier_client/src`, and it fails
 immediately, by name, when node is missing.
