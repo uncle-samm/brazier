@@ -17,8 +17,21 @@ import gleam/option.{None, Some}
 import gleam/string
 import gleeunit/should
 
-fn short_idle_store(name: String) -> session.SessionStore {
-  session.new_store_with_config(
+/// A LocalEts store whose wall clock only moves when the test advances it.
+fn clocked_store(
+  name: String,
+  config: session.StoreConfig,
+) -> #(session.SessionStore, ManualClock) {
+  let clock = new_clock(1_000_000)
+  let assert Ok(store) =
+    session.start_store_with_clock(session.LocalEts(name), config, fn() {
+      clock_now(clock)
+    })
+  #(store, clock)
+}
+
+fn short_idle_store(name: String) -> #(session.SessionStore, ManualClock) {
+  clocked_store(
     name,
     session.StoreConfig(
       absolute_ttl_ms: 60_000,
@@ -30,25 +43,25 @@ fn short_idle_store(name: String) -> session.SessionStore {
 
 // --- Expiry ---
 
-// Expiry is wall-clock time and the LocalEts store has no clock to advance,
-// so these tests sleep past a lifetime: the sleep is the thing under test.
-// A sleep past a TTL cannot race (a slow scheduler only makes the session
-// older); a test that needs a session to stay alive gives every gap a wide
-// margin below the TTL instead.
+// Lifetimes are read from the store's clock, which these tests advance by
+// hand: no test sleeps, and every boundary is exact.
 
 pub fn idle_expired_session_is_rejected_test() {
-  let store = short_idle_store("sec_idle_expired")
+  let #(store, clock) = short_idle_store("sec_idle_expired")
   let sess = session.create(store)
-  sleep_ms(80)
+  advance(clock, 39)
+  let assert Some(_) = session.get(store, sess.id)
+  // That read touched the session; idle time restarts from it.
+  advance(clock, 40)
   should.equal(session.get(store, sess.id), None)
   // Expired rows are deleted on access, not left behind.
   should.equal(session.count(store), 0)
 }
 
 pub fn write_to_expired_session_is_rejected_and_not_resurrected_test() {
-  let store = short_idle_store("sec_write_expired")
+  let #(store, clock) = short_idle_store("sec_write_expired")
   let sess = session.create(store)
-  sleep_ms(80)
+  advance(clock, 40)
   should.equal(
     session.set(store, sess, "k", "v"),
     Error(session.SessionExpired),
@@ -58,8 +71,8 @@ pub fn write_to_expired_session_is_rejected_and_not_resurrected_test() {
 }
 
 pub fn absolute_lifetime_is_enforced_despite_activity_test() {
-  let store =
-    session.new_store_with_config(
+  let #(store, clock) =
+    clocked_store(
       "sec_absolute_expired",
       session.StoreConfig(
         absolute_ttl_ms: 100,
@@ -69,20 +82,19 @@ pub fn absolute_lifetime_is_enforced_despite_activity_test() {
     )
   let sess = session.create(store)
   // Keep it busy: idle never passes, absolute does.
-  list.each(seq(1, 6), fn(_) {
-    sleep_ms(25)
-    let _ = session.get(store, sess.id)
+  list.each(seq(1, 3), fn(_) {
+    advance(clock, 33)
+    let assert Some(_) = session.get(store, sess.id)
     Nil
   })
-  sleep_ms(30)
+  // 99 ms old: still alive. 100 ms old: gone, however recently touched.
+  advance(clock, 1)
   should.equal(session.get(store, sess.id), None)
 }
 
 pub fn activity_extends_idle_lifetime_test() {
-  // 4 touches 150 ms apart span 600 ms, past the 400 ms idle TTL, and each
-  // gap leaves 250 ms of margin for a starved scheduler.
-  let store =
-    session.new_store_with_config(
+  let #(store, clock) =
+    clocked_store(
       "sec_idle_extend",
       session.StoreConfig(
         absolute_ttl_ms: 60_000,
@@ -91,21 +103,19 @@ pub fn activity_extends_idle_lifetime_test() {
       ),
     )
   let sess = session.create(store)
-  let started = monotonic_ms()
+  // Four touches 399 ms apart span 1596 ms, four times the idle TTL.
   list.each(seq(1, 4), fn(_) {
-    sleep_ms(150)
+    advance(clock, 399)
     let assert Some(_) = session.get(store, sess.id)
     Nil
   })
-  // The session outlived its idle TTL only because it was touched.
-  let assert True = monotonic_ms() - started > 400
+  advance(clock, 400)
+  should.equal(session.get(store, sess.id), None)
 }
 
 pub fn sweep_removes_expired_sessions_test() {
-  // The live session must survive from its creation to the sweep: a 500 ms
-  // idle TTL leaves that gap a wide margin, and 600 ms expires the others.
-  let store =
-    session.new_store_with_config(
+  let #(store, clock) =
+    clocked_store(
       "sec_sweep_manual",
       session.StoreConfig(
         absolute_ttl_ms: 60_000,
@@ -116,7 +126,7 @@ pub fn sweep_removes_expired_sessions_test() {
   let _a = session.create(store)
   let _b = session.create(store)
   should.equal(session.count(store), 2)
-  sleep_ms(600)
+  advance(clock, 500)
   let live = session.create(store)
   should.equal(session.sweep_expired(store), Ok(2))
   should.equal(session.count(store), 1)
@@ -124,8 +134,8 @@ pub fn sweep_removes_expired_sessions_test() {
 }
 
 pub fn background_sweeper_removes_expired_sessions_test() {
-  let store =
-    session.new_store_with_config(
+  let #(store, clock) =
+    clocked_store(
       "sec_sweep_background",
       session.StoreConfig(
         absolute_ttl_ms: 60_000,
@@ -137,6 +147,9 @@ pub fn background_sweeper_removes_expired_sessions_test() {
     let _ = session.create(store)
     Nil
   })
+  // The sweeper reads the same clock: nothing has expired yet.
+  should.equal(session.count(store), 10)
+  advance(clock, 30)
   // Nothing reads the sessions, so only the background sweeper removes
   // them. It emits one expired event per row, after deleting the row: each
   // event is a point to look, instead of sleeping and hoping enough sweeps
@@ -302,8 +315,8 @@ pub fn rotation_notifies_bound_processes_test() {
 }
 
 pub fn expiry_notifies_bound_processes_test() {
-  let store =
-    session.new_store_with_config(
+  let #(store, clock) =
+    clocked_store(
       "sec_revoke_expire",
       session.StoreConfig(
         absolute_ttl_ms: 60_000,
@@ -314,6 +327,8 @@ pub fn expiry_notifies_bound_processes_test() {
   let sess = session.create(store)
   let #(ready, result) = spawn_bound_watcher(store, sess.id)
   let assert Ok(Nil) = process.receive(ready, 1000)
+  // The background sweeper finds the session expired once time passes.
+  advance(clock, 30)
   let assert Ok(Ok(#(_, reason))) = process.receive(result, 1000)
   should.equal(reason, "expired")
 }
@@ -389,6 +404,8 @@ pub fn allow_guests_ws_admits_a_dead_session_unbound_test() {
   session.delete(store, login.session.id)
   let auth_fn = auth.allow_guests_ws(store, config)
   let req = cookie_request("GET", "/ws", config.cookie_name, login.session.id)
+  // A stale cookie on a fresh connection is a guest, not a revocation.
+  should.be_false(session.is_current_process_bound(store, login.session.id))
   let #(outcome, logs) = log_capture.capture(fn() { auth_fn(req) })
   should.equal(outcome, Ok(Nil))
   should.equal(session.bound_process_count(store, login.session.id), 0)
@@ -396,6 +413,8 @@ pub fn allow_guests_ws_admits_a_dead_session_unbound_test() {
     log_capture.has(logs, level: "debug", containing: [
       "a guest", "invalid session",
     ])
+  let assert False =
+    log_capture.has(logs, level: "warning", containing: ["no longer valid"])
 }
 
 pub fn allow_guests_ws_admits_a_session_without_a_user_unbound_test() {
@@ -406,6 +425,8 @@ pub fn allow_guests_ws_admits_a_session_without_a_user_unbound_test() {
   let req = cookie_request("GET", "/ws", config.cookie_name, anon.id)
   should.equal(auth_fn(req), Ok(Nil))
   should.equal(session.bound_process_count(store, anon.id), 0)
+  // Admitting a guest binds nothing, so its recheck is a guest again.
+  should.equal(auth_fn(req), Ok(Nil))
 }
 
 pub fn allow_guests_ws_binds_a_signed_in_session_test() {
@@ -416,11 +437,75 @@ pub fn allow_guests_ws_binds_a_signed_in_session_test() {
   let req = cookie_request("GET", "/ws", config.cookie_name, login.session.id)
   should.equal(auth_fn(req), Ok(Nil))
   should.equal(session.bound_process_count(store, login.session.id), 1)
-  // Logout revokes the bound socket, as with protect_ws; the same request
-  // then connects as a guest.
+  // Logout revokes the bound socket, as with protect_ws.
   session.delete(store, login.session.id)
   let assert Ok(#(_, "deleted")) = receive_revoked(1000)
+  // The bound socket's recheck refuses, so it closes with 4401 instead of
+  // carrying on as a guest.
+  let #(outcome, logs) = log_capture.capture(fn() { auth_fn(req) })
+  should.equal(outcome, Error("invalid session"))
+  let assert True =
+    log_capture.has(logs, level: "warning", containing: [
+      "WS auth rejected", "no longer valid", "invalid session",
+    ])
+  // The reloaded page opens a new socket: that one is a guest.
+  should.equal(auth_in_new_process(auth_fn, req), Ok(Nil))
+}
+
+pub fn allow_guests_ws_refuses_a_bound_socket_whose_session_expired_test() {
+  let config = auth.dev_session_config()
+  let #(store, clock) = short_idle_store("sec_guests_ws_expired")
+  let assert Ok(sess) = auth.login(store, "alice")
+  let auth_fn = auth.allow_guests_ws(store, config)
+  let req = cookie_request("GET", "/ws", config.cookie_name, sess.id)
   should.equal(auth_fn(req), Ok(Nil))
+  should.be_true(session.is_current_process_bound(store, sess.id))
+  // No sweep runs, so no revocation is sent: only the recheck sees expiry.
+  advance(clock, 40)
+  let #(outcome, logs) = log_capture.capture(fn() { auth_fn(req) })
+  should.equal(outcome, Error("invalid session"))
+  let assert True =
+    log_capture.has(logs, level: "warning", containing: ["no longer valid"])
+  should.equal(auth_in_new_process(auth_fn, req), Ok(Nil))
+}
+
+pub fn allow_guests_ws_refuses_a_bound_socket_whose_user_was_removed_test() {
+  let store = session.new_store("sec_guests_ws_user_removed")
+  let config = auth.dev_session_config()
+  let assert Ok(login) = auth.create_login(store, "alice")
+  let auth_fn = auth.allow_guests_ws(store, config)
+  let req = cookie_request("GET", "/ws", config.cookie_name, login.session.id)
+  should.equal(auth_fn(req), Ok(Nil))
+  // Removing the user changes the data but sends no revocation.
+  let assert Ok(_) =
+    session.update(store, login.session.id, dict.delete(_, "user_id"))
+  let #(outcome, logs) = log_capture.capture(fn() { auth_fn(req) })
+  let assert Error(reason) = outcome
+  let assert True =
+    log_capture.has(logs, level: "warning", containing: [
+      "no longer valid", reason,
+    ])
+  // The session itself lives on, so a new socket is a guest on it.
+  should.equal(auth_in_new_process(auth_fn, req), Ok(Nil))
+}
+
+pub fn is_current_process_bound_matches_binding_test() {
+  let store = session.new_store("sec_is_bound")
+  let other_store = session.new_store("sec_is_bound_other")
+  let sess = session.create(store)
+  let other = session.create(store)
+  session.ensure_registry()
+  should.be_false(session.is_current_process_bound(store, sess.id))
+  session.bind_current_process(store, sess.id)
+  should.be_true(session.is_current_process_bound(store, sess.id))
+  // Bound to that session in that store only, and only in this process.
+  should.be_false(session.is_current_process_bound(store, other.id))
+  should.be_false(session.is_current_process_bound(other_store, sess.id))
+  let answer = process.new_subject()
+  process.spawn(fn() {
+    process.send(answer, session.is_current_process_bound(store, sess.id))
+  })
+  let assert Ok(False) = process.receive(answer, 1000)
 }
 
 // --- Request helpers / secrets ---
@@ -517,27 +602,37 @@ fn spawn_bound_watcher(
   #(ready, result)
 }
 
+/// Runs the auth function in a fresh process, as a new socket would.
+fn auth_in_new_process(
+  auth_fn: fn(Request(Connection)) -> Result(Nil, String),
+  req: Request(Connection),
+) -> Result(Nil, String) {
+  let answer = process.new_subject()
+  process.spawn(fn() { process.send(answer, auth_fn(req)) })
+  let assert Ok(outcome) = process.receive(answer, 1000)
+    as "the auth process answers"
+  outcome
+}
+
 /// Inclusive integer sequence.
 fn seq(from: Int, to: Int) -> List(Int) {
   int.range(from: to, to: from - 1, with: [], run: fn(acc, i) { [i, ..acc] })
 }
 
-fn monotonic_ms() -> Int {
-  monotonic_time(Millisecond)
-}
+/// A manual wall clock (see brazier_session_clock_test_ffi).
+type ManualClock
 
-type MillisecondUnit {
-  Millisecond
-}
+@external(erlang, "brazier_session_clock_test_ffi", "new")
+fn new_clock(start_ms: Int) -> ManualClock
 
-@external(erlang, "erlang", "monotonic_time")
-fn monotonic_time(unit: MillisecondUnit) -> Int
+@external(erlang, "brazier_session_clock_test_ffi", "now")
+fn clock_now(clock: ManualClock) -> Int
+
+@external(erlang, "brazier_session_clock_test_ffi", "advance")
+fn advance(clock: ManualClock, ms: Int) -> Nil
 
 @external(erlang, "brazier_ws_test_ffi", "receive_revoked")
 fn receive_revoked(timeout_ms: Int) -> Result(#(String, String), Nil)
-
-@external(erlang, "brazier_ws_test_ffi", "sleep_ms")
-fn sleep_ms(ms: Int) -> Nil
 
 @external(erlang, "brazier_ws_test_ffi", "run_parallel")
 fn run_parallel(n: Int, f: fn(Int) -> a) -> List(a)

@@ -395,7 +395,7 @@ fn build(
   handler: fn(Socket) -> Nil,
 ) -> Result(#(ConnsName, static_supervisor.Builder), String) {
   use Nil <- result_try(validate_options(options))
-  use trusted <- result_try(ip.parse_trusted_proxies(options.trusted_proxies))
+  use trusted <- result_try(ip.parse_proxy_networks(options.trusted_proxies))
   let name = ffi_conns_new_name()
   let conns =
     supervision.worker(fn() {
@@ -499,7 +499,7 @@ fn ffi_conns_start_link(
   handler: fn(Socket) -> Nil,
   max_connections: Int,
   max_connections_per_ip: Int,
-  trusted: ip.TrustedProxies,
+  trusted: ip.ProxyNetworks,
   drain_timeout_ms: Int,
 ) -> Result(actor.Started(ConnsName), actor.StartError)
 

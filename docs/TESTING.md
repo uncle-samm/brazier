@@ -422,7 +422,6 @@ These are the waits that remain, and why.
 | Where | Wait | Why it stays |
 |-------|------|--------------|
 | `ws_protocol_test` idle timeout | 4 × `process.sleep(550)` | Wall-clock time must pass the idle timeout while only heartbeats arrive. |
-| `ws_protocol_test` idle session | `process.sleep(80)` | The session idle TTL is wall-clock time, and the store has no clock to advance. |
 | `brazier/stress` | `hold_duration_ms` | Holding connections open is the load being measured (0 in tests). |
 | `brazier/sim` pool | `stagger_ms` | Connection pacing is part of the scenario. |
 | CDP pong pause | see [Waiting](#waiting) | The stillness is under test. |

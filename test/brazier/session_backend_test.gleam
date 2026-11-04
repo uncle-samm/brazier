@@ -132,8 +132,18 @@ pub fn failed_delete_still_revokes_test() {
   let s = session.create(store)
   let _pid = bind(store, s.id)
   set_failing(node.self(), name, True)
-  let assert Error(SessionBackendFailed(_)) = session.try_delete(store, s.id)
+  let #(outcome, lines) =
+    log_capture.capture(fn() { session.try_delete(store, s.id) })
+  let assert Error(SessionBackendFailed(_)) = outcome
   set_failing(node.self(), name, False)
+  // Regression (TS-8): the delete's own error line dropped the reason.
+  assert log_capture.contains(
+    lines,
+    "error",
+    "Session delete failed in external "
+      <> name
+      <> ": session backend failed: injected failure",
+  )
   // The socket is told to close; the row survives for a retried logout.
   assert revoked(s.id, "deleted")
   assert session.count(store) == 1

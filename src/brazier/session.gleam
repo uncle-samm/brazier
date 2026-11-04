@@ -152,6 +152,8 @@ pub opaque type SessionStore {
     /// Live-connection registry namespace (the same on every node).
     namespace: String,
     config: StoreConfig,
+    /// The wall clock, in milliseconds. `system_now_ms` outside tests.
+    clock: fn() -> Int,
   )
 }
 
@@ -251,6 +253,19 @@ pub fn start_store(
   backend: SessionBackend,
   config: StoreConfig,
 ) -> Result(SessionStore, SessionStoreError) {
+  start_store_with_clock(backend, config, system_now_ms)
+}
+
+/// `start_store` with an injected wall clock (milliseconds), read for every
+/// lifetime decision: creation, touch, liveness checks and sweeps. Tests use
+/// it to move time forward instead of sleeping. The clock is called from
+/// any process that uses the store, the sweeper included.
+@internal
+pub fn start_store_with_clock(
+  backend: SessionBackend,
+  config: StoreConfig,
+  clock: fn() -> Int,
+) -> Result(SessionStore, SessionStoreError) {
   use Nil <- result.try(validate_config(config))
   use store <- result.try(case backend {
     LocalEts(name) -> {
@@ -262,6 +277,7 @@ pub fn start_store(
         name: table_name,
         namespace: table_name,
         config: config,
+        clock: clock,
       ))
     }
     External(ext) -> {
@@ -271,6 +287,7 @@ pub fn start_store(
         name: "external " <> ext.name,
         namespace: "external:" <> ext.name,
         config: config,
+        clock: clock,
       ))
     }
   })
@@ -382,7 +399,7 @@ fn create_row(
 ) -> Result(Session, SessionStoreError) {
   let id = generate_id()
   let session = Session(id: id, data: data)
-  let now = now_ms()
+  let now = store.clock()
   let row =
     StoredSession(
       session: session,
@@ -433,7 +450,7 @@ pub fn fetch(
   use row <- result.try(lookup_live(store, id))
   // touch never recreates a row deleted concurrently; False means the
   // session vanished between lookup and touch.
-  use touched <- result.try(backend_touch(store, id, now_ms()))
+  use touched <- result.try(backend_touch(store, id, store.clock()))
   case touched {
     True -> Ok(row.session)
     False -> {
@@ -458,7 +475,7 @@ fn lookup_live(
       Error(SessionNotFound)
     }
     Some(row) ->
-      case liveness(store, now_ms(), row) {
+      case liveness(store, store.clock(), row) {
         Live -> Ok(row)
         Ended(reason) -> {
           use Nil <- result.try(expire_row(store, id, row.version, reason))
@@ -598,7 +615,7 @@ fn update_loop(
       ..current,
       session: updated,
       version: current.version + 1,
-      last_seen_ms: now_ms(),
+      last_seen_ms: store.clock(),
     )
   use swapped <- result.try(backend_replace(store, row, current.version))
   case swapped {
@@ -649,11 +666,13 @@ pub fn try_delete(
       log.info(module_name, "Deleted session in " <> store.name)
       telemetry.session_event(telemetry.Revoked, "deleted")
     }
-    Error(_) ->
+    Error(err) ->
       log.error(
         module_name,
         "Session delete failed in "
           <> store.name
+          <> ": "
+          <> store_error_to_string(err)
           <> "; closing its live connections anyway",
       )
   }
@@ -739,7 +758,7 @@ fn sweep_batches(
   store: SessionStore,
   removed_so_far: Int,
 ) -> Result(Int, SessionStoreError) {
-  let now = now_ms()
+  let now = store.clock()
   use expired <- result.try(backend_expired(
     store,
     now - store.config.absolute_ttl_ms,
@@ -819,6 +838,9 @@ fn or_crash(
           <> "; crashing the caller (use the try_ variant to handle it)",
       )
   }
+  // Deliberate crash, not an assumed invariant: these operations have no
+  // error channel, so a failed backend must stop the caller rather than
+  // hand it a default. The failure was logged above with its reason.
   let assert Ok(value) = outcome
     as "session backend failed in an operation with no error channel"
   value
@@ -881,6 +903,17 @@ pub fn registry_supervised() -> supervision.ChildSpecification(Nil) {
 /// Whether the registry scope is running on this node.
 pub fn registry_running() -> Bool {
   ffi_registry_running()
+}
+
+/// Whether the calling process is bound to the session (by
+/// `bind_current_process`). A WebSocket re-check uses it to tell a socket
+/// that signed in from one that never did: once bound, the session going
+/// away must close the socket, never turn it into a guest.
+pub fn is_current_process_bound(
+  store: SessionStore,
+  session_id: String,
+) -> Bool {
+  is_bound(store.namespace, session_id, process.self())
 }
 
 /// Bind the calling process (a WebSocket handler) to a session.
@@ -1196,7 +1229,7 @@ fn session_ets_new(name: String) -> SessionTable
 fn table_name(table: SessionTable) -> String
 
 @external(erlang, "brazier_session_ffi", "now_ms")
-fn now_ms() -> Int
+fn system_now_ms() -> Int
 
 @external(erlang, "brazier_session_ffi", "session_ets_insert_new")
 fn session_ets_insert_new(
@@ -1265,6 +1298,9 @@ fn ffi_registry_running() -> Bool
 
 @external(erlang, "brazier_session_ffi", "bind_process")
 fn bind_process(namespace: String, session_id: String, pid: Pid) -> Int
+
+@external(erlang, "brazier_session_binding_ffi", "is_bound")
+fn is_bound(namespace: String, session_id: String, pid: Pid) -> Bool
 
 @external(erlang, "brazier_session_ffi", "bound_process_count")
 fn ffi_bound_process_count(namespace: String, session_id: String) -> Int
