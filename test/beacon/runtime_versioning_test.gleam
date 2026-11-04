@@ -762,10 +762,11 @@ pub fn client_replay_of_server_frames_matches_final_sync_test() {
 /// backoff, heartbeats, outbound pacing, server errors, revision handling,
 /// event delegation with prevent-default, stop-propagation, debounce and
 /// throttle, decoder failures, submit form data, pre-hydration replay,
-/// `simple` prediction, the focused-input lock, autofocus and server navigation)
-/// driven by a fake socket, clock and DOM. The harness exits non-zero on any failed
-/// scenario.
+/// `simple` prediction, the focused-input lock, autofocus, server navigation,
+/// the join's build id, 4409 behind the reload guard, the outbound test hook
+/// and the dev `reload` message) driven by a fake socket, clock and DOM. The
+/// harness exits non-zero on any failed scenario.
 pub fn client_runtime_behaviour_harness_test() {
   let assert Ok(output) = run_node("beacon_client/test/ffi_harness.mjs", "")
-  let assert True = string.contains(output, "ffi harness ok: 33 scenarios")
+  let assert True = string.contains(output, "ffi harness ok: 38 scenarios")
 }
