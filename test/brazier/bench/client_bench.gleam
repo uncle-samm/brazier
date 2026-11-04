@@ -46,9 +46,10 @@ const inputs = "build/inputs"
 
 const patch_module = "brazier_client/src/brazier_client/patch.mjs"
 
-/// Each size: #(rows, warm-up calls, timed calls).
+/// Each size: #(rows, warm-up calls, timed calls). The 1000-row size
+/// times 1000 calls so its p99 is the tenth slowest, not the fourth.
 fn sizes() -> List(#(Int, Int, Int)) {
-  [#(100, 500, 2000), #(1000, 100, 400)]
+  [#(100, 500, 2000), #(1000, 100, 1000)]
 }
 
 /// The built fixture, ready for `run`.

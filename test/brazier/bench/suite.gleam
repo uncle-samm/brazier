@@ -660,7 +660,9 @@ const crdt_append_sizes = [10, 1000, 10_000]
 
 const crdt_append_warmup_blocks = 5
 
-const crdt_append_blocks = 50
+/// The p99 of 50 blocks was the worst block but one, which a single
+/// scheduling hiccup moved by 60%; at 500 it is the fifth worst.
+const crdt_append_blocks = 500
 
 fn crdt_append_scenario() -> Result(List(Metric), String) {
   let replica = crdt.Replica(node: "bench@host", incarnation: 1)

@@ -642,6 +642,18 @@
       - 6 atoms leak per suite run;
       - `ws.100x200` still runs only 5 rounds.
 - [ ] Final verification: build (zero warnings), tests, all examples, CDP browser suite, perf baselines
+  - 2026-11-04, on 89f1051. Green so far:
+    - clean build with zero warnings, format and lint clean, 1932 tests passing in each of 3 runs, `make test-flake` 5 of 5;
+    - docs check (73 sample modules) and test-client (58 scenarios, 9 patch-safety checks, 2450/550 apply equivalence);
+    - no `todo` or `panic` outside string literals in the lint and codegen;
+    - all 24 examples build with zero warnings;
+    - CDP: 625 of 625 on desktop and 634 of 634 on mobile.
+  - The first CDP run failed 11 examples at server start, with `beacon.simple` "called but it did not exist". The cause was gitignored build output from before the rename: each example's `build/dev/erlang/beacon_<app>/ebin/` still held an old `<app>.beam`, which shadowed the new one on the code path. The coordinator deleted the 72 stale `beacon*` build dirs. A fresh clone never has them, so no repo change.
+  - Perf baseline not taken yet. `make bench-baseline` refused twice, correctly, because one run in five made some p99s spread past 50%:
+    - Run 1: `store.crdt_append.10.p99` was a p99 of only 50 blocks (in effect the second-worst block), and `client.render.rows_1000.p99` of only 400 calls. The coordinator raised these to 500 blocks and 1000 calls.
+    - Run 2: both now hold. Instead, five other p99s spread by 50–190% (`runtime.unchanged`, `runtime.list_50kb.changed`, `http.static.100kb.200`, `presence.list.10`, `presence.track.10000`). Those scenarios already take 1000–2000 samples a round.
+    - The machine was in interactive use: FL Studio and coreaudiod were running, with a load average of about 5 before the bench and 9–11 during it.
+  - Decision: no baseline from a busy machine, and no wider tolerance to make one pass. The baseline is retried when the load average is low. Merging into main waits for that baseline and a passing `make bench-check` against it.
 
 **Decisions (Milestone 117, coordinator):**
 - 2026-11-03, WS10b runs as two agents with disjoint files, started together after WS9 merged.
