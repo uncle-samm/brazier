@@ -312,6 +312,23 @@
       - a render bench scenario (for the PERF-9 owner);
       - constant tag names are re-checked on every render;
       - CDP on an idle machine, during final verification.
+  - [x] fix-static-tooling (PERF-3/SEC-15, PERF-10, PERF-13, TS-4 HTTP part, TS-5, TS-6, TS-7, TS-13, stale-name lint), merged as 1af7b17.
+    - PERF-3/SEC-15: static ETag digests are cached in ETS against the file's size, mtime, ctime, inode and device. An entry recorded less than 2 s after the file's last change is not trusted (git's racy-clean rule, racy-git.txt). The cache holds at most 2048 entries. A missing table fails the request with `cache_unavailable`; there is no uncached fallback.
+    - PERF-13: responses go to `gen_tcp:send` as iodata. PERF-10: `log` checks `logger:allow/2` before building a message, as OTP's `?LOG_*` macros do.
+    - TS-7: the rate limiter returns `LimiterError` (`LimiterNotRunning`, `LimiterTimeout`, `LimiterCallFailed`) instead of `Error(Nil)`. This breaks `reset`, `key_count` and `sweep`.
+    - TS-4 (HTTP part): the rate-limit sweep uses an injected clock (`sweep_with`), and the slow-header test sends a byte each time a receive times out. TESTING.md has an "Instead of a sleep" table.
+    - TS-13: the lint walks every glance expression variant with no catch-all, so a `todo`, `panic` or `let _ =` in a `use` callback, guard, capture or similar is now seen. A new `stale-name` rule flags the old project name in `src`, `test` and `examples`.
+    - TS-5: `test_all_cdp.py` raises `CdpError` on a failed `*.enable`, viewport, cache or init-script call. `evaluation_value` raises on a thrown script or a non-JSON result instead of returning sentinel strings.
+    - TS-6: `sim_memory_leak_test` asserts that a second round of 100 connect/disconnect cycles keeps no process, ETS table, ETS object or atom. A byte bound was measured and rejected: heap and ETS sizes move with GC and bucket history.
+    - Coordinator verify on the merge of c67000c into the branch (d391a93): clean build with zero warnings, format and lint (including `stale-name`) clean, 1591 tests passing in each of 3 runs, docs check OK, `py_compile` of `test_all_cdp.py` OK.
+    - Decisions:
+      - the one CDP error a wait still retries is a navigation replacing the page's context (`CdpContextGone`, matched on Chrome's messages). The match is unverified until the CDP run in final verification;
+      - the agent made small edits to TIGERSTYLE.md (linter description, sim leak rules), which it does not own; accepted.
+    - Follow-ups:
+      - `brazier_asset_cache_ffi.erl` trusts possibly stale entries the way the old digest cache did;
+      - CHANGELOG WS10b bullets still use old names (`__beaconOutboundPendingForTest`, `beacon_http_conns`, `data-beacon-auto`), and the lint does not scan CHANGELOG;
+      - `stop_server` in `test_all_cdp.py` only logs when the page doesn't reach `about:blank`;
+      - a lint rule requiring an `as` message on every `let assert` (TS-12, for the wave-4 sweep).
 - [ ] Final verification: build (zero warnings), tests, all examples, CDP browser suite, perf baselines
 
 **Decisions (Milestone 117, coordinator):**
