@@ -11,6 +11,7 @@ import beacon/error
 import beacon/ip
 import beacon/log
 import beacon/middleware
+import beacon/pubsub
 import beacon/ssr
 import beacon/static
 import beacon/telemetry
@@ -1599,6 +1600,13 @@ fn handle_socket_event(state: ConnectionState, event: ws.SocketEvent) -> Next {
         "server draining",
       )
     }
+    ws.DevReload -> {
+      log.info(
+        "beacon.transport",
+        "Dev rebuild: telling the page of " <> ctx(state) <> " to reload",
+      )
+      send_or_stop(state, ServerReload)
+    }
     ws.UnexpectedMessage(description) -> {
       log.error(
         "beacon.transport",
@@ -1828,6 +1836,55 @@ fn ws_loop_inner(
   }
 }
 
+/// Under `beacon/dev`, subscribe this handler to the dev reload topic, so a
+/// rebuild reaches the page as a `reload` message (`ws.DevReload`). Outside
+/// dev mode nothing subscribes. The subscription ends when the handler
+/// process exits: PubSub is linked to its subscribers.
+///
+/// A subscription that fails means PubSub is down or refused it, and the
+/// page would silently miss every reload, so the connection closes with
+/// 1011 instead and the client reconnects with backoff.
+fn subscribe_dev_reload(state: ConnectionState) -> Next {
+  case dev_live_reload_enabled() {
+    False -> Continue(state)
+    True -> {
+      let topic = dev_live_reload_topic()
+      case pubsub.try_subscribe(topic) {
+        Ok(Nil) -> {
+          log.debug(
+            "beacon.transport",
+            ctx(state) <> " listens for dev reloads on " <> topic,
+          )
+          Continue(state)
+        }
+        Error(reason) -> {
+          log.error(
+            "beacon.transport",
+            "Cannot subscribe "
+              <> ctx(state)
+              <> " to dev reloads on "
+              <> topic
+              <> ", closing with 1011: "
+              <> string.inspect(reason),
+          )
+          Stop(
+            state,
+            SendClose(ws.close_internal_error, "internal error"),
+            "dev reload subscription failed",
+          )
+        }
+      }
+    }
+  }
+}
+
+/// True only in a VM where `beacon/dev` started the app.
+@external(erlang, "beacon_dev_ffi", "live_reload_enabled")
+fn dev_live_reload_enabled() -> Bool
+
+@external(erlang, "beacon_dev_ffi", "live_reload_topic")
+fn dev_live_reload_topic() -> String
+
 /// Identity of an admitted connection, carried from admission to startup.
 type Admission {
   Admission(conn_id: ConnectionId, peer_ip: String)
@@ -1916,11 +1973,16 @@ fn start_ws_connection(
           bytes_out: 0,
         )
 
-      // Start receiving TCP data
-      server.set_active_once(socket)
-
-      // Enter the receive loop — returns after close and cleanup
-      ws_loop(state, subject)
+      case subscribe_dev_reload(state) {
+        Continue(state) -> {
+          // Start receiving TCP data
+          server.set_active_once(socket)
+          // Enter the receive loop — returns after close and cleanup
+          ws_loop(state, subject)
+        }
+        Stop(state: final_state, action: action, reason: reason) ->
+          stop_connection(final_state, action, reason)
+      }
     }
     Error(startup_error) -> {
       let #(close_code, close_reason, close_label) =

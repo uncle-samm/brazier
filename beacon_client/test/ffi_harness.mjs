@@ -1357,6 +1357,19 @@ scenario("server navigation pushes or replaces local paths and flushes pending i
   assert.equal(window.location.href, "/login");
 });
 
+scenario("a dev reload message reloads the page every time, outside the reload guard", async () => {
+  const storage = new FakeStorage();
+  for (let i = 0; i < 5; i++) {
+    await loadRuntime({ storage });
+    const s = sockets[0];
+    s.open();
+    sync(s, 0, {});
+    s.deliver({ type: "reload" });
+    assert.equal(reloads, 1, `rebuild ${i + 1} reloads`);
+  }
+  assert.equal(storage.getItem("beacon:reloads"), null, "a dev reload is not counted by the guard");
+});
+
 let failures = 0;
 for (const { name, fn } of scenarios) {
   try {

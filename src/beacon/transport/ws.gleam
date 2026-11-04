@@ -537,6 +537,9 @@ pub type SocketEvent {
   /// The listener is stopping: its connection owner asked this connection
   /// to drain. The handler closes with 1001 (going away).
   ServerDraining
+  /// `beacon/dev` rebuilt the app: the handler tells the page to reload.
+  /// Only a handler that subscribed to the dev reload topic receives it.
+  DevReload
   /// Anything else — a framework bug; the handler closes with 1011.
   UnexpectedMessage(description: String)
 }

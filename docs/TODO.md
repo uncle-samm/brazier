@@ -17,16 +17,6 @@
 Found while making the docs match the code (Milestone 117, WS10a, 2026-11-03).
 The docs describe the current behaviour; each item is a code change.
 
-- **Issue:** dev-mode browser reload never reaches a browser.
-  - **Context:** `dev.gleam:151` calls `notify_browser_reload`, which sends to
-    the local subscribers of `beacon:reload` (`beacon_dev_ffi.erl:155`).
-    Nothing subscribes to that topic, and `transport.ServerReload`
-    (`transport.gleam:106`, handled at `:642`) is never constructed.
-  - **Files:** `src/beacon/dev.gleam`, `src/beacon_dev_ffi.erl`, `src/beacon/transport.gleam`
-- **Issue:** the dev watcher falls back to polling every 500 ms when neither
-  `fswatch` nor `inotifywait` is installed (`dev.gleam:104-107`), against the
-  no-fallbacks rule.
-  - **Files:** `src/beacon/dev.gleam`
 - **Issue:** `store.StoreError` aliases `state_manager.EtsError`
   (`store.gleam:44`), and `state_manager` is an internal module, so an app
   cannot match or describe the error without importing it.

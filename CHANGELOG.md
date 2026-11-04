@@ -188,6 +188,10 @@ with its own changelog, so they are not listed here.
 - (WS10b) `/health` answered every method. Methods other than GET and HEAD
   get 405 with `allow: GET, HEAD`, and the answer is `cache-control:
   no-store`.
+- (WS10b) Dev mode's browser reload never reached a browser: nothing
+  subscribed to its topic. Under `beacon/dev` every WebSocket handler now
+  subscribes to `beacon:dev:reload`, and each rebuild sends every open page a
+  `reload`. A handler that cannot subscribe closes 1011.
 
 ### Removed
 
@@ -208,6 +212,9 @@ with its own changelog, so they are not listed here.
 - (WS10b) The per-upgrade check of the security limits, which the listener
   already validates when it starts, and with it the `invalid_limits`
   WebSocket upgrade outcome.
+- (WS10b) Dev mode's polling watcher. Without `fswatch` (macOS) or
+  `inotifywait` (Linux) dev mode now exits with status 1 and names the package
+  to install.
 
 ### Security
 

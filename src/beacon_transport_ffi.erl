@@ -829,6 +829,13 @@ ws_classify_message({beacon_http_drain, _} = Msg) ->
         false ->
             {unexpected_message, list_to_binary(io_lib:format("~0P", [Msg, 8]))}
     end;
+%% The rebuild broadcast of beacon/dev, on the topic its handlers subscribe
+%% to when live reload is on (beacon_dev_ffi:notify_browser_reload/0).
+ws_classify_message({beacon_pubsub, Topic, beacon_dev_reload} = Msg) ->
+    case Topic =:= beacon_dev_ffi:live_reload_topic() of
+        true -> dev_reload;
+        false -> {unexpected_message, list_to_binary(io_lib:format("~0P", [Msg, 8]))}
+    end;
 ws_classify_message(Other) ->
     {unexpected_message, list_to_binary(io_lib:format("~0P", [Other, 8]))}.
 

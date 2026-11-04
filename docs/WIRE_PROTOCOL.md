@@ -141,7 +141,12 @@ this triggers a real HTTP request — use when the browser needs to receive HTTP
 {"type": "hard_navigate", "path": "/api/auth/session/TOKEN"}
 ```
 
-**reload** -- Dev mode: tells the browser to reload. See `beacon/dev`.
+**reload** -- Dev mode only: the app was rebuilt, reload the page. Under
+`gleam run -m beacon/dev` every WebSocket handler subscribes to the PubSub
+topic `beacon:dev:reload`, and each successful rebuild broadcasts on it, so
+every open page gets one `reload`. The server keeps the socket open; the
+page's reload closes it. Outside dev mode no handler subscribes and the
+server never sends it.
 ```json
 {"type": "reload"}
 ```

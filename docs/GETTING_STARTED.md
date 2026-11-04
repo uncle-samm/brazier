@@ -961,12 +961,11 @@ Dev mode is the only place Beacon builds automatically:
 - It runs the build, then starts the app module's `main`. If the first build
   fails, dev mode exits with status 1.
 - It watches `src/` for `.gleam` changes with `fswatch` (macOS) or
-  `inotifywait` (Linux), or polls every 500ms when neither is installed.
+  `inotifywait` (Linux, from inotify-tools). When that program is not
+  installed, dev mode exits with status 1 and names the package to install.
 - On each change it rebuilds and hot-loads the changed BEAM modules into the
-  running app without restarting it.
+  running app without restarting it, then tells every open page to reload.
 - A failed rebuild is logged and the app keeps running the last good build.
-- Connected browsers are not reloaded automatically yet; refresh the page to
-  pick up client-side changes.
 
 ## Server Privacy
 

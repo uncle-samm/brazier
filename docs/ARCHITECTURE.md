@@ -340,7 +340,7 @@ drain under one node-local `global:trans` lock, so an app is stopped once.
 | Module | Contents |
 |---|---|
 | `build`, `build/*` | The build pipeline above |
-| `dev` | Build, run, rebuild and hot-reload on change |
+| `dev` | Build, run, rebuild and hot-reload on change (with `fswatch` or `inotifywait`, required), then tell every open page to reload |
 | `lint` | Glance-based linter for the engineering principles (`gleam run -m beacon/lint`) |
 
 ## Dependencies

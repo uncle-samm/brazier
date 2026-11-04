@@ -1,73 +1,22 @@
 -module(beacon_dev_ffi).
--export([sleep/1, check_for_changes/1, record_file_timestamps/1,
-         find_gleam_files/1, reload_modules/1, start_app/1,
+-export([reload_modules/1, start_app/1,
          start_native_watcher/1, poll_native_watcher/0,
-         native_watcher_available/0, notify_browser_reload/0]).
+         watcher_requirement/0, find_executable/1,
+         enable_live_reload/0, live_reload_enabled/0, live_reload_topic/0,
+         notify_browser_reload/0]).
 
 %% Paths arrive as UTF-8 binaries and are converted with the unicode module,
 %% never binary_to_list/list_to_binary, so a non-ASCII project path works.
 
-%% Process-dictionary keys of the dev process.
--define(TIMESTAMP_KEY, beacon_dev_timestamps).
+%% Process-dictionary key of the dev process.
 -define(WATCHER_KEY, beacon_native_watcher_port).
 
-sleep(Ms) ->
-    timer:sleep(Ms),
-    nil.
-
-%% Record the modification time of every .gleam file below Dirs, as the
-%% baseline for check_for_changes/1.
-record_file_timestamps(Dirs) ->
-    erlang:put(?TIMESTAMP_KEY, timestamps(Dirs)),
-    nil.
-
-%% True when a .gleam file below Dirs was added, removed or modified since the
-%% last call (or since record_file_timestamps/1).
-check_for_changes(Dirs) ->
-    Old = case erlang:get(?TIMESTAMP_KEY) of
-        undefined -> [];
-        T -> T
-    end,
-    New = timestamps(Dirs),
-    erlang:put(?TIMESTAMP_KEY, New),
-    Old =/= New.
-
-timestamps(Dirs) ->
-    Files = lists:flatmap(fun find_gleam_files/1, Dirs),
-    [{F, mtime(F)} || F <- Files].
-
-%% A file that vanished between listing and stat records its error, which
-%% differs from any earlier timestamp, so the change is still detected.
-mtime(File) ->
-    case file:read_file_info(File, [{time, posix}]) of
-        {ok, Info} -> element(6, Info);
-        {error, Reason} -> {error, Reason}
-    end.
-
-%% Every .gleam file below Dir, recursively. A Dir that does not exist has
-%% none; a directory that exists but cannot be listed crashes the caller.
-find_gleam_files(Dir) ->
-    DirStr = unicode:characters_to_list(Dir),
-    case filelib:is_dir(DirStr) of
-        true ->
-            {ok, Entries} = file:list_dir(DirStr),
-            lists:flatmap(
-                fun(Entry) ->
-                    Path = filename:join(DirStr, Entry),
-                    case filelib:is_dir(Path) of
-                        true -> find_gleam_files(unicode:characters_to_binary(Path));
-                        false ->
-                            case filename:extension(Entry) of
-                                ".gleam" -> [unicode:characters_to_binary(Path)];
-                                _ -> []
-                            end
-                    end
-                end,
-                lists:sort(Entries)
-            );
-        false ->
-            []
-    end.
+%% The PubSub topic WebSocket handlers subscribe to in dev mode, and the
+%% message a rebuild broadcasts on it. beacon_transport_ffi:ws_classify_message/1
+%% turns {beacon_pubsub, ?RELOAD_TOPIC, ?RELOAD_MESSAGE} into dev_reload.
+-define(RELOAD_TOPIC, <<"beacon:dev:reload">>).
+-define(RELOAD_MESSAGE, beacon_dev_reload).
+-define(LIVE_RELOAD_KEY, {beacon_dev, live_reload}).
 
 %% Load every module in Ebin whose compiled code differs from the loaded
 %% version, or that is not loaded yet. Any module that cannot be reloaded
@@ -151,22 +100,41 @@ start_app(ModuleName) ->
             {error, format("Cannot load the app module ~p: ~p", [Module, Reason])}
     end.
 
-%% Notify connected browsers to reload via PubSub.
+%% Turn live reload on for this VM: every WebSocket connection opened from
+%% now on subscribes to the reload topic. Called once by beacon/dev before it
+%% starts the app; nothing turns it off, because dev mode runs until the VM
+%% stops. A persistent_term is read without copying on every connection and
+%% written once.
+enable_live_reload() ->
+    persistent_term:put(?LIVE_RELOAD_KEY, true),
+    nil.
+
+%% True only in a VM where beacon/dev called enable_live_reload/0. Outside dev
+%% mode the key is absent, which is the normal production state, not an
+%% error.
+live_reload_enabled() ->
+    persistent_term:get(?LIVE_RELOAD_KEY, false).
+
+live_reload_topic() ->
+    ?RELOAD_TOPIC.
+
+%% Tell every WebSocket connection on this node to reload its page. Returns
+%% the number of connections subscribed when the broadcast was sent.
 notify_browser_reload() ->
-    case beacon_pubsub_ffi:local_subscribers(<<"beacon:reload">>) of
-        {ok, Pids} ->
-            [Pid ! {beacon_reload} || Pid <- Pids],
-            {ok, nil};
-        {error, Reason} ->
-            beacon_log_ffi:warning(<<"beacon.dev">>, "notify_browser_reload failed: ~p", [Reason]),
-            {error, format("~p", [Reason])}
+    Count = beacon_pubsub_ffi:local_subscriber_count(?RELOAD_TOPIC),
+    case beacon_pubsub_ffi:local_broadcast(?RELOAD_TOPIC, ?RELOAD_MESSAGE) of
+        {ok, nil} -> {ok, Count};
+        {error, Reason} -> {error, format("PubSub refused the reload broadcast: ~tp", [Reason])}
     end.
 
-%% True when fswatch (macOS) or inotifywait (Linux) is installed.
-native_watcher_available() ->
+%% The watcher program for this OS and the package that provides it, for the
+%% error dev mode exits with when the program is not installed.
+watcher_requirement() ->
     case watcher_command([]) of
-        {ok, Program, _Args} -> os:find_executable(Program) =/= false;
-        {unsupported, _} -> false
+        {ok, "fswatch", _} -> {ok, {<<"fswatch">>, <<"fswatch (brew install fswatch)">>}};
+        {ok, "inotifywait", _} -> {ok, {<<"inotifywait">>, <<"inotify-tools (apt install inotify-tools)">>}};
+        {unsupported, Os} -> {error, format("Dev mode watches files with fswatch on macOS or inotifywait on Linux; "
+                                            "there is no watcher for os:type() = ~p", [Os])}
     end.
 
 watcher_command(DirArgs) ->
@@ -179,6 +147,13 @@ watcher_command(DirArgs) ->
             {unsupported, Other}
     end.
 
+%% The path of Program on the PATH.
+find_executable(Program) ->
+    case os:find_executable(unicode:characters_to_list(Program)) of
+        false -> {error, nil};
+        Path -> {ok, unicode:characters_to_binary(Path)}
+    end.
+
 %% Start a watcher that reports the next change below Dirs and exits.
 start_native_watcher(Dirs) ->
     case watcher_command([unicode:characters_to_list(D) || D <- Dirs]) of
@@ -187,7 +162,7 @@ start_native_watcher(Dirs) ->
         {ok, Program, Args} ->
             case os:find_executable(Program) of
                 false ->
-                    {error, unicode:characters_to_binary(["Executable not found: ", Program])};
+                    {error, unicode:characters_to_binary([Program, " is not installed or not on the PATH"])};
                 Executable ->
                     try open_port({spawn_executable, Executable},
                                   [{args, Args}, stream, exit_status, binary]) of
