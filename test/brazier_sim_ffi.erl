@@ -5,7 +5,8 @@
     monotonic_us/0, snapshot_memory/0, snapshot_processes/0,
     snapshot_pids/0, count_new_processes/1, describe_new_processes/1,
     message_queue_len/1,
-    watch_teardown/1, await_teardown/3, handle_ws_close/4
+    watch_teardown/1, unwatch_teardown/1, await_teardown/3, handle_ws_close/4,
+    close_reporter/0, close_report_waiting/0
 ]).
 
 %% Create a new metrics ETS table. Returns table reference.
@@ -191,14 +192,17 @@ describe_process(Pid, Info) ->
 %% connection owner) are reported, so connections of other listeners in the
 %% same VM are never counted.
 
-%% Attach the watch. Returns {HandlerId, Tag}; reports arrive as
-%% {Tag, HandlerPid, LinkedPids}.
+%% Attach the watch. Returns {HandlerId, Tag, Alias}; reports arrive as
+%% {Tag, HandlerPid, LinkedPids}. The handler sends them to an alias of the
+%% caller (erlang:alias/0), so unwatch_teardown/1 can make sure none arrives
+%% after it (see test/brazier/monitored.gleam, listening).
 watch_teardown(ConnsPid) ->
     Tag = make_ref(),
+    Alias = erlang:alias(),
     Id = iolist_to_binary(io_lib:format("brazier-sim-teardown-~p", [Tag])),
     ok = telemetry:attach(Id, [brazier, ws, close], fun ?MODULE:handle_ws_close/4,
-                          #{test => self(), tag => Tag, conns => ConnsPid}),
-    {Id, Tag}.
+                          #{test => Alias, tag => Tag, conns => ConnsPid}),
+    {Id, Tag, Alias}.
 
 handle_ws_close(_Event, _Measurements, _Metadata, #{test := Test, tag := Tag, conns := Conns}) ->
     case erlang:process_info(self(), [parent, links]) of
@@ -210,20 +214,59 @@ handle_ws_close(_Event, _Measurements, _Metadata, #{test := Test, tag := Tag, co
             ok
     end.
 
+%% Remove the watch: detach its handler, deactivate the alias so a report
+%% from a handler call already under way is dropped by the runtime, and
+%% remove the reports still in the mailbox. Runs in the process that
+%% attached the watch, the only one allowed to unalias it. teardown.watching
+%% runs it however the body ends.
+unwatch_teardown({Id, Tag, Alias}) ->
+    ok = telemetry:detach(Id),
+    true = erlang:unalias(Alias),
+    flush_closes(Tag).
+
+flush_closes(Tag) ->
+    receive
+        {Tag, _Handler, _Linked} -> flush_closes(Tag)
+    after 0 -> nil
+    end.
+
+%% For teardown_test: the teardown watch handlers attached now, as a fun
+%% that calls them from a new child of the caller (a connection handler as
+%% the watch sees one when the caller is the watched connection owner) and
+%% returns, with how many it called, once the child has exited.
+close_reporter() ->
+    Handlers = [{F, C} || #{id := <<"brazier-sim-teardown-", _/binary>>, function := F,
+                            config := C} <- telemetry:list_handlers([brazier, ws, close])],
+    fun() ->
+        {Pid, Ref} = spawn_monitor(fun() ->
+            [ok = F([brazier, ws, close], #{}, #{}, C) || {F, C} <- Handlers]
+        end),
+        receive
+            {'DOWN', Ref, process, Pid, normal} -> length(Handlers)
+        end
+    end.
+
+%% For teardown_test: whether the caller's mailbox holds a close report.
+close_report_waiting() ->
+    {messages, Messages} = erlang:process_info(self(), messages),
+    lists:any(fun({Tag, Handler, Linked}) ->
+                      is_reference(Tag) andalso is_pid(Handler) andalso is_list(Linked);
+                 (_) ->
+                      false
+              end, Messages).
+
 %% Wait for N close reports, then for every reported process to exit, all
-%% within TimeoutMs. Detaches the watch either way. Returns {ok, nil} or
-%% {error, Description}.
-await_teardown({Id, Tag}, N, TimeoutMs) ->
+%% within TimeoutMs. Returns {ok, nil} or {error, Description}. The watch
+%% stays attached: unwatch_teardown/1 removes it.
+await_teardown({_Id, Tag, _Alias}, N, TimeoutMs) ->
     Deadline = erlang:monotonic_time(millisecond) + TimeoutMs,
-    Result = case collect_closes(Tag, N, Deadline, []) of
+    case collect_closes(Tag, N, Deadline, []) of
         {ok, Pids} -> await_exits(Pids, Deadline);
         {error, Got} ->
             {error, iolist_to_binary(io_lib:format(
                 "~b of ~b connections reported [brazier, ws, close] within ~b ms",
                 [Got, N, TimeoutMs]))}
-    end,
-    ok = telemetry:detach(Id),
-    Result.
+    end.
 
 collect_closes(_Tag, 0, _Deadline, Acc) ->
     {ok, lists:usort(lists:append(Acc))};

@@ -6,6 +6,7 @@ import brazier/error
 import brazier/html
 import brazier/internal/context.{type Context}
 import brazier/log_capture
+import brazier/monitored
 import brazier/session
 import brazier/ssr
 import brazier/telemetry
@@ -863,21 +864,20 @@ pub fn join_token_over_cookie_budget_is_refused_test() {
 }
 
 pub fn page_over_cookie_budget_is_a_500_without_a_cookie_test() {
-  let assert Ok(Nil) = telemetry.start()
-  let id = "ssr_too_large_" <> int.to_string(unique_integer())
-  let events = process.new_subject()
-  let assert Ok(Nil) =
-    telemetry.attach(
-      id,
+  // The handler is detached however the render ends, so a crash in it does
+  // not leave a node-wide handler sending to eunit's shared test process.
+  let #(resp, event) =
+    monitored.listening(
       [["brazier", "ssr", "join_token", "too_large"]],
-      fn(event) { process.send(events, event) },
+      fn(events) {
+        let assert Ok(resp) = ssr.to_response(render(over_budget_config()))
+        let assert Ok(event) = process.receive(events, 0)
+          as "the refusal emits its telemetry event in the calling process"
+        #(resp, event)
+      },
     )
-  let assert Ok(resp) = ssr.to_response(render(over_budget_config()))
-  let assert Ok(Nil) = telemetry.detach(id)
   let assert 500 = resp.status
   let assert Error(Nil) = find_header(resp.headers, "set-cookie")
-  let assert Ok(event) = process.receive(events, 0)
-    as "the refusal emits its telemetry event in the calling process"
   let assert Ok(bytes) = telemetry.int(event, "bytes")
   let assert True = bytes > ssr.join_token_cookie_budget_bytes
   let assert Ok(3800) = telemetry.int(event, "budget")

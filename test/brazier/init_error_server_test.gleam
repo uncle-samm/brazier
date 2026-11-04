@@ -13,6 +13,7 @@ import brazier/effect
 import brazier/error
 import brazier/html
 import brazier/internal/context.{type Context}
+import brazier/monitored
 import brazier/telemetry.{type Event}
 import gleam/bit_array
 import gleam/erlang/process.{type Subject}
@@ -110,15 +111,12 @@ fn upgrade_and_await_close(app: application.App) -> #(Int, String) {
   #(code, reason)
 }
 
-fn listen() -> #(String, Subject(Event)) {
-  let assert Ok(Nil) = telemetry.start()
-  let id = "init_error_server_" <> int.to_string(unique_integer())
-  let events = process.new_subject()
-  let assert Ok(Nil) =
-    telemetry.attach(id, [["brazier", "ws", "close"]], fn(event) {
-      process.send(events, event)
-    })
-  #(id, events)
+/// Run `run` with the `[brazier, ws, close]` summaries sent to a subject it receives. The handler is
+/// detached however `run` ends: telemetry handlers are node-wide, and one
+/// left by a failing test would send every later event to eunit's shared
+/// test process.
+fn listen(run: fn(Subject(Event)) -> a) -> a {
+  monitored.listening([["brazier", "ws", "close"]], run)
 }
 
 /// The close summary carrying `label`; summaries of other connections are
@@ -174,7 +172,7 @@ pub fn page_whose_init_crashes_is_a_500_test() {
 
 pub fn socket_refused_as_unavailable_closes_with_4503_test() {
   let app = start(refusing(error.unavailable("orders-db.internal down")))
-  let #(id, events) = listen()
+  use events <- listen()
   let #(#(code, reason), logs) =
     log_capture.capture(fn() { upgrade_and_await_close(app) })
   let assert 4503 = code
@@ -185,7 +183,6 @@ pub fn socket_refused_as_unavailable_closes_with_4503_test() {
   let assert True =
     log_capture.contains(logs, "error", "503: orders-db.internal down")
   let assert True = log_capture.contains(logs, "info", "4503")
-  let assert Ok(Nil) = telemetry.detach(id)
   stop(app)
 }
 
@@ -193,7 +190,7 @@ pub fn socket_refused_with_401_closes_with_4401_test() {
   // 4401 is the code the client answers by reloading the page, so the
   // server render can answer the refusal with its own status.
   let app = start(refusing(error.refuse(401, "signed out")))
-  let #(id, events) = listen()
+  use events <- listen()
   let #(#(code, reason), logs) =
     log_capture.capture(fn() { upgrade_and_await_close(app) })
   let assert 4401 = code
@@ -205,13 +202,12 @@ pub fn socket_refused_with_401_closes_with_4401_test() {
     list.any(logs, fn(line) {
       line.level == "error" && string.contains(line.message, "signed out")
     })
-  let assert Ok(Nil) = telemetry.detach(id)
   stop(app)
 }
 
 pub fn socket_whose_init_crashes_closes_with_1011_test() {
   let app = start(crashing)
-  let #(id, events) = listen()
+  use events <- listen()
   let #(#(code, reason), logs) =
     log_capture.capture(fn() { upgrade_and_await_close(app) })
   let assert 1011 = code
@@ -223,12 +219,8 @@ pub fn socket_whose_init_crashes_closes_with_1011_test() {
   // The handler closed the socket itself: the listener still upgrades.
   let #(code, _reason) = upgrade_and_await_close(app)
   let assert 1011 = code
-  let assert Ok(Nil) = telemetry.detach(id)
   stop(app)
 }
-
-@external(erlang, "erlang", "unique_integer")
-fn unique_integer() -> Int
 
 @external(erlang, "brazier_http_client_ffi", "http_request")
 fn http_request(

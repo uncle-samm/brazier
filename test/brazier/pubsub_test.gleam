@@ -238,8 +238,7 @@ pub fn subscriber_exit_removes_its_subscriptions_test() {
   // The subscriber's partition traps its exit and removes its rows when it
   // handles the 'EXIT': wait for exactly that instead of polling the counts.
   let assert Ok(partition) = pubsub.partition_for(pid)
-  let exit = await.watch_exit(partition, pid)
-  use <- monitored.with_cleanup(fn() { await.unwatch(exit) })
+  use exit <- await.with_watch_exit(partition, pid)
   process.kill(pid)
   await.expect_info(exit, partition, "the partition handling the kill")
   let assert 0 = pubsub.subscriber_count(topic_a)

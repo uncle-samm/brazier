@@ -339,7 +339,7 @@ pub fn bindings_are_released_when_process_exits_test() {
   let ready = process.new_subject()
   // No application runs here: start the node-wide session scope.
   session.ensure_registry()
-  let watch = await.watch_pg_scope("brazier_session_pg")
+  use watch <- await.with_watch_pg_scope("brazier_session_pg")
   let pid =
     process.spawn(fn() {
       session.bind_current_process(store, sess.id)
@@ -357,7 +357,6 @@ pub fn bindings_are_released_when_process_exits_test() {
   await.expect_down(pid, "the bound process")
   // pg drops a member when it exits; once it says so the count is final.
   await.expect_pg_leave(watch, pid, "the bound process")
-  await.unwatch_pg_scope(watch)
   should.equal(session.bound_process_count(store, sess.id), 0)
 }
 

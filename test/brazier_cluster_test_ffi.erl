@@ -3,13 +3,14 @@
 %% Helpers that multi-node tests run ON a peer node (through rpc). The test
 %% runner is not distributed, so results come back as rpc return values.
 
--export([spawn_recorders/2, spawn_recorder/1, recorded/1, recorded_all/1,
-         recorded_count/1, spawn_counters/2, counter_value/0, round_done_at/1, now_us/0, os_us/0,
+-export([spawn_recorders/2, spawn_recorder/1, await_recorded/3,
+         spawn_counters/2, await_round/2, now_us/0, os_us/0,
          report/1, fail/1,
          worker_queue_len/1, suspend_worker/1, resume_worker/1,
-         remote_worker_nodes/1, count_events/1, counted_events/0,
-         registered/1, alive/1, kill/1, wait_down/2, record_event/4,
-         record_events/1, recorded_events/0, record_named_event/4, putenv/2,
+         remote_worker_nodes/1,
+         registered/1, kill/1, wait_down/2, mailbox_len/0,
+         record_events/1, recorded_events/0, record_named_event/4,
+         watch_recorded/0, unwatch_recorded/1, putenv/2,
          dist_protocol/1, dist_optfile/1, no_argument/0, option_groups/1,
          write_optfile/1, atom_exists/1, state_holds/1, status_holds/1,
          send_marked_hellos/1, manager_suspend/0, manager_resume/0, manager_barrier/0,
@@ -19,8 +20,6 @@
          spawn_verified_waiter/1, waiter_result/2,
          forge_forward/3, deliver_forged/2, store_message_from/1,
          presence_message_from/1, partition_churn/3]).
-
--define(EVENTS, brazier_test_counted_events).
 
 %% --- Recorders: subscribers that remember what they received ---
 
@@ -35,7 +34,7 @@ spawn_recorder(Topics) ->
     Pid = spawn(fun() ->
         [{ok, nil} = brazier_pubsub_ffi:subscribe(T) || T <- Topics],
         Parent ! {Ref, ready},
-        recorder_loop([])
+        recorder_loop([], [])
     end),
     receive
         {Ref, ready} -> Pid
@@ -43,16 +42,35 @@ spawn_recorder(Topics) ->
         erlang:error({recorder_not_ready, Pid})
     end.
 
-recorder_loop(Acc) ->
+%% Acc is newest first. Waiters are {ReplyTo, Ref, Count} for await_recorded/3
+%% requests that need more messages than Acc holds.
+recorder_loop(Acc, Waiters) ->
     receive
         {brazier_pubsub, _Topic, Message} ->
-            recorder_loop([Message | Acc]);
+            Acc1 = [Message | Acc],
+            recorder_loop(Acc1, answer_waiters(Acc1, Waiters));
         {recorded, From, Ref} ->
             From ! {Ref, lists:reverse(Acc)},
-            recorder_loop(Acc)
+            recorder_loop(Acc, Waiters);
+        {await_recorded, ReplyTo, Ref, Count} ->
+            recorder_loop(Acc, answer_waiters(Acc, [{ReplyTo, Ref, Count} | Waiters]))
     end.
 
-%% Messages Pid recorded, oldest first.
+%% Answer every waiter whose count Acc reaches; keep the others.
+answer_waiters(Acc, Waiters) ->
+    Have = length(Acc),
+    lists:filter(fun({ReplyTo, Ref, Count}) when Count =< Have ->
+                         ReplyTo ! {Ref, lists:reverse(Acc)},
+                         false;
+                    (_) ->
+                         true
+                 end, Waiters).
+
+%% Messages Pid recorded, oldest first: what await_recorded/3 reports after
+%% a timeout. Not exported as a read: a delivery and this request come from
+%% different processes, and Erlang orders messages per sender only, so a
+%% delivery sent before the request may still be handled after it. Tests
+%% read a recorder with await_recorded/3.
 recorded(Pid) ->
     Ref = erlang:monitor(process, Pid),
     Pid ! {recorded, self(), Ref},
@@ -66,11 +84,27 @@ recorded(Pid) ->
         erlang:error({recorder_timeout, Pid})
     end.
 
-recorded_all(Pids) ->
-    [recorded(Pid) || Pid <- Pids].
-
-recorded_count(Pid) ->
-    length(recorded(Pid)).
+%% Wait until Pid has recorded at least Count messages: {ok, Messages} with
+%% all of them, oldest first, or {error, Messages} with what it had when
+%% TimeoutMs passed. The recorder holds the request and answers it from the
+%% delivery that reaches Count, so no delivery can overtake the answer.
+%% The reply goes to a monitor alias (gen_server:call's pattern): after a
+%% timeout the alias is gone, and a late answer is dropped by the runtime
+%% instead of being left in the caller's mailbox.
+await_recorded(Pid, Count, TimeoutMs) when is_integer(Count), Count >= 0 ->
+    MRef = erlang:monitor(process, Pid, [{alias, reply_demonitor}]),
+    Pid ! {await_recorded, MRef, MRef, Count},
+    receive
+        {MRef, Messages} ->
+            {ok, Messages};
+        {'DOWN', MRef, process, Pid, Reason} ->
+            erlang:error({recorder_down, Pid, Reason})
+    after TimeoutMs ->
+        true = erlang:demonitor(MRef, [flush]),
+        %% An answer that arrived before the demonitor is still queued.
+        receive {MRef, _} -> ok after 0 -> ok end,
+        {error, recorded(Pid)}
+    end.
 
 %% --- Counters: cheap subscribers for fan-out benchmarks ---
 
@@ -80,9 +114,12 @@ recorded_count(Pid) ->
 %% per delivery (ETS update_counter on one key serialises them and would
 %% dominate the measurement). Whenever the total reaches a multiple of
 %% Count (one complete fan-out round), the subscriber that completed it
-%% stores the OS time under {done, Round}. Peers share the host clock, so
-%% these times compare across nodes. The table is owned by a long-lived
-%% process; the atomic lives in persistent_term (written once per node).
+%% stores the OS time under {done, Round}, then tells the process waiting
+%% for that round (await_round/2), if one is. The time is taken before the
+%% notice is sent, so the notice is not part of what is measured. Peers
+%% share the host clock, so these times compare across nodes. The table is
+%% owned by a long-lived process; the atomic lives in persistent_term
+%% (written once per node).
 spawn_counters(Topic, Count) ->
     Parent = self(),
     Ref = make_ref(),
@@ -116,21 +153,51 @@ counter_loop(Atomic, Target) ->
         {brazier_pubsub, _Topic, _Message} ->
             N = atomics:add_get(Atomic, 1, 1),
             case N rem Target of
-                0 -> true = ets:insert(?COUNTER, {{done, N div Target}, os_us()});
-                _ -> true
+                0 -> round_done(N div Target, os_us());
+                _ -> ok
             end,
             counter_loop(Atomic, Target)
     end.
 
-counter_value() ->
-    atomics:get(persistent_term:get(?COUNTER), 1).
+%% Store the round's time, then read the waiter. await_round/2 does the
+%% opposite (register, then read the time). The table is a plain set, so
+%% its operations are atomic and happen in one order: if the waiter's read
+%% misses the time, its registration came before this lookup, which then
+%% finds it. Either the waiter sees the time or it is told.
+round_done(Round, At) ->
+    true = ets:insert(?COUNTER, {{done, Round}, At}),
+    case ets:lookup(?COUNTER, {waiter, Round}) of
+        [{_, Alias}] -> Alias ! {Alias, At}, ok;
+        [] -> ok
+    end.
 
-%% When fan-out round Round completed on this node: {ok, OsMicros} or
-%% {error, nil} if it has not yet.
-round_done_at(Round) ->
-    case ets:lookup(?COUNTER, {done, Round}) of
-        [{_, At}] -> {ok, At};
-        [] -> {error, nil}
+%% Wait until fan-out round Round has completed on this node: {ok, OsMicros}
+%% with the time it completed, or {error, nil} if it does not within
+%% TimeoutMs. One waiter per round: a second is a test bug and crashes.
+%% The notice goes to an alias that is removed before returning, so a
+%% notice sent after a timeout is dropped instead of left in the mailbox.
+await_round(Round, TimeoutMs) ->
+    Alias = erlang:alias(),
+    Key = {waiter, Round},
+    case ets:insert_new(?COUNTER, {Key, Alias}) of
+        true -> ok;
+        false -> erlang:error({second_waiter_for_round, Round})
+    end,
+    try
+        case ets:lookup(?COUNTER, {done, Round}) of
+            [{_, At}] ->
+                {ok, At};
+            [] ->
+                receive
+                    {Alias, At} -> {ok, At}
+                after TimeoutMs ->
+                    {error, nil}
+                end
+        end
+    after
+        true = ets:delete(?COUNTER, Key),
+        true = erlang:unalias(Alias),
+        receive {Alias, _} -> ok after 0 -> ok end
     end.
 
 %% --- Forwarding workers ---
@@ -159,45 +226,36 @@ remote_worker_nodes(Shard) ->
     lists:usort([node(P) || P <- pg:get_members(brazier_pubsub_pg, {brazier_pubsub, Shard}),
                             node(P) =/= node()]).
 
-%% --- Telemetry counting on a peer ---
-
-%% Record every EventName (a list of binaries) emitted on this node, with
-%% its measurements, in a public table owned by a long-lived process.
-count_events(EventName) ->
-    Parent = self(),
-    Ref = make_ref(),
-    spawn(fun() ->
-        ?EVENTS = ets:new(?EVENTS, [ordered_set, public, named_table]),
-        Parent ! {Ref, ready},
-        receive stop -> ok end
-    end),
-    receive {Ref, ready} -> ok after 5000 -> erlang:error(counter_not_ready) end,
-    Atoms = [binary_to_atom(S, utf8) || S <- EventName],
-    ok = telemetry:attach(<<"brazier-test-event-counter">>, Atoms,
-                          fun ?MODULE:record_event/4, nil),
-    nil.
-
-%% The queue_len measurement of each counted event, oldest first.
-counted_events() ->
-    [maps:get(queue_len, M, -1) || {_, M} <- ets:tab2list(?EVENTS)].
-
-record_event(_Name, Measurements, _Metadata, nil) ->
-    true = ets:insert(?EVENTS, {erlang:unique_integer([monotonic]), Measurements}),
-    ok.
-
 %% --- Telemetry recording with metadata ---
 
 -define(NAMED, brazier_test_named_events).
+-define(EVENT_RECORDER, brazier_test_event_recorder).
 
 %% Record every event in EventNames (each a list of binaries) emitted on
 %% this node: its dotted name and its node and reason metadata.
+%%
+%% The handler and its table live as long as the node, so this runs only
+%% on a peer node, which its test's with_cluster stops (ExUnit's on_exit/1
+%% at node scope); on the test runner, where every module's tests share one
+%% node, it crashes instead of leaving a handler behind. A second call on
+%% one node crashes too (the table and the handler exist).
+%%
+%% The handler writes the event to the table, then tells the recorder
+%% process, which tells every process watching (watch_recorded/0). The
+%% write stays in the handler, so a reader that knows the event was emitted
+%% (the emitting call has returned) reads it at once.
 record_events(EventNames) ->
+    case erlang:is_alive() of
+        true -> ok;
+        false -> erlang:error({record_events, not_on_a_peer_node})
+    end,
     Parent = self(),
     Ref = make_ref(),
     spawn(fun() ->
+        true = register(?EVENT_RECORDER, self()),
         ?NAMED = ets:new(?NAMED, [ordered_set, public, named_table]),
         Parent ! {Ref, ready},
-        receive stop -> ok end
+        event_recorder_loop(#{})
     end),
     receive {Ref, ready} -> ok after 5000 -> erlang:error(recorder_table_not_ready) end,
     Names = [[binary_to_atom(S, utf8) || S <- Name] || Name <- EventNames],
@@ -210,11 +268,72 @@ record_named_event(Name, _Measurements, Metadata, nil) ->
     true = ets:insert(?NAMED, {erlang:unique_integer([monotonic]), Dotted,
                                maps:get(node, Metadata, <<>>),
                                maps:get(reason, Metadata, <<>>)}),
+    ?EVENT_RECORDER ! recorded,
     ok.
+
+%% Watchers maps each watcher's alias to its monitor.
+event_recorder_loop(Watchers) ->
+    receive
+        recorded ->
+            maps:foreach(fun(Alias, _MRef) -> Alias ! {Alias, recorded} end, Watchers),
+            event_recorder_loop(Watchers);
+        {watch, From, Alias} ->
+            MRef = erlang:monitor(process, From),
+            From ! {Alias, watching},
+            event_recorder_loop(Watchers#{Alias => MRef});
+        {unwatch, Alias} ->
+            case maps:take(Alias, Watchers) of
+                {MRef, Rest} ->
+                    true = erlang:demonitor(MRef, [flush]),
+                    event_recorder_loop(Rest);
+                error ->
+                    event_recorder_loop(Watchers)
+            end;
+        {'DOWN', MRef, process, _, _} ->
+            event_recorder_loop(maps:filter(fun(_, M) -> M =/= MRef end, Watchers))
+    end.
 
 %% Recorded events, oldest first, as {event, Name, Node, Reason}.
 recorded_events() ->
     [{event, Name, Node, Reason} || {_, Name, Node, Reason} <- ets:tab2list(?NAMED)].
+
+%% Have the caller sent {Alias, recorded} after each event recorded from
+%% now on, and return Alias. Returns once the recorder has subscribed the
+%% caller, so an event recorded after a read that follows this call is
+%% always announced: its handler tells the recorder after the write, and
+%% the recorder handles that after the subscription.
+watch_recorded() ->
+    case whereis(?EVENT_RECORDER) of
+        undefined ->
+            erlang:error({watch_recorded, record_events_not_running});
+        Recorder ->
+            Alias = erlang:alias(),
+            MRef = erlang:monitor(process, Recorder),
+            Recorder ! {watch, self(), Alias},
+            receive
+                {Alias, watching} ->
+                    true = erlang:demonitor(MRef, [flush]),
+                    Alias;
+                {'DOWN', MRef, process, Recorder, Reason} ->
+                    erlang:error({event_recorder_down, Reason})
+            after 5000 ->
+                erlang:error({watch_recorded, timeout})
+            end
+    end.
+
+%% Undo watch_recorded/0. The alias goes first, so a notice still on its
+%% way is dropped by the runtime; the ones already queued are removed.
+unwatch_recorded(Alias) ->
+    true = erlang:unalias(Alias),
+    ?EVENT_RECORDER ! {unwatch, Alias},
+    flush_recorded(Alias).
+
+flush_recorded(Alias) ->
+    receive
+        {Alias, recorded} -> flush_recorded(Alias)
+    after 0 ->
+        nil
+    end.
 
 putenv(Name, Value) ->
     true = os:putenv(unicode:characters_to_list(Name), unicode:characters_to_list(Value)),
@@ -282,11 +401,15 @@ registered(Name) ->
         Pid -> {ok, Pid}
     end.
 
-alive(Pid) -> is_process_alive(Pid).
-
 kill(Pid) ->
     true = exit(Pid, kill),
     nil.
+
+%% How many messages wait in the caller's mailbox: a wait that has ended
+%% must have left none behind.
+mailbox_len() ->
+    {message_queue_len, Len} = erlang:process_info(self(), message_queue_len),
+    Len.
 
 %% Wait until Pid is dead. True if it died within TimeoutMs.
 wait_down(Pid, TimeoutMs) ->
