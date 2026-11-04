@@ -6,7 +6,7 @@
 %% tests can drive replica up, down, permdown, restarts and the limits.
 
 -export([fake_ref/2, heartbeat/2, transfer_ack/4, graceful_permdown/2,
-         send_peer/3, receive_diff/1, flush_diffs/0, unique_positive/0, shard_has_delta/1,
+         send_peer/3, receive_diff/1, parent/1, unique_positive/0, shard_has_delta/1,
          malformed_messages/0, with_verified/2]).
 
 -define(STATE, 'brazier@presence@state').
@@ -24,10 +24,17 @@ with_verified(NodeNames, Fun) ->
     Parent = self(),
     Ref = make_ref(),
     {Owner, Monitor} = spawn_monitor(fun() ->
+        %% If the test process is killed (an eunit timeout) the after
+        %% clause below never runs: the owner then exits with it, taking the
+        %% table along, instead of leaving it to fail every later test.
+        ParentMonitor = erlang:monitor(process, Parent),
         ?MEMBERS = ets:new(?MEMBERS, [set, protected, named_table, {read_concurrency, true}]),
         true = ets:insert(?MEMBERS, [{binary_to_atom(N, utf8), 0} || N <- NodeNames]),
         Parent ! {Ref, ready},
-        receive {Ref, stop} -> true = ets:delete(?MEMBERS) end
+        receive
+            {Ref, stop} -> true = ets:delete(?MEMBERS);
+            {'DOWN', ParentMonitor, process, Parent, _} -> exit(test_process_gone)
+        end
     end),
     receive
         {Ref, ready} -> ok;
@@ -80,16 +87,11 @@ receive_diff(TimeoutMs) ->
         {error, nil}
     end.
 
-%% Drop every PubSub delivery already in the mailbox; returns how many.
-flush_diffs() ->
-    flush_diffs(0).
-
-flush_diffs(N) ->
-    receive
-        {brazier_pubsub, _Topic, _Message} -> flush_diffs(N + 1)
-    after 0 ->
-        N
-    end.
+%% The process that started Pid (proc_lib's parent: a shard's supervisor).
+parent(Pid) ->
+    {parent, Parent} = erlang:process_info(Pid, parent),
+    true = is_pid(Parent),
+    Parent.
 
 unique_positive() ->
     erlang:unique_integer([positive]).

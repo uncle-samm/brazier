@@ -1,6 +1,6 @@
 -module(brazier_await_ffi).
--export([barrier/2, watch_info/2, watch_exit/2, next_info/2, watch_pg_scope/1,
-         next_pg_leave/3, unwatch_pg_scope/1]).
+-export([barrier/2, watch_info/2, watch_exit/2, watch_down/2, next_info/2,
+         unwatch/1, watch_pg_scope/1, next_pg_leave/3, unwatch_pg_scope/1]).
 
 %% A mailbox barrier on an OTP process (a gleam_otp actor, gen_server or any
 %% sys-compliant process). sys:get_state/2 is answered in mailbox order, so
@@ -22,7 +22,8 @@ barrier(Pid, TimeoutMs) ->
 %% plain (non-call, non-cast) message MessageAtom, e.g. a timer tick sent
 %% with erlang:send_after. Uses the sys debug hook (sys:install/2), which
 %% gen_server, gen_statem and gleam_otp actors run on every incoming
-%% message before handling it. The hook lives as long as Pid.
+%% message before handling it. The hook lives as long as Pid, or until
+%% unwatch/1 removes it.
 watch_info(Pid, MessageName) when is_binary(MessageName) ->
     Message = binary_to_existing_atom(MessageName),
     install_watch(Pid, fun(M) -> M =:= Message end).
@@ -32,6 +33,14 @@ watch_info(Pid, MessageName) when is_binary(MessageName) ->
 watch_exit(Pid, Child) when is_pid(Child) ->
     install_watch(Pid, fun
         ({'EXIT', From, _Reason}) -> From =:= Child;
+        (_) -> false
+    end).
+
+%% Tell the caller when the sys-compliant process Pid receives the DOWN of
+%% a monitor it holds on Target (a presence shard on a tracked process).
+watch_down(Pid, Target) when is_pid(Target) ->
+    install_watch(Pid, fun
+        ({'DOWN', _Ref, process, From, _Reason}) -> From =:= Target;
         (_) -> false
     end).
 
@@ -51,17 +60,33 @@ install_watch(Pid, Matches) ->
         State
     end,
     try sys:install(Pid, {Hook, ok}) of
-        ok -> {ok, {Pid, Ref}}
+        ok -> {ok, {Pid, Ref, Hook}}
     catch
         exit:{Reason, {sys, install, _}} -> {error, format(Reason)}
     end.
 
 %% The next notice from watch_info/2: Pid has received the message. It may
 %% still be handling it; follow with barrier/2 to know it is done.
-next_info({_Pid, Ref}, TimeoutMs) ->
+next_info({_Pid, Ref, _Hook}, TimeoutMs) ->
     receive
         {brazier_await_info, Ref} -> {ok, nil}
     after TimeoutMs -> {error, nil}
+    end.
+
+%% Remove a watch's hook from its process and flush its notices. A hook
+%% otherwise lives as long as the process, and the shared PubSub partitions
+%% and presence shards outlive every test: a forgotten hook keeps sending
+%% notices to the test process, which eunit reuses for the module's later
+%% tests. The watched process must still be alive; sys:remove/2 exits if
+%% it is not.
+unwatch({Pid, Ref, Hook}) ->
+    ok = sys:remove(Pid, Hook),
+    flush_info(Ref).
+
+flush_info(Ref) ->
+    receive
+        {brazier_await_info, Ref} -> flush_info(Ref)
+    after 0 -> nil
     end.
 
 %% Subscribe to membership changes in a pg scope (pg:monitor_scope/1).

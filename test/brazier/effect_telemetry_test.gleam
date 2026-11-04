@@ -9,11 +9,15 @@
 /// the test, and tests synchronize on those events; nothing sleeps.
 import brazier/effect
 import brazier/log_capture
+import brazier/monitored
 import brazier/telemetry.{type Event}
 import gleam/dynamic
+import gleam/dynamic/decode
+import gleam/erlang/atom
 import gleam/erlang/process.{type Subject}
 import gleam/int
 import gleam/list
+import gleam/result
 
 const run_events = [
   ["brazier", "effect", "run", "start"],
@@ -127,15 +131,33 @@ pub fn crashing_sync_effect_emits_exception_and_reraises_test() {
 
 pub fn crashing_background_effect_emits_exception_test() {
   let #(id, events) = listen(run_events)
+  let ready = process.new_subject()
+  // The worker crashes only once the test has monitored it: a monitor taken
+  // after the crash would see `noproc` and say nothing about the crash.
   let assert [pid] =
-    perform(effect.background(fn(_dispatch) { crash() }), fn(_) { Nil })
+    perform(
+      effect.background(fn(_dispatch) {
+        let go = process.new_subject()
+        process.send(ready, go)
+        let assert Ok(Nil) = process.receive(go, 2000)
+          as "test must release the background effect"
+        crash()
+      }),
+      fn(_) { Nil },
+    )
+  let assert Ok(go) = process.receive(ready, 2000)
+    as "the background worker must hand over its release subject"
   let monitor = process.monitor(pid)
+  process.send(go, Nil)
   let _exception = expect(events, run_event("exception", "background"))
-  let selector =
-    process.new_selector()
-    |> process.select_specific_monitor(monitor, fn(down) { down })
-  let assert Ok(_down) = process.selector_receive(selector, 2000)
-    as "the crashed background process must exit"
+  // The worker exits with the crash itself: `{brazier_test_handler_crash,
+  // Stacktrace}`.
+  let assert process.Abnormal(reason) =
+    monitored.down_reason(monitor, "the crashing background effect")
+  let assert Ok("brazier_test_handler_crash") =
+    decode.run(reason, decode.at([0], atom.decoder()))
+    |> result.map(atom.to_string)
+    as "the worker exits with the crash's own reason"
   let assert Ok(Nil) = telemetry.detach(id)
 }
 

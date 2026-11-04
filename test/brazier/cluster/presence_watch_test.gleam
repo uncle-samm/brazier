@@ -10,6 +10,7 @@ import brazier/cluster/peer.{type Peer, Timeout}
 import brazier/effect
 import brazier/error
 import brazier/internal/presence_watch
+import brazier/monitored
 import brazier/presence.{type Presence, Tracking}
 import brazier/presence/holder.{type Holder}
 import brazier/presence/sync.{type Diff, type Entry}
@@ -136,22 +137,29 @@ fn try_session(
   room: Option(String),
   track: fn(Model) -> List(presence.Tracking(String)),
 ) -> Result(Session, error.BrazierError) {
-  peer.on(p, fn() {
-    let h = holder.start()
-    let #(proof, started) =
-      holder.run(h, fn() {
-        let proof = process.new_subject()
-        let config = session_config(user, room, proof, track)
-        #(proof, runtime.start(config, test_ctx.root()))
-      })
-    case started {
-      Ok(rt) -> Ok(Session(holder: h, runtime: rt, proof:))
-      Error(reason) -> {
-        holder.kill(h)
-        Error(reason)
-      }
+  peer.on(p, fn() { try_session_here(user, room, track) })
+}
+
+/// `try_session` on the node it is called on.
+fn try_session_here(
+  user: String,
+  room: Option(String),
+  track: fn(Model) -> List(presence.Tracking(String)),
+) -> Result(Session, error.BrazierError) {
+  let h = holder.start()
+  let #(proof, started) =
+    holder.run(h, fn() {
+      let proof = process.new_subject()
+      let config = session_config(user, room, proof, track)
+      #(proof, runtime.start(config, test_ctx.root()))
+    })
+  case started {
+    Ok(rt) -> Ok(Session(holder: h, runtime: rt, proof:))
+    Error(reason) -> {
+      holder.kill(h)
+      Error(reason)
     }
-  })
+  }
 }
 
 fn start_session(p: Peer, user: String, room: Option(String)) -> Session {
@@ -425,10 +433,13 @@ pub fn stops_when_pubsub_partition_dies_test_() -> peer.Timeout {
     peer.on(a, fn() {
       let assert Ok(partition) = pubsub.partition_for(watcher(ann))
         as "pubsub.partition_for succeeds"
+      // Monitor before the kill: a monitor taken after the runtime is gone
+      // reports `noproc`, not why it stopped.
+      let monitor = process.monitor(runtime_pid(ann))
       process.kill(partition)
-      await_exit(runtime_pid(ann), receive_ms)
+      monitored.down_reason(monitor, "the runtime whose partition died")
+      |> monitored.describe
     })
-  let assert Ok(reason) = reason as "the runtime exited within the wait"
   assert string.contains(reason, "brazier_pubsub_down")
   Nil
 }
@@ -469,10 +480,23 @@ pub fn stops_when_tracker_never_starts_test_() -> peer.Timeout {
   use peers <- peer.with_members(1, "brazier_pw_down")
   let assert [a] = peers as "the cluster starts one peer"
   peer.on(a, fn() { pubsub.start() })
-  let ann = start_session(a, "ann", Some("lobby"))
 
-  let reason = peer.on(a, fn() { await_exit(runtime_pid(ann), 9000) })
-  let assert Ok(reason) = reason as "the runtime exited within the wait"
+  let reason =
+    peer.on(a, fn() {
+      // Started and monitored in one call on the peer, as soon as the
+      // runtime exists: its retries run for seconds before it gives up. A
+      // monitor that still comes too late fails on `noproc` instead of
+      // passing on it.
+      let assert Ok(ann) = try_session_here("ann", Some("lobby"), in_room)
+        as "the runtime starts while the tracker is down"
+      let monitor = process.monitor(runtime_pid(ann))
+      monitored.down_reason_within(
+        monitor,
+        "the runtime whose tracker never starts",
+        9000,
+      )
+      |> monitored.describe
+    })
   assert string.contains(reason, "brazier_presence_down")
   Nil
 }
@@ -487,6 +511,3 @@ fn suspend(pid: Pid) -> Nil
 
 @external(erlang, "brazier_presence_watch_test_ffi", "resume")
 fn resume(pid: Pid) -> Nil
-
-@external(erlang, "brazier_presence_watch_test_ffi", "await_exit")
-fn await_exit(pid: Pid, timeout_ms: Int) -> Result(String, Nil)

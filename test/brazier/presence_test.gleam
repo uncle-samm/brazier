@@ -2,8 +2,17 @@
 //// lifecycle, and the shard's replica handling driven by fake replication
 //// messages (see brazier_presence_test_ffi). Real multi-node behaviour is in
 //// test/brazier/cluster/presence_cluster_test.gleam.
+////
+//// A test that has messages delivered to the test process (diffs, sys hook
+//// notices) runs in a process of its own (monitored.isolated): eunit runs
+//// every test of this module in one process, so a failure would leave its
+//// subscription or hook feeding that process for the tests after it.
+//// Nothing polls: a test waits for the shard to handle the DOWN, EXIT or
+//// heartbeat tick that changes what it checks.
 
+import brazier/await
 import brazier/cluster/log_capture
+import brazier/monitored
 import brazier/presence.{
   type Presence, AlreadyTracked, Down, InvalidConfig, InvalidKey, InvalidMessage,
   InvalidTopic, MetaDecodeFailed, MetaTooLarge, NotTracked,
@@ -101,12 +110,52 @@ fn send_peer(p: Presence(String), message: Dynamic) -> Nil {
   Nil
 }
 
-/// Subscribe the test process to diffs on `topic`. eunit runs tests in one
-/// process, so diffs left by an earlier test are dropped first.
+/// Subscribe the test process to diffs on `topic`. Only isolated tests
+/// subscribe, so no diff can be waiting yet; one that is was left by
+/// another test and fails this one loudly instead of being dropped.
 fn subscribe(p: Presence(String), topic: String) -> Nil {
-  let _ = flush_diffs()
+  let assert Error(Nil) = receive_diff(0)
+    as "a diff from before this test was in the test process's mailbox"
   let assert Ok(Nil) = presence.subscribe(p, topic)
   Nil
+}
+
+/// The single shard of a tracker with the default pool size of 1, which
+/// holds every topic.
+fn only_shard(p: Presence(String)) -> process.Pid {
+  let assert Ok(shard) = presence.shard_pid(p, "any")
+  shard
+}
+
+/// Kill `h` and return once the shard has handled the DOWN of its monitor
+/// on it, so its entries are gone. The tracker must have one shard.
+fn kill_and_await_leave(p: Presence(String), h: Holder) -> Nil {
+  let shard = only_shard(p)
+  let down = await.watch_down(shard, h.pid)
+  holder.kill(h)
+  await.expect_info(down, shard, "the shard handling the holder's DOWN")
+  await.unwatch(down)
+}
+
+/// A fast tracker's heartbeat ticks, every 20 ms: the bound for a test that
+/// waits tick by tick for a replica to go down.
+const max_ticks = 250
+
+/// Return once the shard's replicas are `expected`, checking after each of
+/// its heartbeat ticks (replicas go down and are forgotten on a tick).
+fn await_replicas(
+  p: Presence(String),
+  tick: await.InfoWatch,
+  expected: List(#(String, presence.ReplicaStatus)),
+  what: String,
+) -> Nil {
+  await.until_info(
+    tick,
+    only_shard(p),
+    fn() { replicas(p) == expected },
+    max_ticks,
+    what,
+  )
 }
 
 /// End a test that subscribed to `topic`: unsubscribe and stop the tracker,
@@ -288,17 +337,21 @@ pub fn untrack_all_removes_every_topic_test() {
 }
 
 pub fn exited_process_leaves_test() {
+  use <- monitored.isolated
   let p = start_default()
   let h = holder.start()
   let stays = holder.start()
   let _ = track(p, h, "room", "alice", "a")
   let _ = track(p, h, "lobby", "alice", "a")
   let _ = track(p, stays, "room", "bob", "b")
-  holder.kill(h)
-  assert eventually(fn() { keys(p, "room") == ["bob"] }, wait_ms)
-  assert eventually(fn() { keys(p, "lobby") == [] }, wait_ms)
-  holder.kill(stays)
-  assert eventually(fn() { keys(p, "room") == [] }, wait_ms)
+  // One shard holds both topics and monitors the holder once.
+  let assert Ok(lobby_shard) = presence.shard_pid(p, "lobby")
+  assert lobby_shard == only_shard(p)
+  kill_and_await_leave(p, h)
+  assert keys(p, "room") == ["bob"]
+  assert keys(p, "lobby") == []
+  kill_and_await_leave(p, stays)
+  assert keys(p, "room") == []
   let assert Ok(Nil) = presence.stop(p)
 }
 
@@ -354,6 +407,12 @@ pub fn oversized_meta_is_refused_with_telemetry_test() {
         _ -> Nil
       }
     })
+  // Telemetry handlers are global: detach even when an assertion fails.
+  use <- monitored.with_cleanup(fn() {
+    let assert Ok(Nil) = telemetry.detach(id)
+      as "detaching the test's telemetry handler"
+    Nil
+  })
   let h = holder.start()
   // "12345678" encodes as 10 bytes with its quotes: the limit is inclusive.
   let _ = track(p, h, "room", "fits", "12345678")
@@ -364,7 +423,6 @@ pub fn oversized_meta_is_refused_with_telemetry_test() {
   let assert Ok(event) = process.receive(events, wait_ms)
   let assert Ok(1) = telemetry.int(event, "count")
   assert keys(p, "room") == ["fits"]
-  let assert Ok(Nil) = telemetry.detach(id)
   holder.kill(h)
   let assert Ok(Nil) = presence.stop(p)
 }
@@ -408,6 +466,7 @@ pub fn per_process_limit_test() {
 }
 
 pub fn per_shard_limit_test() {
+  use <- monitored.isolated
   let p = start(config(unique_name()) |> presence.max_entries_per_shard(2))
   let a = holder.start()
   let b = holder.start()
@@ -416,8 +475,8 @@ pub fn per_shard_limit_test() {
   let _ = track(p, b, "room", "b", "m")
   let assert Error(PresenceLimitExceeded("max_entries_per_shard")) =
     holder.run(c, fn() { presence.track(p, "room", "c", "m") })
-  holder.kill(a)
-  assert eventually(fn() { keys(p, "room") == ["b"] }, wait_ms)
+  kill_and_await_leave(p, a)
+  assert keys(p, "room") == ["b"]
   let _ = track(p, c, "room", "c", "m")
   holder.kill(b)
   holder.kill(c)
@@ -427,6 +486,7 @@ pub fn per_shard_limit_test() {
 // --- Diffs ------------------------------------------------------------------
 
 pub fn diffs_arrive_in_order_test() {
+  use <- monitored.isolated
   let p = start_default()
   subscribe(p, "room")
   let h = holder.start()
@@ -453,6 +513,7 @@ pub fn diffs_arrive_in_order_test() {
 }
 
 pub fn diffs_are_per_topic_test() {
+  use <- monitored.isolated
   let p = start_default()
   subscribe(p, "room")
   let h = holder.start()
@@ -467,6 +528,7 @@ pub fn diffs_are_per_topic_test() {
 }
 
 pub fn decode_diff_rejects_other_messages_test() {
+  use <- monitored.isolated
   let p = start_default()
   let other = start_default()
   subscribe(other, "room")
@@ -570,21 +632,21 @@ pub fn stopped_tracker_is_down_test() {
 }
 
 pub fn restarted_shard_starts_empty_test() {
+  use <- monitored.isolated
   let p = start_default()
   let h = holder.start()
   let _ = track(p, h, "room", "alice", "m")
   let assert Ok(shard) = presence.shard_pid(p, "room")
+  // The supervisor restarts the shard while handling its 'EXIT', and the
+  // new shard registers in its init, before the supervisor goes on.
+  let supervisor = parent(shard)
+  let restart = await.watch_exit(supervisor, shard)
   process.kill(shard)
-  assert eventually(
-    fn() {
-      case presence.shard_pid(p, "room") {
-        Ok(new) -> new != shard
-        Error(_) -> False
-      }
-    },
-    wait_ms,
-  )
-  assert eventually(fn() { presence.list(p, "room") == Ok([]) }, wait_ms)
+  await.expect_info(restart, supervisor, "the supervisor restarting the shard")
+  await.unwatch(restart)
+  let assert Ok(new) = presence.shard_pid(p, "room")
+  assert new != shard
+  assert presence.list(p, "room") == Ok([])
   // The holder tracks again, as the runtime does after a shard restart.
   let _ = track(p, h, "room", "alice", "m")
   assert keys(p, "room") == ["alice"]
@@ -601,23 +663,27 @@ pub fn supervised_tracker_test() {
   let owner =
     process.spawn_unlinked(fn() {
       let assert Ok(child) = presence.supervised(c)
-      let assert Ok(_) =
+      let assert Ok(started) =
         supervisor.new(supervisor.OneForOne)
         |> supervisor.add(child)
         |> supervisor.start
-      process.send(ready, Nil)
+        as "the supervisor holding the tracker must start"
+      process.send(ready, started.pid)
       process.sleep_forever()
     })
-  let assert Ok(Nil) = process.receive(ready, wait_ms)
+  let assert Ok(tree) = process.receive(ready, wait_ms)
+    as "the owner did not start the tree"
   let h = holder.start()
   let _ = track(p, h, "room", "alice", "m")
   assert keys(p, "room") == ["alice"]
   holder.kill(h)
+  // The tree is linked to its owner: killing the owner stops the tree,
+  // which stops the tracker before the tree itself exits.
+  let tree_down = process.monitor(tree)
   process.kill(owner)
-  assert eventually(
-    fn() { presence.list(p, "room") == Error(TrackerDown) },
-    wait_ms,
-  )
+  let assert process.Killed =
+    monitored.down_reason(tree_down, "the tree linked to the killed owner")
+  assert presence.list(p, "room") == Error(TrackerDown)
 }
 
 // --- Replicas (fake peers) --------------------------------------------------
@@ -626,8 +692,10 @@ pub fn supervised_tracker_test() {
 // each of these tests counts the fake node as one (with_verified).
 
 pub fn remote_entries_join_go_down_and_permdown_test() {
+  use <- monitored.isolated
   use <- with_verified(["fake@host"])
   let p = start_fast(unique_name())
+  let tick = await.watch_info(only_shard(p), "heartbeat")
   subscribe(p, "room")
   let ref = fake_ref("fake@host", 1)
   send_peer(p, transfer_ack(ref, 1, "room", [#("remote", "\"hi\"")]))
@@ -638,14 +706,15 @@ pub fn remote_entries_join_go_down_and_permdown_test() {
   let assert Diff("room", [Entry("remote", _)], []) = next_diff(p)
 
   // No heartbeats: down after 100ms (entries leave), forgotten after 300ms.
-  assert eventually(fn() { replicas(p) == [#("fake@host", Down)] }, wait_ms)
+  await_replicas(p, tick, [#("fake@host", Down)], "the fake replica down")
   let assert Ok([]) = presence.list(p, "room")
   let assert Diff("room", [], [Entry("remote", _)]) = next_diff(p)
-  assert eventually(fn() { replicas(p) == [] }, wait_ms)
+  await_replicas(p, tick, [], "the fake replica forgotten")
   finish(p, "room")
 }
 
 pub fn heartbeat_brings_a_down_replica_back_test() {
+  use <- monitored.isolated
   use <- with_verified(["fake@host"])
   let p =
     start(
@@ -655,9 +724,10 @@ pub fn heartbeat_brings_a_down_replica_back_test() {
       |> presence.down_period(100)
       |> presence.permdown_period(60_000),
     )
+  let tick = await.watch_info(only_shard(p), "heartbeat")
   let ref = fake_ref("fake@host", 1)
   send_peer(p, transfer_ack(ref, 1, "room", [#("remote", "\"hi\"")]))
-  assert eventually(fn() { replicas(p) == [#("fake@host", Down)] }, wait_ms)
+  await_replicas(p, tick, [#("fake@host", Down)], "the fake replica down")
   let assert Ok([]) = presence.list(p, "room")
   send_peer(p, heartbeat(ref, 1))
   assert replicas(p) == [#("fake@host", Up)]
@@ -681,6 +751,7 @@ pub fn graceful_permdown_drops_entries_at_once_test() {
 }
 
 pub fn new_version_replaces_the_old_replica_test() {
+  use <- monitored.isolated
   use <- with_verified(["fake@host"])
   let p = start(config(unique_name()))
   subscribe(p, "room")
@@ -811,8 +882,9 @@ fn graceful_permdown(ref: Ref, pool_size: Int) -> Dynamic
 @external(erlang, "brazier_presence_test_ffi", "send_peer")
 fn send_peer_ffi(shard: process.Pid, topic: String, message: Dynamic) -> Nil
 
-@external(erlang, "brazier_presence_test_ffi", "flush_diffs")
-fn flush_diffs() -> Int
+/// The process that started `pid` (its supervisor, for a shard).
+@external(erlang, "brazier_presence_test_ffi", "parent")
+fn parent(pid: process.Pid) -> process.Pid
 
 @external(erlang, "brazier_presence_test_ffi", "receive_diff")
 fn receive_diff(timeout_ms: Int) -> Result(Dynamic, Nil)
@@ -826,21 +898,3 @@ fn malformed_messages() -> List(Dynamic)
 /// Run `run` with `nodes` counted as verified cluster members.
 @external(erlang, "brazier_presence_test_ffi", "with_verified")
 fn with_verified(nodes: List(String), run: fn() -> a) -> a
-
-@external(erlang, "brazier_pubsub_test_ffi", "pause")
-fn pause(ms: Int) -> Nil
-
-/// Poll `check` every 5ms until it holds or `timeout_ms` passes.
-fn eventually(check: fn() -> Bool, timeout_ms: Int) -> Bool {
-  case check() {
-    True -> True
-    False ->
-      case timeout_ms <= 0 {
-        True -> False
-        False -> {
-          pause(5)
-          eventually(check, timeout_ms - 5)
-        }
-      }
-  }
-}

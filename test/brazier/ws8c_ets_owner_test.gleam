@@ -13,6 +13,7 @@ import brazier/application.{type App}
 import brazier/cluster/peer.{Timeout}
 import brazier/effect
 import brazier/html
+import brazier/monitored
 import brazier/presence/holder
 import brazier/state_manager
 import brazier/store
@@ -55,30 +56,36 @@ fn owner_child(app: App) -> Pid {
 }
 
 /// Run `start` in a process that then blocks in `wait_forever`, as `main`
-/// does, and return the app with a monitor on that process.
+/// does, and return the app with a monitor on that process. The monitor is
+/// taken with the spawn, so a waiter that crashes while starting fails the
+/// test with its own reason, never `noproc` or a timeout.
 fn start_waiting(before: fn() -> a) -> #(App, a, process.Monitor) {
   let started = process.new_subject()
-  let waiter =
-    process.spawn_unlinked(fn() {
+  let #(_waiter, monitor) =
+    monitored.spawn(fn() {
       let value = before()
       let assert Ok(app) = application.start_supervised(config())
+        as "the tree must start"
       process.send(started, #(app, value))
       application.wait_forever()
     })
-  let monitor = process.monitor(waiter)
-  let assert Ok(#(app, value)) = process.receive(started, 10_000)
-    as "the tree must start"
-  #(app, value, monitor)
+  let outcome =
+    process.new_selector()
+    |> process.select_map(started, Ok)
+    |> process.select_specific_monitor(monitor, Error)
+    |> process.selector_receive(10_000)
+  case outcome {
+    Ok(Ok(#(app, value))) -> #(app, value, monitor)
+    Ok(Error(down)) ->
+      panic as { "the waiter exited while starting: " <> string.inspect(down) }
+    Error(Nil) -> panic as "the tree did not start within 10 s"
+  }
 }
 
+/// The waiter's exit reason, as text.
 fn await_down(monitor: process.Monitor) -> String {
-  let down =
-    process.new_selector()
-    |> process.select_specific_monitor(monitor, fn(down) { down })
-  let assert Ok(process.ProcessDown(reason: reason, ..)) =
-    process.selector_receive(down, 10_000)
-    as "the waiting process must exit"
-  string.inspect(reason)
+  monitored.down_reason(monitor, "the waiting process")
+  |> monitored.describe
 }
 
 pub fn tree_adopts_stores_created_before_it_test_() -> peer.Timeout {

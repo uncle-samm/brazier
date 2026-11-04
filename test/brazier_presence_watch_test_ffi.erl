@@ -1,9 +1,9 @@
 -module(brazier_presence_watch_test_ffi).
 
 %% Helpers for the session presence tests: find a runtime's presence
-%% watcher, hold its mailbox still, and wait for a process to exit.
+%% watcher and hold its mailbox still.
 
--export([watcher_of/1, suspend/1, resume/1, await_exit/2]).
+-export([watcher_of/1, suspend/1, resume/1]).
 
 %% The presence watcher linked to Runtime (labelled by the watcher with
 %% {brazier_presence_watch, TrackerName}). Must run on Runtime's node.
@@ -30,14 +30,3 @@ suspend(Pid) ->
 resume(Pid) ->
     true = erlang:resume_process(Pid),
     nil.
-
-%% Monitor Pid and wait up to TimeoutMs for it to exit: {ok, ReasonText}.
-await_exit(Pid, TimeoutMs) ->
-    Ref = erlang:monitor(process, Pid),
-    receive
-        {'DOWN', Ref, process, Pid, Reason} ->
-            {ok, unicode:characters_to_binary(io_lib:format("~p", [Reason]))}
-    after TimeoutMs ->
-        erlang:demonitor(Ref, [flush]),
-        {error, nil}
-    end.
