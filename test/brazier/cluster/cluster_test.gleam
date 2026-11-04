@@ -219,39 +219,42 @@ pub fn dns_node_names_are_capped_for_the_life_of_the_vm_test_() -> peer.Timeout 
 // --- Peer check ---
 
 /// Nodes of two deployments (same cookie, different secret keys) reject
-/// and disconnect each other.
-pub fn secret_mismatch_disconnects_test_() -> peer.Timeout {
+/// each other and stay connected: neither is the other's member, and
+/// neither drops the connection (which would make `global` partition the
+/// rest of a larger cluster; see membership_test).
+pub fn secret_mismatch_rejects_without_disconnecting_test_() -> peer.Timeout {
   use <- Timeout(60)
   use peers <- peer.with_cluster(2, "brazier_cl_secret")
   let assert [a, b] = peers as "the cluster starts two peers"
   record_cluster_events([a, b])
+  let config =
+    cluster.new(cluster.NoDiscovery) |> cluster.peer_check_timeout(60_000)
   // Already connected when the managers start: init checks them.
-  start_on(a, cluster.new(cluster.NoDiscovery))
-  start_with(b, cluster.new(cluster.NoDiscovery), other_secret)
-  assert peer.eventually(fn() { peer.on(a, nodes) == [] }, wait_ms)
-  // Whichever manager receives the other's hello first rejects and
-  // disconnects; the other side only sees the node go down. Which one it
-  // is depends on start order, so accept either, but require one.
-  assert peer.eventually(
-    fn() {
-      has_event(
-        a,
-        "brazier.cluster.peer.rejected",
-        name(b),
-        "secret key mismatch",
-      )
-      || has_event(
-        b,
-        "brazier.cluster.peer.rejected",
-        name(a),
-        "secret key mismatch",
-      )
-    },
-    wait_ms,
+  start_on(a, config)
+  start_with(b, config, other_secret)
+  // Each side's hello, handled before the call returns.
+  hello(from: b, to: a, key: other_secret)
+  hello(from: a, to: b, key: secret)
+  assert has_event(
+    a,
+    "brazier.cluster.peer.rejected",
+    name(b),
+    "secret key mismatch",
   )
-  assert peer.eventually(fn() { peer.on(b, nodes) == [] }, wait_ms)
+  assert has_event(
+    b,
+    "brazier.cluster.peer.rejected",
+    name(a),
+    "secret key mismatch",
+  )
+  assert peer.on(a, fn() { peer_status(peer.node(b)) }) == "rejected"
+  assert peer.on(b, fn() { peer_status(peer.node(a)) }) == "rejected"
   assert members(a) == []
   assert members(b) == []
+  assert peer.on(a, nodes) == [peer.node(b)]
+  assert peer.on(b, nodes) == [peer.node(a)]
+  assert count_events(a, "brazier.cluster.node.down", name(b)) == 0
+  assert count_events(b, "brazier.cluster.node.down", name(a)) == 0
 }
 
 /// A peer check timer of an earlier connection of a node (here it fired
@@ -306,8 +309,10 @@ pub fn stale_peer_check_timer_is_ignored_test_() -> peer.Timeout {
 }
 
 /// A connected node that never answers the peer check (it runs no
-/// cluster manager) is disconnected when the check times out.
-pub fn silent_peer_is_disconnected_test_() -> peer.Timeout {
+/// cluster manager) is rejected when the check times out, and stays
+/// connected. Once its manager starts with the right key, its hello makes
+/// it a member on the same connection.
+pub fn silent_peer_is_rejected_and_can_pass_later_test_() -> peer.Timeout {
   use <- Timeout(60)
   use peers <- peer.with_cluster(2, "brazier_cl_silent")
   let assert [a, b] = peers as "the cluster starts two peers"
@@ -317,14 +322,23 @@ pub fn silent_peer_is_disconnected_test_() -> peer.Timeout {
     cluster.new(cluster.NoDiscovery)
       |> cluster.peer_check_timeout(100),
   )
-  assert peer.eventually(fn() { peer.on(a, nodes) == [] }, wait_ms)
   assert peer.eventually(
     fn() {
       has_event(a, "brazier.cluster.peer.rejected", name(b), "no hello within")
     },
     wait_ms,
   )
+  assert peer.on(a, fn() { peer_status(peer.node(b)) }) == "rejected"
   assert members(a) == []
+  assert peer.on(a, nodes) == [peer.node(b)]
+
+  start_on(b, cluster.new(cluster.NoDiscovery))
+  let assert Ok(Nil) = peer.await_member(a, peer.node(b), wait_ms)
+    as "b's manager sends a hello with the shared key"
+  assert peer.on(a, fn() { peer_status(peer.node(b)) }) == "verified"
+  assert count_events(a, "brazier.cluster.node.down", name(b)) == 0
+  // One rejection only: a verified node is not checked by a timer again.
+  assert count_events(a, "brazier.cluster.peer.rejected", name(b)) == 1
 }
 
 // --- Keeping the MAC secret ---
@@ -500,6 +514,14 @@ fn members(p: Peer) -> List(Node) {
   members
 }
 
+/// `from` sends `to`'s manager a hello with the MAC of `key`, and returns
+/// once it has been handled.
+fn hello(from from: Peer, to to: Peer, key key: String) -> Nil {
+  let to_node = peer.node(to)
+  let mac = cluster.peer_mac(key)
+  peer.on(from, fn() { send_hello(to_node, mac) })
+}
+
 fn record_cluster_events(peers: List(Peer)) -> Nil {
   list.each(peers, fn(p) {
     peer.on(p, fn() {
@@ -611,3 +633,9 @@ fn send_check_timeout(timer: Reference, node: Node) -> Nil
 
 @external(erlang, "brazier_cluster_test_ffi", "reconnect")
 fn reconnect(node: Node) -> Nil
+
+@external(erlang, "brazier_cluster_test_ffi", "peer_status")
+fn peer_status(node: Node) -> String
+
+@external(erlang, "brazier_cluster_test_ffi", "send_hello")
+fn send_hello(node: Node, mac: BitArray) -> Nil

@@ -511,9 +511,21 @@ with its own changelog, so they are not listed here.
     hooks and messages.
   - The membership tests with an intruder node failed about 1 run in 10.
     When the intruder disconnected one verified member, OTP's `global`
-    sometimes cut the two verified members apart. Their peers now run with
-    `prevent_overlapping_partitions` off. The manager's own handling of
-    this is an open issue.
+    sometimes cut the two verified members apart. The manager no longer
+    disconnects (see the next entry), and the tests run on OTP's defaults.
+- (Audit fix-cluster-reject) Rejecting a peer could partition the verified
+  members. The manager called `erlang:disconnect_node/1` on a rejected
+  peer. Under OTP's default `prevent_overlapping_partitions`, `global` on
+  the rejecting node then told every other node that it had lost the peer,
+  and each of them cut its own link to that peer in turn. One rejected
+  intruder could leave the real members of a deployment apart, and with no
+  discovery nothing reconnected them. A rejected peer now stays connected
+  and is not a member: it is logged at error level and reported with
+  `[brazier, cluster, peer, rejected]` as before, and its later hello is
+  checked again. OTP 25's `global_group` made the same change
+  (`disconnect_nodes/1` excludes a node instead of disconnecting it), and
+  Mnesia likewise ignores connected nodes outside `db_nodes`. A process
+  waiting for a node to pass the check keeps waiting through a rejection.
 
 ### Removed
 

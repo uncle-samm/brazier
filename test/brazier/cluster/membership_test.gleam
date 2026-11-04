@@ -8,8 +8,13 @@
 //// revocation, each test checks three things. Traffic from `a` reaches `c`
 //// (the control). Nothing goes from `a` to `b`. Nothing from `b` is taken
 //// in: `b` sends nothing, and a message forged on `b`'s behalf is dropped
-//// where it lands. Once `b`'s manager runs again, it rejects the others'
-//// hellos and the nodes disconnect.
+//// where it lands. Once `b`'s manager runs again, it rejects `a` and `c`,
+//// and every connection stays up: the verified pair keeps its membership.
+////
+//// The peers run with OTP's defaults, `global`'s overlapping-partition
+//// prevention included. Under it, one dropped connection makes the other
+//// nodes drop theirs (the control test at the end shows it), which is why
+//// the manager never disconnects a rejected peer.
 ////
 //// The checks on the sending side are exact: the verified member list is
 //// what every sender consults. A dropped revocation is read from the
@@ -257,21 +262,13 @@ pub fn revocation_reaches_no_unverified_node_test_() -> peer.Timeout {
 
 /// Three connected peers: `a` and `c` are verified members, `b` runs a
 /// suspended manager with another deployment's secret. After `run`, `b`'s
-/// manager is resumed and must reject the others and disconnect.
-///
-/// The peers run without `global`'s overlapping-partition prevention. With
-/// OTP's default, b's `global` tells c that b lost a as soon as b's manager
-/// disconnects a, and c then disconnects a too. Whether that happens
-/// depends on whether the message reaches c before b disconnects c. When
-/// it does, the verified pair a and c ends with no connection to each
-/// other, and the final `members(a)` check fails (3 in 30 runs). The
-/// manager does not handle that yet; it is reported as an open issue, not
-/// hidden by this setting. Under the setting, this test checks what the
-/// manager itself does.
+/// manager is resumed, rejects both, and nobody loses a connection.
 fn with_intruder(prefix: String, run: fn(Peer, Peer, Peer) -> Nil) -> Nil {
-  use peers <- peer.with_cluster_args(3, prefix, no_partition_prevention)
+  use peers <- peer.with_cluster(3, prefix)
   let assert [a, b, c] = peers as "with_cluster(3) starts three peers"
   record_cluster_events(peers)
+  // Every nodeup and nodedown from here on, on every peer.
+  let watchers = list.map(peers, fn(p) { #(p, peer.on(p, watch_nodes)) })
   // The peer check of b never times out during the test.
   let config =
     cluster.new(cluster.NoDiscovery) |> cluster.peer_check_timeout(60_000)
@@ -294,15 +291,133 @@ fn with_intruder(prefix: String, run: fn(Peer, Peer, Peer) -> Nil) -> Nil {
   run(a, b, c)
 
   peer.on(b, manager_resume)
-  assert peer.eventually(fn() { peer.on(b, nodes) == [] }, wait_ms)
-  assert peer.eventually(fn() { rejected(b, a) }, wait_ms)
-  assert peer.eventually(fn() { rejected(b, c) }, wait_ms)
+  // a and c each hand b's manager a hello with their real MAC and return
+  // once it has been handled, so both rejections have happened.
+  hello_from(a, b)
+  hello_from(c, b)
+  assert rejected(b, a)
+  assert rejected(b, c)
+  assert peer.on(b, fn() { peer_status(peer.node(a)) }) == "rejected"
+  assert peer.on(b, fn() { peer_status(peer.node(c)) }) == "rejected"
+  // Rejecting disconnected nobody. A disconnect is synchronous, so b would
+  // already show it; global's reaction to one would reach a and c as a
+  // nodedown, and no node saw any (nor a reconnect).
+  assert_full_mesh(peers)
+  list.each(watchers, fn(w) {
+    let #(p, watcher) = w
+    assert peer.on(p, fn() { node_events(watcher) }) == []
+  })
   assert members(a) == [peer.node(c)]
+  assert members(c) == [peer.node(a)]
+  assert members(b) == []
 }
 
-const no_partition_prevention = [
-  "-kernel", "prevent_overlapping_partitions", "false",
-]
+/// `from` sends `to`'s manager a hello with `from`'s own MAC and returns
+/// once it has been handled.
+fn hello_from(from: Peer, to: Peer) -> Nil {
+  let to_node = peer.node(to)
+  let mac = cluster.peer_mac(secret)
+  peer.on(from, fn() { send_hello(to_node, mac) })
+}
+
+/// Every peer is connected to every other one.
+fn assert_full_mesh(peers: List(Peer)) -> Nil {
+  list.each(peers, fn(p) {
+    let others =
+      list.filter(peers, fn(q) { q != p })
+      |> list.map(peer.node)
+      |> list.sort(by: node_order)
+    assert list.sort(peer.on(p, nodes), by: node_order) == others
+  })
+}
+
+// --- Why rejection does not disconnect ----------------------------------------
+
+/// The control for the design: with OTP's default overlapping-partition
+/// prevention, one node dropping one connection in a full mesh of three
+/// makes a third node, which dropped nothing, lose a connection too.
+/// `global` on the dropping node reports the loss to the third, which
+/// cuts its own link to the lost node in answer. This is what
+/// `erlang:disconnect_node/1` on a rejected peer used to set off, and why
+/// the manager no longer calls it. No cluster manager runs here.
+pub fn one_disconnect_partitions_the_rest_under_the_otp_default_test_() -> peer.Timeout {
+  use <- Timeout(60)
+  use peers <- peer.with_cluster(3, "brazier_mem_pop")
+  let assert [a, b, c] = peers as "with_cluster(3) starts three peers"
+  assert_full_mesh(peers)
+  list.each(peers, fn(p) { peer.on(p, sync_global) })
+  let watcher = peer.on(c, watch_nodes)
+  let b_node = peer.node(b)
+  peer.on(a, fn() { disconnect(b_node) })
+  // c dropped nothing itself, yet it sees a connection go down.
+  let assert [#("down", lost), ..] =
+    peer.on(c, fn() { node_events_after_down(watcher) })
+    as "c loses a connection after a drops b"
+  assert lost == peer.node(a) || lost == b_node
+}
+
+// --- A rejected peer can still pass ------------------------------------------
+
+/// A verified member that then sends a hello with another key is no longer
+/// a member, and stays connected: membership changed, the connection did
+/// not.
+pub fn verified_member_that_fails_a_later_hello_is_rejected_in_place_test_() -> peer.Timeout {
+  use <- Timeout(60)
+  use peers <- peer.with_cluster(2, "brazier_mem_reverify")
+  let assert [a, b] = peers as "with_cluster(2) starts two peers"
+  record_cluster_events(peers)
+  let watcher = peer.on(a, watch_nodes)
+  let config = cluster.new(cluster.NoDiscovery)
+  start_manager(a, config, secret)
+  start_manager(b, config, secret)
+  let assert Ok(Nil) = peer.await_member(a, peer.node(b), wait_ms)
+    as "a and b share the secret key"
+
+  let a_node = peer.node(a)
+  let bad = cluster.peer_mac(other_secret)
+  peer.on(b, fn() { send_hello(a_node, bad) })
+  assert rejected(a, b)
+  assert members(a) == []
+  assert peer.on(a, fn() { peer_status(peer.node(b)) }) == "rejected"
+  assert peer.on(a, nodes) == [peer.node(b)]
+  assert peer.on(a, fn() { node_events(watcher) }) == []
+
+  // The right key again makes it a member again, on the same connection.
+  hello_from(b, a)
+  assert members(a) == [peer.node(b)]
+  assert peer.on(a, fn() { node_events(watcher) }) == []
+}
+
+/// A process waiting for a node to be verified keeps waiting through a
+/// rejection, and is told once the node passes later on the same
+/// connection. It is told nothing while the node stays rejected.
+pub fn waiter_is_told_when_a_rejected_node_passes_later_test_() -> peer.Timeout {
+  use <- Timeout(60)
+  use peers <- peer.with_cluster(2, "brazier_mem_wait")
+  let assert [a, b] = peers as "with_cluster(2) starts two peers"
+  record_cluster_events(peers)
+  let b_node = peer.node(b)
+  // b runs no manager yet; a's check of b would only time out after 60s.
+  start_manager(
+    a,
+    cluster.new(cluster.NoDiscovery) |> cluster.peer_check_timeout(60_000),
+    secret,
+  )
+  let waiter = peer.on(a, fn() { spawn_verified_waiter(b_node) })
+  let a_node = peer.node(a)
+  peer.on(b, fn() { send_hello(a_node, cluster.peer_mac(other_secret)) })
+  assert rejected(a, b)
+  assert peer.on(a, fn() { waiter_result(waiter, False) }) == 0
+  assert peer.on(a, nodes) == [b_node]
+
+  // b's manager starts with the right key: its init hello passes.
+  start_manager(b, cluster.new(cluster.NoDiscovery), secret)
+  assert peer.on(a, fn() { waiter_result(waiter, True) }) == 1
+  assert members(a) == [b_node]
+  // Exactly one notice, even after a further good hello.
+  hello_from(b, a)
+  assert peer.on(a, fn() { waiter_result(waiter, False) }) == 1
+}
 
 fn start_manager(p: Peer, config: cluster.ClusterConfig, key: String) -> Nil {
   let outcome = peer.on(p, fn() { cluster.start(config, secret_key: key) })
@@ -459,6 +574,33 @@ fn manager_suspend() -> Nil
 
 @external(erlang, "brazier_cluster_test_ffi", "manager_resume")
 fn manager_resume() -> Nil
+
+@external(erlang, "brazier_cluster_test_ffi", "peer_status")
+fn peer_status(node: Node) -> String
+
+@external(erlang, "brazier_cluster_test_ffi", "send_hello")
+fn send_hello(node: Node, mac: BitArray) -> Nil
+
+@external(erlang, "brazier_cluster_test_ffi", "watch_nodes")
+fn watch_nodes() -> Pid
+
+@external(erlang, "brazier_cluster_test_ffi", "node_events")
+fn node_events(watcher: Pid) -> List(#(String, Node))
+
+@external(erlang, "brazier_cluster_test_ffi", "node_events_after_down")
+fn node_events_after_down(watcher: Pid) -> List(#(String, Node))
+
+@external(erlang, "brazier_cluster_test_ffi", "disconnect")
+fn disconnect(node: Node) -> Nil
+
+@external(erlang, "brazier_cluster_test_ffi", "sync_global")
+fn sync_global() -> Nil
+
+@external(erlang, "brazier_cluster_test_ffi", "spawn_verified_waiter")
+fn spawn_verified_waiter(node: Node) -> Pid
+
+@external(erlang, "brazier_cluster_test_ffi", "waiter_result")
+fn waiter_result(waiter: Pid, await: Bool) -> Int
 
 @external(erlang, "brazier_cluster_test_ffi", "record_events")
 fn record_events(names: List(List(String))) -> Nil

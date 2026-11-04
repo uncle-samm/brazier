@@ -31,9 +31,11 @@
 %% manager restarted while its peers stayed connected (they see no nodeup).
 %% A peer whose Mac or version differs, or that sends neither a hello nor
 %% an ack within the check timeout, is rejected: error log,
-%% [brazier, cluster, peer, rejected], erlang:disconnect_node/1. Anyone with
-%% the cookie can already run code on this node, so this guards against
-%% misconfiguration (two deployments sharing a cookie), not an attacker.
+%% [brazier, cluster, peer, rejected], and it is not (or no longer) a
+%% member. It stays connected: the manager never disconnects a node (see
+%% "Why a rejected peer stays connected" below). Anyone with the cookie can
+%% already run code on this node, so this guards against misconfiguration
+%% (two deployments sharing a cookie), not an attacker.
 %%
 %% Verified peers are listed in the protected table brazier_cluster_members
 %% so members/0 and verified/1 read them without a call. The table is the
@@ -41,15 +43,39 @@
 %% revocation send only to verified nodes and drop what unverified nodes
 %% send (brazier_cluster_ffi:verified/1). A node is verified per
 %% connection: its row is removed when it is rejected or goes down, and a
-%% reconnect is checked again.
+%% reconnect is checked again. A rejected node's later hello or ack is
+%% checked again too (its manager may have started late).
 %%
 %% Processes that sync with a peer when it joins (store replicas, session
 %% maintenance) call brazier_cluster_ffi:await_verified/1 on nodeup and get
 %% {brazier_cluster_peer_verified, Node} once the node passes the check,
 %% instead of syncing on nodeup (Phoenix.Tracker replicates only with
-%% replicas it has heard from). The interest is one-shot and dropped when
-%% the node is rejected or goes down: a node that never passes is never
-%% synced with.
+%% replicas it has heard from). The interest is one-shot, kept while the
+%% node stays connected (a rejected node may still pass later) and dropped
+%% when it goes down: a node that never passes is never synced with.
+%%
+%% Why a rejected peer stays connected. Under OTP's default
+%% kernel prevent_overlapping_partitions=true, global treats every lost
+%% connection as a partition to close. When this node drops Node,
+%% global:handle_nodedown/3 here (global.erl, OTP 28) sees a plain
+%% `disconnected` and calls inform_connection_loss/2, which multicasts
+%% {lost_connection, node(), _, _, Node} to every other node it knows.
+%% Each receiver R (handle_info({lost_connection, ...}), ibid.) relays it,
+%% sends {remove_connection, R} to Node and drops Node itself, and Node
+%% then disconnects R (handle_info({remove_connection, ...})). Nothing checks who reported the loss:
+%% when an intruder b rejects the verified members a and c and
+%% disconnects a, b's global tells c "b lost a", and c and a cut their own
+%% connection. With no discovery nothing reconnects them, so one
+%% misconfigured node partitions the deployment it was refused from. A
+%% plain-OTP mesh of three nodes where one calls erlang:disconnect_node/1
+%% ends with all three apart. OTP's own answer is that only
+%% global:disconnect/0, run on the node that leaves, removes a node
+%% without that cascade; a node cannot make another one run it. So
+%% rejection is a membership decision, not a connection one, as in OTP 25's
+%% global_group (disconnect_nodes/1 no longer calls
+%% erlang:disconnect_node/1; the node is just excluded) and in Mnesia,
+%% which ignores connected nodes outside db_nodes. The connection carries
+%% only what membership lets through, which is nothing from Brazier.
 %%
 %% Timers carry their reference ({timeout, TRef, {peer_check, Node}} from
 %% erlang:start_timer/3), and the peer check timeout acts only when it is
@@ -94,13 +120,16 @@ init(Config = #{discovery := Discovery}) ->
     State0 = Config#{
         %% Node => #{attempts := N, timer := TRef | none, inflight := Ref | none}
         targets => #{},
-        %% Node => {pending, TRef} | verified
+        %% Node => {pending, TRef} | verified | rejected, for connected
+        %% nodes only (removed on nodedown).
         peers => #{},
         %% MonitorRef => {connect, Node} | {resolve, Pid, TimeoutRef}
         jobs => #{},
-        %% Node => [Pid]: processes told when Node passes the check. Only
-        %% connected nodes have interests, and they are dropped when the
-        %% node is verified, rejected or goes down, so this stays bounded.
+        %% Node => [Pid]: live local processes told when Node passes the
+        %% check. Only connected nodes have interests; they are dropped
+        %% when the node is verified or goes down, and dead waiters are
+        %% pruned on every new wait, so a node that stays rejected holds at
+        %% most one entry per live process.
         interests => #{},
         dns_atoms => dns_atom_counter()
     },
@@ -118,7 +147,11 @@ handle_call(Request, From, State) ->
     brazier_log_ffi:warning(<<"brazier.cluster">>, "Unexpected call ~p from ~p", [Request, From]),
     {reply, {error, unknown_call}, State}.
 
-handle_cast({await_verified, Node, Pid}, State) when is_atom(Node), is_pid(Pid) ->
+%% Waiters are local (brazier_cluster_ffi:await_verified/1 sends self()):
+%% pruning them uses is_process_alive/1, which takes local pids only, so a
+%% remote one falls through to the unexpected-cast warning.
+handle_cast({await_verified, Node, Pid}, State) when is_atom(Node), is_pid(Pid),
+                                                     node(Pid) =:= node() ->
     {noreply, await_verified(Node, Pid, State)};
 handle_cast(Request, State) ->
     brazier_log_ffi:warning(<<"brazier.cluster">>, "Unexpected cast ~0P", [Request, 10]),
@@ -252,6 +285,13 @@ peer_up(Node, State = #{peers := Peers, mac := Mac, check_timeout_ms := Timeout}
         verified ->
             %% Its hello arrived before our nodeup.
             State;
+        rejected ->
+            %% Its hello arrived before our nodeup and failed; the hello
+            %% just sent lets its manager check us, and a later hello from
+            %% it is checked again. No timer: it was already judged.
+            brazier_log_ffi:debug(<<"brazier.cluster">>, "Node up for ~p, already rejected on this "
+                                 "connection", [Node]),
+            State;
         {pending, Old} ->
             %% A node that connected between monitor_nodes/2 and nodes()
             %% in init is checked twice; the newer timer replaces the old.
@@ -272,13 +312,24 @@ peer_down(Node, State = #{peers := Peers}) ->
         {verified, Rest} ->
             true = ets:delete(?MEMBERS, Node),
             State1#{peers := Rest};
+        {rejected, Rest} ->
+            brazier_log_ffi:info(<<"brazier.cluster">>, "Rejected peer ~p went down", [Node]),
+            State1#{peers := Rest};
         error ->
             State1
     end.
 
 peer_status(verified) -> verified;
+peer_status(rejected) -> rejected;
 peer_status({pending, _}) -> pending_newer_check;
 peer_status(none) -> not_connected.
+
+%% The member table and the peers map agree on Node: a row exactly when
+%% the node is verified. Checked after every transition that touches both.
+assert_membership(Node, #{peers := Peers}) ->
+    Verified = maps:get(Node, Peers, none) =:= verified,
+    Verified = ets:member(?MEMBERS, Node),
+    ok.
 
 %% A hello or ack names its sender; one from a node that is not connected
 %% (a forged FromNode, or a message that outlived its connection) must not
@@ -303,13 +354,20 @@ await_verified(Node, Pid, State = #{peers := Peers, interests := Interests}) ->
         _ ->
             case lists:member(Node, nodes()) of
                 true ->
-                    %% Pending, or connected and its nodeup not yet handled
-                    %% here (the caller saw its own nodeup first).
-                    Waiting = maps:get(Node, Interests, []),
-                    case lists:member(Pid, Waiting) of
-                        true -> State;
-                        false -> State#{interests := Interests#{Node => [Pid | Waiting]}}
-                    end;
+                    %% Pending, rejected (it may still pass on a later
+                    %% hello), or connected and its nodeup not yet handled
+                    %% here (the caller saw its own nodeup first). A
+                    %% rejected node can stay connected indefinitely, so
+                    %% waiters that died meanwhile are pruned here.
+                    Live = [P || P <- maps:get(Node, Interests, []), is_process_alive(P)],
+                    Waiting = case lists:member(Pid, Live) of
+                                  true -> Live;
+                                  false -> [Pid | Live]
+                              end,
+                    brazier_log_ffi:debug(<<"brazier.cluster">>, "~p waits for ~p to be verified (~p, ~b "
+                                         "waiting)", [Pid, Node, peer_status(maps:get(Node, Peers, none)),
+                                                      length(Waiting)]),
+                    State#{interests := Interests#{Node => Waiting}};
                 false ->
                     brazier_log_ffi:debug(<<"brazier.cluster">>, "Not waiting for ~p for ~p: it is not "
                                          "connected", [Node, Pid]),
@@ -331,8 +389,8 @@ notify_verified(Node, State = #{interests := Interests}) ->
 drop_interests(Node, State = #{interests := Interests}) ->
     case maps:take(Node, Interests) of
         {Waiting, Rest} ->
-            brazier_log_ffi:debug(<<"brazier.cluster">>, "Dropping ~b waits for ~p: it was not verified",
-                                 [length(Waiting), Node]),
+            brazier_log_ffi:debug(<<"brazier.cluster">>, "Dropping ~b waits for ~p: it went down "
+                                 "unverified", [length(Waiting), Node]),
             State#{interests := Rest};
         error ->
             State
@@ -343,13 +401,16 @@ check(Node, ?PROTOCOL_VERSION, TheirMac, State = #{mac := Mac, peers := Peers})
     case crypto:hash_equals(pad(TheirMac, byte_size(Mac)), Mac)
          andalso byte_size(TheirMac) =:= byte_size(Mac) of
         true ->
-            case maps:get(Node, Peers, none) of
+            Previous = maps:get(Node, Peers, none),
+            case Previous of
                 {pending, TRef} -> cancel(TRef);
                 _ -> ok
             end,
             true = ets:insert(?MEMBERS, {Node, erlang:system_time(millisecond)}),
-            brazier_log_ffi:info(<<"brazier.cluster">>, "Peer verified: ~p", [Node]),
+            brazier_log_ffi:info(<<"brazier.cluster">>, "Peer verified: ~p (was ~p)",
+                                [Node, peer_status(Previous)]),
             State1 = reset_attempts(Node, State#{peers := Peers#{Node => verified}}),
+            ok = assert_membership(Node, State1),
             {verified, notify_verified(Node, State1)};
         false ->
             {rejected, reject(Node, <<"secret key mismatch">>, State)}
@@ -363,14 +424,29 @@ check(Node, Version, _Mac, State) ->
 pad(Bin, Size) when byte_size(Bin) >= Size -> binary:part(Bin, 0, Size);
 pad(Bin, Size) -> <<Bin/binary, 0:((Size - byte_size(Bin)) * 8)>>.
 
-reject(Node, Reason, State) ->
-    brazier_log_ffi:error(<<"brazier.cluster">>, "Rejecting peer ~p: ~ts; disconnecting", [Node, Reason]),
+%% Rejection removes Node from the membership and leaves its connection
+%% alone. Disconnecting it here would make global, under the default
+%% prevent_overlapping_partitions, tell every other node that this node
+%% lost Node, and they would disconnect from each other in turn (see the
+%% module comment). Node stays connected until it goes down; its waiters
+%% are kept, since a later hello may still verify it.
+reject(Node, Reason, State = #{peers := Peers}) ->
+    Previous = maps:get(Node, Peers, none),
+    brazier_log_ffi:error(<<"brazier.cluster">>, "Rejecting peer ~p (was ~p): ~ts; it is not a member "
+                         "and stays connected, take it out of this cluster with "
+                         "global:disconnect() run on it", [Node, peer_status(Previous), Reason]),
     ok = brazier_telemetry_ffi:cluster_peer_rejected(atom_to_binary(Node), Reason),
-    %% disconnect_node/1 returns false when the node is already gone, which
-    %% is the outcome we want either way; the nodedown is handled as usual.
-    Disconnected = erlang:disconnect_node(Node),
-    brazier_log_ffi:info(<<"brazier.cluster">>, "disconnect_node(~p) -> ~p", [Node, Disconnected]),
-    bump_attempts(Node, peer_down(Node, State)).
+    case Previous of
+        {pending, TRef} -> cancel(TRef);
+        _ -> ok
+    end,
+    %% A verified node that now fails (another hello on the same
+    %% connection) loses its membership; for any other state there is no
+    %% row and the delete does nothing.
+    true = ets:delete(?MEMBERS, Node),
+    State1 = State#{peers := Peers#{Node => rejected}},
+    ok = assert_membership(Node, State1),
+    State1.
 
 %% --- Discovery ---
 
@@ -558,7 +634,8 @@ connect_failed(Node, Reason, State = #{discovery := Discovery}) ->
             State
     end.
 
-%% A static target that went down or was rejected is retried with backoff.
+%% A static target that went down is retried with backoff. A rejected one
+%% stays connected, so it needs no retry.
 retry_target(Node, State = #{discovery := {static, _}, targets := Targets}) ->
     case maps:is_key(Node, Targets) of
         true ->

@@ -14,6 +14,9 @@
          write_optfile/1, atom_exists/1, state_holds/1, status_holds/1,
          send_marked_hellos/1, manager_suspend/0, manager_resume/0, manager_barrier/0,
          pending_check/1, nodeup_queued/1, send_check_timeout/2, reconnect/1,
+         peer_status/1, send_hello/2, watch_nodes/0, node_events/1,
+         node_events_after_down/1, disconnect/1, sync_global/0,
+         spawn_verified_waiter/1, waiter_result/2,
          forge_forward/3, deliver_forged/2, store_message_from/1,
          presence_message_from/1, partition_churn/3]).
 
@@ -369,6 +372,129 @@ nodeup_queued(Node) ->
 %% The message erlang:start_timer/3 delivers when the check timer TRef fires.
 send_check_timeout(TRef, Node) ->
     ?MANAGER ! {timeout, TRef, {peer_check, Node}},
+    nil.
+
+%% The manager's record of Node: "verified", "rejected", "pending" or
+%% "none" (not connected, or not yet seen).
+peer_status(Node) ->
+    case sys:get_state(?MANAGER) of
+        #{peers := #{Node := verified}} -> <<"verified">>;
+        #{peers := #{Node := rejected}} -> <<"rejected">>;
+        #{peers := #{Node := {pending, _}}} -> <<"pending">>;
+        #{peers := _} -> <<"none">>
+    end.
+
+%% Send Node's manager a hello from this node carrying Mac, and return once
+%% it has handled it: the hello and the sys call go from one process to
+%% one process, so they arrive in order.
+send_hello(Node, Mac) ->
+    {?MANAGER, Node} ! {brazier_cluster_hello, node(), 1, Mac},
+    _ = sys:get_state({?MANAGER, Node}),
+    nil.
+
+%% A process that records every nodeup and nodedown this node sees from
+%% now on, in order. Returns once it is subscribed.
+watch_nodes() ->
+    Parent = self(),
+    Ready = make_ref(),
+    Pid = spawn(fun() ->
+                        ok = net_kernel:monitor_nodes(true),
+                        Parent ! Ready,
+                        watch_loop([])
+                end),
+    receive Ready -> Pid
+    after 5000 -> error({watch_nodes, not_subscribed})
+    end.
+
+watch_loop(Acc) ->
+    receive
+        {nodeup, Node} -> watch_loop([{<<"up">>, Node} | Acc]);
+        {nodedown, Node} -> watch_loop([{<<"down">>, Node} | Acc]);
+        {get, From, Ref} -> From ! {Ref, lists:reverse(Acc)}, watch_loop(Acc);
+        {await_down, From, Ref} ->
+            case lists:keymember(<<"down">>, 1, Acc) of
+                true ->
+                    From ! {Ref, lists:reverse(Acc)},
+                    watch_loop(Acc);
+                false ->
+                    receive
+                        {nodedown, Node} ->
+                            Acc1 = [{<<"down">>, Node} | Acc],
+                            From ! {Ref, lists:reverse(Acc1)},
+                            watch_loop(Acc1)
+                    after 10000 ->
+                        From ! {Ref, lists:reverse(Acc)},
+                        watch_loop(Acc)
+                    end
+            end
+    end.
+
+%% What a watch_nodes/0 process has seen so far, oldest first.
+node_events(Pid) ->
+    ask(Pid, get).
+
+%% The same, once it has seen a nodedown (or after 10s without one).
+node_events_after_down(Pid) ->
+    ask(Pid, await_down).
+
+%% Send Pid {Tag, From, Ref} and wait for its {Ref, Answer}.
+ask(Pid, Tag) ->
+    Ref = monitor(process, Pid),
+    Pid ! {Tag, self(), Ref},
+    receive
+        {Ref, Answer} -> true = demonitor(Ref, [flush]), Answer;
+        {'DOWN', Ref, process, Pid, Reason} -> error({helper_down, Tag, Reason})
+    after 15000 -> error({helper_timeout, Tag})
+    end.
+
+%% A process that asks the manager to be told when Node is verified, and
+%% keeps whether it was. Returns once the manager has handled the request.
+spawn_verified_waiter(Node) ->
+    Parent = self(),
+    Ready = make_ref(),
+    Pid = spawn(fun() ->
+                        {ok, nil} = brazier_cluster_ffi:await_verified(Node),
+                        _ = sys:get_state(?MANAGER),
+                        Parent ! Ready,
+                        waiter_loop(Node, 0)
+                end),
+    receive Ready -> Pid
+    after 5000 -> error({spawn_verified_waiter, not_registered})
+    end.
+
+%% One notice at most is expected: a second is a failure the next
+%% waiter_result/1 reports.
+waiter_loop(Node, Told) ->
+    receive
+        {brazier_cluster_peer_verified, Node} ->
+            waiter_loop(Node, Told + 1);
+        {now, From, Ref} ->
+            From ! {Ref, Told},
+            waiter_loop(Node, Told);
+        {await, From, Ref} when Told =:= 0 ->
+            receive
+                {brazier_cluster_peer_verified, Node} -> From ! {Ref, 1}, waiter_loop(Node, 1)
+            after 10000 -> From ! {Ref, 0}, waiter_loop(Node, 0)
+            end;
+        {await, From, Ref} ->
+            From ! {Ref, Told},
+            waiter_loop(Node, Told)
+    end.
+
+%% How many verified notices a spawn_verified_waiter/1 process has had:
+%% Await true waits (up to 10s) for the first one, false answers now.
+waiter_result(Pid, Await) ->
+    ask(Pid, case Await of true -> await; false -> now end).
+
+%% Returns once global on this node has synced with every connected node.
+sync_global() ->
+    ok = global:sync(),
+    nil.
+
+%% Drop the connection to Node, as the cluster manager once did to a
+%% rejected peer.
+disconnect(Node) ->
+    true = erlang:disconnect_node(Node),
     nil.
 
 %% Drop the connection to Node and connect again.

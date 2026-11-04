@@ -316,13 +316,17 @@ When a node connects, both sides exchange
 `secret_key` is the app's secret key. The purpose label keeps the MAC
 distinct from every token signature made with that key.
 
-- If the key or the version differs, the peer is disconnected.
+- If the key or the version differs, the peer is rejected.
 - If the peer sends nothing within `peer_check_timeout` (default 5s), it is
-  disconnected. Each timer belongs to one connection. When a node goes
+  rejected. Each timer belongs to one connection. When a node goes
   down and reconnects as its old timer fires, that old timer is ignored
   and the new connection keeps its full timeout.
 - Each rejection is logged at error level and emits
   `[brazier, cluster, peer, rejected]`.
+- A rejected peer is not a member, and **it stays connected**. A later
+  hello from it is checked again, so a peer whose manager started late
+  still joins. A member that sends a hello with the wrong key stops being
+  a member.
 - A hello in an unexpected shape is dropped and logged at warning level,
   with its sender and size only.
 - The MAC is never logged. `sys:get_status` and the manager's crash
@@ -334,6 +338,36 @@ sharing a cookie, or two releases with incompatible protocols. **It is not
 a security boundary:** a node that holds the cookie can already run code
 before the check finishes. TLS and the network rules above are the
 boundary.
+
+#### Why a rejected peer is not disconnected
+
+OTP's `global` prevents overlapping partitions by default (the kernel
+parameter `prevent_overlapping_partitions` is `true`). When a node loses a
+connection, `global` on that node tells every other node it knows. Each of
+them then drops its own connection to the lost node, and asks that node to
+drop its side. No node checks who sent the report.
+
+So if node `b` of another deployment rejected the members `a` and `c` and
+disconnected `a`, `b` would tell `c` that it had lost `a`. Then `c` and `a`
+would cut the connection between them, though both are real members.
+Without discovery, nothing would connect them again. In a plain mesh of
+three OTP nodes, one `erlang:disconnect_node/1` leaves all three apart.
+
+OTP documents `global:disconnect/0`, run on the node that leaves, as the
+only way to leave without this cascade. One node cannot make another run
+it. Rejection therefore changes membership, not connections. OTP 25's
+`global_group` does the same: `disconnect_nodes/1` now excludes a node
+instead of disconnecting it. Mnesia likewise ignores connected nodes
+outside `db_nodes`. Brazier exchanges nothing with a node that is not a
+member (see [Membership](#membership)).
+
+A rejected peer is a configuration error. To fix it:
+
+- Give each deployment its own cookie, so the nodes cannot connect at all.
+- Or give each deployment its own TLS certificate authority. See
+  [Encrypt and authenticate with TLS](#2-encrypt-and-authenticate-with-tls).
+- To take a running node out of a cluster now, run `global:disconnect()`
+  on that node. It drops every connection without the cascade.
 
 ### Membership
 
@@ -358,7 +392,7 @@ to members only, and what any other node sends is dropped:
 There is no fallback to every connected node. Without a running cluster
 manager, no remote node is a member, so these features stay on this node.
 Membership is per connection. A node loses it when it is rejected or goes
-down, and is checked again when it reconnects.
+down. It is checked again on its next hello, or when it reconnects.
 
 ## PubSub across nodes
 
