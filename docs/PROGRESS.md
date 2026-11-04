@@ -265,7 +265,7 @@
   - Old names: `brazier.start`, `start_supervised` and `cluster.start` refuse to start when `BEACON_ENV` or `BEACON_SHUTDOWN_TIMEOUT` is set (one error log per variable naming the new one, then a `ConfigError`; the old value is never read). The bench refuses `BEACON_BENCH_RUNS`, and the scripts and `test_all_cdp.py` refuse any `BEACON_*` (`scripts/refuse_renamed_env.sh`).
   - Old names left on purpose: the published dev secret `beacon-dev-secret-change-in-production` (refused as a weak key in its real spelling), `gleam.toml` `repo = "beacon"` (the GitHub repository is not renamed), the CHANGELOG history and README rename note, the archived and design docs, and this file's earlier entries.
   - Follow-ups: an example's client build resolves dependencies from Hex every time, since no manifest is kept for the client project, so parallel builds can hit Hex's rate limit; a lint rule against stale `beacon` names in `src`, `test` and `examples`, with an allowlist for the refusals and the dev secret.
-- [ ] Final read-only audits (security, stability, tigerstyle, performance) and fixes
+- [x] Final read-only audits (security, stability, tigerstyle, performance) and fixes
   - Audits started 2026-11-04 at f393ef2: four read-only agents (security, stability with the open runtime-stop flake, TigerStyle/engineering rules, performance), each in its own scratch worktree. Findings are then split into fix agents by file ownership.
   - Audits reported 2026-11-04: 52 findings.
     - Security: SEC-1 to SEC-17, with 2 high. SEC-1 is a URL scheme check that a combining mark defeats (stored XSS). SEC-2 is route-scoped middleware not gating WebSocket mounts or navigation.
@@ -608,6 +608,39 @@
       - `middleware.rate_limit_behind_proxies` resolves the client again on the WS middleware gate, so a malformed hop can still be logged a second time on that path;
       - `ip.parse_trusted_proxies` and `parse_allowed_hosts` log their own line before "Invalid security limits" (two different lines for one refusal);
       - no CDP scenario covers the fragment scroll yet; only the ffi harness does.
+  - [x] w4-bench-gate (PERF-9), merged as e72d35a (branch `worktree-agent-a4892bc1673d37d83`, commit 4b274e8).
+    - New benches, each documented in `docs/PERFORMANCE.md` (Scenarios) and `docs/TESTING.md` (Benchmarks):
+      - static files: 100 KB and 10 MB, each with 200 and 304 responses;
+      - `http.gzip_100kb`, and `ssr.rows_100` / `ssr.rows_1000`;
+      - client render and patch at 100 and 1000 rows, run in node;
+      - `presence.track`, `untrack` and `list` at 10 and 10k entries;
+      - `store.crdt_append` at 10, 1000 and 10k keys.
+    - The gate now covers all 87 metrics:
+      - spread is (max − min) / median over the baseline runs, and a metric's tolerance is max(25%, spread), allowed only while the spread is under 50%;
+      - `make bench-baseline` refuses to write a baseline that holds an ungated metric: it names each one, writes `build/bench/refused_baseline.json` and exits 2;
+      - `make bench-check` fails, naming the metric, on a regression, a too-noisy metric, a metric missing from the run or the baseline, or a changed unit or direction; a different machine fails before anything is compared;
+      - `report_test`, `cli_test` and the new `measure_test` cover these unhappy paths, including a spread exactly at the 50% bound and a value exactly at the limit.
+    - Measurement changes:
+      - each p50/p99 is the median of the per-round p50/p99 (as criterion and JMH report it); sequence scenarios are cut into 5 rounds;
+      - each scenario runs in a fresh process (as Benchee does), because the bench process's growing heap doubled `pubsub.fanout.1.p99` in-suite;
+      - HTTP scenarios run 15 measured rounds instead of 5.
+    - TS-12 is done in the bench files. The coordinator checked `src/`: the `let-assert-message` lint rule (from w4-server-sweep) reports 0 violations.
+    - The merged tree did not build: `client_bench` used `program.absolute_path` as a `String`, which w5-store-build made a `Result`. The coordinator fixed it in the merge commit, passing the error up with context.
+    - Coordinator verify on the merged tree (e72d35a): clean build with zero warnings, format and lint clean, 1932 tests passing in each of 3 runs, docs check OK, and test-client OK on the branch merge (58 scenarios).
+    - `make bench-check` on the merged tree fails, for two separate reasons:
+      - `store.crdt_append.*` is 3.6–5.4× its baseline (about 0.5 µs → 2.7 µs a write). This is real: the baseline was taken at 75a71a8, before w5-store-build made the digest incremental, and is the cost of hashing each write with SHA-256 so that a digest read is O(1) instead of about 1.2M reductions at 10k keys. Accepted, as w5-store-build recorded; the re-baseline in final verification takes it in.
+      - six HTTP/SSR/WS p99 metrics are 1.26–1.45× over a 1.25× limit. This is the machine: every HTTP and WS metric was 4–21% slower, throughput included, and on paths no merge touched (`http.keepalive.8c`). An A/B run of the agent's own pre-merge commit (4b274e8) under the same conditions also failed `http.static.*.latency_p99` at 1.34–1.54×. The bench's own load generators drive the load average from about 8 to 11 during a run.
+    - Decisions:
+      - the merge was committed with the bench gate red, for the two reasons above; final verification re-baselines and must pass `make bench-check`;
+      - the 25% floor did not hold for static-file p99 between two runs about 3 h apart on this machine. If an idle-machine baseline still fails a fresh check, the gate's p99 tolerance needs revisiting (more rounds or a wider floor for tails), not the code.
+    - Follow-ups (real costs the new benches show):
+      - SSR at 1000 rows takes about 8 ms a page, against 1 ms at 100 rows;
+      - the client spends about 1.1 ms decoding the model at 1000 rows, and a patch costs about 2.8 ms;
+      - `presence.list` at 10k entries takes about 5.9 ms, because it copies the whole room;
+      - the DOM morph is not measured (needs a CDP bench);
+      - the ws scenario logs "Join ... carries no build id" on every join (the `docs/TODO.md` item);
+      - 6 atoms leak per suite run;
+      - `ws.100x200` still runs only 5 rounds.
 - [ ] Final verification: build (zero warnings), tests, all examples, CDP browser suite, perf baselines
 
 **Decisions (Milestone 117, coordinator):**
