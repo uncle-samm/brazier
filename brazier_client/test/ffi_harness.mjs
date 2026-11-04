@@ -463,6 +463,7 @@ function freshGlobals(options = {}) {
   parseInto(root, options.ssr || "");
   globalThis.location = {
     protocol: "http:",
+    origin: "http://localhost",
     host: "localhost",
     hostname: "localhost",
     pathname: "/",
@@ -1367,6 +1368,71 @@ scenario("server navigation pushes or replaces local paths and flushes pending i
   assert.equal(window.location.href, undefined);
   s.deliver({ type: "hard_navigate", path: "/login" });
   assert.equal(window.location.href, "/login");
+});
+
+// SEC-5: the URL parser reads "\" as "/" and strips tab, newline and
+// carriage return, so each of these would load evil.example.
+const OFF_ORIGIN_PATHS = ["/\\evil.example", "/\t/evil.example", "/\n/evil.example", "/\r/evil.example", "/x\\..\\\\evil.example", "/%09/evil.example", "\\\\evil.example"];
+
+scenario("server navigate and hard_navigate refuse paths a browser resolves to another host", async () => {
+  await loadRuntime({ path: "/a" });
+  const s = sockets[0];
+  s.open();
+  sync(s, 0, {});
+  const navigatesBefore = s.types().filter((t) => t === "navigate").length;
+  for (const path of OFF_ORIGIN_PATHS) {
+    s.deliver({ type: "navigate", path });
+    s.deliver({ type: "navigate", path, replace: true });
+    s.deliver({ type: "hard_navigate", path });
+  }
+  assert.deepEqual(historyLog.pushed, [], "no refused path is pushed");
+  assert.deepEqual(historyLog.replaced, [], "no refused path replaces the entry");
+  assert.equal(window.location.href, undefined, "no refused path is loaded");
+  assert.equal(location.pathname, "/a");
+  assert.equal(s.types().filter((t) => t === "navigate").length, navigatesBefore, "nothing is sent for a refused path");
+  assert.equal(errorsMatching("Server navigate rejected: not a local path (").length, 2 * OFF_ORIGIN_PATHS.length);
+  assert.equal(errorsMatching("Hard navigate rejected: not a local path (").length, OFF_ORIGIN_PATHS.length);
+  assert.equal(errorsMatching("control character").length, 3 * 3, "tab, newline and carriage return name their reason");
+  s.deliver({ type: "hard_navigate", path: "/café?q=a%20b" });
+  assert.equal(window.location.href, "/café?q=a%20b", "a same-origin path still loads");
+});
+
+scenario("a model_sync or patch without a valid ack_clock is a protocol error that resyncs", async () => {
+  await loadRuntime();
+  const s = sockets[0];
+  s.open();
+  const requests = () => s.types().filter((t) => t === "request_sync").length;
+  s.deliver({ type: "model_sync", model: JSON.stringify({ count: 1 }), version: 0 });
+  assert.equal(decoded.length, 0, "a model_sync without ack_clock is not applied");
+  assert.equal(errorsMatching("invalid ack_clock undefined").length, 1);
+  assert.equal(requests(), 1);
+  sync(s, 0, { count: 0 });
+  assert.deepEqual(decoded.at(-1), { count: 0 }, "a valid model_sync recovers");
+  for (const [i, ackClock] of [undefined, "1", -1, 1.5, null].entries()) {
+    sync(s, i, { count: i });
+    s.deliver({ type: "patch", ops: JSON.stringify([{ op: "replace", path: "/count", value: 99 }]), version: i + 1, ack_clock: ackClock });
+    assert.deepEqual(decoded.at(-1), { count: i }, `a patch with ack_clock ${JSON.stringify(ackClock)} is not applied`);
+    assert.equal(s.types().at(-1), "request_sync", `a patch with ack_clock ${JSON.stringify(ackClock)} resyncs`);
+  }
+  assert.equal(errorsMatching("has invalid ack_clock").length, 5);
+  s.deliver({ type: "model_sync", model: JSON.stringify({ count: 7 }), version: 9, ack_clock: "9" });
+  assert.notDeepEqual(decoded.at(-1), { count: 7 }, "a model_sync with a string ack_clock is not applied");
+  assert.equal(errorsMatching('invalid ack_clock "9"').length, 1);
+});
+
+scenario("an event without a valid clock is refused before it is queued", async () => {
+  const runtime = await loadRuntime();
+  const s = sockets[0];
+  s.open();
+  sync(s, 0, { count: 0 });
+  const { clock: _dropped, ...unclocked } = event(1);
+  for (const bad of [unclocked, { ...event(1), clock: "1" }, { ...event(1), clock: -1 }]) {
+    assert.throws(() => runtime.ws_send(JSON.stringify(bad)), /every event needs a clock/);
+    assert.throws(() => runtime.ws_send(JSON.stringify({ type: "event_batch", events: [event(2), bad] })), /every event needs a clock/);
+  }
+  assert.equal(s.events().length, 0, "nothing was queued");
+  runtime.ws_send(JSON.stringify(event(3)));
+  assert.equal(s.events().at(-1).clock, 3, "a clocked event is sent");
 });
 
 scenario("a dev reload message reloads the page every time, outside the reload guard", async () => {

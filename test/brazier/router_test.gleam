@@ -5,7 +5,9 @@ import brazier/log_capture
 import brazier/router
 import brazier/runtime
 import brazier/transport
+import gleam/dynamic/decode
 import gleam/erlang/process
+import gleam/json
 import gleam/list
 import gleam/option
 import gleam/string
@@ -85,6 +87,70 @@ pub fn check_local_path_refuses_paths_a_browser_reads_as_another_host_test() {
   let assert Error("it contains \"/%09\"" <> _) =
     router.check_local_path("/%09/evil.example")
 }
+
+/// The client's localPathRefusal (brazier_client/src/brazier_client/patch.mjs)
+/// gives the verdict check_local_path gives, reason for reason, on every
+/// path here: the server refuses to send what the client would refuse to
+/// follow, and neither accepts a path the other refuses.
+pub fn client_local_path_rule_matches_server_test() {
+  let paths = [
+    "/", "/users/7?tab=posts", "/search?q=a%20b#top", "/users/J%C3%BCrgen",
+    "/caf\u{E9}/a b", "/x ", "/\u{2028}", "/%2F%2Fevil.example", "/a/%0A",
+    "//evil.example/x", "https://evil.example/", "javascript:alert(1)", "",
+    "users", " /x", "\\\\evil.example", "/\\evil.example",
+    "/a\\..\\\\evil.example", "/ok?next=\\\\evil.example", "/\t/evil.example",
+    "/\n/evil.example", "/\r/evil.example", "/x\u{0}y", "/x\u{1F}y", "/x\u{7F}y",
+    "/%09/evil.example", "/a/%09",
+  ]
+  let expected =
+    list.map(paths, fn(path) {
+      case router.check_local_path(path) {
+        Ok(Nil) -> option.None
+        Error(reason) -> option.Some(reason)
+      }
+    })
+  let file = scratch_path("local_path_parity.json")
+  let assert Ok(Nil) =
+    write_file(file, json.to_string(json.array(paths, json.string)))
+    as "router_test: could not write the parity paths file"
+  let output = case
+    run_node("brazier_client/test/local_path_parity.mjs", file)
+  {
+    Ok(output) -> output
+    Error(output) -> panic as { "client local path parity failed: " <> output }
+  }
+  let assert Ok(#(_, verdicts)) = string.split_once(output, "verdicts: ")
+    as { "local_path_parity.mjs printed no verdicts: " <> output }
+  let assert Ok(actual) =
+    json.parse(verdicts, decode.list(decode.optional(decode.string)))
+    as {
+      "local_path_parity.mjs printed verdicts that do not decode: " <> output
+    }
+  let assert True = list.length(actual) == list.length(paths)
+    as "local_path_parity.mjs gave a verdict count that differs from the paths"
+  list.zip(paths, list.zip(expected, actual))
+  |> list.each(fn(entry) {
+    let #(path, #(server, client)) = entry
+    let assert True = server == client
+      as {
+        "server and client disagree on "
+        <> string.inspect(path)
+        <> ": server "
+        <> string.inspect(server)
+        <> ", client "
+        <> string.inspect(client)
+      }
+  })
+}
+
+@external(erlang, "brazier_patch_test_ffi", "run_node")
+fn run_node(script: String, arg: String) -> Result(String, String)
+
+@external(erlang, "brazier_patch_test_ffi", "write_file")
+fn write_file(path: String, contents: String) -> Result(Nil, String)
+
+@external(erlang, "brazier_patch_test_ffi", "scratch_path")
+fn scratch_path(name: String) -> String
 
 pub fn backslash_push_logs_error_with_reason_test() {
   let #(Nil, logs) =

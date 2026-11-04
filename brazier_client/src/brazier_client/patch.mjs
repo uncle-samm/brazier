@@ -493,6 +493,48 @@ function isRevision(value) {
 }
 
 /**
+ * Whether `value` is a valid event clock or ack_clock: a non-negative safe
+ * integer. The server always sends ack_clock and the client stamps every
+ * event, so anything else is a protocol error, never a default of 0.
+ */
+export function isWireClock(value) {
+  return Number.isSafeInteger(value) && value >= 0;
+}
+
+/**
+ * Why `path` is not a same-origin absolute path for a page at `origin`, or
+ * null when it is one.
+ *
+ * A browser resolves more than "//host" to another origin: the URL parser
+ * reads "\" as "/" and strips tab, newline and carriage return anywhere, so
+ * "/\evil.com" and "/<tab>/evil.com" both load evil.com. The character rule
+ * is Phoenix's validate_local_url (no leading "//", no "\", no "/%09") plus
+ * every ASCII control character; it is the same rule, with the same
+ * reasons, as check_local_path in src/brazier/router.gleam (router_test
+ * compares the two). The path must then also resolve to `origin`.
+ */
+export function localPathRefusal(path, origin) {
+  if (typeof path !== "string") return "it is not a string";
+  if (path.startsWith("//") || path.startsWith("/\\")) {
+    return "it starts with two slashes, which a browser reads as another host";
+  }
+  if (!path.startsWith("/")) return 'it does not start with "/"';
+  if (path.includes("\\")) return 'it contains a backslash, which a browser reads as "/"';
+  if (path.includes("/%09")) return 'it contains "/%09", an encoded tab some browsers strip';
+  if (/[\u0000-\u001f\u007f]/.test(path)) {
+    return 'it contains a control character, which a browser may strip (a tab between two slashes leaves "//")';
+  }
+  let resolved;
+  try {
+    resolved = new URL(path, origin);
+  } catch (e) {
+    return "it does not resolve against " + String(origin) + ": " + e.message;
+  }
+  if (resolved.origin !== origin) return "it resolves to " + resolved.origin + ", not " + origin;
+  return null;
+}
+
+/**
  * Decide what to do with a model_sync.
  * state = { version, synced } where synced is false until the first
  * model_sync of the current connection has been applied.

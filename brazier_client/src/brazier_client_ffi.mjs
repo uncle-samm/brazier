@@ -37,6 +37,8 @@ import {
   classifyPatch,
   closeAction,
   heartbeatAllowed,
+  isWireClock,
+  localPathRefusal,
   messageCost,
   PacedQueue,
   parseReloadHistory,
@@ -572,10 +574,20 @@ function shouldHoldServerState(ackClock, kind, version) {
 function queuedEventClock() {
   let max = 0;
   for (const msg of outbound.messages()) {
-    if (msg.type === "event") max = Math.max(max, msg.clock);
-    else if (msg.type === "event_batch") for (const e of msg.events) max = Math.max(max, e.clock || 0);
+    if (msg.type === "event") max = Math.max(max, eventClockOf(msg));
+    else if (msg.type === "event_batch") for (const e of msg.events) max = Math.max(max, eventClockOf(e));
   }
   return max;
+}
+
+// The clock of an event the client queued. dispatchMsg stamps every event
+// and ws_send refuses one without a valid clock, so an invalid clock here is
+// a bug in the client, not a value to default.
+function eventClockOf(event) {
+  if (!isWireClock(event.clock)) {
+    throw new Error("[brazier] invariant violated: a queued event has clock " + JSON.stringify(event.clock));
+  }
+  return event.clock;
 }
 
 function markServerAckApplied(ackClock) {
@@ -760,9 +772,9 @@ function writeSocket(socket, msg) {
     return false;
   }
   if (msg.type === "event") {
-    writtenEventClock = Math.max(writtenEventClock, msg.clock);
+    writtenEventClock = Math.max(writtenEventClock, eventClockOf(msg));
   } else if (msg.type === "event_batch") {
-    for (const event of msg.events) writtenEventClock = Math.max(writtenEventClock, event.clock || 0);
+    for (const event of msg.events) writtenEventClock = Math.max(writtenEventClock, eventClockOf(event));
   }
   return true;
 }
@@ -862,9 +874,19 @@ function scheduleReconnect() {
   setTimeout(connect, delay);
 }
 
-// Test seam: queue a raw client message (JSON) as the runtime would.
+// Test seam: queue a raw client message (JSON) as the runtime would. Every
+// event must carry its clock, as the ones the runtime stamps do.
 export function ws_send(data) {
   const msg = JSON.parse(data);
+  const events = msg.type === "event" ? [msg] : msg.type === "event_batch" ? msg.events : [];
+  if (!Array.isArray(events)) {
+    throw new Error("[brazier] ws_send: an event_batch needs an events array, got " + JSON.stringify(events));
+  }
+  for (const event of events) {
+    if (!isWireClock(event.clock)) {
+      throw new Error("[brazier] ws_send: every event needs a clock (a non-negative integer), got " + JSON.stringify(event.clock));
+    }
+  }
   if (msg.type === "event_batch") {
     for (const batch of splitEventBatch(msg, CLIENT_SEND_BUDGET)) send(batch);
   } else {
@@ -887,8 +909,8 @@ function handleMessage(raw) {
     return;
   }
   switch (msg.type) {
-    case "model_sync": handleModelSync(msg.model, msg.version, msg.ack_clock || 0); break;
-    case "patch": handlePatch(msg.ops, msg.version, msg.ack_clock || 0); break;
+    case "model_sync": handleModelSync(msg.model, msg.version, msg.ack_clock); break;
+    case "patch": handlePatch(msg.ops, msg.version, msg.ack_clock); break;
     case "navigate": handleServerNavigate(msg.path, msg.replace === true); break;
     case "hard_navigate": handleServerHardNavigate(msg.path); break;
     case "reload": console.log("[brazier] Hot reload: refreshing"); location.reload(); break;
@@ -932,6 +954,12 @@ function handleModelSync(modelJson, version, ackClock) {
   // Any model_sync answers an outstanding request_sync, applied or not.
   syncRequestInFlight = false;
   mark("model-sync-start");
+  // The server sends ack_clock on every model_sync. Without a valid one the
+  // client cannot tell which of its events the model covers.
+  if (!isWireClock(ackClock)) {
+    modelSyncFailed(version, "invalid ack_clock " + JSON.stringify(ackClock));
+    return;
+  }
   const verdict = classifyModelSync({ version: currentModelVersion, synced: modelSynced }, version);
   if (verdict === "invalid") {
     modelSyncFailed(version, "invalid version " + JSON.stringify(version));
@@ -992,6 +1020,12 @@ function modelSyncFailed(version, reason) {
 
 function handlePatch(opsJson, version, ackClock) {
   mark("patch-start");
+  if (!isWireClock(ackClock)) {
+    console.error("[brazier] Patch v" + JSON.stringify(version) + " has invalid ack_clock " + JSON.stringify(ackClock) + "; requesting full sync");
+    invalidateModelCache();
+    requestFullSync("invalid_ack_clock");
+    return;
+  }
   let ops;
   try {
     ops = typeof opsJson === "string" ? JSON.parse(opsJson) : opsJson;
@@ -1121,8 +1155,10 @@ function currentPath() {
   return location.pathname + location.search;
 }
 
-function isLocalPath(path) {
-  return typeof path === "string" && path.startsWith("/") && !path.startsWith("//");
+// Why the server's navigation target is not a same-origin path of this
+// page, or null. See localPathRefusal.
+function navigationRefusal(path) {
+  return localPathRefusal(path, location.origin);
 }
 
 // A route change sends what the old page still owes the server (debounced
@@ -1137,8 +1173,9 @@ function leaveRoute(path) {
 // The server's router.push / router.replace: change the URL, then tell the
 // server so its on_change runs, as for a link click.
 function handleServerNavigate(path, replace) {
-  if (!isLocalPath(path)) {
-    console.error("[brazier] Server navigate rejected: not a local path:", path);
+  const refusal = navigationRefusal(path);
+  if (refusal !== null) {
+    console.error("[brazier] Server navigate rejected: not a local path (" + refusal + "):", JSON.stringify(path));
     return;
   }
   if (path === currentPath()) {
@@ -1155,8 +1192,9 @@ function handleServerNavigate(path, replace) {
 function handleServerHardNavigate(path) {
   // SECURITY: only same-origin paths, never //host, absolute, javascript: or
   // data: URLs, so the server cannot be turned into an open redirect.
-  if (!isLocalPath(path)) {
-    console.error("[brazier] Hard navigate rejected: not a local path:", path);
+  const refusal = navigationRefusal(path);
+  if (refusal !== null) {
+    console.error("[brazier] Hard navigate rejected: not a local path (" + refusal + "):", JSON.stringify(path));
     return;
   }
   window.location.href = path;
