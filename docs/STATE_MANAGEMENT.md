@@ -151,8 +151,8 @@ state is the model, pass `function.identity`.
   The session never continues from `init`'s state in place of a token it
   could not use. LiveView does the same with a stale session token: it
   refuses the join and the client reloads.
-- An open tab whose server was restarted without a fixed `brazier.secret_key`
-  therefore reloads once on reconnect: the new process generated a new key.
+- An open tab whose server was restarted with a different `brazier.secret_key`
+  therefore reloads once on reconnect: its token no longer verifies.
 - Recovery with an empty secret key is a configuration error: the runtime
   refuses to start.
 - Without `with_state_recovery` the session starts from `init`. A missing
@@ -436,8 +436,9 @@ Replication, anti-entropy, limits and failure behaviour are described in
 ## PubSub
 
 Low-level publish/subscribe, a port of Phoenix.PubSub over Erlang `pg`.
-`broadcast` reaches subscribers on every connected node; `local_broadcast`
-reaches this node only. See [CLUSTERING.md](CLUSTERING.md#pubsub-across-nodes)
+`broadcast` reaches subscribers on this node and on every verified cluster
+member ([Membership](CLUSTERING.md#membership)); `local_broadcast` reaches
+this node only. See [CLUSTERING.md](CLUSTERING.md#pubsub-across-nodes)
 for what a cluster needs and what happens during a netsplit.
 
 ```gleam

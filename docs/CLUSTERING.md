@@ -76,7 +76,8 @@ fn track(model: Model) -> List(presence.Tracking(String)) {
 -->
 ```gleam
 brazier.application(init:, update:, view:)
-|> brazier.cluster(cluster.new(discovery, secret_key: secret_key))
+|> brazier.secret_key(secret_key)
+|> brazier.cluster(cluster.new(discovery))
 |> brazier.presence(tracker: online, track: track, on_presence: PresenceChanged)
 |> brazier.start(8080)
 ```
@@ -180,25 +181,31 @@ TLS authenticates nodes. The cookie is still checked after the handshake.
 ### 5. What Brazier refuses
 
 With `BRAZIER_ENV=prod`, `cluster.start` and `cluster.supervised` return
-`Error(InsecureDistribution(reason))` in two cases:
+`Error(InsecureDistribution(reason))` in these cases:
 
 - distribution is not `inet_tls` or `inet6_tls`;
-- the cookie is shorter than 32 bytes.
+- the cookie is shorter than 32 bytes;
+- TLS distribution does not verify peers. The server options must hold
+  `{verify, verify_peer}` and `{fail_if_no_peer_cert, true}`, and the
+  client options `{verify, verify_peer}`. They are read from the
+  `-ssl_dist_optfile` file or the `-ssl_dist_opt` flags. TLS without them
+  encrypts traffic to any node, including one without the cluster's
+  certificate. An options file that cannot be read is a problem too.
 
-The reason lists every problem found. Outside production, both are allowed
-and logged at info level.
+The reason lists every problem found and the option that fixes each one.
+Outside production, they are all allowed and logged at info level.
 
 To run a production node over an insecure setup on purpose, say why:
 
 <!-- docs-check: wrap
 import brazier/cluster
 
-pub fn config(discovery: cluster.Discovery, secret: String) -> cluster.ClusterConfig {
+pub fn config(discovery: cluster.Discovery) -> cluster.ClusterConfig {
   {{block}}
 }
 -->
 ```gleam
-cluster.new(discovery, secret_key: secret)
+cluster.new(discovery)
 |> cluster.allow_insecure_distribution("single-host demo, loopback only")
 ```
 
@@ -242,23 +249,25 @@ import brazier/cluster
 
 pub fn start(secret_key: String) {
   let config =
-    cluster.new(
-      cluster.Dns(query: "app.internal", basename: "app", poll_ms: 5000),
-      secret_key: secret_key,
-    )
+    cluster.new(cluster.Dns(query: "app.internal", basename: "app", poll_ms: 5000))
 
   brazier.application(init:, update:, view:)
+  |> brazier.secret_key(secret_key)
   |> brazier.cluster(config)
   |> brazier.start(8080)
 }
 ```
 
 `brazier.cluster` runs the manager in the application's supervision tree,
-right after PubSub; `brazier.start` fails when the configuration or this
-node's distribution does not pass the checks above. Outside a Brazier app,
-`cluster.supervised(config)` builds a child for your own supervisor, and
-`cluster.start(config)` runs it unsupervised; `cluster.stop()` stops it. Stopping keeps existing connections up, but
-they are no longer reconnected or checked.
+right after PubSub. The manager uses the app's own `brazier.secret_key`; there
+is no separate cluster secret. `brazier.start` fails when the configuration,
+the key or this node's distribution does not pass the checks above. Outside
+a Brazier app, `cluster.supervised(config, secret_key:)` builds a child for
+your own supervisor, and `cluster.start(config, secret_key:)` runs it
+unsupervised. Both refuse a key that `config.secret_key` would refuse.
+`cluster.stop()` stops the manager. Stopping keeps existing connections up,
+but they are no longer reconnected or checked, and no remote node is a member
+any more (see [Membership](#membership)).
 
 ### Discovery
 
@@ -279,6 +288,19 @@ Settings:
 - **DNS.** `dns_timeout` bounds each lookup (default 10s). `max_dns_nodes`
   bounds the nodes taken from one answer (default 256). `dns_resolver`
   replaces the system resolver, which is useful in tests.
+- **Only IP addresses become node names.** A node name is an atom, and
+  atoms are never freed. Answer entries that are not well-formed IPv4 or
+  IPv6 addresses are dropped before any atom is made. The drop is logged at
+  error level and emits `[brazier, cluster, connect, failed]`. Each
+  address is used in its canonical text, so one address is one name. The
+  `basename` is at most 190 bytes, so every name fits the 255-byte limit.
+- **Discovered names are capped for the VM's life.** `max_discovered_nodes`
+  (default 16,384) bounds how many new node names DNS discovery ever makes
+  on one VM. The count survives manager restarts. Past the cap a new
+  address is not connected to: it is logged at error level and emits
+  `[brazier, cluster, connect, failed]`. Addresses that already have a name
+  still connect. `max_dns_nodes` bounds one answer, and
+  `max_discovered_nodes` bounds the total across every answer.
 - **Nodes that leave the DNS answer stay connected.** They disconnect only
   when distribution reports them down. A DNS blip therefore never splits
   the cluster.
@@ -291,19 +313,52 @@ Settings:
 
 When a node connects, both sides exchange
 `HMAC-SHA256(secret_key, "brazier-cluster-v1")` and a protocol version.
+`secret_key` is the app's secret key. The purpose label keeps the MAC
+distinct from every token signature made with that key.
 
 - If the key or the version differs, the peer is disconnected.
 - If the peer sends nothing within `peer_check_timeout` (default 5s), it is
-  disconnected.
+  disconnected. Each timer belongs to one connection. When a node goes
+  down and reconnects as its old timer fires, that old timer is ignored
+  and the new connection keeps its full timeout.
 - Each rejection is logged at error level and emits
   `[brazier, cluster, peer, rejected]`.
-- `cluster.members()` returns the connected peers that passed the check.
+- A hello in an unexpected shape is dropped and logged at warning level,
+  with its sender and size only.
+- The MAC is never logged. `sys:get_status` and the manager's crash
+  reports show it, and any MAC in a message the manager holds, as
+  `redacted`.
 
 The check catches misconfiguration, for example staging and production
 sharing a cookie, or two releases with incompatible protocols. **It is not
 a security boundary:** a node that holds the cookie can already run code
 before the check finishes. TLS and the network rules above are the
 boundary.
+
+### Membership
+
+A connected node is a **member** only after it passes the peer check.
+`cluster.members()` returns the members. Brazier's own cluster traffic goes
+to members only, and what any other node sends is dropped:
+
+- **PubSub.** `broadcast` forwards to members only. `direct_broadcast` to a
+  connected node that is not a member returns `Error(NodeNotVerified(_))`.
+  A forwarded message from a node that is not a member is dropped. Each
+  drop is logged at debug level, and each forwarding worker logs a warning
+  with the count at most once per second.
+- **Replicated stores** sync and replicate with members only. Sync requests
+  and deltas from other nodes are dropped with a warning. A store syncs with
+  a node when the node passes the check, not when it connects.
+- **Presence** sends heartbeats, deltas and state transfers to members
+  only. The same messages from other nodes are dropped with a warning.
+- **Session revocation** (logout and rotation) reaches sockets on members
+  only. A warning counts the bound processes it skipped and names their
+  nodes.
+
+There is no fallback to every connected node. Without a running cluster
+manager, no remote node is a member, so these features stay on this node.
+Membership is per connection. A node loses it when it is rejected or goes
+down, and is checked again when it reconnects.
 
 ## PubSub across nodes
 
@@ -313,11 +368,15 @@ boundary.
   message per remote node. The receiving node's forwarding worker delivers
   it locally.
 - **Scope.** `local_broadcast` reaches this node only. `direct_broadcast`
-  reaches one named node, or returns `Error(NodeNotConnected(_))`.
+  reaches one named node. It returns `Error(NodeNotConnected(_))` when the
+  node is not connected, and `Error(NodeNotVerified(_))` when the node has
+  not passed the peer check.
 - **`pool_size` must be the same on every node.** A message is forwarded to
   the worker of the same index on each node.
-- **Forwarded messages are not authenticated.** Connected nodes trust each
-  other completely (see above). Do not connect nodes you do not trust.
+- **Members only.** Messages go to members and are taken from members only
+  (see [Membership](#membership)). Members trust each other completely, and
+  membership does not authenticate a message's content. Do not connect
+  nodes you do not trust.
 - **Overload is reported, never hidden.** A forwarding worker whose queue
   passes `max_forward_queue` (default 10,000) logs an error and emits
   `[brazier, pubsub, forward, overloaded]` at most once per second. It
@@ -471,7 +530,8 @@ gets `Error(InvalidConfig(_))`.
 - The replica's causal context gains one entry for every incarnation of
   every replica (each restart is a new one), and it is never compacted.
   This is small, but it grows with restarts.
-- Replication messages are not authenticated: connected nodes trust each
+- Replication runs between members only (see [Membership](#membership)).
+  Membership does not authenticate a message's content: members trust each
   other completely (see [Security first](#security-first-what-distribution-means)).
 
 ## Sessions
@@ -506,10 +566,11 @@ Across the cluster:
 
 - **Revocation is cluster-wide.** Deleting, rotating or expiring a session
   sends `{brazier_session_revoked, Id, Reason}` to every process bound to it
-  (`bind_current_process`) on every connected node.
-- **Netsplits.** A revocation cannot cross a netsplit. When a node
-  connects, every store re-checks the sessions its local processes are
-  bound to, and revokes those that are gone.
+  (`bind_current_process`) on this node and on every member (see
+  [Membership](#membership)).
+- **Netsplits.** A revocation cannot cross a netsplit. When a node passes
+  the peer check after it connects, every store re-checks the sessions its
+  local processes are bound to, and revokes those that are gone.
 - **Clocks.** Lifetimes use `erlang:system_time(millisecond)` so nodes can
   compare timestamps. Clocks may differ by up to `clock_skew_tolerance_ms`
   (5,000), so a lifetime can end up to 5s early or late. A timestamp
@@ -519,7 +580,8 @@ Across the cluster:
 ## Presence
 
 `brazier/presence` is a port of Phoenix.Tracker and Phoenix.Presence. It
-tracks which processes are on a topic, on every connected node.
+tracks which processes are on a topic, on this node and every member (see
+[Membership](#membership)).
 
 ### Session presence
 
@@ -935,8 +997,15 @@ each row of this table on real peer nodes.
 module. It can:
 
 - connect peers into a mesh;
+- make every peer a member: `with_members` runs a cluster manager on each
+  peer and waits until every pair has passed the peer check, because
+  PubSub, stores, presence and revocation exchange nothing before that;
 - crash and stop nodes;
 - partition and heal links.
+
+`test/brazier/cluster/membership_test.gleam` connects a node with another
+secret key and checks that store, PubSub, presence and revocation traffic
+crosses in neither direction.
 
 Peers stop when the test ends, whether it passes or fails. The tests wait
 on conditions with a deadline (`peer.eventually`), never with sleeps.
