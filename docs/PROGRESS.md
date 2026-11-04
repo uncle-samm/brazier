@@ -423,7 +423,21 @@
       - raw paths are still logged in `ssr.gleam`, `static.gleam`, `transport/http.gleam`, `upload.gleam` and `transport/client.gleam`;
       - a cascade of `CloseForBackpressure` closes appeared once when many tests failed together;
       - `trusted_proxies` is still parsed on every request.
-  - [ ] W4 monitor-race sweep (test files only), started early from faab3a0 because it shares no files with W2-A. It covers the STAB-1 monitor races in `store_test`, `ws8c_ets_owner_test` and `cluster/app_tree_test`, plus pubsub test isolation.
+  - [x] W4 monitor-race sweep (test files only), started early from faab3a0 because it shares no files with W2-A. It covers the STAB-1 monitor races in `store_test`, `ws8c_ets_owner_test` and `cluster/app_tree_test`, plus pubsub test isolation. Merged as d906532.
+    - New `test/brazier/monitored.gleam` with `brazier_monitored_ffi.erl`: `spawn` monitors atomically, `down_reason` fails on `noproc` instead of accepting it, and there are `isolated` and `with_cleanup`. `await.gleam` gained `watch_down`, `unwatch` and `until_info`.
+    - Monitor-after-trigger races were fixed in the store, sigterm, ws8c_ets_owner, app_tree, effect_telemetry, presence_watch and presence tests. The pubsub, presence, ws8c_presence_sync and store_replicated tests now use unique topics. Polls became messages or direct reads. TESTING.md's waits table is updated.
+    - Coordinator verify on the merge of 24df57d into the branch (e01571a): clean build with zero warnings, format and lint clean, 1682 tests passing in each of 3 runs, and docs check OK (73 modules).
+    - **A real bug the sweep found:** when `brazier_cluster_manager:reject/3` disconnects an intruder, OTP `global`'s default `prevent_overlapping_partitions=true` can make one verified node disconnect from another. With no discovery, nothing reconnects them. On a clean faab3a0 tree the intruder tests failed 3 times in 30 runs; with the flag off they passed 40 times in 40.
+    - Decision: the sweep turned the flag off in the intruder tests (`no_partition_prevention` in `membership_test.gleam`). That hides a bug users would hit on the OTP default, so it is not accepted as final. A fix agent (fix-cluster-reject) owns the manager and must remove the flag from those tests. `session_cluster_test`'s `partial_partitions` stays: it deliberately simulates a netsplit.
+    - Follow-ups:
+      - `runtime_telemetry_test` (around 375) accepts any exit reason;
+      - `ws_protocol_test`'s idle-timeout `sleep(550)` remains, documented;
+      - `peer.eventually` polls remain in the multi-node tests;
+      - other telemetry tests may leave handlers attached when they fail, and presence holders leak when a test fails;
+      - users of `watch_info` never call `unwatch`;
+      - `sleep_ms` in `brazier_ws_test_ffi.erl` is unused;
+      - the churn test accepts `noproc`, with a comment giving the reason.
+  - [ ] fix-cluster-reject: rejecting an intruder must not partition verified members under OTP's default `prevent_overlapping_partitions`; remove `no_partition_prevention` from `membership_test`.
 - [ ] Final verification: build (zero warnings), tests, all examples, CDP browser suite, perf baselines
 
 **Decisions (Milestone 117, coordinator):**
