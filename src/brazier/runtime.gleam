@@ -1490,7 +1490,7 @@ fn refuse_navigation(
               <> " to a non-local path refused ("
               <> reason
               <> "): "
-              <> string.inspect(path),
+              <> log_path(path),
           )
           send_to_conn_id(
             state,
@@ -1547,7 +1547,7 @@ fn hard_navigate(
         "Refusing to send a hard navigation to "
           <> conn_id
           <> " for "
-          <> string.inspect(path)
+          <> log_path(path)
           <> ": not a same-origin path, "
           <> reason,
       )

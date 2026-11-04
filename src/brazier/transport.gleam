@@ -6,6 +6,7 @@
 /// instead of Mist. Direct gen_tcp for zero unnecessary abstraction layers.
 ///
 /// Reference: LiveView channel protocol, RFC 6455.
+import brazier/config as app_env
 import brazier/cookie
 import brazier/error
 import brazier/internal/local_path
@@ -237,6 +238,16 @@ pub type SecurityLimits {
     /// WebSockets in addition to the request's own scheme/host/port.
     /// Default: [].
     ws_allowed_origins: List(String),
+    /// Host names this server answers to; every HTTP request and WebSocket
+    /// upgrade whose Host header names another host gets 400 (DNS
+    /// rebinding protection, Django's `ALLOWED_HOSTS`). The port is not
+    /// compared. An entry is a host (`"example.com"`, `"127.0.0.1"`,
+    /// `"[::1]"`), a domain and all its subdomains (`".example.com"`), or
+    /// `"*"` for every host (which turns the check off, and is logged as a
+    /// warning). Empty means `[".localhost", "127.0.0.1", "[::1]"]` in
+    /// development; in production (`BRAZIER_ENV=production`) the listener
+    /// refuses to start with an empty list. Default: [].
+    allowed_hosts: List(String),
   )
 }
 
@@ -270,6 +281,7 @@ pub fn default_security_limits() -> SecurityLimits {
     ws_max_decode_errors: 10,
     ws_max_rate_violations: 100,
     ws_allowed_origins: [],
+    allowed_hosts: [],
   )
 }
 
@@ -297,9 +309,27 @@ pub fn validate_drain_timeout(ms: Int) -> Result(Nil, String) {
 /// positive (the two abuse thresholds may be 0, meaning "first offence
 /// closes", `max_body_bytes` may be 0, meaning "no request bodies", and
 /// `drain_timeout_ms` may be 0, meaning "kill connections at once"),
-/// timer intervals must fit `erlang:send_after/3`, and every allowed origin
-/// must be a bare `scheme://host[:port]` origin.
+/// timer intervals must fit `erlang:send_after/3`, every allowed origin
+/// must be a bare `scheme://host[:port]` origin, every allowed host a host
+/// name, `.domain` or `*`, and in production (`BRAZIER_ENV=production`)
+/// `allowed_hosts` must not be empty. The listener runs the same checks
+/// when it starts.
 pub fn validate_security_limits(limits: SecurityLimits) -> Result(Nil, String) {
+  log.debug("brazier.transport", "Validating security limits")
+  check_security_limits(limits, production: app_env.is_production())
+  |> result.map(fn(_guards) { Nil })
+}
+
+/// What a listener parsed from its limits once, when it started, for every
+/// connection it serves (TS-9: nothing is re-parsed per request).
+type Guards {
+  Guards(origins: AllowedOrigins, hosts: AllowedHosts)
+}
+
+fn check_security_limits(
+  limits: SecurityLimits,
+  production production: Bool,
+) -> Result(Guards, String) {
   let positive = [
     #("max_message_bytes", limits.max_message_bytes),
     #("max_events_per_second", limits.max_events_per_second),
@@ -370,26 +400,17 @@ pub fn validate_security_limits(limits: SecurityLimits) -> Result(Nil, String) {
       |> result.map(fn(_) { Nil })
       |> result.map_error(fn(reason) { "trusted_proxies: " <> reason }),
     )
-    list.try_each(limits.ws_allowed_origins, fn(origin) {
-      case parse_origin(origin) {
-        Ok(Origin(has_path: False, ..)) -> Ok(Nil)
-        Ok(Origin(has_path: True, ..)) ->
-          Error(
-            "ws_allowed_origins entry must not contain a path: \""
-            <> origin
-            <> "\"",
-          )
-        Error(reason) ->
-          Error(
-            "invalid ws_allowed_origins entry \"" <> origin <> "\": " <> reason,
-          )
-      }
-    })
+    use origins <- result.try(parse_allowed_origins(limits.ws_allowed_origins))
+    use hosts <- result.try(parse_allowed_hosts(
+      limits.allowed_hosts,
+      production: production,
+    ))
+    Ok(Guards(origins: origins, hosts: hosts))
   }
   case outcome {
-    Ok(Nil) -> {
+    Ok(guards) -> {
       log.debug("brazier.transport", "Security limits valid")
-      Ok(Nil)
+      Ok(guards)
     }
     Error(reason) -> {
       log.error("brazier.transport", "Invalid security limits: " <> reason)
@@ -2218,7 +2239,7 @@ fn default_port(scheme: String) -> Result(Int, String) {
   case scheme {
     "http" -> Ok(80)
     "https" -> Ok(443)
-    other -> Error("unsupported scheme \"" <> other <> "\"")
+    other -> Error("unsupported scheme " <> string.inspect(other))
   }
 }
 
@@ -2277,10 +2298,12 @@ fn parse_authority(
   }
 }
 
+/// The errors of `parse_origin`, `parse_authority` and `parse_port` end up
+/// in log lines and quote any client text they repeat (SEC-11).
 fn parse_port(text: String) -> Result(Int, String) {
   case int.parse(text) {
     Ok(port) if port >= 1 && port <= 65_535 -> Ok(port)
-    _ -> Error("invalid port \"" <> text <> "\"")
+    _ -> Error("invalid port " <> string.inspect(text))
   }
 }
 
@@ -2306,6 +2329,225 @@ fn ws_client_ip(
   client.ip_for_socket(socket, req.headers, trusted)
 }
 
+/// The `ws_allowed_origins` of a listener, parsed once when it starts.
+pub opaque type AllowedOrigins {
+  AllowedOrigins(origins: List(Origin))
+}
+
+/// Parse `ws_allowed_origins` entries; each must be a bare
+/// `scheme://host[:port]` origin (http or https, no path).
+pub fn parse_allowed_origins(
+  entries: List(String),
+) -> Result(AllowedOrigins, String) {
+  let parsed =
+    list.try_map(entries, fn(entry) {
+      case parse_origin(entry) {
+        Ok(Origin(has_path: False, ..) as origin) -> Ok(origin)
+        Ok(Origin(has_path: True, ..)) ->
+          Error(
+            "ws_allowed_origins entry must not contain a path: "
+            <> string.inspect(entry),
+          )
+        Error(reason) ->
+          Error(
+            "invalid ws_allowed_origins entry "
+            <> string.inspect(entry)
+            <> ": "
+            <> reason,
+          )
+      }
+    })
+  case parsed {
+    Ok(origins) -> {
+      log.debug(
+        "brazier.transport",
+        "Allowed origins parsed: "
+          <> int.to_string(list.length(origins))
+          <> " extra origin(s)",
+      )
+      Ok(AllowedOrigins(origins: origins))
+    }
+    Error(reason) -> {
+      log.warning(
+        "brazier.transport",
+        "Refusing ws_allowed_origins: " <> reason,
+      )
+      Error(reason)
+    }
+  }
+}
+
+/// The `allowed_hosts` of a listener, parsed once when it starts
+/// (Django's `ALLOWED_HOSTS`, SEC-16).
+pub opaque type AllowedHosts {
+  AllowedHosts(patterns: List(HostPattern))
+}
+
+type HostPattern {
+  /// `*`: every host.
+  AnyHost
+  /// `example.com`: that host only.
+  ExactHost(host: String)
+  /// `.example.com`: the domain and every subdomain.
+  HostAndSubdomains(domain: String)
+}
+
+/// The hosts a development server answers to when `allowed_hosts` is
+/// empty: Django's development default.
+pub const development_allowed_hosts = [".localhost", "127.0.0.1", "[::1]"]
+
+/// Parse `allowed_hosts`. An empty list is refused in production (the
+/// error names the setting) and means `development_allowed_hosts`
+/// otherwise.
+@internal
+pub fn parse_allowed_hosts(
+  entries: List(String),
+  production production: Bool,
+) -> Result(AllowedHosts, String) {
+  let parsed = case entries, production {
+    [], True ->
+      Error(
+        "allowed_hosts is empty: in production (BRAZIER_ENV=production) set "
+        <> "SecurityLimits.allowed_hosts to the host names this server "
+        <> "answers to, such as [\"example.com\", \".example.com\"]",
+      )
+    [], False -> {
+      log.info(
+        "brazier.transport",
+        "allowed_hosts is empty: answering only to "
+          <> string.join(development_allowed_hosts, ", ")
+          <> " (development default; set allowed_hosts to serve other names)",
+      )
+      list.try_map(development_allowed_hosts, parse_host_pattern)
+    }
+    _, _ -> list.try_map(entries, parse_host_pattern)
+  }
+  case parsed {
+    Ok(patterns) -> {
+      case list.contains(patterns, AnyHost) {
+        True ->
+          log.warning(
+            "brazier.transport",
+            "allowed_hosts contains \"*\": the Host header is not checked, "
+              <> "so DNS rebinding is not prevented",
+          )
+        False ->
+          log.debug(
+            "brazier.transport",
+            "Allowed hosts parsed: "
+              <> int.to_string(list.length(patterns))
+              <> " pattern(s)",
+          )
+      }
+      Ok(AllowedHosts(patterns: patterns))
+    }
+    Error(reason) -> {
+      log.warning("brazier.transport", "Refusing allowed_hosts: " <> reason)
+      Error(reason)
+    }
+  }
+}
+
+fn parse_host_pattern(entry: String) -> Result(HostPattern, String) {
+  let refuse = fn(why) {
+    Error(
+      "invalid allowed_hosts entry " <> string.inspect(entry) <> ": " <> why,
+    )
+  }
+  case entry {
+    "*" -> Ok(AnyHost)
+    "." <> domain ->
+      case check_host_name(domain) {
+        Ok(name) -> Ok(HostAndSubdomains(domain: name))
+        Error(why) -> refuse(why)
+      }
+    _ ->
+      case check_host_name(entry) {
+        Ok(name) -> Ok(ExactHost(host: name))
+        Error(why) -> refuse(why)
+      }
+  }
+}
+
+/// A bare host name for `allowed_hosts`, lowercased: no scheme, path, port,
+/// wildcard or trailing dot.
+fn check_host_name(name: String) -> Result(String, String) {
+  case string.contains(name, "/"), string.contains(name, "*") {
+    True, _ -> Error("a host name has no scheme or path")
+    _, True ->
+      Error(
+        "\"*\" is allowed only on its own; use \".example.com\" for a domain "
+        <> "and its subdomains",
+      )
+    False, False -> {
+      use #(host, _port) <- result.try(parse_authority(name, 0))
+      case host == string.lowercase(name), string.ends_with(host, ".") {
+        False, _ -> Error("a host name has no port")
+        True, True -> Error("drop the trailing dot")
+        True, False -> Ok(host)
+      }
+    }
+  }
+}
+
+fn host_matches(pattern: HostPattern, host: String) -> Bool {
+  case pattern {
+    AnyHost -> True
+    ExactHost(host: name) -> name == host
+    HostAndSubdomains(domain: domain) ->
+      host == domain || string.ends_with(host, "." <> domain)
+  }
+}
+
+/// Check a Host header value against `allowed_hosts`. The port is not
+/// compared, and one trailing dot (`example.com.`) is dropped, as Django
+/// does.
+@internal
+pub fn host_allowed(
+  host: String,
+  allowed: AllowedHosts,
+) -> Result(Nil, String) {
+  let decision = {
+    use #(name, _port) <- result.try(
+      parse_authority(host, 0)
+      |> result.map_error(fn(reason) { "invalid Host: " <> reason }),
+    )
+    let name = case string.ends_with(name, ".") {
+      True -> string.drop_end(name, 1)
+      False -> name
+    }
+    case list.any(allowed.patterns, host_matches(_, name)) {
+      True -> Ok(Nil)
+      False -> Error("Host is not in allowed_hosts")
+    }
+  }
+  case decision {
+    Ok(Nil) -> Ok(Nil)
+    Error(reason) -> {
+      log.warning(
+        "brazier.transport",
+        "Host rejected (" <> reason <> "): host=" <> string.inspect(host),
+      )
+      Error(reason)
+    }
+  }
+}
+
+/// The Host check for one request. A request without a Host header got
+/// this far only as HTTP/1.0 (`check_framing` refuses HTTP/1.1 without
+/// one); it names no host, so there is nothing to refuse, as with
+/// Django, which then uses the server's own name (`SERVER_NAME`). Browsers
+/// always send Host, so a rebound page cannot use this.
+fn check_host(
+  req: Request(Connection),
+  allowed: AllowedHosts,
+) -> Result(Nil, String) {
+  case request.get_header(req, "host") {
+    Ok(host) -> host_allowed(host, allowed)
+    Error(Nil) -> Ok(Nil)
+  }
+}
+
 /// Check that the Origin header matches the server's own origin (scheme,
 /// host and port) or an entry of `ws_allowed_origins`.
 /// This prevents cross-site WebSocket hijacking (CSWSH).
@@ -2314,6 +2556,7 @@ fn ws_client_ip(
 fn check_origin(
   req: Request(Connection),
   limits: SecurityLimits,
+  allowed_origins: AllowedOrigins,
 ) -> Result(Nil, String) {
   case request.get_header(req, "origin") {
     Error(Nil) -> {
@@ -2334,12 +2577,7 @@ fn check_origin(
           Error(reason)
         }
         Ok(scheme) ->
-          origin_allowed(
-            origin,
-            scheme,
-            request_host,
-            limits.ws_allowed_origins,
-          )
+          origin_allowed(origin, scheme, request_host, allowed_origins)
       }
     }
   }
@@ -2352,7 +2590,7 @@ pub fn origin_allowed(
   origin: String,
   request_scheme: String,
   request_host: String,
-  allowed_origins: List(String),
+  allowed_origins: AllowedOrigins,
 ) -> Result(Nil, String) {
   let decision = {
     use parsed <- result.try(
@@ -2360,14 +2598,7 @@ pub fn origin_allowed(
       |> result.map_error(fn(reason) { "invalid Origin: " <> reason }),
     )
     let same = Origin(..parsed, has_path: False)
-    let allow_listed =
-      list.any(allowed_origins, fn(allowed) {
-        case parse_origin(allowed) {
-          Ok(entry) -> Origin(..entry, has_path: False) == same
-          Error(_) -> False
-        }
-      })
-    case allow_listed {
+    case list.contains(allowed_origins.origins, same) {
       True -> Ok(Nil)
       False -> {
         use port <- result.try(default_port(string.lowercase(request_scheme)))
@@ -2391,20 +2622,25 @@ pub fn origin_allowed(
   }
   case decision {
     Ok(Nil) -> {
-      log.debug("brazier.transport", "Origin allowed: " <> origin)
+      log.debug(
+        "brazier.transport",
+        "Origin allowed: " <> string.inspect(origin),
+      )
       Ok(Nil)
     }
     Error(reason) -> {
+      // The origin and host are client text: quoted, so a newline or a
+      // control character cannot forge a log line (SEC-11).
       log.warning(
         "brazier.transport",
         "Origin rejected ("
           <> reason
           <> "): origin="
-          <> origin
+          <> string.inspect(origin)
           <> " scheme="
           <> request_scheme
           <> " host="
-          <> request_host,
+          <> string.inspect(request_host),
       )
       Error(reason)
     }
@@ -2420,9 +2656,9 @@ pub fn origin_allowed_for_host(
 ) -> Result(Nil, String) {
   log.debug(
     "brazier.transport",
-    "Checking origin against host " <> request_host,
+    "Checking origin against host " <> string.inspect(request_host),
   )
-  origin_allowed(origin, "http", request_host, [])
+  origin_allowed(origin, "http", request_host, AllowedOrigins(origins: []))
 }
 
 /// How a WebSocket upgrade request ended: upgraded (the 101 was written
@@ -2448,6 +2684,7 @@ fn handle_ws_request(
   socket: Socket,
   req: Request(Connection),
   config: TransportConfig,
+  guards: Guards,
   page: LivePage,
 ) -> UpgradeOutcome {
   let conn_id = generate_connection_id()
@@ -2470,6 +2707,7 @@ fn handle_ws_request(
         socket,
         req,
         config,
+        guards,
         Admission(conn_id:, peer_ip:, page:),
       )
   }
@@ -2479,6 +2717,7 @@ fn admit_ws_request(
   socket: Socket,
   req: Request(Connection),
   config: TransportConfig,
+  guards: Guards,
   admission: Admission,
 ) -> UpgradeOutcome {
   let Admission(conn_id:, peer_ip:, page: _) = admission
@@ -2502,7 +2741,7 @@ fn admit_ws_request(
       )
     // The slots belong to this listener's connection owner, so two
     // listeners in one VM never share per-IP counts.
-    False -> acquire_ws_slot(socket, req, config, admission)
+    False -> acquire_ws_slot(socket, req, config, guards, admission)
   }
 }
 
@@ -2510,6 +2749,7 @@ fn acquire_ws_slot(
   socket: Socket,
   req: Request(Connection),
   config: TransportConfig,
+  guards: Guards,
   admission: Admission,
 ) -> UpgradeOutcome {
   let Admission(conn_id:, peer_ip:, page: _) = admission
@@ -2526,7 +2766,7 @@ fn acquire_ws_slot(
         "Too many connections from this address",
         "per-IP WebSocket limit reached (" <> int.to_string(count) <> ")",
       )
-    Ok(_count) -> authorize_ws_request(socket, req, config, admission)
+    Ok(_count) -> authorize_ws_request(socket, req, config, guards, admission)
   }
 }
 
@@ -2534,6 +2774,7 @@ fn authorize_ws_request(
   socket: Socket,
   req: Request(Connection),
   config: TransportConfig,
+  guards: Guards,
   admission: Admission,
 ) -> UpgradeOutcome {
   let reject = fn(label, status, body, reason) {
@@ -2548,7 +2789,7 @@ fn authorize_ws_request(
       reason,
     )
   }
-  case check_origin(req, config.security_limits) {
+  case check_origin(req, config.security_limits, guards.origins) {
     Error(reason) ->
       reject(
         "rejected_origin",
@@ -2801,7 +3042,7 @@ fn route_static_or_page(
               Error(Nil) -> {
                 log.debug(
                   "brazier.transport",
-                  "404 for missing static file " <> req.path,
+                  "404 for missing static file " <> log_path.describe(req.path),
                 )
                 transport_http.create_error_response(404, "Not Found")
               }
@@ -2835,7 +3076,7 @@ fn when_readable_method(
         "405 for "
           <> http.method_to_string(method)
           <> " on framework asset "
-          <> req.path,
+          <> log_path.describe(req.path),
       )
       response.new(405)
       |> response.set_header("allow", "GET, HEAD")
@@ -2874,15 +3115,17 @@ const allowed_methods_header = "GET, HEAD, POST, PUT, DELETE, OPTIONS, PATCH"
 fn per_connection_handler(
   socket: Socket,
   config: TransportConfig,
+  guards: Guards,
   handler: fn(Request(Connection)) -> response.Response(ResponseBody),
 ) -> Nil {
   log.debug("brazier.transport", "Connection handler started")
-  serve_requests(socket, config, handler, 0)
+  serve_requests(socket, config, guards, handler, 0)
 }
 
 fn serve_requests(
   socket: Socket,
   config: TransportConfig,
+  guards: Guards,
   handler: fn(Request(Connection)) -> response.Response(ResponseBody),
   served: Int,
 ) -> Nil {
@@ -2936,17 +3179,29 @@ fn serve_requests(
           transport_http.write_error(socket, status, reason)
         Ok(framing) ->
           case request.path_segments(req) {
-            ["ws"] -> serve_ws_request(socket, req, framing, config)
+            ["ws"] -> serve_ws_request(socket, req, framing, config, guards)
             _ ->
-              serve_http_request(
-                socket,
-                req,
-                version,
-                framing,
-                config,
-                handler,
-                served,
-              )
+              case check_host(req, guards.hosts) {
+                // DNS rebinding: a page served under another name would be
+                // same-origin with the attacker's site (SEC-16).
+                Error(reason) ->
+                  transport_http.write_error(
+                    socket,
+                    400,
+                    "Bad Request: " <> reason,
+                  )
+                Ok(Nil) ->
+                  serve_http_request(
+                    socket,
+                    req,
+                    version,
+                    framing,
+                    config,
+                    guards,
+                    handler,
+                    served,
+                  )
+              }
           }
       }
   }
@@ -2963,10 +3218,11 @@ fn serve_ws_request(
   req: Request(Connection),
   framing: transport_http.BodyFraming,
   config: TransportConfig,
+  guards: Guards,
 ) -> Nil {
   let outcome =
     telemetry.ws_upgrade_span(ws_route, fn() {
-      let outcome = decide_ws_upgrade(socket, req, framing, config)
+      let outcome = decide_ws_upgrade(socket, req, framing, config, guards)
       #(outcome, upgrade_outcome_label(outcome))
     })
   case outcome {
@@ -2981,6 +3237,26 @@ fn decide_ws_upgrade(
   req: Request(Connection),
   framing: transport_http.BodyFraming,
   config: TransportConfig,
+  guards: Guards,
+) -> UpgradeOutcome {
+  case check_host(req, guards.hosts) {
+    // DNS rebinding: an attacker's name resolving to this server sends a
+    // matching Origin and Host, which the origin check alone accepts
+    // (SEC-16).
+    Error(reason) -> {
+      transport_http.write_error(socket, 400, "Bad Request: " <> reason)
+      Refused("rejected_host")
+    }
+    Ok(Nil) -> decide_ws_framing(socket, req, framing, config, guards)
+  }
+}
+
+fn decide_ws_framing(
+  socket: Socket,
+  req: Request(Connection),
+  framing: transport_http.BodyFraming,
+  config: TransportConfig,
+  guards: Guards,
 ) -> UpgradeOutcome {
   case framing.content_length, transport_http.get_buffered_byte_count(socket) {
     0, 0 ->
@@ -3001,7 +3277,7 @@ fn decide_ws_upgrade(
         // pipeline runs on the page's GET, not on the /ws request (SEC-2).
         Ok(page) ->
           case check_middleware(page_request(req, page), config.middlewares) {
-            Ok(Nil) -> handle_ws_request(socket, req, config, page)
+            Ok(Nil) -> handle_ws_request(socket, req, config, guards, page)
             Error(resp) -> {
               log.warning(
                 "brazier.transport",
@@ -3065,6 +3341,7 @@ fn serve_http_request(
   version: transport_http.HttpVersion,
   framing: transport_http.BodyFraming,
   config: TransportConfig,
+  guards: Guards,
   handler: fn(Request(Connection)) -> response.Response(ResponseBody),
   served: Int,
 ) -> Nil {
@@ -3122,7 +3399,7 @@ fn serve_http_request(
             True ->
               case transport_http.finish_body(socket, body) {
                 transport_http.BodyConsumed ->
-                  serve_requests(socket, config, handler, served)
+                  serve_requests(socket, config, guards, handler, served)
                 // finish_body logged why the leftover could not be read.
                 transport_http.BodyDiscardable(_)
                 | transport_http.BodyUnread(_)
@@ -3447,7 +3724,7 @@ fn page_response(
       log.error(
         "brazier.transport",
         "Cannot set the SSR join cookie for "
-          <> req.path
+          <> log_path.describe(req.path)
           <> ": "
           <> cookie.error_to_string(error),
       )
@@ -3708,7 +3985,12 @@ fn prepare_listener(
     Some(static_cfg) -> static.validate_config(static_cfg)
     None -> Ok(Nil)
   }
-  case validate_security_limits(config.security_limits), static_check {
+  let checked =
+    check_security_limits(
+      config.security_limits,
+      production: app_env.is_production(),
+    )
+  case checked, static_check {
     Error(reason), _ -> {
       log.error("brazier.transport", "Invalid security limits: " <> reason)
       Error(error.ConfigError(reason: "Invalid security limits: " <> reason))
@@ -3717,11 +3999,14 @@ fn prepare_listener(
       log.error("brazier.transport", "Invalid static config: " <> reason)
       Error(error.ConfigError(reason: "Invalid static config: " <> reason))
     }
-    Ok(Nil), Ok(Nil) -> {
-      // Built once: middleware and routing closures are shared by every
-      // connection instead of being rebuilt per request.
+    Ok(guards), Ok(Nil) -> {
+      // Built once: middleware and routing closures, and the parsed hosts
+      // and origins, are shared by every connection instead of being
+      // rebuilt per request.
       let handler = create_handler(config)
-      Ok(fn(socket: Socket) { per_connection_handler(socket, config, handler) })
+      Ok(fn(socket: Socket) {
+        per_connection_handler(socket, config, guards, handler)
+      })
     }
   }
 }

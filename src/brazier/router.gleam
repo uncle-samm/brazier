@@ -21,7 +21,6 @@ import gleam/erlang/process.{type Subject}
 import gleam/int
 import gleam/list
 import gleam/option.{None, Some}
-import gleam/string
 import gleam/uri.{type Uri}
 
 /// The percent-decoded path segments, with empty and dot segments removed:
@@ -105,7 +104,7 @@ fn navigation_effect(
           "router."
             <> kind
             <> " needs a same-origin path starting with \"/\"; refusing "
-            <> string.inspect(path)
+            <> log_path.describe(path)
             <> ": "
             <> reason,
         )

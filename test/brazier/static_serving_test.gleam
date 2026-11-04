@@ -49,7 +49,11 @@ fn config_for(static_cfg: option.Option(static.StaticConfig)) {
     runtime_factory: None,
     ws_auth: None,
     ssr_factory: None,
-    security_limits: transport.default_security_limits(),
+    security_limits: transport.SecurityLimits(
+      ..transport.default_security_limits(),
+      // The raw requests below name the host "test".
+      allowed_hosts: ["test"],
+    ),
     api_handler: None,
   )
 }

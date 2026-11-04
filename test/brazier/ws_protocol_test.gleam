@@ -1194,51 +1194,87 @@ pub fn failed_auth_recheck_closes_4401_test() {
 
 // --- Pure helpers ---
 
+/// No extra allowed origins: only the request's own origin passes.
+fn no_origins() -> transport.AllowedOrigins {
+  let assert Ok(none) = transport.parse_allowed_origins([])
+    as "an empty origin list always parses"
+  none
+}
+
 pub fn origin_allowed_compares_scheme_host_and_port_test() {
   let assert Ok(Nil) =
-    transport.origin_allowed("http://example.com", "http", "example.com", [])
+    transport.origin_allowed(
+      "http://example.com",
+      "http",
+      "example.com",
+      no_origins(),
+    )
   let assert Ok(Nil) =
     transport.origin_allowed(
       "https://example.com",
       "https",
       "example.com:443",
-      [],
+      no_origins(),
     )
   let assert Ok(Nil) =
-    transport.origin_allowed("HTTP://Example.COM:80", "http", "example.com", [])
+    transport.origin_allowed(
+      "HTTP://Example.COM:80",
+      "http",
+      "example.com",
+      no_origins(),
+    )
   let assert Error(_) =
-    transport.origin_allowed("https://example.com", "http", "example.com", [])
+    transport.origin_allowed(
+      "https://example.com",
+      "http",
+      "example.com",
+      no_origins(),
+    )
   let assert Error(_) =
     transport.origin_allowed(
       "http://example.com:8080",
       "http",
       "example.com",
-      [],
+      no_origins(),
     )
   let assert Error(_) =
-    transport.origin_allowed("http://evil.com", "http", "example.com", [])
+    transport.origin_allowed(
+      "http://evil.com",
+      "http",
+      "example.com",
+      no_origins(),
+    )
   let assert Error(_) =
     transport.origin_allowed(
       "http://example.com.evil.com",
       "http",
       "example.com",
-      [],
+      no_origins(),
     )
   let assert Error(_) =
     transport.origin_allowed(
       "http://user@example.com",
       "http",
       "example.com",
-      [],
+      no_origins(),
     )
   let assert Error(_) =
-    transport.origin_allowed("null", "http", "example.com", [])
+    transport.origin_allowed("null", "http", "example.com", no_origins())
   let assert Error(_) =
-    transport.origin_allowed("ws://example.com", "http", "example.com", [])
+    transport.origin_allowed(
+      "ws://example.com",
+      "http",
+      "example.com",
+      no_origins(),
+    )
 }
 
 pub fn origin_allowed_honours_allow_list_test() {
-  let allowed = ["https://app.example.com", "http://localhost:3000"]
+  let assert Ok(allowed) =
+    transport.parse_allowed_origins([
+      "https://app.example.com",
+      "http://localhost:3000",
+    ])
   let assert Ok(Nil) =
     transport.origin_allowed(
       "https://app.example.com",
@@ -1271,9 +1307,19 @@ pub fn origin_allowed_honours_allow_list_test() {
 
 pub fn ipv6_origins_are_compared_exactly_test() {
   let assert Ok(Nil) =
-    transport.origin_allowed("http://[::1]:4000", "http", "[::1]:4000", [])
+    transport.origin_allowed(
+      "http://[::1]:4000",
+      "http",
+      "[::1]:4000",
+      no_origins(),
+    )
   let assert Error(_) =
-    transport.origin_allowed("http://[::1]:4001", "http", "[::1]:4000", [])
+    transport.origin_allowed(
+      "http://[::1]:4001",
+      "http",
+      "[::1]:4000",
+      no_origins(),
+    )
 }
 
 pub fn validate_security_limits_rejects_nonsense_test() {

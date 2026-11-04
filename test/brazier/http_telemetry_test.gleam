@@ -87,6 +87,8 @@ fn limits() -> transport.SecurityLimits {
     ..transport.default_security_limits(),
     keepalive_idle_timeout_ms: 2000,
     request_timeout_ms: 2000,
+    // The raw requests below name the host "test".
+    allowed_hosts: ["test"],
   )
 }
 

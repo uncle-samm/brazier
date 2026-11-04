@@ -442,6 +442,36 @@ pub fn navigation_to_non_local_path_is_refused_test() {
   let assert "{\"page\":\"home\",\"visits\":\"home\",\"tab\":\"\"}" = json
 }
 
+pub fn refused_navigation_log_omits_the_query_test() {
+  // SEC-11: the refusal names the path quoted, without its query.
+  let #(subject, transport_subject, _first) = join_routed("/", "r_ext_log")
+  let #(Nil, lines) =
+    cluster_log_capture.capture(fn() {
+      process.send(
+        subject,
+        runtime.ClientNavigated(
+          conn_id: "r_ext_log",
+          path: "//evil.example/x?token=s3cr3t",
+        ),
+      )
+      // The refusal is logged before it is sent.
+      let assert Ok(transport.SendError(..)) =
+        process.receive(transport_subject, await.deadline_ms)
+        as "a non-local navigation is refused"
+      Nil
+    })
+  let assert True =
+    cluster_log_capture.contains(
+      lines,
+      "warning",
+      "to a non-local path refused",
+    )
+  let assert True =
+    cluster_log_capture.contains(lines, "warning", "\"//evil.example/x\"")
+  let assert False =
+    list.any(lines, fn(line) { string.contains(line.message, "s3cr3t") })
+}
+
 pub fn navigation_without_router_hard_navigates_test() {
   let assert Ok(subject) = runtime.start(counter_config(), test_context())
   let #(transport_subject, _first) = join_and_receive(subject, "no_router", "")
