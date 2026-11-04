@@ -345,6 +345,24 @@
       - removing `data-brazier-hook` does not unmount the hook (already the case before);
       - a keyed morph; whole-array replaces when about n/4 of the items change;
       - a patch-apply bench metric (for PERF-9).
+  - [x] fix-runtime-effects (STAB-1, STAB-2, STAB-5, TS-1, TS-10, TS-11, TS-14, TS-15, PERF-12, PERF-14, SEC-17 logging; SEC-11 runtime part), merged as 0a9bf23.
+    - STAB-1: the runtime-stop flake was the test's monitor racing the helper's EXIT. The test now makes the runtime and helper answer a synchronous request after each monitor, and fails clearly on a `noproc` DOWN.
+    - STAB-2: `effect.after` is an `erlang:send_after` to the runtime's own mailbox (LiveView's `Process.send_after(self(), ...)`), so it spawns nothing and dies with the runtime. Each runtime holds at most 100 pending `after` timers and 32 live `background` workers. Going over logs a warning and emits `[brazier, effect, after|background, rejected]`. A keyed `after` cancels its timer and drops a message already in flight.
+    - STAB-5: the guardian starts and monitors the owner before it `spawn_link`s the worker, and hands back the worker pid through a monitored request/reply (the `gen:call` pattern).
+    - TS-15/PERF-14: no list of effect pids scanned with `is_alive` on every update; dynamic subscriptions are diffed as sets and skipped when unchanged.
+    - TS-1: a join token over the 3800-byte cookie budget gives a plain-text 500 with no cookie, an error log and `[brazier, ssr, join_token, too_large]`, instead of silently dropping the model. With state recovery on, a verified token without a model refuses the join (4400).
+    - TS-10: signing with an empty secret crashes with an `as` message. TS-11: the v1 session-token API (`create_session_token`, `verify_session_token`, `max_token_lifetime_seconds`) is deleted; SECURITY.md has "Join Tokens" instead.
+    - PERF-12: the client bundle name is cached in persistent_term (at most 4 manifests), checked against the manifest's size, mtime and inode, with git's racy-clean rule.
+    - SEC-17 logging: `internal/log_path` drops the query and fragment and quotes control characters (LiveView `filter_parameters`). It is used in every join, navigation and refusal log, the `UnknownRoute` reason and SSR's `describe_uri`.
+    - TS-14/TS-12: every listener log names the listener and runtime pids, and every `let assert` in these files has an `as` message.
+    - Coordinator verify on the merge of 41eb96f into the branch (aa85828): clean build with zero warnings, format and lint clean, 1618 tests passing in each of 3 runs, docs check OK, test-client OK.
+    - Decisions:
+      - SEC-17 recovery approved: `with_state_recovery` changes so `restore` also gets the fresh `init` state (`restore: fn(model, state) -> state`), the way LiveView re-runs mount. It touches `brazier.gleam`, `application.gleam` and `RuntimeConfig.restore_model`, so it goes to wave 2, after fix-cluster (which edits `brazier.gleam`) merges;
+      - accepted the doc edits outside the agent's sections (STATE_MANAGEMENT.md refusal list, SECURITY.md "Effect Caps");
+      - accepted that a model-less token now refuses a join while state recovery is on.
+    - Follow-ups:
+      - the STAB-1 monitor race also exists in `store_test.gleam:29` and `:134`, `ws8c_ets_owner_test.gleam:68` and `cluster/app_tree_test.gleam:371` (wave 4 sweep);
+      - `docs/DEPLOYMENT.md:56` still says "Join tokens and session tokens".
 - [ ] Final verification: build (zero warnings), tests, all examples, CDP browser suite, perf baselines
 
 **Decisions (Milestone 117, coordinator):**
