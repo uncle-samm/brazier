@@ -1,9 +1,11 @@
 -module(beacon_application_ffi).
 -export([trap_exit/0, receive_wait_event/0, get_env_int/1, generate_strong_secret/0,
          fail_loudly/1, once_new/0, once_take/1, stop_supervisor/2,
-         remember_app/2, forget_app/1, remembered_apps/0, is_linked/1, await_exit/1]).
+         remember_app/2, forget_app/1, remembered_apps/0, is_linked/1, await_exit/1,
+         drain_exclusively/1, take_pending_sigterm/0, pass_on_sigterm/0]).
 
--define(APPS_KEY, '$beacon_started_apps').
+%% The persistent_term key of one running application, by supervisor pid.
+-define(APP_KEY(Pid), {?MODULE, started_app, Pid}).
 
 %% Enable trapping of exit signals (SIGTERM etc.)
 trap_exit() ->
@@ -27,24 +29,25 @@ receive_wait_event() ->
              iolist_to_binary(io_lib:format("~p exited with ~p", [From, Reason]))}
     end.
 
-%% The applications this process started and has not stopped, newest first,
-%% keyed by their supervisor pid. wait_forever stops them on SIGTERM.
+%% The applications started on this node and not stopped, newest first,
+%% keyed by their supervisor pid. wait_forever stops them on SIGTERM, from
+%% whichever process it runs in, so the record is node-wide: one
+%% persistent_term per application, written when it starts and erased when
+%% it stops, as beacon_http_conns does for a listener's bound port. Starts
+%% and stops are rare, which is what persistent_term is for. A tree that
+%% died without `stop` keeps its entry until a `stop` or a SIGTERM finds it
+%% not running.
 remember_app(Pid, App) when is_pid(Pid) ->
-    put(?APPS_KEY, [{Pid, App} | lists:keydelete(Pid, 1, apps())]),
+    persistent_term:put(?APP_KEY(Pid), {erlang:unique_integer([monotonic]), App}),
     nil.
 
 forget_app(Pid) when is_pid(Pid) ->
-    put(?APPS_KEY, lists:keydelete(Pid, 1, apps())),
+    _ = persistent_term:erase(?APP_KEY(Pid)),
     nil.
 
 remembered_apps() ->
-    [App || {_Pid, App} <- apps()].
-
-apps() ->
-    case get(?APPS_KEY) of
-        undefined -> [];
-        Apps when is_list(Apps) -> Apps
-    end.
+    Started = [{Seq, App} || {?APP_KEY(_Pid), {Seq, App}} <- persistent_term:get()],
+    [App || {_Seq, App} <- lists:reverse(lists:keysort(1, Started))].
 
 is_linked(Pid) ->
     {links, Links} = process_info(self(), links),
@@ -61,6 +64,31 @@ await_exit(Pid) ->
 
 %% Generate a cryptographically secure secret key using crypto:strong_rand_bytes/1.
 %% Returns a URL-safe base64-encoded string prefixed with "beacon_".
+%% Run Drain while holding the node's SIGTERM drain lock: every process in
+%% wait_forever is told about SIGTERM, and they drain one after the other,
+%% so an application is never stopped by two of them at once, and none
+%% returns while another is still draining. The lock is global's, scoped to
+%% this node (global:trans with Nodes = [node()], retried until taken).
+drain_exclusively(Drain) when is_function(Drain, 0) ->
+    global:trans({beacon_sigterm_drain, self()}, Drain, [node()], infinity).
+
+%% A SIGTERM the handler forwarded to this process and nobody received:
+%% true once per pending one. Checked after the handler let this process
+%% go, so every forwarded SIGTERM is already in the mailbox (the handler
+%% sends it before it answers the leave). A zero timeout reads the mailbox
+%% without waiting.
+take_pending_sigterm() ->
+    receive
+        {beacon_signal, sigterm} -> true
+    after 0 -> false
+    end.
+
+%% Hand a SIGTERM back to the signal server, as the VM delivers one: to the
+%% other waiters if any, else to OTP's handler (init:stop()).
+pass_on_sigterm() ->
+    gen_event:notify(erl_signal_server, sigterm),
+    nil.
+
 generate_strong_secret() ->
     Bytes = crypto:strong_rand_bytes(32),
     Base = base64:encode(Bytes, #{mode => urlsafe, padding => false}),
@@ -95,17 +123,22 @@ once_take(Ref) ->
 
 %% Stop a supervisor synchronously with reason `normal`: it terminates its
 %% children in reverse start order, then exits. A linked caller that does
-%% not trap exits is unaffected by a normal exit.
+%% not trap exits is unaffected by a normal exit. A supervisor that is not
+%% running is {error, {not_running, Text}}, apart from a stop that failed,
+%% {error, {stop_failed, Text}}.
 stop_supervisor(Pid, Timeout) ->
     try proc_lib:stop(Pid, normal, Timeout) of
         ok -> {ok, nil}
     catch
         exit:noproc ->
-            {error, iolist_to_binary(io_lib:format("~p is not running", [Pid]))};
+            {error, {not_running, format("~p is not running", [Pid])}};
         exit:timeout ->
-            {error, iolist_to_binary(
-                      io_lib:format("~p did not stop within ~pms", [Pid, Timeout]))};
+            {error, {stop_failed,
+                     format("~p did not stop within ~pms", [Pid, Timeout])}};
         exit:Reason ->
-            {error, iolist_to_binary(
-                      io_lib:format("~p exited with ~p while stopping", [Pid, Reason]))}
+            {error, {stop_failed,
+                     format("~p exited with ~p while stopping", [Pid, Reason])}}
     end.
+
+format(Format, Args) ->
+    iolist_to_binary(io_lib:format(Format, Args)).

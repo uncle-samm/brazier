@@ -13,8 +13,31 @@ local path.
 
 **join** -- Sent after WebSocket opens. `path` drives routing. `token` remains in the JSON shape for direct runtime tests and non-browser clients, but browser join/session recovery uses the HttpOnly `beacon_join_token` cookie from the WebSocket upgrade request.
 ```json
-{"type": "join", "token": "", "path": "/"}
+{"type": "join", "token": "", "path": "/", "build": "8a13610f74006aaf"}
 ```
+`build` is optional. It is the build id of the client bundle the page
+loaded: the content hash in `/beacon_client_<hash>.js`, which the client
+reads from the URL of its own script (`document.currentScript`). The server
+compares it with the bundle `priv/static/beacon_client.manifest` names now,
+read on every join:
+
+- the same bundle: the join goes on;
+- another one (the app was rebuilt or redeployed since the page loaded): the
+  server closes with **4409** `stale build`, and the client reloads the page
+  behind its reload guard (see
+  [Client Connection Behaviour](#client-connection-behaviour)), so a page
+  never decodes a model with the codec of another build;
+- the manifest cannot be read, or names a bundle that does not exist: the
+  server logs an error and closes with **1011** `internal error`;
+- no `build` (the page loaded the client from the unversioned
+  `/beacon_client.js`, or a non-browser client): the join goes on unchecked,
+  and the server logs a warning. The client also warns once when it finds no
+  build id in its script URL.
+
+A `build` that is not a string makes the join a message that fails to
+decode. The check follows LiveView's `phx-track-static`: the client reports
+the digested assets its page loaded on join, and an outdated page is told to
+reload.
 
 **event** -- A Msg the browser decoded from a DOM event. The client runs the
 handler's decoder against the event, applies the Msg locally, and sends it
@@ -118,7 +141,12 @@ this triggers a real HTTP request — use when the browser needs to receive HTTP
 {"type": "hard_navigate", "path": "/api/auth/session/TOKEN"}
 ```
 
-**reload** -- Dev mode: tells browser to reload.
+**reload** -- Dev mode only: the app was rebuilt, reload the page. Under
+`gleam run -m beacon/dev` every WebSocket handler subscribes to the PubSub
+topic `beacon:dev:reload`, and each successful rebuild broadcasts on it, so
+every open page gets one `reload`. The server keeps the socket open; the
+page's reload closes it. Outside dev mode no handler subscribes and the
+server never sends it.
 ```json
 {"type": "reload"}
 ```
@@ -176,21 +204,29 @@ model event is held until the server catches up.
 The generated browser client handles close codes, reconnects and sending as
 follows.
 
-- **4400 to 4499** (`init` refused with a client error, and 4401 for a
-  revoked session): stop reconnecting, log an error and reload the page. The
-  new page load decides: the server renders the page again (a fresh session,
-  or the login page) or answers with its error page, which opens no socket.
+- **4400 to 4499**: the server refused this page's session. That is `init`
+  refusing with a 4xx status (4000 + the status), 4401 for a revoked session
+  or failed authentication, and 4409 `stale build` for a page from another
+  build. The client stops reconnecting, logs an error and reloads the page.
+  The new page load decides: the server renders the page again (a fresh
+  session, the login page, or the page with the current bundle) or answers
+  with its error page, which opens no socket.
   A reload guard in `sessionStorage` (`beacon:reloads`) allows at most 3 such
-  reloads per tab within 60 seconds. After that, or when `sessionStorage`
-  cannot be used, the client does not reload. It logs the reason, marks the
-  app root with `data-beacon-error` and puts a `role="alert"` notice
-  (`data-beacon-error-notice`) at the top of the root.
+  reloads per tab within 60 seconds, whatever the code. After that, or when
+  `sessionStorage` cannot be used, the client does not reload. It logs the
+  reason, marks the app root with `data-beacon-error` and puts a
+  `role="alert"` notice (`data-beacon-error-notice`) at the top of the root.
+  The guard is what stops a loop: a deployment whose pages keep naming
+  another bundle than its manifest gets 3 reloads, then the error state.
 - **Any other close** (including 1001, 1008, 1009, 1011, 1013 and 4500 to
   4599): reconnect after `min(1s * 2^attempts, 30s)` plus up to 1s of random
   jitter. `attempts` resets only after a `model_sync` is applied. A server
   that keeps refusing (4503 while a store is down, 1011 for an `init` that
   crashes) or that accepts and drops sockets is therefore tried at most once
-  every 31 seconds per tab.
+  every 31 seconds per tab. 1001 is a server that is shutting down: the
+  reconnect reaches the next instance, or this one once it is back.
+- A `reload` message (dev mode) reloads the page at once, without the guard:
+  the server sends it once per rebuild, never in answer to a join.
 - **Outbound pacing**: every message except `heartbeat` passes through one
   queue paced at 40 messages per sliding 1s window (an `event_batch` costs one
   per event, as on the server), below the server's 50 per second. The queue
@@ -216,11 +252,11 @@ follows.
 
 The server answers `GET /ws` with `101 Switching Protocols` only when every
 check passes. Checks run in this order, and each rejection is logged with the
-connection id and peer address:
+connection id and peer address. The `SecurityLimits` are not checked here:
+the listener refuses to start with invalid ones.
 
 | Check | Rejection |
 |-------|-----------|
-| `SecurityLimits` are valid | 500 |
 | Global connection limit (`max_connections`, 10,000) | 503 |
 | Per-IP WebSocket cap (`max_ws_connections_per_ip`, 100) | 429 |
 | `Origin` present and allowed (see below) | 403 |
@@ -291,6 +327,13 @@ the echo.
   A batch with more than 100 events is rejected with `Batch too large`, so a
   batch larger than `max_events_per_second` can never be accepted. Clients
   should cap batches at `max_events_per_second`.
+- The limit is not sent to the client. Like Phoenix channels, Beacon does
+  not advertise it: it is there for clients that do not pace themselves, and
+  an advertised number would not slow those down. The generated client paces
+  itself at 40 events per second against the default of 50 (see
+  [Client Connection Behaviour](#client-connection-behaviour)). A lower
+  `max_events_per_second` is allowed, and the listener logs a warning at
+  start, since a burst from an honest client is then rate limited.
 - Heartbeats are limited to 2 per second. Extra heartbeats are not acked and
   count as violations.
 - Each rejected message is one rate violation. More than
@@ -312,23 +355,30 @@ the echo.
 - Logging out, rotating the session id (on login or a privilege change) or
   deleting the session closes every live socket bound to it immediately with
   **4401** `session revoked`. The old id is then rejected with 401.
-- A client receiving **4401** must not reconnect with the same session. It
-  should reload or send the user to log in.
+- A client receiving **4401** must not reconnect with the same session. The
+  generated client reloads the page (behind its reload guard), so the server
+  renders it for the session the cookie now names, or the login page.
 
 ## Close Codes
 
 | Code | Meaning |
 |------|---------|
 | 1000 | Normal close, pong timeout or idle timeout |
-| 1001 | Going away: the server is shutting down (`server shutting down`) |
+| 1001 | Going away: the server is draining for a shutdown (`server shutting down`). The client reconnects with backoff |
 | 1002 | Protocol error (bad frame, bad close payload) |
 | 1003 | Binary data not supported |
 | 1005 | Reported for an empty close frame (never sent as a code) |
 | 1007 | Invalid UTF-8 in a text message |
 | 1008 | Policy violation: rate limit or decode-error flood |
 | 1009 | Message too big |
-| 1011 | Internal error (runtime startup failure or an unexpected process message) |
+| 1011 | Internal error (`internal error`): `init` crashed, the runtime did not start, the handler got a message it does not know, or a join's build cannot be checked because the client bundle is missing. The client reconnects with backoff |
 | 1013 | Try again later (backpressure or overload) |
-| 4401 | Session revoked or authentication expired. Do not reconnect |
-| 4400-4499 | `init` refused with a 4xx status (4000 + status). The client reloads the page |
+| 4400-4499 | The server refused this page's session. The client does not reconnect: it reloads the page, at most 3 times per tab within 60 seconds |
+| 4000 + status | `init` refused with that 4xx status (4404, 4403, ...) |
+| 4401 | Session revoked (`session revoked`) or authentication expired (`authentication expired`). The page reloads, so the server renders it for whoever the cookie now names, or the login page |
+| 4409 | Stale build (`stale build`): the join's `build` is not the bundle the server serves now. The page reloads and gets the current bundle |
 | 4500-4599 | `init` refused with a 5xx status (4503 for `error.unavailable`). The client reconnects with backoff |
+
+An `init` refusal with 401 or 409 also closes with 4401 or 4409. The action
+is the same, a reload, and the close reason and the server log tell them
+apart.

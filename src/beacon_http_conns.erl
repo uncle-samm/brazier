@@ -12,9 +12,23 @@
 %%   {global, N}                       live connections
 %%   {{ip, Ip}, N}                     live connections per peer IP
 %%   {{pid, Pid}, Ip, CountedPerIp}    slot owned by a handler pid
+%%   {{ws_ip, IpText}, N}              live WebSockets per client IP
+%%   {{ws_pid, Pid}, IpText}           WebSocket slot owned by a handler pid
 %%   {port, Port}                      bound listen port (survives acceptor restarts)
+%%   {listen_socket, Socket}           the listen socket, published by its owner
+%%                                     beacon_http_listen_socket for the acceptors
 %% Slot removal uses ets:take/2 so a concurrent early release and 'EXIT'
 %% can never double-decrement.
+%%
+%% WEBSOCKET SLOTS. A handler that upgrades to a WebSocket also takes a
+%% per-client-IP WebSocket slot (ws_acquire_self/2). The client IP is the
+%% one the transport resolved, which behind a trusted proxy is the forwarded
+%% client, so it is counted apart from the connection's peer IP above. The
+%% handler releases its slot when the socket closes (ws_release_self/0), and
+%% this process releases it on the handler's 'EXIT' in any case, so a crashed
+%% or killed handler never leaks one. The slots live and die with this
+%% listener: no node-wide process holds them, and two listeners never share
+%% a count.
 %%
 %% The children map is Pid => StartedAt (native monotonic time). When a
 %% handler exits, this process emits [beacon, http, connection, closed]
@@ -23,8 +37,8 @@
 %%
 %% DRAIN. When this process terminates in an orderly way (its listener is
 %% stopped, or restarted because an earlier child of the application tree
-%% restarted), the acceptors have already stopped: the listen socket is
-%% closed and no connection is added. terminate/2 then sends every handler
+%% restarted), the acceptors have already stopped and the listen socket
+%% owner has closed the socket: no connection is added. terminate/2 then sends every handler
 %% {beacon_http_drain, self()} instead of an exit signal, and each handler
 %% finishes what it is doing (drain_requested/0, mark_draining/0):
 %%   * a WebSocket sends close 1001 (going away) and exits;
@@ -48,7 +62,8 @@
     start_connection/2, release_self/0, release_pid/2,
     drain_requested/0, mark_draining/0, is_drain_message/1, owner/0, owner_if_any/0,
     count_self/0, count/1, count_for_ip/2, count_for_ip_text/2, children/1,
-    get_port/1, set_port/2, forget_port/1
+    ws_acquire_self/2, ws_release_self/0, ws_count_for_ip/2,
+    get_port/1, set_listen_socket/3, listen_socket/1, forget_port/1
 ]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 -export([connection_init/3]).
@@ -80,7 +95,11 @@ start_connection(Conns, Ip) ->
     gen_server:call(Conns, {start_connection, Ip}).
 
 get_port(Conns) -> gen_server:call(Conns, get_port).
-set_port(Conns, Port) -> gen_server:call(Conns, {set_port, Port}).
+%% Called by beacon_http_listen_socket once it has bound: records the bound
+%% port (reused by every later bind of this listener) and the socket.
+set_listen_socket(Conns, Socket, Port) -> gen_server:call(Conns, {set_listen_socket, Socket, Port}).
+%% The current listen socket, for the acceptors. {ok, Socket} | {error, no_listen_socket}.
+listen_socket(Conns) -> gen_server:call(Conns, listen_socket).
 count(Conns) -> gen_server:call(Conns, count).
 count_for_ip(Conns, Ip) -> gen_server:call(Conns, {count_for_ip, Ip}).
 children(Conns) -> gen_server:call(Conns, children).
@@ -184,13 +203,65 @@ release_pid(Tid, Pid) ->
 %% Decrement a per-IP counter and drop the row once it reaches zero so the
 %% table stays bounded by the number of IPs with live connections.
 decrement_ip(Tid, Ip) ->
-    case ets:update_counter(Tid, {ip, Ip}, -1) of
+    decrement_counter(Tid, {ip, Ip}).
+
+%% A concurrent increment between the decrement and the delete is safe: the
+%% delete only matches a row still at zero, and update_counter/4 recreates a
+%% deleted row.
+decrement_counter(Tid, Key) ->
+    case ets:update_counter(Tid, Key, -1) of
         N when N =< 0 ->
-            _ = ets:select_delete(Tid, [{{{ip, Ip}, '$1'}, [{'=<', '$1', 0}], [true]}]),
+            _ = ets:select_delete(Tid, [{{Key, '$1'}, [{'=<', '$1', 0}], [true]}]),
             ok;
         _ ->
             ok
     end.
+
+%% Take a WebSocket slot for client IP IpText for the calling handler.
+%% {ok, Count} when taken, {error, Held} when IpText already holds Max (the
+%% caller then holds nothing). A handler holds at most one slot: a second
+%% acquire is a bug and crashes.
+ws_acquire_self(IpText, Max) when is_binary(IpText), is_integer(Max), Max > 0 ->
+    {_Conns, Tid} = connection_context(),
+    case ets:insert_new(Tid, {{ws_pid, self()}, IpText}) of
+        true -> ok;
+        false ->
+            beacon_log_ffi:error(<<"beacon.http_conns">>,
+                                 "connection ~p already holds a WebSocket slot", [self()]),
+            erlang:error(ws_slot_already_held)
+    end,
+    Key = {ws_ip, IpText},
+    Count = ets:update_counter(Tid, Key, 1, {Key, 0}),
+    case Count > Max of
+        true ->
+            true = ets:delete(Tid, {ws_pid, self()}),
+            decrement_counter(Tid, Key),
+            {error, Count - 1};
+        false ->
+            {ok, Count}
+    end.
+
+%% Release the calling handler's WebSocket slot. Idempotent: {ok, IpText}
+%% when this call released it, {error, nil} when none was held.
+ws_release_self() ->
+    {_Conns, Tid} = connection_context(),
+    case release_ws_pid(Tid, self()) of
+        {ok, IpText} -> {ok, IpText};
+        none -> {error, nil}
+    end.
+
+release_ws_pid(Tid, Pid) ->
+    case ets:take(Tid, {ws_pid, Pid}) of
+        [{{ws_pid, Pid}, IpText}] ->
+            decrement_counter(Tid, {ws_ip, IpText}),
+            {ok, IpText};
+        [] ->
+            none
+    end.
+
+%% Live WebSockets of one client IP on the listener whose owner is Conns.
+ws_count_for_ip(Conns, IpText) when is_binary(IpText) ->
+    gen_server:call(Conns, {ws_count_for_ip, IpText}).
 
 global_count(Tid) ->
     ets:lookup_element(Tid, global, 2).
@@ -259,18 +330,31 @@ handle_call({start_connection, Ip}, _From, State) ->
     end;
 handle_call(get_port, _From, State = #{tid := Tid}) ->
     {reply, ets:lookup_element(Tid, port, 2), State};
-handle_call({set_port, Port}, _From, State = #{tid := Tid}) when is_integer(Port), Port > 0 ->
-    true = ets:insert(Tid, {port, Port}),
+handle_call({set_listen_socket, Socket, Port}, _From, State = #{tid := Tid})
+        when is_integer(Port), Port > 0 ->
+    true = ets:insert(Tid, [{port, Port}, {listen_socket, Socket}]),
     Key = {?MODULE, bound_port, self_name()},
     case persistent_term:get(Key, undefined) of
         Port -> ok;
         _ -> persistent_term:put(Key, Port)
     end,
     {reply, ok, State};
+handle_call(listen_socket, _From, State = #{tid := Tid}) ->
+    Reply = case ets:lookup(Tid, listen_socket) of
+        [{listen_socket, Socket}] -> {ok, Socket};
+        [] -> {error, no_listen_socket}
+    end,
+    {reply, Reply, State};
 handle_call(count, _From, State = #{tid := Tid}) ->
     {reply, global_count(Tid), State};
 handle_call({count_for_ip, Ip}, _From, State = #{tid := Tid}) ->
     N = case ets:lookup(Tid, {ip, beacon_ip_ffi:normalize(Ip)}) of
+        [{_, C}] -> C;
+        [] -> 0
+    end,
+    {reply, N, State};
+handle_call({ws_count_for_ip, IpText}, _From, State = #{tid := Tid}) ->
+    N = case ets:lookup(Tid, {ws_ip, IpText}) of
         [{_, C}] -> C;
         [] -> 0
     end,
@@ -288,8 +372,9 @@ handle_cast(Other, State) ->
 handle_info({'EXIT', Pid, Reason}, State = #{tid := Tid, children := Children}) ->
     case maps:take(Pid, Children) of
         {StartedAt, Rest} ->
-            %% false: the handler already released its slot early.
+            %% false / none: the handler already released its slot early.
             _ = release_pid(Tid, Pid),
+            _ = release_ws_pid(Tid, Pid),
             log_exit(Pid, Reason),
             emit_closed(StartedAt, close_reason(Reason)),
             {noreply, State#{children := Rest}};
@@ -338,8 +423,9 @@ await_exits(Remaining, Tid, Deadline) ->
     Timeout = max(0, Deadline - erlang:monotonic_time(millisecond)),
     receive
         {'EXIT', Pid, Reason} when is_map_key(Pid, Remaining) ->
-            %% false: the handler already released its slot early.
+            %% false / none: the handler already released its slot early.
             _ = release_pid(Tid, Pid),
+            _ = release_ws_pid(Tid, Pid),
             {StartedAt, Rest} = maps:take(Pid, Remaining),
             emit_closed(StartedAt, close_reason(Reason)),
             await_exits(Rest, Tid, Deadline)

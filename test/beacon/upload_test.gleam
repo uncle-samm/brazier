@@ -603,7 +603,7 @@ pub fn format_size_test() {
 // --- Helpers ---
 
 fn body_of(resp: response.Response(server.ResponseBody)) -> BitArray {
-  let server.Bytes(tree) = resp.body
+  let assert server.Bytes(tree) = resp.body
   bytes_tree.to_bit_array(tree)
 }
 

@@ -11,22 +11,33 @@
 /// ├── connection owner   beacon_http_conns      (worker)
 /// │     links every connection handler process, enforces the global and
 /// │     per-IP connection caps, releases a slot when a handler exits
+/// ├── listen socket      beacon_http_listen_socket (worker)
+/// │     opens the listen socket, traps exits, closes it in terminate
 /// └── acceptors          beacon_http_acceptors_sup (supervisor, one_for_one)
-///       owns the listen socket; N permanent acceptor processes
+///       N transient acceptor processes on that socket
 /// ```
 ///
 /// Stopping the listener stops the acceptors first (no new connection is
-/// accepted), then the connection owner drains: it sends every handler a
-/// drain message and waits, without polling, up to `drain_timeout_ms` for
-/// them to exit. An idle keep-alive connection closes at once, a request in
-/// progress finishes and is answered with `connection: close`, a WebSocket
-/// closes with 1001. Handlers still running at the deadline are killed and
-/// logged as an error.
+/// accepted), then closes the listen socket, then the connection owner
+/// drains: it sends every handler a drain message and waits, without
+/// polling, up to `drain_timeout_ms` for them to exit. An idle keep-alive
+/// connection closes at once, a request in progress finishes and is
+/// answered with `connection: close`, a WebSocket closes with 1001.
+/// Handlers still running at the deadline are killed and logged as an
+/// error.
+///
+/// The listen socket has an owner of its own because the runtime closes a
+/// port asynchronously after its owner exits: a listener restarted at once
+/// could find the port still bound (`eaddrinuse`). Closing the socket in
+/// the owner's terminate makes the port free before the owner is reported
+/// down. Ranch keeps the socket in its acceptor supervisor and never closes
+/// it; Thousand Island gives it a dedicated listener process, as here.
 ///
 /// A crashing handler only takes itself down (its slot is released by the
 /// owner). A crashing acceptor is restarted and reported by its supervisor.
-/// If the connection owner itself dies, rest_for_one restarts the acceptors
-/// too, so no acceptor ever hands a socket to a dead owner.
+/// If the connection owner itself dies, rest_for_one restarts the socket
+/// owner and the acceptors too, so no acceptor ever hands a socket to a dead
+/// owner; if the socket owner dies, the acceptors restart on its new socket.
 ///
 /// Reference: RFC 6455 (WebSocket), RFC 9112 (HTTP/1.1), ranch.
 import beacon/ip
@@ -46,10 +57,19 @@ pub type Connection {
   Connection(socket: Socket)
 }
 
-/// Response body type. Replaces mist.ResponseData.
+/// Response body type.
+///
+/// Reference: mist's `ResponseData` (`Bytes` and `File`), Plug's
+/// `send_file/5`.
 pub type ResponseBody {
   /// Bytes response body wrapping a BytesTree.
   Bytes(BytesTree)
+  /// `length` bytes of the file at `path`, starting at byte `offset`. The
+  /// listener writes them with `file:sendfile`, so they never enter the
+  /// BEAM heap. Content-Length is `length`. If the file holds fewer bytes
+  /// when it is sent, the response is cut short and the connection closed.
+  /// Static files are served this way (`beacon/static`).
+  File(path: String, offset: Int, length: Int)
 }
 
 /// Opaque socket type wrapping an Erlang gen_tcp socket (port).
@@ -136,7 +156,7 @@ pub fn send_close_frame(socket: Socket) -> Result(Nil, String) {
 /// never wait longer than the body read timeout or the total request
 /// deadline, and fails loudly when called outside an active request.
 /// Application code should normally use `beacon/transport/http.read_body`.
-@external(erlang, "beacon_transport_ffi", "read_body")
+@external(erlang, "beacon_transport_ffi", "http_body_read")
 pub fn read_body(socket: Socket, length: Int) -> Result(BitArray, String)
 
 // --- TCP Message Classification ---
@@ -296,20 +316,8 @@ pub fn stop(listener: Listener) -> Nil {
     "Stopping listener on port " <> int.to_string(listener.port),
   )
   ffi_stop_supervisor(listener.supervisor)
-  release(listener)
-}
-
-/// Forget the remembered bound port of a listener that has stopped for
-/// good. A restarted listener rebinds the port it bound first (so a port-0
-/// listener keeps its port across restarts); once its parent tree has been
-/// stopped, that memory must go. `stop` calls this itself.
-pub fn release(listener: Listener) -> Nil {
-  case ffi_conns_forget_port(listener.conns) {
-    True ->
-      log.debug(
-        "beacon.server",
-        "Forgot bound port " <> int.to_string(listener.port),
-      )
+  case release(listener) {
+    True -> Nil
     False ->
       log.warning(
         "beacon.server",
@@ -318,6 +326,25 @@ pub fn release(listener: Listener) -> Nil {
           <> " (stopped twice?)",
       )
   }
+}
+
+/// Forget the remembered bound port of a listener that has stopped for
+/// good. A restarted listener rebinds the port it bound first (so a port-0
+/// listener keeps its port across restarts); once its parent tree has been
+/// stopped, that memory must go. `stop` calls this itself. Returns whether
+/// a port was remembered: a caller that knows the listener ran warns when
+/// it was not.
+pub fn release(listener: Listener) -> Bool {
+  let forgot = ffi_conns_forget_port(listener.conns)
+  log.debug(
+    "beacon.server",
+    case forgot {
+      True -> "Forgot bound port "
+      False -> "No bound port remembered for port "
+    }
+      <> int.to_string(listener.port),
+  )
+  forgot
 }
 
 /// The port the listener is bound to (the OS-assigned one for port 0).
@@ -341,6 +368,16 @@ pub fn get_connection_count_for_ip(
   address: String,
 ) -> Result(Int, Nil) {
   ffi_conns_count_for_ip(listener.conns, address)
+}
+
+/// Number of live WebSockets on this listener from one client IP: the
+/// address the per-IP WebSocket cap counts, which behind a trusted proxy is
+/// the forwarded client.
+pub fn get_ws_connection_count_for_ip(
+  listener: Listener,
+  address: String,
+) -> Int {
+  ffi_conns_ws_count_for_ip(listener.conns, address)
 }
 
 /// Pids of the live connection handler processes.
@@ -375,19 +412,23 @@ fn build(
     // The owner drains for up to drain_timeout_ms, then kills the
     // stragglers and waits for their exits: the margin covers that.
     |> supervision.timeout(ms: options.drain_timeout_ms + conns_stop_margin_ms)
-  let acceptors =
-    supervision.supervisor(fn() {
-      ffi_acceptors_start_link(
+  let listen_socket =
+    supervision.worker(fn() {
+      ffi_listen_socket_start_link(
         name,
-        options.acceptors,
         options.backlog,
         options.send_timeout_ms,
       )
+    })
+  let acceptors =
+    supervision.supervisor(fn() {
+      ffi_acceptors_start_link(name, options.acceptors)
     })
   let builder =
     static_supervisor.new(static_supervisor.RestForOne)
     |> static_supervisor.restart_tolerance(intensity: 3, period: 10)
     |> static_supervisor.add(conns)
+    |> static_supervisor.add(listen_socket)
     |> static_supervisor.add(acceptors)
   Ok(#(name, builder))
 }
@@ -462,12 +503,17 @@ fn ffi_conns_start_link(
   drain_timeout_ms: Int,
 ) -> Result(actor.Started(ConnsName), actor.StartError)
 
+@external(erlang, "beacon_http_listen_socket", "start_link_gleam")
+fn ffi_listen_socket_start_link(
+  name: ConnsName,
+  backlog: Int,
+  send_timeout_ms: Int,
+) -> Result(actor.Started(Nil), actor.StartError)
+
 @external(erlang, "beacon_http_acceptors_sup", "start_link_gleam")
 fn ffi_acceptors_start_link(
   name: ConnsName,
   acceptors: Int,
-  backlog: Int,
-  send_timeout_ms: Int,
 ) -> Result(actor.Started(Nil), actor.StartError)
 
 @external(erlang, "beacon_http_conns", "get_port")
@@ -481,6 +527,9 @@ fn ffi_conns_count(name: ConnsName) -> Int
 
 @external(erlang, "beacon_http_conns", "count_for_ip_text")
 fn ffi_conns_count_for_ip(name: ConnsName, address: String) -> Result(Int, Nil)
+
+@external(erlang, "beacon_http_conns", "ws_count_for_ip")
+fn ffi_conns_ws_count_for_ip(name: ConnsName, address: String) -> Int
 
 @external(erlang, "beacon_http_conns", "children")
 fn ffi_conns_children(name: ConnsName) -> List(process.Pid)

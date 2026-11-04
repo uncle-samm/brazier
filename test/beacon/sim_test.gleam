@@ -85,10 +85,9 @@ fn run_measured(
 }
 
 /// Serve one connection before the leak baseline is taken. The first
-/// connection in a VM starts singletons that live for the rest of it: the
-/// native resolver for "localhost" (inet_gethost_native) and the
-/// beacon_ws_pg scope for per-IP WebSocket slots. They are not per
-/// connection state, so they belong in the baseline; anything a measured
+/// connection in a VM starts a singleton that lives for the rest of it: the
+/// native resolver for "localhost" (inet_gethost_native). It is not per
+/// connection state, so it belongs in the baseline; anything a measured
 /// connection leaves behind still shows up, once per connection.
 fn warm_up(app: application.App) -> Nil {
   let mt = metrics.new()

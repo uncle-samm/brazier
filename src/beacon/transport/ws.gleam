@@ -55,6 +55,12 @@ pub const close_try_again_later = 1013
 /// Clients must not blindly reconnect on this code; they must re-authenticate.
 pub const close_auth_revoked = 4401
 
+/// 4409: application code — the page's client bundle is not the one the
+/// server serves now (the app was rebuilt since the page loaded), so its
+/// model codec may not match the server's. The client reloads the page, as
+/// for every code from 4400 to 4499.
+pub const close_stale_build = 4409
+
 /// Maximum close reason length: control payload limit 125 minus the code.
 const max_close_reason_bytes = 123
 
@@ -531,6 +537,9 @@ pub type SocketEvent {
   /// The listener is stopping: its connection owner asked this connection
   /// to drain. The handler closes with 1001 (going away).
   ServerDraining
+  /// `beacon/dev` rebuilt the app: the handler tells the page to reload.
+  /// Only a handler that subscribed to the dev reload topic receives it.
+  DevReload
   /// Anything else — a framework bug; the handler closes with 1011.
   UnexpectedMessage(description: String)
 }
@@ -579,12 +588,14 @@ pub fn peer_ip(socket: server.Socket) -> Result(String, String) {
   }
 }
 
-@external(erlang, "beacon_transport_ffi", "ws_acquire_ip_slot")
+@external(erlang, "beacon_http_conns", "ws_acquire_self")
 fn ffi_acquire_ip_slot(ip: String, max: Int) -> Result(Int, Int)
 
-/// Take one per-IP WebSocket slot for the calling process.
-/// Ok(count) on success; Error(count) when the IP already holds `max`.
-/// The slot is released automatically when the calling process exits.
+/// Take one per-IP WebSocket slot on this listener for the calling
+/// connection handler. Ok(count) on success; Error(count) when the IP
+/// already holds `max`. The listener's connection owner releases the slot
+/// when the handler exits, whatever the reason. Crashes outside a
+/// connection handler, or when the handler already holds a slot.
 pub fn acquire_ip_slot(ip: String, max: Int) -> Result(Int, Int) {
   let assert True = max > 0 as "max_ws_connections_per_ip is validated > 0"
   case ffi_acquire_ip_slot(ip, max) {
@@ -617,14 +628,6 @@ pub fn acquire_ip_slot(ip: String, max: Int) -> Result(Int, Int) {
   }
 }
 
-@external(erlang, "beacon_transport_ffi", "ws_ip_slot_count")
-fn ffi_ip_slot_count(ip: String) -> Int
-
-/// Number of live WebSocket handlers holding a slot for `ip`.
-pub fn get_ip_slot_count(ip: String) -> Int {
-  ffi_ip_slot_count(ip)
-}
-
 @external(erlang, "beacon_transport_ffi", "ws_mailbox_len")
 fn ffi_mailbox_len() -> Int
 
@@ -633,16 +636,17 @@ pub fn get_mailbox_len() -> Int {
   ffi_mailbox_len()
 }
 
-@external(erlang, "beacon_transport_ffi", "ws_release_ip_slot")
-fn ffi_release_ip_slot(ip: String) -> Bool
+@external(erlang, "beacon_http_conns", "ws_release_self")
+fn ffi_release_ip_slot() -> Result(String, Nil)
 
-/// Release the calling process's per-IP slot. Idempotent; logs whether a
-/// slot was actually held so double releases are visible in debug logs.
-pub fn release_ip_slot(ip: String) -> Nil {
-  case ffi_release_ip_slot(ip) {
-    True -> log.debug("beacon.ws", "WebSocket slot released for " <> ip)
-    False ->
-      log.debug("beacon.ws", "WebSocket slot for " <> ip <> " already released")
+/// Release the calling connection handler's per-IP WebSocket slot.
+/// Idempotent; logs whether a slot was actually held so double releases are
+/// visible in debug logs. Crashes outside a connection handler.
+pub fn release_ip_slot() -> Nil {
+  case ffi_release_ip_slot() {
+    Ok(ip) -> log.debug("beacon.ws", "WebSocket slot released for " <> ip)
+    Error(Nil) ->
+      log.debug("beacon.ws", "WebSocket slot already released for this handler")
   }
 }
 

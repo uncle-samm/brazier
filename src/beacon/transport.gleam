@@ -11,6 +11,7 @@ import beacon/error
 import beacon/ip
 import beacon/log
 import beacon/middleware
+import beacon/pubsub
 import beacon/ssr
 import beacon/static
 import beacon/telemetry
@@ -136,8 +137,8 @@ pub type InternalMessage {
 
 /// Configurable security limits for the transport layer.
 /// All fields have sensible defaults via `default_security_limits()`.
-/// `validate_security_limits` rejects nonsensical values; the WebSocket
-/// upgrade path refuses to run with invalid limits.
+/// `validate_security_limits` rejects nonsensical values; the listener
+/// refuses to start with invalid limits.
 pub type SecurityLimits {
   SecurityLimits(
     /// Maximum WebSocket message size in bytes. Default: 65536 (64KB).
@@ -447,8 +448,6 @@ pub type ConnectionState {
     reassembly: ws.Reassembly,
     /// Peer IP address, for logs.
     peer_ip: String,
-    /// Per-IP slot this connection holds (released on cleanup).
-    slot_key: String,
     /// The original upgrade request (for periodic `ws_auth` re-checks).
     request: Request(Connection),
     /// The configured `ws_auth`, re-run every `ws_auth_recheck_interval_ms`.
@@ -676,10 +675,17 @@ pub fn encode_server_message(msg: ServerMessage) -> String {
   }
 }
 
-/// Build a decoder for ClientMessage JSON.
+/// A decoded client message and, for a `join`, the build id it carries:
+/// the hash of the client bundle its page loaded (`beacon_client_<hash>.js`),
+/// `None` when the join names none. Only the transport reads the build id,
+/// so it is not part of `ClientJoin`.
+type ClientFrame =
+  #(ClientMessage, Option(String))
+
+/// Build a decoder for client message JSON.
 /// Uses the "type" field to determine which variant to decode.
 /// Follows Lustre's transport.server_message_decoder() pattern.
-fn client_message_decoder() -> decode.Decoder(ClientMessage) {
+fn client_frame_decoder() -> decode.Decoder(ClientFrame) {
   use msg_type <- decode.field("type", decode.string)
   case msg_type {
     "event" -> {
@@ -689,26 +695,34 @@ fn client_message_decoder() -> decode.Decoder(ClientMessage) {
       use target_path <- decode.field("target_path", decode.string)
       use clock <- decode.optional_field("clock", 0, decode.int)
       use ops <- decode.optional_field("ops", "", decode.string)
-      decode.success(ClientEvent(
-        name: name,
-        handler_id: handler_id,
-        data: data,
-        target_path: target_path,
-        clock: clock,
-        ops: ops,
+      decode.success(#(
+        ClientEvent(
+          name: name,
+          handler_id: handler_id,
+          data: data,
+          target_path: target_path,
+          clock: clock,
+          ops: ops,
+        ),
+        None,
       ))
     }
-    "heartbeat" -> decode.success(ClientHeartbeat)
+    "heartbeat" -> decode.success(#(ClientHeartbeat, None))
     "join" -> {
       use token <- decode.optional_field("token", "", decode.string)
       use path <- decode.optional_field("path", "/", decode.string)
-      decode.success(ClientJoin(token: token, path: path))
+      use build <- decode.optional_field(
+        "build",
+        None,
+        decode.map(decode.string, Some),
+      )
+      decode.success(#(ClientJoin(token: token, path: path), build))
     }
     "navigate" -> {
       use path <- decode.field("path", decode.string)
-      decode.success(ClientNavigate(path: path))
+      decode.success(#(ClientNavigate(path: path), None))
     }
-    "request_sync" -> decode.success(ClientRequestSync)
+    "request_sync" -> decode.success(#(ClientRequestSync, None))
     "event_batch" -> {
       // Decode array of events — each follows the "event" format
       let event_decoder = {
@@ -732,9 +746,9 @@ fn client_message_decoder() -> decode.Decoder(ClientMessage) {
         ))
       }
       use events <- decode.field("events", decode.list(event_decoder))
-      decode.success(ClientEventBatch(events: events))
+      decode.success(#(ClientEventBatch(events: events), None))
     }
-    _unknown -> decode.failure(ClientHeartbeat, "ClientMessage type")
+    _unknown -> decode.failure(#(ClientHeartbeat, None), "ClientMessage type")
   }
 }
 
@@ -742,10 +756,15 @@ fn client_message_decoder() -> decode.Decoder(ClientMessage) {
 pub fn decode_client_message(
   raw: String,
 ) -> Result(ClientMessage, error.BeaconError) {
-  case json.parse(raw, client_message_decoder()) {
-    Ok(msg) -> {
+  decode_client_frame(raw) |> result.map(fn(frame) { frame.0 })
+}
+
+/// Decode a JSON string from the client into a message and its build id.
+fn decode_client_frame(raw: String) -> Result(ClientFrame, error.BeaconError) {
+  case json.parse(raw, client_frame_decoder()) {
+    Ok(frame) -> {
       log.debug("beacon.transport", "Decoded client message")
-      Ok(msg)
+      Ok(frame)
     }
     Error(_json_err) -> {
       log.warning("beacon.transport", "Failed to decode client message")
@@ -1035,8 +1054,8 @@ fn handle_ws_text(state: ConnectionState, text: String) -> Next {
 /// Decode and dispatch a text message, applying heartbeat and event rate
 /// limits (each event of a batch counts) and decode error accounting.
 fn handle_ws_text_decode(state: ConnectionState, text: String) -> Next {
-  case decode_client_message(text) {
-    Ok(ClientHeartbeat) -> {
+  case decode_client_frame(text) {
+    Ok(#(ClientHeartbeat, _)) -> {
       let #(new_state, hb_limited) = check_heartbeat_rate(state)
       case hb_limited {
         True ->
@@ -1052,7 +1071,7 @@ fn handle_ws_text_decode(state: ConnectionState, text: String) -> Next {
         }
       }
     }
-    Ok(ClientEventBatch(events) as msg) -> {
+    Ok(#(ClientEventBatch(events) as msg, _)) -> {
       let batch_len = list.length(events)
       case batch_len > max_batch_size {
         True ->
@@ -1069,8 +1088,106 @@ fn handle_ws_text_decode(state: ConnectionState, text: String) -> Next {
         False -> dispatch_rate_limited(state, msg, int.max(batch_len, 1))
       }
     }
-    Ok(msg) -> dispatch_rate_limited(state, msg, 1)
+    Ok(#(ClientJoin(..) as msg, build)) -> {
+      use new_state <- admit_rate_limited(state, msg, 1)
+      case check_build(new_state, build) {
+        Ok(Nil) -> deliver(new_state, msg)
+        Error(stop) -> stop
+      }
+    }
+    Ok(#(msg, _)) -> dispatch_rate_limited(state, msg, 1)
     Error(_codec_error) -> record_decode_error(state, string.byte_size(text))
+  }
+}
+
+/// Refuse a join whose page runs an older client build; see
+/// `check_join_build`.
+fn check_build(
+  state: ConnectionState,
+  build: Option(String),
+) -> Result(Nil, Next) {
+  case check_join_build(ssr.client_assets_dir(), ctx(state), build) {
+    Ok(Nil) -> Ok(Nil)
+    Error(#(code, reason)) ->
+      Error(Stop(state, SendClose(code, reason), reason))
+  }
+}
+
+/// Check the build id a `join` carries against the client bundle the
+/// server serves now: the one `beacon_client.manifest` in `assets_dir`
+/// names, as the server-rendered page does. The manifest is read on every
+/// join, never cached, because `beacon/dev` rebuilds the bundle into a
+/// running server.
+///
+/// - The page's bundle is the current one: `Ok(Nil)`.
+/// - It is another one (the app was rebuilt since the page loaded):
+///   `Error(#(4409, "stale build"))`. The client reloads behind its reload
+///   guard and gets the new bundle, so it never decodes a model with a
+///   codec of another build.
+/// - The manifest cannot be read, or names no bundle that exists:
+///   `Error(#(1011, "internal error"))`, logged as an error. This is a
+///   broken deployment, so the join is not let through unchecked.
+/// - The join has no build id (its page loaded the client from the
+///   unversioned `/beacon_client.js`, or by some other URL): it cannot be
+///   checked. `Ok(Nil)`, logged as a warning on every such join.
+///
+/// `conn` names the connection in the log lines.
+/// Reference: Phoenix LiveView's `phx-track-static`. The client sends the
+/// URLs of the tracked assets its page loaded with the join, the server
+/// compares them with its current digests, and an outdated page is told to
+/// reload, with a counter in the client that stops a reload loop.
+pub fn check_join_build(
+  assets_dir: String,
+  conn: String,
+  build: Option(String),
+) -> Result(Nil, #(Int, String)) {
+  case build {
+    None -> {
+      log.warning(
+        "beacon.transport",
+        "Join from "
+          <> conn
+          <> " carries no build id: its page did not load the client from "
+          <> "/beacon_client_<hash>.js, so a page from an older build is not detected",
+      )
+      Ok(Nil)
+    }
+    Some(page_build) ->
+      case ssr.client_bundle_name(assets_dir) {
+        Error(reason) -> {
+          log.error(
+            "beacon.transport",
+            "Cannot check the build of the join from "
+              <> conn
+              <> ", closing with 1011: "
+              <> reason,
+          )
+          Error(#(ws.close_internal_error, "internal error"))
+        }
+        Ok(bundle) ->
+          case bundle == "beacon_client_" <> page_build <> ".js" {
+            True -> {
+              log.debug(
+                "beacon.transport",
+                "Join from " <> conn <> " is on the current build " <> bundle,
+              )
+              Ok(Nil)
+            }
+            False -> {
+              log.info(
+                "beacon.transport",
+                "Join from "
+                  <> conn
+                  <> " is from build "
+                  <> string.inspect(string.slice(page_build, 0, 64))
+                  <> ", the server serves "
+                  <> bundle
+                  <> ": closing with 4409 so the page reloads",
+              )
+              Error(#(ws.close_stale_build, "stale build"))
+            }
+          }
+      }
   }
 }
 
@@ -1079,6 +1196,28 @@ fn dispatch_rate_limited(
   state: ConnectionState,
   msg: ClientMessage,
   cost: Int,
+) -> Next {
+  use new_state <- admit_rate_limited(state, msg, cost)
+  deliver(new_state, msg)
+}
+
+/// Hand a message that passed every check to the runtime.
+fn deliver(state: ConnectionState, msg: ClientMessage) -> Next {
+  log.debug(
+    "beacon.transport",
+    "Event from " <> state.id <> ": " <> client_message_type(msg),
+  )
+  state.on_event(state.id, msg)
+  Continue(state)
+}
+
+/// Charge `cost` events against the rate limit: a message over it is a rate
+/// violation, one within it continues with `next`.
+fn admit_rate_limited(
+  state: ConnectionState,
+  msg: ClientMessage,
+  cost: Int,
+  next: fn(ConnectionState) -> Next,
 ) -> Next {
   let #(new_state, rate_limited) = check_rate_limit(state, cost)
   case rate_limited {
@@ -1095,14 +1234,7 @@ fn dispatch_rate_limited(
           <> " already this second)",
         Some("Rate limited"),
       )
-    False -> {
-      log.debug(
-        "beacon.transport",
-        "Event from " <> new_state.id <> ": " <> client_message_type(msg),
-      )
-      new_state.on_event(new_state.id, msg)
-      Continue(new_state)
-    }
+    False -> next(new_state)
   }
 }
 
@@ -1468,6 +1600,13 @@ fn handle_socket_event(state: ConnectionState, event: ws.SocketEvent) -> Next {
         "server draining",
       )
     }
+    ws.DevReload -> {
+      log.info(
+        "beacon.transport",
+        "Dev rebuild: telling the page of " <> ctx(state) <> " to reload",
+      )
+      send_or_stop(state, ServerReload)
+    }
     ws.UnexpectedMessage(description) -> {
       log.error(
         "beacon.transport",
@@ -1579,7 +1718,7 @@ fn cleanup_connection(state: ConnectionState) -> Nil {
   cancel_timer(state.pong_timer)
   cancel_timer(state.idle_timer)
   cancel_timer(state.auth_timer)
-  ws.release_ip_slot(state.slot_key)
+  ws.release_ip_slot()
   let conn_count = connection_tracker_decrement()
   log.debug(
     "beacon.transport",
@@ -1697,9 +1836,58 @@ fn ws_loop_inner(
   }
 }
 
+/// Under `beacon/dev`, subscribe this handler to the dev reload topic, so a
+/// rebuild reaches the page as a `reload` message (`ws.DevReload`). Outside
+/// dev mode nothing subscribes. The subscription ends when the handler
+/// process exits: PubSub is linked to its subscribers.
+///
+/// A subscription that fails means PubSub is down or refused it, and the
+/// page would silently miss every reload, so the connection closes with
+/// 1011 instead and the client reconnects with backoff.
+fn subscribe_dev_reload(state: ConnectionState) -> Next {
+  case dev_live_reload_enabled() {
+    False -> Continue(state)
+    True -> {
+      let topic = dev_live_reload_topic()
+      case pubsub.try_subscribe(topic) {
+        Ok(Nil) -> {
+          log.debug(
+            "beacon.transport",
+            ctx(state) <> " listens for dev reloads on " <> topic,
+          )
+          Continue(state)
+        }
+        Error(reason) -> {
+          log.error(
+            "beacon.transport",
+            "Cannot subscribe "
+              <> ctx(state)
+              <> " to dev reloads on "
+              <> topic
+              <> ", closing with 1011: "
+              <> string.inspect(reason),
+          )
+          Stop(
+            state,
+            SendClose(ws.close_internal_error, "internal error"),
+            "dev reload subscription failed",
+          )
+        }
+      }
+    }
+  }
+}
+
+/// True only in a VM where `beacon/dev` started the app.
+@external(erlang, "beacon_dev_ffi", "live_reload_enabled")
+fn dev_live_reload_enabled() -> Bool
+
+@external(erlang, "beacon_dev_ffi", "live_reload_topic")
+fn dev_live_reload_topic() -> String
+
 /// Identity of an admitted connection, carried from admission to startup.
 type Admission {
-  Admission(conn_id: ConnectionId, peer_ip: String, slot_key: String)
+  Admission(conn_id: ConnectionId, peer_ip: String)
 }
 
 /// Start a WebSocket connection on an already-upgraded socket.
@@ -1758,7 +1946,6 @@ fn start_ws_connection(
           buffer: <<>>,
           reassembly: ws.create_reassembly(),
           peer_ip: admission.peer_ip,
-          slot_key: admission.slot_key,
           request: req,
           ws_auth: config.ws_auth,
           last_activity_ms: now,
@@ -1786,11 +1973,16 @@ fn start_ws_connection(
           bytes_out: 0,
         )
 
-      // Start receiving TCP data
-      server.set_active_once(socket)
-
-      // Enter the receive loop — returns after close and cleanup
-      ws_loop(state, subject)
+      case subscribe_dev_reload(state) {
+        Continue(state) -> {
+          // Start receiving TCP data
+          server.set_active_once(socket)
+          // Enter the receive loop — returns after close and cleanup
+          ws_loop(state, subject)
+        }
+        Stop(state: final_state, action: action, reason: reason) ->
+          stop_connection(final_state, action, reason)
+      }
     }
     Error(startup_error) -> {
       let #(close_code, close_reason, close_label) =
@@ -1835,7 +2027,7 @@ fn start_ws_connection(
         close_label,
         conn_id,
       )
-      ws.release_ip_slot(admission.slot_key)
+      ws.release_ip_slot()
       let conn_count = connection_tracker_decrement()
       log.debug(
         "beacon.transport",
@@ -2061,10 +2253,6 @@ pub fn origin_allowed_for_host(
   origin_allowed(origin, "http", request_host, [])
 }
 
-/// Handle a WebSocket upgrade request on a raw socket.
-/// Admission order: limits sanity, global cap, per-IP cap, origin, auth,
-/// then RFC 6455 handshake validation. Every rejection is logged with the
-/// connection id and peer address and releases what was acquired.
 /// How a WebSocket upgrade request ended: upgraded (the 101 was written
 /// and the connection starts) or refused with a fixed snake_case label,
 /// the `result` of the `[beacon, ws, upgrade]` span.
@@ -2080,26 +2268,21 @@ fn upgrade_outcome_label(outcome: UpgradeOutcome) -> String {
   }
 }
 
+/// Handle a WebSocket upgrade request on a raw socket.
+/// Admission order: global cap, per-IP cap, origin, auth, then RFC 6455
+/// handshake validation. Every rejection is logged with the connection id
+/// and peer address and releases what was acquired.
 fn handle_ws_request(
   socket: Socket,
   req: Request(Connection),
   config: TransportConfig,
 ) -> UpgradeOutcome {
   let conn_id = generate_connection_id()
-  let limits = config.security_limits
-  case validate_security_limits(limits), ws_client_ip(socket, req, limits) {
-    Error(reason), _ ->
-      reject_ws_request(
-        "invalid_limits",
-        socket,
-        conn_id,
-        "unknown",
-        None,
-        500,
-        "Server misconfigured",
-        "invalid security limits: " <> reason,
-      )
-    Ok(Nil), Error(reason) -> {
+  // The limits were validated once, when the listener started
+  // (`prepare_listener` refuses to build a handler otherwise), and this
+  // function is reachable only through that handler.
+  case ws_client_ip(socket, req, config.security_limits) {
+    Error(reason) -> {
       // The peer is already gone: nobody to answer.
       log.warning(
         "beacon.transport",
@@ -2109,8 +2292,7 @@ fn handle_ws_request(
       release_connection_slot("peer gone before upgrade")
       Refused("peer_gone")
     }
-    Ok(Nil), Ok(peer_ip) ->
-      admit_ws_request(socket, req, config, conn_id, peer_ip)
+    Ok(peer_ip) -> admit_ws_request(socket, req, config, conn_id, peer_ip)
   }
 }
 
@@ -2130,7 +2312,7 @@ fn admit_ws_request(
         socket,
         conn_id,
         peer_ip,
-        None,
+        False,
         503,
         "Too many connections",
         "global connection limit reached ("
@@ -2139,32 +2321,9 @@ fn admit_ws_request(
           <> int.to_string(limits.max_connections)
           <> ")",
       )
-    False ->
-      // Slots are scoped by the port the socket was accepted on (not the
-      // configured port, which is 0 for OS-assigned listeners) so two
-      // listeners in one VM never share per-IP counts.
-      case server.get_local_port(socket) {
-        Error(reason) ->
-          reject_ws_request(
-            "local_port_unavailable",
-            socket,
-            conn_id,
-            peer_ip,
-            None,
-            500,
-            "Server error",
-            "could not read local port: " <> reason,
-          )
-        Ok(local_port) ->
-          acquire_ws_slot(
-            socket,
-            req,
-            config,
-            conn_id,
-            peer_ip,
-            int.to_string(local_port) <> "|" <> peer_ip,
-          )
-      }
+    // The slots belong to this listener's connection owner, so two
+    // listeners in one VM never share per-IP counts.
+    False -> acquire_ws_slot(socket, req, config, conn_id, peer_ip)
   }
 }
 
@@ -2174,17 +2333,16 @@ fn acquire_ws_slot(
   config: TransportConfig,
   conn_id: ConnectionId,
   peer_ip: String,
-  slot_key: String,
 ) -> UpgradeOutcome {
   let limits = config.security_limits
-  case ws.acquire_ip_slot(slot_key, limits.max_ws_connections_per_ip) {
+  case ws.acquire_ip_slot(peer_ip, limits.max_ws_connections_per_ip) {
     Error(count) ->
       reject_ws_request(
         "rejected_ip_limit",
         socket,
         conn_id,
         peer_ip,
-        None,
+        False,
         429,
         "Too many connections from this address",
         "per-IP WebSocket limit reached (" <> int.to_string(count) <> ")",
@@ -2194,7 +2352,7 @@ fn acquire_ws_slot(
         socket,
         req,
         config,
-        Admission(conn_id: conn_id, peer_ip: peer_ip, slot_key: slot_key),
+        Admission(conn_id: conn_id, peer_ip: peer_ip),
       )
   }
 }
@@ -2211,7 +2369,7 @@ fn authorize_ws_request(
       socket,
       admission.conn_id,
       admission.peer_ip,
-      Some(admission.slot_key),
+      True,
       status,
       body,
       reason,
@@ -2288,7 +2446,7 @@ fn upgrade_ws_request(
           <> reason,
       )
       server.close(socket)
-      ws.release_ip_slot(admission.slot_key)
+      ws.release_ip_slot()
       release_connection_slot("upgrade write failed")
       Refused("upgrade_write_failed")
     }
@@ -2310,7 +2468,7 @@ fn reject_unsupported_version(
       <> ") status 426: "
       <> description,
   )
-  ws.release_ip_slot(admission.slot_key)
+  ws.release_ip_slot()
   release_connection_slot("unsupported WebSocket version")
   let resp =
     response.new(426)
@@ -2339,7 +2497,7 @@ fn reject_ws_request(
   socket: Socket,
   conn_id: ConnectionId,
   peer_ip: String,
-  slot_key: Option(String),
+  holds_slot: Bool,
   status: Int,
   body: String,
   reason: String,
@@ -2355,9 +2513,9 @@ fn reject_ws_request(
       <> ": "
       <> reason,
   )
-  case slot_key {
-    Some(key) -> ws.release_ip_slot(key)
-    None -> Nil
+  case holds_slot {
+    True -> ws.release_ip_slot()
+    False -> Nil
   }
   release_connection_slot("WebSocket request rejected")
   transport_http.write_error(socket, status, body)
@@ -2409,9 +2567,14 @@ fn route_framework_request(
   case req.path {
     "/health" -> {
       transport_http.tag_route("/health")
-      response.new(200)
-      |> response.set_header("content-type", "application/json")
-      |> response.set_body(Bytes(bytes_tree.from_string("{\"status\":\"ok\"}")))
+      when_readable_method(req, fn() {
+        response.new(200)
+        |> response.set_header("content-type", "application/json")
+        |> response.set_header("cache-control", "no-store")
+        |> response.set_body(
+          Bytes(bytes_tree.from_string("{\"status\":\"ok\"}")),
+        )
+      })
     }
     "/beacon_client.js" -> {
       transport_http.tag_route("/beacon_client.js")
@@ -2449,8 +2612,9 @@ fn route_static_or_page(
         False -> page()
         True -> {
           // Tagged before the method check, so a 405 is reported on the
-          // static route too. A missed file is served as a page, which
-          // re-tags it (the last tag wins).
+          // static route too. A path under the prefix names a file or
+          // nothing: a miss is 404, never a page, so a missing script or
+          // stylesheet is not answered with HTML.
           transport_http.tag_route(static.route_pattern(static_cfg))
           when_readable_method(req, fn() {
             case
@@ -2461,7 +2625,13 @@ fn route_static_or_page(
               )
             {
               Ok(resp) -> resp
-              Error(Nil) -> page()
+              Error(Nil) -> {
+                log.debug(
+                  "beacon.transport",
+                  "404 for missing static file " <> req.path,
+                )
+                transport_http.create_error_response(404, "Not Found")
+              }
             }
           })
         }
@@ -2719,7 +2889,9 @@ fn serve_http_request(
     True -> 0
     False -> max_discard_body_bytes
   }
-  let body = transport_http.finish_body(socket, discard_limit)
+  // Classified without reading: the response goes out first, and a small
+  // leftover body is discarded only after it (see `check_body`).
+  let body = transport_http.check_body(socket, discard_limit)
   case result {
     Error(_) -> {
       // run_handler already logged the crash with its stacktrace.
@@ -2733,7 +2905,7 @@ fn serve_http_request(
             "Failed to write 500 after handler crash: " <> reason,
           )
       }
-      transport_http.close_gracefully(socket)
+      close_after_response(socket, body)
     }
     Ok(resp) -> {
       let served = served + 1
@@ -2749,12 +2921,32 @@ fn serve_http_request(
         }
         Ok(Nil) ->
           case keep_alive {
-            True -> serve_requests(socket, config, handler, served)
-            False -> transport_http.close_gracefully(socket)
+            True ->
+              case transport_http.finish_body(socket, body) {
+                transport_http.BodyConsumed ->
+                  serve_requests(socket, config, handler, served)
+                // finish_body logged why the leftover could not be read.
+                transport_http.BodyDiscardable(_)
+                | transport_http.BodyUnread(_)
+                | transport_http.BodyFailed ->
+                  transport_http.close_gracefully(socket)
+              }
+            False -> close_after_response(socket, body)
           }
       }
     }
   }
+}
+
+/// End a connection whose response has been written: the body context is
+/// closed without reading the leftover, which `close_gracefully` drains
+/// until the peer closes or its linger bound is reached.
+fn close_after_response(
+  socket: Socket,
+  body: transport_http.BodyOutcome,
+) -> Nil {
+  transport_http.abandon_body(socket, body)
+  transport_http.close_gracefully(socket)
 }
 
 fn write_response_for(
@@ -2808,7 +3000,11 @@ fn decide_keep_alive(
       )
       False
     }
-    _, _, transport_http.BodyConsumed, True -> {
+    // A discardable leftover is read after the response (`finish_body`); it
+    // does not stop reuse unless that read fails.
+    _, _, transport_http.BodyConsumed, True
+    | _, _, transport_http.BodyDiscardable(_), True
+    -> {
       log.info(
         "beacon.transport",
         "Closing connection after "
@@ -2817,7 +3013,9 @@ fn decide_keep_alive(
       )
       False
     }
-    True, False, transport_http.BodyConsumed, False ->
+    True, False, transport_http.BodyConsumed, False
+    | True, False, transport_http.BodyDiscardable(_), False
+    ->
       case drain_requested() {
         True -> {
           log.info(
@@ -2927,7 +3125,7 @@ fn default_page_html() -> Result(String, String) {
         <> "<div id=\"beacon-app\"></div>"
         <> "<script src=\"/"
         <> filename
-        <> "\" data-beacon-auto></script>"
+        <> "\"></script>"
         <> "</body></html>",
       )
   }
@@ -3194,6 +3392,16 @@ pub fn supervised(
   }
 }
 
+/// The event rate the Beacon client paces itself for: it sends at most
+/// `CLIENT_SEND_BUDGET` (40) events per second so jitter cannot push a
+/// server window over this (`SERVER_MAX_EVENTS_PER_SECOND` in
+/// `beacon_client/patch.mjs`). The server does not advertise its
+/// `max_events_per_second`: the limit is there for clients that do not
+/// pace themselves, which an advertisement would not slow down, and
+/// LiveView and Phoenix channels advertise no rate limit either. A lower
+/// limit is allowed (a deployment may want it) and logged at start.
+const client_paced_events_per_second = 50
+
 /// Validate the configuration and build the per-connection handler.
 fn prepare_listener(
   config: TransportConfig,
@@ -3211,6 +3419,23 @@ fn prepare_listener(
           <> "Set ws_auth in TransportConfig to require authentication on upgrade.",
       )
     Some(_) -> Nil
+  }
+  case
+    config.security_limits.max_events_per_second
+    < client_paced_events_per_second
+  {
+    True ->
+      log.warning(
+        "beacon.transport",
+        "max_events_per_second is "
+          <> int.to_string(config.security_limits.max_events_per_second)
+          <> ", below the "
+          <> int.to_string(client_paced_events_per_second)
+          <> " the Beacon client paces itself for: a burst of events from an "
+          <> "honest client will be rate limited, and repeated bursts close "
+          <> "the socket with 1008",
+      )
+    False -> Nil
   }
   let static_check = case config.static_config {
     Some(static_cfg) -> static.validate_config(static_cfg)

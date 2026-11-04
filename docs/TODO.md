@@ -17,26 +17,6 @@
 Found while making the docs match the code (Milestone 117, WS10a, 2026-11-03).
 The docs describe the current behaviour; each item is a code change.
 
-- **Issue:** dev-mode browser reload never reaches a browser.
-  - **Context:** `dev.gleam:151` calls `notify_browser_reload`, which sends to
-    the local subscribers of `beacon:reload` (`beacon_dev_ffi.erl:155`).
-    Nothing subscribes to that topic, and `transport.ServerReload`
-    (`transport.gleam:106`, handled at `:642`) is never constructed.
-  - **Files:** `src/beacon/dev.gleam`, `src/beacon_dev_ffi.erl`, `src/beacon/transport.gleam`
-- **Issue:** the dev watcher falls back to polling every 500 ms when neither
-  `fswatch` nor `inotifywait` is installed (`dev.gleam:104-107`), against the
-  no-fallbacks rule.
-  - **Files:** `src/beacon/dev.gleam`
-- **Issue:** `middleware.body_parser(max_bytes)` passes through a request whose
-  `Content-Length` is missing or does not parse (`middleware.gleam:282`).
-  - **Files:** `src/beacon/middleware.gleam`
-- **Issue:** `middleware.Context` (`new_context`, `set_context`,
-  `get_context`, `middleware.gleam:519-538`) is carried by nothing; its doc
-  comment says it passes data to the handler.
-  - **Files:** `src/beacon/middleware.gleam`
-- **Issue:** `/health` answers every method, not only GET and HEAD
-  (`transport.gleam:2374`).
-  - **Files:** `src/beacon/transport.gleam`
 - **Issue:** `beacon.title` is computed only for the HTML render
   (`ssr.gleam:308`); a client navigation leaves `document.title` unchanged.
   - **Files:** `src/beacon/ssr.gleam`, `beacon_client/`
@@ -83,3 +63,31 @@ The docs describe the current behaviour; each item is a code change.
     reloads for a fresh token, as LiveView does with a stale session token.
     A join on a runtime without the upgrade request gets an `error` frame
     ("join refused") and stays unjoined. `runtime_test` covers each case.
+- **Issue:** `middleware.body_parser(max_bytes)` passed through a request whose
+  `Content-Length` was missing or did not parse.
+  - **Resolution:** (Milestone 117, WS10b-T) `body_parser` applies the
+    listener's framing rule (`transport/http.declared_body_length`): a
+    repeated or non-decimal `Content-Length` is 400, `Transfer-Encoding` is
+    501 (400 with a `Content-Length`), over the limit is 413, and no header
+    means no body. Tests: `middleware_test.body_parser_rejects_*`.
+- **Issue:** `middleware.Context` (`new_context`, `set_context`,
+  `get_context`) was carried by nothing; its doc comment said it passed data
+  to the handler.
+  - **Resolution:** (Milestone 117, WS10b-T) removed, with its tests. Request
+    data reaches a handler through the request itself, as in Plug, where the
+    conn is the only carrier.
+- **Issue:** `/health` answered every method, not only GET and HEAD.
+  - **Resolution:** (Milestone 117, WS10b-T) other methods get 405 with
+    `allow: GET, HEAD`, and the answer carries `cache-control: no-store`.
+    Tests: `http_routes_test.health_*`.
+- **Issue:** dev-mode browser reload never reached a browser: `dev.gleam`
+  sent to the subscribers of `beacon:reload`, and nothing subscribed.
+  - **Resolution:** (Milestone 117, WS10b-T) as in Phoenix.LiveReloader,
+    `dev.start` turns live reload on before it starts the app, every
+    WebSocket handler then subscribes to `beacon:dev:reload`, and each
+    rebuild sends every open page a `reload`. A handler that cannot
+    subscribe closes 1011.
+- **Issue:** the dev watcher fell back to polling every 500 ms when neither
+  `fswatch` nor `inotifywait` was installed, against the no-fallbacks rule.
+  - **Resolution:** (Milestone 117, WS10b-T) a native watcher is required;
+    dev mode checks for it before building and exits with status 1 naming the program to install.

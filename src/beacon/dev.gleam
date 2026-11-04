@@ -14,10 +14,20 @@
 /// 2. Loads the freshly compiled modules and starts the app by calling the
 ///    app module's `main` (the module the build found, see
 ///    `beacon/build/discovery`).
-/// 3. Watches `src` for `.gleam` changes. Each change reruns the build; on
-///    success the changed modules are hot-reloaded into the running app. A
-///    failed rebuild is logged and the app keeps running the last good build
-///    until the next change.
+/// 3. Watches `src` for `.gleam` changes with `fswatch` (macOS) or
+///    `inotifywait` (Linux, from inotify-tools). Each change reruns the
+///    build; on success the changed modules are hot-reloaded into the running
+///    app and every connected browser is told to reload its page (the
+///    `reload` server message). A failed rebuild is logged and the app keeps
+///    running the last good build until the next change.
+///
+/// Dev mode checks for the watcher before it builds, and exits with status 1
+/// naming the program to install when it is missing: there is no polling
+/// mode that would rebuild late or not at all.
+///
+/// Reference: Phoenix's `Phoenix.LiveReloader` and `Phoenix.CodeReloader`.
+/// A file watcher triggers the rebuild, the server broadcasts on a PubSub
+/// topic every page's socket listens to, and the page reloads itself.
 ///
 /// Production never builds: `beacon.start` requires the artifacts of
 /// `gleam run -m beacon/build`.
@@ -25,6 +35,7 @@ import beacon/build
 import beacon/build/discovery.{type AppModule}
 import beacon/build/program
 import beacon/build/project_toml
+import beacon/internal/dev_watch
 import beacon/log
 import gleam/int
 import gleam/list
@@ -45,16 +56,30 @@ pub fn main() -> Nil {
 }
 
 fn start() -> Result(Nil, String) {
-  case project_toml.read_project("gleam.toml") {
+  case dev_watch.check() {
     Error(reason) -> Error(reason)
-    Ok(project) ->
-      case rebuild(project.name) {
-        Error(reason) -> Error("Initial build failed: " <> reason)
-        Ok(app) -> {
-          log.info("beacon.dev", "Starting " <> app.module_path <> ".main")
-          start_app(erlang_module(app.module_path))
-        }
+    Ok(program) -> {
+      log.info("beacon.dev", "File watcher: " <> program)
+      case project_toml.read_project("gleam.toml") {
+        Error(reason) -> Error(reason)
+        Ok(project) ->
+          case rebuild(project.name) {
+            Error(reason) -> Error("Initial build failed: " <> reason)
+            Ok(app) -> {
+              // Before the app starts, so every WebSocket it accepts listens
+              // for the reload of the next rebuild.
+              enable_live_reload()
+              log.info(
+                "beacon.dev",
+                "Live reload on: each WebSocket subscribes to "
+                  <> live_reload_topic(),
+              )
+              log.info("beacon.dev", "Starting " <> app.module_path <> ".main")
+              start_app(erlang_module(app.module_path))
+            }
+          }
       }
+    }
   }
 }
 
@@ -80,31 +105,12 @@ fn rebuild(project_name: String) -> Result(AppModule, String) {
 }
 
 fn watch() -> Nil {
-  case native_watcher_available() {
-    True -> {
-      log.info(
-        "beacon.dev",
-        "Watching "
-          <> string.join(watch_dirs, ", ")
-          <> " with fswatch/inotifywait",
-      )
-      case start_native_watcher(watch_dirs) {
-        Ok(Nil) -> native_watch_loop()
-        Error(reason) -> {
-          log.error("beacon.dev", "Cannot start the file watcher: " <> reason)
-          program.exit_failure(reason)
-        }
-      }
-    }
-    False -> {
-      log.info(
-        "beacon.dev",
-        "Watching "
-          <> string.join(watch_dirs, ", ")
-          <> " by polling every 500ms (install fswatch or inotify-tools for instant rebuilds)",
-      )
-      record_file_timestamps(watch_dirs)
-      poll_watch_loop()
+  log.info("beacon.dev", "Watching " <> string.join(watch_dirs, ", "))
+  case start_native_watcher(watch_dirs) {
+    Ok(Nil) -> native_watch_loop()
+    Error(reason) -> {
+      log.error("beacon.dev", "Cannot start the file watcher: " <> reason)
+      program.exit_failure(reason)
     }
   }
 }
@@ -126,15 +132,6 @@ fn native_watch_loop() -> Nil {
   native_watch_loop()
 }
 
-fn poll_watch_loop() -> Nil {
-  sleep(500)
-  case check_for_changes(watch_dirs) {
-    True -> on_change()
-    False -> Nil
-  }
-  poll_watch_loop()
-}
-
 fn on_change() -> Nil {
   log.info("beacon.dev", "Change detected, rebuilding")
   case project_toml.read_project("gleam.toml") {
@@ -149,11 +146,21 @@ fn on_change() -> Nil {
           )
         Ok(_app) ->
           case notify_browser_reload() {
-            Ok(Nil) -> log.info("beacon.dev", "Rebuild complete")
-            Error(reason) ->
-              log.warning(
+            Ok(connections) ->
+              log.info(
                 "beacon.dev",
-                "Rebuild complete, but notifying browsers failed: " <> reason,
+                "Rebuild complete; told "
+                  <> int.to_string(connections)
+                  <> " connected page(s) to reload",
+              )
+            // The app runs the new build either way. The pages open now are
+            // not reloaded; one whose client bundle changed reloads when its
+            // next join is refused with 4409 (stale build).
+            Error(reason) ->
+              log.error(
+                "beacon.dev",
+                "Rebuild complete, but telling the pages to reload failed: "
+                  <> reason,
               )
           }
       }
@@ -181,17 +188,11 @@ fn reload_modules(ebin: String) -> Result(List(String), String)
 @external(erlang, "beacon_dev_ffi", "start_app")
 fn start_app(module: String) -> Result(Nil, String)
 
-@external(erlang, "beacon_dev_ffi", "sleep")
-fn sleep(ms: Int) -> Nil
+@external(erlang, "beacon_dev_ffi", "enable_live_reload")
+fn enable_live_reload() -> Nil
 
-@external(erlang, "beacon_dev_ffi", "check_for_changes")
-fn check_for_changes(dirs: List(String)) -> Bool
-
-@external(erlang, "beacon_dev_ffi", "record_file_timestamps")
-fn record_file_timestamps(dirs: List(String)) -> Nil
-
-@external(erlang, "beacon_dev_ffi", "native_watcher_available")
-fn native_watcher_available() -> Bool
+@external(erlang, "beacon_dev_ffi", "live_reload_topic")
+fn live_reload_topic() -> String
 
 @external(erlang, "beacon_dev_ffi", "start_native_watcher")
 fn start_native_watcher(dirs: List(String)) -> Result(Nil, String)
@@ -199,5 +200,7 @@ fn start_native_watcher(dirs: List(String)) -> Result(Nil, String)
 @external(erlang, "beacon_dev_ffi", "poll_native_watcher")
 fn poll_native_watcher() -> Bool
 
+/// Tell every WebSocket connection on this node to reload its page. Returns
+/// how many were subscribed.
 @external(erlang, "beacon_dev_ffi", "notify_browser_reload")
-fn notify_browser_reload() -> Result(Nil, String)
+fn notify_browser_reload() -> Result(Int, String)

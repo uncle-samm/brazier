@@ -402,13 +402,39 @@ export const RECONNECT_JITTER_MS = 1000;
 /** Close code for a revoked session or expired authentication. */
 export const CLOSE_AUTH_REVOKED = 4401;
 /**
- * Close codes 4400 to 4499: `init` refused the session with a client error
- * (4000 + an HTTP 4xx status, 4401 also for a revoked session). The page is
- * stale for this session, so a new page load decides: the server renders it
- * again, or answers with its error page, which opens no socket.
+ * Close code for a join whose build id is not the client bundle the server
+ * serves now: the app was rebuilt since the page loaded. It is in the reload
+ * range, so the page reloads (behind the reload guard) and gets the new bundle.
+ */
+export const CLOSE_STALE_BUILD = 4409;
+/**
+ * Close codes 4400 to 4499: the server refused this page's session. `init`
+ * refused it with a client error (4000 + an HTTP 4xx status, 4401 also for a
+ * revoked session), or the page runs an older build (CLOSE_STALE_BUILD). The
+ * page is stale for this session, so a new page load decides: the server
+ * renders it again, or answers with its error page, which opens no socket.
  */
 export const CLOSE_RELOAD_MIN = 4400;
 export const CLOSE_RELOAD_MAX = 4499;
+
+/**
+ * The build id of a client bundle, from the URL its script was loaded from:
+ * the hex content hash in `/beacon_client_<hash>.js` (8 to 64 hex digits, the
+ * names the build tool writes to the manifest). A query or fragment is
+ * ignored. Returns null for any other URL, such as the stable
+ * `/beacon_client.js`, or for no URL at all (`src` null or empty).
+ * Reference: LiveView's `phx-track-static` compares the digested asset URLs
+ * of the page with the server's on join.
+ */
+export function buildIdFromScriptSrc(src) {
+  if (src === null || src === undefined || src === "") return null;
+  if (typeof src !== "string") {
+    throw new Error("buildIdFromScriptSrc: the script src must be a string, got " + typeof src);
+  }
+  const path = src.split("#")[0].split("?")[0];
+  const match = /\/beacon_client_([0-9a-fA-F]{8,64})\.js$/.exec(path);
+  return match === null ? null : match[1];
+}
 /**
  * The reload guard: at most MAX_RELOADS refusal reloads per tab within
  * RELOAD_WINDOW_MS. The times are kept in sessionStorage under

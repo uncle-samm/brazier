@@ -116,6 +116,15 @@ with its own changelog, so they are not listed here.
   limiter's settings.
 - (WS10b) `[beacon, subscription, changed]` telemetry: a runtime's PubSub
   listener joined or left a topic.
+- (WS10b) A build-id handshake. The client's `join` carries the content hash
+  of the bundle its page loaded (`build`). A server that serves another
+  bundle closes with 4409 `stale build`, and the client reloads behind its
+  reload guard, so a page left open across a deploy never decodes a model
+  with the codec of another build. An unreadable client manifest at join
+  closes with 1011. A join without a build is let through with a warning.
+- (WS10b) `window.__beaconOutboundPendingForTest()` behind
+  `__BEACON_ENABLE_TEST_HOOKS`: the client's queued and scheduled sends, for
+  browser tests that wait on the client instead of a quiet period.
 
 ### Changed
 
@@ -166,6 +175,58 @@ with its own changelog, so they are not listed here.
   ERROR_HANDLING and TESTING are compiled too, and ERROR_HANDLING describes
   the transport, rate limit, join token and model size errors as the code
   raises them.
+- (WS10b) Static files are sent with `file:sendfile` from a new
+  `server.File` response body, so a file is never read into memory to be
+  served. The ETag is still the content hash, now computed in 64 KiB chunks.
+  A FIFO, socket or device under the static directory is never opened.
+  `middleware.compress` passes a file body through uncompressed.
+- (WS10b) A request under the static prefix that names no file answers 404.
+  It used to fall through to the page and answer 200 `text/html`.
+- (WS10b) The per-IP WebSocket slots are kept by the listener's connection
+  owner (`beacon_http_conns`), which releases a slot when its handler exits
+  for any reason. They used to live in a `beacon_ws_pg` pg scope that the
+  first upgrade started outside any supervisor. With it go the
+  `local_port_unavailable` upgrade outcome and `ws.get_ip_slot_count`; tests
+  read `server.get_ws_connection_count_for_ip`.
+- (WS10b) A `max_events_per_second` below 50, the rate the generated client
+  paces itself for, is logged as a warning when the listener starts. The
+  limit is still not advertised to the client, as in Phoenix channels.
+
+### Fixed
+
+- (WS10b) A listener restarted under load could fail to bind its port with
+  `eaddrinuse` and use up the restart tolerance of the application tree. The
+  listen socket now has an owner process of its own
+  (`beacon_http_listen_socket`), which closes it synchronously before it
+  exits. The acceptors no longer own it.
+- (WS10b) `middleware.body_parser` passed a request whose `Content-Length`
+  was missing or unparseable. It now applies the listener's framing rule:
+  400 for a repeated or non-decimal length, 501 for `Transfer-Encoding`, 413
+  over the limit.
+- (WS10b) A response to a request whose body the handler left unread was
+  held back until the server had discarded that body, so an early refusal
+  such as a 413 waited for a body the client never sent, up to the body read
+  timeout. The response is now written first, and a leftover of at most
+  64 KiB is discarded after it so the connection can be reused (the order
+  cowboy and Bandit use).
+- (WS10b) An HTTP handler crash was logged twice, once with the stacktrace
+  and once with the route. It is logged once, with both.
+- (WS10b) `wait_forever` drained only the apps started by its own process.
+  It now drains every app running on the node, recorded node-wide when it
+  starts. A second SIGTERM during the drain reached OTP's `init:stop()` and
+  cut the drain short; it is now logged and ignored. Several waiting
+  processes drain one after the other.
+- (WS10b) Stopping an app twice logged two errors. An app that is not running
+  is now one warning, and its error says whether it was stopped already or
+  its tree died (whose remembered port is then forgotten). `server.release`
+  returns whether a port was remembered.
+- (WS10b) `/health` answered every method. Methods other than GET and HEAD
+  get 405 with `allow: GET, HEAD`, and the answer is `cache-control:
+  no-store`.
+- (WS10b) Dev mode's browser reload never reached a browser: nothing
+  subscribed to its topic. Under `beacon/dev` every WebSocket handler now
+  subscribes to `beacon:dev:reload`, and each rebuild sends every open page a
+  `reload`. A handler that cannot subscribe closes 1011.
 
 ### Removed
 
@@ -177,6 +238,18 @@ with its own changelog, so they are not listed here.
 - (WS7) The server-render fallback to `priv/static`.
 - (WS10) The expect-based `scripts/publish.sh`, which fed the Hex key to
   `gleam publish --yes` and answered its prompts automatically.
+- (WS10b) `middleware.Context`, `new_context`, `set_context` and
+  `get_context`, which nothing carried to a handler.
+- (WS10b) The unused request readers `transport/http.read_request` and
+  `read_request_with_limits` with their FFI, the dead
+  `beacon_middleware_ffi.erl`, and the `data-beacon-auto` attribute on the
+  default page, which nothing read.
+- (WS10b) The per-upgrade check of the security limits, which the listener
+  already validates when it starts, and with it the `invalid_limits`
+  WebSocket upgrade outcome.
+- (WS10b) Dev mode's polling watcher. Without `fswatch` (macOS) or
+  `inotifywait` (Linux) dev mode now exits with status 1 and names the package
+  to install.
 
 ### Security
 

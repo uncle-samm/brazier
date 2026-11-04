@@ -1,8 +1,7 @@
 -module(beacon_transport_ffi).
 -export([
-    listen/2, accept/1, tcp_send/2, close/1,
+    listen/2, accept/1, tcp_send/2, send_file/4, close/1,
     controlling_process/2, set_active_once/1,
-    read_http_request/1, read_http_request_with_limits/4, read_body/2,
     ws_accept_key/1,
     ws_encode_text_frame/1, ws_encode_close_frame/0,
     classify_tcp_message/1
@@ -31,9 +30,6 @@
     ws_decode_key/1,
     ws_set_send_timeout/2,
     ws_peer_ip/1,
-    ws_acquire_ip_slot/2,
-    ws_release_ip_slot/1,
-    ws_ip_slot_count/1,
     ws_now_ms/0,
     ws_classify_message/1,
     ws_mailbox_len/0
@@ -66,6 +62,46 @@ tcp_send(Socket, Data) ->
     case gen_tcp:send(Socket, Data) of
         ok -> {ok, nil};
         {error, Reason} -> {error, format_reason(Reason)}
+    end.
+
+%% Send Length bytes of the file at Path, from Offset, with file:sendfile/5
+%% (the kernel copies the file to the socket; the bytes never enter the
+%% BEAM heap). The response head is already on the wire with
+%% Content-Length: Length, so a file that shrank in between leaves the
+%% message short: that is an error, and the caller closes the connection.
+%% Reference: cowboy_http sendfile bodies, Plug.Conn.send_file/5.
+send_file(Socket, Path, Offset, Length)
+  when is_binary(Path), is_integer(Offset), Offset >= 0, is_integer(Length), Length >= 0 ->
+    case Length of
+        0 ->
+            {ok, nil};
+        _ ->
+            %% file:sendfile/5 takes a raw file; the file is opened per
+            %% response and closed before returning, so no descriptor
+            %% outlives the response.
+            case file:open(Path, [read, raw, binary]) of
+                {ok, Fd} ->
+                    Result = file:sendfile(Fd, Socket, Offset, Length, []),
+                    case file:close(Fd) of
+                        ok -> ok;
+                        {error, CloseReason} ->
+                            beacon_log_ffi:warning(<<"beacon.http">>, "closing ~ts failed: ~p",
+                                                   [Path, CloseReason])
+                    end,
+                    case Result of
+                        {ok, Length} ->
+                            {ok, nil};
+                        {ok, Sent} ->
+                            {error, iolist_to_binary(io_lib:format(
+                                "sendfile sent ~p of ~p bytes of ~ts (the file changed)",
+                                [Sent, Length, Path]))};
+                        {error, Reason} ->
+                            {error, format_reason(Reason)}
+                    end;
+                {error, Reason} ->
+                    {error, iolist_to_binary(io_lib:format("cannot open ~ts: ~p",
+                                                           [Path, Reason]))}
+            end
     end.
 
 close(Socket) ->
@@ -446,22 +482,6 @@ normalize_header_name(Name) when is_binary(Name) ->
 method_to_binary(Method) when is_atom(Method) -> atom_to_binary(Method, utf8);
 method_to_binary(Method) when is_binary(Method) -> Method.
 
-%% Legacy entry points kept for API compatibility. They use the same parser
-%% and return the old {Method, Path, Headers} shape with string reasons.
-read_http_request(Socket) ->
-    read_http_request_with_limits(Socket, 100, 65536, 5000).
-
-read_http_request_with_limits(Socket, MaxHeaders, MaxHeaderBytes, TimeoutMs) ->
-    case read_http_head(Socket, {head_limits, MaxHeaders, MaxHeaderBytes, 8192},
-                        {head_timing, TimeoutMs, shared_with_request_line}) of
-        {ok, {Method, Path, _Version, Headers}} -> {ok, {Method, Path, Headers}};
-        {error, Reason} -> {error, head_error_to_binary(Reason)}
-    end.
-
-head_error_to_binary(Reason) when is_atom(Reason) -> atom_to_binary(Reason, utf8);
-head_error_to_binary({Tag, Detail}) when is_atom(Tag), is_binary(Detail) ->
-    <<(atom_to_binary(Tag, utf8))/binary, ": ", Detail/binary>>.
-
 %% --- HTTP Request Body ---
 %% The connection handler registers the framing of the current request
 %% (validated Content-Length, deadlines) before calling the application.
@@ -591,20 +611,18 @@ maybe_send_continue(Socket, Ctx = #{expect_continue := true}) ->
 maybe_send_continue(_Socket, Ctx) ->
     {ok, Ctx}.
 
-%% Legacy raw body read: routed through the request context.
-read_body(Socket, Length) ->
-    http_body_read(Socket, Length).
-
-%% Run an application handler, converting a crash into an explicit error
-%% (logged with stacktrace) so the connection can answer 500 and close.
+%% Run an application handler, converting a crash into an explicit error so
+%% the connection can answer 500 and close. Returns
+%% {error, {handler_crash, Reason, Stacktrace}} with both formatted; the
+%% caller (transport/http.run_handler) logs it once, with the route.
 run_handler(Fun, Arg) ->
     try Fun(Arg) of
         Result -> {ok, Result}
     catch
         Class:Reason:Stacktrace ->
-            beacon_log_ffi:error(<<"beacon.http">>, "request handler crashed: ~p:~p~n~p",
-                                 [Class, Reason, Stacktrace]),
-            {error, iolist_to_binary(io_lib:format("~p:~p", [Class, Reason]))}
+            {error, {handler_crash,
+                     iolist_to_binary(io_lib:format("~p:~p", [Class, Reason])),
+                     iolist_to_binary(io_lib:format("~p", [Stacktrace]))}}
     end.
 
 %% Close a connection after the server decided to end it (error response,
@@ -785,47 +803,8 @@ ws_peer_ip(Socket) ->
         {error, Reason} -> {error, format_reason(Reason)}
     end.
 
-%% --- Per-IP WebSocket slots ---
-%% The calling process joins the pg group {beacon_ws_ip, SlotKey}, where
-%% SlotKey identifies a listener and a peer IP. pg removes a member
-%% automatically when it exits, so a crashed handler can never leak a slot.
-%% Join-then-count is race free: two concurrent joins may both see the other
-%% and both be rejected, but the cap can never be exceeded.
--define(WS_PG_SCOPE, beacon_ws_pg).
-
-ensure_ws_pg() ->
-    case pg:start(?WS_PG_SCOPE) of
-        {ok, _Pid} -> ok;
-        {error, {already_started, _Pid}} -> ok
-    end.
-
-%% Returns {ok, Count} when the slot was taken, {error, Count} when the cap
-%% would be exceeded (the caller has already been removed from the group).
-ws_acquire_ip_slot(SlotKey, Max) when is_binary(SlotKey), is_integer(Max), Max > 0 ->
-    ensure_ws_pg(),
-    Group = {beacon_ws_ip, SlotKey},
-    ok = pg:join(?WS_PG_SCOPE, Group, self()),
-    Count = length(pg:get_local_members(?WS_PG_SCOPE, Group)),
-    case Count > Max of
-        true ->
-            ok = pg:leave(?WS_PG_SCOPE, Group, self()),
-            {error, Count - 1};
-        false ->
-            {ok, Count}
-    end.
-
-%% Release the calling process's slot. Idempotent: returns true when a slot
-%% was held, false when it had already been released.
-ws_release_ip_slot(SlotKey) when is_binary(SlotKey) ->
-    ensure_ws_pg(),
-    case pg:leave(?WS_PG_SCOPE, {beacon_ws_ip, SlotKey}, self()) of
-        ok -> true;
-        not_joined -> false
-    end.
-
-ws_ip_slot_count(SlotKey) when is_binary(SlotKey) ->
-    ensure_ws_pg(),
-    length(pg:get_local_members(?WS_PG_SCOPE, {beacon_ws_ip, SlotKey})).
+%% Per-IP WebSocket slots are kept by the listener's connection owner; see
+%% beacon_http_conns:ws_acquire_self/2.
 
 %% Monotonic clock in milliseconds (liveness bookkeeping).
 ws_now_ms() ->
@@ -849,6 +828,13 @@ ws_classify_message({beacon_http_drain, _} = Msg) ->
             server_draining;
         false ->
             {unexpected_message, list_to_binary(io_lib:format("~0P", [Msg, 8]))}
+    end;
+%% The rebuild broadcast of beacon/dev, on the topic its handlers subscribe
+%% to when live reload is on (beacon_dev_ffi:notify_browser_reload/0).
+ws_classify_message({beacon_pubsub, Topic, beacon_dev_reload} = Msg) ->
+    case Topic =:= beacon_dev_ffi:live_reload_topic() of
+        true -> dev_reload;
+        false -> {unexpected_message, list_to_binary(io_lib:format("~0P", [Msg, 8]))}
     end;
 ws_classify_message(Other) ->
     {unexpected_message, list_to_binary(io_lib:format("~0P", [Other, 8]))}.

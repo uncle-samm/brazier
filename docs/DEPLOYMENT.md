@@ -220,7 +220,8 @@ app's first page; `/health` (above) is the cheaper check.
 is up, turns SIGTERM (what `docker stop`, Kubernetes and systemd send) into a
 drain:
 
-1. The acceptors stop, so no new connection is accepted.
+1. The acceptors stop and the listen socket is closed, so no new connection
+   is accepted and the port is free for the next instance at once.
 2. Every open connection is told to finish. A WebSocket is closed with
    **1001** `server shutting down` (the browser reconnects with backoff to
    the next instance). An HTTP request in progress completes and its
@@ -236,11 +237,28 @@ The drain timeout is `SecurityLimits.drain_timeout_ms` (default 5000), or
 period: `docker stop` sends SIGKILL after 10 seconds, and Kubernetes after
 `terminationGracePeriodSeconds` (30 by default).
 
-While `wait_forever` waits, Beacon's handler replaces OTP's on the
-`erl_signal_server` event manager, and puts OTP's back once nothing waits.
-A second SIGTERM that arrives after the first has been taken goes to OTP's
-handler, which runs `init:stop()`. Only apps started by the process that
-calls `wait_forever` are drained. SIGUSR1 and SIGQUIT still halt the node.
+While `wait_forever` waits and drains, Beacon's handler replaces OTP's on
+the `erl_signal_server` event manager, and puts OTP's back once nothing
+waits. Every application running on the node is drained, whichever process
+started it. A second SIGTERM during the drain is logged as a warning and
+ignored, so it cannot cut the drain short; SIGQUIT, SIGUSR1 and SIGKILL
+still stop the node at once. When several processes
+call `wait_forever`, they drain one after the other and none returns before
+the drain is over.
+
+A page that reconnects to an instance running a different build (a new
+release, or a rolling deploy that sends it to an old instance) is refused
+with **4409** `stale build` when it joins, and reloads to fetch the bundle
+that instance serves. The join carries the page's build id, the hash in its
+`beacon_client_<hash>.js` URL; the server compares it with its own manifest.
+The reload goes through the client's reload guard (at most 3 per tab within
+60 s), so a rolling deploy that keeps sending a tab between builds ends in an
+error page rather than a reload loop: route a client to one build at a time
+(session affinity, or drain the old instances before new ones take traffic).
+
+Calling `application.stop` on an application that is not running (stopped
+already, or its tree died) returns an error that says so and logs one
+warning.
 
 ## Logging and Connections
 

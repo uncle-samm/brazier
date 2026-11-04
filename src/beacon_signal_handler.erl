@@ -9,6 +9,13 @@
 %% drains its connections) before it returns. SIGUSR1 and SIGQUIT keep OTP's
 %% behaviour (halt).
 %%
+%% The waiters stay joined while they drain, so this handler still answers
+%% a SIGTERM that arrives during the drain: it is logged and ignored, as
+%% OTP's init:stop() ignores a second call while the node is stopping. Only
+%% the first SIGTERM is forwarded, and a process that starts waiting after
+%% it is told at once. (A waiter that left before draining let a second
+%% SIGTERM reach init:stop() and cut the drain short.)
+%%
 %% Every change of handler happens inside the event manager process, so
 %% concurrent waiters never race: the first waiter swaps OTP's handler for
 %% this one, later waiters join it, and the handler swaps OTP's back in
@@ -86,73 +93,93 @@ refuse(Reason) ->
 
 %% Swapped in for OTP's handler: its terminate/2 returned `ok`. When it was
 %% not installed, swap_handler passes `error` and this handler is not added.
+%% The state is {Waiters, Signalled}: Waiters maps each waiter to its
+%% monitor, and Signalled is true once SIGTERM was forwarded.
 init({Waiter, ok}) ->
-    {ok, #{Waiter => erlang:monitor(process, Waiter)}};
+    {ok, {#{Waiter => erlang:monitor(process, Waiter)}, false}};
 init({_Waiter, error}) ->
     {error, otp_handler_not_installed}.
 
-handle_event(sigterm, Waiters) ->
+handle_event(sigterm, {Waiters, false}) ->
     beacon_log_ffi:info(<<"beacon.application">>,
                         "SIGTERM received, telling ~b waiting process(es) to stop",
                         [map_size(Waiters)]),
-    maps:foreach(fun(Waiter, _Monitor) -> Waiter ! {beacon_signal, sigterm} end, Waiters),
-    {ok, Waiters};
-handle_event(sigusr1, Waiters) ->
+    maps:foreach(fun(Waiter, _Monitor) -> tell(Waiter) end, Waiters),
+    {ok, {Waiters, true}};
+handle_event(sigterm, {Waiters, true}) ->
+    beacon_log_ffi:warning(<<"beacon.application">>,
+                           "SIGTERM received again while ~b process(es) drain: ignored, "
+                           "the drain goes on (SIGQUIT or SIGKILL stops the node now)",
+                           [map_size(Waiters)]),
+    {ok, {Waiters, true}};
+handle_event(sigusr1, State) ->
     erlang:halt("Received SIGUSR1"),
-    {ok, Waiters};
-handle_event(sigquit, Waiters) ->
+    {ok, State};
+handle_event(sigquit, State) ->
     erlang:halt(),
-    {ok, Waiters};
-handle_event(_Signal, Waiters) ->
+    {ok, State};
+handle_event(_Signal, State) ->
     %% OTP's handler ignores every other signal too.
-    {ok, Waiters}.
+    {ok, State}.
 
-handle_call({join, Waiter}, Waiters) ->
+handle_call({join, Waiter}, {Waiters, Signalled} = State) ->
     case maps:is_key(Waiter, Waiters) of
-        true -> {ok, ok, Waiters};
-        false -> {ok, ok, Waiters#{Waiter => erlang:monitor(process, Waiter)}}
+        true -> {ok, ok, State};
+        false ->
+            case Signalled of
+                true ->
+                    beacon_log_ffi:info(<<"beacon.application">>,
+                                        "~p started waiting after SIGTERM, telling it to stop",
+                                        [Waiter]),
+                    tell(Waiter);
+                false -> ok
+            end,
+            {ok, ok, {Waiters#{Waiter => erlang:monitor(process, Waiter)}, Signalled}}
     end;
-handle_call({leave, Waiter}, Waiters) ->
+handle_call({leave, Waiter}, {Waiters, Signalled} = State) ->
     case maps:take(Waiter, Waiters) of
         {Monitor, Rest} ->
             erlang:demonitor(Monitor, [flush]),
-            leave(ok, Rest);
+            leave(ok, {Rest, Signalled});
         error ->
-            {ok, {error, not_a_waiter}, Waiters}
+            {ok, {error, not_a_waiter}, State}
     end.
 
-handle_info({'DOWN', Monitor, process, Waiter, Reason}, Waiters) ->
+handle_info({'DOWN', Monitor, process, Waiter, Reason}, {Waiters, Signalled} = State) ->
     case Waiters of
         #{Waiter := Monitor} ->
             beacon_log_ffi:info(<<"beacon.application">>,
                                 "~p stopped waiting for SIGTERM: it exited with ~p",
                                 [Waiter, Reason]),
-            leave(no_reply, maps:remove(Waiter, Waiters));
+            leave(no_reply, {maps:remove(Waiter, Waiters), Signalled});
         _ ->
             %% Another handler's monitor: every handler sees every message.
-            {ok, Waiters}
+            {ok, State}
     end;
-handle_info(_Info, Waiters) ->
-    {ok, Waiters}.
+handle_info(_Info, State) ->
+    {ok, State}.
+
+tell(Waiter) ->
+    Waiter ! {beacon_signal, sigterm}.
 
 %% The last waiter gone: OTP's handler answers SIGTERM again.
-leave(Reply, Waiters) when map_size(Waiters) =:= 0 ->
+leave(Reply, {Waiters, _Signalled} = State) when map_size(Waiters) =:= 0 ->
     beacon_log_ffi:info(<<"beacon.application">>,
                         "No process waits for SIGTERM any more, restoring OTP's handler", []),
     case Reply of
-        no_reply -> {swap_handler, restore, Waiters, ?OTP_HANDLER, []};
-        _ -> {swap_handler, Reply, restore, Waiters, ?OTP_HANDLER, []}
+        no_reply -> {swap_handler, restore, State, ?OTP_HANDLER, []};
+        _ -> {swap_handler, Reply, restore, State, ?OTP_HANDLER, []}
     end;
-leave(no_reply, Waiters) ->
-    {ok, Waiters};
-leave(Reply, Waiters) ->
-    {ok, Reply, Waiters}.
+leave(no_reply, State) ->
+    {ok, State};
+leave(Reply, State) ->
+    {ok, Reply, State}.
 
-terminate(_Arg, Waiters) when is_map(Waiters) ->
+terminate(_Arg, {Waiters, _Signalled}) when is_map(Waiters) ->
     maps:foreach(fun(_Waiter, Monitor) -> erlang:demonitor(Monitor, [flush]) end, Waiters),
     ok;
 terminate(_Arg, _State) ->
     ok.
 
-code_change(_OldVsn, Waiters, _Extra) ->
-    {ok, Waiters}.
+code_change(_OldVsn, State, _Extra) ->
+    {ok, State}.

@@ -13,7 +13,7 @@
 ///
 /// Reference: Plug.Static, cowboy_static, Phoenix static serving.
 import beacon/log
-import beacon/transport/server.{type ResponseBody, Bytes}
+import beacon/transport/server.{type ResponseBody, Bytes, File}
 import gleam/bit_array
 import gleam/bool
 import gleam/bytes_tree
@@ -25,7 +25,6 @@ import gleam/list
 import gleam/result
 import gleam/string
 import gleam/uri
-import simplifile
 
 /// Configuration for static file serving.
 pub type StaticConfig {
@@ -263,17 +262,43 @@ fn check_segment(segment: String) -> Result(Nil, PathProblem) {
   }
 }
 
+/// Why `ffi_file_digest` could not digest a path.
+type DigestError {
+  /// Missing, or not a regular file (a directory, FIFO, socket or device).
+  NotAFile
+  /// The file exists but could not be read.
+  ReadFailed(String)
+}
+
+/// The length and the first `hex_chars` lowercase hex characters of the
+/// SHA-256 of a regular file, read in bounded chunks.
+@external(erlang, "beacon_static_ffi", "file_digest")
+fn ffi_file_digest(
+  path: String,
+  hex_chars: Int,
+) -> Result(#(Int, String), DigestError)
+
+/// Characters of the content hash shown in an ETag (128 bits).
+const etag_hash_chars = 32
+
 /// Serve a single file from the filesystem.
 /// If `if_none_match` matches the file's ETag, returns 304 Not Modified.
+///
+/// The file is never loaded whole: its content hash (the ETag) is computed
+/// over bounded chunks, and the body is a `File` that the listener sends
+/// with `file:sendfile`. The ETag stays content-based, so an edit that keeps
+/// the size and the modification second is not answered 304. A stat-based
+/// tag as in Plug.Static and cowboy_static (`phash2({size, mtime})`) would
+/// be.
 fn serve_file(
   path: String,
   cache: String,
   if_none_match: String,
 ) -> Result(Response(ResponseBody), Nil) {
-  case simplifile.read_bits(path) {
-    Ok(contents) -> {
+  case ffi_file_digest(path, etag_hash_chars) {
+    Ok(#(length, hash)) -> {
       let mime = mime_type(path)
-      let etag = etag_for(contents)
+      let etag = "\"" <> hash <> "\""
       case etag_matches(if_none_match, etag) {
         True -> {
           log.debug("beacon.static", "304 Not Modified: " <> path)
@@ -293,23 +318,21 @@ fn serve_file(
             |> response.set_header("cache-control", cache)
             |> response.set_header("etag", etag)
             |> response.set_header("x-content-type-options", "nosniff")
-            |> response.set_body(Bytes(bytes_tree.from_bit_array(contents))),
+            |> response.set_body(File(path:, offset: 0, length:)),
           )
         }
       }
     }
-    // Missing files and directories are "not a static file": the caller
-    // routes the request on (normally to a 404 page).
-    Error(simplifile.Enoent)
-    | Error(simplifile.Eisdir)
-    | Error(simplifile.Enotdir) -> {
-      log.debug("beacon.static", "File not found: " <> path)
+    // A missing path, a directory or a special file is "no such static
+    // file": the transport answers 404 for it.
+    Error(NotAFile) -> {
+      log.debug("beacon.static", "No regular file at: " <> path)
       Error(Nil)
     }
-    Error(err) -> {
+    Error(ReadFailed(reason)) -> {
       log.error(
         "beacon.static",
-        "Cannot read static file " <> path <> ": " <> string.inspect(err),
+        "Cannot read static file " <> path <> ": " <> reason,
       )
       Ok(plain_response(500, "Internal Server Error"))
     }
@@ -324,8 +347,9 @@ fn plain_response(status: Int, body: String) -> Response(ResponseBody) {
 }
 
 /// A strong entity tag derived from the content (SHA-256, 128 bits shown).
+/// A served static file carries the tag of its contents.
 pub fn etag_for(contents: BitArray) -> String {
-  "\"" <> content_hash(contents, 32) <> "\""
+  "\"" <> content_hash(contents, etag_hash_chars) <> "\""
 }
 
 /// Lowercase hex of the SHA-256 of `contents`, truncated to `length` chars.

@@ -1,70 +1,64 @@
 -module(beacon_http_acceptors_sup).
-%% Supervisor that owns the listen socket and the acceptor pool for one
-%% Beacon HTTP listener. Modelled on ranch_acceptors_sup: the listen socket
-%% is opened in init/1 so it lives exactly as long as this supervisor, and
-%% acceptors are permanent children restarted (and reported by the
-%% supervisor) if they crash.
+%% Supervisor of the acceptor pool for one Beacon HTTP listener. Modelled
+%% on ranch_acceptors_sup: acceptors are children restarted (and reported
+%% by the supervisor) if they crash.
 %%
-%% The bound port is stored in the connection owner after the first bind,
-%% so a restart of this supervisor rebinds the SAME port even when the
-%% listener was started on port 0.
+%% Unlike ranch_acceptors_sup this supervisor does not own the listen
+%% socket. A supervisor has no terminate callback, so a socket it owned
+%% would only be closed by the runtime after the supervisor exited, which
+%% is asynchronous, and a listener restarted at once could then fail with
+%% eaddrinuse. The socket belongs to the sibling beacon_http_listen_socket,
+%% which closes it in its terminate/2. This supervisor reads the socket
+%% from the connection owner (beacon_http_conns), where its owner publishes
+%% it. The listener tree is rest_for_one with the socket owner before this
+%% supervisor, so a new socket always comes with new acceptors.
 -behaviour(supervisor).
 
--export([start_link/4, start_link_gleam/4]).
+-export([start_link/2, start_link_gleam/2]).
 -export([init/1]).
 
-start_link(ConnsName, NumAcceptors, Backlog, SendTimeoutMs) ->
-    supervisor:start_link(?MODULE, {ConnsName, NumAcceptors, Backlog, SendTimeoutMs}).
+start_link(ConnsName, NumAcceptors) ->
+    supervisor:start_link(?MODULE, {ConnsName, NumAcceptors}).
 
 %% Gleam supervision start shape: {ok, {started, Pid, nil}} | {error, StartError}.
-start_link_gleam(ConnsName, NumAcceptors, Backlog, SendTimeoutMs) ->
-    case start_link(ConnsName, NumAcceptors, Backlog, SendTimeoutMs) of
+start_link_gleam(ConnsName, NumAcceptors) ->
+    case start_link(ConnsName, NumAcceptors) of
         {ok, Pid} -> {ok, {started, Pid, nil}};
         {error, Reason} -> {error, {init_failed, format(Reason)}};
         ignore -> {error, {init_failed, <<"acceptor supervisor returned ignore">>}}
     end.
 
-init({ConnsName, NumAcceptors, Backlog, SendTimeoutMs}) ->
+init({ConnsName, NumAcceptors}) ->
+    true = is_atom(ConnsName),
     true = is_integer(NumAcceptors) andalso NumAcceptors > 0,
-    true = is_integer(Backlog) andalso Backlog > 0,
-    true = is_integer(SendTimeoutMs) andalso SendTimeoutMs > 0,
-    Port = beacon_http_conns:get_port(ConnsName),
-    Opts = [
-        binary,
-        {active, false},
-        {packet, raw},
-        {reuseaddr, true},
-        {backlog, Backlog},
-        {nodelay, true},
-        {send_timeout, SendTimeoutMs},
-        {send_timeout_close, true}
-    ],
-    case gen_tcp:listen(Port, Opts) of
+    case beacon_http_conns:listen_socket(ConnsName) of
         {ok, ListenSocket} ->
-            case inet:port(ListenSocket) of
-                {ok, BoundPort} ->
-                    ok = beacon_http_conns:set_port(ConnsName, BoundPort),
-                    beacon_log_ffi:info(<<"beacon.http_acceptors">>, "listening on port ~p with ~p acceptors",
-                                        [BoundPort, NumAcceptors]),
-                    Children = [
-                        #{id => {acceptor, Id},
-                          start => {beacon_http_acceptor, start_link, [ListenSocket, ConnsName, Id]},
-                          restart => permanent,
-                          shutdown => brutal_kill,
-                          type => worker}
-                        || Id <- lists:seq(1, NumAcceptors)
-                    ],
-                    Intensity = 1 + ceil(math:log2(NumAcceptors)),
-                    {ok, {#{strategy => one_for_one, intensity => Intensity, period => 5},
-                          Children}};
-                {error, Reason} ->
-                    beacon_log_ffi:error(<<"beacon.http_acceptors">>, "could not read bound port: ~p", [Reason]),
-                    gen_tcp:close(ListenSocket),
-                    {error, {bound_port_unavailable, Reason}}
-            end;
-        {error, Reason} ->
-            beacon_log_ffi:error(<<"beacon.http_acceptors">>, "failed to listen on port ~p: ~p", [Port, Reason]),
-            {error, {listen_failed, Port, Reason}}
+            beacon_log_ffi:info(<<"beacon.http_acceptors">>, "starting ~p acceptors on port ~p",
+                                [NumAcceptors, beacon_http_conns:get_port(ConnsName)]),
+            Children = [
+                #{id => {acceptor, Id},
+                  start => {beacon_http_acceptor, start_link, [ListenSocket, ConnsName, Id]},
+                  %% transient: an acceptor whose listen socket closed
+                  %% exits {shutdown, listen_socket_closed} and is not
+                  %% restarted on that dead socket. The socket owner sees
+                  %% the same close (the socket is linked to it) and exits,
+                  %% and the listener restarts it and this pool behind it.
+                  %% Any other exit is a crash and is restarted.
+                  restart => transient,
+                  shutdown => brutal_kill,
+                  type => worker}
+                || Id <- lists:seq(1, NumAcceptors)
+            ],
+            Intensity = 1 + ceil(math:log2(NumAcceptors)),
+            {ok, {#{strategy => one_for_one, intensity => Intensity, period => 5},
+                  Children}};
+        {error, no_listen_socket} ->
+            %% The socket owner starts before this supervisor and publishes
+            %% the socket in its init, so this is a broken tree: crash, so
+            %% start_link reports the error.
+            beacon_log_ffi:error(<<"beacon.http_acceptors">>, "no listen socket published for ~p",
+                                 [ConnsName]),
+            erlang:error({no_listen_socket, ConnsName})
     end.
 
 format(Reason) when is_binary(Reason) -> Reason;

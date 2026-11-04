@@ -32,6 +32,7 @@
 
 import {
   applyOps,
+  buildIdFromScriptSrc,
   classifyModelSync,
   classifyPatch,
   closeAction,
@@ -71,6 +72,18 @@ const REQUIRED_EXPORTS = [
 let app = null;
 let simple = false;
 let started = false;
+
+// The build id of this bundle: the content hash in the URL of the script
+// that is evaluating now (`/beacon_client_<hash>.js`). document.currentScript
+// is only set while a classic script runs, so it is read here, at evaluation.
+// The join carries it, and a server whose bundle is another one refuses the
+// join with CLOSE_STALE_BUILD (4409), which reloads the page. Null when the
+// page loaded the bundle from another URL, such as the stable
+// /beacon_client.js; the join then carries no build and is not checked.
+const BUILD_ID =
+  typeof document !== "undefined" && document.currentScript
+    ? buildIdFromScriptSrc(document.currentScript.src)
+    : null;
 
 // === Connection state ===
 let ws = null;
@@ -209,6 +222,12 @@ export function start(entry) {
   started = true;
   app = entry;
   simple = app.is_simple() === true;
+  if (BUILD_ID === null) {
+    console.warn(
+      "[beacon] This page did not load the client from /beacon_client_<hash>.js, so its join carries no build id " +
+        "and a page left open across a rebuild is not reloaded. Load the script the server renders.",
+    );
+  }
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", boot, { once: true });
   } else {
@@ -650,7 +669,9 @@ function sendJoin(socket) {
   if (!outbound.budget.tryTake(performance.now(), 1)) {
     throw new Error("[beacon] invariant violated: join does not fit a fresh send budget");
   }
-  if (!writeSocket(socket, { type: "join", token: "", path: location.pathname + location.search })) {
+  const join = { type: "join", token: "", path: location.pathname + location.search };
+  if (BUILD_ID !== null) join.build = BUILD_ID;
+  if (!writeSocket(socket, join)) {
     console.error("[beacon] Join could not be written; closing the socket to reconnect");
     socket.close(4000, "join send failed");
     return;
@@ -797,6 +818,13 @@ if (typeof window !== "undefined") {
       ws.close(4000, "beacon test close");
       return state;
     };
+    // What the client still owes the server: the messages waiting in the
+    // paced queue, and whether a paced send is scheduled. A test waits for
+    // { queued: 0, scheduled: false } instead of a quiet period.
+    window.__beaconOutboundPendingForTest = () => ({
+      queued: outbound.length,
+      scheduled: pumpTimer !== null,
+    });
   }
 }
 
