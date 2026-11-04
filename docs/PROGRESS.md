@@ -437,6 +437,29 @@
       - users of `watch_info` never call `unwatch`;
       - `sleep_ms` in `brazier_ws_test_ffi.erl` is unused;
       - the churn test accepts `noproc`, with a comment giving the reason.
+  - [x] Wave 3 w3-wire-perf (PERF-2, PERF-6), merged as 75a71a8.
+    - PERF-2:
+      - the runtime caches the decoded model (`patch.Snapshot`) beside its JSON, so an event decodes only the new model;
+      - `diff_snapshots` returns `Unchanged` or `Ops`, so ops are never parsed back;
+      - a resync sends the cached snapshot instead of encoding again;
+      - encoder output that is not valid JSON is logged as an error, answered with an `error` frame, and drops the cache.
+      - Benches: the 500 KB pipelined changed event went from about 4.1ms to 2.5ms, the 50 KB one from 322µs to 209µs.
+      - Tests: a seeded property test (200 chains × 25 steps), and a check that a resync encodes only once.
+    - PERF-6:
+      - model and ops JSON are put into the frame as is (Phoenix V2 serializer), and frames are `[Header, Payload]` iodata (cowlib `cow_ws:frame/2`);
+      - the client uses its single parse, and the generated `decode_model` takes a `Dynamic`;
+      - this is a wire break: `"model":{...}` and `"ops":[...]`.
+      - Benches: the 50 KB `model_sync` encode went from 117µs to 0.33µs. That excludes the kernel copy, which both versions pay.
+      - The client bundle was regenerated (`brazier_client_d557934894815973.js`), and the harness now has 47 scenarios.
+    - Agent CDP desktop run: 503 passed. The 3 failures were Hex rate limits; each passed when rerun alone. The mobile viewport was not run (final verification).
+    - Coordinator verify on the merge of 417e29b into the branch (7abadde): clean build with zero warnings, format and lint clean, 1695 tests passing in each of 3 runs, docs check OK (73 modules), and test-client OK (47 scenarios, 9 patch-safety checks, 2450/550 apply equivalence). All 24 examples were rebuilt after the merge, because the generated decoder changed.
+    - Decisions:
+      - a join without `build` is still accepted with a warning: non-browser clients and the unversioned bundle have no build id. A pre-change client fails its syncs loudly; the hashed bundle gets 4409 and reloads;
+      - there is no opaque type for the "always valid JSON" text: the invariant is documented on the four message constructors, which only the runtime builds;
+      - `bench/baselines.json` gained the 10 new `runtime.list_*` and `wire.*` entries from a loaded machine (load average 6–9); final verification re-baselines when the machine is idle.
+    - Follow-ups:
+      - `make bench-check` fails because the PERF-7 `store.crdt_append.*` metrics have no baseline (wave 4 PERF-9);
+      - client-to-server `event` messages still carry `ops` as a JSON string.
   - [ ] fix-cluster-reject: rejecting an intruder must not partition verified members under OTP's default `prevent_overlapping_partitions`; remove `no_partition_prevention` from `membership_test`.
 - [ ] Final verification: build (zero warnings), tests, all examples, CDP browser suite, perf baselines
 
