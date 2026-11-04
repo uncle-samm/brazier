@@ -7,6 +7,7 @@
 /// subject and synchronizes on them; nothing sleeps.
 import brazier/api
 import brazier/middleware
+import brazier/monitored
 import brazier/ssr
 import brazier/static
 import brazier/telemetry.{type Event}
@@ -137,15 +138,11 @@ fn unique(label: String) -> String {
   label <> "_" <> int.to_string(unique_integer())
 }
 
-/// Attach a handler forwarding `names` to a fresh subject owned by the
-/// calling test process.
-fn listen(names: List(List(String))) -> #(String, Subject(Event)) {
-  let assert Ok(Nil) = telemetry.start()
-  let id = unique("http_telemetry")
-  let events = process.new_subject()
-  let assert Ok(Nil) =
-    telemetry.attach(id, names, fn(event) { process.send(events, event) })
-  #(id, events)
+/// Run `run` with a handler forwarding `names` to a fresh subject owned by
+/// the calling test process; it is detached afterwards even if `run`
+/// crashes.
+fn listen(names: List(List(String)), run: fn(Subject(Event)) -> a) -> a {
+  monitored.listening(names, run)
 }
 
 /// Wait for the first event matching `matches`, returning it together with
@@ -213,7 +210,7 @@ fn metadata_mentions(event: Event, needle: String) -> Bool {
 
 pub fn request_span_reports_route_status_and_body_sizes_test() {
   let listener = start_server(limits())
-  let #(id, events) = listen(request_events)
+  use events <- listen(request_events)
   let socket = open(listener)
   let assert #(201, _, "got hello") =
     request(socket, post("/items/42", "hello"))
@@ -239,14 +236,13 @@ pub fn request_span_reports_route_status_and_body_sizes_test() {
   let assert Error(Nil) = dict.get(start.metadata, "route")
   let assert Error(Nil) = dict.get(start.metadata, "status")
 
-  let assert Ok(Nil) = telemetry.detach(id)
   raw_close(socket)
   server.stop(listener)
 }
 
 pub fn keep_alive_requests_share_a_connection_id_test() {
   let listener = start_server(limits())
-  let #(id, events) = listen(request_events)
+  use events <- listen(request_events)
   let socket = open(listener)
   let assert #(201, _, _) = request(socket, post("/items/1", "x"))
   let assert #(201, _, _) = request(socket, post("/items/2", "y"))
@@ -255,14 +251,13 @@ pub fn keep_alive_requests_share_a_connection_id_test() {
   let assert Ok(first_id) = telemetry.string(first, "connection_id")
   let assert Ok(second_id) = telemetry.string(second, "connection_id")
   let assert True = first_id == second_id
-  let assert Ok(Nil) = telemetry.detach(id)
   raw_close(socket)
   server.stop(listener)
 }
 
 pub fn untagged_request_reports_unknown_never_the_raw_path_test() {
   let listener = start_server(limits())
-  let #(id, events) = listen(request_events)
+  use events <- listen(request_events)
   let socket = open(listener)
   let path = "/private/" <> unique("user")
   let assert #(203, _, _) = request(socket, get(path))
@@ -275,14 +270,13 @@ pub fn untagged_request_reports_unknown_never_the_raw_path_test() {
   let assert Ok("GET") = telemetry.string(stop, "method")
   let assert Ok(0) = telemetry.int(stop, "req_body_bytes")
   let assert False = metadata_mentions(stop, path)
-  let assert Ok(Nil) = telemetry.detach(id)
   raw_close(socket)
   server.stop(listener)
 }
 
 pub fn route_tag_does_not_leak_into_the_next_request_test() {
   let listener = start_server(limits())
-  let #(id, events) = listen(request_events)
+  use events <- listen(request_events)
   let socket = open(listener)
   // Same connection process: the tag from the first request must be gone
   // when the second, untagged one is reported.
@@ -298,14 +292,13 @@ pub fn route_tag_does_not_leak_into_the_next_request_test() {
     telemetry.string(tagged, "connection_id")
     == telemetry.string(untagged, "connection_id")
   let assert Ok("unknown") = telemetry.string(untagged, "route")
-  let assert Ok(Nil) = telemetry.detach(id)
   raw_close(socket)
   server.stop(listener)
 }
 
 pub fn crashing_request_handler_reports_500_test() {
   let listener = start_server(limits())
-  let #(id, events) = listen(request_events)
+  use events <- listen(request_events)
   let socket = open(listener)
   let assert #(500, _, _) = request(socket, get("/explode/now"))
   let #(stop, before) = await(events, stop_for_route("/explode/:x"))
@@ -315,7 +308,6 @@ pub fn crashing_request_handler_reports_500_test() {
   let assert Ok(0) = telemetry.int(stop, "resp_body_bytes")
   let assert False =
     list.any(before, fn(event) { named(event, ["request", "exception"]) })
-  let assert Ok(Nil) = telemetry.detach(id)
   raw_close(socket)
   server.stop(listener)
 }
@@ -323,12 +315,18 @@ pub fn crashing_request_handler_reports_500_test() {
 pub fn crashing_telemetry_handler_does_not_break_the_request_test() {
   let listener = start_server(limits())
   let crashing = unique("crashing_http_handler")
-  let assert Ok(Nil) = telemetry.start()
+  let assert Ok(Nil) = telemetry.start() as "telemetry starts"
   let assert Ok(Nil) =
     telemetry.attach(crashing, [["brazier", "http", "request", "stop"]], fn(_) {
       panic as "telemetry handler crashed on purpose"
     })
-  let #(watcher, failures) = listen([["telemetry", "handler", "failure"]])
+    as "the crashing handler attaches"
+  // The test asserts telemetry detached the crashing handler itself; the
+  // cleanup detaches it only if the test failed before it crashed.
+  use <- monitored.with_cleanup(fn() {
+    monitored.detach_unless_detached(crashing)
+  })
+  use failures <- listen([["telemetry", "handler", "failure"]])
   let socket = open(listener)
   // The request that ran the crashing handler is answered normally, on a
   // connection that stays usable.
@@ -339,7 +337,7 @@ pub fn crashing_telemetry_handler_does_not_break_the_request_test() {
   let assert #(201, _, "got ok") = request(socket, post("/items/8", "ok"))
   // telemetry detached the crashing handler.
   let assert Error(telemetry.NotAttached(_)) = telemetry.detach(crashing)
-  let assert Ok(Nil) = telemetry.detach(watcher)
+    as "telemetry detached the crashing handler"
   raw_close(socket)
   server.stop(listener)
 }
@@ -430,7 +428,7 @@ fn route_of_next(events: Subject(Event), status: Int) -> String {
 pub fn built_in_routes_report_their_pattern_never_the_path_test() {
   let dir = static_dir()
   let listener = start_app_server(dir, [])
-  let #(id, events) = listen(request_events)
+  use events <- listen(request_events)
   let socket = open(listener)
 
   // An API route reports its declared, normalised path.
@@ -471,7 +469,6 @@ pub fn built_in_routes_report_their_pattern_never_the_path_test() {
     })
   let assert Ok("*") = telemetry.string(options, "route")
 
-  let assert Ok(Nil) = telemetry.detach(id)
   raw_close(socket)
   server.stop(listener)
   let assert Ok(Nil) = simplifile.delete(dir) as "test directory cleanup"
@@ -480,7 +477,7 @@ pub fn built_in_routes_report_their_pattern_never_the_path_test() {
 pub fn client_script_routes_are_tagged_test() {
   let dir = static_dir()
   let listener = start_app_server(dir, [])
-  let #(id, events) = listen(request_events)
+  use events <- listen(request_events)
   let socket = open(listener)
   // The client script may or may not be built in this checkout: only the
   // tag is asserted, never the status.
@@ -494,7 +491,6 @@ pub fn client_script_routes_are_tagged_test() {
   let #(_, _, _) = request(socket, get("/brazier_client_nothex.js"))
   let third = expect(events, fn(event) { named(event, ["request", "stop"]) })
   let assert Ok("/*") = telemetry.string(third, "route")
-  let assert Ok(Nil) = telemetry.detach(id)
   raw_close(socket)
   server.stop(listener)
   let assert Ok(Nil) = simplifile.delete(dir) as "test directory cleanup"
@@ -504,7 +500,7 @@ pub fn websocket_middleware_pass_reports_the_ws_route_test() {
   let dir = static_dir()
   let passthrough: middleware.Middleware = fn(req, next) { next(req) }
   let listener = start_app_server(dir, [passthrough])
-  let #(id, events) = listen(request_events)
+  use events <- listen(request_events)
   let socket = open(listener)
   let upgrade =
     "GET /ws?path=%2F HTTP/1.1\r\nHost: test\r\nUpgrade: websocket\r\n"
@@ -515,7 +511,6 @@ pub fn websocket_middleware_pass_reports_the_ws_route_test() {
   let stop = expect(events, fn(event) { named(event, ["request", "stop"]) })
   let assert Ok("/ws") = telemetry.string(stop, "route")
   let assert Ok("GET") = telemetry.string(stop, "method")
-  let assert Ok(Nil) = telemetry.detach(id)
   raw_close(socket)
   server.stop(listener)
   let assert Ok(Nil) = simplifile.delete(dir) as "test directory cleanup"
@@ -525,7 +520,7 @@ pub fn websocket_middleware_pass_reports_the_ws_route_test() {
 
 pub fn connection_accepted_and_closed_normally_test() {
   let listener = start_server(limits())
-  let #(id, events) = listen(connection_events)
+  use events <- listen(connection_events)
   let socket = open(listener)
   let event = expect(events, accepted)
   let assert Ok("ok") = telemetry.string(event, "reason")
@@ -538,14 +533,13 @@ pub fn connection_accepted_and_closed_normally_test() {
   let assert Ok(1) = telemetry.int(closed, "count")
   let assert Ok(lifetime) = telemetry.int(closed, "duration")
   let assert True = lifetime > 0
-  let assert Ok(Nil) = telemetry.detach(id)
   server.stop(listener)
 }
 
 pub fn connection_over_global_cap_is_rejected_test() {
   let listener =
     start_server(transport.SecurityLimits(..limits(), max_connections: 1))
-  let #(id, events) = listen(connection_events)
+  use events <- listen(connection_events)
   let a = open(listener)
   let first = expect(events, accepted)
   let assert Ok("ok") = telemetry.string(first, "reason")
@@ -558,7 +552,6 @@ pub fn connection_over_global_cap_is_rejected_test() {
   let assert Ok(1) = telemetry.int(rejected, "count")
   let assert Ok(decision) = telemetry.int(rejected, "duration")
   let assert True = decision >= 0
-  let assert Ok(Nil) = telemetry.detach(id)
   raw_close(b)
   raw_close(a)
   server.stop(listener)
@@ -569,7 +562,7 @@ pub fn connection_over_per_ip_cap_is_rejected_test() {
     start_server(
       transport.SecurityLimits(..limits(), max_connections_per_ip: 1),
     )
-  let #(id, events) = listen(connection_events)
+  use events <- listen(connection_events)
   let a = open(listener)
   let first = expect(events, accepted)
   let assert Ok("ok") = telemetry.string(first, "reason")
@@ -579,7 +572,6 @@ pub fn connection_over_per_ip_cap_is_rejected_test() {
   let rejected =
     expect(events, fn(event) { named(event, ["connection", "rejected"]) })
   let assert Ok("max_connections_per_ip") = telemetry.string(rejected, "reason")
-  let assert Ok(Nil) = telemetry.detach(id)
   raw_close(b)
   raw_close(a)
   server.stop(listener)
@@ -587,7 +579,7 @@ pub fn connection_over_per_ip_cap_is_rejected_test() {
 
 pub fn killed_and_crashed_connections_report_their_reason_test() {
   let listener = start_server(limits())
-  let #(id, events) = listen(connection_events)
+  use events <- listen(connection_events)
   let a = open(listener)
   let first = expect(events, accepted)
   let assert Ok("ok") = telemetry.string(first, "reason")
@@ -604,7 +596,6 @@ pub fn killed_and_crashed_connections_report_their_reason_test() {
   let crashed = expect(events, closed_with("crash"))
   // The crash reason itself is logged, never put in metadata.
   let assert False = metadata_mentions(crashed, "abnormal_exit")
-  let assert Ok(Nil) = telemetry.detach(id)
   raw_close(a)
   raw_close(b)
   server.stop(listener)
@@ -612,14 +603,13 @@ pub fn killed_and_crashed_connections_report_their_reason_test() {
 
 pub fn stopping_the_listener_reports_shutdown_test() {
   let listener = start_server(limits())
-  let #(id, events) = listen(connection_events)
+  use events <- listen(connection_events)
   let socket = open(listener)
   let event = expect(events, accepted)
   let assert Ok("ok") = telemetry.string(event, "reason")
   server.stop(listener)
   let closed = expect(events, closed_with("shutdown"))
   let assert Ok(1) = telemetry.int(closed, "count")
-  let assert Ok(Nil) = telemetry.detach(id)
   raw_close(socket)
 }
 

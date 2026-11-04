@@ -6,6 +6,7 @@
 /// Handlers run in the emitting process (the connection's handler), so
 /// each test forwards events to its own subject and synchronizes on them;
 /// nothing sleeps.
+import brazier/monitored
 import brazier/telemetry.{type Event}
 import brazier/transport
 import brazier/transport/server
@@ -177,13 +178,10 @@ const ws_events = [
   ["brazier", "ws", "backpressure"],
 ]
 
-fn listen() -> #(String, Subject(Event)) {
-  let assert Ok(Nil) = telemetry.start()
-  let id = "ws_telemetry_" <> int.to_string(unique_integer())
-  let events = process.new_subject()
-  let assert Ok(Nil) =
-    telemetry.attach(id, ws_events, fn(event) { process.send(events, event) })
-  #(id, events)
+/// Run `run` with every WebSocket event forwarded to it; the handler is
+/// detached afterwards even if `run` crashes.
+fn listen(run: fn(Subject(Event)) -> a) -> a {
+  monitored.listening(ws_events, run)
 }
 
 /// The first event matching `matches`; others (from earlier steps of the
@@ -218,8 +216,7 @@ fn int_of(event: Event, key: String) -> Int {
   value
 }
 
-fn finish(id: String, app: Server) -> Nil {
-  let assert Ok(Nil) = telemetry.detach(id)
+fn finish(app: Server) -> Nil {
   server.stop(app.listener)
 }
 
@@ -227,7 +224,7 @@ fn finish(id: String, app: Server) -> Nil {
 
 pub fn accepted_upgrade_span_reports_ok_test() {
   let app = start_server(limits())
-  let #(id, events) = listen()
+  use events <- listen()
   let probe = open(app)
   let start = expect(events, named(_, ["upgrade", "start"]))
   let assert Ok("/ws") = telemetry.string(start, "route")
@@ -237,12 +234,12 @@ pub fn accepted_upgrade_span_reports_ok_test() {
   let assert Ok("/ws") = telemetry.string(stop, "route")
   let assert True = int_of(stop, "duration") >= 0
   raw_close(probe.socket)
-  finish(id, app)
+  finish(app)
 }
 
 pub fn refused_upgrade_span_reports_the_refusal_test() {
   let app = start_server(limits())
-  let #(id, events) = listen()
+  use events <- listen()
   let headers =
     list.filter(upgrade_headers(app.port), fn(h) { h.0 != "Origin" })
   let #(socket, status) = upgrade(app.port, headers)
@@ -270,14 +267,14 @@ pub fn refused_upgrade_span_reports_the_refusal_test() {
   let stop = expect(events, upgrade_stop)
   let assert Ok("rejected_version") = telemetry.string(stop, "result")
   let assert Error(Nil) = process.receive(app.connected, 0)
-  finish(id, app)
+  finish(app)
 }
 
 // --- [brazier, ws, close] ----------------------------------------------------
 
 pub fn peer_close_reports_its_code_and_the_traffic_test() {
   let app = start_server(limits())
-  let #(id, events) = listen()
+  use events <- listen()
   let probe = open(app)
   send_text(probe.socket, heartbeat)
   let assert "{\"type\":\"heartbeat_ack\"" <> _ = recv_text(probe.socket)
@@ -294,12 +291,12 @@ pub fn peer_close_reports_its_code_and_the_traffic_test() {
   let assert True = int_of(close, "bytes_out") > 0
   let assert True = int_of(close, "duration") > 0
   raw_close(probe.socket)
-  finish(id, app)
+  finish(app)
 }
 
 pub fn empty_peer_close_reports_1005_test() {
   let app = start_server(limits())
-  let #(id, events) = listen()
+  use events <- listen()
   let probe = open(app)
   let assert Ok(Nil) = raw_send(probe.socket, masked_frame(1, 8, <<>>))
     as "test client close must be sent"
@@ -307,12 +304,12 @@ pub fn empty_peer_close_reports_1005_test() {
   let assert Ok(1005) = telemetry.int(close, "close_code")
   let assert Ok("peer_close") = telemetry.string(close, "reason")
   raw_close(probe.socket)
-  finish(id, app)
+  finish(app)
 }
 
 pub fn protocol_error_reports_the_close_sent_test() {
   let app = start_server(limits())
-  let #(id, events) = listen()
+  use events <- listen()
   let probe = open(app)
   // An unmasked client frame is a protocol error (RFC 6455 5.1).
   let assert Ok(Nil) =
@@ -322,12 +319,12 @@ pub fn protocol_error_reports_the_close_sent_test() {
   let assert Ok(1002) = telemetry.int(close, "close_code")
   let assert Ok("protocol_error") = telemetry.string(close, "reason")
   raw_close(probe.socket)
-  finish(id, app)
+  finish(app)
 }
 
 pub fn invalid_utf8_reports_a_snake_case_label_test() {
   let app = start_server(limits())
-  let #(id, events) = listen()
+  use events <- listen()
   let probe = open(app)
   let assert Ok(Nil) =
     raw_send(probe.socket, masked_frame(1, 1, <<0xFF, 0xFE>>))
@@ -336,19 +333,19 @@ pub fn invalid_utf8_reports_a_snake_case_label_test() {
   let assert Ok(1007) = telemetry.int(close, "close_code")
   let assert Ok("invalid_utf8") = telemetry.string(close, "reason")
   raw_close(probe.socket)
-  finish(id, app)
+  finish(app)
 }
 
 pub fn dropped_tcp_connection_reports_1006_test() {
   let app = start_server(limits())
-  let #(id, events) = listen()
+  use events <- listen()
   let probe = open(app)
   raw_close(probe.socket)
   let close = expect(events, for_connection(probe, ["close"]))
   let assert Ok(1006) = telemetry.int(close, "close_code")
   let assert Ok("tcp_closed") = telemetry.string(close, "reason")
   let assert 0 = int_of(close, "frames_in")
-  finish(id, app)
+  finish(app)
 }
 
 // --- [brazier, ws, rate_limited] ---------------------------------------------
@@ -356,7 +353,7 @@ pub fn dropped_tcp_connection_reports_1006_test() {
 pub fn event_over_the_rate_is_reported_test() {
   let app =
     start_server(transport.SecurityLimits(..limits(), max_events_per_second: 1))
-  let #(id, events) = listen()
+  use events <- listen()
   let probe = open(app)
   send_text(probe.socket, event_json("a"))
   send_text(probe.socket, event_json("b"))
@@ -373,7 +370,7 @@ pub fn event_over_the_rate_is_reported_test() {
   let again = expect(events, for_connection(probe, ["rate_limited"]))
   let assert 2 = int_of(again, "violations")
   raw_close(probe.socket)
-  finish(id, app)
+  finish(app)
 }
 
 pub fn oversized_batch_is_reported_test() {
@@ -381,7 +378,7 @@ pub fn oversized_batch_is_reported_test() {
     start_server(
       transport.SecurityLimits(..limits(), max_events_per_second: 1000),
     )
-  let #(id, events) = listen()
+  use events <- listen()
   let probe = open(app)
   send_text(probe.socket, batch_json(101))
   let assert "{\"type\":\"error\",\"reason\":\"Batch too large\"}" =
@@ -389,12 +386,12 @@ pub fn oversized_batch_is_reported_test() {
   let limited = expect(events, for_connection(probe, ["rate_limited"]))
   let assert Ok("batch_size") = telemetry.string(limited, "kind")
   raw_close(probe.socket)
-  finish(id, app)
+  finish(app)
 }
 
 pub fn heartbeat_flood_is_reported_test() {
   let app = start_server(limits())
-  let #(id, events) = listen()
+  use events <- listen()
   let probe = open(app)
   // Two heartbeats per second are acknowledged; the third is a violation.
   list.each([1, 2, 3], fn(_) { send_text(probe.socket, heartbeat) })
@@ -402,14 +399,14 @@ pub fn heartbeat_flood_is_reported_test() {
   let assert Ok("heartbeat_rate") = telemetry.string(limited, "kind")
   let assert 1 = int_of(limited, "violations")
   raw_close(probe.socket)
-  finish(id, app)
+  finish(app)
 }
 
 // --- [brazier, ws, backpressure] ---------------------------------------------
 
 pub fn runtime_backpressure_is_reported_test() {
   let app = start_server(limits())
-  let #(id, events) = listen()
+  use events <- listen()
   let probe = open(app)
   process.send(
     probe.runtime,
@@ -422,13 +419,13 @@ pub fn runtime_backpressure_is_reported_test() {
   let assert Ok(1013) = telemetry.int(close, "close_code")
   let assert Ok("backpressure") = telemetry.string(close, "reason")
   raw_close(probe.socket)
-  finish(id, app)
+  finish(app)
 }
 
 pub fn outbound_queue_overflow_is_reported_test() {
   let app =
     start_server(transport.SecurityLimits(..limits(), ws_max_outbound_queue: 5))
-  let #(id, events) = listen()
+  use events <- listen()
   let probe = open(app)
   // Suspend the handler so its mailbox fills deterministically.
   let assert Ok(Nil) = suspend(probe.handler)
@@ -444,13 +441,10 @@ pub fn outbound_queue_overflow_is_reported_test() {
   let close = expect(events, for_connection(probe, ["close"]))
   let assert Ok(1013) = telemetry.int(close, "close_code")
   raw_close(probe.socket)
-  finish(id, app)
+  finish(app)
 }
 
 // --- FFI --------------------------------------------------------------------
-
-@external(erlang, "erlang", "unique_integer")
-fn unique_integer() -> Int
 
 @external(erlang, "brazier_ws_test_ffi", "raw_connect")
 fn raw_connect(host: String, port: Int) -> Result(RawSocket, String)

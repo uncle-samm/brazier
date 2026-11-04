@@ -16,10 +16,12 @@
 ////   with it instead of reaching the next test in eunit's shared process.
 
 import brazier/await
+import brazier/telemetry.{type Event}
 import gleam/dynamic.{type Dynamic}
 import gleam/erlang/atom
-import gleam/erlang/process.{type ExitReason, type Monitor, type Pid}
+import gleam/erlang/process.{type ExitReason, type Monitor, type Pid, type Subject}
 import gleam/int
+import gleam/string
 
 /// Spawn an unlinked process running `running`, monitored from the start:
 /// its DOWN always carries the reason it exited with.
@@ -91,3 +93,71 @@ pub fn isolated(run: fn() -> a) -> a
 /// unchanged once `cleanup` has run.
 @external(erlang, "brazier_monitored_ffi", "with_cleanup")
 pub fn with_cleanup(cleanup cleanup: fn() -> Nil, run run: fn() -> a) -> a
+
+/// Attach the telemetry handler `id` to `names`, run `run`, then detach it,
+/// whether `run` returned or crashed. Telemetry handlers are node-wide and
+/// outlive the test process, so a handler left attached by a failing test
+/// keeps sending every later event to eunit's shared test process (ExUnit's
+/// `on_exit(fn -> :telemetry.detach(id) end)` pattern).
+///
+/// Crashes if the attach fails, and if the handler is no longer attached at
+/// cleanup: a test that detaches its own handler uses `with_cleanup` and
+/// `detach_unless_detached` instead.
+pub fn with_handler(
+  id: String,
+  names: List(List(String)),
+  handler: fn(Event) -> Nil,
+  run: fn() -> a,
+) -> a {
+  case telemetry.start() {
+    Ok(Nil) -> Nil
+    Error(reason) ->
+      panic as { "with_handler: telemetry start: " <> string.inspect(reason) }
+  }
+  case telemetry.attach(id, names, handler) {
+    Ok(Nil) -> Nil
+    Error(reason) ->
+      panic as {
+        "with_handler: attach " <> id <> ": " <> string.inspect(reason)
+      }
+  }
+  use <- with_cleanup(fn() {
+    case telemetry.detach(id) {
+      Ok(Nil) -> Nil
+      Error(reason) ->
+        panic as {
+          "with_handler: detach " <> id <> ": " <> string.inspect(reason)
+        }
+    }
+  })
+  run()
+}
+
+/// `with_handler` with a fresh handler id and a handler that forwards every
+/// event to a subject owned by the calling process, which `run` receives.
+pub fn listening(
+  names: List(List(String)),
+  run: fn(Subject(Event)) -> a,
+) -> a {
+  let id = "brazier_listening_" <> int.to_string(unique_integer())
+  let events = process.new_subject()
+  use <- with_handler(id, names, fn(event) { process.send(events, event) })
+  run(events)
+}
+
+/// Cleanup for a test that detaches handler `id` itself (to check detach,
+/// or because telemetry detached a crashing handler): detach it if the body
+/// failed before doing so. `NotAttached` is the expected outcome when the
+/// body ran to the end, so it is the one error accepted; any other crashes.
+pub fn detach_unless_detached(id: String) -> Nil {
+  case telemetry.detach(id) {
+    Ok(Nil) | Error(telemetry.NotAttached(_)) -> Nil
+    Error(reason) ->
+      panic as {
+        "detach_unless_detached " <> id <> ": " <> string.inspect(reason)
+      }
+  }
+}
+
+@external(erlang, "erlang", "unique_integer")
+fn unique_integer() -> Int

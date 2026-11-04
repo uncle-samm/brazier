@@ -7,7 +7,7 @@
 ////
 //// Every presence is stopped after its test even when the test fails
 //// (with_presence), and nothing polls: a test waits for the shard's own
-//// heartbeat ticks (await.watch_info) or for its answer.
+//// heartbeat ticks (await.with_watch_info) or for its answer.
 
 import brazier/await
 import brazier/cluster/log_capture
@@ -125,7 +125,7 @@ pub fn absent_for_a_node_never_heard_from_test() {
 pub fn down_for_a_node_that_is_down_test() {
   use <- with_verified(["ghost@host"])
   use p <- with_presence(100)
-  let tick = await.watch_info(shard(p), "heartbeat")
+  use tick <- await.with_watch_info(shard(p), "heartbeat")
   let ghost = fake_ref("ghost@host", 1)
   send_peer(p, transfer_ack(ghost, 1, "room", [#("remote", "\"hi\"")]))
   // The shard marks a silent replica down on a heartbeat tick, once
@@ -147,7 +147,7 @@ pub fn down_for_a_node_that_is_down_test() {
 pub fn timeout_when_the_node_never_catches_up_test() {
   use <- with_verified(["ghost@host"])
   use p <- with_presence(300)
-  let tick = await.watch_info(shard(p), "heartbeat")
+  use tick <- await.with_watch_info(shard(p), "heartbeat")
   let ghost = fake_ref("ghost@host", 1)
   send_peer(p, heartbeat_at(ghost, 1, 5))
   let #(answered, lines) =

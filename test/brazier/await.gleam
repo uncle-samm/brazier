@@ -237,6 +237,37 @@ pub fn unwatch(watch: InfoWatch) -> Nil {
   unwatch_ffi(watch)
 }
 
+/// `watch_info` scoped to `run`: the hook is removed when `run` returns or
+/// crashes, so a failing test never leaves it on a process that outlives
+/// the test. Prefer it to `watch_info` plus `unwatch`.
+pub fn with_watch_info(pid: Pid, message: String, run: fn(InfoWatch) -> a) -> a {
+  scoped_watch(pid, watch_info(pid, message), run)
+}
+
+/// `watch_exit` scoped to `run`, as `with_watch_info`.
+pub fn with_watch_exit(pid: Pid, child: Pid, run: fn(InfoWatch) -> a) -> a {
+  scoped_watch(pid, watch_exit(pid, child), run)
+}
+
+/// `watch_down` scoped to `run`, as `with_watch_info`.
+pub fn with_watch_down(pid: Pid, target: Pid, run: fn(InfoWatch) -> a) -> a {
+  scoped_watch(pid, watch_down(pid, target), run)
+}
+
+fn scoped_watch(pid: Pid, watch: InfoWatch, run: fn(InfoWatch) -> a) -> a {
+  use <- with_cleanup(fn() {
+    // A sys hook lives inside the watched process, so a process that has
+    // exited (a test that stops it) holds none to remove, and sys:remove/2
+    // would exit on it. Its pending notices carry the watch's own ref, which
+    // no later watch selects on.
+    case process.is_alive(pid) {
+      True -> unwatch(watch)
+      False -> Nil
+    }
+  })
+  run(watch)
+}
+
 /// Return once the watched process has received and handled the next
 /// watched message. Crashes with `what` if none arrives by the deadline.
 pub fn expect_info(watch: InfoWatch, pid: Pid, what: String) -> Nil {

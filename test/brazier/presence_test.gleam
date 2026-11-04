@@ -131,10 +131,9 @@ fn only_shard(p: Presence(String)) -> process.Pid {
 /// on it, so its entries are gone. The tracker must have one shard.
 fn kill_and_await_leave(p: Presence(String), h: Holder) -> Nil {
   let shard = only_shard(p)
-  let down = await.watch_down(shard, h.pid)
+  use down <- await.with_watch_down(shard, h.pid)
   holder.kill(h)
   await.expect_info(down, shard, "the shard handling the holder's DOWN")
-  await.unwatch(down)
 }
 
 /// A fast tracker's heartbeat ticks, every 20 ms: the bound for a test that
@@ -248,7 +247,7 @@ pub fn starting_a_running_tracker_twice_fails_test() {
 
 pub fn track_list_untrack_test() {
   let p = start_default()
-  let h = holder.start()
+  use h <- holder.with_holder
   let ref = track(p, h, "room", "alice", "online")
   assert string.length(ref) == 11
 
@@ -269,12 +268,12 @@ pub fn track_list_untrack_test() {
 
 pub fn tracking_a_key_twice_is_refused_test() {
   let p = start_default()
-  let h = holder.start()
+  use h <- holder.with_holder
   let _ = track(p, h, "room", "alice", "a")
   let assert Error(AlreadyTracked) =
     holder.run(h, fn() { presence.track(p, "room", "alice", "b") })
   // The same key from another process is a second meta of one entry.
-  let other = holder.start()
+  use other <- holder.with_holder
   let _ = track(p, other, "room", "alice", "c")
   let assert Ok([Entry("alice", metas)]) = presence.list(p, "room")
   assert list.sort(list.map(metas, fn(m) { m.value }), string.compare)
@@ -286,7 +285,7 @@ pub fn tracking_a_key_twice_is_refused_test() {
 
 pub fn list_is_ordered_by_key_test() {
   let p = start_default()
-  let h = holder.start()
+  use h <- holder.with_holder
   list.each(["carol", "alice", "bob"], fn(key) {
     let _ = track(p, h, "room", key, key)
   })
@@ -297,7 +296,7 @@ pub fn list_is_ordered_by_key_test() {
 
 pub fn update_replaces_meta_and_keeps_ref_prev_test() {
   let p = start_default()
-  let h = holder.start()
+  use h <- holder.with_holder
   let first = track(p, h, "room", "alice", "online")
   let assert Ok(second) =
     holder.run(h, fn() { presence.update(p, "room", "alice", "away") })
@@ -318,7 +317,7 @@ pub fn update_replaces_meta_and_keeps_ref_prev_test() {
 
 pub fn untrack_all_removes_every_topic_test() {
   let p = start(config(unique_name()) |> presence.pool_size(4))
-  let h = holder.start()
+  use h <- holder.with_holder
   let topics = ["a", "b", "c", "d", "e", "f"]
   list.each(topics, fn(topic) {
     let _ = track(p, h, topic, "k", "m")
@@ -339,8 +338,8 @@ pub fn untrack_all_removes_every_topic_test() {
 pub fn exited_process_leaves_test() {
   use <- monitored.isolated
   let p = start_default()
-  let h = holder.start()
-  let stays = holder.start()
+  use h <- holder.with_holder
+  use stays <- holder.with_holder
   let _ = track(p, h, "room", "alice", "a")
   let _ = track(p, h, "lobby", "alice", "a")
   let _ = track(p, stays, "room", "bob", "b")
@@ -359,7 +358,7 @@ pub fn exited_process_leaves_test() {
 
 pub fn topic_and_key_are_validated_test() {
   let p = start_default()
-  let h = holder.start()
+  use h <- holder.with_holder
   let max = presence.max_topic_bytes(p)
   assert max == 255 - string.byte_size("presence:" <> presence.name(p) <> ":")
   let longest = string.repeat("t", max)
@@ -397,23 +396,20 @@ fn result_keys(
 pub fn oversized_meta_is_refused_with_telemetry_test() {
   let name = unique_name()
   let p = start(config(name) |> presence.max_meta_bytes(10))
-  let assert Ok(Nil) = telemetry.start()
   let events = process.new_subject()
-  let id = unique_name()
-  let assert Ok(Nil) =
-    telemetry.attach(id, [["brazier", "presence", "limit_exceeded"]], fn(event) {
+  // Telemetry handlers are global: with_handler detaches even when an
+  // assertion fails.
+  use <- monitored.with_handler(
+    unique_name(),
+    [["brazier", "presence", "limit_exceeded"]],
+    fn(event) {
       case telemetry.string(event, "tracker") {
         Ok(tracker) if tracker == name -> process.send(events, event)
         _ -> Nil
       }
-    })
-  // Telemetry handlers are global: detach even when an assertion fails.
-  use <- monitored.with_cleanup(fn() {
-    let assert Ok(Nil) = telemetry.detach(id)
-      as "detaching the test's telemetry handler"
-    Nil
-  })
-  let h = holder.start()
+    },
+  )
+  use h <- holder.with_holder
   // "12345678" encodes as 10 bytes with its quotes: the limit is inclusive.
   let _ = track(p, h, "room", "fits", "12345678")
   let assert Error(MetaTooLarge(11)) =
@@ -435,7 +431,7 @@ pub fn meta_that_does_not_decode_is_refused_test() {
       fn(meta: String) { json.int(string.length(meta)) },
       decode.string,
     ))
-  let h = holder.start()
+  use h <- holder.with_holder
   let assert Error(MetaDecodeFailed(_)) =
     holder.run(h, fn() { presence.track(p, "room", "alice", "online") })
   let assert Ok([]) = presence.list(p, "room")
@@ -445,7 +441,7 @@ pub fn meta_that_does_not_decode_is_refused_test() {
 
 pub fn per_process_limit_test() {
   let p = start(config(unique_name()) |> presence.max_topics_per_pid(2))
-  let h = holder.start()
+  use h <- holder.with_holder
   let _ = track(p, h, "a", "k", "m")
   let _ = track(p, h, "b", "k", "m")
   let #(outcome, lines) =
@@ -455,7 +451,7 @@ pub fn per_process_limit_test() {
   let assert Error(PresenceLimitExceeded("max_topics_per_pid")) = outcome
   assert log_capture.contains(lines, "warning", "max_topics_per_pid")
   // Another process has its own allowance.
-  let other = holder.start()
+  use other <- holder.with_holder
   let _ = track(p, other, "c", "k", "m")
   // Untracking frees a slot.
   let assert Ok(Nil) = holder.run(h, fn() { presence.untrack(p, "a", "k") })
@@ -468,9 +464,9 @@ pub fn per_process_limit_test() {
 pub fn per_shard_limit_test() {
   use <- monitored.isolated
   let p = start(config(unique_name()) |> presence.max_entries_per_shard(2))
-  let a = holder.start()
-  let b = holder.start()
-  let c = holder.start()
+  use a <- holder.with_holder
+  use b <- holder.with_holder
+  use c <- holder.with_holder
   let _ = track(p, a, "room", "a", "m")
   let _ = track(p, b, "room", "b", "m")
   let assert Error(PresenceLimitExceeded("max_entries_per_shard")) =
@@ -489,7 +485,7 @@ pub fn diffs_arrive_in_order_test() {
   use <- monitored.isolated
   let p = start_default()
   subscribe(p, "room")
-  let h = holder.start()
+  use h <- holder.with_holder
   let first = track(p, h, "room", "alice", "online")
   let assert Ok(second) =
     holder.run(h, fn() { presence.update(p, "room", "alice", "away") })
@@ -516,7 +512,7 @@ pub fn diffs_are_per_topic_test() {
   use <- monitored.isolated
   let p = start_default()
   subscribe(p, "room")
-  let h = holder.start()
+  use h <- holder.with_holder
   let _ = track(p, h, "lobby", "alice", "m")
   let _ = track(p, h, "room", "bob", "m")
   let assert Diff("room", [Entry("bob", _)], []) = next_diff(p)
@@ -532,7 +528,7 @@ pub fn decode_diff_rejects_other_messages_test() {
   let p = start_default()
   let other = start_default()
   subscribe(other, "room")
-  let h = holder.start()
+  use h <- holder.with_holder
   let _ = track(other, h, "room", "alice", "m")
   let assert Ok(message) = receive_diff(wait_ms)
   // A diff of another tracker.
@@ -617,7 +613,7 @@ pub fn merge_drops_keys_without_metas_test() {
 
 pub fn stopped_tracker_is_down_test() {
   let p = start_default()
-  let h = holder.start()
+  use h <- holder.with_holder
   let _ = track(p, h, "room", "alice", "m")
   let assert Ok(Nil) = presence.stop(p)
   let assert Error(TrackerDown) =
@@ -634,16 +630,17 @@ pub fn stopped_tracker_is_down_test() {
 pub fn restarted_shard_starts_empty_test() {
   use <- monitored.isolated
   let p = start_default()
-  let h = holder.start()
+  use h <- holder.with_holder
   let _ = track(p, h, "room", "alice", "m")
   let assert Ok(shard) = presence.shard_pid(p, "room")
   // The supervisor restarts the shard while handling its 'EXIT', and the
   // new shard registers in its init, before the supervisor goes on.
   let supervisor = parent(shard)
-  let restart = await.watch_exit(supervisor, shard)
-  process.kill(shard)
-  await.expect_info(restart, supervisor, "the supervisor restarting the shard")
-  await.unwatch(restart)
+  {
+    use restart <- await.with_watch_exit(supervisor, shard)
+    process.kill(shard)
+    await.expect_info(restart, supervisor, "the supervisor restarting the shard")
+  }
   let assert Ok(new) = presence.shard_pid(p, "room")
   assert new != shard
   assert presence.list(p, "room") == Ok([])
@@ -673,7 +670,7 @@ pub fn supervised_tracker_test() {
     })
   let assert Ok(tree) = process.receive(ready, wait_ms)
     as "the owner did not start the tree"
-  let h = holder.start()
+  use h <- holder.with_holder
   let _ = track(p, h, "room", "alice", "m")
   assert keys(p, "room") == ["alice"]
   holder.kill(h)
@@ -695,21 +692,23 @@ pub fn remote_entries_join_go_down_and_permdown_test() {
   use <- monitored.isolated
   use <- with_verified(["fake@host"])
   let p = start_fast(unique_name())
-  let tick = await.watch_info(only_shard(p), "heartbeat")
-  subscribe(p, "room")
-  let ref = fake_ref("fake@host", 1)
-  send_peer(p, transfer_ack(ref, 1, "room", [#("remote", "\"hi\"")]))
-  assert replicas(p) == [#("fake@host", Up)]
-  let assert Ok([Entry("remote", [meta])]) = presence.list(p, "room")
-  assert meta
-    == Meta(value: "hi", ref: "fake-remote", ref_prev: None, node: "fake@host")
-  let assert Diff("room", [Entry("remote", _)], []) = next_diff(p)
+  {
+    use tick <- await.with_watch_info(only_shard(p), "heartbeat")
+    subscribe(p, "room")
+    let ref = fake_ref("fake@host", 1)
+    send_peer(p, transfer_ack(ref, 1, "room", [#("remote", "\"hi\"")]))
+    assert replicas(p) == [#("fake@host", Up)]
+    let assert Ok([Entry("remote", [meta])]) = presence.list(p, "room")
+    assert meta
+      == Meta(value: "hi", ref: "fake-remote", ref_prev: None, node: "fake@host")
+    let assert Diff("room", [Entry("remote", _)], []) = next_diff(p)
 
-  // No heartbeats: down after 100ms (entries leave), forgotten after 300ms.
-  await_replicas(p, tick, [#("fake@host", Down)], "the fake replica down")
-  let assert Ok([]) = presence.list(p, "room")
-  let assert Diff("room", [], [Entry("remote", _)]) = next_diff(p)
-  await_replicas(p, tick, [], "the fake replica forgotten")
+    // No heartbeats: down after 100ms (entries leave), forgotten after 300ms.
+    await_replicas(p, tick, [#("fake@host", Down)], "the fake replica down")
+    let assert Ok([]) = presence.list(p, "room")
+    let assert Diff("room", [], [Entry("remote", _)]) = next_diff(p)
+    await_replicas(p, tick, [], "the fake replica forgotten")
+  }
   finish(p, "room")
 }
 
@@ -724,10 +723,12 @@ pub fn heartbeat_brings_a_down_replica_back_test() {
       |> presence.down_period(100)
       |> presence.permdown_period(60_000),
     )
-  let tick = await.watch_info(only_shard(p), "heartbeat")
   let ref = fake_ref("fake@host", 1)
-  send_peer(p, transfer_ack(ref, 1, "room", [#("remote", "\"hi\"")]))
-  await_replicas(p, tick, [#("fake@host", Down)], "the fake replica down")
+  {
+    use tick <- await.with_watch_info(only_shard(p), "heartbeat")
+    send_peer(p, transfer_ack(ref, 1, "room", [#("remote", "\"hi\"")]))
+    await_replicas(p, tick, [#("fake@host", Down)], "the fake replica down")
+  }
   let assert Ok([]) = presence.list(p, "room")
   send_peer(p, heartbeat(ref, 1))
   assert replicas(p) == [#("fake@host", Up)]
