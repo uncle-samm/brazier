@@ -421,7 +421,10 @@ pub fn navigation_with_bad_encoding_hard_navigates_test() {
 pub fn navigation_to_non_local_path_is_refused_test() {
   let #(subject, transport_subject, _first) = join_routed("/", "r_ext")
   list.each(
-    ["//evil.example/x", "https://evil.example/", "javascript:x"],
+    [
+      "//evil.example/x", "https://evil.example/", "javascript:x",
+      "/\\evil.example", "/\t/evil.example", "/%09/evil.example",
+    ],
     fn(path) {
       process.send(
         subject,
@@ -429,7 +432,7 @@ pub fn navigation_to_non_local_path_is_refused_test() {
       )
       let assert Ok(transport.SendError(reason: reason)) =
         process.receive(transport_subject, await.deadline_ms)
-      let assert True = string.contains(reason, "must start with /")
+      let assert True = string.contains(reason, "same-origin path")
     },
   )
   // The model was not touched.

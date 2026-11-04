@@ -36,6 +36,7 @@
     ws_close/8,
     ws_rate_limited/3,
     ws_backpressure/3,
+    ws_navigation_refused/3,
     runtime_span/5,
     runtime_render_span/4,
     runtime_stop/2,
@@ -236,6 +237,11 @@ ws_rate_limited(Violations, Kind, ConnectionId) ->
 ws_backpressure(QueueLen, Reason, ConnectionId) ->
     telemetry:execute([?PREFIX, ws, backpressure], #{queue_len => QueueLen},
                       #{reason => Reason, connection_id => ConnectionId}).
+
+%% [brazier, ws, navigation_refused]
+ws_navigation_refused(Kind, Status, ConnectionId) ->
+    telemetry:execute([?PREFIX, ws, navigation_refused], #{count => 1},
+                      #{kind => Kind, status => Status, connection_id => ConnectionId}).
 
 %% [brazier, runtime, mount | handle_event | navigate] span.
 runtime_span(Kind, Route, Event, ConnectionId, Run) ->

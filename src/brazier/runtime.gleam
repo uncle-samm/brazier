@@ -63,6 +63,7 @@ import brazier/cookie
 import brazier/effect.{type Effect}
 import brazier/error
 import brazier/internal/context.{type Context}
+import brazier/internal/local_path
 import brazier/internal/log_path
 import brazier/internal/presence_watch
 import brazier/internal/uri_check
@@ -1393,8 +1394,8 @@ fn ack_if_unchanged(
 
 /// Why a client-reported path cannot be routed in place.
 type PathProblem {
-  /// Not a same-origin path (`/…`, not `//…`): never navigated to.
-  NotLocal
+  /// Not a same-origin path (`internal/local_path`): never navigated to.
+  NotLocal(reason: String)
   /// A path whose encoding does not decode: the dead render answers 400.
   BadEncoding(reason: String)
   /// A path the app's `parse` does not accept: the dead render answers 404.
@@ -1408,13 +1409,10 @@ fn route_for_path(
   page_uri: Uri,
   path: String,
 ) -> Result(msg, PathProblem) {
+  use Nil <- result.try(local_path.check(path) |> result.map_error(NotLocal))
   use parsed <- result.try(
-    case string.starts_with(path, "/") && !string.starts_with(path, "//") {
-      False -> Error(NotLocal)
-      True ->
-        uri.parse(path)
-        |> result.replace_error(BadEncoding("the path does not parse as a URL"))
-    },
+    uri.parse(path)
+    |> result.replace_error(BadEncoding("the path does not parse as a URL")),
   )
   let target = uri.Uri(..page_uri, path: parsed.path, query: parsed.query)
   use Nil <- result.try(
@@ -1484,18 +1482,22 @@ fn refuse_navigation(
     }
     Unroutable(problem) ->
       case problem {
-        NotLocal -> {
+        NotLocal(reason) -> {
           log.warning(
             "brazier.runtime",
             "Navigation from "
               <> conn_id
-              <> " to a non-local path refused: "
-              <> log_path(path),
+              <> " to a non-local path refused ("
+              <> reason
+              <> "): "
+              <> string.inspect(path),
           )
           send_to_conn_id(
             state,
             conn_id,
-            transport.SendError(reason: "navigation path must start with /"),
+            transport.SendError(
+              reason: "navigation path must be a same-origin path",
+            ),
           )
           state
         }
@@ -1527,12 +1529,35 @@ fn refuse_navigation(
   }
 }
 
+/// Send a hard navigation to `path`: the browser loads it. Only a
+/// same-origin path is ever sent (`internal/local_path`); every caller has
+/// already checked it, so another path is a bug in the runtime, which is
+/// logged as an error and answered with an error, never sent.
 fn hard_navigate(
   state: RuntimeState(model, msg),
   conn_id: transport.ConnectionId,
   path: String,
 ) -> RuntimeState(model, msg) {
-  send_to_conn_id(state, conn_id, transport.SendHardNavigate(path: path))
+  case local_path.check(path) {
+    Ok(Nil) ->
+      send_to_conn_id(state, conn_id, transport.SendHardNavigate(path: path))
+    Error(reason) -> {
+      log.error(
+        "brazier.runtime",
+        "Refusing to send a hard navigation to "
+          <> conn_id
+          <> " for "
+          <> string.inspect(path)
+          <> ": not a same-origin path, "
+          <> reason,
+      )
+      send_to_conn_id(
+        state,
+        conn_id,
+        transport.SendError(reason: "Invalid page path"),
+      )
+    }
+  }
   state
 }
 
@@ -1576,7 +1601,8 @@ fn route_join(
           }
         Error(problem) -> {
           let reason = case problem {
-            NotLocal -> "join path must start with /"
+            NotLocal(reason) ->
+              "join path is not a same-origin path: " <> reason
             BadEncoding(reason) ->
               "join path has an invalid encoding: " <> reason
             UnknownRoute -> "no route for the joined path " <> log_path(path)
@@ -2445,7 +2471,8 @@ pub fn start_and_connect_with_request(
   }
 }
 
-/// The Context for a connected mount, from the upgrade request.
+/// The Context for a connected mount, from the upgrade request. Its page is
+/// `transport.get_upgrade_page`, the page the transport gated the upgrade on.
 @internal
 pub fn connected_context(
   req: request.Request(server.Connection),
@@ -2454,35 +2481,9 @@ pub fn connected_context(
     "brazier.runtime",
     "Building connected context from upgrade request " <> log_path(req.path),
   )
-  use pairs <- result.try(
-    request.get_query(req)
-    |> result.replace_error("the WebSocket URL's query string does not parse"),
-  )
-  use page_path <- result.try(
-    list.key_find(pairs, "path")
-    |> result.replace_error(
-      "the WebSocket URL has no path parameter (expected /ws?path=<page path>)",
-    ),
-  )
-  use parsed <- result.try(
-    case
-      string.starts_with(page_path, "/") && !string.starts_with(page_path, "//")
-    {
-      False ->
-        Error(
-          "the WebSocket path parameter is not a local path: "
-          <> string.inspect(page_path),
-        )
-      True ->
-        uri.parse(page_path)
-        |> result.replace_error(
-          "the WebSocket path parameter does not parse: "
-          <> string.inspect(page_path),
-        )
-    },
-  )
+  use page <- result.try(transport.get_upgrade_page(req))
   let page_uri =
-    uri.Uri(..request.to_uri(req), path: parsed.path, query: parsed.query)
+    uri.Uri(..request.to_uri(req), path: page.path, query: page.query)
   Ok(context.new(
     uri: page_uri,
     cookies: cookie.parse(req),
