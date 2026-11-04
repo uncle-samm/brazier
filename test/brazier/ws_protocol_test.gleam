@@ -821,9 +821,11 @@ pub fn killed_handler_releases_its_slot_test() {
   let probe = open(test_server)
   let assert 1 = ws_slots(test_server, host)
   let assert Ok(owner) = server.get_connection_owner(test_server.listener)
-  let watch = await.watch_exit(owner, probe.handler)
-  process.kill(probe.handler)
-  await.expect_info(watch, owner, "the connection owner handling the kill")
+  {
+    use watch <- await.with_watch_exit(owner, probe.handler)
+    process.kill(probe.handler)
+    await.expect_info(watch, owner, "the connection owner handling the kill")
+  }
   let assert 0 = ws_slots(test_server, host)
   // The freed slot admits a new connection under the cap of one.
   let next = open(test_server)

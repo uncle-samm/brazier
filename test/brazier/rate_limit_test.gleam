@@ -235,7 +235,9 @@ pub fn periodic_sweep_runs_without_being_asked_test() {
       rate_limit.RateLimitConfig(max_requests: 5, window_seconds: 1),
     )
   let owner = rate_limit.owner(limiter)
-  let sweeps = await.watch_info(owner, "sweep")
+  // The owner lives as long as this (shared eunit) process, so the hook is
+  // scoped: a failing test does not leave it reporting sweeps to later tests.
+  use sweeps <- await.with_watch_info(owner, "sweep")
   let assert rate_limit.Allowed(..) = rate_limit.check(limiter, "a")
   let assert Ok(1) = rate_limit.key_count(limiter)
   // Sweeps are a second apart and the counter's window ends at most a
