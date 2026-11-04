@@ -161,6 +161,11 @@ with its own changelog, so they are not listed here.
 - (WS10b) The examples' generated `src/beacon_codec.gleam` and
   `priv/static/` bundles are no longer tracked; build an example before its
   first run.
+- (WS10b) CI runs `scripts/check_docs.sh` and the CDP suite at the mobile
+  viewport as well as the desktop one. The samples in CLUSTERING, TELEMETRY,
+  ERROR_HANDLING and TESTING are compiled too, and ERROR_HANDLING describes
+  the transport, rate limit, join token and model size errors as the code
+  raises them.
 
 ### Removed
 
