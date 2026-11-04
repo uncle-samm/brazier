@@ -3,8 +3,9 @@
 ////
 //// Sessions are runtimes on peer nodes inside holder processes (see
 //// cluster/presence_watch_test); their presence comes from the
-//// `brazier.watch_presence` builder. Waiting is always a receive or
-//// `peer.eventually` with a deadline.
+//// `brazier.watch_presence` builder. Waiting is always a receive with a
+//// deadline: the app's presence messages, or `peer.until` woken by each
+//// diff the tracker reports (brazier/presence/wake).
 
 import brazier
 import brazier/cluster/peer.{type Peer, Timeout}
@@ -15,6 +16,7 @@ import brazier/internal/presence_watch
 import brazier/presence.{type Presence}
 import brazier/presence/holder.{type Holder}
 import brazier/presence/sync.{type Diff, type Entry}
+import brazier/presence/wake
 import brazier/pubsub
 import brazier/runtime
 import brazier/test_ctx
@@ -66,8 +68,8 @@ fn fast_config() -> presence.PresenceConfig(String) {
 }
 
 fn tracker() -> Presence(String) {
-  // INVARIANT: fast_config is a valid configuration.
   let assert Ok(tracker) = presence.handle(fast_config())
+    as "fast_config is a valid presence configuration"
   tracker
 }
 
@@ -140,6 +142,7 @@ fn start_tracker(p: Peer) -> Nil {
   peer.on(p, fn() {
     pubsub.start()
     let assert Ok(_) = presence.start(fast_config())
+      as "presence.start succeeds"
     Nil
   })
 }
@@ -166,7 +169,7 @@ fn try_session(
 }
 
 fn start_session(p: Peer, watched: List(String)) -> Session {
-  let assert Ok(session) = try_session(p, watched)
+  let assert Ok(session) = try_session(p, watched) as "the session starts"
   session
 }
 
@@ -222,11 +225,27 @@ fn keys(entries: List(Entry(String))) -> List(String) {
   })
 }
 
+/// The keys this node's tracker lists on `topic`.
+fn listed_here(topic: String) -> List(String) {
+  let assert Ok(entries) = presence.list(tracker(), topic)
+    as "presence.list succeeds"
+  keys(entries)
+}
+
 fn listed(p: Peer, topic: String) -> List(String) {
-  peer.on(p, fn() {
-    let assert Ok(entries) = presence.list(tracker(), topic)
-    keys(entries)
-  })
+  peer.on(p, fn() { listed_here(topic) })
+}
+
+/// Whether `p`'s tracker comes to list the keys `expected` on `topic`,
+/// re-checked on each diff it reports there. A restarted shard reports
+/// the entries it merges from a peer, so catching up wakes this.
+fn lists(p: Peer, topic: String, expected: List(String)) -> Bool {
+  peer.until(
+    p,
+    wake.diffs(tracker(), topic),
+    fn() { listed_here(topic) == expected },
+    wait_ms,
+  )
 }
 
 /// A holder on `p` tracking `key` on `topic`.
@@ -235,6 +254,7 @@ fn track_on(p: Peer, topic: String, key: String) -> Holder {
     let h = holder.start()
     let assert Ok(_) =
       holder.run(h, fn() { presence.track(tracker(), topic, key, "idle") })
+      as "presence.track succeeds"
     h
   })
 }
@@ -242,14 +262,15 @@ fn track_on(p: Peer, topic: String, key: String) -> Holder {
 fn kill_shard(p: Peer, topic: String) -> Nil {
   peer.on(p, fn() {
     let assert Ok(shard) = presence.shard_pid(tracker(), topic)
+      as "the topic has a shard"
     process.kill(shard)
   })
 }
 
 /// The session's presence watcher; call on the session's node.
 fn watcher(session: Session) -> Pid {
-  // INVARIANT: a started runtime's subject is owned by its actor.
   let assert Ok(runtime) = process.subject_owner(session.runtime)
+    as "a started runtime's subject is owned by its actor"
   let assert Ok(pid) = watcher_of(runtime)
     as "the runtime has no presence watcher"
   pid
@@ -263,37 +284,34 @@ fn watcher(session: Session) -> Pid {
 pub fn watches_without_tracking_test_() -> peer.Timeout {
   use <- Timeout(60)
   use peers <- peer.with_members(2, "brazier_ws8c_watch_only")
-  let assert [a, b] = peers
+  let assert [a, b] = peers as "the cluster starts two peers"
   start_tracker(a)
   start_tracker(b)
   let ann = track_on(a, "lobby", "ann")
   let _bob = track_on(b, "lobby", "bob")
-  let assert True =
-    peer.eventually(fn() { listed(a, "lobby") == ["ann", "bob"] }, wait_ms)
+  assert lists(a, "lobby", ["ann", "bob"])
 
   let viewer = start_session(a, ["lobby"])
-  let assert Ok(#(first, view)) = next(a, viewer)
-  let assert "lobby" = first.topic
-  let assert ["ann", "bob"] = keys(first.joins)
-  let assert [] = first.leaves
-  let assert ["ann", "bob"] = keys(view)
+  let assert Ok(#(first, view)) = next(a, viewer) as "the viewer sees the lobby"
+  assert first.topic == "lobby"
+  assert keys(first.joins) == ["ann", "bob"]
+  assert first.leaves == []
+  assert keys(view) == ["ann", "bob"]
 
   let _cat = track_on(b, "lobby", "cat")
-  let assert Ok(#(joined, _)) = next(a, viewer)
-  let assert ["cat"] = keys(joined.joins)
-  let assert [] = joined.leaves
+  let assert Ok(#(joined, _)) = next(a, viewer) as "the viewer sees cat join"
+  assert keys(joined.joins) == ["cat"]
+  assert joined.leaves == []
 
   peer.on(a, fn() { holder.kill(ann) })
-  let assert Ok(#(left, view)) = next(a, viewer)
-  let assert [] = left.joins
-  let assert ["ann"] = keys(left.leaves)
-  let assert ["bob", "cat"] = keys(view)
+  let assert Ok(#(left, view)) = next(a, viewer) as "the viewer sees ann leave"
+  assert left.joins == []
+  assert keys(left.leaves) == ["ann"]
+  assert keys(view) == ["bob", "cat"]
 
   // The session never appears on the topic, on either node.
-  let assert ["bob", "cat"] = listed(a, "lobby")
-  let assert True =
-    peer.eventually(fn() { listed(b, "lobby") == ["bob", "cat"] }, wait_ms)
-  Nil
+  assert listed(a, "lobby") == ["bob", "cat"]
+  assert lists(b, "lobby", ["bob", "cat"])
 }
 
 /// Changes queued while the watcher is busy reach the app coalesced, as
@@ -301,11 +319,12 @@ pub fn watches_without_tracking_test_() -> peer.Timeout {
 pub fn queued_changes_are_coalesced_test_() -> peer.Timeout {
   use <- Timeout(60)
   use peers <- peer.with_members(1, "brazier_ws8c_watch_coalesce")
-  let assert [a] = peers
+  let assert [a] = peers as "the cluster starts one peer"
   start_tracker(a)
   let viewer = start_session(a, ["lobby"])
   let _ann = track_on(a, "lobby", "ann")
   let assert Ok(_) = collect_until(a, viewer, "lobby", ["ann"])
+    as "the viewer sees ann"
 
   let holders =
     peer.on(a, fn() {
@@ -318,23 +337,23 @@ pub fn queued_changes_are_coalesced_test_() -> peer.Timeout {
           let key = "u" <> string.pad_start(int.to_string(i), 3, "0")
           let assert Ok(_) =
             holder.run(h, fn() { presence.track(tracker(), "lobby", key, "x") })
+            as "presence.track succeeds"
           h
         })
       resume(w)
       holders
     })
-  let assert 120 = list.length(holders)
+  assert list.length(holders) == 120
 
-  let assert Ok(#(first, _)) = next(a, viewer)
-  let assert Ok(#(second, view)) = next(a, viewer)
-  let assert 100 = list.length(keys(first.joins))
-  let assert 20 = list.length(keys(second.joins))
-  let assert [] = first.leaves
-  let assert [] = second.leaves
-  let assert 121 = list.length(view)
+  let assert Ok(#(first, _)) = next(a, viewer) as "the first batch arrives"
+  let assert Ok(#(second, view)) = next(a, viewer) as "the second batch arrives"
+  assert list.length(keys(first.joins)) == 100
+  assert list.length(keys(second.joins)) == 20
+  assert first.leaves == []
+  assert second.leaves == []
+  assert list.length(view) == 121
   // Only the holders are tracked; the watching session is not.
-  let assert 121 = list.length(listed(a, "lobby"))
-  Nil
+  assert list.length(listed(a, "lobby")) == 121
 }
 
 /// The watched topics follow the state. Moving from the lobby to the hall
@@ -347,61 +366,42 @@ pub fn queued_changes_are_coalesced_test_() -> peer.Timeout {
 pub fn watched_topics_follow_the_state_test_() -> peer.Timeout {
   use <- Timeout(60)
   use peers <- peer.with_members(1, "brazier_ws8c_watch_move")
-  let assert [a] = peers
+  let assert [a] = peers as "the cluster starts one peer"
   start_tracker(a)
   let _ann = track_on(a, "lobby", "ann")
   let _bob = track_on(a, "hall", "bob")
 
   let viewer = start_session(a, ["lobby", "lobby"])
-  let assert Ok(#(first, _)) = next(a, viewer)
-  let assert #("lobby", ["ann"], []) = #(
-    first.topic,
-    keys(first.joins),
-    keys(first.leaves),
-  )
+  let assert Ok(#(first, _)) = next(a, viewer) as "the viewer sees the lobby"
+  assert summary(first) == #("lobby", ["ann"], [])
 
   send(a, viewer, SetWatched(["hall"]))
-  let assert Ok(#(left, _)) = next(a, viewer)
-  let assert #("lobby", [], ["ann"]) = #(
-    left.topic,
-    keys(left.joins),
-    keys(left.leaves),
-  )
-  let assert Ok(#(joined, _)) = next(a, viewer)
-  let assert #("hall", ["bob"], []) = #(
-    joined.topic,
-    keys(joined.joins),
-    keys(joined.leaves),
-  )
+  let assert Ok(#(left, _)) = next(a, viewer) as "the viewer leaves the lobby"
+  assert summary(left) == #("lobby", [], ["ann"])
+  let assert Ok(#(joined, _)) = next(a, viewer) as "the viewer sees the hall"
+  assert summary(joined) == #("hall", ["bob"], [])
 
   // A lobby change is not reported; the hall change after it is next.
   let _cat = track_on(a, "lobby", "cat")
   let _dan = track_on(a, "hall", "dan")
-  let assert Ok(#(dan, _)) = next(a, viewer)
-  let assert #("hall", ["dan"], []) = #(
-    dan.topic,
-    keys(dan.joins),
-    keys(dan.leaves),
-  )
+  let assert Ok(#(dan, _)) = next(a, viewer) as "the viewer sees dan join"
+  assert summary(dan) == #("hall", ["dan"], [])
 
   send(a, viewer, SetWatched([]))
-  let assert Ok(#(gone, view)) = next(a, viewer)
-  let assert #("hall", [], ["bob", "dan"]) = #(
-    gone.topic,
-    keys(gone.joins),
-    keys(gone.leaves),
-  )
-  let assert [] = view
+  let assert Ok(#(gone, view)) = next(a, viewer) as "the viewer leaves the hall"
+  assert summary(gone) == #("hall", [], ["bob", "dan"])
+  assert view == []
 
   send(a, viewer, SetWatched(["lobby"]))
   let assert Ok(#(back, _)) = next(a, viewer)
-  let assert #("lobby", ["ann", "cat"], []) = #(
-    back.topic,
-    keys(back.joins),
-    keys(back.leaves),
-  )
-  let assert ["ann", "cat"] = listed(a, "lobby")
-  Nil
+    as "the viewer sees the lobby again"
+  assert summary(back) == #("lobby", ["ann", "cat"], [])
+  assert listed(a, "lobby") == ["ann", "cat"]
+}
+
+/// A diff's topic, joined keys and left keys.
+fn summary(diff: Diff(String)) -> #(String, List(String), List(String)) {
+  #(diff.topic, keys(diff.joins), keys(diff.leaves))
 }
 
 /// When A's lobby shard restarts, a watching session on A hears ann (an
@@ -411,28 +411,28 @@ pub fn watched_topics_follow_the_state_test_() -> peer.Timeout {
 pub fn shard_restart_does_not_flap_remote_entries_test_() -> peer.Timeout {
   use <- Timeout(60)
   use peers <- peer.with_members(2, "brazier_ws8c_watch_restart")
-  let assert [a, b] = peers
+  let assert [a, b] = peers as "the cluster starts two peers"
   start_tracker(a)
   start_tracker(b)
   let _ann = track_on(a, "lobby", "ann")
   let _bob = track_on(b, "lobby", "bob")
   let viewer = start_session(a, ["lobby"])
   let assert Ok(_) = collect_until(a, viewer, "lobby", ["ann", "bob"])
+    as "the viewer sees ann and bob"
 
   kill_shard(a, "lobby")
   let assert Ok(#(restart, view)) = next(a, viewer)
-  let assert [] = restart.joins
-  let assert ["ann"] = keys(restart.leaves)
-  let assert ["bob"] = keys(view)
+    as "the viewer sees the restart"
+  assert restart.joins == []
+  assert keys(restart.leaves) == ["ann"]
+  assert keys(view) == ["bob"]
 
-  let assert True =
-    peer.eventually(fn() { listed(a, "lobby") == ["bob"] }, wait_ms)
+  assert lists(a, "lobby", ["bob"])
   let _cat = track_on(b, "lobby", "cat")
-  let assert Ok(#(after, view)) = next(a, viewer)
-  let assert [] = after.leaves
-  let assert ["cat"] = keys(after.joins)
-  let assert ["bob", "cat"] = keys(view)
-  Nil
+  let assert Ok(#(after, view)) = next(a, viewer) as "the viewer sees cat join"
+  assert after.leaves == []
+  assert keys(after.joins) == ["cat"]
+  assert keys(view) == ["bob", "cat"]
 }
 
 /// A watched topic the tracker refuses (empty) fails the start; one the
@@ -441,17 +441,18 @@ pub fn shard_restart_does_not_flap_remote_entries_test_() -> peer.Timeout {
 pub fn invalid_watched_topic_fails_test_() -> peer.Timeout {
   use <- Timeout(60)
   use peers <- peer.with_members(1, "brazier_ws8c_watch_invalid")
-  let assert [a] = peers
+  let assert [a] = peers as "the cluster starts one peer"
   start_tracker(a)
 
   let assert Error(error.RuntimeError(reason)) = try_session(a, [""])
-  let assert True = string.contains(reason, "presence")
+    as "try_session returns Error(RuntimeError)"
+  assert string.contains(reason, "presence")
 
   let viewer = start_session(a, ["lobby"])
   let reason =
     peer.on(a, fn() {
-      // INVARIANT: a started runtime's subject is owned by its actor.
       let assert Ok(runtime) = process.subject_owner(viewer.runtime)
+        as "a started runtime's subject is owned by its actor"
       // Monitor before the message, so the exit cannot come first.
       let monitor = process.monitor(runtime)
       process.send(
@@ -463,10 +464,10 @@ pub fn invalid_watched_topic_fails_test_() -> peer.Timeout {
       |> process.selector_receive(receive_ms)
     })
   let assert Ok(process.Abnormal(reason)) = reason
+    as "the runtime exits abnormally"
   let reason = string.inspect(reason)
-  let assert True = string.contains(reason, "BrazierPresenceFailed") as reason
-  let assert True = string.contains(reason, "subscribing") as reason
-  Nil
+  assert string.contains(reason, "BrazierPresenceFailed") as reason
+  assert string.contains(reason, "subscribing") as reason
 }
 
 // --- FFI ----------------------------------------------------------------------

@@ -432,6 +432,25 @@ with its own changelog, so they are not listed here.
   `cow_ws:frame`), and `gen_tcp:send` writes it without flattening. A
   50 KB `model_sync` costs about 0.3 µs to frame instead of 117 µs, and
   the browser parses each frame once instead of parsing the model again.
+- (Wave 4 test hygiene) Telemetry handlers, sys watches and presence
+  holders in the telemetry, presence and cluster tests are scoped to the
+  test body (`monitored.with_handler`, `await.with_watch_info`,
+  `with_watch_exit`, `with_watch_down`, `holder.with_holder`) and removed
+  even when the body crashes, like ExUnit's `on_exit/1`.
+  `presence/scoped_cleanup_test` shows it for watches and holders.
+- (Wave 4 test hygiene) The multi-node tests wait for messages instead of
+  polling. `peer.until` runs one check on a peer and checks again on each
+  wake-up (`node_changes`, `process_down`, `pg_changes`, `events`,
+  `events_on`, `receives`, `info`, `any`), draining queued wake-ups first.
+  `peer.on_node`, `peer.registered`, `cluster/relay` (telemetry events and
+  PubSub deliveries forwarded from a peer) and `presence/wake` support it.
+  The pubsub, store and presence cluster tests no longer call
+  `peer.eventually`; the store tests wait on the
+  `[brazier, store, sync, stop]` span event.
+- (Wave 4 test hygiene, TS-12) The unused `sleep_ms` helper is gone from
+  `brazier_ws_test_ffi`, the runtime
+  telemetry test asserts the exact exit reason, and every `let assert` in
+  the touched tests carries an `as` message.
 
 ### Fixed
 
@@ -537,6 +556,33 @@ with its own changelog, so they are not listed here.
   (`disconnect_nodes/1` excludes a node instead of disconnecting it), and
   Mnesia likewise ignores connected nodes outside `db_nodes`. A process
   waiting for a node to pass the check keeps waiting through a rejection.
+- (Wave 4) A client hook element that stays in the page but loses its
+  `data-brazier-hook`, or names another hook, now unmounts the old hook
+  (and mounts the new one). Before, the old hook stayed mounted and a hook
+  added back later never mounted again. This is LiveView's
+  `View.performPatch`, which destroys a removed or changed `phx-hook`.
+- (Wave 4) Clicking an in-page fragment link (`#section`, `/this/page#x` or
+  `#`) is left to the browser, which scrolls to the anchor; the client no
+  longer prevents it. Back and forward between fragments of the same page
+  send no `navigate`. A link to another page's fragment keeps the fragment
+  in the pushed URL and sends the server only the path. This is LiveView's
+  `DOM.isNewPageClick` and its popstate rule.
+- (Wave 4) Keyed children (`data-brazier-key`, or `id`) are matched by key
+  at any distance, so a reorder moves elements instead of rebuilding them:
+  every keyed element keeps its identity, focus, selection and mounted hook
+  (morphdom's and idiomorph's id matching). A key rendered with another tag
+  is a new element; before, the old element kept its old tag. A key
+  repeated among siblings is logged as an error, and only the first keeps
+  the element. A focused input that moves keeps its unacknowledged value.
+- (Wave 4) A WebSocket that closes before it opens (how a browser reports a
+  refused upgrade, an unreachable server, or a disallowed origin) still
+  reconnects with the capped backoff, and from the third such close in a
+  row logs an error that names those causes, instead of a warning each
+  time. An opened socket resets the count. A seeded random morph test in
+  the client harness checks that the DOM matches the markup, keyed elements
+  survive, and mounted hooks match hook elements after every render.
+- (Audit TS-12) Every `let assert` in `runtime_versioning_test` has an `as`
+  message.
 - The client bundle cache could serve a stale bundle. It checked an entry
   against the file's size and mtime only, so a same-size rewrite in the
   same second, or a rename of a new file with the same size and mtime over

@@ -93,6 +93,17 @@ let heartbeatTimer = null;
 let lastHeartbeatAt = null;
 const HEARTBEAT_INTERVAL_MS = 30000;
 let reconnectAttempts = 0;
+// Consecutive sockets that closed without ever opening. A browser does not
+// expose the HTTP status of a refused upgrade, so an upgrade the server or
+// its middleware answered with an HTTP response (upgrade result
+// rejected_middleware, rejected_origin, ...) looks like a network failure:
+// close 1006 without onopen. Retrying continues with capped backoff, as
+// Phoenix's socket does; from UNOPENED_CLOSES_BEFORE_ERROR on, each retry
+// is logged as an error naming both causes, so a refused page is not
+// mistaken for a flaky network.
+let unopenedCloses = 0;
+let socketOpened = false;
+const UNOPENED_CLOSES_BEFORE_ERROR = 3;
 // Set on close codes 4400 to 4499: the server refused this page's session,
 // so never reconnect with it (the page reloads or shows an error state).
 let reconnectStopped = false;
@@ -673,8 +684,11 @@ function connect() {
   if (purged > 0) trace("send_queue.purge_request_sync", { purged });
   const socket = new WebSocket(socketUrl());
   ws = socket;
+  socketOpened = false;
   socket.onopen = () => {
     mark("ws-open");
+    socketOpened = true;
+    unopenedCloses = 0;
     startHeartbeat(socket);
     sendJoin(socket);
   };
@@ -715,7 +729,22 @@ function handleClose(socket, e) {
     reloadRefusedPage(e);
     return;
   }
-  console.warn("[brazier] WebSocket closed (code " + e.code + (e.reason ? ", " + e.reason : "") + "); reconnecting with backoff");
+  const closed = "code " + e.code + (e.reason ? ", " + e.reason : "");
+  if (socketOpened) {
+    console.warn("[brazier] WebSocket closed (" + closed + "); reconnecting with backoff");
+  } else {
+    unopenedCloses++;
+    trace("ws.close_unopened", { code: e.code, unopenedCloses });
+    if (unopenedCloses >= UNOPENED_CLOSES_BEFORE_ERROR) {
+      console.error(
+        "[brazier] The WebSocket upgrade failed " + unopenedCloses + " times in a row before opening (" + closed + "): " +
+          "the server is unreachable, or it refused the upgrade (its middleware refusing this page, a disallowed origin or host). " +
+          "Reconnecting with backoff; reload the page to see the server's answer.",
+      );
+    } else {
+      console.warn("[brazier] WebSocket closed before opening (" + closed + "); reconnecting with backoff");
+    }
+  }
   scheduleReconnect();
 }
 
@@ -1162,6 +1191,12 @@ function currentPath() {
   return location.pathname + location.search;
 }
 
+// The path (pathname and query) of the route the server was last told
+// about. A fragment change (an in-page #anchor link, or back and forward
+// between two of them) changes the URL but not this path, and fires
+// popstate; it is the same page, so no navigate is sent for it.
+let routePath = null;
+
 // Why the server's navigation target is not a same-origin path of this
 // page, or null. See localPathRefusal.
 function navigationRefusal(path) {
@@ -1192,6 +1227,7 @@ function handleServerNavigate(path, replace) {
   leaveRoute(path);
   if (replace) history.replaceState(null, "", path);
   else history.pushState(null, "", path);
+  routePath = currentPath();
   send({ type: "navigate", path });
 }
 
@@ -1208,6 +1244,7 @@ function handleServerHardNavigate(path) {
 }
 
 function setupNavigation() {
+  routePath = currentPath();
   // Same-origin links navigate without a page load.
   document.addEventListener("click", (e) => {
     if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
@@ -1226,17 +1263,36 @@ function setupNavigation() {
     if (url.origin !== location.origin) return;
     if (a.hasAttribute("data-brazier-external") || a.hasAttribute("download")) return;
     if (a.target && a.target !== "_self") return;
-    e.preventDefault();
     const path = url.pathname + url.search;
+    // An in-page fragment link (`#section`, `/this/page#section`, or a bare
+    // `#`) stays the browser's: it scrolls and changes the hash, and the
+    // page does not change. This is LiveView's DOM.isNewPageClick (the same
+    // pathname and search with a hash, or an href ending in "#", is not a
+    // new page) and Turbo's same-page anchor rule.
+    if (path === currentPath() && (url.hash !== "" || url.href.endsWith("#"))) {
+      trace("navigate.fragment", { hash: url.hash });
+      return;
+    }
+    e.preventDefault();
     if (path === currentPath()) return;
     leaveRoute(path);
-    history.pushState(null, "", path);
+    // A link to another page's fragment keeps the fragment in the URL; the
+    // server is told only the path, which is what it routes on.
+    history.pushState(null, "", path + url.hash);
+    routePath = path;
     send({ type: "navigate", path });
   });
-  // Back and forward.
+  // Back and forward. Moving between fragments of the same page fires
+  // popstate too, and is not a navigation: LiveView's popstate handler
+  // returns when isNewLocation finds the pathname and search unchanged.
   window.addEventListener("popstate", () => {
     const path = currentPath();
+    if (path === routePath) {
+      trace("navigate.same_route_popstate", { path });
+      return;
+    }
     leaveRoute(path);
+    routePath = path;
     send({ type: "navigate", path });
   });
 }
@@ -1255,13 +1311,21 @@ function morphInnerHTML(container, html) {
 
   autofocusQueue = [];
   hookTouched = [];
+  morphFocused = focused;
   morphChildren(container, parseFragment(html));
+  morphFocused = null;
   syncHooks(container);
   if (devMode) trace("morph", { childCount: container.childNodes.length });
 
   restoreReplacedFocus(container, focused, focusedTag, focusedName, focusedValue, selStart, selEnd, locked);
   focusAutofocused(container);
 }
+
+// The element focused when the current morph began. A keyed move takes the
+// focused element out of the document for a moment, which blurs it, so the
+// morph compares against this, not document.activeElement, to keep a
+// focused input's typed value while it moves.
+let morphFocused = null;
 
 // The fragment parsed from the last rendered HTML. The morph only reads the
 // new tree and clones from it (it never moves or changes a node of it), so a
@@ -1302,46 +1366,164 @@ function focusAutofocused(container) {
 }
 
 function restoreReplacedFocus(container, focused, focusedTag, focusedName, focusedValue, selStart, selEnd, locked) {
+  if (focused && container.contains(focused)) {
+    // Still in the page, but a keyed move (insertBefore) takes the element
+    // out of the document for a moment, and the browser moves focus to the
+    // body. Nothing else took focus meanwhile, so give it back with its
+    // selection.
+    const active = document.activeElement;
+    if (active !== focused && (!active || active === document.body)) {
+      focused.focus();
+      restoreSelection(focused, selStart, selEnd);
+      if (devMode) trace("morph.focus_restored", { node: describeNode(focused) });
+    }
+    return;
+  }
   if (focusedTag !== "INPUT" && focusedTag !== "TEXTAREA" && focusedTag !== "SELECT") return;
-  if (container.contains(focused) || !focusedName) return;
+  if (!focusedName) return;
   // The focused control was replaced: focus its successor by name.
   // SECURITY: CSS.escape keeps the attribute value out of the selector syntax.
   const restored = container.querySelector(`[name="${CSS.escape(focusedName)}"]`);
   if (!restored) return;
   restored.focus();
   if (locked && focusedValue !== undefined && restored.value !== focusedValue) restored.value = focusedValue;
-  if (typeof selStart === "number" && restored.setSelectionRange) {
-    try {
-      restored.setSelectionRange(selStart, selEnd);
-    } catch (e) {
-      console.warn("[brazier] setSelectionRange failed:", e.message);
-    }
+  restoreSelection(restored, selStart, selEnd);
+}
+
+function restoreSelection(node, selStart, selEnd) {
+  if (typeof selStart !== "number" || !node.setSelectionRange) return;
+  try {
+    node.setSelectionRange(selStart, selEnd);
+  } catch (e) {
+    console.warn("[brazier] setSelectionRange failed:", e.message);
   }
 }
 
+// How far past the cursor an unkeyed new child looks for an old element of
+// its tag before it is inserted instead. Keyed children are matched by key
+// at any distance.
+const UNKEYED_LOOKAHEAD = 8;
+
+// Reconcile the children of `op` (the live DOM) with those of `np` (the new
+// markup, never changed).
+//
+// Keyed children (data-brazier-key, or id) are matched by key wherever they
+// are, and moved into place, so a keyed element keeps its identity (focus,
+// typed value, scroll position, mounted hook) across any reorder: morphdom's
+// and idiomorph's id matching, and the keyed children of Lustre's
+// reconciler and of LiveView's streams. An old keyed element is "reserved"
+// when the new markup has its key with the same tag; it is never morphed
+// into another child or removed, only moved. Any other old keyed element
+// (a key the markup no longer has, another tag, a duplicate) is removed.
+// Unkeyed children match by position with a bounded lookahead, as before.
 function morphChildren(op, np) {
+  const newKeys = newChildKeys(np);
+  const reserved = newKeys ? reservedOldChildren(op, newKeys) : null;
+  const isReserved = (node) => {
+    if (!reserved) return false;
+    const key = nodeKey(node);
+    return key !== null && reserved.get(key) === node;
+  };
+  const remove = (node) => {
+    unmountSubtree(node);
+    op.removeChild(node);
+    if (devMode) trace("morph.remove", { key: nodeKey(node) });
+  };
   let oc = op.firstChild, nc = np.firstChild;
   while (nc) {
-    if (!oc) { inserted(op.appendChild(nc.cloneNode(true))); if (devMode) trace("morph.append", { key: nodeKey(nc) }); nc = nc.nextSibling; continue; }
-    if (sameNode(oc, nc)) { morphNode(oc, nc); oc = oc.nextSibling; nc = nc.nextSibling; continue; }
-    const m = findMatch(oc.nextSibling, nc);
-    if (m) {
-      const targetKey = nodeKey(nc);
-      if (targetKey) {
-        op.insertBefore(m, oc);
-        if (devMode) trace("morph.move", { key: targetKey });
+    // An old keyed element at the cursor that nothing reserves goes now, so
+    // it does not use up an unkeyed child's lookahead.
+    while (oc && nodeKey(oc) !== null && !isReserved(oc)) {
+      const nx = oc.nextSibling;
+      remove(oc);
+      oc = nx;
+    }
+    const key = nodeKey(nc);
+    if (key !== null && newKeys.get(key) === nc) {
+      const m = reserved.get(key);
+      if (m) {
+        reserved.delete(key);
+        if (m === oc) oc = oc.nextSibling;
+        else {
+          op.insertBefore(m, oc);
+          if (devMode) trace("morph.move", { key });
+        }
         morphNode(m, nc);
-        nc = nc.nextSibling;
-        continue;
+      } else {
+        inserted(op.insertBefore(nc.cloneNode(true), oc));
+        if (devMode) trace("morph.insert", { key });
       }
-      while (oc && oc !== m) { const nx = oc.nextSibling; unmountSubtree(oc); op.removeChild(oc); if (devMode) trace("morph.remove", { key: nodeKey(oc) }); oc = nx; }
-      if (oc) { morphNode(oc, nc); oc = oc.nextSibling; }
       nc = nc.nextSibling;
       continue;
     }
-    inserted(op.insertBefore(nc.cloneNode(true), oc)); if (devMode) trace("morph.insert", { key: nodeKey(nc) }); nc = nc.nextSibling;
+    // An unkeyed child, or a later duplicate of a key (always a new
+    // element): the first old element of its kind within the lookahead,
+    // passing over reserved elements, which wait for their key.
+    let m = null;
+    if (key === null) {
+      for (let c = oc, k = UNKEYED_LOOKAHEAD; c && k > 0; c = c.nextSibling) {
+        if (isReserved(c)) continue;
+        if (sameNode(c, nc)) { m = c; break; }
+        k--;
+      }
+    }
+    if (m) {
+      // What lies between the cursor and the match is not in the markup,
+      // except reserved elements: they stay until their key moves them.
+      while (oc !== m) {
+        const nx = oc.nextSibling;
+        if (!isReserved(oc)) remove(oc);
+        oc = nx;
+      }
+      morphNode(m, nc);
+      oc = m.nextSibling;
+    } else {
+      inserted(op.insertBefore(nc.cloneNode(true), oc));
+      if (devMode) trace("morph.insert", { key });
+    }
+    nc = nc.nextSibling;
   }
-  while (oc) { const nx = oc.nextSibling; unmountSubtree(oc); op.removeChild(oc); if (devMode) trace("morph.remove", { key: nodeKey(oc) }); oc = nx; }
+  // Every reserved element was moved into place when its key came up.
+  if (reserved && reserved.size !== 0) {
+    throw new Error("[brazier] invariant violated: the morph left " + reserved.size + " keyed element(s) unplaced: " + [...reserved.keys()].join(", "));
+  }
+  while (oc) {
+    const nx = oc.nextSibling;
+    remove(oc);
+    oc = nx;
+  }
+}
+
+// The keys of the new children, each mapped to the first child with that
+// key, or null when no child is keyed. A key repeated among siblings is a
+// bug in the view (only the first match keeps an element's identity): it
+// is logged, and each later child with it is rendered as a new element.
+function newChildKeys(np) {
+  let keys = null;
+  for (let c = np.firstChild; c; c = c.nextSibling) {
+    const key = nodeKey(c);
+    if (key === null) continue;
+    if (keys === null) keys = new Map();
+    if (keys.has(key)) {
+      console.error("[brazier] Duplicate key " + JSON.stringify(key) + " among siblings (" + describeNode(c) + "); only the first keeps its element across renders");
+      continue;
+    }
+    keys.set(key, c);
+  }
+  return keys;
+}
+
+// The old children that the new markup keeps, by key: the first old child
+// with each key of `newKeys` and the same tag as that new child.
+function reservedOldChildren(op, newKeys) {
+  const reserved = new Map();
+  for (let c = op.firstChild; c; c = c.nextSibling) {
+    const key = nodeKey(c);
+    if (key === null || reserved.has(key)) continue;
+    const target = newKeys.get(key);
+    if (target && target.tagName === c.tagName) reserved.set(key, c);
+  }
+  return reserved;
 }
 
 // A subtree the morph inserted: its autofocus and hook elements are new.
@@ -1353,6 +1535,15 @@ function inserted(node) {
 function morphNode(o, n) {
   if (o.nodeType === 3) { if (o.textContent !== n.textContent) o.textContent = n.textContent; return; }
   if (o.nodeType !== 1) return;
+  // A hook element that stays but loses its hook, or names another one,
+  // unmounts the old hook now; a new name mounts when hooks sync. This is
+  // LiveView's View.performPatch (beforeUpdated: a removed or changed
+  // phx-hook destroys the hook, and a changed one is added after the patch).
+  const mounted = mountedHooks.get(o);
+  if (mounted && mounted.hookName !== n.getAttribute("data-brazier-hook")) {
+    if (devMode) trace("morph.hook_removed", { node: describeNode(o), hook: mounted.hookName });
+    unmountHookNode(o);
+  }
   if (morphAttributes(o, n) && o.hasAttribute("data-brazier-hook")) hookTouched.push({ node: o, subtree: false });
   if (o.hasAttribute("data-brazier-preserve-children")) {
     // Other code owns these children, and may have added hook elements.
@@ -1360,7 +1551,7 @@ function morphNode(o, n) {
     return;
   }
   const isFormControl = o.tagName === "INPUT" || o.tagName === "TEXTAREA" || o.tagName === "SELECT";
-  if (isFormControl && o === document.activeElement) {
+  if (isFormControl && o === morphFocused) {
     // The user is typing here: keep their value while it is not yet
     // reflected by the server (LiveView's rule for focused inputs).
     if (inputLocked()) {
@@ -1452,17 +1643,6 @@ function sameNode(a, b) {
   return true;
 }
 
-function findMatch(s, t) {
-  const targetKey = nodeKey(t);
-  let c = s, k = 8;
-  while (c && k > 0) {
-    if (targetKey ? nodeKey(c) === targetKey : sameNode(c, t)) return c;
-    c = c.nextSibling;
-    k--;
-  }
-  return null;
-}
-
 // === Hooks ===
 
 // What the current morph touched that can hold a hook element, in document
@@ -1516,13 +1696,20 @@ function syncHooks(root) {
 
 function syncHook(node) {
   const hookName = node.getAttribute("data-brazier-hook");
+  let existing = mountedHooks.get(node);
+  if (existing && existing.hookName !== hookName) {
+    // The morph unmounts a hook whose name it changes, so only other code
+    // renaming the attribute between renders gets here: a full scan (after
+    // a registration) then finds the element under its new name.
+    unmountHookNode(node);
+    existing = undefined;
+  }
   const hook = hookRegistry.get(hookName);
   if (!hook) {
     trace("hook.unregistered", { hook: hookName });
     return;
   }
   const attrs = serializeHookAttrs(node);
-  const existing = mountedHooks.get(node);
   if (!existing) {
     const state = hook.mount ? hook.mount(node) : undefined;
     mountedHooks.set(node, { hookName, hook, attrs, state });

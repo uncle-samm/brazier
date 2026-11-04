@@ -15,7 +15,6 @@ import gleam/dynamic
 import gleam/dynamic/decode
 import gleam/erlang/atom
 import gleam/erlang/process.{type Subject}
-import gleam/int
 import gleam/list
 import gleam/result
 
@@ -27,13 +26,10 @@ const run_events = [
 
 const rejected_event = ["brazier", "effect", "timer", "rejected"]
 
-fn listen(names: List(List(String))) -> #(String, Subject(Event)) {
-  let assert Ok(Nil) = telemetry.start()
-  let id = "effect_telemetry_" <> int.to_string(unique_integer())
-  let events = process.new_subject()
-  let assert Ok(Nil) =
-    telemetry.attach(id, names, fn(event) { process.send(events, event) })
-  #(id, events)
+/// Run `run` with every event in `names` forwarded to it; the handler is
+/// detached afterwards even if `run` crashes.
+fn listen(names: List(List(String)), run: fn(Subject(Event)) -> a) -> a {
+  monitored.listening(names, run)
 }
 
 /// The first event matching `matches`; events from other live listeners
@@ -59,24 +55,25 @@ fn perform(eff: effect.Effect(a), dispatch: fn(a) -> Nil) -> List(process.Pid) {
 }
 
 pub fn sync_effect_runs_inside_a_span_test() {
-  let #(id, events) = listen(run_events)
+  use events <- listen(run_events)
   let dispatched = process.new_subject()
   let assert [] =
     perform(effect.from(fn(dispatch) { dispatch(7) }), process.send(
       dispatched,
       _,
     ))
+    as "perform returns []"
   let assert Ok(7) = process.receive(dispatched, 0)
     as "a sync effect dispatches before perform returns"
   let _start = expect(events, run_event("start", "sync"))
   let stop = expect(events, run_event("stop", "sync"))
   let assert Ok(duration) = telemetry.int(stop, "duration")
-  let assert True = duration >= 0
-  let assert Ok(Nil) = telemetry.detach(id)
+    as "telemetry.int succeeds"
+  assert duration >= 0
 }
 
 pub fn keyed_effect_reports_keyed_kind_test() {
-  let #(id, events) = listen(run_events)
+  use events <- listen(run_events)
   let keyed = process.new_subject()
   effect.perform(
     effect.keyed("load", effect.from(fn(dispatch) { dispatch(1) })),
@@ -84,13 +81,13 @@ pub fn keyed_effect_reports_keyed_kind_test() {
     fn(key, _generation, value) { process.send(keyed, #(key, value)) },
   )
   let assert Ok(#("load", 1)) = process.receive(keyed, 0)
+    as "process.receive succeeds"
   let _start = expect(events, run_event("start", "keyed"))
   let _stop = expect(events, run_event("stop", "keyed"))
-  let assert Ok(Nil) = telemetry.detach(id)
 }
 
 pub fn background_effect_is_measured_in_its_own_process_test() {
-  let #(id, events) = listen(run_events)
+  use events <- listen(run_events)
   let ready = process.new_subject()
   let dispatched = process.new_subject()
   let assert [pid] =
@@ -113,24 +110,25 @@ pub fn background_effect_is_measured_in_its_own_process_test() {
   process.send(release, Nil)
   let _stop = expect(events, run_event("stop", "background"))
   let assert Ok(3) = process.receive(dispatched, 2000)
-  let assert True = pid != process.self()
-  let assert Ok(Nil) = telemetry.detach(id)
+    as "process.receive succeeds"
+  assert pid != process.self()
 }
 
 pub fn crashing_sync_effect_emits_exception_and_reraises_test() {
-  let #(id, events) = listen(run_events)
+  use events <- listen(run_events)
   let assert Error(#("error", _reason)) =
     rescue(fn() {
       perform(effect.from(fn(_dispatch) { crash() }), fn(_) { Nil })
     })
+    as "rescue returns Error(#('error', _reason))"
   let exception = expect(events, run_event("exception", "sync"))
   // The exception class is in `kind`; the effect label survives beside it.
   let assert Ok("error") = telemetry.string(exception, "kind")
-  let assert Ok(Nil) = telemetry.detach(id)
+    as "telemetry.string succeeds"
 }
 
 pub fn crashing_background_effect_emits_exception_test() {
-  let #(id, events) = listen(run_events)
+  use events <- listen(run_events)
   let ready = process.new_subject()
   // The worker crashes only once the test has monitored it: a monitor taken
   // after the crash would see `noproc` and say nothing about the crash.
@@ -154,15 +152,15 @@ pub fn crashing_background_effect_emits_exception_test() {
   // Stacktrace}`.
   let assert process.Abnormal(reason) =
     monitored.down_reason(monitor, "the crashing background effect")
+    as "monitored.down_reason returns process.Abnormal(reason)"
   let assert Ok("brazier_test_handler_crash") =
     decode.run(reason, decode.at([0], atom.decoder()))
     |> result.map(atom.to_string)
     as "the worker exits with the crash's own reason"
-  let assert Ok(Nil) = telemetry.detach(id)
 }
 
 pub fn timer_cap_emits_rejected_with_limit_test() {
-  let #(id, events) = listen([rejected_event])
+  use events <- listen([rejected_event])
   // The timer registry lives in this process; fill all ten slots with
   // timers that never tick during the test.
   let fillers =
@@ -170,47 +168,50 @@ pub fn timer_cap_emits_rejected_with_limit_test() {
     |> list.flat_map(fn(_) {
       perform(effect.every(60_000, fn() { 0 }), fn(_) { Nil })
     })
-  let assert 10 = list.length(fillers)
+  let assert 10 = list.length(fillers) as "list.length returns 10"
   let assert [] = perform(effect.every(60_000, fn() { 0 }), fn(_) { Nil })
     as "the eleventh timer must be rejected"
   let rejected =
     expect(events, fn(event: Event) { event.name == rejected_event })
   let assert Ok(10) = telemetry.int(rejected, "limit")
+    as "telemetry.int succeeds"
   stop_all(fillers)
-  let assert Ok(Nil) = telemetry.detach(id)
 }
 
 pub fn after_cap_emits_rejected_with_limit_test() {
   let event_name = ["brazier", "effect", "after", "rejected"]
-  let #(id, events) = listen([event_name])
+  use events <- listen([event_name])
   let fired = process.new_subject()
   // Fill every slot with timers that do not fire during the test.
   list.each(list.repeat(Nil, effect.max_after_timers), fn(_) {
     let assert [] =
       perform(effect.after(60_000, fn() { 0 }), process.send(fired, _))
+      as "perform returns []"
   })
   let assert 100 = effect.pending_after_timers()
+    as "effect.pending_after_timers returns 100"
   let #(rejected_pids, logs) =
     log_capture.capture(fn() {
       perform(effect.after(0, fn() { 1 }), process.send(fired, _))
     })
-  let assert [] = rejected_pids
-  let assert True =
-    log_capture.has(logs, level: "warning", containing: [
-      "After-timer limit reached", "100/100",
-    ])
+  let assert [] = rejected_pids as "rejected_pids is []"
+  assert log_capture.has(logs, level: "warning", containing: [
+    "After-timer limit reached", "100/100",
+  ])
   let assert 100 = effect.pending_after_timers()
     as "the rejected timer must not be armed"
   let rejected = expect(events, fn(event: Event) { event.name == event_name })
   let assert Ok(100) = telemetry.int(rejected, "limit")
+    as "telemetry.int succeeds"
   let assert #(0, 100) = effect.stop_owned()
+    as "effect.stop_owned returns #(0, 100)"
   let assert Error(Nil) = process.receive(fired, 0)
-  let assert Ok(Nil) = telemetry.detach(id)
+    as "process.receive returns Error(Nil)"
 }
 
 pub fn background_cap_emits_rejected_with_limit_test() {
   let event_name = ["brazier", "effect", "background", "rejected"]
-  let #(id, events) = listen([event_name])
+  use events <- listen([event_name])
   let ran = process.new_subject()
   let workers =
     list.repeat(Nil, effect.max_background_processes)
@@ -220,7 +221,7 @@ pub fn background_cap_emits_rejected_with_limit_test() {
         fn(_) { Nil },
       )
     })
-  let assert 32 = list.length(workers)
+  let assert 32 = list.length(workers) as "list.length returns 32"
   let #(rejected_pids, logs) =
     log_capture.capture(fn() {
       perform(
@@ -229,22 +230,23 @@ pub fn background_cap_emits_rejected_with_limit_test() {
       )
     })
   let assert [] = rejected_pids as "the 33rd worker must not start"
-  let assert True =
-    log_capture.has(logs, level: "warning", containing: [
-      "Background effect limit reached", "32/32",
-    ])
+  assert log_capture.has(logs, level: "warning", containing: [
+    "Background effect limit reached", "32/32",
+  ])
   let rejected = expect(events, fn(event: Event) { event.name == event_name })
   let assert Ok(32) = telemetry.int(rejected, "limit")
+    as "telemetry.int succeeds"
   // A finished worker frees its slot: stop one and the next one starts.
   stop_all([first_worker(workers)])
   let assert [_worker] =
     perform(effect.background(fn(_dispatch) { process.send(ran, Nil) }), fn(_) {
       Nil
     })
+    as "perform returns [_worker]"
   let assert Ok(Nil) = process.receive(ran, 2000)
     as "a worker under the cap must run"
   let assert #(_, 0) = effect.stop_owned()
-  let assert Ok(Nil) = telemetry.detach(id)
+    as "effect.stop_owned returns #(_, 0)"
 }
 
 fn first_worker(workers: List(process.Pid)) -> process.Pid {
@@ -259,7 +261,9 @@ pub fn effect_without_handler_runs_normally_test() {
       dispatched,
       _,
     ))
+    as "perform returns []"
   let assert Ok(5) = process.receive(dispatched, 0)
+    as "process.receive succeeds"
 }
 
 /// Kill every pid and wait for each to exit, so the timer registry of this
@@ -276,9 +280,6 @@ fn stop_all(pids: List(process.Pid)) -> Nil {
     Nil
   })
 }
-
-@external(erlang, "erlang", "unique_integer")
-fn unique_integer() -> Int
 
 @external(erlang, "brazier_telemetry_test_ffi", "rescue")
 fn rescue(run: fn() -> a) -> Result(a, #(String, dynamic.Dynamic))

@@ -180,7 +180,10 @@ a `model_sync`, not JSON text), `init_local`, `render`, `lookup_handler`,
   table from `internal/render.gleam`, the same target-neutral module SSR
   uses. Handlers are keyed by event name and position id (`"0.1"`); keyed
   nodes are transparent, so server and browser agree on ids. The DOM
-  is morphed toward the new HTML; `data-brazier-key` gives a node identity.
+  is morphed toward the new HTML; `data-brazier-key` (or `id`) gives a node
+  identity: keyed children are matched by key at any distance and moved,
+  unkeyed ones by position with a lookahead of 8. A hook element that loses
+  or renames its `data-brazier-hook` unmounts the old hook.
 - **Events.** One capture listener per event name matches elements carrying
   `data-brazier-on-<name>`. Handler options apply prevent-default,
   stop-propagation, debounce and throttle. The decoder runs against the real

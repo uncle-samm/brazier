@@ -273,6 +273,13 @@ follows.
   crashes) or that accepts and drops sockets is therefore tried at most once
   every 31 seconds per tab. 1001 is a server that is shutting down: the
   reconnect reaches the next instance, or this one once it is back.
+- **A socket that closes before it opens** (1006 without `onopen`) is
+  retried the same way. A browser reports every failed upgrade like this,
+  whatever the server answered: an unreachable server, an origin or host
+  the server does not allow, or middleware refusing the page
+  (`rejected_middleware`). The first two such closes in a row are warnings;
+  from the third the client logs an error that names these causes. A socket
+  that opens resets the count.
 - A `reload` message (dev mode) reloads the page at once, without the guard:
   the server sends it once per rebuild, never in answer to a join.
 - **Outbound pacing**: every message except `heartbeat` passes through one

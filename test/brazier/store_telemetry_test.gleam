@@ -1,6 +1,7 @@
 /// `[brazier, store, write]` from node-local stores. Writes emit in the
 /// writing process, so each test forwards only its own events and drains
 /// its mailbox without waiting.
+import brazier/monitored
 import brazier/pubsub
 import brazier/store
 import brazier/telemetry.{type Event}
@@ -10,21 +11,21 @@ import gleam/list
 
 const write_event = ["brazier", "store", "write"]
 
-fn listen() -> #(String, Subject(Event)) {
+/// Run `run` with this process's own write events forwarded to it; the
+/// handler is detached afterwards even if `run` crashes.
+fn listen(run: fn(Subject(Event)) -> a) -> a {
   // Store writes notify watchers through pubsub, which must be running.
   pubsub.start()
-  let assert Ok(Nil) = telemetry.start()
   let id = "store_telemetry_" <> int.to_string(unique_integer())
   let events = process.new_subject()
   let owner = process.self()
-  let assert Ok(Nil) =
-    telemetry.attach(id, [write_event], fn(event) {
-      case process.self() == owner {
-        True -> process.send(events, event)
-        False -> Nil
-      }
-    })
-  #(id, events)
+  use <- monitored.with_handler(id, [write_event], fn(event) {
+    case process.self() == owner {
+      True -> process.send(events, event)
+      False -> Nil
+    }
+  })
+  run(events)
 }
 
 /// `#(store, op, mode, count)` for every write event so far, oldest first.
@@ -40,28 +41,32 @@ fn drain_loop(
     Error(Nil) -> list.reverse(acc)
     Ok(event) -> {
       let assert Ok(name) = telemetry.string(event, "store")
+        as "telemetry.string succeeds"
       let assert Ok(op) = telemetry.string(event, "op")
+        as "telemetry.string succeeds"
       let assert Ok(mode) = telemetry.string(event, "mode")
+        as "telemetry.string succeeds"
       let assert Ok(count) = telemetry.int(event, "count")
+        as "telemetry.int succeeds"
       drain_loop(events, [#(name, op, mode, count), ..acc])
     }
   }
 }
 
 pub fn local_key_value_writes_emit_store_write_test() {
-  let #(id, events) = listen()
+  use events <- listen()
   let name = "telemetry_kv_" <> int.to_string(unique_integer())
   let kv = store.new(name)
   store.put(kv, "a", 1)
   store.delete(kv, "a")
   let assert [#(n1, "put", "local", 1), #(n2, "delete", "local", 1)] =
     drain(events)
-  let assert True = n1 == name && n2 == name
-  let assert Ok(Nil) = telemetry.detach(id)
+    as "drain returns [#(..)"
+  assert n1 == name && n2 == name
 }
 
 pub fn local_list_writes_report_how_many_values_test() {
-  let #(id, events) = listen()
+  use events <- listen()
   let name = "telemetry_list_" <> int.to_string(unique_integer())
   let messages = store.new_list(name)
   store.append(messages, "room", "hi")
@@ -72,7 +77,7 @@ pub fn local_list_writes_report_how_many_values_test() {
     #(_, "append", "local", 3),
     #(_, "delete_all", "local", 1),
   ] = drain(events)
-  let assert Ok(Nil) = telemetry.detach(id)
+    as "the list store reports append, append_many and delete_all in order"
 }
 
 @external(erlang, "erlang", "unique_integer")

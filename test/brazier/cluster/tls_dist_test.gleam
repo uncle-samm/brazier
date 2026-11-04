@@ -32,10 +32,9 @@ pub fn tls_nodes_connect_test_() -> peer.Timeout {
       })
     assert outcome == Ok(Nil)
   })
-  assert peer.eventually(
-    fn() { peer.on(a, cluster.members) == Ok([peer.node(b)]) },
-    wait_ms,
-  )
+  // The manager stores a member before it tells waiters it is verified.
+  assert peer.await_member(a, peer.node(b), wait_ms) == Ok(Nil)
+  assert peer.on(a, cluster.members) == Ok([peer.node(b)])
 }
 
 /// A TLS node without a certificate, and a plain TCP node, cannot join a
