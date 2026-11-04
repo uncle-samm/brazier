@@ -266,6 +266,7 @@
   - Old names left on purpose: the published dev secret `beacon-dev-secret-change-in-production` (refused as a weak key in its real spelling), `gleam.toml` `repo = "beacon"` (the GitHub repository is not renamed), the CHANGELOG history and README rename note, the archived and design docs, and this file's earlier entries.
   - Follow-ups: an example's client build resolves dependencies from Hex every time, since no manifest is kept for the client project, so parallel builds can hit Hex's rate limit; a lint rule against stale `beacon` names in `src`, `test` and `examples`, with an allowlist for the refusals and the dev secret.
 - [ ] Final read-only audits (security, stability, tigerstyle, performance) and fixes
+  - Audits started 2026-11-04 at f393ef2: four read-only agents (security, stability with the open runtime-stop flake, TigerStyle/engineering rules, performance), each in its own scratch worktree. Findings are then split into fix agents by file ownership.
 - [ ] Final verification: build (zero warnings), tests, all examples, CDP browser suite, perf baselines
 
 **Decisions (Milestone 117, coordinator):**
