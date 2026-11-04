@@ -207,8 +207,8 @@ The simulation tests (`test/brazier/sim_test.gleam`, with the harness in
   unknown handlers; the server must survive and leak no process.
 - **Flooding**: 500 events on one connection, past the per-connection rate
   limit.
-- **Leaks**: 100 connect/disconnect cycles, measuring memory and process
-  counts before and after.
+- **Leaks**: rounds of 100 connect/disconnect cycles that must keep no
+  process, ETS table, ETS object or atom.
 
 ### 8. Zero Tolerance for Leaks
 
@@ -228,13 +228,12 @@ let assert True = processes_leaked < 10
 let assert True = processes_leaked == 0
 ```
 
-Not every simulation test meets this rule yet: some still allow a margin of
-leaked processes or failed connections. Each margin is a bug to remove, not
-a tolerance to copy.
+Every simulation test meets this rule: each one asserts no failed
+connection and exactly 0 kept processes.
 
 ## How We Enforce This
 
-1. **Custom linter** (`gleam run -m brazier/lint`, `src/brazier/lint.gleam`) — parses the source and reports `todo`, `panic`, catch-all branches that do not log, `let _ =` discards, degraded-path phrases, and public functions in key modules that never log
+1. **Custom linter** (`gleam run -m brazier/lint`, `src/brazier/lint.gleam`) — parses the source and reports `todo`, `panic`, `let _ =` discards, degraded-path phrases, public functions in key modules that never log, and the pre-rename project name; the rules are listed at the top of `lint.gleam`
 2. **Simulation tests** (`test/brazier/sim/`) — real connections, fault injection, leak detection
 3. **Code review** — every `Error(_) -> Nil` is a red flag
 4. **CI** — `gleam build` (zero warnings) + `gleam test` (all pass) + linter (zero violations)

@@ -151,6 +151,61 @@ pub fn describe_and_truncate_test() {
   let assert "short" = url.truncate_for_log("short")
 }
 
+// --- Combining marks after the scheme separator (SEC-1) ---
+//
+// Each of these code points forms one grapheme with a `:` before it. A
+// grapheme-based scan never saw the `:` and read the value as relative,
+// while the browser reads the scheme one code point at a time.
+
+const combining_after_colon = [
+  "\u{0E33}", "\u{0EB3}", "\u{1885}", "\u{1886}", "\u{FF9E}", "\u{FF9F}",
+]
+
+pub fn combining_mark_after_colon_does_not_hide_javascript_test() {
+  let assert True =
+    list.all(combining_after_colon, fn(mark) {
+      url.check("href", "javascript:" <> mark <> "=1;alert(document.domain)")
+      == Error(url.DisallowedScheme("javascript"))
+    })
+}
+
+pub fn combining_mark_after_colon_does_not_hide_other_schemes_test() {
+  let assert Error(url.DisallowedData("href")) =
+    url.check("href", "data:\u{0E33}text/html,x")
+  let assert Error(url.DisallowedData("src")) =
+    url.check("src", "data:\u{0E33}text/html,x")
+  let assert Error(url.DisallowedScheme("ms-msdt")) =
+    url.check("href", "ms-msdt:\u{0E33}/id")
+  let assert Error(url.DisallowedScheme("vbscript")) =
+    url.check("action", " VBScript:\u{FF9E}msgbox(1)")
+}
+
+pub fn combining_mark_before_data_media_type_is_refused_test() {
+  // The media type is read by code point too: a mark in front of
+  // `image/png` makes it a different media type.
+  let assert True = blocked("src", "data:\u{0E33}image/png;base64,AAAA")
+  let assert True = blocked("src", "data:image/png\u{0301};base64,AAAA")
+}
+
+pub fn non_ascii_in_scheme_position_is_relative_test() {
+  // The URL parser accepts only ASCII in a scheme, so anything else makes
+  // the value relative: the browser resolves it as a path, not a scheme.
+  let assert True = kept("href", "j\u{0301}avascript:alert(1)")
+  let assert True = kept("href", "\u{00A0}javascript:alert(1)")
+  let assert True = kept("href", "1http:x")
+  let assert True = kept("href", "java script:alert(1)")
+}
+
+pub fn scheme_characters_per_whatwg_test() {
+  // `+`, `-` and `.` are scheme characters, so these are schemes.
+  let assert Error(url.DisallowedScheme("view-source")) =
+    url.check("href", "view-source:https://example.com")
+  let assert Error(url.DisallowedScheme("a+b.c")) = url.check("href", "A+B.C:x")
+  // Non-ASCII letters are not lowercased into ASCII ones: the Kelvin sign
+  // is not `k`.
+  let assert True = kept("href", "\u{212A}:x")
+}
+
 fn string_repeat(s: String, times: Int) -> String {
   list.repeat(s, times) |> list.fold("", fn(acc, x) { acc <> x })
 }

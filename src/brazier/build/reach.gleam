@@ -1087,9 +1087,16 @@ fn slice(bytes: BitArray, span: glance.Span) -> Result(String, String) {
   )
 }
 
-/// A JavaScript external path, relative to the module's file, as a path
-/// relative to the source directory.
-fn resolve_ffi_path(module: String, path: String) -> Result(String, String) {
+/// A JavaScript external path, relative to the file of the module at
+/// module path `module`, as a path relative to the source directory. A path
+/// that is not relative, or that leaves the source directory, is an error.
+///
+/// The client bundle uses it for user modules and for the Brazier modules it
+/// copies.
+pub fn resolve_ffi_path(
+  module: String,
+  path: String,
+) -> Result(String, String) {
   let invalid = fn(reason) {
     Error(
       "The JavaScript external "

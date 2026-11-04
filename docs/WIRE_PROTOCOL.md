@@ -210,7 +210,10 @@ Each `event` has a monotonic `clock`. The server keeps the highest clock it has
 processed per connection and echoes it back as `ack_clock` on `model_sync` and
 `patch`, so the client knows which of its optimistic events the server state
 already includes. A frame whose `ack_clock` is behind the client's pending
-model event is held until the server catches up.
+model event is held until the server catches up. `clock` and `ack_clock` are
+required non-negative integers. A `model_sync` or `patch` without a valid
+`ack_clock` is a protocol error, logged in the browser, and the client asks
+for a full sync. It never defaults the value to 0.
 
 ## Client Connection Behaviour
 

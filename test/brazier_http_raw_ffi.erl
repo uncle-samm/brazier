@@ -3,7 +3,7 @@
 %% bytes and parses responses itself so tests can observe framing,
 %% pipelining and connection closure precisely.
 -export([connect/1, send/2, recv_response/3, recv_raw/3, wait_closed/2, close/1,
-         kill/1, acceptor_pids/1, acceptor_pool/2, sleep_then_send/3, crash/0]).
+         kill/1, acceptor_pids/1, acceptor_pool/2, drip_until_answer/4, crash/0]).
 
 -define(BUF(S), {brazier_http_raw_buffer, S}).
 
@@ -19,10 +19,30 @@ send(Socket, Data) ->
         {error, Reason} -> {error, reason(Reason)}
     end.
 
-%% Send Data after DelayMs (used to drip bytes slowly).
-sleep_then_send(Socket, DelayMs, Data) ->
-    timer:sleep(DelayMs),
-    send(Socket, Data).
+%% Drip Data to a server that is reading a request: wait up to IntervalMs
+%% for the server to send something; while it sends nothing, send Data and
+%% wait again, at most MaxDrips times. The wait is a gen_tcp:recv with a
+%% timeout, not a sleep: it ends the moment the server answers (or closes).
+%% {ok, Drips} once the server sent bytes (kept for recv_response), where
+%% Drips is how many times Data was sent; {error, Bin} otherwise.
+drip_until_answer(Socket, IntervalMs, MaxDrips, Data) ->
+    drip_until_answer(Socket, IntervalMs, MaxDrips, Data, 0).
+
+drip_until_answer(Socket, IntervalMs, MaxDrips, Data, Drips) ->
+    case gen_tcp:recv(Socket, 0, IntervalMs) of
+        {ok, Answer} ->
+            put(?BUF(Socket), <<(take(Socket))/binary, Answer/binary>>),
+            {ok, Drips};
+        {error, timeout} when Drips < MaxDrips ->
+            case send(Socket, Data) of
+                {ok, nil} -> drip_until_answer(Socket, IntervalMs, MaxDrips, Data, Drips + 1);
+                {error, _} = E -> E
+            end;
+        {error, timeout} ->
+            {error, iolist_to_binary(io_lib:format("no answer after ~p drips", [Drips]))};
+        {error, Reason} ->
+            {error, reason(Reason)}
+    end.
 
 close(Socket) ->
     ok = gen_tcp:close(Socket),

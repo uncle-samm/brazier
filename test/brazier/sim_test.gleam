@@ -17,6 +17,7 @@ import brazier/sim/scenario
 import brazier/sim/teardown
 import brazier/sim/test_app
 import brazier/transport
+import gleam/int
 import gleam/string
 
 /// One pool run against `app`, with leak snapshots taken after the server
@@ -159,14 +160,103 @@ pub fn sim_100_connections_counter_test() {
 
 // ===== Leak Detection =====
 
+/// 100 connect/disconnect cycles leave nothing behind: no process
+/// (`assert_all_clean`), no ETS table or object, and no atom.
+///
+/// The first round pays the one-time costs of serving connections (atoms
+/// and tables made on first use), so the second round is the one measured,
+/// and it must keep exactly nothing. Memory in bytes is logged but not
+/// asserted: a heap's size depends on the process's GC history and an ETS
+/// table's on its peak load, not only on what they hold, so an exact or
+/// tight bound on bytes would be a flaky test, and a loose one would catch
+/// nothing.
 pub fn sim_memory_leak_test() {
   let assert Ok(app) = test_app.start_counter_app()
-  let run =
-    run_measured(app, "memory_leak", 100, scenario.connect_disconnect(), 5)
-  assert_all_clean(run)
-  let assert 100 = run.result.upgraded
+  let first =
+    run_measured(
+      app,
+      "memory_leak_first",
+      100,
+      scenario.connect_disconnect(),
+      5,
+    )
+  assert_all_clean(first)
+  let before = kept_state()
+  let second =
+    run_measured(
+      app,
+      "memory_leak_second",
+      100,
+      scenario.connect_disconnect(),
+      5,
+    )
+  let change = describe_change(before, kept_state())
+  assert_all_clean(second)
+  let assert 100 = second.result.upgraded
+  log.info(
+    "brazier.sim_test",
+    "memory_leak: second round of 100 changed VM memory by "
+      <> int.to_string(second.report.memory_delta_kb)
+      <> " KiB; ETS and atoms: "
+      <> case change {
+      "" -> "unchanged"
+      _ -> change
+    },
+  )
+  assert change == "" as "a round of connections left ETS state or atoms"
   stop(app)
 }
+
+/// The leak test's check sees each kind of kept state it claims to.
+pub fn kept_state_sees_a_new_table_object_and_atom_test() {
+  let start = kept_state()
+  let name = binary_to_atom("brazier_sim_kept_state_" <> unique_suffix())
+  let with_atom = kept_state()
+  assert_contains(describe_change(start, with_atom), "atom count changed by 1")
+
+  let table = ets_new(name, [])
+  let with_table = kept_state()
+  assert_contains(describe_change(with_atom, with_table), "new table")
+
+  let assert True = ets_insert(table, #(1))
+  assert_contains(describe_change(with_table, kept_state()), "0 -> 1 objects")
+
+  let assert True = ets_delete(table)
+  assert_contains(describe_change(with_table, kept_state()), "deleted")
+}
+
+@external(erlang, "erlang", "binary_to_atom")
+fn binary_to_atom(name: String) -> EtsName
+
+@external(erlang, "ets", "new")
+fn ets_new(name: EtsName, options: List(Nil)) -> EtsTable
+
+@external(erlang, "ets", "insert")
+fn ets_insert(table: EtsTable, object: #(Int)) -> Bool
+
+@external(erlang, "ets", "delete")
+fn ets_delete(table: EtsTable) -> Bool
+
+fn unique_suffix() -> String {
+  int.to_string(unique_integer())
+}
+
+@external(erlang, "erlang", "unique_integer")
+fn unique_integer() -> Int
+
+type EtsName
+
+type EtsTable
+
+/// Every ETS table (id, name, objects, words) and the atom count.
+type KeptState
+
+@external(erlang, "brazier_sim_memory_ffi", "kept_state")
+fn kept_state() -> KeptState
+
+/// What changed between two `kept_state` readings, or "" if nothing did.
+@external(erlang, "brazier_sim_memory_ffi", "describe_change")
+fn describe_change(before: KeptState, after: KeptState) -> String
 
 // ===== Resilience Tests =====
 

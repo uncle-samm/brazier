@@ -25,15 +25,21 @@ running it, so a missing node is a test failure, never a skip. Several
 tests depend on it:
 
 - `patch_test`: runs the client's patch application on server-made vectors
-  (`brazier_client/test/patch_vectors.mjs`) and its patch safety checks
-  (`patch_safety.mjs`).
+  (`brazier_client/test/patch_vectors.mjs`), its patch safety checks
+  (`patch_safety.mjs`, which also prints the client's unsafe-key list for
+  comparison with the server's) and the comparison of its apply engine with
+  the per-op copying engine it replaced (`apply_equivalence.mjs`).
+- `router_test`: runs the client's navigation-path rule on the server's
+  cases (`local_path_parity.mjs`) and holds every verdict equal to
+  `router.check_local_path`'s.
 - `runtime_versioning_test`: runs the client sync state machine
   (`sync_vectors.mjs`) and its FFI harness (`ffi_harness.mjs`).
 - `build_fixture_test`: also needs **npx**, which runs the pinned esbuild
   (`esbuild@0.25.12` in `src/brazier/build/program.gleam`) exactly as
   `brazier/build` does. The first run downloads it into the npx cache.
 
-`make test-client` runs `ffi_harness.mjs` and `patch_safety.mjs` directly.
+`make test-client` runs `ffi_harness.mjs`, `patch_safety.mjs` and
+`apply_equivalence.mjs` directly.
 These are the client checks that need no Gleam-generated input. It is the
 quick loop when you are changing `brazier_client/src`, and it fails
 immediately, by name, when node is missing.
@@ -85,6 +91,22 @@ busy loops never trip it.
 A bounded wait for *nothing* to arrive is still a time window. Use one
 only after a barrier proves that the work which could produce the
 message is done.
+
+### Instead of a sleep
+
+When the thing under test depends on time, or on a process being slow,
+make that state happen rather than waiting for it:
+
+| Situation | Do this | Example |
+|-----------|---------|---------|
+| Code compares against the clock (windows, TTLs, staleness) | Take the time as an `@internal` argument and pass a later one. | `rate_limit.sweep_with(limiter, now + 2, _)`; `static.file_digest_at(path, now, _)` |
+| A call must time out | `sys:suspend` the server, make the call with a short timeout, then `sys:resume` it. | `sweep_of_a_suspended_owner_is_a_timeout_test` |
+| Something must happen after a message has arrived | `erlang:trace(Pid, true, ['receive'])` and wait for the trace message. | `sweep_of_an_owner_that_dies_mid_call_is_a_call_failure_test` kills the owner once the call is in its mailbox |
+| A client must be slow (slowloris) | Send a byte each time `gen_tcp:recv` times out, until the server answers. | `slow_headers_get_408_test` (`drip_until_answer`) |
+| A process must have handled earlier messages | `await.barrier`. | see the table above |
+
+The fixtures for these are in `test/brazier_rate_limit_test_ffi.erl` and
+`test/brazier_http_raw_ffi.erl`.
 
 Example: a runtime test, connected through a fake transport subject:
 
@@ -178,8 +200,13 @@ Leak snapshots taken after it measure cleanup that has finished, not
 cleanup that a sleep hoped had finished. See `run_measured` in
 `test/brazier/sim_test.gleam`.
 
-The 1000-connection test requires all 1000 connections to succeed and all
-5000 events to be acknowledged, with no leaked processes.
+Every simulation test ends with `assert_all_clean`: no failed connection
+and exactly 0 processes kept. The 1000-connection test also requires all
+5000 events to be acknowledged. `sim_memory_leak_test` runs two rounds of
+100 connect/disconnect cycles and asserts that the second keeps no ETS
+table, no ETS object and no atom. It logs memory in bytes but does not
+assert it: a heap's size depends on its GC history and an ETS table's on
+its peak load, so no bound on bytes is both stable and tight.
 
 Scenarios:
 
@@ -286,7 +313,13 @@ For each example:
    the port to be released.
 
 The script exits 1 if any check failed (an example that does not start
-counts as a failure) and 0 otherwise.
+counts as a failure) and 0 otherwise. A broken harness stops the run with
+a `CdpError` instead of failing checks one by one: a `*.enable` command
+that gets no answer or an error (the suite would then record no console
+errors or frames, and checks reading them would pass on nothing), or a
+`Runtime.evaluate` whose script throws or returns no JSON value. The one
+error a wait retries is the page's JavaScript context being replaced by a
+navigation (`CdpContextGone`).
 
 ### Waiting
 
@@ -388,7 +421,6 @@ These are the waits that remain, and why.
 
 | Where | Wait | Why it stays |
 |-------|------|--------------|
-| `rate_limit_test` sweep | `process.sleep(1100)` | Rate-limit windows are wall-clock seconds; the window rolling over is under test. |
 | `ws_protocol_test` idle timeout | 4 × `process.sleep(550)` | Wall-clock time must pass the idle timeout while only heartbeats arrive. |
 | `ws_protocol_test` idle session | `process.sleep(80)` | The session idle TTL is wall-clock time, and the store has no clock to advance. |
 | `brazier/stress` | `hold_duration_ms` | Holding connections open is the load being measured (0 in tests). |

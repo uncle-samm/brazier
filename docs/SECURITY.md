@@ -211,7 +211,16 @@ HTTP responses are validated immediately before serialization. Header names must
 
 ## HTML Attribute Validation
 
-Brazier escapes text and attribute values during SSR. `attribute.attribute(name, value)` crashes on an inline event attribute name such as `onclick`, or a name with characters outside `a-z A-Z 0-9 - _ : .`: attribute names come from application code, so such a name is a bug in the view. Use `brazier/event` for event handlers. Event handler IDs are rendered as escaped attribute values.
+Brazier escapes text (`&`, `<`, `>`) and attribute values (also `"`) during SSR and in the browser. The escapers work on bytes on Erlang and UTF-16 code units in JavaScript, never on graphemes, so every `"` is escaped even when a combining mark follows it and the two form one grapheme.
+
+`attribute.attribute(name, value)` crashes on these names, and rendering crashes again on an attribute that reaches it without the constructor:
+
+- an inline event attribute such as `onclick`: use `brazier/event`;
+- `srcdoc`, whose value is a whole HTML document: use `attribute.unsafe_srcdoc` (see [Escape Hatches](#escape-hatches));
+- `attributeName` with a value containing `href`: an SVG `<animate>` or `<set>` targeting `href` or `xlink:href` would change a link after the URL policy checked it. DOMPurify refuses the same values. See [SVG.md](SVG.md#animation);
+- a name with characters outside `a-z A-Z 0-9 - _ : .`.
+
+Names match case-insensitively. Attribute names come from application code, so such a name is a bug in the view. Event handler IDs are rendered as escaped attribute values.
 
 ### URL Policy
 
@@ -221,11 +230,17 @@ Attributes the browser treats as a URL (`href`, `src`, `action`, `formaction`, `
 - `http:`, `https:`, `mailto:` and `tel:`;
 - in `src` only, `data:image/png`, `data:image/gif`, `data:image/jpeg` and `data:image/webp`. `data:image/svg+xml` is never allowed, because an SVG document can run script.
 
-Any other value (`javascript:`, `vbscript:`, `data:text/html`, ...) drops the attribute and logs a warning naming it, as React does for `javascript:` URLs. The scheme is read the way a browser reads it: tabs and newlines are removed anywhere, leading and trailing whitespace and control characters are stripped, and case is ignored, so `" JaVa\tScRiPt:"` is refused too.
+Any other value (`javascript:`, `vbscript:`, `data:text/html`, ...) drops the attribute and logs a warning naming it, as React does for `javascript:` URLs. The scheme is read the way a browser's URL parser reads it (the WHATWG URL Standard's scheme state), one code point at a time:
+
+- tabs and newlines are removed anywhere, and leading and trailing C0 control characters and spaces are stripped, so `" JaVa\tScRiPt:"` is refused;
+- a scheme is an ASCII letter followed by ASCII letters, digits, `+`, `-` or `.`, up to the first `:`. Anything else before the `:` makes the value relative, as it is to the browser;
+- case is ignored for ASCII letters only.
+
+Reading by code point matters: a combining mark right after the `:` (`javascript:` followed by U+0E33) joins the colon into one grapheme, and a grapheme-based reader found no `:` and treated the value as relative, while the browser ran it.
 
 ### Escape Hatches
 
-`element.unsafe_raw_html` and `brazier.head_html` insert trusted HTML without escaping or the URL policy. Do not pass user input to them.
+`element.unsafe_raw_html` and `brazier.head_html` insert trusted HTML without escaping or the URL policy. `attribute.unsafe_srcdoc` gives an `<iframe>` a whole document that is not checked; its value is attribute-escaped and the browser decodes it back to HTML, which runs with the page's origin unless the iframe's `sandbox` withholds `allow-scripts` or `allow-same-origin`. Do not pass user input to any of them.
 
 ## Build And Dev Command Execution
 
@@ -240,7 +255,12 @@ The `middleware.secure_headers()` middleware (included by default in all apps) s
 - `X-XSS-Protection: 0` (the legacy XSS auditor is itself exploitable; OWASP recommends disabling it and relying on CSP)
 - `Referrer-Policy: strict-origin-when-cross-origin`
 - `Permissions-Policy: camera=(), microphone=(), geolocation=()`
-- `Content-Security-Policy:` `middleware.default_csp`, which is `default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https://avatars.githubusercontent.com; connect-src 'self' ws: wss:; frame-ancestors 'self'; object-src 'none'; base-uri 'self'`. `frame-ancestors 'self'` is the CSP form of `X-Frame-Options: SAMEORIGIN`.
+- `Content-Security-Policy:` `middleware.default_csp`, which is `default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'self'; object-src 'none'; base-uri 'self'`.
+  - `script-src 'self'` runs only scripts the app serves. Brazier loads its client bundle with `<script src>` and renders no inline script or `on*` attribute, so an injected script or handler does not run. A `head_html` with an inline `<script>` needs its own policy.
+  - `connect-src 'self'` lets the WebSocket and `fetch` reach only the page's origin. CSP Level 3 matches same-origin `ws:` and `wss:` against `'self'`. Safari 15 and earlier did not (WebKit bugs 201591 and 235873), so an app that supports them passes a policy naming its own `wss://host` to `middleware.secure_headers_with_csp`.
+  - `img-src 'self' data:` allows no third-party image host.
+  - `style-src` keeps `'unsafe-inline'`, which `attribute.style` needs.
+  - `frame-ancestors 'self'` is the CSP form of `X-Frame-Options: SAMEORIGIN`.
 
 HSTS is opt-in because Brazier does not terminate TLS: add `middleware.hsts(31_536_000, True)` (it returns a `Result`; a negative max-age is an error) when the app is served over HTTPS behind a TLS proxy.
 
@@ -434,6 +454,37 @@ The runtime tracks serialized model size. Models exceeding 1MB trigger a warning
 The server decodes every event with the generated `brazier_codec.decode_event`. The accepted messages are exactly the `Msg` constructors that client code (what `view`, a Local layer and a `simple` app's `update` reach) can build, as found by the build. Any other message is refused before `update` runs: the server logs a warning, answers with an error, and the browser drops its optimistic state. Messages that only effects, subscriptions or the router produce cannot be sent from the browser.
 
 An accepted message is still only a request: `update` runs on the server and must check that the session may perform it (for example, that a guest is not sending a signed-in action). With `brazier.simple` the browser runs `update` first for instant feedback, but the server runs it too and its model wins; a mismatch is logged in the browser.
+
+## Navigation Targets
+
+`router.push`, `router.replace` and `router.redirect` send the browser to a
+path, so a path built from user input (a `?next=` parameter) must not become
+an open redirect. A browser's URL parser reads `\` as `/` and strips tab,
+newline and carriage return anywhere in a URL. That means `/\evil.example`
+and `/<tab>/evil.example` load evil.example just as `//evil.example` does.
+The router accepts a path only when all of these hold:
+
+- it starts with `/`, but not with `//` or `/\`;
+- it has no `\`;
+- it has no ASCII control character (U+0000 to U+001F, U+007F);
+- it has no `/%09`, an encoded tab that some browsers strip.
+
+This is Phoenix's `validate_local_url` rule plus the control characters. A
+refused path is logged as an error with the reason and never sent.
+
+The client applies the same rule, with the same reasons, to the `navigate`
+and `hard_navigate` frames. It then refuses a path that
+`new URL(path, location.origin)` resolves to another origin. `router_test`
+holds the server's and the client's verdicts equal on every case.
+
+## Model Patches
+
+A patch path never goes through `__proto__`, `constructor` or `prototype`.
+The client refuses any patch with such a segment, so applying it cannot reach
+`Object.prototype`. The diff never writes one: when such a key is added,
+removed or changed, the server and the client replace the object holding it
+whole. The server's `patch.unsafe_keys()` is the canonical list, and
+`patch_test` holds the client's `UNSAFE_PATCH_KEYS` equal to it.
 
 ## Client Bundle Privacy
 

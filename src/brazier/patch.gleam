@@ -23,6 +23,12 @@
 /// whose target does not exist is an error — never a silent skip. The
 /// client mirrors this: any patch failure requests a full model sync.
 ///
+/// A path never passes through an unsafe key (`__proto__`, `constructor`,
+/// `prototype`; the canonical list is `unsafe_keys/0` in
+/// `brazier_patch_ffi.erl`, mirrored by `UNSAFE_PATCH_KEYS` in `patch.mjs`).
+/// When one is added, removed or changed, the diff replaces the object that
+/// holds it, and both appliers refuse a path through one.
+///
 /// Reference: RFC 6902 (JSON Patch), RFC 6901 (JSON Pointer).
 import brazier/log
 
@@ -71,6 +77,13 @@ fn apply_json_ops(
 pub fn count_ops(ops_json: String) -> Result(Int, String) {
   count_ops_ffi(ops_json)
 }
+
+/// The keys no patch path may pass through. The canonical list lives in
+/// `brazier_patch_ffi.erl`; the JS client's copy is held equal to it by
+/// `test/brazier/patch_test.gleam`.
+@external(erlang, "brazier_patch_ffi", "unsafe_keys")
+@internal
+pub fn unsafe_keys() -> List(String)
 
 /// Erlang FFI: check if ops are empty.
 @external(erlang, "brazier_patch_ffi", "is_empty_ops")

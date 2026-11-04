@@ -39,6 +39,7 @@ pub fn element(
   // Invariant: tag names come from application code, not user input. A tag
   // that could break out of the markup is a bug in the view.
   let assert True = render.is_valid_tag_name(tag)
+    as "brazier/element.element: tag names are a-z A-Z 0-9 - _ : ."
   Element(render.Element(
     tag,
     list.map(attributes, attribute.to_attr),
@@ -63,18 +64,9 @@ pub fn keyed(key: String, child: Element(msg)) -> Element(msg) {
   Element(render.Keyed(key, child.node))
 }
 
-/// Mark a subtree as depending only on `deps`, so the client morph can skip
-/// it when they are unchanged.
-pub fn memo(
-  key: String,
-  deps: List(String),
-  child: Element(msg),
-) -> Element(msg) {
-  Element(render.Memo(key, deps, child.node))
-}
-
 /// HTML inserted as is: no escaping and no URL policy. Never pass it text
-/// that a user controls.
+/// that a user controls. For a whole document in an iframe, see
+/// `attribute.unsafe_srcdoc`.
 pub fn unsafe_raw_html(html: String) -> Element(msg) {
   Element(render.RawHtml(html))
 }

@@ -147,32 +147,80 @@ pub fn check(limiter: RateLimiter, key: String) -> RateLimitResult {
   }
 }
 
+/// Why an operation on a limiter's table or owner failed.
+pub type LimiterError {
+  /// The limiter's owner exited, and its table with it.
+  LimiterNotRunning
+  /// The owner did not answer within `timeout_ms` (it is alive but busy or
+  /// suspended).
+  LimiterTimeout(timeout_ms: Int)
+  /// The owner exited while handling the call; `reason` is its exit reason.
+  LimiterCallFailed(reason: String)
+}
+
+/// A readable description of a `LimiterError`, for logs.
+pub fn describe_error(error: LimiterError) -> String {
+  case error {
+    LimiterNotRunning -> "the rate limiter is not running"
+    LimiterTimeout(timeout_ms:) ->
+      "the rate limiter owner did not answer within "
+      <> int.to_string(timeout_ms)
+      <> " ms"
+    LimiterCallFailed(reason:) ->
+      "the rate limiter owner exited during the call: " <> reason
+  }
+}
+
 /// Delete every counter for a key.
-pub fn reset(limiter: RateLimiter, key: String) -> Result(Nil, Nil) {
+pub fn reset(limiter: RateLimiter, key: String) -> Result(Nil, LimiterError) {
   case ffi_delete_key(limiter.handle, key) {
     Ok(Nil) -> {
       log.debug("brazier.rate_limit", "Reset counters for " <> key)
       Ok(Nil)
     }
-    Error(Nil) -> {
+    Error(error) -> {
       log.error(
         "brazier.rate_limit",
-        "Cannot reset " <> key <> ": the rate limiter is not running",
+        "Cannot reset " <> key <> ": " <> describe_error(error),
       )
-      Error(Nil)
+      Error(error)
     }
   }
 }
 
 /// Number of live counters (one per key per active window).
-pub fn key_count(limiter: RateLimiter) -> Result(Int, Nil) {
-  ffi_key_count(limiter.handle)
+pub fn key_count(limiter: RateLimiter) -> Result(Int, LimiterError) {
+  case ffi_key_count(limiter.handle) {
+    Ok(count) -> Ok(count)
+    Error(error) -> {
+      log.warning(
+        "brazier.rate_limit",
+        "Cannot count keys: " <> describe_error(error),
+      )
+      Error(error)
+    }
+  }
 }
+
+/// How long `sweep` waits for the owner.
+const sweep_timeout_ms = 5000
 
 /// Delete expired counters now instead of waiting for the next periodic
 /// sweep. Returns how many counters were deleted.
-pub fn sweep(limiter: RateLimiter) -> Result(Int, Nil) {
-  case ffi_sweep_now(limiter.handle) {
+pub fn sweep(limiter: RateLimiter) -> Result(Int, LimiterError) {
+  sweep_with(limiter, ffi_now_seconds(), sweep_timeout_ms)
+}
+
+/// `sweep` as of `now_seconds` (POSIX seconds), waiting at most
+/// `timeout_ms` for the owner. Tests use it to sweep a later window without
+/// waiting for the clock, and to observe a timeout.
+@internal
+pub fn sweep_with(
+  limiter: RateLimiter,
+  now_seconds: Int,
+  timeout_ms: Int,
+) -> Result(Int, LimiterError) {
+  case ffi_sweep_now(limiter.handle, now_seconds, timeout_ms) {
     Ok(deleted) -> {
       log.debug(
         "brazier.rate_limit",
@@ -180,9 +228,9 @@ pub fn sweep(limiter: RateLimiter) -> Result(Int, Nil) {
       )
       Ok(deleted)
     }
-    Error(Nil) -> {
-      log.error("brazier.rate_limit", "Cannot sweep: limiter is not running")
-      Error(Nil)
+    Error(error) -> {
+      log.error("brazier.rate_limit", "Cannot sweep: " <> describe_error(error))
+      Error(error)
     }
   }
 }
@@ -220,13 +268,20 @@ fn ffi_increment(
 ) -> Result(Int, IncrementError)
 
 @external(erlang, "brazier_rate_limit_ffi", "delete_key")
-fn ffi_delete_key(handle: Handle, key: String) -> Result(Nil, Nil)
+fn ffi_delete_key(handle: Handle, key: String) -> Result(Nil, LimiterError)
 
 @external(erlang, "brazier_rate_limit_ffi", "key_count")
-fn ffi_key_count(handle: Handle) -> Result(Int, Nil)
+fn ffi_key_count(handle: Handle) -> Result(Int, LimiterError)
 
 @external(erlang, "brazier_rate_limit_ffi", "sweep_now")
-fn ffi_sweep_now(handle: Handle) -> Result(Int, Nil)
+fn ffi_sweep_now(
+  handle: Handle,
+  now_seconds: Int,
+  timeout_ms: Int,
+) -> Result(Int, LimiterError)
+
+@external(erlang, "brazier_rate_limit_ffi", "now_seconds")
+fn ffi_now_seconds() -> Int
 
 @external(erlang, "brazier_rate_limit_ffi", "owner")
 fn ffi_owner(handle: Handle) -> process.Pid

@@ -267,6 +267,84 @@
   - Follow-ups: an example's client build resolves dependencies from Hex every time, since no manifest is kept for the client project, so parallel builds can hit Hex's rate limit; a lint rule against stale `beacon` names in `src`, `test` and `examples`, with an allowlist for the refusals and the dev secret.
 - [ ] Final read-only audits (security, stability, tigerstyle, performance) and fixes
   - Audits started 2026-11-04 at f393ef2: four read-only agents (security, stability with the open runtime-stop flake, TigerStyle/engineering rules, performance), each in its own scratch worktree. Findings are then split into fix agents by file ownership.
+  - Audits reported 2026-11-04: 52 findings.
+    - Security: SEC-1 to SEC-17, with 2 high. SEC-1 is a URL scheme check that a combining mark defeats (stored XSS). SEC-2 is route-scoped middleware not gating WebSocket mounts or navigation.
+    - Stability: STAB-1 to STAB-5. STAB-1 is the runtime-stop flake, which is a race in the test: the test's monitor request is ordered against the owner's EXIT, giving `DOWN noproc`. STAB-2 is that `effect.after` and `effect.background` have no cap.
+    - TigerStyle: TS-1 to TS-15, with 2 high. TS-1 is an over-budget join token silently dropping the model. TS-2 is a generated secret-key fallback.
+    - Performance: PERF-1 to PERF-15, with 3 high: client full re-render plus per-render name checks, per-event full model encode and double decode, and static files hashed on every request.
+  - Fix plan. Each wave has disjoint file ownership. Each agent fixes TS-12 (`let assert` messages) in its own files.
+    - Wave 1, started 2026-11-04 at 97eb035:
+      - fix-render: SEC-1, SEC-6, SEC-12, SEC-13, PERF-1 server side, PERF-4, PERF-5;
+      - fix-client-patch: TS-3, SEC-5, SEC-14, PERF-8, PERF-15, PERF-1 client side;
+      - fix-runtime-effects: STAB-1, STAB-2, STAB-5, TS-1, TS-10, TS-11, TS-14, TS-15, PERF-12, PERF-14, SEC-11 runtime part, SEC-17;
+      - fix-cluster: TS-2, SEC-3, SEC-8, SEC-9, SEC-10, STAB-3, STAB-4;
+      - fix-static-tooling: PERF-3/SEC-15, PERF-10, PERF-13, TS-4 HTTP part, TS-5, TS-6, TS-7, TS-13 and the stale-name lint rule;
+      - fix-crdt: PERF-7.
+    - Wave 2: transport and auth. Covers SEC-2, SEC-4, SEC-7, SEC-16, SEC-11 transport part, TS-4 session-store clock, TS-8 and TS-9.
+    - Wave 3: wire and encoding performance, PERF-2 and PERF-6. Raw JSON envelopes need a wire version bump.
+    - Wave 4: PERF-9, which closes the bench gate's gaps (benches for large models, SSR, static files, client render and CRDT; no ungated metrics) and re-baselines. Then a sweep of the remaining TS-12 items.
+    - PERF-11 (about 0.5µs of telemetry span cost per event with no handler) is accepted within the overhead budget already recorded, and is not fixed.
+  - [x] fix-crdt (PERF-7), merged as 461baf2.
+    - The fix: `join_keys` finds removed dots from whichever is smaller, the delta's context or the key. This is the delta-state dot-set join (Almeida, Shoker and Baquero; delta_crdt_ex `join_dot_sets`).
+    - Effect: an append to a 10,000-value key went from 2184µs to 0.99µs, and the peer's join is just as flat. `join_full` gives unchanged results.
+    - Tests: an oracle comparison against the old join over 20 seeds × 500 steps on 3 replicas, the algebra laws, and reduction-count cost bounds.
+    - Coordinator verify on the branch (a fast-forward of bf1b9a2): clean build with zero warnings, format and lint clean, 1538 tests passing in each of 3 runs.
+    - Decisions:
+      - a clock entry covers only counters of 1 and above;
+      - the order of changes returned by `crdt.join` is unspecified;
+      - the new `store.crdt_append.*` bench metrics need a baseline (PERF-9 owner).
+    - Follow-ups:
+      - `brazier_store_replica.erl` does not validate the shape of incoming peer deltas;
+      - `compact` sorts the whole cloud on every join.
+  - [x] fix-render (SEC-1, SEC-6, SEC-12, SEC-13, PERF-1 server side, PERF-4, PERF-5), merged as 14631d6.
+    - SEC-1: `internal/url` reads the scheme the way the WHATWG URL parser does, one code point at a time (scheme start state, then scheme state). A combining mark after `:` no longer hides `javascript:`.
+    - New XSS found and fixed: on Erlang, `string.replace` works on graphemes and skipped a `"` that a combining mark followed, so an attribute value could break out. Escaping is now a single byte pass in `src/brazier_render_ffi.erl` and `.mjs`, following Phoenix.HTML's `html_escape`.
+    - SEC-12/13: render checks tag, attribute and event names again with an ASCII byte scan; `srcdoc` needs the `UnsafeSrcdoc` variant. The default CSP is now `script-src 'self'` and `connect-src 'self'`.
+    - PERF-4: `element.memo` (a documented no-op) is removed, along with its mentions in the docs, ARCHITECTURE included.
+    - PERF-1 server side and PERF-5: render is 2.3× faster and escaping 8× faster.
+    - `client_bundle.framework_ffi_files` copies the JS FFI files and errors when one is missing; `reach.resolve_ffi_path` is now public.
+    - Coordinator verify on the merge of 9c48e5e into the branch (c0f88e5): clean build with zero warnings, format and lint clean, 1564 tests passing in each of 3 runs, docs check with 72 samples, test-client with 39 scenarios and 5 patch-safety checks.
+    - Decisions:
+      - render re-checks attribute names on every call rather than trusting construction;
+      - `srcdoc` is opt-in through `UnsafeSrcdoc`;
+      - Safari 15 and older may need an explicit `wss://` host in `connect-src`. This is documented and not verified.
+    - Follow-ups:
+      - a render bench scenario (for the PERF-9 owner);
+      - constant tag names are re-checked on every render;
+      - CDP on an idle machine, during final verification.
+  - [x] fix-static-tooling (PERF-3/SEC-15, PERF-10, PERF-13, TS-4 HTTP part, TS-5, TS-6, TS-7, TS-13, stale-name lint), merged as 1af7b17.
+    - PERF-3/SEC-15: static ETag digests are cached in ETS against the file's size, mtime, ctime, inode and device. An entry recorded less than 2 s after the file's last change is not trusted (git's racy-clean rule, racy-git.txt). The cache holds at most 2048 entries. A missing table fails the request with `cache_unavailable`; there is no uncached fallback.
+    - PERF-13: responses go to `gen_tcp:send` as iodata. PERF-10: `log` checks `logger:allow/2` before building a message, as OTP's `?LOG_*` macros do.
+    - TS-7: the rate limiter returns `LimiterError` (`LimiterNotRunning`, `LimiterTimeout`, `LimiterCallFailed`) instead of `Error(Nil)`. This breaks `reset`, `key_count` and `sweep`.
+    - TS-4 (HTTP part): the rate-limit sweep uses an injected clock (`sweep_with`), and the slow-header test sends a byte each time a receive times out. TESTING.md has an "Instead of a sleep" table.
+    - TS-13: the lint walks every glance expression variant with no catch-all, so a `todo`, `panic` or `let _ =` in a `use` callback, guard, capture or similar is now seen. A new `stale-name` rule flags the old project name in `src`, `test` and `examples`.
+    - TS-5: `test_all_cdp.py` raises `CdpError` on a failed `*.enable`, viewport, cache or init-script call. `evaluation_value` raises on a thrown script or a non-JSON result instead of returning sentinel strings.
+    - TS-6: `sim_memory_leak_test` asserts that a second round of 100 connect/disconnect cycles keeps no process, ETS table, ETS object or atom. A byte bound was measured and rejected: heap and ETS sizes move with GC and bucket history.
+    - Coordinator verify on the merge of c67000c into the branch (d391a93): clean build with zero warnings, format and lint (including `stale-name`) clean, 1591 tests passing in each of 3 runs, docs check OK, `py_compile` of `test_all_cdp.py` OK.
+    - Decisions:
+      - the one CDP error a wait still retries is a navigation replacing the page's context (`CdpContextGone`, matched on Chrome's messages). The match is unverified until the CDP run in final verification;
+      - the agent made small edits to TIGERSTYLE.md (linter description, sim leak rules), which it does not own; accepted.
+    - Follow-ups:
+      - `brazier_asset_cache_ffi.erl` trusts possibly stale entries the way the old digest cache did;
+      - CHANGELOG WS10b bullets still use old names (`__beaconOutboundPendingForTest`, `beacon_http_conns`, `data-beacon-auto`), and the lint does not scan CHANGELOG;
+      - `stop_server` in `test_all_cdp.py` only logs when the page doesn't reach `about:blank`;
+      - a lint rule requiring an `as` message on every `let assert` (TS-12, for the wave-4 sweep).
+  - [x] fix-client-patch (TS-3, SEC-5, SEC-14, PERF-8, PERF-15, PERF-1 client side), merged as 3b6baa5.
+    - SEC-14: neither diff writes a patch path through `__proto__`, `constructor` or `prototype`; the object holding such a key is replaced whole. `patch.unsafe_keys()` is the one list, and a test checks the client's copy equals it.
+    - PERF-8: each array is copied once per patch, not once per op (copy-on-write in JS, a zipper in Erlang). An equivalence test runs the new engine against the old on 2450 applied and 550 refused patches. Speed-ups at n=4000: Erlang 4.6–9.4×, JS 3.0–8.6×.
+    - SEC-5: navigation targets follow Phoenix's `validate_local_url` (no leading `//` or `/\`, no `\`, no `/%09`) and also refuse control characters, on the server (`router.check_local_path`) and the client (`localPathRefusal`, plus a same-origin check with `new URL`). A parity test runs 27 paths through both.
+    - TS-3: a missing or invalid `ack_clock` or event clock is no longer read as 0. A `model_sync` fails, a patch drops the cache and asks for a full sync, and a queued event without a clock throws.
+    - PERF-15: the trace flag is read once and checked before trace details are built. PERF-1 client side: an identical render reuses the parsed fragment, and hooks are synced only for elements the morph touched (the morphdom / LiveView DOMPatch pattern), up to 2× faster. A keyed or vdom morph is the remaining cost.
+    - Coordinator verify on the merge of 1af7b17 into the branch (84e106f): clean build with zero warnings, format and lint clean, 1603 tests passing in each of 3 runs, docs check OK, test-client with 45 harness scenarios, 9 patch-safety checks and the apply-equivalence check.
+    - Decisions:
+      - kept: a hook `unmount` that removes an element the same morph changed now fails the render loudly and the client resyncs. Before, nothing was reported and the hook entry leaked;
+      - accepted the agent's edits outside its files: `runtime_versioning_test.gleam` (harness count, `as` messages) and the `Makefile` `test-client` target.
+    - Follow-ups:
+      - link-click interception compares only the hostname, not the origin;
+      - `runtime.gleam` (around 1400 and 2460) has its own weaker local-path checks, which should use `router.check_local_path`, and `hard_navigate` (around 1523) echoes a client-supplied path. Both go to wave 2;
+      - removing `data-brazier-hook` does not unmount the hook (already the case before);
+      - a keyed morph; whole-array replaces when about n/4 of the items change;
+      - a patch-apply bench metric (for PERF-9).
 - [ ] Final verification: build (zero warnings), tests, all examples, CDP browser suite, perf baselines
 
 **Decisions (Milestone 117, coordinator):**

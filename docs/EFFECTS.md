@@ -150,8 +150,11 @@ Effects that spawn their own processes inside `effect.from` are not tracked; use
   when the browser must make a real HTTP request, for example to receive a
   `Set-Cookie` header.
 
-All three take same-origin paths only (`/` but not `//`). Any other value is
-logged as an error and not sent.
+All three take same-origin paths only: a path that starts with `/`, but not
+with `//` or `/\`, and has no `\`, ASCII control character or `/%09` (a
+browser reads each of those as another host). Any other value is logged as an
+error, with the reason, and not sent. See
+[Navigation Targets](SECURITY.md#navigation-targets).
 
 <!-- docs-check: wrap
 import brazier/effect.{type Effect}

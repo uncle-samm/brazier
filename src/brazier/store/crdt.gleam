@@ -175,7 +175,10 @@ fn apply(
 
 // --- Joins ---
 
-/// Merge a delta: only the keys the delta names can change.
+/// Merge a delta: only the keys the delta names can change. The cost
+/// follows the delta, not the key: appending to a key that holds 10,000
+/// values visits none of them (see `join_keys`). The changes come in no
+/// particular order.
 pub fn join(
   state: State(value),
   delta: Delta(value),
@@ -199,45 +202,149 @@ pub fn join_full(
   join_keys(state, full.entries, full.context, keys)
 }
 
+/// The DotSet join of Almeida, Shoker and Baquero, key by key:
+///
+///     (s, c) ⊔ (s', c') = ((s ∩ s') ∪ (s \ c') ∪ (s' \ c), c ∪ c')
+///
+/// (delta_crdt_ex `AWLWWMap.join_dot_sets/4` computes the same three sets).
+/// Written as edits to `s`: a dot of `s` goes when `c'` covers it and `s'`
+/// lacks it, and a dot of `s'` comes in when `c` does not cover it.
+///
+/// The removed dots are `s ∩ c'` minus `s'`, and `s ∩ c'` is found from
+/// whichever side is smaller: scanning `s` and testing `c'` (what a full
+/// state needs: its context covers everything), or listing the dots of
+/// `c'` and looking each up in `s` (what a delta needs: an append's
+/// context is only its own new dots, so the values already under the key
+/// are never visited). Both give the same set; `observed` is the number of
+/// dots `c'` lists, counted once per join. So a join costs
+/// O(min(|s|, |c'|) + |s'|) per key, never more than the full scan.
 fn join_keys(
   state: State(value),
   other: Dict(String, Dots(value)),
   other_context: Context,
   keys: List(String),
 ) -> #(State(value), List(Change(value))) {
+  let observed = context_dot_count(other_context)
   let #(entries, size, changes) =
     list.fold(keys, #(state.entries, state.size, []), fn(acc, key) {
       let #(entries, size, changes) = acc
       let mine = dict_get_or_empty(entries, key)
       let theirs = dict_get_or_empty(other, key)
-      let #(kept, removed) =
-        dict.fold(mine, #(dict.new(), []), fn(acc, dot, entry) {
-          let #(kept, removed) = acc
-          case dict.has_key(theirs, dot) || !covers(other_context, dot) {
-            True -> #(dict.insert(kept, dot, entry), removed)
-            False -> #(kept, [Removed(key:, dot:, entry:), ..removed])
-          }
+      let #(removed, removed_count) =
+        removed_dots(mine, theirs, other_context, observed)
+      let changes =
+        list.fold(removed, changes, fn(changes, pair) {
+          [Removed(key:, dot: pair.0, entry: pair.1), ..changes]
         })
-      let #(joined, added) =
-        dict.fold(theirs, #(kept, []), fn(acc, dot, entry) {
-          let #(joined, added) = acc
+      let kept = case removed_count == dict.size(mine) {
+        // A put or remove replaces every value it observed: nothing to
+        // drop one by one.
+        True -> dict.new()
+        False ->
+          case removed {
+            [] -> mine
+            _ -> dict.drop(mine, list.map(removed, fn(pair) { pair.0 }))
+          }
+      }
+      let #(joined, changes, added) =
+        dict.fold(theirs, #(kept, changes, 0), fn(acc, dot, entry) {
+          let #(joined, changes, added) = acc
           case dict.has_key(mine, dot) || covers(state.context, dot) {
             True -> acc
-            False -> #(dict.insert(joined, dot, entry), [
-              Added(key:, dot:, entry:),
-              ..added
-            ])
+            False -> #(
+              dict.insert(joined, dot, entry),
+              [Added(key:, dot:, entry:), ..changes],
+              added + 1,
+            )
           }
         })
       let entries = case dict.is_empty(joined) {
         True -> dict.delete(entries, key)
         False -> dict.insert(entries, key, joined)
       }
-      let size = size - list.length(removed) + list.length(added)
-      #(entries, size, list.flatten([added, removed, changes]))
+      #(entries, size - removed_count + added, changes)
     })
   let context = union_context(state.context, other_context)
   #(State(entries:, context:, size:), list.reverse(changes))
+}
+
+/// The dots of `mine` that `context` covers and `theirs` lacks (the ones
+/// the other side saw and then replaced or removed), each once, and how
+/// many there are. `observed` is `context_dot_count(context)`.
+fn removed_dots(
+  mine: Dots(value),
+  theirs: Dots(value),
+  context: Context,
+  observed: Int,
+) -> #(List(#(Dot, Entry(value))), Int) {
+  case observed < dict.size(mine) {
+    True -> {
+      // Collected in a dict: an uncompacted context lists a dot twice.
+      let removed =
+        fold_context_dots(context, dict.new(), fn(removed, dot) {
+          case dict.get(mine, dot) {
+            Ok(entry) ->
+              case dict.has_key(theirs, dot) {
+                True -> removed
+                False -> dict.insert(removed, dot, entry)
+              }
+            Error(Nil) -> removed
+          }
+        })
+      #(dict.to_list(removed), dict.size(removed))
+    }
+    False ->
+      dict.fold(mine, #([], 0), fn(acc, dot, entry) {
+        case !dict.has_key(theirs, dot) && covers(context, dot) {
+          True -> #([#(dot, entry), ..acc.0], acc.1 + 1)
+          False -> acc
+        }
+      })
+  }
+}
+
+/// How many dots `fold_context_dots` visits: every counter `1..n` of each
+/// clock entry plus the cloud.
+fn context_dot_count(context: Context) -> Int {
+  dict.fold(context.clock, set.size(context.cloud), fn(count, _replica, max) {
+    count + int.max(max, 0)
+  })
+}
+
+/// Visit every dot the context lists: counters `1..n` of each clock entry,
+/// then the cloud. A cloud dot the clock also covers (a context that was
+/// not compacted) is visited twice; callers collect into a dict, so that
+/// is harmless.
+fn fold_context_dots(
+  context: Context,
+  acc: acc,
+  visit: fn(acc, Dot) -> acc,
+) -> acc {
+  let acc =
+    dict.fold(context.clock, acc, fn(acc, replica, max) {
+      fold_counters(replica, 1, max, acc, visit)
+    })
+  set.fold(context.cloud, acc, visit)
+}
+
+fn fold_counters(
+  replica: Replica,
+  counter: Int,
+  max: Int,
+  acc: acc,
+  visit: fn(acc, Dot) -> acc,
+) -> acc {
+  case counter > max {
+    True -> acc
+    False ->
+      fold_counters(
+        replica,
+        counter + 1,
+        max,
+        visit(acc, Dot(replica:, counter:)),
+        visit,
+      )
+  }
 }
 
 fn dict_get_or_empty(
@@ -252,10 +359,14 @@ fn dict_get_or_empty(
 
 // --- Causal context ---
 
-/// Whether the context has observed `dot`.
+/// Whether the context has observed `dot`. A clock entry `n` covers
+/// counters `1..n` only: `next_dot` never makes a counter below 1, and a
+/// clock that covered one would cover dots `fold_context_dots` cannot list,
+/// so the two ways `join_keys` finds removed dots would disagree on a
+/// malformed delta from a peer.
 pub fn covers(context: Context, dot: Dot) -> Bool {
   case dict.get(context.clock, dot.replica) {
-    Ok(max) if dot.counter <= max -> True
+    Ok(max) if dot.counter >= 1 && dot.counter <= max -> True
     Ok(_) | Error(Nil) -> set.contains(context.cloud, dot)
   }
 }
