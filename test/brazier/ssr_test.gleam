@@ -8,10 +8,13 @@ import brazier/internal/context.{type Context}
 import brazier/log_capture
 import brazier/session
 import brazier/ssr
+import brazier/telemetry
 import gleam/bit_array
 import gleam/crypto
+import gleam/dynamic
 import gleam/erlang/process.{type Subject}
 import gleam/http/request
+import gleam/int
 import gleam/json
 import gleam/list
 import gleam/option
@@ -261,8 +264,9 @@ pub fn render_page_sets_session_token_without_dom_exposure_test() {
   let page = render(test_config())
   let assert False = str_contains(page.html, "data-brazier-token=\"")
   // The token verifies with the same secret
-  let assert Ok(_ts) =
-    ssr.verify_session_token(ssr.join_token_for(page, ""), test_secret, 3600)
+  let assert Ok(token) = ssr.join_token_for(page, "")
+  let assert Ok(_verified) =
+    ssr.verify_join_token(token, test_secret, "", current_system_time_seconds())
 }
 
 // --- Routing and the dead-render context ---
@@ -430,8 +434,9 @@ pub fn recovery_model_is_stored_in_signed_cookie_token_test() {
       }),
     )
   let page = render(config)
-  let assert Ok(_) =
-    ssr.verify_session_token(ssr.join_token_for(page, ""), test_secret, 3600)
+  let assert Ok(token) = ssr.join_token_for(page, "")
+  let assert Ok(_verified) =
+    ssr.verify_join_token(token, test_secret, "", current_system_time_seconds())
   let assert False = str_contains(page.html, "SecretCookieState")
 }
 
@@ -483,55 +488,63 @@ pub fn head_html_multiple_tags_test() {
   let assert True = str_contains(page.html, "theme-color")
 }
 
-// --- Session token tests ---
+// --- Join token signing ---
 
-pub fn create_session_token_is_a_signed_message_without_the_secret_test() {
+pub fn join_token_is_a_signed_message_without_the_secret_test() {
   let secret = "my-secret-key-for-testing-purposes!!"
-  let token = ssr.create_session_token(secret)
+  let token =
+    ssr.sign_join_token(secret, "", option.None, current_system_time_seconds())
   // gleam/crypto.sign_message: protected header, payload, signature.
   let assert [header, payload, signature] = string.split(token, ".")
   let assert True = header != "" && payload != "" && signature != ""
   let assert False = string.contains(token, secret)
 }
 
-pub fn verify_valid_token_test() {
+pub fn join_token_reports_its_issue_time_test() {
   let secret = "my-secret-key-for-testing-purposes!!"
-  let token = ssr.create_session_token(secret)
-  let assert Ok(ts) = ssr.verify_session_token(token, secret, 3600)
-  // The timestamp is recent: within the last 60 seconds
+  let issued_at = current_system_time_seconds() - 30
+  let token = ssr.sign_join_token(secret, "", option.None, issued_at)
+  let assert Ok(verified) =
+    ssr.verify_join_token(token, secret, "", current_system_time_seconds())
+  assert verified.issued_at == issued_at
+  assert verified.expires_at == issued_at + ssr.join_token_lifetime_seconds
+}
+
+pub fn join_token_past_its_lifetime_is_expired_test() {
+  let secret = "my-secret-key-for-testing-purposes!!"
   let now = current_system_time_seconds()
-  let age = now - ts
-  let assert True = age >= 0
-  let assert True = age < 60
+  let token =
+    ssr.sign_join_token(
+      secret,
+      "",
+      option.None,
+      now - ssr.join_token_lifetime_seconds - 1,
+    )
+  let assert Error(ssr.JoinTokenExpired(..)) =
+    ssr.verify_join_token(token, secret, "", now)
 }
 
-pub fn verify_token_wrong_secret_test() {
-  let token = ssr.create_session_token("correct-secret-key-for-signing!!")
-  let assert Error(_) =
-    ssr.verify_session_token(token, "wrong-secret-key-for-verifying!!!", 3600)
+/// An empty secret is refused when the app starts, so signing with one is
+/// a broken invariant: it crashes instead of minting a token that can
+/// never verify.
+pub fn signing_with_an_empty_secret_crashes_test() {
+  let assert Error(#("error", reason)) =
+    rescue(fn() {
+      ssr.sign_join_token("", "", option.None, current_system_time_seconds())
+    })
+  let assert True =
+    string.contains(string.inspect(reason), "secret_key is empty")
 }
 
-pub fn verify_expired_token_test() {
-  let secret = "my-secret-key-for-testing-purposes!!"
-  let token = ssr.create_session_token(secret)
-  // max_age of -1 seconds: the token is already "expired"
-  let assert Error("Session token expired") =
-    ssr.verify_session_token(token, secret, -1)
-}
-
-pub fn verify_tampered_token_test() {
-  let secret = "my-secret-key-for-testing-purposes!!"
-  let token = ssr.create_session_token(secret)
-  let tampered = token <> "x"
-  let assert Error(_) = ssr.verify_session_token(tampered, secret, 3600)
-}
+@external(erlang, "brazier_telemetry_test_ffi", "rescue")
+fn rescue(run: fn() -> a) -> Result(a, #(String, dynamic.Dynamic))
 
 /// The join token goes into a Set-Cookie header; a token outside the
 /// cookie-octet set is refused instead of being written as an injection.
 pub fn to_response_rejects_a_token_that_is_not_a_cookie_value_test() {
   let page =
     ssr.RenderedPage(..render(test_config()), sign_join_token: fn(_) {
-      "tok; Domain=evil.example"
+      Ok("tok; Domain=evil.example")
     })
   let assert Error(cookie.InvalidValue(_)) = ssr.to_response(page)
   let req =
@@ -542,18 +555,13 @@ pub fn to_response_rejects_a_token_that_is_not_a_cookie_value_test() {
 
 pub fn join_tokens_are_valid_cookie_values_test() {
   let page = render(test_config())
+  let assert Ok(unbound) = ssr.join_token_for(page, "")
   let assert Ok(Nil) =
-    cookie.validate(
-      ssr.session_cookie_name,
-      ssr.join_token_for(page, ""),
-      cookie.default_options(),
-    )
+    cookie.validate(ssr.session_cookie_name, unbound, cookie.default_options())
+  let assert Ok(bound) =
+    ssr.join_token_for(page, ssr.fingerprint_session_id("session-a"))
   let assert Ok(Nil) =
-    cookie.validate(
-      ssr.session_cookie_name,
-      ssr.join_token_for(page, ssr.fingerprint_session_id("session-a")),
-      cookie.default_options(),
-    )
+    cookie.validate(ssr.session_cookie_name, bound, cookie.default_options())
 }
 
 pub fn to_response_returns_200_test() {
@@ -587,18 +595,6 @@ fn signed_join_token(fingerprint: String, model: option.Option(String)) {
 
 pub fn join_token_rejects_empty_server_secret_test() {
   let token = signed_join_token("", option.Some("{}"))
-  let assert Error(ssr.JoinTokenInvalid(_)) =
-    ssr.verify_join_token(token, "", "", current_system_time_seconds())
-}
-
-pub fn join_token_signed_with_empty_secret_never_verifies_test() {
-  let token =
-    ssr.sign_join_token(
-      "",
-      "",
-      option.Some("{}"),
-      current_system_time_seconds(),
-    )
   let assert Error(ssr.JoinTokenInvalid(_)) =
     ssr.verify_join_token(token, "", "", current_system_time_seconds())
 }
@@ -640,10 +636,10 @@ pub fn join_token_rejects_other_secret_test() {
     )
 }
 
-pub fn create_session_token_is_unbound_join_token_without_model_test() {
-  // The v1 API mints a join token that carries no model and no session
-  // binding, so it can never restore state or cross sessions.
-  let session_token = ssr.create_session_token(join_secret)
+pub fn unbound_join_token_without_model_test() {
+  // A token with no model and no session binding can never restore state
+  // or cross sessions.
+  let session_token = signed_join_token("", option.None)
   let assert Ok(ssr.JoinToken(model_json: option.None, ..)) =
     ssr.verify_join_token(
       session_token,
@@ -840,23 +836,77 @@ pub fn to_response_for_request_binds_token_to_session_test() {
   let assert "{\"name\":\"World\"}" = model_json
 }
 
-pub fn join_token_omits_model_over_cookie_budget_test() {
+fn over_budget_config() -> ssr.SsrConfig(TestModel, TestMsg) {
   let big = string.repeat("x", 5000)
+  ssr.SsrConfig(
+    ..test_config(),
+    secret_key: join_secret,
+    recovery_encoder: option.Some(fn(_m: TestModel) { "\"" <> big <> "\"" }),
+  )
+}
+
+/// A browser drops a cookie over 4096 bytes. The model is never dropped to
+/// make the token fit (the session would silently restart from `init`): the
+/// page is refused, loudly.
+pub fn join_token_over_cookie_budget_is_refused_test() {
+  let #(minted, logs) =
+    log_capture.capture(fn() {
+      ssr.join_token_for(render_path(over_budget_config(), "/big"), "")
+    })
+  let assert Error(ssr.JoinTokenTooLarge(bytes: bytes, budget: 3800)) = minted
+  let assert True = bytes > ssr.join_token_cookie_budget_bytes
+  let assert True =
+    log_capture.has(logs, level: "error", containing: [
+      "Refusing \"/big\" (500): its join token is " <> int.to_string(bytes),
+      "over the 3800-byte cookie budget",
+    ])
+}
+
+pub fn page_over_cookie_budget_is_a_500_without_a_cookie_test() {
+  let assert Ok(Nil) = telemetry.start()
+  let id = "ssr_too_large_" <> int.to_string(unique_integer())
+  let events = process.new_subject()
+  let assert Ok(Nil) =
+    telemetry.attach(
+      id,
+      [["brazier", "ssr", "join_token", "too_large"]],
+      fn(event) { process.send(events, event) },
+    )
+  let assert Ok(resp) = ssr.to_response(render(over_budget_config()))
+  let assert Ok(Nil) = telemetry.detach(id)
+  let assert 500 = resp.status
+  let assert Error(Nil) = find_header(resp.headers, "set-cookie")
+  let assert Ok(event) = process.receive(events, 0)
+    as "the refusal emits its telemetry event in the calling process"
+  let assert Ok(bytes) = telemetry.int(event, "bytes")
+  let assert True = bytes > ssr.join_token_cookie_budget_bytes
+  let assert Ok(3800) = telemetry.int(event, "budget")
+}
+
+pub fn join_token_just_under_the_budget_keeps_its_model_test() {
+  // The largest model that fits is carried whole.
   let config =
     ssr.SsrConfig(
       ..test_config(),
       secret_key: join_secret,
-      recovery_encoder: option.Some(fn(_m: TestModel) { "\"" <> big <> "\"" }),
+      recovery_encoder: option.Some(fn(_m: TestModel) {
+        "\"" <> string.repeat("x", 2000) <> "\""
+      }),
     )
-  let token = ssr.join_token_for(render(config), "")
-  let assert True = string_length(token) <= 3800
-  let assert Ok(ssr.JoinToken(model_json: option.None, ..)) =
+  let assert Ok(token) = ssr.join_token_for(render(config), "")
+  let assert True =
+    string.byte_size(token) <= ssr.join_token_cookie_budget_bytes
+  let assert Ok(ssr.JoinToken(model_json: option.Some(model), ..)) =
     ssr.verify_join_token(token, join_secret, "", current_system_time_seconds())
+  let assert True = string.length(model) == 2002
 }
+
+@external(erlang, "erlang", "unique_integer")
+fn unique_integer() -> Int
 
 pub fn join_token_carries_no_model_without_serializer_test() {
   let config = ssr.SsrConfig(..test_config(), secret_key: join_secret)
-  let token = ssr.join_token_for(render(config), "")
+  let assert Ok(token) = ssr.join_token_for(render(config), "")
   let assert Ok(ssr.JoinToken(model_json: option.None, ..)) =
     ssr.verify_join_token(token, join_secret, "", current_system_time_seconds())
 }
@@ -915,13 +965,6 @@ fn find_header(
 @external(erlang, "brazier_test_ffi", "string_contains")
 fn do_str_contains(haystack: String, needle: String) -> Bool
 
-fn string_length(s: String) -> Int {
-  do_string_length(s)
-}
-
-@external(erlang, "erlang", "byte_size")
-fn do_string_length(s: String) -> Int
-
 fn string_index_of(haystack: String, needle: String) -> Result(Int, Nil) {
   do_string_index_of(haystack, needle)
 }
@@ -931,3 +974,94 @@ fn do_string_index_of(haystack: String, needle: String) -> Result(Int, Nil)
 
 @external(erlang, "brazier_test_ffi", "system_time_seconds")
 fn current_system_time_seconds() -> Int
+
+// --- Client bundle name cache ---
+
+const bundle_a = "brazier_client_0123456789abcdef.js"
+
+const bundle_b = "brazier_client_fedcba9876543210.js"
+
+/// A scratch assets dir holding a manifest that names bundle A, with the
+/// manifest's mtime at `mtime`.
+fn bundle_dir(mtime: Int) -> #(String, String) {
+  let dir = "/tmp/brazier_ssr_bundle_" <> int.to_string(unique_integer())
+  let assert Ok(Nil) = simplifile.create_directory_all(dir)
+    as "test directory must be creatable"
+  let manifest = dir <> "/brazier_client.manifest"
+  write_file(dir <> "/" <> bundle_a, "/* a */")
+  write_manifest(manifest, bundle_a, mtime)
+  #(dir, manifest)
+}
+
+fn write_manifest(manifest: String, name: String, mtime: Int) -> Nil {
+  write_file(manifest, name)
+  let assert Ok(Nil) = set_mtime(manifest, mtime)
+    as "the test sets the manifest's mtime"
+  Nil
+}
+
+fn write_file(path: String, contents: String) -> Nil {
+  let assert Ok(Nil) = simplifile.write(path, contents)
+    as "test file must be writable"
+  Nil
+}
+
+fn remove_dir(dir: String) -> Nil {
+  let assert Ok(Nil) = simplifile.delete(dir) as "test directory cleanup"
+  Nil
+}
+
+@external(erlang, "brazier_bundle_manifest_test_ffi", "set_mtime")
+fn set_mtime(path: String, posix: Int) -> Result(Nil, String)
+
+pub fn bundle_name_of_a_settled_manifest_is_cached_test() {
+  let #(dir, manifest) = bundle_dir(current_system_time_seconds() - 100)
+  let assert Ok(name) = ssr.client_bundle_name(dir)
+  assert name == bundle_a
+  let assert True = list.contains(ssr.cached_bundle_manifests(), manifest)
+    as "a manifest last changed before it was read is cached"
+  // A hit still checks the bundle: a deleted bundle is an error, not a
+  // name served from the cache.
+  let assert Ok(Nil) = simplifile.delete(dir <> "/" <> bundle_a)
+  let assert Error(reason) = ssr.client_bundle_name(dir)
+  let assert True =
+    string.contains(reason, bundle_a <> ", which does not exist")
+  remove_dir(dir)
+}
+
+pub fn bundle_name_cache_sees_a_rebuild_test() {
+  let now = current_system_time_seconds()
+  let #(dir, manifest) = bundle_dir(now - 100)
+  let assert Ok(_) = ssr.client_bundle_name(dir)
+  write_file(dir <> "/" <> bundle_b, "/* b */")
+  write_manifest(manifest, bundle_b, now - 50)
+  let assert Ok(name) = ssr.client_bundle_name(dir)
+  assert name == bundle_b
+  remove_dir(dir)
+}
+
+/// mtime has one-second resolution and every bundle name has the same
+/// length, so a manifest rewritten in the second it was read keeps its
+/// stat. Such a manifest is never served from the cache (git's racy-clean
+/// rule): here its mtime is never in the past, and a rewrite with the same
+/// stat is still seen.
+pub fn bundle_name_of_a_manifest_changed_this_second_is_not_cached_test() {
+  let racy = current_system_time_seconds() + 100
+  let #(dir, manifest) = bundle_dir(racy)
+  let assert Ok(name) = ssr.client_bundle_name(dir)
+  assert name == bundle_a
+  let assert False = list.contains(ssr.cached_bundle_manifests(), manifest)
+    as "a manifest modified in the second it was read is not cached"
+  write_file(dir <> "/" <> bundle_b, "/* b */")
+  write_manifest(manifest, bundle_b, racy)
+  let assert Ok(name) = ssr.client_bundle_name(dir)
+  assert name == bundle_b
+  remove_dir(dir)
+}
+
+pub fn bundle_name_of_a_missing_manifest_is_an_error_test() {
+  let dir = "/tmp/brazier_ssr_bundle_" <> int.to_string(unique_integer())
+  let assert Error(reason) = ssr.client_bundle_name(dir)
+  let assert True =
+    string.contains(reason, "Cannot read " <> dir <> "/brazier_client.manifest")
+}

@@ -17,8 +17,10 @@
 //// let assert Ok(Nil) =
 ////   telemetry.attach("http-logger", [["brazier", "http", "request", "stop"]], fn(event) {
 ////     let assert Ok(duration) = telemetry.int(event, "duration")
+////       as "every stop event measures its duration"
 ////     io.println("request took " <> int.to_string(duration))
 ////   })
+////   as "the handler id is unique"
 //// ```
 
 import gleam/dict.{type Dict}
@@ -139,6 +141,9 @@ pub fn catalogue() -> List(List(String)) {
     ["ws", "backpressure"],
     ["runtime", "stop"],
     ["effect", "timer", "rejected"],
+    ["effect", "after", "rejected"],
+    ["effect", "background", "rejected"],
+    ["ssr", "join_token", "too_large"],
     ["store", "write"],
     ["session", "created"],
     ["session", "revoked"],
@@ -332,6 +337,25 @@ pub fn effect_run_span(effect: String, run: fn() -> a) -> a
 @external(erlang, "brazier_telemetry_ffi", "effect_timer_rejected")
 @internal
 pub fn effect_timer_rejected(limit: Int) -> Nil
+
+/// `[brazier, effect, after, rejected]`: `effect.after` hit the per-runtime
+/// limit of pending timers.
+@external(erlang, "brazier_telemetry_ffi", "effect_after_rejected")
+@internal
+pub fn effect_after_rejected(limit: Int) -> Nil
+
+/// `[brazier, effect, background, rejected]`: `effect.background` hit the
+/// per-runtime limit of live workers.
+@external(erlang, "brazier_telemetry_ffi", "effect_background_rejected")
+@internal
+pub fn effect_background_rejected(limit: Int) -> Nil
+
+/// `[brazier, ssr, join_token, too_large]`: a page's join token, carrying
+/// the state-recovery model, is `bytes` long and over the cookie `budget`,
+/// so the page is refused with a 500 (see `ssr.join_token_cookie_budget_bytes`).
+@external(erlang, "brazier_telemetry_ffi", "ssr_join_token_too_large")
+@internal
+pub fn ssr_join_token_too_large(bytes: Int, budget: Int) -> Nil
 
 /// `[brazier, store, write]`.
 @external(erlang, "brazier_telemetry_ffi", "store_write")

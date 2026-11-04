@@ -68,6 +68,13 @@ with its own changelog, so they are not listed here.
     and the CDP scripts and the bench exit non-zero. The old published dev
     secret `beacon-dev-secret-change-in-production` is still refused as a
     weak key.
+- `ssr.create_session_token`, `ssr.verify_session_token` and
+  `ssr.max_token_lifetime_seconds` (the v1 session token) are removed. Use
+  `ssr.sign_join_token` and `ssr.verify_join_token`; a join token's
+  lifetime is `ssr.join_token_lifetime_seconds`.
+- `RenderedPage.sign_join_token` and `ssr.join_token_for` return
+  `Result(String, ssr.JoinTokenTooLarge)`: a token over the 3800-byte
+  cookie budget is an error, no longer a token with its model dropped.
 - (WS7) The application API was redesigned; see `docs/design/API_REDESIGN.md`.
   - There are three constructors: `beacon.simple`, `beacon.application` and
     `beacon.full_application`. They take a `Context` and the router, and
@@ -185,6 +192,26 @@ with its own changelog, so they are not listed here.
 
 ### Changed
 
+- The bundle name in `brazier_client.manifest` is cached in
+  `persistent_term` and validated by a stat of the manifest, as the client
+  asset cache is: a page render or join no longer reads the manifest. A
+  manifest modified in the second it was read is never trusted (git's
+  racy-clean rule), so a rebuild is always seen.
+- `effect.after` no longer spawns a process. It is an `erlang:send_after`
+  into the runtime's own mailbox (LiveView's `Process.send_after(self(), ...)`),
+  and its `make_msg` runs in the runtime when it fires. At most 100 timers
+  (`effect.max_after_timers`) can be pending per runtime; one more is
+  rejected with a warning and `[brazier, effect, after, rejected]`. A keyed
+  or cancellable `after` cancels its timer, and a message that was already
+  in flight is dropped.
+- `effect.background` is capped at 32 live workers per runtime
+  (`effect.max_background_processes`); one more never runs and is logged at
+  warning with `[brazier, effect, background, rejected]`.
+- The runtime no longer keeps a list of effect pids and no longer scans it
+  with `is_alive` on every update. The effect module tracks what each
+  runtime owns, bounded by the limits above, and `Shutdown` stops it all.
+- A dynamic-subscription change is diffed with sets, and not at all when
+  `subscriptions(model)` returns the same list as before.
 - (Phase 0) Gleam is pinned to 1.19.2 through `mise.toml`, and the
   dependency floors were raised.
 - (WS3) Per-event cost fell from about 243 µs to about 48 µs for an event
@@ -326,6 +353,15 @@ with its own changelog, so they are not listed here.
 
 ### Fixed
 
+- A `background` worker could run for a moment with no guardian watching
+  its owner, so an owner dying in that window left it orphaned. The
+  guardian now starts first, monitors the owner, and only then starts the
+  worker linked to itself.
+- `ws8c_runtime_stop_test` flaked when the runtime exited, from its
+  helper's exit signal, before it had handled the test's monitor, so the
+  DOWN said `noproc`. The test now makes the runtime (and the helper)
+  answer a synchronous request after each such monitor, and fails with a
+  clear message on a `noproc` DOWN.
 - (WS10b) After a shard restart, a session on the shard's node that follows
   the topic could get the new entry's join before the old entry's leave.
   The new shard's diffs that arrive before the session's read of the
@@ -396,6 +432,22 @@ with its own changelog, so they are not listed here.
 
 ### Security
 
+- A page whose join token is over the 3800-byte cookie budget is refused
+  with a 500 and no cookie, logged at error and reported as
+  `[brazier, ssr, join_token, too_large]`. It used to drop the model from
+  the token, so the session silently restarted from `init` on reconnect.
+- With state recovery on, a join token without a model refuses the join
+  (4400, the browser reloads) instead of starting the session from `init`.
+- Signing a join token with an empty secret key crashes instead of minting
+  a token that never verifies; the app already refuses to start without a
+  key.
+- Runtime and SSR logs name a page by its path only: the query string and
+  fragment (which can hold tokens or personal data) are dropped, and the
+  path is quoted with `string.inspect`, so a CR or LF from the browser
+  cannot forge a log line (LiveView's `filter_parameters` keeps such values
+  out of its logs).
+- SECURITY.md documents that state recovery restores the client-visible
+  model up to 24 hours old, and that authorization must not live in it.
 - (WS1) HTTP: request-line forms (absolute URI and `*`); limits on headers,
   bodies and packets; read timeouts against slowloris; HEAD responses carry
   no body.

@@ -1,7 +1,26 @@
 -module(brazier_effect_test_ffi).
--export([effect_guardian/1, pg_members/1, await_pg_empty/2]).
+-export([effect_guardian/1, pg_members/1, await_pg_empty/2,
+         after_timer_refs/1, timer_pending/1]).
 
 %% Lifecycle-test helpers.
+
+%% The erlang:send_after references of the after timers Owner has armed
+%% (brazier_effect_ffi keeps them in Owner's process dictionary). Crashes
+%% if Owner is not alive: the caller reads them before stopping it.
+after_timer_refs(Owner) ->
+    {dictionary, Dict} = erlang:process_info(Owner, dictionary),
+    case lists:keyfind(brazier_after_timers, 1, Dict) of
+        {brazier_after_timers, Timers} ->
+            [TimerRef || {TimerRef, _Fire} <- maps:values(Timers)];
+        false ->
+            []
+    end.
+
+%% Whether a send_after timer is still running. The VM cancels a timer
+%% whose destination process exits, so after the owner is DOWN this must
+%% be false.
+timer_pending(TimerRef) ->
+    is_integer(erlang:read_timer(TimerRef)).
 
 %% The guardian pid that brazier_effect_ffi:spawn_owned/1 records in the
 %% worker's process dictionary.

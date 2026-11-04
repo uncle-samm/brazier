@@ -268,9 +268,15 @@ HSTS is opt-in because Brazier does not terminate TLS: add `middleware.hsts(31_5
 
 `middleware.only`, `middleware.at` and `middleware.except` compare paths segment by segment, the way the routers read them, not as raw string prefixes. `only("/admin", mw)` covers `/admin` and `/admin/users` but not `/administrator`. A path is read both with empty segments dropped (page routing) and with dot segments resolved (API routing): `only` and `at` apply when either reading matches, and `except` skips the middleware only when both readings are under the prefix. So `//admin` still gets `only("/admin", auth)`, and `/public/../admin` still gets `except("/public", auth)`.
 
-## Session Tokens
+## Join Tokens
 
-SSR pages set a signed join/state recovery token in the HttpOnly `brazier_join_token` cookie; static error pages (4xx/5xx, which load no client) set none. The browser client sends an empty join token; the runtime reads the cookie from the WebSocket upgrade request. Tokens are created with `crypto.sign_message` using HMAC-SHA256 and contain a JSON payload with a timestamp, version, and optionally serialized model state. The `verify_session_token` function checks the signature and rejects tokens older than `max_age_seconds` (default 24 hours / 86400 seconds).
+SSR pages set a signed join token in the HttpOnly `brazier_join_token` cookie; static error pages (4xx/5xx, which load no client) set none. The browser client sends an empty join token; the runtime reads the cookie from the WebSocket upgrade request. Tokens follow Phoenix.Token: `ssr.sign_join_token` signs a JSON payload with `crypto.sign_message` (HMAC-SHA256) holding a purpose, the issue time, the expiry, a fingerprint of the browser session and, with state recovery, the client-visible model. `ssr.verify_join_token` checks the signature, the purpose, the session fingerprint and the expiry. A token lives 24 hours (`ssr.join_token_lifetime_seconds`); the expiry is signed into it, so a verifier cannot extend it. Signing with an empty secret key is a broken invariant (the app refuses to start without a key) and crashes.
+
+The token must fit in a cookie: a browser drops a cookie over 4096 bytes. A page whose token is over `ssr.join_token_cookie_budget_bytes` (3800 bytes) is refused with a plain-text 500 and no cookie, the error is logged with the token size, and `[brazier, ssr, join_token, too_large]` is emitted. The model is never dropped to make the token fit: the session would then restart from `init` on its next reconnect with nothing to say why. Keep the client-visible model small, or do not use state recovery.
+
+While state recovery is enabled, the runtime refuses a join (4400, the browser reloads for a fresh token) whose token is missing, does not verify, carries no model, or carries a model `restore` cannot decode. See [ERROR_HANDLING.md](ERROR_HANDLING.md#join-tokens).
+
+**What state recovery restores.** A recovered model is the client-visible model as it was when the page was rendered, up to 24 hours earlier. The `restore` function builds the session's state from it alone: it does not see the state the current `init` built, nor the request. So never put authorization (a role, a permission, a user id that grants access) in the client-visible model with recovery on: a reconnect would bring back what the page had, even if it was revoked since. Keep it in server state that `update` re-reads (the session store, or a database), as LiveView re-runs `mount` on every reconnect and reloads the user from the session there.
 
 The cookie is `HttpOnly`, `SameSite=Lax`, path `/`, and has `Max-Age=86400`. JavaScript cannot read it, so XSS cannot directly steal the join token from DOM state.
 
@@ -431,9 +437,9 @@ exact host, with `Secure` and `Path=/`.
 
 `upload.error_status` maps each error to 400, 413, 415 or 500.
 
-## Timer Cap
+## Effect Caps
 
-The effect system caps periodic timers at 10 per runtime process (`effect.every`). Attempts to create additional timers are rejected with a warning log. This prevents runaway timer creation from buggy update handlers.
+The effect system caps what one runtime process can have running: 10 periodic timers (`effect.every`), 100 pending `effect.after` timers and 32 live `effect.background` workers. One more is rejected with a warning log and a `rejected` telemetry event. This prevents runaway timer or process creation from buggy update handlers. See [EFFECTS.md](EFFECTS.md#limits).
 
 ## Model Size Bounds
 

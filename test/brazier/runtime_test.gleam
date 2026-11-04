@@ -1,7 +1,9 @@
 import brazier/await
+import brazier/cluster/log_capture as cluster_log_capture
 import brazier/effect
 import brazier/error
 import brazier/internal/context
+import brazier/internal/log_path
 import brazier/log_capture
 import brazier/pubsub
 import brazier/runtime
@@ -279,7 +281,7 @@ pub fn start_with_a_crashing_init_is_a_startup_error_test() {
   let assert True = string.starts_with(reason, "init crashed: ")
   let assert True =
     log_capture.has(logs, level: "error", containing: [
-      "init or the initial route crashed for /",
+      "init or the initial route crashed for \"/\"",
     ])
   // The caller survived and can start a healthy runtime.
   let assert Ok(_subject) = runtime.start(counter_config(), test_context())
@@ -302,7 +304,7 @@ pub fn start_with_unknown_route_keeps_init_state_test() {
     list.any(msgs, fn(msg) {
       case msg {
         transport.SendError(reason: reason) ->
-          string.contains(reason, "no route for the joined path /nowhere")
+          string.contains(reason, "no route for the joined path \"/nowhere\"")
         _ -> False
       }
     })
@@ -340,6 +342,48 @@ pub fn navigation_runs_on_change_for_known_route_test() {
     process.receive(transport_subject, await.deadline_ms)
   let assert True = string.contains(ops, "settings")
   let assert True = string.contains(ops, "home,settings")
+}
+
+// --- client paths in logs (SEC-17) ---
+
+pub fn log_path_drops_query_and_fragment_test() {
+  let assert "\"/settings\"" =
+    log_path.describe("/settings?token=s3cr3t&email=a@b.c#frag")
+  let assert "\"/settings\"" = log_path.describe("/settings#frag?not=query")
+  let assert "\"/\"" = log_path.describe("/")
+}
+
+pub fn log_path_quotes_control_characters_test() {
+  // A forged second log line stays inside the quoted path.
+  let assert "\"/a\\nERROR forged\"" = log_path.describe("/a\nERROR forged")
+}
+
+pub fn join_and_navigation_logs_omit_the_query_test() {
+  let #(ops, lines) =
+    cluster_log_capture.capture(fn() {
+      let #(subject, transport_subject, _first) =
+        join_routed("/settings?tab=s3cr3t-join", "r_log")
+      process.send(
+        subject,
+        runtime.ClientNavigated(conn_id: "r_log", path: "/?tab=s3cr3t-nav"),
+      )
+      // The patch is sent after the navigation is logged.
+      let assert Ok(transport.SendPatch(ops_json: ops, ..)) =
+        process.receive(transport_subject, await.deadline_ms)
+      ops
+    })
+  let assert True =
+    cluster_log_capture.contains(
+      lines,
+      "info",
+      "Client joined: r_log path: \"/settings\"",
+    )
+  let assert True =
+    cluster_log_capture.contains(lines, "info", "Navigation: r_log → \"/\"")
+  let assert False =
+    list.any(lines, fn(line) { string.contains(line.message, "s3cr3t") })
+  // The query still reached the app: only the logs drop it.
+  let assert True = string.contains(ops, "s3cr3t-nav")
 }
 
 pub fn navigation_to_same_route_runs_on_change_again_test() {
@@ -1139,6 +1183,17 @@ pub fn state_recovery_rejects_expired_token_test() {
   assert_join_refused(subject, "expired_conn", conn, first)
 }
 
+/// The page render puts the model in every join token while recovery is
+/// on; a token without one must not quietly restart the session from init.
+pub fn state_recovery_refuses_a_token_without_a_model_test() {
+  let assert Ok(subject) =
+    runtime.start(recovery_config(recovery_secret), test_context())
+  let modelless =
+    ssr.sign_join_token(recovery_secret, "", option.None, ssr_now())
+  let #(conn, first) = join_and_receive(subject, "modelless_conn", modelless)
+  assert_join_refused(subject, "modelless_conn", conn, first)
+}
+
 pub fn state_recovery_rejects_model_the_deserializer_refuses_test() {
   let assert Ok(subject) =
     runtime.start(recovery_config(recovery_secret), test_context())
@@ -1158,10 +1213,10 @@ pub fn state_recovery_only_applies_to_first_join_test() {
   // the first connection is already looking at.
   let assert Ok(subject) =
     runtime.start(recovery_config(recovery_secret), test_context())
-  // The first join's token carries no model: nothing to recover.
-  let modelless =
-    ssr.sign_join_token(recovery_secret, "", option.None, ssr_now())
-  let #(_, first) = join_and_receive(subject, "first_conn", modelless)
+  // The first join recovers its token's model.
+  let first_token =
+    ssr.sign_join_token(recovery_secret, "", option.Some("0"), ssr_now())
+  let #(_, first) = join_and_receive(subject, "first_conn", first_token)
   let assert transport.SendModelSync(model_json: "0", ..) = first
   let token =
     runtime.create_state_token(

@@ -143,8 +143,8 @@ state is the model, pass `function.identity`.
   [DEPLOYMENT.md](DEPLOYMENT.md#secret-key)).
 - The join token is checked before `init` runs. A token that does not verify
   (malformed, signed with another key, older than 24 hours, or issued to
-  another browser session), a token whose model `restore` cannot decode, and
-  a missing token while recovery is enabled refuse the connection. The
+  another browser session), a token whose model `restore` cannot decode, a
+  token without a model, and a missing token refuse the connection. The
   refusal is logged as a warning, the WebSocket closes with **4400**, and the
   browser reloads the page, whose server render issues a fresh token (at most
   3 reloads per tab within 60 seconds, then the page shows an error state).
@@ -155,6 +155,12 @@ state is the model, pass `function.identity`.
   therefore reloads once on reconnect: the new process generated a new key.
 - Recovery with an empty secret key is a configuration error: the runtime
   refuses to start.
+- The model must fit in a cookie with its signature: a page whose join token
+  is over 3800 bytes is refused with a 500 (see
+  [ERROR_HANDLING.md](ERROR_HANDLING.md#join-tokens)).
+- `restore` sees only the recovered model, which can be up to 24 hours old.
+  Do not keep authorization in the client-visible model (see
+  [SECURITY.md](SECURITY.md#join-tokens)).
 - Without `with_state_recovery` the session starts from `init`. A missing
   token is then fine, but a token that does not verify still refuses the
   connection the same way.
