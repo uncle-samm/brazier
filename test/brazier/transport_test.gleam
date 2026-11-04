@@ -1,11 +1,13 @@
 import brazier/transport
 import brazier/transport/ws
 import gleam/bit_array
+import gleam/bytes_tree
 import gleam/dynamic/decode
 import gleam/json
 import gleam/list
 import gleam/option
 import gleam/string
+import gleam/string_tree
 
 // --- ServerMessage encoding tests ---
 
@@ -27,12 +29,66 @@ pub fn encode_model_sync_message_test() {
       ack_clock: 1,
     )
   let encoded = transport.encode_server_message(msg)
-  let assert Ok("model_sync") =
-    json.parse(encoded, decode.at(["type"], decode.string))
-  let assert Ok("{\"count\":1}") =
-    json.parse(encoded, decode.at(["model"], decode.string))
-  let assert Ok(1) = json.parse(encoded, decode.at(["version"], decode.int))
-  let assert Ok(1) = json.parse(encoded, decode.at(["ack_clock"], decode.int))
+  // The model JSON is embedded raw: an object, not a string to parse again.
+  let assert "{\"type\":\"model_sync\",\"model\":{\"count\":1},\"version\":1,\"ack_clock\":1}" =
+    encoded
+  let assert Ok(1) =
+    json.parse(encoded, decode.at(["model", "count"], decode.int))
+}
+
+pub fn encode_model_sync_embeds_large_model_unescaped_test() {
+  // Quotes, backslashes and unicode inside the model stay as the encoder
+  // wrote them; they are not escaped a second time.
+  let model_json = "{\"text\":\"say \\\"hi\\\" \\\\ \\u00e9\",\"n\":[1,2,3]}"
+  let encoded =
+    transport.encode_server_message(transport.ServerModelSync(
+      model_json:,
+      version: 3,
+      ack_clock: 2,
+    ))
+  let assert True =
+    encoded
+    == "{\"type\":\"model_sync\",\"model\":"
+    <> model_json
+    <> ",\"version\":3,\"ack_clock\":2}"
+  let assert Ok("say \"hi\" \\ é") =
+    json.parse(encoded, decode.at(["model", "text"], decode.string))
+}
+
+pub fn encode_server_message_tree_matches_string_encoding_test() {
+  let messages = [
+    transport.ServerModelSync(model_json: "{\"a\":1}", version: 1, ack_clock: 0),
+    transport.ServerPatch(
+      ops_json: "[{\"op\":\"remove\",\"path\":\"/a\"}]",
+      version: 2,
+      ack_clock: 1,
+    ),
+    transport.ServerError(reason: "x"),
+    transport.ServerTitle(title: "T"),
+  ]
+  list.each(messages, fn(msg) {
+    let assert True =
+      string_tree.to_string(transport.encode_server_message_tree(msg))
+      == transport.encode_server_message(msg)
+  })
+}
+
+pub fn encode_text_tree_frame_matches_flat_frame_test() {
+  // The iodata frame the transport writes is byte-identical to the flat
+  // frame, at each of the three payload length encodings (7, 16, 64 bit).
+  list.each([0, 125, 126, 65_535, 65_536, 70_000], fn(size) {
+    let text = string.repeat("a", size)
+    let tree =
+      ws.encode_text_tree(
+        string_tree.from_strings([
+          string.slice(text, 0, size / 2),
+          string.drop_start(text, size / 2),
+        ]),
+      )
+    let assert True = bytes_tree.to_bit_array(tree) == ws.encode_text(text)
+    let assert True =
+      bytes_tree.byte_size(tree) == bit_array.byte_size(ws.encode_text(text))
+  })
 }
 
 pub fn encode_heartbeat_ack_test() {
@@ -162,10 +218,14 @@ pub fn encode_patch_message_test() {
   let encoded = transport.encode_server_message(msg)
   let assert Ok("patch") =
     json.parse(encoded, decode.at(["type"], decode.string))
-  let assert Ok("[{\"op\":\"replace\",\"path\":\"/count\",\"value\":1}]") =
-    json.parse(encoded, decode.at(["ops"], decode.string))
-  let assert Ok(2) = json.parse(encoded, decode.at(["version"], decode.int))
-  let assert Ok(2) = json.parse(encoded, decode.at(["ack_clock"], decode.int))
+  // The ops JSON is embedded raw: an array, not a string to parse again.
+  let assert "{\"type\":\"patch\",\"ops\":[{\"op\":\"replace\",\"path\":\"/count\",\"value\":1}],\"version\":2,\"ack_clock\":2}" =
+    encoded
+  let assert Ok([1]) =
+    json.parse(
+      encoded,
+      decode.at(["ops"], decode.list(decode.at(["value"], decode.int))),
+    )
 }
 
 pub fn encode_navigate_message_test() {

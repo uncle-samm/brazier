@@ -611,10 +611,11 @@ function inputLocked() {
     || outbound.some((msg) => msg.type === "event" || msg.type === "event_batch");
 }
 
-// Decode an authoritative model and render it. Returns null on success or
-// the reason it failed. Throws if the app's code throws.
-function adoptAuthoritativeModel(modelStr) {
-  const result = app.decode_model(modelStr);
+// Decode an authoritative model (the parsed JSON value, never text) and
+// render it. Returns null on success or the reason it failed. Throws if the
+// app's code throws.
+function adoptAuthoritativeModel(modelValue) {
+  const result = app.decode_model(modelValue);
   if (!result.isOk()) return "decode_model failed: " + String(result[0]);
   const model = result[0];
   if (predicted) {
@@ -957,7 +958,9 @@ function invalidateModelCache() {
   modelSynced = false;
 }
 
-function handleModelSync(modelJson, version, ackClock) {
+// `model` is the frame's `model` value, parsed with the frame: the server
+// embeds the model JSON raw, so it is never parsed a second time.
+function handleModelSync(model, version, ackClock) {
   // Any model_sync answers an outstanding request_sync, applied or not.
   syncRequestInFlight = false;
   mark("model-sync-start");
@@ -982,12 +985,16 @@ function handleModelSync(modelJson, version, ackClock) {
   if (held && !clientInitialized) {
     throw new Error("[brazier] invariant violated: a simple event is pending before the client was initialized");
   }
-  let parsed;
+  // A frame without a model field cannot be applied. Any other value is
+  // handed to decode_model, which refuses one that is not the app's Model.
+  if (model === undefined) {
+    modelSyncFailed(version, "the frame has no model field");
+    return;
+  }
   try {
-    parsed = JSON.parse(modelJson);
     if (!held) {
       markServerAckApplied(ackClock);
-      const failure = adoptAuthoritativeModel(modelJson);
+      const failure = adoptAuthoritativeModel(model);
       if (failure !== null) {
         modelSyncFailed(version, failure);
         return;
@@ -997,7 +1004,7 @@ function handleModelSync(modelJson, version, ackClock) {
     modelSyncFailed(version, e && e.message ? e.message : String(e));
     return;
   }
-  clientModelJson = parsed;
+  clientModelJson = model;
   currentModelVersion = version;
   modelSynced = true;
   consecutiveModelSyncFailures = 0;
@@ -1025,7 +1032,9 @@ function modelSyncFailed(version, reason) {
   requestFullSync("model_sync_failed");
 }
 
-function handlePatch(opsJson, version, ackClock) {
+// `ops` is the frame's `ops` value, parsed with the frame: the server embeds
+// the RFC 6902 array raw, so it is never parsed a second time.
+function handlePatch(ops, version, ackClock) {
   mark("patch-start");
   if (!isWireClock(ackClock)) {
     console.error("[brazier] Patch v" + JSON.stringify(version) + " has invalid ack_clock " + JSON.stringify(ackClock) + "; requesting full sync");
@@ -1033,17 +1042,8 @@ function handlePatch(opsJson, version, ackClock) {
     requestFullSync("invalid_ack_clock");
     return;
   }
-  let ops;
-  try {
-    ops = typeof opsJson === "string" ? JSON.parse(opsJson) : opsJson;
-  } catch (e) {
-    console.error("[brazier] Patch ops are not valid JSON; requesting full sync:", e.message);
-    invalidateModelCache();
-    requestFullSync("patch_ops_unparseable");
-    return;
-  }
   if (!Array.isArray(ops)) {
-    console.error("[brazier] Patch ops are not an array; requesting full sync");
+    console.error("[brazier] Patch ops are not an array (got " + (ops === null ? "null" : typeof ops) + "); requesting full sync");
     invalidateModelCache();
     requestFullSync("patch_ops_not_array");
     return;
@@ -1093,7 +1093,7 @@ function handlePatch(opsJson, version, ackClock) {
   }
   try {
     markServerAckApplied(ackClock);
-    const failure = adoptAuthoritativeModel(JSON.stringify(newModelJson));
+    const failure = adoptAuthoritativeModel(newModelJson);
     if (failure !== null) {
       console.error("[brazier] Patch v" + version + " produced a model the client cannot decode (" + failure + "); requesting full sync");
       invalidateModelCache();
@@ -1127,7 +1127,7 @@ function handleAckPatch(version, ackClock) {
   if (hasPendingModelEvent()) return;
   if (!wasPending && !(wasLocked && !inputLocked())) return;
   try {
-    const failure = adoptAuthoritativeModel(JSON.stringify(clientModelJson));
+    const failure = adoptAuthoritativeModel(clientModelJson);
     if (failure !== null) {
       console.error("[brazier] Cached model v" + version + " cannot be decoded after ack (" + failure + "); requesting full sync");
       invalidateModelCache();

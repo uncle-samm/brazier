@@ -523,6 +523,37 @@ pub fn fragmented_message_with_interleaved_ping_is_reassembled_test() {
   raw_close(probe.socket)
 }
 
+pub fn state_frames_embed_model_and_ops_raw_on_the_socket_test() {
+  let server = start_server(test_limits(), None)
+  let probe = open(server)
+  // Above 65_535 bytes, so the frame uses the 64-bit length header.
+  let model_json =
+    "{\"rows\":["
+    <> string.join(list.repeat("\"row \\\"q\\\"\"", 8000), ",")
+    <> "]}"
+  let assert True = string.byte_size(model_json) > 65_535
+  process.send(
+    probe.runtime,
+    transport.SendModelSync(model_json:, version: 4, ack_clock: 3),
+  )
+  let assert True =
+    recv_text(probe.socket)
+    == "{\"type\":\"model_sync\",\"model\":"
+    <> model_json
+    <> ",\"version\":4,\"ack_clock\":3}"
+  let ops_json = "[{\"op\":\"replace\",\"path\":\"/rows/0\",\"value\":\"x\"}]"
+  process.send(
+    probe.runtime,
+    transport.SendPatch(ops_json:, version: 5, ack_clock: 3),
+  )
+  let assert True =
+    recv_text(probe.socket)
+    == "{\"type\":\"patch\",\"ops\":"
+    <> ops_json
+    <> ",\"version\":5,\"ack_clock\":3}"
+  raw_close(probe.socket)
+}
+
 pub fn many_frames_in_one_tcp_segment_are_all_processed_test() {
   let server = start_server(test_limits(), None)
   let probe = open(server)

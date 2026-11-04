@@ -3,7 +3,8 @@
 ///
 /// The client runtime calls these exports by name:
 ///
-/// - `decode_model(json)`: the Model in a `model_sync` payload.
+/// - `decode_model(data)`: the Model from the parsed `model` value of a
+///   `model_sync` frame (a Dynamic; the frame is parsed once).
 /// - `init_local(model)`: the first Local state, `Nil` without a layer.
 /// - `render(model, local)`: the view as `#(html, handlers)`.
 /// - `lookup_handler(handlers, event, id)`, `run_handler(handler, event)`,
@@ -68,14 +69,17 @@ pub fn generate(analysis: Analysis) -> Result(String, String) {
         Function(
           "decode_model",
           True,
-          ["The Model in a `model_sync` payload."],
-          [Param("data", codec_gen.string_type())],
+          [
+            "The Model in a `model_sync` frame: its `model` value, already",
+            "parsed with the rest of the frame.",
+          ],
+          [Param("data", TNamed(Some(dynamic_module), "Dynamic", []))],
           codec_gen.result_type(model_type),
           [
             ExprStmt(
               Case(
                 [
-                  Call(Ref(Some(codec_gen.json), "parse"), [
+                  Call(Ref(Some(codec_gen.decode), "run"), [
                     Arg(Var("data")),
                     Arg(model_decoder),
                   ]),

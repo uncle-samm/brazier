@@ -413,8 +413,12 @@ let renders = 0;
 function makeApp(spec = {}) {
   const view = spec.view || (() => ({ html: "", handlers: [] }));
   const app = {
-    decode_model(json) {
-      const value = JSON.parse(json);
+    // The runtime hands decode_model the parsed `model` value of the frame
+    // (or the patched cached value), never text: a string here means the
+    // model JSON was parsed twice or re-stringified.
+    decode_model(value) {
+      if (typeof value === "string") return err("decode_model got JSON text, not a parsed value");
+      if (value === null || typeof value !== "object") return err("model is not an object");
       if (value.bad === true) return err("bad model");
       decoded.push(value);
       return ok(value);
@@ -520,11 +524,12 @@ async function loadRuntime(options = {}) {
   return runtime;
 }
 
+// The server embeds the model and the ops raw: `"model":{...}`, `"ops":[...]`.
 function sync(socket, version, model, ackClock = 0) {
-  socket.deliver({ type: "model_sync", model: JSON.stringify(model), version, ack_clock: ackClock });
+  socket.deliver({ type: "model_sync", model, version, ack_clock: ackClock });
 }
 function patch(socket, version, ops, ackClock = 0) {
-  socket.deliver({ type: "patch", ops: JSON.stringify(ops), version, ack_clock: ackClock });
+  socket.deliver({ type: "patch", ops, version, ack_clock: ackClock });
 }
 function event(clockValue) {
   return { type: "event", name: "click", handler_id: "h", data: "{}", target_path: "0", clock: clockValue };
@@ -1433,7 +1438,7 @@ scenario("a model_sync or patch without a valid ack_clock is a protocol error th
   const s = sockets[0];
   s.open();
   const requests = () => s.types().filter((t) => t === "request_sync").length;
-  s.deliver({ type: "model_sync", model: JSON.stringify({ count: 1 }), version: 0 });
+  s.deliver({ type: "model_sync", model: { count: 1 }, version: 0 });
   assert.equal(decoded.length, 0, "a model_sync without ack_clock is not applied");
   assert.equal(errorsMatching("invalid ack_clock undefined").length, 1);
   assert.equal(requests(), 1);
@@ -1441,14 +1446,39 @@ scenario("a model_sync or patch without a valid ack_clock is a protocol error th
   assert.deepEqual(decoded.at(-1), { count: 0 }, "a valid model_sync recovers");
   for (const [i, ackClock] of [undefined, "1", -1, 1.5, null].entries()) {
     sync(s, i, { count: i });
-    s.deliver({ type: "patch", ops: JSON.stringify([{ op: "replace", path: "/count", value: 99 }]), version: i + 1, ack_clock: ackClock });
+    s.deliver({ type: "patch", ops: [{ op: "replace", path: "/count", value: 99 }], version: i + 1, ack_clock: ackClock });
     assert.deepEqual(decoded.at(-1), { count: i }, `a patch with ack_clock ${JSON.stringify(ackClock)} is not applied`);
     assert.equal(s.types().at(-1), "request_sync", `a patch with ack_clock ${JSON.stringify(ackClock)} resyncs`);
   }
   assert.equal(errorsMatching("has invalid ack_clock").length, 5);
-  s.deliver({ type: "model_sync", model: JSON.stringify({ count: 7 }), version: 9, ack_clock: "9" });
+  s.deliver({ type: "model_sync", model: { count: 7 }, version: 9, ack_clock: "9" });
   assert.notDeepEqual(decoded.at(-1), { count: 7 }, "a model_sync with a string ack_clock is not applied");
   assert.equal(errorsMatching('invalid ack_clock "9"').length, 1);
+});
+
+scenario("a model or ops sent as JSON text instead of a raw value is refused and resyncs", async () => {
+  await loadRuntime();
+  const s = sockets[0];
+  s.open();
+  const requests = () => s.types().filter((t) => t === "request_sync").length;
+  // The wire format before raw embedding: "model":"{...}" and "ops":"[...]".
+  s.deliver({ type: "model_sync", model: JSON.stringify({ count: 1 }), version: 0, ack_clock: 0 });
+  assert.equal(decoded.length, 0, "a model sent as text is not adopted");
+  assert.equal(errorsMatching("decode_model got JSON text").length, 1);
+  assert.equal(requests(), 1);
+  s.deliver({ type: "model_sync", version: 0, ack_clock: 0 });
+  assert.equal(decoded.length, 0, "a model_sync without a model is not adopted");
+  assert.equal(errorsMatching("the frame has no model field").length, 1);
+  assert.equal(requests(), 2);
+  sync(s, 0, { count: 0 });
+  assert.deepEqual(decoded.at(-1), { count: 0 }, "a raw model is adopted as parsed");
+  s.deliver({ type: "patch", ops: JSON.stringify([{ op: "replace", path: "/count", value: 5 }]), version: 1, ack_clock: 0 });
+  assert.deepEqual(decoded.at(-1), { count: 0 }, "ops sent as text are not applied");
+  assert.equal(errorsMatching("Patch ops are not an array (got string)").length, 1);
+  assert.equal(requests(), 3);
+  sync(s, 1, { count: 1 });
+  patch(s, 2, [{ op: "replace", path: "/count", value: 5 }]);
+  assert.deepEqual(decoded.at(-1), { count: 5 }, "raw ops patch the parsed model");
 });
 
 scenario("an event without a valid clock is refused before it is queued", async () => {

@@ -166,6 +166,19 @@ with its own changelog, so they are not listed here.
 - (Final audit SEC-7) `auth.allow_guests_ws` refuses a bound socket whose
   session is gone, expired or has no user (4401, the page reloads) instead
   of keeping it open as a guest.
+- (Audit PERF-6) Wire format: `model_sync`'s `model` and `patch`'s `ops`
+  are raw JSON values in the frame (`"model":{"count":1}`,
+  `"ops":[...]`, an ack is `"ops":[]`), not JSON strings holding them. A
+  client must not parse them a second time. A client built before this
+  change, loaded without a build id, fails its syncs loudly (3 retries,
+  then an error) instead of running on; a page loaded from the hashed
+  bundle gets 4409 and reloads. The generated `brazier_app_entry`'s
+  `decode_model` takes the parsed `model` as a `Dynamic`, not JSON text.
+- (Audit PERF-2) `patch.diff` returns `Result(Diff, String)` (`Unchanged`
+  or `Ops(json)`), and an input that is not JSON is an `Error` instead of a
+  crash. `patch.is_empty`, `patch.diff_json` and `patch.merge_ops_json`
+  are removed. The runtime's cached model is
+  `FullModelCache(snapshot: patch.Snapshot)`.
 
 ### Added
 
@@ -399,6 +412,20 @@ with its own changelog, so they are not listed here.
   `allowed_hosts` once, when it starts, as Phoenix compiles `check_origin`,
   and refuses to start with an invalid entry. Origins used to be parsed on
   every upgrade, and an invalid entry silently matched nothing.
+- (Audit PERF-2) The runtime keeps the last model it sent decoded as well
+  as encoded (`patch.Snapshot`, as LiveView keeps the last rendered tree on
+  the socket), so a changed event decodes only the new model, the diff
+  reports an empty result without parsing the ops back, and a broadcast
+  that falls back to `model_sync` no longer encodes the model twice. With a
+  500 KB model a changed event went from about 4.1 ms to 2.5 ms. Encoder
+  output that is not JSON is logged as an error and answered with an
+  `error` frame instead of crashing the diff or being sent raw.
+- (Audit PERF-6) A `model_sync` or `patch` frame is built as iodata: the
+  model and ops JSON go into the envelope as they are (Phoenix's V2
+  serializer), the WebSocket header goes in front of the text (cowlib's
+  `cow_ws:frame`), and `gen_tcp:send` writes it without flattening. A
+  50 KB `model_sync` costs about 0.3 µs to frame instead of 117 µs, and
+  the browser parses each frame once instead of parsing the model again.
 
 ### Fixed
 

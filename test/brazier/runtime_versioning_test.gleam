@@ -8,6 +8,7 @@
 import brazier/await
 import brazier/effect
 import brazier/error
+import brazier/patch
 import brazier/pubsub
 import brazier/runtime
 import brazier/test_ctx
@@ -558,26 +559,195 @@ const subscription_changed = ["brazier", "subscription", "changed"]
 
 // --- snapshot diffs ---
 
+fn cache_of(json: String) -> runtime.CachedModelState {
+  let assert Ok(snapshot) = patch.snapshot(json) as "test model JSON is valid"
+  runtime.FullModelCache(snapshot)
+}
+
 pub fn snapshot_diff_of_equal_json_is_unchanged_test() {
   let json = model_json(Model(0, "", "/"))
-  let assert runtime.Unchanged =
-    runtime.diff_snapshot(runtime.FullModelCache(json), json)
+  let cache = cache_of(json)
+  let assert runtime.FullModelCache(cached) = cache
+  // The very snapshot that is cached comes back: nothing was decoded.
+  let assert runtime.Unchanged(snapshot) = runtime.diff_snapshot(cache, json)
+  let assert True = snapshot == cached
+}
+
+pub fn snapshot_diff_of_equivalent_json_is_unchanged_test() {
+  // A different string that decodes equal: no patch, and the new string is
+  // what gets cached.
+  let new_json = " " <> model_json(Model(0, "", "/"))
+  let assert runtime.Unchanged(snapshot) =
+    runtime.diff_snapshot(cache_of(model_json(Model(0, "", "/"))), new_json)
+  let assert True = patch.snapshot_json(snapshot) == new_json
 }
 
 pub fn snapshot_diff_reports_only_changed_fields_test() {
-  let assert runtime.Changed(ops) =
-    runtime.diff_snapshot(
-      runtime.FullModelCache(model_json(Model(0, "", "/"))),
-      model_json(Model(1, "", "/")),
-    )
+  let new_json = model_json(Model(1, "", "/"))
+  let assert runtime.Changed(ops, snapshot) =
+    runtime.diff_snapshot(cache_of(model_json(Model(0, "", "/"))), new_json)
   let assert True = string.contains(ops, "\"/count\"")
   let assert False = string.contains(ops, "/path")
   let assert False = string.contains(ops, "/blob")
+  let assert True = patch.snapshot_json(snapshot) == new_json
 }
 
 pub fn snapshot_diff_without_cache_is_resync_test() {
-  let assert runtime.Resync =
-    runtime.diff_snapshot(runtime.NoCache, model_json(Model(0, "", "")))
+  let json = model_json(Model(0, "", ""))
+  let assert runtime.Resync(snapshot) =
+    runtime.diff_snapshot(runtime.NoCache, json)
+  let assert True = patch.snapshot_json(snapshot) == json
+}
+
+pub fn snapshot_diff_of_invalid_json_is_refused_test() {
+  let assert runtime.InvalidJson(reason) =
+    runtime.diff_snapshot(cache_of(model_json(Model(0, "", ""))), "{\"count\":")
+  let assert True = string.contains(reason, "does not decode")
+  let assert runtime.InvalidJson(_) =
+    runtime.diff_snapshot(runtime.NoCache, "{\"count\":1} trailing")
+}
+
+@external(erlang, "brazier_patch_test_ffi", "random_chain")
+fn random_chain(seed: Int, steps: Int) -> List(String)
+
+/// PERF-2 property: over seeded chains of random models, the cache the
+/// runtime keeps (decoded once per model) turns each step into ops that
+/// take the client's copy of the previous model exactly to the new one,
+/// and reports "unchanged" only when the documents decode equal.
+pub fn snapshot_diff_chain_patches_client_to_every_new_model_test() {
+  let #(changed, unchanged) =
+    int.range(from: 1, to: 201, with: #(0, 0), run: fn(counts, seed) {
+      let assert [first, ..rest] = random_chain(seed, 25)
+        as "a chain has a first model"
+      let assert runtime.Resync(snapshot) =
+        runtime.diff_snapshot(runtime.NoCache, first)
+      let #(_, _, counts) =
+        list.fold(
+          rest,
+          #(runtime.FullModelCache(snapshot), first, counts),
+          fn(acc, new_json) {
+            let #(cache, client, #(changed, unchanged)) = acc
+            case runtime.diff_snapshot(cache, new_json) {
+              runtime.Changed(ops, snapshot) -> {
+                let assert False = ops == "[]" as "Changed carries real ops"
+                let assert Ok(patched) = patch.apply_ops(client, ops)
+                  as { "seed " <> int.to_string(seed) <> ": ops refused" }
+                let assert True = canonical(patched) == canonical(new_json)
+                  as {
+                    "seed "
+                    <> int.to_string(seed)
+                    <> ": patched "
+                    <> patched
+                    <> " is not "
+                    <> new_json
+                  }
+                #(
+                  runtime.FullModelCache(snapshot),
+                  patched,
+                  #(changed + 1, unchanged),
+                )
+              }
+              runtime.Unchanged(snapshot) -> {
+                let assert True = canonical(client) == canonical(new_json)
+                  as { "seed " <> int.to_string(seed) <> ": missed a change" }
+                #(
+                  runtime.FullModelCache(snapshot),
+                  client,
+                  #(changed, unchanged + 1),
+                )
+              }
+              runtime.Resync(_) -> panic as "a cached snapshot never resyncs"
+              runtime.InvalidJson(reason) ->
+                panic as { "generated JSON refused: " <> reason }
+            }
+          },
+        )
+      counts
+    })
+  // Both outcomes must be exercised in quantity, or the property is weak.
+  let assert True = changed > 3000 as "most chain steps change the model"
+  let assert True = unchanged > 500 as "some chain steps leave it unchanged"
+}
+
+/// Re-encode through the patch engine (empty ops) so key order is canonical.
+fn canonical(json: String) -> String {
+  let assert Ok(encoded) = patch.apply_ops(json, "[]")
+    as "canonical of valid JSON"
+  encoded
+}
+
+/// `config()` with an encoder that reports each call (the model's count)
+/// to `encodes`, and returns invalid JSON while the count is 1.
+fn reporting_config(
+  encodes: Subject(Int),
+) -> runtime.RuntimeConfig(Model, Msg) {
+  runtime.RuntimeConfig(..config(), encode_model: fn(m: Model) {
+    process.send(encodes, m.count)
+    case m.count {
+      1 -> "{\"count\":"
+      _ -> model_json(m)
+    }
+  })
+}
+
+/// Every encode reported so far. The runtime reports an encode before it
+/// sends what it encoded, so after receiving that frame the report is
+/// already in this process's mailbox.
+fn encodes_so_far(encodes: Subject(Int), acc: List(Int)) -> List(Int) {
+  case process.receive(encodes, 0) {
+    Ok(count) -> encodes_so_far(encodes, [count, ..acc])
+    Error(Nil) -> list.reverse(acc)
+  }
+}
+
+pub fn invalid_model_json_fails_loudly_and_resyncs_after_fix_test() {
+  let encodes = process.new_subject()
+  let assert Ok(rt) = runtime.start(reporting_config(encodes), test_ctx.root())
+  let s = join(rt, "c", "")
+  let assert transport.SendModelSync(version: 0, ..) = next(s)
+
+  // The encoder returns invalid JSON: nothing reaches the client but an
+  // error, and the event is still acknowledged at the same revision.
+  event(rt, "c", "inc", 1)
+  let assert transport.SendError(reason: "Model encoder returned invalid JSON") =
+    next(s)
+  let assert transport.SendPatch(ops_json: "[]", version: 0, ack_clock: 1) =
+    next(s)
+
+  // A join while the encoder is broken gets the same error, and so does
+  // the joined connection, since there is no cache to trust.
+  let late = join(rt, "late", "")
+  let assert transport.SendError(reason: "Model encoder returned invalid JSON") =
+    next(late)
+  let assert transport.SendError(reason: "Model encoder returned invalid JSON") =
+    next(s)
+
+  // Valid JSON again: every joined connection resyncs at a new revision.
+  event(rt, "c", "inc", 2)
+  let assert transport.SendModelSync(model_json: json, version: 1, ack_clock: 2) =
+    next(s)
+  let assert True = string.contains(json, "\"count\":2")
+  let assert transport.SendModelSync(version: 1, ack_clock: 0, ..) = next(late)
+  process.send(rt, runtime.Shutdown)
+}
+
+/// PERF-2: a broadcast that falls back to a full model_sync sends the model
+/// it encoded for the diff; it does not encode it a second time.
+pub fn broadcast_resync_encodes_the_model_once_test() {
+  let encodes = process.new_subject()
+  let assert Ok(rt) = runtime.start(reporting_config(encodes), test_ctx.root())
+  let s = join(rt, "c", "")
+  let assert transport.SendModelSync(version: 0, ..) = next(s)
+  // Count 1 encodes invalid JSON, which drops the cache.
+  event(rt, "c", "inc", 1)
+  let assert transport.SendError(..) = next(s)
+  let assert transport.SendPatch(ops_json: "[]", ..) = next(s)
+  let assert [0, 1] = encodes_so_far(encodes, [])
+
+  event(rt, "c", "inc", 2)
+  let assert transport.SendModelSync(version: 1, ack_clock: 2, ..) = next(s)
+  let assert [2] = encodes_so_far(encodes, [])
+  process.send(rt, runtime.Shutdown)
 }
 
 // --- client replay of server frames (server and client versioning agree) ---
@@ -747,12 +917,12 @@ pub fn client_replay_of_server_frames_matches_final_sync_test() {
 /// `simple` prediction, the focused-input lock, autofocus, server navigation
 /// and its same-origin refusals, ack_clock and event clock validation, hook
 /// mount/update/unmount tracking, the parsed-markup cache, the join's build
-/// id, 4409 behind the reload guard, the outbound test hook and the dev
+/// id, 4409 behind the reload guard, the outbound test hook, refusal of a model or ops sent as JSON text, and the dev
 /// `reload` message) driven by a fake socket, clock and DOM. The harness
 /// exits non-zero on any failed scenario.
 pub fn client_runtime_behaviour_harness_test() {
   let assert Ok(output) = run_node("brazier_client/test/ffi_harness.mjs", "")
     as "the client FFI harness failed; run node brazier_client/test/ffi_harness.mjs"
-  let assert True = string.contains(output, "ffi harness ok: 46 scenarios")
-    as "the client FFI harness did not run all 46 scenarios"
+  let assert True = string.contains(output, "ffi harness ok: 47 scenarios")
+    as "the client FFI harness did not run all 47 scenarios"
 }
