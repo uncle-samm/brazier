@@ -10,13 +10,13 @@
 
 ## Current Status
 
-**Active Milestone:** 117 — Full Review Remediation
-**Last Completed:** 116 — Review Hardening (CSRF, Timers, Auth, Cookies, Docs)
+**Active Milestone:** 118 (proposed; see below)
+**Last Completed:** 117 — Full Review Remediation (merged into main 2026-11-05, perf re-baseline deferred to 118)
 **Build Status:** GREEN (zero errors, zero warnings) on Gleam 1.19.2
-**Test Status:** GREEN (1529 tests passed, 0 failures, after the rename merge)
+**Test Status:** GREEN (1932 tests passed, 0 failures)
 **Linter:** PASSING (zero violations)
 
-### Milestone 117: Full Review Remediation 🚧
+### Milestone 117: Full Review Remediation ✅
 > Fix every finding from the 2026-11-02 full review (security, runtime/OTP,
 > DX/codegen, tests, packaging, postgleam, kadei-rat pool fork), and add
 > clustering, presence, telemetry, a hardened HTTP server and performance
@@ -641,7 +641,7 @@
       - the ws scenario logs "Join ... carries no build id" on every join (the `docs/TODO.md` item);
       - 6 atoms leak per suite run;
       - `ws.100x200` still runs only 5 rounds.
-- [ ] Final verification: build (zero warnings), tests, all examples, CDP browser suite, perf baselines
+- [x] Final verification: build (zero warnings), tests, all examples, CDP browser suite, perf baselines (the perf baseline is deferred, see the decision below)
   - 2026-11-04, on 89f1051. Green so far:
     - clean build with zero warnings, format and lint clean, 1932 tests passing in each of 3 runs, `make test-flake` 5 of 5;
     - docs check (73 sample modules) and test-client (58 scenarios, 9 patch-safety checks, 2450/550 apply equivalence);
@@ -655,6 +655,7 @@
     - The machine was in interactive use: FL Studio and coreaudiod were running, with a load average of about 5 before the bench and 9–11 during it.
     - Run 3, 23:32, load 2.6 at the start and 8 during the runs: refused, with 13 p99s spread past 50%. Each spread came from one slow run in five. The fresh 3-run check against the old baseline failed only the 6 `store.crdt_append` metrics, the accepted digest cost; every HTTP, WS and SSR p99 passed.
   - Decision: no baseline from a busy machine, and no wider tolerance to make one pass. The baseline is retried when the load average is low. Merging into main waits for that baseline and a passing `make bench-check` against it.
+  - Decision, 2026-11-05, by Sam: merge into main now, without the new baseline. The gate's spread rule is not changed (Sam rejected measuring the spread without the slowest run), and `bench/baselines.json` stays the 75a71a8 baseline. Until the re-baseline, `make bench-check` on main fails the 6 `store.crdt_append` metrics, and only those: that is the accepted digest cost, not a regression. The re-baseline on an idle machine is the first item of Milestone 118.
 
 **Decisions (Milestone 117, coordinator):**
 - 2026-11-03, WS10b runs as two agents with disjoint files, started together after WS9 merged.
@@ -725,6 +726,7 @@
   - R8 is for Sam (glite), not Brazier.
 
 ### Milestone 118 (proposed, after the M117 merge)
+- [ ] Perf re-baseline, deferred from M117 final verification: `make bench-baseline` on an idle machine (no other agents, no audio apps), then `make bench-check` against it must pass. The gate's spread rule stays as it is.
 - [ ] Server-to-hook push (Modorra R1), following LiveView `push_event`:
   - API: `effect.push_hook(hook_id, name, json)` on the server and `handleEvent` in `registerHook`;
   - delivered after the same update's patch, fire-and-forget;
