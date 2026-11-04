@@ -1,8 +1,10 @@
 /// Tests for the client-side build pieces: the generated `brazier/log` shim,
-/// app module discovery, and bundle publishing.
+/// app module discovery, bundle publishing, and the framework FFI files the
+/// client project gets.
 import brazier/build/client_bundle
 import brazier/build/client_shim
 import brazier/build/discovery
+import brazier/build/sources
 import glance
 import gleam/dict
 import gleam/list
@@ -282,4 +284,41 @@ pub fn publish_replaces_old_bundles_only_test() {
   let assert Ok(manifest) =
     simplifile.read(dir <> "/" <> client_bundle.manifest_file)
   let assert True = manifest == new.filename
+}
+
+// --- Framework FFI files ---
+
+pub fn framework_ffi_files_copies_the_render_ffi_test() {
+  // A view module reaches `brazier/internal/render`, whose name checks and
+  // escapers are JavaScript externals in `brazier_render_ffi.mjs`.
+  let view = "import brazier/element\npub fn view() { element.text(\"x\") }\n"
+  let assert Ok(framework) = sources.framework_closure(".", [view])
+  let assert True =
+    list.any(framework, fn(source) { source.0 == "brazier/internal/render" })
+  let assert Ok(ffi) = client_bundle.framework_ffi_files(".", framework)
+  let assert Ok(copied) = list.key_find(ffi, "src/brazier_render_ffi.mjs")
+  let assert Ok(original) = simplifile.read("src/brazier_render_ffi.mjs")
+  let assert True = copied == original
+  // Each file once, however many externals load it.
+  let assert True =
+    list.length(ffi) == list.length(list.unique(list.map(ffi, fn(f) { f.0 })))
+}
+
+pub fn framework_ffi_files_missing_file_is_an_error_test() {
+  let root = fresh_dir("framework_ffi_missing")
+  let module =
+    "@external(javascript, \"../gone_ffi.mjs\", \"go\")\npub fn go() -> Nil\n"
+  write(root, "src/brazier/thing.gleam", module)
+  let assert Error(reason) =
+    client_bundle.framework_ffi_files(root, [#("brazier/thing", module)])
+  let assert True = string.contains(reason, root <> "/src/gone_ffi.mjs")
+  let assert True = string.contains(reason, "`brazier/thing`")
+  let assert True = string.contains(reason, "does not exist")
+}
+
+pub fn framework_ffi_files_without_externals_is_empty_test() {
+  let assert Ok([]) =
+    client_bundle.framework_ffi_files(".", [
+      #("brazier/plain", "pub fn id(x) { x }\n"),
+    ])
 }

@@ -76,6 +76,16 @@ Import with `import brazier/svg`. `brazier/svg` is a client module, so `view` ma
 Other attributes, such as `class` or one with no helper, come from
 `brazier/attribute`; they work on SVG elements as on HTML ones.
 
+## Animation
+
+`animate` and `animate_transform` take their target with
+`attribute.attribute("attributeName", name)`. An `attributeName` whose value
+contains `href` (`href`, `xlink:href`, any case) crashes: an animation of a
+link's URL would set it to the animation's values after the URL policy
+checked the `href`, so `<animate attributeName="href" to="javascript:...">`
+would make a script link. Animate other attributes as usual.
+DOMPurify refuses the same values.
+
 ## Example
 
 Render a simple triangle icon:

@@ -199,7 +199,7 @@ def get_tab():
 
 def configure_viewport():
     if MOBILE_VIEWPORT:
-        cdp("Emulation.setDeviceMetricsOverride", {
+        cdp_checked("Emulation.setDeviceMetricsOverride", {
             "width": 390,
             "height": 844,
             "deviceScaleFactor": 3,
@@ -207,8 +207,8 @@ def configure_viewport():
             "screenWidth": 390,
             "screenHeight": 844,
         })
-        cdp("Emulation.setTouchEmulationEnabled", {"enabled": True, "maxTouchPoints": 5})
-        cdp("Network.setUserAgentOverride", {
+        cdp_checked("Emulation.setTouchEmulationEnabled", {"enabled": True, "maxTouchPoints": 5})
+        cdp_checked("Network.setUserAgentOverride", {
             "userAgent": (
                 "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
                 "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 "
@@ -216,7 +216,7 @@ def configure_viewport():
             )
         })
     else:
-        cdp("Emulation.setDeviceMetricsOverride", {
+        cdp_checked("Emulation.setDeviceMetricsOverride", {
             "width": 1280,
             "height": 900,
             "deviceScaleFactor": 1,
@@ -224,7 +224,7 @@ def configure_viewport():
             "screenWidth": 1280,
             "screenHeight": 900,
         })
-        cdp("Emulation.setTouchEmulationEnabled", {"enabled": False})
+        cdp_checked("Emulation.setTouchEmulationEnabled", {"enabled": False})
 
 ws = None
 pending_responses = {}
@@ -300,28 +300,71 @@ def reconnect_cdp():
     ws = websocket.create_connection(get_tab(), timeout=10, suppress_origin=True)
     pending_responses = {}
     DOM_MONITOR_INSTALLED = False
-    cdp("Runtime.enable", retry=False)
-    cdp("Log.enable", retry=False)
-    cdp("Network.enable", retry=False)
-    cdp("Page.enable", retry=False)
+    # Without these domains the suite records no console errors, no
+    # WebSocket frames and no page events, and every check that reads them
+    # would pass on nothing. So a failed enable stops the run.
+    cdp_checked("Runtime.enable", retry=False)
+    cdp_checked("Log.enable", retry=False)
+    cdp_checked("Network.enable", retry=False)
+    cdp_checked("Page.enable", retry=False)
     configure_viewport()
 
-def evaluation_value(r):
+class CdpError(Exception):
+    """A CDP command got no response, a protocol error, or (for
+    Runtime.evaluate) a JavaScript exception or a value that is not one."""
+
+class CdpContextGone(CdpError):
+    """Runtime.evaluate ran while the page's JavaScript context was being
+    replaced by a navigation. Only a polling wait may retry this."""
+
+# The protocol errors Chrome answers Runtime.evaluate with while a
+# navigation replaces the page's execution context.
+CONTEXT_GONE_MESSAGES = (
+    "Execution context was destroyed",
+    "Cannot find context with specified id",
+)
+
+def cdp_checked(method, params=None, timeout=8, retry=True):
+    """cdp(), but raise CdpError if there is no response or the response is
+    a protocol error."""
+    r = cdp(method, params, timeout, retry)
     if r is None:
-        return "TIMEOUT"
+        raise CdpError(f"CDP {method}: no response within {timeout} s")
+    if "error" in r:
+        message = str(r["error"].get("message"))
+        if any(gone in message for gone in CONTEXT_GONE_MESSAGES):
+            raise CdpContextGone(f"CDP {method}: {message}")
+        raise CdpError(f"CDP {method}: protocol error {r['error']}")
+    return r
+
+def evaluation_value(r, expr):
+    """The value a Runtime.evaluate response `r` for `expr` carries. Raises
+    CdpError if the script threw, or if the result is not a JSON value (an
+    object or function, NaN, Infinity, a BigInt): a check comparing with it
+    would compare against something the page never returned. `undefined`
+    is None."""
     result = r.get("result", {})
     if "exceptionDetails" in result:
         details = result["exceptionDetails"]
         exception = details.get("exception", {})
-        return "EXCEPTION: " + str(exception.get("description") or details.get("text"))
-    return result.get("result", {}).get("value", "ERR")
+        description = exception.get("description") or details.get("text")
+        raise CdpError(f"evaluate {expr[:120]!r} threw: {description}")
+    remote = result.get("result", {})
+    if remote.get("type") == "undefined":
+        return None
+    if "value" not in remote:
+        raise CdpError(f"evaluate {expr[:120]!r} returned no JSON value: {remote}")
+    return remote["value"]
 
 def evl(expr):
-    return evaluation_value(cdp("Runtime.evaluate", {"expression": expr}))
+    return evaluation_value(cdp_checked("Runtime.evaluate", {"expression": expr}), expr)
 
 def evl_async(expr):
     return evaluation_value(
-        cdp("Runtime.evaluate", {"expression": expr, "awaitPromise": True}, timeout=12)
+        cdp_checked(
+            "Runtime.evaluate", {"expression": expr, "awaitPromise": True}, timeout=12
+        ),
+        expr,
     )
 
 def pump(seconds):
@@ -369,11 +412,17 @@ def wait_outbound_drained(msg):
 
 def wait_until(predicate, timeout=None):
     """Re-check `predicate` every RETRY_SECONDS (recording CDP events in
-    between) until it holds or the deadline passes. Returns whether it held."""
+    between) until it holds or the deadline passes. Returns whether it held.
+    A predicate that evaluates while a navigation replaces the page's
+    context (CdpContextGone) has not held yet; every other CdpError
+    propagates."""
     deadline = time.time() + (WAIT_SECONDS if timeout is None else timeout)
     while True:
-        if predicate():
-            return True
+        try:
+            if predicate():
+                return True
+        except CdpContextGone as exc:
+            vlog(f"Waiting through a navigation: {exc}")
         if time.time() >= deadline:
             return False
         pump(RETRY_SECONDS)
@@ -501,7 +550,7 @@ def navigate(path="/", expect_app=True):
     if it never gets there."""
     clear_browser_errors()
     install_dom_monitor()
-    cdp("Network.setCacheDisabled", {"cacheDisabled": True})
+    cdp_checked("Network.setCacheDisabled", {"cacheDisabled": True})
     # The old document keeps this marker; a fresh one has none, so the wait
     # below cannot be satisfied by the page being navigated away from.
     marker = json.dumps(f"nav-{time.time_ns()}")
@@ -815,7 +864,7 @@ def install_dom_monitor():
   setTimeout(setupObserver, 0);
 })();
 """
-    cdp("Page.addScriptToEvaluateOnNewDocument", {"source": script})
+    cdp_checked("Page.addScriptToEvaluateOnNewDocument", {"source": script})
     DOM_MONITOR_INSTALLED = True
 
 def reset_dom_monitor():

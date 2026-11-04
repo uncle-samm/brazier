@@ -22,7 +22,8 @@
 %% (max 255 bytes). Each distinct limiter creates one atom.
 -behaviour(gen_server).
 
--export([start/3, increment/3, delete_key/2, key_count/1, owner/1, sweep_now/1]).
+-export([start/3, increment/3, delete_key/2, key_count/1, owner/1, sweep_now/3,
+         now_seconds/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
 
 -define(START_TIMEOUT_MS, 5000).
@@ -82,32 +83,50 @@ increment({brazier_rate_limiter, Tab, _Owner, Refusals}, Key, {WindowSeconds, Ma
             end
     end.
 
-%% Delete every window counter of Key.
+%% Errors mirror the Gleam type brazier/rate_limit.LimiterError:
+%%   limiter_not_running        the table (and so its owner) is gone
+%%   {limiter_timeout, Ms}      the owner did not answer a call in Ms
+%%   {limiter_call_failed, Bin} the owner exited during a call (Bin is why)
+
+%% Delete every window counter of Key. A badarg from a table that still
+%% exists is not "not running": it is a bug, and it is re-raised.
 delete_key({brazier_rate_limiter, Tab, _Owner, _Refusals}, Key) ->
     try ets:match_delete(Tab, {{Key, '_'}, '_'}) of
         true -> {ok, nil}
     catch
-        error:badarg -> {error, nil}
+        error:badarg:Stacktrace ->
+            case ets:info(Tab, size) of
+                undefined -> {error, limiter_not_running};
+                _ -> erlang:raise(error, badarg, Stacktrace)
+            end
     end.
 
-%% Number of live counters, or {error, nil} when the owner is gone.
+%% Number of live counters.
 key_count({brazier_rate_limiter, Tab, _Owner, _Refusals}) ->
     case ets:info(Tab, size) of
-        undefined -> {error, nil};
+        undefined -> {error, limiter_not_running};
         Size -> {ok, Size}
     end.
 
 owner({brazier_rate_limiter, _Tab, Owner, _Refusals}) ->
     Owner.
 
-%% Run a sweep synchronously (tests and operators). Returns the number of
-%% counters deleted, or {error, nil} when the owner is gone.
-sweep_now({brazier_rate_limiter, _Tab, Owner, _Refusals}) ->
-    try gen_server:call(Owner, sweep, ?START_TIMEOUT_MS) of
-        Deleted -> {ok, Deleted}
+%% Run a sweep synchronously (tests and operators), as of NowSeconds (POSIX
+%% seconds), waiting at most TimeoutMs for the owner. Returns the number of
+%% counters deleted. The exit reasons are those gen_server:call/3 documents:
+%% noproc (no owner), timeout, or the reason the owner exited mid-call.
+sweep_now({brazier_rate_limiter, _Tab, Owner, _Refusals}, NowSeconds, TimeoutMs)
+        when is_integer(NowSeconds), is_integer(TimeoutMs), TimeoutMs > 0 ->
+    try gen_server:call(Owner, {sweep, NowSeconds}, TimeoutMs) of
+        Deleted when is_integer(Deleted) -> {ok, Deleted}
     catch
-        exit:_ -> {error, nil}
+        exit:{noproc, _} -> {error, limiter_not_running};
+        exit:{timeout, _} -> {error, {limiter_timeout, TimeoutMs}};
+        exit:{Reason, _} -> {error, {limiter_call_failed, format("~p", [Reason])}}
     end.
+
+now_seconds() ->
+    erlang:system_time(second).
 
 %% --- Owner ---
 
@@ -126,8 +145,8 @@ init({TabName, WindowSeconds, Refusals, Creator}) ->
             {stop, {already_exists, TabName}}
     end.
 
-handle_call(sweep, _From, State) ->
-    {reply, sweep(State), State};
+handle_call({sweep, NowSeconds}, _From, State) when is_integer(NowSeconds) ->
+    {reply, sweep(State, NowSeconds), State};
 handle_call(Other, From, State) ->
     brazier_log_ffi:error(<<"brazier.rate_limit">>, "unexpected call ~p from ~p", [Other, From]),
     {reply, {error, unexpected_call}, State}.
@@ -137,7 +156,7 @@ handle_cast(Other, State) ->
     {noreply, State}.
 
 handle_info(sweep, State = #{window := WindowSeconds}) ->
-    _Deleted = sweep(State),
+    _Deleted = sweep(State, now_seconds()),
     schedule_sweep(WindowSeconds),
     {noreply, State};
 handle_info({'DOWN', _Ref, process, Creator, Reason}, State = #{tab := Tab}) ->
@@ -148,9 +167,10 @@ handle_info(Other, State) ->
     brazier_log_ffi:warning(<<"brazier.rate_limit">>, "unexpected message ~p", [Other]),
     {noreply, State}.
 
-%% Delete counters of windows before the current one and report refusals.
-sweep(#{tab := Tab, window := WindowSeconds, refusals := Refusals}) ->
-    Current = current_window(WindowSeconds),
+%% Delete counters of windows before the one NowSeconds is in and report
+%% refusals.
+sweep(#{tab := Tab, window := WindowSeconds, refusals := Refusals}, NowSeconds) ->
+    Current = NowSeconds div WindowSeconds,
     Deleted = ets:select_delete(Tab, [{{{'_', '$1'}, '_'}, [{'<', '$1', Current}], [true]}]),
     Refused = counters:get(Refusals, 1),
     case Refused of
@@ -172,7 +192,7 @@ schedule_sweep(WindowSeconds) ->
     erlang:send_after(WindowSeconds * 1000, self(), sweep).
 
 current_window(WindowSeconds) ->
-    erlang:system_time(second) div WindowSeconds.
+    now_seconds() div WindowSeconds.
 
 validate_name(Name) when byte_size(Name) > 255 ->
     {error, <<"Name too long (max 255 bytes)">>};
