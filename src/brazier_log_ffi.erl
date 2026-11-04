@@ -19,7 +19,13 @@
 %% A format string that does not match its arguments is a programming
 %% error: io_lib:format raises badarg and the caller crashes loudly.
 -export([debug/2, debug/3, info/2, info/3, notice/2, notice/3,
-         warning/2, warning/3, error/2, error/3, text/3]).
+         warning/2, warning/3, error/2, error/3, text/3, allowed/1]).
+
+%% Whether an event at Level would pass the logger's level checks. The
+%% Gleam side (brazier/log) asks before it builds a line, as this module
+%% does below.
+allowed(Level) when is_atom(Level) ->
+    logger:allow(Level, ?MODULE).
 
 debug(Context, Text) -> log(debug, Context, Text).
 debug(Context, Format, Args) -> log(debug, Context, Format, Args).
