@@ -4,8 +4,9 @@
 ////
 //// Sessions are runtimes on peer nodes inside holder processes (see
 //// ws8c_presence_watch_only_test); their presence comes from the public
-//// builder. Waiting is always a receive or `peer.eventually` with a
-//// deadline.
+//// builder. Waiting is always a receive with a deadline; reads of the
+//// tracker need no wait, because the shard writes an entry before it
+//// answers the track or untrack call.
 
 import brazier
 import brazier/cluster/peer.{type Peer, Timeout}
@@ -27,8 +28,6 @@ import gleam/list
 import gleam/option.{None, Some}
 import gleam/result
 import gleam/string
-
-const wait_ms = 10_000
 
 const receive_ms = 5000
 
@@ -225,8 +224,9 @@ pub fn tracks_its_room_and_watches_the_lobby_test_() -> peer.Timeout {
   let assert [a] = peers
   start_tracker(a)
   let _bob = track_on(a, "lobby", "bob")
-  let assert True =
-    peer.eventually(fn() { listed(a, "lobby") == ["bob"] }, wait_ms)
+  // Tracking is a call the shard answers after writing the entry, so it
+  // is listed as soon as track_on returns.
+  let assert ["bob"] = listed(a, "lobby")
 
   let session = start_session(a, "room", ["lobby", "room"])
   let first = next(a, session)
@@ -262,7 +262,9 @@ pub fn tracking_follows_the_state_while_watching_stays_test_() -> peer.Timeout {
   let second = next(a, session)
   let assert [#("blue", ["me"], []), #("red", [], ["me"])] =
     list.sort([first, second], fn(x, y) { string.compare(x.0, y.0) })
-  let assert True = peer.eventually(fn() { listed(a, "red") == [] }, wait_ms)
+  // The session's watcher reports its own leave only after the untrack
+  // call has returned, so a session that heard it finds red empty.
+  let assert [] = listed(a, "red")
   let assert ["me"] = listed(a, "blue")
 
   let _bob = track_on(a, "lobby", "bob")

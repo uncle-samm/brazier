@@ -205,6 +205,38 @@ pub fn watch_exit(pid: Pid, child: Pid) -> InfoWatch {
   }
 }
 
+@external(erlang, "brazier_await_ffi", "watch_down")
+fn watch_down_ffi(pid: Pid, target: Pid) -> Result(InfoWatch, String)
+
+/// Watch for the sys-compliant process `pid` (such as a presence shard)
+/// receiving the DOWN of a monitor it holds on `target`. `expect_info` then
+/// returns once `pid` has handled it, for example once a shard has removed
+/// a dead session's presence, instead of polling until it has.
+pub fn watch_down(pid: Pid, target: Pid) -> InfoWatch {
+  case watch_down_ffi(pid, target) {
+    Ok(watch) -> watch
+    Error(reason) ->
+      panic as {
+        "watch_down: cannot install a sys hook on "
+        <> string.inspect(pid)
+        <> ": "
+        <> reason
+      }
+  }
+}
+
+@external(erlang, "brazier_await_ffi", "unwatch")
+fn unwatch_ffi(watch: InfoWatch) -> Nil
+
+/// Remove a watch's hook from its process and drop its pending notices.
+/// Call it when the watched process outlives the test (the shared PubSub
+/// partitions and presence shards do): a forgotten hook keeps notifying the
+/// test process, which eunit reuses for the module's later tests. The
+/// watched process must still be alive.
+pub fn unwatch(watch: InfoWatch) -> Nil {
+  unwatch_ffi(watch)
+}
+
 /// Return once the watched process has received and handled the next
 /// watched message. Crashes with `what` if none arrives by the deadline.
 pub fn expect_info(watch: InfoWatch, pid: Pid, what: String) -> Nil {
@@ -214,6 +246,29 @@ pub fn expect_info(watch: InfoWatch, pid: Pid, what: String) -> Nil {
       panic as {
         "expected " <> what <> " within " <> int.to_string(deadline_ms) <> " ms"
       }
+  }
+}
+
+/// Wait one watched message at a time until `check` holds: for state a
+/// process changes on its own timer (a presence shard marking a replica
+/// down on a heartbeat tick). `check` runs first, then after each message
+/// the process has handled. Crashes with `what` if it still fails after
+/// `max_messages`, or if a message does not arrive by the deadline.
+pub fn until_info(
+  watch: InfoWatch,
+  pid: Pid,
+  check: fn() -> Bool,
+  max_messages: Int,
+  what: String,
+) -> Nil {
+  case check() {
+    True -> Nil
+    False if max_messages <= 0 ->
+      panic as { "expected " <> what <> ": still false after its last message" }
+    False -> {
+      expect_info(watch, pid, what)
+      until_info(watch, pid, check, max_messages - 1, what)
+    }
   }
 }
 
@@ -291,11 +346,19 @@ pub fn until_telemetry(
     Error(reason) ->
       panic as { "until_telemetry: attach failed: " <> string.inspect(reason) }
   }
-  let outcome = recheck(emitted, condition, now_ms() + deadline_ms, 0)
-  case telemetry.detach(id) {
-    Ok(Nil) -> Nil
-    Error(reason) ->
-      panic as { "until_telemetry: detach failed: " <> string.inspect(reason) }
+  // Detached even when `condition` crashes: the handler is global, and
+  // left attached it would send every later event to this process.
+  let outcome = {
+    use <- with_cleanup(fn() {
+      case telemetry.detach(id) {
+        Ok(Nil) -> Nil
+        Error(reason) ->
+          panic as {
+            "until_telemetry: detach failed: " <> string.inspect(reason)
+          }
+      }
+    })
+    recheck(emitted, condition, now_ms() + deadline_ms, 0)
   }
   case outcome {
     Ok(Nil) -> Nil
@@ -327,6 +390,11 @@ fn recheck(
       }
   }
 }
+
+/// `monitored.with_cleanup`, which this module cannot import: `monitored`
+/// imports it.
+@external(erlang, "brazier_monitored_ffi", "with_cleanup")
+fn with_cleanup(cleanup: fn() -> Nil, run: fn() -> a) -> a
 
 @external(erlang, "erlang", "unique_integer")
 fn unique_integer() -> Int

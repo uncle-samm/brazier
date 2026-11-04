@@ -3,13 +3,14 @@
 //// with mode Replicated (limits, errors, telemetry, notifications).
 //// Multi-node behaviour is in cluster/store_cluster_test.
 
-import brazier/cluster/peer
+import brazier/monitored
 import brazier/pubsub
 import brazier/store
 import brazier/store/crdt.{type Delta, type State, Replica}
 import brazier/store/hlc.{Timestamp}
 import brazier/store/replicated.{Config}
 import brazier/telemetry.{type Event}
+import gleam/dynamic.{type Dynamic}
 import gleam/erlang/process.{type Pid, type Subject}
 import gleam/int
 import gleam/list
@@ -415,27 +416,44 @@ pub fn writes_to_a_stopped_replica_are_unavailable_test() {
 pub fn replicated_writes_emit_store_write_with_mode_replicated_test() {
   let name = unique("rs_telemetry")
   let assert Ok(kv) = store.open(name, store.Replicated(config()))
-  let #(id, events) = listen()
+  use events <- listening()
   store.put(kv, "a", "small")
   store.delete(kv, "a")
   // A rejected write is not reported as a write.
   let assert Error(_) = store.try_put(kv, "big", string.repeat("x", 70 * 1024))
   assert drain(events)
     == [#(name, "put", "replicated", 1), #(name, "delete", "replicated", 1)]
-  let assert Ok(Nil) = telemetry.detach(id)
   stop(replicated.KeyValue, name, config())
 }
 
 pub fn replicated_writes_notify_local_watchers_test() {
+  // Isolated: the test process subscribes and receives the notifications
+  // itself, and its subscriptions end with it even if an assertion fails.
+  use <- monitored.isolated
   let name = unique("rs_notify")
+  // A key of its own, so its topic is this test's alone.
+  let key = unique("general")
   let assert Ok(messages) = store.open_list(name, store.Replicated(config()))
-  let store_watcher = spawn_recorder(["store:" <> name])
-  let key_watcher = spawn_recorder(["room:general"])
-  store.append_notify(messages, "general", "hi", "room:")
-  store.append(messages, "general", "again")
-  assert wait_for(store_watcher, 2)
-  assert wait_for(key_watcher, 1)
+  let assert Ok(Nil) = pubsub.try_subscribe("store:" <> name)
+  let assert Ok(Nil) = pubsub.try_subscribe("room:" <> key)
+  store.append_notify(messages, key, "hi", "room:")
+  store.append(messages, key, "again")
+  // The store topic hears both writes, the key topic the notifying one.
+  let topics =
+    list.sort([next_topic(), next_topic(), next_topic()], string.compare)
+  assert topics
+    == list.sort(
+      ["store:" <> name, "store:" <> name, "room:" <> key],
+      string.compare,
+    )
   stop(replicated.List, name, config())
+}
+
+/// The topic of the next PubSub delivery to the test process.
+fn next_topic() -> String {
+  let assert Ok(#(topic, _)) = receive_pubsub(5000)
+    as "a store notification did not arrive within 5 s"
+  topic
 }
 
 pub fn replica_digest_and_size_describe_its_state_test() {
@@ -463,7 +481,10 @@ fn table_of(name: String) {
 
 const write_event = ["brazier", "store", "write"]
 
-fn listen() -> #(String, Subject(Event)) {
+/// Run `body` with the store write events this process emits, and detach
+/// the handler afterwards even when `body` fails: telemetry handlers are
+/// global and would otherwise outlive the test.
+fn listening(body: fn(Subject(Event)) -> a) -> a {
   let assert Ok(Nil) = telemetry.start()
   let id = "store_replicated_" <> int.to_string(unique_integer())
   let events = process.new_subject()
@@ -475,7 +496,12 @@ fn listen() -> #(String, Subject(Event)) {
         False -> Nil
       }
     })
-  #(id, events)
+  use <- monitored.with_cleanup(fn() {
+    let assert Ok(Nil) = telemetry.detach(id)
+      as "detaching the test's telemetry handler"
+    Nil
+  })
+  body(events)
 }
 
 fn drain(events: Subject(Event)) -> List(#(String, String, String, Int)) {
@@ -498,19 +524,11 @@ fn drain_loop(
   }
 }
 
-/// Whether `recorder` receives `count` deliveries within 5 seconds.
-fn wait_for(recorder: Pid, count: Int) -> Bool {
-  peer.eventually(fn() { recorded_count(recorder) == count }, 5000)
-}
-
 @external(erlang, "erlang", "unique_integer")
 fn unique_integer() -> Int
 
 @external(erlang, "brazier_store_test_ffi", "replica_pid")
 fn replica_pid(name: String) -> Result(Pid, Nil)
 
-@external(erlang, "brazier_cluster_test_ffi", "spawn_recorder")
-fn spawn_recorder(topics: List(String)) -> Pid
-
-@external(erlang, "brazier_cluster_test_ffi", "recorded_count")
-fn recorded_count(recorder: Pid) -> Int
+@external(erlang, "brazier_pubsub_test_ffi", "receive_pubsub")
+fn receive_pubsub(timeout_ms: Int) -> Result(#(String, Dynamic), Nil)

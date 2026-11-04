@@ -1,3 +1,5 @@
+import brazier/monitored
+import brazier/pubsub
 import brazier/state_manager
 import brazier/store
 import brazier/store/replicated
@@ -25,12 +27,12 @@ pub fn try_new_rejects_overlong_name_test() {
 }
 
 pub fn new_with_invalid_name_crashes_loudly_test() {
-  let pid = process.spawn_unlinked(fn() { store.new("no spaces allowed") })
-  let monitor = process.monitor(pid)
-  let selector =
-    process.new_selector()
-    |> process.select_specific_monitor(monitor, fn(down) { down.reason })
-  let assert Ok(process.Abnormal(_)) = process.selector_receive(selector, 1000)
+  // Monitored from the spawn: the DOWN carries the crash, never `noproc`.
+  let #(_pid, monitor) =
+    monitored.spawn(fn() { store.new("no spaces allowed") })
+  let assert process.Abnormal(reason) =
+    monitored.down_reason(monitor, "store.new with an invalid name")
+  assert string.contains(string.inspect(reason), "brazier.store.new failed")
 }
 
 pub fn ensure_table_type_mismatch_is_typed_error_test() {
@@ -79,6 +81,7 @@ pub fn open_replicated_with_invalid_name_is_invalid_store_test() {
 // --- Regression: store.new crashed on the second call (named table exists) ---
 
 pub fn store_new_twice_returns_same_store_test() {
+  writes_notify()
   let name = "test_store_twice_" <> uid()
   let first = store.new(name)
   store.put(first, "k", "v")
@@ -88,6 +91,7 @@ pub fn store_new_twice_returns_same_store_test() {
 }
 
 pub fn list_store_new_twice_returns_same_store_test() {
+  writes_notify()
   let name = "test_ls_twice_" <> uid()
   let first = store.new_list(name)
   store.append(first, "room", "hello")
@@ -96,6 +100,7 @@ pub fn list_store_new_twice_returns_same_store_test() {
 }
 
 pub fn concurrent_new_list_all_share_one_table_test() {
+  writes_notify()
   let name = "test_ls_concurrent_" <> uid()
   let subject = process.new_subject()
   list.each(one_to(20), fn(i) {
@@ -112,6 +117,7 @@ pub fn concurrent_new_list_all_share_one_table_test() {
 }
 
 pub fn store_and_list_store_with_same_name_do_not_alias_test() {
+  writes_notify()
   let name = "test_alias_" <> uid()
   let kv = store.new(name)
   let ls = store.new_list(name)
@@ -124,18 +130,16 @@ pub fn store_and_list_store_with_same_name_do_not_alias_test() {
 // --- Regression: tables died with the process that created them ---
 
 pub fn store_outlives_creating_process_test() {
+  writes_notify()
   let name = "test_store_owner_" <> uid()
   let ls_name = "test_ls_owner_" <> uid()
-  let pid =
-    process.spawn_unlinked(fn() {
+  let #(_pid, monitor) =
+    monitored.spawn(fn() {
       store.put(store.new(name), "k", "kept")
       store.append(store.new_list(ls_name), "k", "kept")
     })
-  let monitor = process.monitor(pid)
-  let selector =
-    process.new_selector()
-    |> process.select_specific_monitor(monitor, fn(down) { down.reason })
-  let assert Ok(process.Normal) = process.selector_receive(selector, 1000)
+  let assert process.Normal =
+    monitored.down_reason(monitor, "the process that created the stores")
   let assert Ok("kept") = store.get(store.new(name), "k")
   let assert ["kept"] = store.get_all(store.new_list(ls_name), "k")
 }
@@ -143,6 +147,7 @@ pub fn store_outlives_creating_process_test() {
 // --- Regression: ListStore was an ETS bag, which dropped duplicate messages ---
 
 pub fn list_store_keeps_duplicate_values_test() {
+  writes_notify()
   let s = store.new_list("test_ls_dupes_" <> uid())
   store.append(s, "room", "hi")
   store.append(s, "room", "hi")
@@ -151,6 +156,7 @@ pub fn list_store_keeps_duplicate_values_test() {
 }
 
 pub fn list_store_preserves_insertion_order_test() {
+  writes_notify()
   let s = store.new_list("test_ls_order_" <> uid())
   list.each(one_to(50), fn(i) { store.append(s, "k", i) })
   let assert True = store.get_all(s, "k") == one_to(50)
@@ -159,17 +165,20 @@ pub fn list_store_preserves_insertion_order_test() {
 // --- Happy paths ---
 
 pub fn store_put_and_get_test() {
+  writes_notify()
   let s = store.new("test_store_" <> uid())
   store.put(s, "key1", "value1")
   let assert Ok("value1") = store.get(s, "key1")
 }
 
 pub fn store_get_missing_test() {
+  writes_notify()
   let s = store.new("test_store_miss_" <> uid())
   let assert Error(Nil) = store.get(s, "nope")
 }
 
 pub fn store_delete_test() {
+  writes_notify()
   let s = store.new("test_store_del_" <> uid())
   store.put(s, "k", "v")
   store.delete(s, "k")
@@ -177,6 +186,7 @@ pub fn store_delete_test() {
 }
 
 pub fn store_count_test() {
+  writes_notify()
   let s = store.new("test_store_cnt_" <> uid())
   let assert 0 = store.count(s)
   store.put(s, "a", "1")
@@ -185,6 +195,7 @@ pub fn store_count_test() {
 }
 
 pub fn list_store_append_and_get_all_test() {
+  writes_notify()
   let s = store.new_list("test_ls_" <> uid())
   store.append(s, "room1", "msg_a")
   store.append(s, "room1", "msg_b")
@@ -194,6 +205,7 @@ pub fn list_store_append_and_get_all_test() {
 }
 
 pub fn list_store_different_keys_test() {
+  writes_notify()
   let s = store.new_list("test_ls_keys_" <> uid())
   store.append(s, "general", "hello")
   store.append(s, "random", "world")
@@ -202,16 +214,26 @@ pub fn list_store_different_keys_test() {
 }
 
 pub fn list_store_empty_key_test() {
+  writes_notify()
   let s = store.new_list("test_ls_empty_" <> uid())
   let assert [] = store.get_all(s, "empty")
 }
 
 pub fn list_store_delete_all_test() {
+  writes_notify()
   let s = store.new_list("test_ls_delall_" <> uid())
   store.append(s, "k", "a")
   store.append(s, "k", "b")
   store.delete_all(s, "k")
   let assert [] = store.get_all(s, "k")
+}
+
+/// Start PubSub, which every store write notifies through (a write whose
+/// notification fails crashes the writer). Each test starts it itself, so
+/// it does not depend on an earlier test module having started it: run
+/// alone, this module failed in `store.notify` with `not_started`.
+fn writes_notify() -> Nil {
+  pubsub.start()
 }
 
 /// [1, 2, ..., n]

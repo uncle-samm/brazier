@@ -3,7 +3,6 @@
 //// tolerance. Multi-node behaviour is in cluster/session_cluster_test.
 
 import brazier/cluster/log_capture
-import brazier/cluster/peer
 import brazier/session.{
   type ExternalBackend, type SessionStore, External, ExternalBackend,
   InvalidBackend, LocalEts, Session, SessionBackendFailed, SessionExpired,
@@ -15,6 +14,7 @@ import gleam/erlang/process.{type Pid}
 import gleam/int
 import gleam/list
 import gleam/option.{None, Some}
+import gleam/string
 
 fn fresh_name(prefix: String) -> String {
   prefix <> int.to_string(unique())
@@ -51,10 +51,22 @@ fn bind(store: SessionStore, id: String) -> Pid {
   spawn_bound(fn() { session.bind_current_process(store, id) })
 }
 
-/// Whether a bound process recorded this revocation within the deadline
-/// (delivery is a message, so it is asynchronous).
-fn revoked(id: String, reason: String) -> Bool {
-  peer.eventually(fn() { list.contains(revocations(), #(id, reason)) }, 5000)
+/// Wait for the bound process `pid` to be revoked with `reason`. Delivery
+/// is a message, so it is asynchronous; the bound process reports each
+/// revocation to this process, and only `pid`'s reports count.
+fn expect_revoked(pid: Pid, id: String, reason: String) -> Nil {
+  case await_revoked(pid, id, reason, 5000) {
+    Ok(Nil) -> Nil
+    Error(others) ->
+      panic as {
+        "expected bound process to be revoked ("
+        <> id
+        <> ", "
+        <> reason
+        <> ") within 5 s; it reported "
+        <> string.inspect(others)
+      }
+  }
 }
 
 // --- CRUD on External ---
@@ -89,13 +101,13 @@ pub fn external_update_applies_to_current_data_test() {
 pub fn external_rotate_moves_data_and_revokes_test() {
   let #(_, store) = new_store("rotate")
   let s = session.create_with_data(store, dict.from_list([#("k", "v")]))
-  let _pid = bind(store, s.id)
+  let pid = bind(store, s.id)
   let assert Ok(fresh) = session.rotate(store, s.id)
   assert fresh.id != s.id
   assert fresh.data == s.data
   assert session.get(store, s.id) == None
   assert session.get(store, fresh.id) == Some(fresh)
-  assert revoked(s.id, "rotated")
+  expect_revoked(pid, s.id, "rotated")
   // Rotating the old id again is refused.
   assert session.rotate(store, s.id) == Error(SessionNotFound)
 }
@@ -103,10 +115,10 @@ pub fn external_rotate_moves_data_and_revokes_test() {
 pub fn external_delete_revokes_bound_processes_test() {
   let #(_, store) = new_store("revoke")
   let s = session.create(store)
-  let _pid = bind(store, s.id)
+  let pid = bind(store, s.id)
   assert session.bound_process_count(store, s.id) == 1
   session.delete(store, s.id)
-  assert revoked(s.id, "deleted")
+  expect_revoked(pid, s.id, "deleted")
 }
 
 // --- Backend failures ---
@@ -130,7 +142,7 @@ pub fn backend_failures_are_returned_test() {
 pub fn failed_delete_still_revokes_test() {
   let #(name, store) = new_store("faildel")
   let s = session.create(store)
-  let _pid = bind(store, s.id)
+  let pid = bind(store, s.id)
   set_failing(node.self(), name, True)
   let #(outcome, lines) =
     log_capture.capture(fn() { session.try_delete(store, s.id) })
@@ -145,7 +157,7 @@ pub fn failed_delete_still_revokes_test() {
       <> ": session backend failed: injected failure",
   )
   // The socket is told to close; the row survives for a retried logout.
-  assert revoked(s.id, "deleted")
+  expect_revoked(pid, s.id, "deleted")
   assert session.count(store) == 1
 }
 
@@ -222,11 +234,11 @@ pub fn sweep_runs_in_batches_test() {
     Nil
   })
   let live = session.create(store)
-  let _pid = bind(store, "old7")
+  let pid = bind(store, "old7")
   assert session.sweep_expired(store) == Ok(2500)
   assert session.count(store) == 1
   assert session.get(store, live.id) == Some(live)
-  assert revoked("old7", "expired")
+  expect_revoked(pid, "old7", "expired")
 }
 
 pub fn small_clock_skew_is_tolerated_test() {
@@ -250,14 +262,14 @@ pub fn large_clock_skew_ends_the_session_test() {
     })
   let far = system_now() + session.clock_skew_tolerance_ms + 5000
   let assert Ok(True) = ext.create(row("future", far, far))
-  let _pid = bind(store, "future")
+  let pid = bind(store, "future")
   let #(outcome, lines) =
     log_capture.capture(fn() { session.fetch(store, "future") })
   assert outcome == Error(SessionExpired)
   assert log_capture.contains(lines, "error", "in the future")
   // Deleted and revoked like any expired session.
   assert session.fetch(store, "future") == Error(SessionNotFound)
-  assert revoked("future", "expired")
+  expect_revoked(pid, "future", "expired")
 }
 
 pub fn old_last_seen_expires_test() {
@@ -302,8 +314,13 @@ fn owned(run: fn() -> a) -> a
 @external(erlang, "brazier_session_test_ffi", "spawn_bound")
 fn spawn_bound(bind: fn() -> Nil) -> Pid
 
-@external(erlang, "brazier_session_test_ffi", "revocations")
-fn revocations() -> List(#(String, String))
+@external(erlang, "brazier_session_test_ffi", "await_revoked")
+fn await_revoked(
+  pid: Pid,
+  id: String,
+  reason: String,
+  timeout_ms: Int,
+) -> Result(Nil, List(#(String, String)))
 
 @external(erlang, "brazier_session_test_ffi", "raises")
 fn raises(run: fn() -> a) -> Bool

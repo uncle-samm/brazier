@@ -423,6 +423,11 @@ partition_churn(Topic, PerRound, Iterations) ->
     Reasons = [await_churner(Churner) || Churner <- Churners],
     [_ = sys:get_state(element(I, Names)) || I <- Indexes],
     Rows = lists:sum([ets:info(element(I, Table), size) || Table <- [Keys, Pids], I <- Indexes]),
+    %% Every churner is monitored before it is told to go, so these are the
+    %% churners' own exit reasons, never a late monitor's. `noproc` is one
+    %% of them: link/1 to a partition that is alive at the call but gone
+    %% when the link signal arrives sends the caller an exit signal with
+    %% reason noproc, the same death as `killed` a moment later.
     {[unicode:characters_to_binary(io_lib:format("~0p", [R]))
       || R <- Reasons, not lists:member(R, [normal, killed, noproc])],
      Rows}.

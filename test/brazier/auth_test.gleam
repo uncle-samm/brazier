@@ -223,6 +223,9 @@ pub fn validate_csrf_rejects_missing_and_invalid_header_test() {
 }
 
 pub fn ws_session_auth_accepts_valid_session_and_rejects_missing_test() {
+  // ws_session_auth binds the caller to the session: the registry must run.
+  // Started here, not left to whichever earlier test module started it.
+  session.ensure_registry()
   let store = session.new_store("auth_ws_session")
   let config = auth.dev_session_config()
   let assert Ok(result) =
@@ -238,6 +241,7 @@ pub fn ws_session_auth_accepts_valid_session_and_rejects_missing_test() {
 }
 
 pub fn protect_ws_alias_matches_session_auth_test() {
+  session.ensure_registry()
   let store = session.new_store("auth_protect_ws")
   let config = auth.dev_session_config()
   let assert Ok(result) = auth.login_json_response(store, "socket-user", config)
