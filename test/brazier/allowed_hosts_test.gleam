@@ -10,6 +10,7 @@
 import brazier/cluster/peer.{Timeout}
 import brazier/error
 import brazier/log_capture
+import brazier/monitored
 import brazier/telemetry.{type Event}
 import brazier/transport
 import brazier/transport/server
@@ -143,9 +144,6 @@ fn raw_upgrade_request(
   headers: List(#(String, String)),
 ) -> BitArray
 
-@external(erlang, "erlang", "unique_integer")
-fn unique_integer() -> Int
-
 @external(erlang, "brazier_cluster_test_ffi", "putenv")
 fn putenv(name: String, value: String) -> Nil
 
@@ -215,15 +213,12 @@ fn upgrade_headers(host_name: String, port: Int) -> List(#(String, String)) {
   ]
 }
 
-fn listen() -> #(String, Subject(Event)) {
-  let assert Ok(Nil) = telemetry.start()
-  let id = "allowed_hosts_" <> int.to_string(unique_integer())
-  let events = process.new_subject()
-  let assert Ok(Nil) =
-    telemetry.attach(id, [["brazier", "ws", "upgrade", "stop"]], fn(event) {
-      process.send(events, event)
-    })
-  #(id, events)
+/// Run `run` with the `[brazier, ws, upgrade, stop]` events sent to a subject it receives. The handler is
+/// detached however `run` ends: telemetry handlers are node-wide, and one
+/// left by a failing test would send every later event to eunit's shared
+/// test process.
+fn listen(run: fn(Subject(Event)) -> a) -> a {
+  monitored.listening([["brazier", "ws", "upgrade", "stop"]], run)
 }
 
 pub fn rebound_http_request_is_refused_test() {
@@ -238,7 +233,7 @@ pub fn rebound_http_request_is_refused_test() {
 
 pub fn rebound_websocket_upgrade_is_refused_test() {
   let #(listener, port, connected) = start_server()
-  let #(id, events) = listen()
+  use events <- listen()
   // Origin and Host agree, so only the host check refuses it.
   let status =
     status_for(
@@ -264,7 +259,6 @@ pub fn rebound_websocket_upgrade_is_refused_test() {
     )
   let assert Ok(_conn_id) = process.receive(connected, 3000)
     as "the runtime factory must be called"
-  let assert Ok(Nil) = telemetry.detach(id)
   server.stop(listener)
 }
 
