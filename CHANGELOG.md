@@ -674,6 +674,21 @@ with its own changelog, so they are not listed here.
   errors (field names and parameter keys), client-IP resolution, and an
   invalid `Content-Length` value. Filesystem paths built from a request are
   quoted with `string.inspect`.
+- (SEC-4 follow-up) The scheme comes from the configured forwarding header
+  only. `X-Forwarded-Proto` was read whatever `forwarding_header` said, so
+  behind a proxy that sets `Forwarded` a client could send its own
+  `X-Forwarded-Proto: https`, and `Forwarded` `proto=` was never read. Now
+  `ip.Forwarded` reads the `proto=` of the client's element (the one the
+  address walk stops at), `ip.XForwardedFor` reads `X-Forwarded-Proto`, and
+  `ip.NoForwardingHeader` is always `http` (before, a listed proxy's
+  `X-Forwarded-Proto` was believed). A repeated `proto=` in one element is
+  rejected (RFC 7239 section 4). `ip.client_scheme` is the rule;
+  `client.scheme_from` calls it. Plug.RewriteOn and Django's
+  `SECURE_PROXY_SSL_HEADER` likewise read only the header they are given.
+- (TS-9 follow-up) The listener parses `trusted_proxies` once, when it
+  starts, with the origins and hosts, and refuses to start on a bad entry;
+  WebSocket upgrades no longer parse the list again for the client address
+  and the Origin check's scheme.
 - (Audit SEC-17) State recovery no longer lets a join token decide the
   server state: `restore` receives the state this connection's `init` and
   route produced, and only the client-visible model comes from the token.
