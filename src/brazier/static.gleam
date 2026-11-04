@@ -589,12 +589,52 @@ pub type AssetError {
   AssetReadFailed(reason: String)
 }
 
+/// A client bundle from `load_client_asset_at`, and where it came from.
+@internal
+pub type LoadedAsset {
+  LoadedAsset(asset: ClientAsset, source: AssetSource)
+}
+
+@internal
+pub type AssetSource {
+  /// The cached bundle was used: the stat data matched and is not racy.
+  AssetCached
+  /// The file was read and compressed, and the entry was (re)cached.
+  AssetBuilt(reason: HashReason)
+}
+
 /// Load a client bundle through the asset cache. The file is stat-ed on
-/// every call; it is only re-read and re-compressed when its size or mtime
-/// changes, so a rebuilt bundle is picked up without a restart.
+/// every call and re-read and re-compressed when its size, mtime, ctime,
+/// inode or device changed, or when the cached entry was recorded within
+/// two seconds of the file's last change (git's racy-clean rule, as for the
+/// static digest cache), so a rebuilt bundle is never served stale and is
+/// picked up without a restart.
 pub fn load_client_asset(path: String) -> Result(ClientAsset, AssetError) {
-  case ffi_load_asset(path) {
-    Ok(asset) -> Ok(asset)
+  case load_client_asset_at(path, now_seconds()) {
+    Ok(LoadedAsset(asset:, source: _)) -> Ok(asset)
+    Error(reason) -> Error(reason)
+  }
+}
+
+/// `load_client_asset` at time `now_seconds`. Tests pass their own time to
+/// place an entry inside or outside the racy window.
+@internal
+pub fn load_client_asset_at(
+  path: String,
+  now_seconds: Int,
+) -> Result(LoadedAsset, AssetError) {
+  case ffi_load_asset(path, now_seconds) {
+    Ok(LoadedAsset(source: AssetCached, ..) as loaded) -> Ok(loaded)
+    Ok(LoadedAsset(source: AssetBuilt(reason), ..) as loaded) -> {
+      log.debug(
+        "brazier.static",
+        "Client asset cache miss ("
+          <> hash_reason_name(reason)
+          <> "): "
+          <> string.inspect(path),
+      )
+      Ok(loaded)
+    }
     Error(AssetNotFound) -> {
       log.warning(
         "brazier.static",
@@ -617,7 +657,10 @@ pub fn load_client_asset(path: String) -> Result(ClientAsset, AssetError) {
 pub fn cached_client_asset_paths() -> List(String)
 
 @external(erlang, "brazier_asset_cache_ffi", "load")
-fn ffi_load_asset(path: String) -> Result(ClientAsset, AssetError)
+fn ffi_load_asset(
+  path: String,
+  now_seconds: Int,
+) -> Result(LoadedAsset, AssetError)
 
 /// Check if a path contains directory traversal sequences.
 /// Catches: "..", backslash, null bytes, and encoded traversal (%2e, %2f, %5c).

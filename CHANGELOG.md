@@ -531,6 +531,17 @@ with its own changelog, so they are not listed here.
   (`disconnect_nodes/1` excludes a node instead of disconnecting it), and
   Mnesia likewise ignores connected nodes outside `db_nodes`. A process
   waiting for a node to pass the check keeps waiting through a rejection.
+- The client bundle cache could serve a stale bundle. It checked an entry
+  against the file's size and mtime only, so a same-size rewrite in the
+  same second, or a rename of a new file with the same size and mtime over
+  the old one, kept the old bytes and ETag. An entry is now checked against
+  the size, mtime, ctime, inode and device, and one recorded less than 2 s
+  after the file's last change is rebuilt rather than trusted (git's
+  racy-clean rule, `Documentation/technical/racy-git.txt`), the rule the
+  static digest cache already follows. The recording time is taken before
+  the read. `static.load_client_asset_at` takes the time and reports
+  whether the entry was used or why it was rebuilt; misses are logged at
+  debug.
 
 ### Removed
 
