@@ -919,6 +919,22 @@ def build_example(name, directory):
         return False
     return True
 
+def reset_tab_history(name):
+    """Give each example a tab with an empty session history. The tab is
+    shared by every example, and once its history reaches Chrome's cap of 50
+    entries, history.go(-1) across pushState entries can land on an evicted
+    entry's about:blank instead of the previous route, so the history checks
+    of an example late in the run would depend on how many pages the
+    examples before it loaded."""
+    if ws is None:
+        return True
+    r = cdp("Page.resetNavigationHistory")
+    if r is None or "error" in r:
+        reason = "no response" if r is None else r["error"].get("message")
+        check(False, f"{name}: browser resets the tab history before start ({reason})")
+        return False
+    return True
+
 def start_example(name, module=None):
     """Start `examples/<name>` with `gleam run -m <module>` and wait for its
     startup log line. Fails loudly, naming the example and printing its last
@@ -928,6 +944,8 @@ def start_example(name, module=None):
         SKIP += 1
         return False
     stop_server()
+    if not reset_tab_history(name):
+        return False
     if port_accepts_connections(BRAZIER_PORT):
         check(False, f"{name}: port {BRAZIER_PORT} is free before start (another server, or a concurrent CDP run, holds it)")
         return False

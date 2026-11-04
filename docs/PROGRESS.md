@@ -10,7 +10,7 @@
 **Active Milestone:** 117 — Full Review Remediation
 **Last Completed:** 116 — Review Hardening (CSRF, Timers, Auth, Cookies, Docs)
 **Build Status:** GREEN (zero errors, zero warnings) on Gleam 1.19.2
-**Test Status:** GREEN (1456 tests passed, 0 failures, after the WS8c and WS9 merges)
+**Test Status:** GREEN (1525 tests passed, 0 failures, after the WS10b merges)
 **Linter:** PASSING (zero violations)
 
 ### Milestone 117: Full Review Remediation 🚧
@@ -217,7 +217,7 @@
     - the old sim latency metrics were always 0, and are gone.
 
 **Phase 4 — Docs, hygiene, rename, final audits**
-- [ ] WS10 Docs that compile, LICENSE, remove stale committed builds/stray files, archive old PROGRESS notes, honest CHANGELOG, publish script (split into WS10a and WS10b; see Decisions)
+- [x] WS10 Docs that compile, LICENSE, remove stale committed builds/stray files, archive old PROGRESS notes, honest CHANGELOG, publish script (split into WS10a and WS10b; see Decisions)
   - [x] WS10a docs and hygiene (merged 2026-11-03).
     - Coordinator verify on the merged tree: a clean build with zero warnings; format and lint clean; 1362 tests passing in each of 3 runs; `scripts/check_docs.sh` reports 59 sample modules compiling with zero warnings and 152 links resolving.
     - What was built:
@@ -228,7 +228,9 @@
       - strict bash release scripts (`publish.sh` with `--dry-run` that stops at `gleam export hex-tarball`; `push.sh`/`tag.sh` on a shared `release_lib.sh`) and fixed CDP runner scripts; the Makefile release targets use bash, and `release` runs `publish-dry-run` first;
       - removed the tracked stray `.playwright-mcp` log and the unreferenced `test_client_patch.mjs`;
       - Milestones 1–116 archived verbatim to `docs/archive/PROGRESS.md`, after which the coordinator cut this file.
-  - [ ] WS10b source follow-ups and the WS8c-owned docs (running 2026-11-03 as WS10b-T and WS10b-R, see Decisions; also takes the WS8c follow-ups not marked WS9 and the WS9 source hooks and follow-ups):
+  - [x] WS10b source follow-ups and the WS8c-owned docs (WS10b-T and WS10b-R, merged 2026-11-04; see Decisions; also took the WS8c follow-ups not marked WS9 and the WS9 source hooks and follow-ups):
+    - Coordinator verify at fa127d4: a clean build with zero warnings; format and lint clean; 1525 tests passing in each of 12 full-suite runs, and in each of 11 runs so far that start from a clean build; `scripts/check_docs.sh` reports 72 sample modules compiling with zero warnings; the client patch-safety checks pass; CDP browser-all passes with 625 desktop and 634 mobile scenarios and 0 failures (after the tab-history fix below).
+    - Open: the `ws8c_runtime_stop_test` atom-DOWN flake (see Decisions) did not come back; its diagnostic stays in the test.
     - From WS10a's code pass (also in `docs/TODO.md`):
       - dev reload never reaches a browser (`dev.gleam:151`, nothing joins `beacon:reload`), and the watcher falls back to polling (`dev.gleam:104-107`);
       - `body_parser` passes requests with a missing or bad Content-Length (`middleware.gleam:282`), and `middleware.Context` is carried by nothing (`:519-538`);
@@ -282,6 +284,8 @@
   - Rejected: reporting the leaves when the DOWN arrives. That would split the tracking session's own restart into two messages, which `ws8c_presence_flap_test` and CLUSTERING.md promise as one.
 - 2026-11-04, the same gate's flake gate also failed once in `cluster/session_cluster_test` (`revocation_during_partition_is_enforced_on_heal_test_`): no `[beacon, session, revoked]` event was recorded. The cause was the test. `session.recheck_bound` tells the bound sockets first, logs how many it told, and then emits the event. The test read the events as soon as the socket had recorded its revocation, which can happen before the emit. The test now waits for the event, then still asserts exactly one. The source order stays, because the log line reports the number of sockets notified.
 - 2026-11-04, `ws8c_runtime_stop_test` (`failing_linked_process_reports_stop_with_exit_test`) failed once, in the first `gleam test` after a clean build. The stop event carried the owner's reason, but the runtime's DOWN reason was an atom. It did not come back in 12 full-suite runs, 300 runs of the module alone (with and without logging, and with `+S 1`), 500 runs under CPU load, or 15 runs with the presence modules. The assertion now prints the reason it got, and the hunt continues with clean-build runs in a scratch worktree. It is not closed.
+- 2026-11-04, the CDP suite once failed the 4 example builds of routed, local_first_form, route_server_workspace and auth_workspace with "The rate limit for the Hex API has been exceeded" while the rename agent and the flake hunt were resolving dependencies at the same time. That is the environment, not the code: the examples' manifests are committed, and the rerun built them.
+- 2026-11-04, the next CDP run failed 5 mobile history checks in `routed`: `history.go(-1)` from /settings landed on about:blank, not /about. The harness reuses one tab for every example and every example adds entries, so by `routed` in the mobile pass the tab history was at Chrome's cap of 50 (47 in earlier, passing runs). A standalone headless-Chrome script reproduced it: three pushState entries after 30 padding navigations (history.length 50) send the second `go(-1)` to about:blank; with 22 (length 49) it works; `Page.resetNavigationHistory` before the routes fixes it. `test_all_cdp.py` now resets the tab history before each example starts, and fails that example loudly if the browser refuses, so no example's history checks depend on how many pages the examples before it loaded. Both viewports then passed (625 and 634 scenarios).
 - 2026-11-03, the PROGRESS archive is named `docs/archive/PROGRESS.md`.
   - The lint's historical-file rule already skips that name, so the archive stays verbatim and no lint source changes.
   - The rejected alternative was editing the stale phrases out of the archive, which would make it not verbatim.
