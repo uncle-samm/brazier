@@ -256,6 +256,17 @@ with its own changelog, so they are not listed here.
   2.3 times faster on Erlang; escaping is about 8 times faster. The client
   build copies the framework's JavaScript FFI files into the client project
   and fails when one is missing.
+- (PERF-7) Appending to a replicated list store, and merging that append on
+  every other node, no longer costs time in proportion to the values already
+  under the key. On a 10,000-value key an append fell from about 2,200 µs to
+  about 1 µs. `crdt.join` now only looks at the dots the delta's causal
+  context covers, the delta-state rule of Almeida, Shoker and Baquero (2018).
+  `crdt.join_full` gives the same results and is still linear. `crdt.join`
+  returns its changes in no particular order. A clock entry now covers only
+  counters from 1 up, so a malformed peer dot with counter 0 or below is
+  covered only through the cloud. The bench suite has a new
+  `store.crdt_append.{10,1000,10000}` case; its metrics need a re-baseline
+  before `brazier_bench_check` accepts them.
 
 ### Fixed
 

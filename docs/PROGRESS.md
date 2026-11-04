@@ -267,6 +267,35 @@
   - Follow-ups: an example's client build resolves dependencies from Hex every time, since no manifest is kept for the client project, so parallel builds can hit Hex's rate limit; a lint rule against stale `beacon` names in `src`, `test` and `examples`, with an allowlist for the refusals and the dev secret.
 - [ ] Final read-only audits (security, stability, tigerstyle, performance) and fixes
   - Audits started 2026-11-04 at f393ef2: four read-only agents (security, stability with the open runtime-stop flake, TigerStyle/engineering rules, performance), each in its own scratch worktree. Findings are then split into fix agents by file ownership.
+  - Audits reported 2026-11-04: 52 findings.
+    - Security: SEC-1 to SEC-17, with 2 high. SEC-1 is a URL scheme check that a combining mark defeats (stored XSS). SEC-2 is route-scoped middleware not gating WebSocket mounts or navigation.
+    - Stability: STAB-1 to STAB-5. STAB-1 is the runtime-stop flake, which is a race in the test: the test's monitor request is ordered against the owner's EXIT, giving `DOWN noproc`. STAB-2 is that `effect.after` and `effect.background` have no cap.
+    - TigerStyle: TS-1 to TS-15, with 2 high. TS-1 is an over-budget join token silently dropping the model. TS-2 is a generated secret-key fallback.
+    - Performance: PERF-1 to PERF-15, with 3 high: client full re-render plus per-render name checks, per-event full model encode and double decode, and static files hashed on every request.
+  - Fix plan. Each wave has disjoint file ownership. Each agent fixes TS-12 (`let assert` messages) in its own files.
+    - Wave 1, started 2026-11-04 at 97eb035:
+      - fix-render: SEC-1, SEC-6, SEC-12, SEC-13, PERF-1 server side, PERF-4, PERF-5;
+      - fix-client-patch: TS-3, SEC-5, SEC-14, PERF-8, PERF-15, PERF-1 client side;
+      - fix-runtime-effects: STAB-1, STAB-2, STAB-5, TS-1, TS-10, TS-11, TS-14, TS-15, PERF-12, PERF-14, SEC-11 runtime part, SEC-17;
+      - fix-cluster: TS-2, SEC-3, SEC-8, SEC-9, SEC-10, STAB-3, STAB-4;
+      - fix-static-tooling: PERF-3/SEC-15, PERF-10, PERF-13, TS-4 HTTP part, TS-5, TS-6, TS-7, TS-13 and the stale-name lint rule;
+      - fix-crdt: PERF-7.
+    - Wave 2: transport and auth. Covers SEC-2, SEC-4, SEC-7, SEC-16, SEC-11 transport part, TS-4 session-store clock, TS-8 and TS-9.
+    - Wave 3: wire and encoding performance, PERF-2 and PERF-6. Raw JSON envelopes need a wire version bump.
+    - Wave 4: PERF-9, which closes the bench gate's gaps (benches for large models, SSR, static files, client render and CRDT; no ungated metrics) and re-baselines. Then a sweep of the remaining TS-12 items.
+    - PERF-11 (about 0.5µs of telemetry span cost per event with no handler) is accepted within the overhead budget already recorded, and is not fixed.
+  - [x] fix-crdt (PERF-7), merged as 461baf2.
+    - The fix: `join_keys` finds removed dots from whichever is smaller, the delta's context or the key. This is the delta-state dot-set join (Almeida, Shoker and Baquero; delta_crdt_ex `join_dot_sets`).
+    - Effect: an append to a 10,000-value key went from 2184µs to 0.99µs, and the peer's join is just as flat. `join_full` gives unchanged results.
+    - Tests: an oracle comparison against the old join over 20 seeds × 500 steps on 3 replicas, the algebra laws, and reduction-count cost bounds.
+    - Coordinator verify on the branch (a fast-forward of bf1b9a2): clean build with zero warnings, format and lint clean, 1538 tests passing in each of 3 runs.
+    - Decisions:
+      - a clock entry covers only counters of 1 and above;
+      - the order of changes returned by `crdt.join` is unspecified;
+      - the new `store.crdt_append.*` bench metrics need a baseline (PERF-9 owner).
+    - Follow-ups:
+      - `brazier_store_replica.erl` does not validate the shape of incoming peer deltas;
+      - `compact` sorts the whole cloud on every join.
 - [ ] Final verification: build (zero warnings), tests, all examples, CDP browser suite, perf baselines
 
 **Decisions (Milestone 117, coordinator):**
