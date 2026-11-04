@@ -518,6 +518,29 @@
       - `start_listener` may log "Invalid security limits" twice;
       - `brazier_build_ffi` `absolute_path` never returns an error;
       - for up to 2 s after a bundle write, the asset cache rebuilds its entry on every load.
+  - [x] w4-client-tests, merged as 409d9eb. Items 6–11 ran in a sub-agent and came in as e86e29e and 0541256.
+    - Client:
+      - a kept element that loses or renames its `data-brazier-hook` destroys the hook (LiveView `performPatch`);
+      - `#x`, `/same/page#x` and a bare `#` are left to the browser, and back/forward between fragments of one page sends nothing (LiveView `isNewPageClick`, Turbo);
+      - `rejected_middleware` upgrades back off to one attempt per 30 s, with each early close logged as a warning and the third in a row as an error;
+      - keyed children are matched by key at any distance, so a moved focused input keeps its focus, selection and value. A seeded random morph test (5 seeds × 200 renders) found and fixed an old bug: a keyed element whose tag changed kept its old tag;
+      - each of the 5 new harness scenarios fails against the old client;
+      - the bundle was regenerated as `brazier_client_6c4e52d955510c84.js` (a rebuild is byte-identical). The coordinator changed nothing in `brazier_client/` or `priv/static/` since the branch base, so the bundle holds after the merge.
+    - Tests:
+      - telemetry handlers, presence holders and watches are cleaned up even when a test fails (`monitored.with_handler`, `holder.with_holder`, `await.with_watch_*`), and `presence/scoped_cleanup_test` proves it;
+      - `sleep_ms` is gone from the WS test FFI;
+      - `runtime_telemetry_test` asserts the exact exit reason;
+      - the pubsub, store, presence, session, TLS and peer cluster tests wait for messages through `peer.until` instead of polling.
+    - Agent CDP desktop run: 352 passed. The 8 failures were Hex rate limits; each passed when rerun alone.
+    - Coordinator verify on the merge of 7347820 into the branch (67e8f6e): clean build with zero warnings, format and lint clean, 1736 tests passing in each of 3 runs, docs check OK (73 modules), and test-client OK (52 scenarios, 9 patch-safety checks, 2450/550 apply equivalence).
+    - Decision: the sub-agent's leftover worktree matched 0541256 exactly, so it was removed with nothing lost.
+    - Follow-ups:
+      - server side of `rejected_middleware`: the browser cannot see the HTTP status of a refused upgrade. Finish the handshake and close with 4000 plus the status (for example 4403), so the client can reload and show the middleware's answer (`src/brazier/transport.gleam`, near the upgrade refusal);
+      - after a live navigation to another page's `#fragment`, the client does not scroll to it;
+      - scoped cleanup is still missing in files the agent did not own. Watches are removed by hand in rate_limit, http_server, ws_protocol, listener_rebind, session_security and pubsub tests. Telemetry is attached without detach-on-failure in ssr, init_error_server, allowed_hosts, live_page_gate, ws8c_runtime_stop, `brazier_store_test_ffi` `record_syncs`, and the cluster and sim FFI;
+      - a stray `[brazier, ws, upgrade, stop]` handler leaks, most likely from allowed_hosts_test or live_page_gate_test;
+      - `peer.eventually` polls remain in cluster_test (21) and membership_test (10);
+      - `brazier_cluster_test_ffi` counters notify no one and `recorded` races between senders; `counted_events` races too.
 - [ ] Final verification: build (zero warnings), tests, all examples, CDP browser suite, perf baselines
 
 **Decisions (Milestone 117, coordinator):**
