@@ -9,8 +9,8 @@ import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/string
 
-/// The minimum secret_key length in bytes. Join tokens and session data are
-/// signed with HMAC-SHA256, whose security needs a key of at least the hash
+/// The minimum secret_key length in bytes. Join tokens and the cluster peer
+/// check are signed with HMAC-SHA256, whose security needs a key of at least the hash
 /// length (32 bytes; RFC 2104 section 3). Generate one with
 /// `openssl rand -base64 48`.
 pub const min_secret_key_bytes = 32
