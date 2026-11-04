@@ -31,6 +31,7 @@ import {
   splitEventBatch,
   CLIENT_SEND_BUDGET,
   CLIENT_SEND_WINDOW_MS,
+  CLOSE_MIDDLEWARE_REFUSED,
   CLOSE_STALE_BUILD,
   SERVER_MAX_BATCH_SIZE,
   SERVER_MAX_EVENTS_PER_SECOND,
@@ -110,8 +111,12 @@ check("4400 to 4499 reload the page", () => {
     assert.equal(closeAction(code), "reload", String(code));
   }
 });
-check("every other close code reconnects, 4500 to 4599 and 1011 included", () => {
-  for (const code of [1000, 1001, 1002, 1003, 1006, 1007, 1008, 1009, 1011, 1013, 4000, 4399, 4500, 4503, 4599]) {
+check("4600 (middleware refused the mount) navigates to the page", () => {
+  assert.equal(CLOSE_MIDDLEWARE_REFUSED, 4600);
+  assert.equal(closeAction(CLOSE_MIDDLEWARE_REFUSED), "navigate");
+});
+check("every other close code reconnects, 4500 to 4599, 1011 and unknown 4xxx included", () => {
+  for (const code of [1000, 1001, 1002, 1003, 1006, 1007, 1008, 1009, 1011, 1013, 4000, 4123, 4399, 4500, 4503, 4599, 4601, 4999]) {
     assert.equal(closeAction(code), "reconnect", String(code));
   }
 });

@@ -1,6 +1,18 @@
 -module(brazier_telemetry_test_ffi).
 -export([rescue/1, handler_ids/1, bench_no_handler_emit/1, print_to_user/1,
-         exit_abnormally/1]).
+         exit_abnormally/1, looked_up_handler/1]).
+
+%% The call telemetry:execute makes for the one handler on EventName, taken
+%% now and made later, as by an emitter that read the handler table before
+%% a detach and calls the handler after it.
+looked_up_handler(EventName) ->
+    Atoms = [binary_to_atom(S, utf8) || S <- EventName],
+    [#{function := Function, config := Config}] =
+        [H || #{event_name := Name} = H <- telemetry:list_handlers(Atoms), Name =:= Atoms],
+    fun() ->
+        Function(Atoms, #{}, #{}, Config),
+        nil
+    end.
 
 %% Exit Pid with an abnormal reason (not normal, shutdown or kill), as an
 %% unexpected crash of a connection process would.

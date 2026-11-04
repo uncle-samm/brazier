@@ -10,6 +10,7 @@
 import brazier/application
 import brazier/await
 import brazier/log
+import brazier/monitored
 import brazier/transport/server
 import gleam/erlang/process.{type Pid}
 import gleam/int
@@ -19,6 +20,9 @@ pub type Watch
 @external(erlang, "brazier_sim_ffi", "watch_teardown")
 fn watch_ffi(conns: Pid) -> Watch
 
+@external(erlang, "brazier_sim_ffi", "unwatch_teardown")
+fn unwatch_ffi(watch: Watch) -> Nil
+
 @external(erlang, "brazier_sim_ffi", "await_teardown")
 fn await_teardown_ffi(
   watch: Watch,
@@ -26,19 +30,32 @@ fn await_teardown_ffi(
   timeout_ms: Int,
 ) -> Result(Nil, String)
 
-/// Start watching `app`'s connections. Attach before the pool runs: a
-/// close that happens before the watch exists is never reported.
-pub fn watch(app: application.App) -> Watch {
+/// Run `run` with a watch on `app`'s connections. Start it before the pool
+/// runs: a close that happens before the watch exists is never reported.
+///
+/// The watch is a node-wide telemetry handler. It is detached however
+/// `run` ends, and no report of it is left in the caller's mailbox, so a
+/// failing run does not leave a handler sending to eunit's shared test
+/// process (ExUnit's `on_exit/1`).
+pub fn watching(app: application.App, run: fn(Watch) -> a) -> a {
   case server.get_connection_owner(app.listener) {
-    Ok(conns) -> watch_ffi(conns)
+    Ok(conns) -> watching_connections(conns, run)
     Error(Nil) ->
-      panic as "teardown.watch: the app's listener has no connection owner"
+      panic as "teardown.watching: the app's listener has no connection owner"
   }
+}
+
+/// `watching` for the connections whose handlers `conns` started: the
+/// listener's connection owner (or, in teardown_test, the test process).
+pub fn watching_connections(conns: Pid, run: fn(Watch) -> a) -> a {
+  let watch = watch_ffi(conns)
+  use <- monitored.with_cleanup(fn() { unwatch_ffi(watch) })
+  run(watch)
 }
 
 /// Wait until `connections` server connections have closed and every
 /// process they reported has exited. Crashes with what is still missing
-/// if that does not happen within the deadline. Detaches the watch.
+/// if that does not happen within the deadline.
 pub fn await_closed(watch: Watch, connections: Int) -> Nil {
   // A 1000-connection pool under the stress gate closes in well under a
   // second; the deadline only bounds a broken teardown.

@@ -154,7 +154,7 @@ measurements: `system_time` and `monotonic_time` on start, `duration` and
 | `[brazier, effect, after, rejected]` | none | `limit` | yes, `brazier/effect` |
 | `[brazier, effect, background, rejected]` | none | `limit` | yes, `brazier/effect` |
 | `[brazier, store, write]` | `count` | `store`, `op`, `mode`: `local` or `replicated` | yes, `brazier/store` |
-| `[brazier, store, sync]` S | `entries`, `bytes` (stop) | `store`, `peer` | yes, `brazier_store_replica` (replicated stores) |
+| `[brazier, store, sync]` S | `entries`, `bytes` (stop) | `store`, `peer`; `result`, `reason` (stop) | yes, `brazier_store_replica` (replicated stores) |
 | `[brazier, session, created \| revoked \| expired \| contention]` | `count` | `reason` | yes, `brazier/session` |
 | `[brazier, pubsub, broadcast]` | `local_subscribers`, `remote_nodes` | `scope`: `cluster`, `local` or `direct` | yes |
 | `[brazier, pubsub, forward, overloaded]` | `queue_len` | `shard` | yes, at most once per second per worker |
@@ -183,7 +183,8 @@ Notes on individual events:
   - pages: `/*`, the shared page pattern (Brazier's router is typed, so a
     page has no textual pattern);
   - `*` for `OPTIONS *`, and `/ws` for the middleware pass on a live page
-    (at the upgrade, and for each gated live navigation and join; see
+    (at the upgrade, once it has passed every other check, and for each
+    gated live navigation and join; see
     [MIDDLEWARE.md](MIDDLEWARE.md#the-live-page)), which runs as a request
     span and reports status 101 when the page is admitted, or the
     middleware's status when it is refused.
@@ -201,8 +202,9 @@ Notes on individual events:
   `rejected_host` (a `Host` not in `allowed_hosts`), `rejected_early_data`,
   `rejected_body`, `rejected_path` (no `path` parameter, or one that is not
   a same-origin path), `rejected_middleware` (the middleware refused the
-  page),
-  `peer_gone`, `rejected_connection_limit`, `rejected_ip_limit`,
+  page: the span then covers the 101, the 4600 close and its wait of at
+  most 1 second for the peer to close, and the connection's `[brazier, ws,
+  close]` is emitted inside it), `peer_gone`, `rejected_connection_limit`, `rejected_ip_limit`,
   `rejected_origin`, `rejected_auth`, `rejected_handshake`,
   `rejected_version` or `upgrade_write_failed`.
 - `[brazier, ws, close]` is emitted once per upgraded connection when its
@@ -218,7 +220,9 @@ Notes on individual events:
   manifest, and a dev-mode handler that cannot subscribe to reloads),
   `authentication_expired`, `session_revoked`, `server_overloaded`,
   `backpressure`, `server_shutting_down` or `stale_build` (4409, a join
-  from a page of another build) for a close Brazier sent; `tcp_closed`,
+  from a page of another build) or `middleware_refused` (4600, an upgrade
+  the page's middleware refused; it has `frames_out` 1 and no runtime ran)
+  for a close Brazier sent; `tcp_closed`,
   `tcp_error` or `send_failed` without a close frame; or `init_refused`
   (including a join token that fails its check, 4400) and
   `startup_failure` when the runtime did not start. Dev mode's `reload`
@@ -276,7 +280,19 @@ Notes on individual events:
   refused by a replicated store's limits emits nothing.
 - `[brazier, store, sync]` wraps every remote merge into a replicated
   store, accepted or refused. `entries` and `bytes` describe the payload,
-  and `peer` is the sending node. See
+  and `peer` is the sending node. The stop event's `result` says how the
+  merge ended, and `reason` why:
+
+  | `result` | `reason` |
+  |----------|----------|
+  | `ok` | `none` |
+  | `malformed` | the field that failed the check, for example `a clock counter is not an integer >= 1` |
+  | `too_large` | `max_delta_bytes` or `max_sync_bytes` |
+  | `too_many_entries` | `max_entries` |
+
+  A malformed payload reports `entries` 0, since its entries cannot be
+  counted. Count refusals by `result`, not by `entries`: an empty delta (a
+  removal) is `ok` with `entries` 0. See
   [CLUSTERING.md](CLUSTERING.md#replicated-stores).
 - `[brazier, pubsub, broadcast]`: for `scope: "cluster"`, `remote_nodes` is
   the number of remote nodes forwarded to, one message each, however many

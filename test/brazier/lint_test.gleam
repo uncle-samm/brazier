@@ -250,11 +250,80 @@ pub fn let_assert_discard_is_not_flagged_test() {
   let source =
     "
 pub fn save() {
-  let assert Ok(_) = write()
+  let assert Ok(_) = write() as \"write cannot fail here\"
   Nil
 }
 "
   let assert [] = lint.lint_source("src/brazier/other.gleam", source)
+}
+
+pub fn let_assert_without_message_in_src_is_violation_test() {
+  let source =
+    "
+pub fn save() {
+  let assert Ok(_) = write()
+  Nil
+}
+"
+  let assert [v] = lint.lint_source("src/brazier/other.gleam", source)
+    as "the one let assert without `as` is the one violation"
+  assert v.rule == "let-assert-message"
+  assert v.location == "3:3"
+  assert str_contains(v.message, "`save`")
+  assert str_contains(v.message, "no `as")
+}
+
+pub fn let_assert_with_empty_message_is_violation_test() {
+  let source =
+    "
+pub fn save() {
+  let assert Ok(_) = write() as \"  \"
+  Nil
+}
+"
+  let assert [v] = lint.lint_source("src/brazier/other.gleam", source)
+    as "a blank `as` message names no invariant"
+  assert v.rule == "let-assert-message"
+  assert str_contains(v.message, "empty `as` message")
+}
+
+pub fn let_assert_without_message_deep_in_a_use_callback_is_found_test() {
+  let source =
+    "
+pub fn save() {
+  use x <- result.try(read())
+  case x {
+    _ -> {
+      let assert Ok(y) = write(x)
+      y
+    }
+  }
+}
+"
+  let violations = lint.lint_source("src/brazier/other.gleam", source)
+  assert list.map(violations, fn(v) { v.rule }) == ["let-assert-message"]
+}
+
+pub fn let_assert_with_computed_message_passes_test() {
+  let source =
+    "
+pub fn save(path: String) {
+  let assert Ok(_) = write(path) as { \"cannot write \" <> path }
+  Nil
+}
+"
+  let assert [] = lint.lint_source("src/brazier/other.gleam", source)
+}
+
+pub fn let_assert_without_message_outside_src_is_not_checked_test() {
+  let source =
+    "
+pub fn save_test() {
+  let assert Ok(_) = write()
+  Nil
+}
+"
+  let assert [] = lint.lint_source("test/brazier/other_test.gleam", source)
 }
 
 pub fn removed_router_api_phrase_is_violation_test() {

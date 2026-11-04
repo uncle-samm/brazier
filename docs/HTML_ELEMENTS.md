@@ -41,7 +41,7 @@ Elements take `(attributes: List(Attribute(msg)), children: List(Element(msg)))`
 | `element.element(tag, attributes, children)` | Any tag. A tag with characters outside `a-z A-Z 0-9 - _ : .` crashes. |
 | `element.text(content)` | Escaped text |
 | `element.none()` | Renders nothing; use it for conditional content |
-| `element.keyed(key, child)` | Gives `child` an identity (`data-brazier-key`) so the browser keeps or replaces its DOM node by key instead of by position |
+| `element.keyed(key, child)` | Gives `child` an identity (`data-brazier-key`) so the browser keeps or replaces its DOM node by key instead of by position. A reorder moves keyed nodes, which keep focus and state; a key rendered with another tag is a new node. Keys must be unique among siblings: a repeated key is logged as an error. |
 | `element.map(element, f)` | Changes the message type, for child modules |
 | `element.unsafe_raw_html(html)` | Inserts HTML without escaping or the URL policy |
 | `element.to_string(element)` | Renders to an HTML string |

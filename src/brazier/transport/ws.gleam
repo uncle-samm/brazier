@@ -63,6 +63,16 @@ pub const close_auth_revoked = 4401
 /// for every code from 4400 to 4499.
 pub const close_stale_build = 4409
 
+/// 4600: application code — route middleware refused the page this socket
+/// would mount. A browser cannot read the HTTP status of a refused upgrade,
+/// so the server completes the handshake and closes at once with this code
+/// and `middleware refused <status>` as the reason; the client then loads
+/// the page over HTTP, where the middleware's own answer (a redirect, a
+/// 403 page) is shown. It sits outside 4400-4499 (reload behind the reload
+/// guard), 4500-4599 (reconnect) and `4000 + status` (init refusals,
+/// statuses are at most 599), so no other code can be mistaken for it.
+pub const close_middleware_refused = 4600
+
 /// Maximum close reason length: control payload limit 125 minus the code.
 const max_close_reason_bytes = 123
 

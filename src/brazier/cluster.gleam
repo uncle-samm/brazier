@@ -14,10 +14,12 @@
 ////   where `secret_key` is the application's own secret key (one key per
 ////   deployment; the purpose label keeps the MAC apart from token
 ////   signatures). A peer whose key differs, or that does not answer within
-////   `peer_check_timeout`, is disconnected and reported with
-////   `[brazier, cluster, peer, rejected]`. This catches two deployments
-////   sharing a cookie by mistake; it is not a defence against a node that
-////   holds the cookie, which can run any code here.
+////   `peer_check_timeout`, is rejected: it is not a member, the error is
+////   logged and reported with `[brazier, cluster, peer, rejected]`, and it
+////   stays connected (disconnecting it would make OTP's `global` partition
+////   the verified members; see docs/CLUSTERING.md). This catches two
+////   deployments sharing a cookie by mistake; it is not a defence against
+////   a node that holds the cookie, which can run any code here.
 //// - keeps the cluster's membership: PubSub, replicated stores, presence
 ////   and session revocation exchange messages only with peers that passed
 ////   the check (`members`), and drop what any other node sends. Without a

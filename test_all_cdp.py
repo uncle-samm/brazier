@@ -997,7 +997,8 @@ def start_example(name, module=None):
     if not should_run(name):
         SKIP += 1
         return False
-    stop_server()
+    if not stop_server():
+        return False
     if not reset_tab_history(name):
         return False
     if port_accepts_connections(BRAZIER_PORT):
@@ -1072,25 +1073,41 @@ def report_contract(name, directory):
 
 def stop_server():
     """Unload the page, stop the server's process group and wait until its
-    port refuses connections, so the next example starts on a free port."""
+    port refuses connections, so the next example starts on a free port.
+
+    Returns False, after recording each failure with `check`, when the page
+    was not unloaded, the output reader outlived the server, or the port is
+    still open. The server is stopped either way. `start_example` refuses
+    to start the next example on False: a page still connected to the old
+    server, or a port still held, would make its results meaningless."""
     global server_proc, server_reader
+    ok = True
+    label = server_name or "before the first example"
     if ws is not None:
         r = cdp("Page.navigate", {"url": "about:blank"}, timeout=2)
-        if r is None or not wait_for_js('location.href === "about:blank"', timeout=2):
-            vlog("Browser did not reach about:blank before the server stop")
+        if r is None or "error" in r:
+            reason = "no response" if r is None else r["error"].get("message")
+            check(False, f"{label}: browser unloads the page before the server stops ({reason})")
+            ok = False
+        elif not wait_for_js('location.href === "about:blank"', timeout=2):
+            check(False, f"{label}: browser reaches about:blank before the server stops")
+            ok = False
         clear_browser_errors()
     if server_proc:
         kill_server_group(server_proc)
         if server_reader is not None:
             server_reader.join(timeout=5)
             if server_reader.is_alive():
-                print(f"  * {server_name}: server output reader still running after the server exited")
+                check(False, f"{label}: server output reader stops after the server exited")
+                ok = False
         server_proc = None
         server_reader = None
     if os.environ.get("BRAZIER_CDP_KILL_PORT") == "1":
         os.system(f"lsof -ti:{BRAZIER_PORT} 2>/dev/null | xargs kill -9 2>/dev/null")
     if not wait_until_port_free(BRAZIER_PORT):
         check(False, f"port {BRAZIER_PORT} refuses connections after the server stopped")
+        ok = False
+    return ok
 
 def wait_until_port_free(port):
     deadline = time.time() + WAIT_SECONDS

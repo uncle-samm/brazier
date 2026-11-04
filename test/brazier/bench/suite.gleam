@@ -453,7 +453,7 @@ fn send_event(rt: Runtime, handler_id: String, clock: Int) -> Nil {
       event_data: "{}",
       target_path: "0",
       clock: clock,
-      ops: "",
+      ops: [],
     ),
   )
 }

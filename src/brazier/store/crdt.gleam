@@ -27,6 +27,9 @@
 //// Join is commutative, associative and idempotent, so replicas converge
 //// whatever order, duplication or batching deltas and full states arrive
 //// in.
+////
+//// Every state carries a `digest` of itself for anti-entropy, kept up to
+//// date by every join instead of recomputed (see `digest`).
 
 import brazier/store/hlc.{type Timestamp}
 import gleam/dict.{type Dict}
@@ -66,9 +69,16 @@ pub type Context {
 pub type Dots(value) =
   Dict(Dot, Entry(value))
 
-/// A replica's state. `size` is the number of live dots over every key.
+/// A replica's state. `size` is the number of live dots over every key and
+/// `digest` the XOR of the hashes of its elements (see `digest`); both are
+/// kept up to date by every join.
 pub type State(value) {
-  State(entries: Dict(String, Dots(value)), context: Context, size: Int)
+  State(
+    entries: Dict(String, Dots(value)),
+    context: Context,
+    size: Int,
+    digest: Int,
+  )
 }
 
 /// A state fragment produced by a write. `entries` names every key the
@@ -88,9 +98,9 @@ pub type Change(value) {
   Removed(key: String, dot: Dot, entry: Entry(value))
 }
 
-/// The empty state.
+/// The empty state. Its digest is 0, the XOR of no hashes.
 pub fn new() -> State(value) {
-  State(entries: dict.new(), context: empty_context(), size: 0)
+  State(entries: dict.new(), context: empty_context(), size: 0, digest: 0)
 }
 
 fn empty_context() -> Context {
@@ -225,16 +235,20 @@ fn join_keys(
   keys: List(String),
 ) -> #(State(value), List(Change(value))) {
   let observed = context_dot_count(other_context)
-  let #(entries, size, changes) =
-    list.fold(keys, #(state.entries, state.size, []), fn(acc, key) {
-      let #(entries, size, changes) = acc
+  let start = #(state.entries, state.size, [], state.digest)
+  let #(entries, size, changes, digest) =
+    list.fold(keys, start, fn(acc, key) {
+      let #(entries, size, changes, digest) = acc
       let mine = dict_get_or_empty(entries, key)
       let theirs = dict_get_or_empty(other, key)
       let #(removed, removed_count) =
         removed_dots(mine, theirs, other_context, observed)
-      let changes =
-        list.fold(removed, changes, fn(changes, pair) {
-          [Removed(key:, dot: pair.0, entry: pair.1), ..changes]
+      let #(changes, digest) =
+        list.fold(removed, #(changes, digest), fn(acc, pair) {
+          #(
+            [Removed(key:, dot: pair.0, entry: pair.1), ..acc.0],
+            toggle(acc.1, LiveDot(key:, dot: pair.0)),
+          )
         })
       let kept = case removed_count == dict.size(mine) {
         // A put or remove replaces every value it observed: nothing to
@@ -246,15 +260,16 @@ fn join_keys(
             _ -> dict.drop(mine, list.map(removed, fn(pair) { pair.0 }))
           }
       }
-      let #(joined, changes, added) =
-        dict.fold(theirs, #(kept, changes, 0), fn(acc, dot, entry) {
-          let #(joined, changes, added) = acc
+      let #(joined, changes, added, digest) =
+        dict.fold(theirs, #(kept, changes, 0, digest), fn(acc, dot, entry) {
+          let #(joined, changes, added, digest) = acc
           case dict.has_key(mine, dot) || covers(state.context, dot) {
             True -> acc
             False -> #(
               dict.insert(joined, dot, entry),
               [Added(key:, dot:, entry:), ..changes],
               added + 1,
+              toggle(digest, LiveDot(key:, dot:)),
             )
           }
         })
@@ -262,10 +277,11 @@ fn join_keys(
         True -> dict.delete(entries, key)
         False -> dict.insert(entries, key, joined)
       }
-      #(entries, size - removed_count + added, changes)
+      #(entries, size - removed_count + added, changes, digest)
     })
-  let context = union_context(state.context, other_context)
-  #(State(entries:, context:, size:), list.reverse(changes))
+  let #(context, digest) =
+    union_context(state.context, other_context, digest, toggle)
+  #(State(entries:, context:, size:, digest:), list.reverse(changes))
 }
 
 /// The dots of `mine` that `context` covers and `theirs` lacks (the ones
@@ -384,33 +400,203 @@ fn next_dot(context: Context, replica: Replica) -> Dot {
 /// The exact context of a set of dots (compaction is lossless: it only
 /// moves a dot from the cloud into the clock when every lower counter of
 /// its replica is already there).
+/// A delta has no digest, so its context is built untracked.
 fn context_of(dots: List(Dot)) -> Context {
-  compact(Context(clock: dict.new(), cloud: set.from_list(dots)))
+  let #(context, _digest) =
+    union_context(
+      empty_context(),
+      Context(clock: dict.new(), cloud: set.from_list(dots)),
+      0,
+      untracked,
+    )
+  context
 }
 
-fn union_context(a: Context, b: Context) -> Context {
+/// The compacted union of a compacted context `a` (a state's context: every
+/// context this module builds is compacted) and any context `b`.
+///
+/// *Compacted* means: no cloud dot is at or below its replica's clock (0
+/// when the replica has no entry), and no cloud dot is the counter right
+/// after it, so the clock cannot be extended. Given that of `a`, only the
+/// replicas `b` names can change, and only by the dots `b` brings: the
+/// cloud dots of `a` its clock now covers are dropped, `b`'s cloud dots
+/// above the clock are added, and each named replica's clock is extended
+/// while the next counter is in the cloud. The cost is
+/// O(|b| + min(counters b's clock newly covers, |a.cloud|) + dots absorbed
+/// into the clock), not O(|a.cloud| log |a.cloud|): the cloud of a state is
+/// never sorted, and is walked only when `b`'s clock newly covers more
+/// counters than the cloud holds. The result is exactly the one
+/// sorting the whole cloud gives (the oracle in crdt_test), and is
+/// compacted again, so the invariant holds for every state.
+///
+/// The compaction rule is the one of Almeida, Shoker and Baquero (a dot
+/// joins the version vector once every lower counter of its replica has
+/// been seen); applying it only to the replicas a delta names is what keeps
+/// a join's cost following the delta, as `join_keys` does for the dots.
+///
+/// `digest` is the digest of a state whose context is `a`; the result
+/// carries it updated for the new context. `toggle` folds in every element
+/// of the context that is added or removed (`untracked` for a context with
+/// no digest), so the digest costs O(elements that change), as the rest of
+/// the union does.
+fn union_context(
+  a: Context,
+  b: Context,
+  digest: Int,
+  toggle: fn(Int, Element) -> Int,
+) -> #(Context, Int) {
   let clock = dict.combine(a.clock, b.clock, fn(x, y) { int.max(x, y) })
-  compact(Context(clock: clock, cloud: set.union(a.cloud, b.cloud)))
-}
-
-/// Move every cloud dot that extends its replica's clock into the clock and
-/// drop the cloud dots the clock already covers.
-fn compact(context: Context) -> Context {
-  let sorted = list.sort(set.to_list(context.cloud), compare_dots)
-  let #(clock, cloud) =
-    list.fold(sorted, #(context.clock, set.new()), fn(acc, dot) {
-      let #(clock, cloud) = acc
-      let max = case dict.get(clock, dot.replica) {
-        Ok(max) -> max
-        Error(Nil) -> 0
-      }
-      case dot.counter <= max, dot.counter == max + 1 {
-        True, _ -> acc
-        False, True -> #(dict.insert(clock, dot.replica, dot.counter), cloud)
-        False, False -> #(clock, set.insert(cloud, dot))
+  let #(cloud, digest) = drop_covered(a, b.clock, digest, toggle)
+  // Every replica `b` names is a candidate for extension: its clock may
+  // have moved (up, or for a replica `a` lacked, below 0) or its cloud
+  // grown.
+  let #(cloud, touched, digest) =
+    set.fold(b.cloud, #(cloud, dict.keys(b.clock), digest), fn(acc, dot) {
+      let #(cloud, touched, digest) = acc
+      case dot.counter <= clock_or_zero(clock, dot.replica) {
+        True -> acc
+        False ->
+          case set.contains(cloud, dot) {
+            True -> #(cloud, [dot.replica, ..touched], digest)
+            False -> #(
+              set.insert(cloud, dot),
+              [dot.replica, ..touched],
+              toggle(digest, CloudDot(dot)),
+            )
+          }
       }
     })
-  Context(clock: clock, cloud: cloud)
+  let #(clock, cloud, digest) =
+    list.fold(touched, #(clock, cloud, digest), fn(acc, replica) {
+      let #(clock, cloud, digest) = acc
+      extend(clock, cloud, replica, digest, toggle)
+    })
+  // Only a replica `b` names can have a new clock entry: fold out the old
+  // entry and in the new one of each that moved, once.
+  let digest =
+    set.fold(set.from_list(touched), digest, fn(digest, replica) {
+      let old = dict.get(a.clock, replica)
+      let new = dict.get(clock, replica)
+      case old == new {
+        True -> digest
+        False ->
+          digest
+          |> toggle_entry(old, replica, toggle)
+          |> toggle_entry(new, replica, toggle)
+      }
+    })
+  #(Context(clock:, cloud:), digest)
+}
+
+fn toggle_entry(
+  digest: Int,
+  entry: Result(Int, Nil),
+  replica: Replica,
+  toggle: fn(Int, Element) -> Int,
+) -> Int {
+  case entry {
+    Ok(max) -> toggle(digest, ClockEntry(replica:, max:))
+    Error(Nil) -> digest
+  }
+}
+
+/// The cloud of `a` without the dots `clock` (another context's clock)
+/// covers and `a.clock` did not, with `digest` updated for each dot
+/// dropped. Probes each newly covered counter, or scans the cloud once
+/// when that is fewer steps.
+fn drop_covered(
+  a: Context,
+  clock: Dict(Replica, Int),
+  digest: Int,
+  toggle: fn(Int, Element) -> Int,
+) -> #(Set(Dot), Int) {
+  let raised =
+    dict.fold(clock, [], fn(raised, replica, max) {
+      let old = clock_or_zero(a.clock, replica)
+      case max > old {
+        True -> [#(replica, old, max), ..raised]
+        False -> raised
+      }
+    })
+  let probes =
+    list.fold(raised, 0, fn(probes, raise) { probes + raise.2 - raise.1 })
+  case raised, probes <= set.size(a.cloud) {
+    [], _ -> #(a.cloud, digest)
+    _, True ->
+      list.fold(raised, #(a.cloud, digest), fn(acc, raise) {
+        let #(replica, old, max) = raise
+        drop_counters(acc.0, replica, old + 1, max, acc.1, toggle)
+      })
+    _, False -> {
+      let raised =
+        list.fold(raised, dict.new(), fn(raised, raise) {
+          dict.insert(raised, raise.0, raise.2)
+        })
+      set.fold(a.cloud, #(a.cloud, digest), fn(acc, dot) {
+        case dict.get(raised, dot.replica) {
+          Ok(max) if dot.counter <= max -> #(
+            set.delete(acc.0, dot),
+            toggle(acc.1, CloudDot(dot)),
+          )
+          Ok(_) | Error(Nil) -> acc
+        }
+      })
+    }
+  }
+}
+
+fn drop_counters(
+  cloud: Set(Dot),
+  replica: Replica,
+  counter: Int,
+  max: Int,
+  digest: Int,
+  toggle: fn(Int, Element) -> Int,
+) -> #(Set(Dot), Int) {
+  case counter > max {
+    True -> #(cloud, digest)
+    False -> {
+      let dot = Dot(replica:, counter:)
+      let #(cloud, digest) = case set.contains(cloud, dot) {
+        True -> #(set.delete(cloud, dot), toggle(digest, CloudDot(dot)))
+        False -> #(cloud, digest)
+      }
+      drop_counters(cloud, replica, counter + 1, max, digest, toggle)
+    }
+  }
+}
+
+/// Move the cloud dots that continue `replica`'s clock into the clock, one
+/// counter at a time, with `digest` updated for each dot that leaves the
+/// cloud (`union_context` updates it for the clock entry). A replica with
+/// no entry starts at 0 and gets one only if its counter 1 is in the cloud.
+fn extend(
+  clock: Dict(Replica, Int),
+  cloud: Set(Dot),
+  replica: Replica,
+  digest: Int,
+  toggle: fn(Int, Element) -> Int,
+) -> #(Dict(Replica, Int), Set(Dot), Int) {
+  let max = clock_or_zero(clock, replica)
+  let next = Dot(replica:, counter: max + 1)
+  case set.contains(cloud, next) {
+    False -> #(clock, cloud, digest)
+    True ->
+      extend(
+        dict.insert(clock, replica, next.counter),
+        set.delete(cloud, next),
+        replica,
+        toggle(digest, CloudDot(next)),
+        toggle,
+      )
+  }
+}
+
+fn clock_or_zero(clock: Dict(Replica, Int), replica: Replica) -> Int {
+  case dict.get(clock, replica) {
+    Ok(max) -> max
+    Error(Nil) -> 0
+  }
 }
 
 // --- Reads ---
@@ -469,28 +655,68 @@ pub fn max_timestamp(delta: Delta(value)) -> Result(Timestamp, Nil) {
   })
 }
 
-/// A canonical description of the state (every live `(key, dot)` and the
-/// context, sorted) that is equal on two replicas exactly when their states
-/// are equal. Values are left out: a dot names one value forever.
-pub fn fingerprint(
-  state: State(value),
-) -> #(List(#(String, Dot)), List(#(Replica, Int)), List(Dot)) {
-  let live =
-    dict.fold(state.entries, [], fn(acc, key, dots) {
-      list.fold(dict.keys(dots), acc, fn(acc, dot) { [#(key, dot), ..acc] })
-    })
-    |> list.sort(fn(a, b) {
-      case string.compare(a.0, b.0) {
-        order.Eq -> compare_dots(a.1, b.1)
-        other -> other
-      }
-    })
-  let clock =
-    dict.to_list(state.context.clock)
-    |> list.sort(fn(a, b) { compare_replicas(a.0, b.0) })
-  let cloud = list.sort(set.to_list(state.context.cloud), compare_dots)
-  #(live, clock, cloud)
+// --- Digest ---
+
+/// One element of a state, as the digest hashes it: a live dot under its
+/// key, a clock entry, or a cloud dot. Values are left out: a dot names
+/// one value forever.
+type Element {
+  LiveDot(key: String, dot: Dot)
+  ClockEntry(replica: Replica, max: Int)
+  CloudDot(dot: Dot)
 }
+
+/// The state's digest for anti-entropy: the XOR of the 256-bit hashes of
+/// its elements (every live `(key, dot)`, clock entry and cloud dot). Two
+/// replicas hold the same digest exactly when they hold the same elements,
+/// up to a hash collision. Reading it costs nothing: every join folds in
+/// the elements it adds and removes (XOR is its own inverse, and the
+/// result does not depend on order), so a write costs a few hashes and a
+/// digest exchange never walks the state.
+///
+/// This is the incremental tree hash of Riak's TicTac AAE
+/// (`leveled_tictac`, whose segment hashes are XORs of per-key hashes,
+/// updated by XOR-ing in the hash of each change), with one segment, since
+/// a mismatch pulls the whole state. delta_crdt_ex keeps its MerkleMap up
+/// to date on every change for the same reason. XOR resists accidental
+/// collisions, not crafted ones, which is enough between members: they
+/// trust each other completely.
+pub fn digest(state: State(value)) -> Int {
+  state.digest
+}
+
+/// The digest computed from the whole state, in O(state) and without
+/// sorting: what `digest` must always equal (the tests check it after
+/// every join).
+pub fn recompute_digest(state: State(value)) -> Int {
+  let digest =
+    dict.fold(state.entries, 0, fn(digest, key, dots) {
+      dict.fold(dots, digest, fn(digest, dot, _entry) {
+        toggle(digest, LiveDot(key:, dot:))
+      })
+    })
+  let digest =
+    dict.fold(state.context.clock, digest, fn(digest, replica, max) {
+      toggle(digest, ClockEntry(replica:, max:))
+    })
+  set.fold(state.context.cloud, digest, fn(digest, dot) {
+    toggle(digest, CloudDot(dot))
+  })
+}
+
+/// Fold `element` into or out of `digest`.
+fn toggle(digest: Int, element: Element) -> Int {
+  int.bitwise_exclusive_or(digest, element_hash(element))
+}
+
+fn untracked(digest: Int, _element: Element) -> Int {
+  digest
+}
+
+/// The SHA-256 of the element's canonical external term format, as a
+/// 256-bit integer: the same on every node and OTP release.
+@external(erlang, "brazier_crdt_ffi", "element_hash")
+fn element_hash(element: Element) -> Int
 
 // --- Order ---
 

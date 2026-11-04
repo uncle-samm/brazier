@@ -39,21 +39,23 @@ fn run_measured(
 ) -> Run {
   warm_up(app)
   let mt = metrics.new()
-  let watch = teardown.watch(app)
-  let mem_before = metrics.snapshot_memory()
-  let procs_before = metrics.snapshot_processes()
-  let pids_before = metrics.snapshot_pids()
-
-  let result =
-    pool.run(pool.PoolConfig(
-      concurrency: concurrency,
-      host: "localhost",
-      port: app.port,
-      scenario: run_scenario,
-      stagger_ms: stagger_ms,
-      metrics: mt,
-    ))
-  teardown.await_closed(watch, result.upgraded)
+  let #(result, mem_before, procs_before, pids_before) = {
+    use watch <- teardown.watching(app)
+    let mem_before = metrics.snapshot_memory()
+    let procs_before = metrics.snapshot_processes()
+    let pids_before = metrics.snapshot_pids()
+    let result =
+      pool.run(pool.PoolConfig(
+        concurrency: concurrency,
+        host: "localhost",
+        port: app.port,
+        scenario: run_scenario,
+        stagger_ms: stagger_ms,
+        metrics: mt,
+      ))
+    teardown.await_closed(watch, result.upgraded)
+    #(result, mem_before, procs_before, pids_before)
+  }
 
   let mem_after = metrics.snapshot_memory()
   let procs_after = metrics.snapshot_processes()
@@ -92,17 +94,20 @@ fn run_measured(
 /// connection leaves behind still shows up, once per connection.
 fn warm_up(app: application.App) -> Nil {
   let mt = metrics.new()
-  let watch = teardown.watch(app)
-  let result =
-    pool.run(pool.PoolConfig(
-      concurrency: 1,
-      host: "localhost",
-      port: app.port,
-      scenario: scenario.connect_disconnect(),
-      stagger_ms: 0,
-      metrics: mt,
-    ))
-  teardown.await_closed(watch, result.upgraded)
+  let result = {
+    use watch <- teardown.watching(app)
+    let result =
+      pool.run(pool.PoolConfig(
+        concurrency: 1,
+        host: "localhost",
+        port: app.port,
+        scenario: scenario.connect_disconnect(),
+        stagger_ms: 0,
+        metrics: mt,
+      ))
+    teardown.await_closed(watch, result.upgraded)
+    result
+  }
   metrics.destroy(mt)
   let assert [] = result.failures
   let assert 1 = result.upgraded

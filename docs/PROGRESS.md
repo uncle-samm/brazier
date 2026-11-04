@@ -286,6 +286,35 @@
       - Both may make small edits to `brazier.gleam` and `application.gleam`, which fix-cluster also edits; the coordinator resolves those merges. Neither touches the `.erl` files fix-cluster owns.
     - Wave 3: wire and encoding performance, PERF-2 and PERF-6. Raw JSON envelopes need a wire version bump. Started 2026-11-04 at the commit after 4678b0f as one agent (w3-wire-perf), because both findings cross the runtime-to-transport boundary. It runs alongside the W4 monitor-race sweep, which touches only tests that are not runtime, transport or client tests.
     - Wave 4: PERF-9, which closes the bench gate's gaps (benches for large models, SSR, static files, client render and CRDT; no ungated metrics) and re-baselines. Then a sweep of the remaining TS-12 items.
+      - Started 2026-11-04 as three agents with disjoint files:
+        - **w4-bench-gate** (PERF-9), from 75a71a8. It owns the bench code, `bench/`, the Makefile bench targets and the bench docs.
+        - **w4-server-sweep**, from 67e1158. It owns `src/` outside the client and takes:
+          - the TS-12 sweep, plus a lint rule that requires `as` on every `let assert`;
+          - raw-path logging (the rest of SEC-11);
+          - `trusted_proxies` parsed once, and the scheme read only from the configured forwarding header;
+          - stale `asset_cache_ffi` entries;
+          - the `stop_server` error;
+          - validation of peer deltas in `store_replica`;
+          - the CRDT compact sort.
+        - **w4-client-tests**, from 67e1158. It owns `brazier_client`, `priv/static` and the test-hygiene files, and takes:
+          - unmounting a hook when its attribute is removed;
+          - `#` links;
+          - the `rejected_middleware` retry;
+          - keyed morph;
+          - telemetry and presence cleanup, `watch_info`/`unwatch`, `sleep_ms`, the exact exit reason, and the `peer.eventually` polls.
+    - Wave 5: follow-ups from waves 3 and 4 that are worth fixing before final verification. Started 2026-11-04 at e798211 as three agents with disjoint files, while w4-bench-gate is still running:
+      - **w5-transport-client** owns transport, `brazier_client` and `priv/static`. It takes:
+        - the server side of `rejected_middleware`: complete the handshake, then close with a 4xxx refusal code that makes the client hard-navigate;
+        - raw JSON `ops` in client-to-server `event` messages;
+        - the fragment scroll after a live navigation;
+        - the duplicate proxy-hop and security-limits logs;
+        - the bundle, the examples and a CDP desktop run.
+      - **w5-store-build** owns the store, CRDT, replica and build FFI. It takes the refused-payload telemetry event, an incremental `crdt.fingerprint`, and an honest `absolute_path`.
+      - **w5-test-hygiene** owns test files and test FFIs only. It takes:
+        - scoped watch and telemetry cleanup in the remaining tests;
+        - the stray `[brazier, ws, upgrade, stop]` handler leak;
+        - the `peer.eventually` polls in cluster_test and membership_test;
+        - the cluster test FFI counter races.
     - PERF-11 (about 0.5µs of telemetry span cost per event with no handler) is accepted within the overhead budget already recorded, and is not fixed.
   - [x] fix-crdt (PERF-7), merged as 461baf2.
     - The fix: `join_keys` finds removed dots from whichever is smaller, the delta's context or the key. This is the delta-state dot-set join (Almeida, Shoker and Baquero; delta_crdt_ex `join_dot_sets`).
@@ -437,7 +466,148 @@
       - users of `watch_info` never call `unwatch`;
       - `sleep_ms` in `brazier_ws_test_ffi.erl` is unused;
       - the churn test accepts `noproc`, with a comment giving the reason.
-  - [ ] fix-cluster-reject: rejecting an intruder must not partition verified members under OTP's default `prevent_overlapping_partitions`; remove `no_partition_prevention` from `membership_test`.
+  - [x] Wave 3 w3-wire-perf (PERF-2, PERF-6), merged as 75a71a8.
+    - PERF-2:
+      - the runtime caches the decoded model (`patch.Snapshot`) beside its JSON, so an event decodes only the new model;
+      - `diff_snapshots` returns `Unchanged` or `Ops`, so ops are never parsed back;
+      - a resync sends the cached snapshot instead of encoding again;
+      - encoder output that is not valid JSON is logged as an error, answered with an `error` frame, and drops the cache.
+      - Benches: the 500 KB pipelined changed event went from about 4.1ms to 2.5ms, the 50 KB one from 322µs to 209µs.
+      - Tests: a seeded property test (200 chains × 25 steps), and a check that a resync encodes only once.
+    - PERF-6:
+      - model and ops JSON are put into the frame as is (Phoenix V2 serializer), and frames are `[Header, Payload]` iodata (cowlib `cow_ws:frame/2`);
+      - the client uses its single parse, and the generated `decode_model` takes a `Dynamic`;
+      - this is a wire break: `"model":{...}` and `"ops":[...]`.
+      - Benches: the 50 KB `model_sync` encode went from 117µs to 0.33µs. That excludes the kernel copy, which both versions pay.
+      - The client bundle was regenerated (`brazier_client_d557934894815973.js`), and the harness now has 47 scenarios.
+    - Agent CDP desktop run: 503 passed. The 3 failures were Hex rate limits; each passed when rerun alone. The mobile viewport was not run (final verification).
+    - Coordinator verify on the merge of 417e29b into the branch (7abadde): clean build with zero warnings, format and lint clean, 1695 tests passing in each of 3 runs, docs check OK (73 modules), and test-client OK (47 scenarios, 9 patch-safety checks, 2450/550 apply equivalence). All 24 examples were rebuilt after the merge, because the generated decoder changed.
+    - Decisions:
+      - a join without `build` is still accepted with a warning: non-browser clients and the unversioned bundle have no build id. A pre-change client fails its syncs loudly; the hashed bundle gets 4409 and reloads;
+      - there is no opaque type for the "always valid JSON" text: the invariant is documented on the four message constructors, which only the runtime builds;
+      - `bench/baselines.json` gained the 10 new `runtime.list_*` and `wire.*` entries from a loaded machine (load average 6–9); final verification re-baselines when the machine is idle.
+    - Follow-ups:
+      - `make bench-check` fails because the PERF-7 `store.crdt_append.*` metrics have no baseline (wave 4 PERF-9);
+      - client-to-server `event` messages still carry `ops` as a JSON string.
+  - [x] fix-cluster-reject: rejecting an intruder must not partition verified members under OTP's default `prevent_overlapping_partitions`; remove `no_partition_prevention` from `membership_test`. Merged as 107aec8.
+    - Mechanism:
+      - `disconnect_node` on a gives `global` on a a nodedown of b with reason `disconnected`;
+      - global on a reports the lost connection to c, which believes it (global does not check that the reporter is a member), drops b and tells b to drop c;
+      - the overlapping-partition rule then separates a and c, and with no discovery they stay apart.
+      - A plain three-node OTP mesh splits the same way on one `disconnect_node` (10 of 10). The mechanism is written up in the manager header and in the CLUSTERING.md section "Why a rejected peer is not disconnected".
+    - Fix:
+      - rejecting a peer changes only membership: the manager marks it `rejected`, removes it from the members table, and logs and counts it, but never disconnects it;
+      - a rejected peer that later passes becomes a member, and a member that fails a later check is rejected in place;
+      - the invariant "verified in state" equals "in the members table" is asserted on every change;
+      - waiters survive a rejection and are released only by nodedown, and dead waiters are pruned;
+      - requests are accepted only from local pids.
+      - Precedent: OTP docs (`global:disconnect/0` is the only disconnect that does not cascade), `global_group` exclusion, Mnesia `db_nodes`, Phoenix.Tracker.
+    - Tests:
+      - `membership_test` runs on OTP defaults, using explicit hellos and nodeup/nodedown watchers on every node, with no polls or sleeps;
+      - new tests: a control showing the OTP cascade, rejection in place, and a waiter released on a later pass;
+      - the `cluster_test` mismatch and silent-peer tests check that the peer is rejected yet still connected.
+      - Results: the old code passed 27 of 30 runs; the fix passed 30 of 30, twice (the second time on a clean rebuild).
+    - Coordinator verify on the merge of 75a71a8 into the branch (db50eb2): clean build with zero warnings, format and lint clean, 1698 tests passing in each of 3 runs, and docs check OK (73 modules).
+    - Decisions:
+      - a rejected node now stays connected at the distribution level. The coordinator checked every cross-node path before accepting this. PubSub `remote_workers`, session revocation (`notify_revoked`), presence shards and store replicas each gate on `brazier_cluster_ffi:verified/1`, so a rejected node receives nothing. CLUSTERING.md already states that the check is not a security boundary: TLS, the cookie and the network rules are;
+      - this is listed in the CHANGELOG.
+    - Follow-ups:
+      - with `no_discovery`, a member lost to a real netsplit is never reconnected;
+      - global can still drop members on a genuine netsplit, which `session_cluster_test` simulates deliberately.
+  - [x] w4-server-sweep, merged as a87186f.
+    - TS-12: a lint rule requires `as` on every `let assert` in `src`, and all violations are fixed (c72487f).
+    - SEC-11 remainder: raw client paths in ssr, static, http, upload and client logs go through `log_path` (b81b997).
+    - `trusted_proxies` is parsed once at listener start. The scheme comes only from the configured forwarding header (`Forwarded` `proto=` or `X-Forwarded-Proto`), and the other header from a trusted proxy is warned about. Follows Plug.RewriteOn, Rails RemoteIp and RFC 7239 (dc0909e).
+    - The asset cache revalidates size, mtime, ctime, inode and device, and applies git's racy-clean rule: an entry is trusted only 2 s after the file's last change (440ffc3).
+    - The CDP harness `stop_server` reports failures, and `start_example` stops on one. Only syntax-checked so far; it gets exercised in final verification (74bcb0c).
+    - `brazier_store_replica:check_payload/2` validates every field of a peer delta or full state before counting, sizing or joining it. A malformed payload is refused and logged with the failing field, and the replica keeps its state. 27 malformed variants are tested, in unit tests and on a 2-node cluster (5b8ae13).
+    - CRDT `union_context` no longer sorts the cloud: its cost follows the delta, checked against the old sort kept as a test oracle. A one-dot delta into a 10,000-dot cloud went from about 1.33M reductions to about the cost on a 10-dot cloud (75513e5).
+    - Coordinator verify on the merge of f802343 into the branch (dc899d1): clean build with zero warnings, format and lint clean, 1731 tests passing in each of 3 runs, docs check OK (73 modules), and test-client OK (47 scenarios, 9 patch-safety checks, 2450/550 apply equivalence).
+    - Decision: a refused replica payload is reported through the existing `[brazier, store, sync]` span with `entries` 0, not a new event. That keeps the telemetry catalogue that the client-tests agent's files assert unchanged; a dedicated event is a follow-up.
+    - Follow-ups:
+      - a `[brazier, store, sync, refused]` event, or a `result` key;
+      - `crdt.fingerprint` sorts the whole state on every anti-entropy tick;
+      - the warning for a malformed proxy hop can be logged twice on a WebSocket upgrade;
+      - `start_listener` may log "Invalid security limits" twice;
+      - `brazier_build_ffi` `absolute_path` never returns an error;
+      - for up to 2 s after a bundle write, the asset cache rebuilds its entry on every load.
+  - [x] w4-client-tests, merged as 409d9eb. Items 6–11 ran in a sub-agent and came in as e86e29e and 0541256.
+    - Client:
+      - a kept element that loses or renames its `data-brazier-hook` destroys the hook (LiveView `performPatch`);
+      - `#x`, `/same/page#x` and a bare `#` are left to the browser, and back/forward between fragments of one page sends nothing (LiveView `isNewPageClick`, Turbo);
+      - `rejected_middleware` upgrades back off to one attempt per 30 s, with each early close logged as a warning and the third in a row as an error;
+      - keyed children are matched by key at any distance, so a moved focused input keeps its focus, selection and value. A seeded random morph test (5 seeds × 200 renders) found and fixed an old bug: a keyed element whose tag changed kept its old tag;
+      - each of the 5 new harness scenarios fails against the old client;
+      - the bundle was regenerated as `brazier_client_6c4e52d955510c84.js` (a rebuild is byte-identical). The coordinator changed nothing in `brazier_client/` or `priv/static/` since the branch base, so the bundle holds after the merge.
+    - Tests:
+      - telemetry handlers, presence holders and watches are cleaned up even when a test fails (`monitored.with_handler`, `holder.with_holder`, `await.with_watch_*`), and `presence/scoped_cleanup_test` proves it;
+      - `sleep_ms` is gone from the WS test FFI;
+      - `runtime_telemetry_test` asserts the exact exit reason;
+      - the pubsub, store, presence, session, TLS and peer cluster tests wait for messages through `peer.until` instead of polling.
+    - Agent CDP desktop run: 352 passed. The 8 failures were Hex rate limits; each passed when rerun alone.
+    - Coordinator verify on the merge of 7347820 into the branch (67e8f6e): clean build with zero warnings, format and lint clean, 1736 tests passing in each of 3 runs, docs check OK (73 modules), and test-client OK (52 scenarios, 9 patch-safety checks, 2450/550 apply equivalence).
+    - Decision: the sub-agent's leftover worktree matched 0541256 exactly, so it was removed with nothing lost.
+    - Follow-ups:
+      - server side of `rejected_middleware`: the browser cannot see the HTTP status of a refused upgrade. Finish the handshake and close with 4000 plus the status (for example 4403), so the client can reload and show the middleware's answer (`src/brazier/transport.gleam`, near the upgrade refusal);
+      - after a live navigation to another page's `#fragment`, the client does not scroll to it;
+      - scoped cleanup is still missing in files the agent did not own. Watches are removed by hand in rate_limit, http_server, ws_protocol, listener_rebind, session_security and pubsub tests. Telemetry is attached without detach-on-failure in ssr, init_error_server, allowed_hosts, live_page_gate, ws8c_runtime_stop, `brazier_store_test_ffi` `record_syncs`, and the cluster and sim FFI;
+      - a stray `[brazier, ws, upgrade, stop]` handler leaks, most likely from allowed_hosts_test or live_page_gate_test;
+      - `peer.eventually` polls remain in cluster_test (21) and membership_test (10);
+      - `brazier_cluster_test_ffi` counters notify no one and `recorded` races between senders; `counted_events` races too.
+  - [x] w5-store-build, merged as 4817e5f (branch `m117-store-crdt-build`, commits ce7943a and 64cb30c).
+    - A refused replica payload is reported on the `[brazier, store, sync]` stop event:
+      - `result` is `ok`, `malformed`, `too_large` or `too_many_entries`, and `reason` names the failing field or limit (the Phoenix and `[brazier, ws, upgrade]` convention of putting the outcome on stop metadata);
+      - the decision is made in `brazier_store_replica:admit/4`;
+      - the 2-node validation test now waits on the event.
+    - The CRDT digest is incremental:
+      - `crdt.State` carries the XOR of SHA-256 hashes of each live (key, dot), clock entry and cloud dot, updated by every join (Riak TicTac AAE, delta_crdt_ex MerkleMap);
+      - `crdt.fingerprint` is removed;
+      - the old sorted fingerprint is kept as a test oracle. A 20 seeds × 500 steps property test on 3 replicas checks that digests are equal exactly when fingerprints are, and the oracle join checks the cached digest against `recompute_digest`;
+      - a write plus digest costs 969 reductions on 10 keys and on 10,000, against about 1.2M before.
+    - `program.absolute_path` returns `Result`: `filename:absname/1` crashes when the current directory has been deleted (`enoent`) or can't be searched (`eacces`), and this is now an error, logged. A test covers a deleted cwd.
+    - Coordinator verify on the merge of 136a22b into the branch (8c21e0c): clean build with zero warnings, format and lint clean, 1743 tests passing in each of 3 runs, and docs check OK (73 modules).
+    - Decisions:
+      - the agent made a small edit outside its files, to `brazier_telemetry_ffi.erl` and `telemetry.gleam`, because the store span callback now returns `result` and `reason`;
+      - the digest changed on the wire between replicas, so a cluster mixing builds full-syncs until every node runs the same build. This is noted in the CHANGELOG; nothing has been released;
+      - the XOR digest resists accidental collisions only, which is enough because members trust each other (documented on `crdt.digest`). A keyed hash would be needed if untrusted members ever became possible.
+    - Follow-up: the `store.crdt_append.*` bench baselines shift by about 2µs per write. The final-verification re-baseline covers it.
+  - [x] w5-test-hygiene, merged as ec8e4a8 (branch `fix-test-hygiene`, commits 37c33ca, b7c624a, 2396adb, bf98f1f and 265deaf).
+    - Cluster tests no longer poll:
+      - the 32 `peer.eventually` polls in cluster_test, membership_test and pubsub_cluster_test are replaced by `peer.await_members` and `peer.broadcasts`, which wait on messages;
+      - `await_recorded/3` and `await_round/2` notify their waiter and no longer race between senders; `counted_events` is removed, and `await_revocation/4` is new;
+      - `record_events` and `record_syncs` crash with `not_on_a_peer_node` when called on the test runner, so a handler can't leak there;
+      - `test/brazier/cluster/harness_ffi_test.gleam` covers the harness itself, unhappy paths included.
+    - Telemetry residue: the suite runs through `brazier_test_runner_ffi:run/0` (gleeunit's discovery and options, unchanged), which adds one check per test module that fails, naming the module, if its tests left a telemetry handler attached or detached one they didn't own. The checks found and fixed the stray `[brazier, ws, upgrade, stop]` handler and the other leaks listed under w4-client-tests.
+    - The agent's cluster loop passed 12 of 12 runs.
+    - Coordinator verify on the merge of 549ef6a into the branch (82daa87): clean build with zero warnings, format and lint clean, 1875 tests passing in each of 3 runs, and docs check OK. The count rises by 132: 11 new test functions and one handler check per module.
+    - Decisions:
+      - the handler check is a test in the module's eunit group (ExUnit reports an `on_exit` failure against its test the same way), so a leak fails the module that caused it, not a later victim;
+      - the runner starts telemetry before the first module, because the production handler-failure logger stays attached for the node's life.
+    - Follow-ups:
+      - 2 `peer.eventually` polls remain in store_replica_validation_test;
+      - `await_restart` spins on `yield`;
+      - mailbox residue (messages a test leaves in the shared eunit process) in build_handshake, child_module, dev_reload, router, runtime_test, runtime_versioning, ws_protocol, presence_test and session_security tests.
+  - [x] w5-transport-client, merged as 7156412 (branch `m117-transport-followups`, commits 248f4f5, 65dd6c5, 2432d12 and ae2f796).
+    - Refused WS mount: when middleware refuses a mount on the upgrade, the server completes the handshake and closes with `4600 middleware refused <status>`. 4600–4699 is a new band for transport refusals, on which the client neither reloads nor reconnects (4400–4499 still reload, 4500–4599 still reconnect). The upgrade checks run host, framing/path, caps, origin, `ws_auth`, `validate_upgrade`, then the middleware gate. Breaking, in the CHANGELOG.
+    - Event `ops` travel as raw JSON instead of a JSON string inside the frame. Breaking on the wire: an older client gets 4409 and reloads.
+    - Fragment scroll: `navigate` carries an optional `clock` (absent means 0), the server acks every navigation (an unchanged one with an empty ack), and `router.push` strips the fragment. The client keeps a pending `{hash, clock}` and scrolls once a `model_sync`, patch or ack at that clock or later is applied: to the element with that `id`, else `<a name>`, else the top of the page with a console warning.
+    - Log once: `ip.client` resolves the client address and scheme from one parse of the forwarding header, so a bad hop is logged once per upgrade, and `prepare_listener` no longer logs a refused limit or static config a second time. `client.scheme`, `request_scheme` and `ws_client_ip` were removed as dead. `test/brazier/log_once_test.gleam` asserts exactly one line per case; putting the second parse back fails 4 of its tests.
+    - Bundle: `brazier_client_5e36facf8e217dc4.js` (a rebuild is byte-identical).
+    - Agent gates: 24/24 examples built one at a time with zero warnings, and CDP desktop passed 625 of 625.
+    - Coordinator verify on the merge of 6ff96b5 into the branch (3681ee4): clean build with zero warnings, format and lint clean, 1908 tests passing in each of 3 runs, docs check OK (73 modules), and test-client OK (58 scenarios, 9 patch-safety checks, 2450/550 apply equivalence). The new per-module telemetry-handler check from w5-test-hygiene passes for the new test modules.
+    - Decisions:
+      - middleware runs after the origin, auth and handshake checks, so the `/ws` HTTP telemetry covers only upgrades that pass them; a refused upgrade's span includes a linger of at most 1 s;
+      - the navigate `clock` is additive, and the new ack changes the frame counts tests see (`runtime_versioning_test` replays 10 frames, not 9);
+      - the listener checks the static config only after the security limits pass;
+      - the agent made the smallest forced edits outside its files (the `clock: 0` field and signature updates in ten test files, `live_page_gate_test`, and 2 lines of `test/brazier/bench/suite.gleam`, which w4-bench-gate owns).
+    - The coordinator removed the stale `docs/TODO.md` item about `ws_client_ip` re-parsing `trusted_proxies` on every upgrade: the listener parses them once, in `validate_security_limits`.
+    - Follow-ups:
+      - a navigation refused with an `error` frame gets no ack, so its pending scroll fires on the next event's ack instead;
+      - a navigation without a hash does not scroll to the top (LiveView does this only for redirects);
+      - the non-monotonic clock warning says "event clock" for navigations too;
+      - `middleware.rate_limit_behind_proxies` resolves the client again on the WS middleware gate, so a malformed hop can still be logged a second time on that path;
+      - `ip.parse_trusted_proxies` and `parse_allowed_hosts` log their own line before "Invalid security limits" (two different lines for one refusal);
+      - no CDP scenario covers the fragment scroll yet; only the ffi harness does.
 - [ ] Final verification: build (zero warnings), tests, all examples, CDP browser suite, perf baselines
 
 **Decisions (Milestone 117, coordinator):**

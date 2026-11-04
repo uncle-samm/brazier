@@ -179,8 +179,58 @@ with its own changelog, so they are not listed here.
   crash. `patch.is_empty`, `patch.diff_json` and `patch.merge_ops_json`
   are removed. The runtime's cached model is
   `FullModelCache(snapshot: patch.Snapshot)`.
+- (M117 transport follow-ups) **Wire break:** the client `event`'s
+  optional `ops` is a raw JSON array (`"ops":[{"op":"replace",...}]`), as
+  the server's `patch` already is, not a string holding the array. The
+  server decodes it strictly (RFC 6902 op names and members, RFC 6901
+  pointers, no `__proto__`/`constructor`/`prototype` segment) and refuses
+  an event or `event_batch` with any malformed op whole: a warning with the
+  connection id, the `error` frame `"Invalid event ops"`, and one count
+  toward `ws_max_decode_errors`. The old string form is refused the same
+  way. A page from an older bundle sends its build id on join and gets 4409,
+  so it reloads before it sends an event. `ClientEvent.ops` and
+  `ClientEventReceived.ops` are `List(transport.ClientOp)`, not `String`.
+- (M117 transport follow-ups) **New close code 4600:** a WebSocket upgrade
+  whose page the route middleware refuses now completes the handshake and
+  closes with 4600 `middleware refused <status>`, instead of answering the
+  upgrade with the middleware's response, which a browser cannot read. The
+  client answers 4600 by loading the current URL behind its reload guard
+  (at most 3 loads per tab within 60 seconds), so the page shows the
+  middleware's answer, where it used to retry the upgrade with backoff
+  forever. The middleware now runs after the connection limits, the origin
+  and `ws_auth` checks and the RFC 6455 handshake checks, not before them,
+  so a cross-origin upgrade never reaches it, and the `/ws` request span it
+  emits appears only for upgrades that passed those checks. Other 4xxx
+  codes the client does not know still reconnect with backoff. The 4xxx
+  scheme (4400-4499 reload, 4500-4599 reconnect, 4600-4699 transport
+  refusals) is in `docs/WIRE_PROTOCOL.md`. This follows LiveView, whose
+  `onJoinError` navigates to the page's URL when a join is refused.
+- (M117 follow-up) `brazier/store/crdt.fingerprint` is removed: a state
+  carries its anti-entropy digest (`State(.., digest:)`, read with
+  `crdt.digest`, checked with `crdt.recompute_digest`). The digest a replica
+  broadcasts is a different value from the old sorted-fingerprint hash, so
+  a cluster mixing builds from before and after this change full-syncs on
+  every tick until every node runs the same build.
+- (M117 follow-up) `brazier/build/program.absolute_path` returns
+  `Result(String, String)`, and the resolver passed to
+  `project_toml.pinned_dependency_line` returns one too.
+- (M117 follow-up) `telemetry.store_sync_span`'s function returns
+  `#(result, entries, bytes, outcome, reason)`: the outcome and reason are
+  the stop event's `result` and `reason` metadata.
 
 ### Added
+
+- (M117 transport follow-ups) A live navigation to another page's fragment
+  (`/docs#install`, by a link or `router.push`) scrolls to it once the new
+  page is rendered: to the element with that id, else the `<a>` with that
+  name, or to the top with a console warning when there is neither, as
+  LiveView's `Browser.pushState` does. To find that render, the client's
+  `navigate` now carries a `clock` from the events' counter and the server
+  acknowledges it like an event: the frame with the navigation's state
+  carries `ack_clock` = `clock`, and a navigation that leaves the model as
+  it was gets an empty ack patch (it used to get no frame). The field is
+  additive: a `navigate` without `clock` is acknowledged at 0. A
+  `router.push` path's fragment is no longer sent to the server.
 
 - (WS1) Supervised HTTP listener with an acceptor pool, keep-alive and
   `Connection: close`. It binds to port 0 and reports the bound port.
@@ -258,6 +308,13 @@ with its own changelog, so they are not listed here.
 
   Each scenario checks the answers it times. The baseline now records the
   load average it was taken under.
+- (M117 follow-up) The `[brazier, store, sync]` stop event carries `result`
+  (`ok`, `malformed`, `too_large` or `too_many_entries`) and `reason` (the
+  failing field of a malformed payload, or the limit a refused one broke:
+  `max_delta_bytes`, `max_sync_bytes`, `max_entries`; `none` when merged),
+  with the store and the peer node, so a refused payload is told apart from
+  an empty one. Phoenix puts the outcome in the stop metadata the same
+  way, as `[brazier, ws, upgrade]` does.
 
 ### Changed
 
@@ -436,6 +493,12 @@ with its own changelog, so they are not listed here.
   covered only through the cloud. The bench suite has a new
   `store.crdt_append.{10,1000,10000}` case; its metrics need a re-baseline
   before `brazier_bench_check` accepts them.
+- Merging a delta into a replicated store no longer sorts the replica's
+  whole causal-context cloud (the dots seen out of order). Only the
+  replicas the delta names are compacted, from their clock upwards, so a
+  one-dot delta against a 10,000-dot cloud fell from about 1.3 million
+  reductions to the cost of the same merge against a 10-dot cloud. The
+  result is the one the sort gave, checked against it as an oracle.
 - (Audit TS-9) The listener parses `ws_allowed_origins` and
   `allowed_hosts` once, when it starts, as Phoenix compiles `check_origin`,
   and refuses to start with an invalid entry. Origins used to be parsed on
@@ -454,9 +517,37 @@ with its own changelog, so they are not listed here.
   `cow_ws:frame`), and `gen_tcp:send` writes it without flattening. A
   50 KB `model_sync` costs about 0.3 µs to frame instead of 117 µs, and
   the browser parses each frame once instead of parsing the model again.
+- (Wave 4 test hygiene) Telemetry handlers, sys watches and presence
+  holders in the telemetry, presence and cluster tests are scoped to the
+  test body (`monitored.with_handler`, `await.with_watch_info`,
+  `with_watch_exit`, `with_watch_down`, `holder.with_holder`) and removed
+  even when the body crashes, like ExUnit's `on_exit/1`.
+  `presence/scoped_cleanup_test` shows it for watches and holders.
+- (Wave 4 test hygiene) The multi-node tests wait for messages instead of
+  polling. `peer.until` runs one check on a peer and checks again on each
+  wake-up (`node_changes`, `process_down`, `pg_changes`, `events`,
+  `events_on`, `receives`, `info`, `any`), draining queued wake-ups first.
+  `peer.on_node`, `peer.registered`, `cluster/relay` (telemetry events and
+  PubSub deliveries forwarded from a peer) and `presence/wake` support it.
+  The pubsub, store and presence cluster tests no longer call
+  `peer.eventually`; the store tests wait on the
+  `[brazier, store, sync, stop]` span event.
+- (Wave 4 test hygiene, TS-12) The unused `sleep_ms` helper is gone from
+  `brazier_ws_test_ffi`, the runtime
+  telemetry test asserts the exact exit reason, and every `let assert` in
+  the touched tests carries an `as` message.
 
 ### Fixed
 
+- (M117 transport follow-ups) A WebSocket upgrade logged a malformed
+  forwarding hop (and a `Forwarded` request's unconfigured `X-Forwarded-*`
+  headers) twice: the per-IP cap and the Origin check each parsed the
+  forwarding header. The upgrade now resolves the address and scheme
+  together, from one parse (`ip.client`), and logs each problem once.
+- (M117 transport follow-ups) `start_listener` and `transport.supervised`
+  logged "Invalid security limits" and "Invalid static config" twice, in
+  the check and again in the listener. Each refusal is logged once, and the
+  static config is checked only after the limits pass.
 - (Final audit TS-8) A failed `session.try_delete` logs the store's error
   reason.
 - (Final audit TS-4) The session store reads its time from a clock, so the
@@ -523,6 +614,11 @@ with its own changelog, so they are not listed here.
 - (Audit TS-12) Every `let assert` in `brazier/cluster`, `brazier/pubsub`
   and the cluster tests has an `as` message. `let assert True = e` in those
   tests is now `assert e`.
+- (Audit TS-12) `brazier/lint` has a `let-assert-message` rule: a
+  `let assert` in `src/` without an `as` message, or with an empty one, is
+  a violation, and the last ten such asserts have messages. The lint also
+  skipped every directory named `build`, so `src/brazier/build` was never
+  linted; only the `build` next to a `gleam.toml` is skipped now.
 - (TS-3) The client defaulted a missing `ack_clock`, and a missing event
   clock, to 0. Now a `model_sync` or `patch` without a valid `ack_clock` (a
   non-negative integer) is a protocol error, logged, that requests a full
@@ -539,9 +635,77 @@ with its own changelog, so they are not listed here.
     hooks and messages.
   - The membership tests with an intruder node failed about 1 run in 10.
     When the intruder disconnected one verified member, OTP's `global`
-    sometimes cut the two verified members apart. Their peers now run with
-    `prevent_overlapping_partitions` off. The manager's own handling of
-    this is an open issue.
+    sometimes cut the two verified members apart. The manager no longer
+    disconnects (see the next entry), and the tests run on OTP's defaults.
+- (Audit fix-cluster-reject) Rejecting a peer could partition the verified
+  members. The manager called `erlang:disconnect_node/1` on a rejected
+  peer. Under OTP's default `prevent_overlapping_partitions`, `global` on
+  the rejecting node then told every other node that it had lost the peer,
+  and each of them cut its own link to that peer in turn. One rejected
+  intruder could leave the real members of a deployment apart, and with no
+  discovery nothing reconnected them. A rejected peer now stays connected
+  and is not a member: it is logged at error level and reported with
+  `[brazier, cluster, peer, rejected]` as before, and its later hello is
+  checked again. OTP 25's `global_group` made the same change
+  (`disconnect_nodes/1` excludes a node instead of disconnecting it), and
+  Mnesia likewise ignores connected nodes outside `db_nodes`. A process
+  waiting for a node to pass the check keeps waiting through a rejection.
+- (Wave 4) A client hook element that stays in the page but loses its
+  `data-brazier-hook`, or names another hook, now unmounts the old hook
+  (and mounts the new one). Before, the old hook stayed mounted and a hook
+  added back later never mounted again. This is LiveView's
+  `View.performPatch`, which destroys a removed or changed `phx-hook`.
+- (Wave 4) Clicking an in-page fragment link (`#section`, `/this/page#x` or
+  `#`) is left to the browser, which scrolls to the anchor; the client no
+  longer prevents it. Back and forward between fragments of the same page
+  send no `navigate`. A link to another page's fragment keeps the fragment
+  in the pushed URL and sends the server only the path. This is LiveView's
+  `DOM.isNewPageClick` and its popstate rule.
+- (Wave 4) Keyed children (`data-brazier-key`, or `id`) are matched by key
+  at any distance, so a reorder moves elements instead of rebuilding them:
+  every keyed element keeps its identity, focus, selection and mounted hook
+  (morphdom's and idiomorph's id matching). A key rendered with another tag
+  is a new element; before, the old element kept its old tag. A key
+  repeated among siblings is logged as an error, and only the first keeps
+  the element. A focused input that moves keeps its unacknowledged value.
+- (Wave 4) A WebSocket that closes before it opens (how a browser reports a
+  refused upgrade, an unreachable server, or a disallowed origin) still
+  reconnects with the capped backoff, and from the third such close in a
+  row logs an error that names those causes, instead of a warning each
+  time. An opened socket resets the count. A seeded random morph test in
+  the client harness checks that the DOM matches the markup, keyed elements
+  survive, and mounted hooks match hook elements after every render.
+- (Audit TS-12) Every `let assert` in `runtime_versioning_test` has an `as`
+  message.
+- The client bundle cache could serve a stale bundle. It checked an entry
+  against the file's size and mtime only, so a same-size rewrite in the
+  same second, or a rename of a new file with the same size and mtime over
+  the old one, kept the old bytes and ETag. An entry is now checked against
+  the size, mtime, ctime, inode and device, and one recorded less than 2 s
+  after the file's last change is rebuilt rather than trusted (git's
+  racy-clean rule, `Documentation/technical/racy-git.txt`), the rule the
+  static digest cache already follows. The recording time is taken before
+  the read. `static.load_client_asset_at` takes the time and reports
+  whether the entry was used or why it was rebuilt; misses are logged at
+  debug.
+- The CDP suite's `stop_server` only logged a page that did not unload, in
+  verbose mode. Now that, an output reader that outlives the server, and a
+  port still open are each recorded as a failure, and `stop_server` returns
+  False, so `start_example` does not start the next example against a page
+  still connected to the old server.
+- (M117 follow-up) A replicated store's digest is kept up to date by every
+  merge instead of computed on each sync tick: the XOR of a SHA-256 hash of
+  each live entry, clock entry and cloud dot, updated with the elements a
+  merge adds and removes (Riak's TicTac AAE `leveled_tictac`;
+  delta_crdt_ex updates its MerkleMap on every change). A tick used to sort
+  and hash the whole state, O(n log n); it is now O(1), and a write costs a
+  few hashes more.
+- (M117 follow-up) `brazier/build/program.absolute_path` reads the current
+  directory itself and returns its error (`Cannot resolve PATH: cannot read
+  the current directory: REASON`, logged at error) when the directory was
+  deleted under the VM or is no longer searchable. `filename:absname/1`
+  crashed the build with a `badmatch` there, behind an `Ok` the FFI spec
+  promised always.
 
 ### Removed
 
@@ -578,6 +742,16 @@ with its own changelog, so they are not listed here.
   trusted proxy that passes the other one through is logged at warning
   (Plug.RewriteOn; Rails `RemoteIp`, `IpSpoofAttackError`; RFC 7239
   section 7.4).
+- A replicated store checks every field of a delta or full state from
+  another member (keys, dots, replicas, timestamps, topics, the clock and
+  cloud, and that each live dot is covered by its own context) before it
+  reads or joins it. A malformed payload is refused, logged at error with
+  the failing field and reported in the `[brazier, store, sync]` span with
+  `entries` 0, `result` `malformed` and the field as `reason`; the replica
+  keeps its state. It used to read the payload
+  unchecked, so a malformed term from a verified member crashed the
+  replica or was joined (Phoenix.Tracker validates a replica's message
+  before merging it).
 - (Final audit SEC-7) An `allow_guests_ws` socket that was bound to a
   signed-in session became a guest on recheck once the session was deleted,
   expired or lost its user, so a revocation that sent no notice left it
@@ -663,7 +837,7 @@ with its own changelog, so they are not listed here.
   refuses over HTTP. The middleware ran only on the `/ws` request, so an
   auth middleware scoped to `/admin` never saw a WebSocket mounting or
   navigating to `/admin`. It now runs on a `GET` of the page at the
-  upgrade (a refusal answers the upgrade), and at every `navigate` and
+  upgrade (a refusal closes the socket with 4600; see Breaking), and at every `navigate` and
   every `join` for another page, where a refusal sends `hard_navigate` so
   the browser loads the page and gets the middleware's response. A refusal
   is logged and emits `[brazier, ws, navigation_refused]`. This follows
@@ -680,6 +854,26 @@ with its own changelog, so they are not listed here.
   a navigation target) is quoted with `string.inspect` in the transport,
   runtime, router and `middleware.logger` logs, and a path is logged
   without its query and fragment, so a CR or LF cannot forge a log line.
+- (Audit SEC-11) The rest of the client paths are quoted too: static
+  serving, the HTTP head and body-length logs, multipart upload logs and
+  errors (field names and parameter keys), client-IP resolution, and an
+  invalid `Content-Length` value. Filesystem paths built from a request are
+  quoted with `string.inspect`.
+- (SEC-4 follow-up) The scheme comes from the configured forwarding header
+  only. `X-Forwarded-Proto` was read whatever `forwarding_header` said, so
+  behind a proxy that sets `Forwarded` a client could send its own
+  `X-Forwarded-Proto: https`, and `Forwarded` `proto=` was never read. Now
+  `ip.Forwarded` reads the `proto=` of the client's element (the one the
+  address walk stops at), `ip.XForwardedFor` reads `X-Forwarded-Proto`, and
+  `ip.NoForwardingHeader` is always `http` (before, a listed proxy's
+  `X-Forwarded-Proto` was believed). A repeated `proto=` in one element is
+  rejected (RFC 7239 section 4). `ip.client_scheme` is the rule;
+  `client.scheme_from` calls it. Plug.RewriteOn and Django's
+  `SECURE_PROXY_SSL_HEADER` likewise read only the header they are given.
+- (TS-9 follow-up) The listener parses `trusted_proxies` once, when it
+  starts, with the origins and hosts, and refuses to start on a bad entry;
+  WebSocket upgrades no longer parse the list again for the client address
+  and the Origin check's scheme.
 - (Audit SEC-17) State recovery no longer lets a join token decide the
   server state: `restore` receives the state this connection's `init` and
   route produced, and only the client-visible model comes from the token.

@@ -1,7 +1,6 @@
 -module(brazier_ws_test_ffi).
 -export([
     receive_revoked/1,
-    sleep_ms/1,
     raw_connect/2,
     raw_send/2,
     raw_recv_frame/2,
@@ -29,10 +28,6 @@ receive_revoked(TimeoutMs) ->
     after TimeoutMs ->
         {error, nil}
     end.
-
-sleep_ms(Ms) ->
-    timer:sleep(Ms),
-    nil.
 
 %% --- Raw TCP WebSocket client ---
 

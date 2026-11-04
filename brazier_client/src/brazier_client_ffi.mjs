@@ -93,6 +93,17 @@ let heartbeatTimer = null;
 let lastHeartbeatAt = null;
 const HEARTBEAT_INTERVAL_MS = 30000;
 let reconnectAttempts = 0;
+// Consecutive sockets that closed without ever opening. A browser does not
+// expose the HTTP status of a refused upgrade, so an upgrade the server or
+// its middleware answered with an HTTP response (upgrade result
+// rejected_middleware, rejected_origin, ...) looks like a network failure:
+// close 1006 without onopen. Retrying continues with capped backoff, as
+// Phoenix's socket does; from UNOPENED_CLOSES_BEFORE_ERROR on, each retry
+// is logged as an error naming both causes, so a refused page is not
+// mistaken for a flaky network.
+let unopenedCloses = 0;
+let socketOpened = false;
+const UNOPENED_CLOSES_BEFORE_ERROR = 3;
 // Set on close codes 4400 to 4499: the server refused this page's session,
 // so never reconnect with it (the page reloads or shows an error state).
 let reconnectStopped = false;
@@ -108,9 +119,13 @@ let syncGaveUp = false;
 let readyForServerEvents = false;
 let syncRequestInFlight = false;
 let appRoot = null;
+// Events and navigations take their clocks from this one counter, so an ack
+// orders them: an ack_clock of a navigation's clock or more is a frame the
+// server sent after it handled that navigation.
 let eventClock = 0;
 let currentModelVersion = 0;
-// The highest event clock the server has acknowledged on this connection.
+// The highest event or navigation clock the server has acknowledged on this
+// connection.
 let latestAckClock = 0;
 // The highest event clock written to the current socket.
 let writtenEventClock = 0;
@@ -656,6 +671,14 @@ function connect() {
   }
   pendingModelEventClock = queuedClock;
   predicted = queuedClock > 0;
+  // A navigation written to the old socket is never acknowledged on this
+  // one, but the join is for the current URL, so its model_sync renders the
+  // page the navigation went to. A still-queued navigate keeps its clock.
+  const scroll = pendingFragmentScroll;
+  if (scroll !== null && !outbound.some((msg) => msg.type === "navigate" && msg.clock === scroll.clock)) {
+    trace("reconnect.fragment_scroll_on_join", { hash: scroll.hash, clock: scroll.clock });
+    pendingFragmentScroll = { hash: scroll.hash, clock: 0 };
+  }
   readyForServerEvents = false;
   socketJoined = false;
   modelSynced = false;
@@ -673,8 +696,11 @@ function connect() {
   if (purged > 0) trace("send_queue.purge_request_sync", { purged });
   const socket = new WebSocket(socketUrl());
   ws = socket;
+  socketOpened = false;
   socket.onopen = () => {
     mark("ws-open");
+    socketOpened = true;
+    unopenedCloses = 0;
     startHeartbeat(socket);
     sendJoin(socket);
   };
@@ -710,12 +736,28 @@ function handleClose(socket, e) {
   socketJoined = false;
   readyForServerEvents = false;
   trace("ws.close", { code: e.code, reason: e.reason });
-  if (closeAction(e.code) === "reload") {
+  const action = closeAction(e.code);
+  if (action === "reload" || action === "navigate") {
     reconnectStopped = true;
-    reloadRefusedPage(e);
+    reloadRefusedPage(e, action);
     return;
   }
-  console.warn("[brazier] WebSocket closed (code " + e.code + (e.reason ? ", " + e.reason : "") + "); reconnecting with backoff");
+  const closed = "code " + e.code + (e.reason ? ", " + e.reason : "");
+  if (socketOpened) {
+    console.warn("[brazier] WebSocket closed (" + closed + "); reconnecting with backoff");
+  } else {
+    unopenedCloses++;
+    trace("ws.close_unopened", { code: e.code, unopenedCloses });
+    if (unopenedCloses >= UNOPENED_CLOSES_BEFORE_ERROR) {
+      console.error(
+        "[brazier] The WebSocket upgrade failed " + unopenedCloses + " times in a row before opening (" + closed + "): " +
+          "the server is unreachable, or it refused the upgrade (a disallowed origin or host, ws_auth, a connection limit). " +
+          "Reconnecting with backoff; reload the page to see the server's answer.",
+      );
+    } else {
+      console.warn("[brazier] WebSocket closed before opening (" + closed + "); reconnecting with backoff");
+    }
+  }
   scheduleReconnect();
 }
 
@@ -723,9 +765,17 @@ function handleClose(socket, e) {
 // a new page load decides. The reload guard allows MAX_RELOADS within
 // RELOAD_WINDOW_MS per tab; past that, or when the guard cannot keep its
 // count, the page shows an error state instead of reloading forever.
-// Reference (knowledge, not code read): LiveView reloads on a stale or
-// unauthorized join and counts consecutive reloads to stop a reload loop.
-function reloadRefusedPage(e) {
+// `action` "navigate" is close 4600, the route middleware refusing this
+// page's mount: the page load of the current URL shows the middleware's
+// answer (its redirect or error page), which the socket cannot. A
+// middleware whose GET admits what its mount refuses would loop, so the
+// same guard counts these loads. location.reload() is the hard navigation
+// to the current URL: assigning location.href to itself would only scroll
+// when the URL has a fragment.
+// Reference: Phoenix LiveView, view.ts onJoinError (a stale or unauthorized
+// join calls onRedirect({to: this.root.href})) and live_socket.ts
+// reloadWithJitter (counts consecutive reloads to stop a reload loop).
+function reloadRefusedPage(e, action) {
   const close = "close " + e.code + (e.reason ? " " + e.reason : "");
   let raw;
   try {
@@ -751,8 +801,14 @@ function reloadRefusedPage(e) {
     showFatalError("The server refused this page's session (" + close + "). The reload guard cannot write sessionStorage (" + err + "), so the page is not reloaded.");
     return;
   }
-  trace("ws.reload", { code: e.code, reloads: decision.history.length });
-  console.error("[brazier] The server refused this page's session (" + close + "); not reconnecting, reloading the page (reload " + decision.history.length + " of at most " + MAX_RELOADS + " within " + RELOAD_WINDOW_MS / 1000 + "s)");
+  const count = "(reload " + decision.history.length + " of at most " + MAX_RELOADS + " within " + RELOAD_WINDOW_MS / 1000 + "s)";
+  if (action === "navigate") {
+    trace("ws.middleware_refused", { code: e.code, reason: e.reason, reloads: decision.history.length });
+    console.error("[brazier] The server's middleware refused this page's live connection (" + close + "); not reconnecting, loading the page to show its answer " + count);
+  } else {
+    trace("ws.reload", { code: e.code, reloads: decision.history.length });
+    console.error("[brazier] The server refused this page's session (" + close + "); not reconnecting, reloading the page " + count);
+  }
   location.reload();
 }
 
@@ -1013,6 +1069,7 @@ function handleModelSync(model, version, ackClock) {
   reconnectAttempts = 0;
   console.log("[brazier] Model synced v" + version);
   trace("model_sync", { version, ackClock });
+  if (!held) resolveFragmentScroll();
   readyForServerEvents = true;
   flushPendingEarlyEvents();
   pumpOutbound();
@@ -1110,6 +1167,7 @@ function handlePatch(ops, version, ackClock) {
   currentModelVersion = version;
   console.log("[brazier] Patch applied v" + version + " (" + ops.length + " ops)");
   trace("patch", { version, ackClock, ops: ops.length });
+  resolveFragmentScroll();
   mark("patch-end");
   measure("patch", "patch-start", "patch-end");
 }
@@ -1125,19 +1183,27 @@ function handleAckPatch(version, ackClock) {
   markServerAckApplied(ackClock);
   trace("patch.ack", { version, ackClock });
   if (hasPendingModelEvent()) return;
-  if (!wasPending && !(wasLocked && !inputLocked())) return;
+  // The page shows the cached model unless a prediction or a locked input
+  // needs the re-render below.
+  if (!wasPending && !(wasLocked && !inputLocked())) {
+    resolveFragmentScroll();
+    return;
+  }
   try {
     const failure = adoptAuthoritativeModel(clientModelJson);
     if (failure !== null) {
       console.error("[brazier] Cached model v" + version + " cannot be decoded after ack (" + failure + "); requesting full sync");
       invalidateModelCache();
       requestFullSync("ack_decode_failed");
+      return;
     }
   } catch (e) {
     console.error("[brazier] Re-render after ack failed:", e);
     invalidateModelCache();
     requestFullSync("ack_render_failed");
+    return;
   }
+  resolveFragmentScroll();
 }
 
 function requestFullSync(reason) {
@@ -1160,6 +1226,82 @@ function requestFullSync(reason) {
 
 function currentPath() {
   return location.pathname + location.search;
+}
+
+// The path (pathname and query) of the route the server was last told
+// about. A fragment change (an in-page #anchor link, or back and forward
+// between two of them) changes the URL but not this path, and fires
+// popstate; it is the same page, so no navigate is sent for it.
+let routePath = null;
+
+// A live navigation to another page's #fragment, waiting for that page:
+// { hash, clock }, clock being the navigate's. The browser does not scroll
+// for pushState, and the new page exists only once the server's answer to
+// the navigate is rendered, so the first applied frame whose ack_clock
+// covers the clock scrolls to the fragment, or to the top when the page has
+// no such element. LiveView's Browser.pushState does the same after the
+// patch reply is rendered (getHashTargetEl, then scrollIntoView, else
+// window.scroll(0, 0)).
+let pendingFragmentScroll = null;
+
+// Tell the server about a route change. `path` is what the server routes on
+// (pathname and search) and `hash` the URL's fragment ("" for none). The
+// navigate takes its clock from the event counter, so the frame that shows
+// the new page is the first one acknowledging it.
+function sendNavigate(path, hash) {
+  const clock = ++eventClock;
+  pendingFragmentScroll = hash === "" || hash === "#" ? null : { hash, clock };
+  if (!send({ type: "navigate", path, clock })) {
+    // send() reported the full queue; the page will not change, so there is
+    // no fragment of it to scroll to.
+    pendingFragmentScroll = null;
+    return;
+  }
+  if (pendingFragmentScroll !== null) trace("navigate.fragment_pending", { path, hash, clock });
+}
+
+// The element a fragment names: the HTML indicated-part rules (an element
+// with that id, else an <a> with that name), for the fragment as written
+// and then percent-decoded, as LiveView's getHashTargetEl and the browser
+// look it up.
+function fragmentTarget(hash) {
+  const raw = hash.slice(1);
+  const candidates = [raw];
+  try {
+    const decoded = decodeURIComponent(raw);
+    if (decoded !== raw) candidates.push(decoded);
+  } catch (e) {
+    console.warn("[brazier] The fragment " + JSON.stringify(hash) + " is not valid percent-encoding (" + e.message + "); looking it up only as written");
+  }
+  for (const name of candidates) {
+    const byId = document.getElementById(name);
+    if (byId) return byId;
+    const anchor = Array.from(document.getElementsByName(name)).find((node) => node.tagName === "A");
+    if (anchor) return anchor;
+  }
+  return null;
+}
+
+// Called after every applied (not held) model_sync, patch or ack.
+function resolveFragmentScroll() {
+  const pending = pendingFragmentScroll;
+  if (pending === null || latestAckClock < pending.clock) return;
+  pendingFragmentScroll = null;
+  // The user moved to another fragment (an in-page link) before the page
+  // arrived; the browser already scrolled for that one.
+  if (location.hash !== pending.hash) {
+    trace("navigate.fragment_superseded", { hash: pending.hash, now: location.hash });
+    return;
+  }
+  const target = fragmentTarget(pending.hash);
+  if (target) {
+    target.scrollIntoView();
+    trace("navigate.fragment_scroll", { hash: pending.hash });
+    return;
+  }
+  console.warn("[brazier] The page has no element for the fragment " + JSON.stringify(pending.hash) + " (no id, no <a name>); scrolled to the top");
+  window.scrollTo(0, 0);
+  trace("navigate.fragment_missing", { hash: pending.hash });
 }
 
 // Why the server's navigation target is not a same-origin path of this
@@ -1192,7 +1334,12 @@ function handleServerNavigate(path, replace) {
   leaveRoute(path);
   if (replace) history.replaceState(null, "", path);
   else history.pushState(null, "", path);
-  send({ type: "navigate", path });
+  routePath = currentPath();
+  // As for a link, the server is told the path without the fragment (a URL's
+  // first "#" starts it) and the client scrolls to the fragment once the
+  // page is rendered.
+  const hashAt = path.indexOf("#");
+  sendNavigate(hashAt < 0 ? path : path.slice(0, hashAt), hashAt < 0 ? "" : location.hash);
 }
 
 // Hard navigation: a full page load, e.g. to receive Set-Cookie headers.
@@ -1208,6 +1355,7 @@ function handleServerHardNavigate(path) {
 }
 
 function setupNavigation() {
+  routePath = currentPath();
   // Same-origin links navigate without a page load.
   document.addEventListener("click", (e) => {
     if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
@@ -1226,18 +1374,39 @@ function setupNavigation() {
     if (url.origin !== location.origin) return;
     if (a.hasAttribute("data-brazier-external") || a.hasAttribute("download")) return;
     if (a.target && a.target !== "_self") return;
-    e.preventDefault();
     const path = url.pathname + url.search;
+    // An in-page fragment link (`#section`, `/this/page#section`, or a bare
+    // `#`) stays the browser's: it scrolls and changes the hash, and the
+    // page does not change. This is LiveView's DOM.isNewPageClick (the same
+    // pathname and search with a hash, or an href ending in "#", is not a
+    // new page) and Turbo's same-page anchor rule.
+    if (path === currentPath() && (url.hash !== "" || url.href.endsWith("#"))) {
+      trace("navigate.fragment", { hash: url.hash });
+      return;
+    }
+    e.preventDefault();
     if (path === currentPath()) return;
     leaveRoute(path);
-    history.pushState(null, "", path);
-    send({ type: "navigate", path });
+    // A link to another page's fragment keeps the fragment in the URL; the
+    // server is told only the path, which is what it routes on.
+    history.pushState(null, "", path + url.hash);
+    routePath = path;
+    sendNavigate(path, url.hash);
   });
-  // Back and forward.
+  // Back and forward. Moving between fragments of the same page fires
+  // popstate too, and is not a navigation: LiveView's popstate handler
+  // returns when isNewLocation finds the pathname and search unchanged.
   window.addEventListener("popstate", () => {
     const path = currentPath();
+    if (path === routePath) {
+      trace("navigate.same_route_popstate", { path });
+      return;
+    }
     leaveRoute(path);
-    send({ type: "navigate", path });
+    routePath = path;
+    // Back and forward keep the browser's scroll restoration, so no
+    // fragment scroll is scheduled (and a pending one is dropped).
+    sendNavigate(path, "");
   });
 }
 
@@ -1255,13 +1424,21 @@ function morphInnerHTML(container, html) {
 
   autofocusQueue = [];
   hookTouched = [];
+  morphFocused = focused;
   morphChildren(container, parseFragment(html));
+  morphFocused = null;
   syncHooks(container);
   if (devMode) trace("morph", { childCount: container.childNodes.length });
 
   restoreReplacedFocus(container, focused, focusedTag, focusedName, focusedValue, selStart, selEnd, locked);
   focusAutofocused(container);
 }
+
+// The element focused when the current morph began. A keyed move takes the
+// focused element out of the document for a moment, which blurs it, so the
+// morph compares against this, not document.activeElement, to keep a
+// focused input's typed value while it moves.
+let morphFocused = null;
 
 // The fragment parsed from the last rendered HTML. The morph only reads the
 // new tree and clones from it (it never moves or changes a node of it), so a
@@ -1302,46 +1479,164 @@ function focusAutofocused(container) {
 }
 
 function restoreReplacedFocus(container, focused, focusedTag, focusedName, focusedValue, selStart, selEnd, locked) {
+  if (focused && container.contains(focused)) {
+    // Still in the page, but a keyed move (insertBefore) takes the element
+    // out of the document for a moment, and the browser moves focus to the
+    // body. Nothing else took focus meanwhile, so give it back with its
+    // selection.
+    const active = document.activeElement;
+    if (active !== focused && (!active || active === document.body)) {
+      focused.focus();
+      restoreSelection(focused, selStart, selEnd);
+      if (devMode) trace("morph.focus_restored", { node: describeNode(focused) });
+    }
+    return;
+  }
   if (focusedTag !== "INPUT" && focusedTag !== "TEXTAREA" && focusedTag !== "SELECT") return;
-  if (container.contains(focused) || !focusedName) return;
+  if (!focusedName) return;
   // The focused control was replaced: focus its successor by name.
   // SECURITY: CSS.escape keeps the attribute value out of the selector syntax.
   const restored = container.querySelector(`[name="${CSS.escape(focusedName)}"]`);
   if (!restored) return;
   restored.focus();
   if (locked && focusedValue !== undefined && restored.value !== focusedValue) restored.value = focusedValue;
-  if (typeof selStart === "number" && restored.setSelectionRange) {
-    try {
-      restored.setSelectionRange(selStart, selEnd);
-    } catch (e) {
-      console.warn("[brazier] setSelectionRange failed:", e.message);
-    }
+  restoreSelection(restored, selStart, selEnd);
+}
+
+function restoreSelection(node, selStart, selEnd) {
+  if (typeof selStart !== "number" || !node.setSelectionRange) return;
+  try {
+    node.setSelectionRange(selStart, selEnd);
+  } catch (e) {
+    console.warn("[brazier] setSelectionRange failed:", e.message);
   }
 }
 
+// How far past the cursor an unkeyed new child looks for an old element of
+// its tag before it is inserted instead. Keyed children are matched by key
+// at any distance.
+const UNKEYED_LOOKAHEAD = 8;
+
+// Reconcile the children of `op` (the live DOM) with those of `np` (the new
+// markup, never changed).
+//
+// Keyed children (data-brazier-key, or id) are matched by key wherever they
+// are, and moved into place, so a keyed element keeps its identity (focus,
+// typed value, scroll position, mounted hook) across any reorder: morphdom's
+// and idiomorph's id matching, and the keyed children of Lustre's
+// reconciler and of LiveView's streams. An old keyed element is "reserved"
+// when the new markup has its key with the same tag; it is never morphed
+// into another child or removed, only moved. Any other old keyed element
+// (a key the markup no longer has, another tag, a duplicate) is removed.
+// Unkeyed children match by position with a bounded lookahead, as before.
 function morphChildren(op, np) {
+  const newKeys = newChildKeys(np);
+  const reserved = newKeys ? reservedOldChildren(op, newKeys) : null;
+  const isReserved = (node) => {
+    if (!reserved) return false;
+    const key = nodeKey(node);
+    return key !== null && reserved.get(key) === node;
+  };
+  const remove = (node) => {
+    unmountSubtree(node);
+    op.removeChild(node);
+    if (devMode) trace("morph.remove", { key: nodeKey(node) });
+  };
   let oc = op.firstChild, nc = np.firstChild;
   while (nc) {
-    if (!oc) { inserted(op.appendChild(nc.cloneNode(true))); if (devMode) trace("morph.append", { key: nodeKey(nc) }); nc = nc.nextSibling; continue; }
-    if (sameNode(oc, nc)) { morphNode(oc, nc); oc = oc.nextSibling; nc = nc.nextSibling; continue; }
-    const m = findMatch(oc.nextSibling, nc);
-    if (m) {
-      const targetKey = nodeKey(nc);
-      if (targetKey) {
-        op.insertBefore(m, oc);
-        if (devMode) trace("morph.move", { key: targetKey });
+    // An old keyed element at the cursor that nothing reserves goes now, so
+    // it does not use up an unkeyed child's lookahead.
+    while (oc && nodeKey(oc) !== null && !isReserved(oc)) {
+      const nx = oc.nextSibling;
+      remove(oc);
+      oc = nx;
+    }
+    const key = nodeKey(nc);
+    if (key !== null && newKeys.get(key) === nc) {
+      const m = reserved.get(key);
+      if (m) {
+        reserved.delete(key);
+        if (m === oc) oc = oc.nextSibling;
+        else {
+          op.insertBefore(m, oc);
+          if (devMode) trace("morph.move", { key });
+        }
         morphNode(m, nc);
-        nc = nc.nextSibling;
-        continue;
+      } else {
+        inserted(op.insertBefore(nc.cloneNode(true), oc));
+        if (devMode) trace("morph.insert", { key });
       }
-      while (oc && oc !== m) { const nx = oc.nextSibling; unmountSubtree(oc); op.removeChild(oc); if (devMode) trace("morph.remove", { key: nodeKey(oc) }); oc = nx; }
-      if (oc) { morphNode(oc, nc); oc = oc.nextSibling; }
       nc = nc.nextSibling;
       continue;
     }
-    inserted(op.insertBefore(nc.cloneNode(true), oc)); if (devMode) trace("morph.insert", { key: nodeKey(nc) }); nc = nc.nextSibling;
+    // An unkeyed child, or a later duplicate of a key (always a new
+    // element): the first old element of its kind within the lookahead,
+    // passing over reserved elements, which wait for their key.
+    let m = null;
+    if (key === null) {
+      for (let c = oc, k = UNKEYED_LOOKAHEAD; c && k > 0; c = c.nextSibling) {
+        if (isReserved(c)) continue;
+        if (sameNode(c, nc)) { m = c; break; }
+        k--;
+      }
+    }
+    if (m) {
+      // What lies between the cursor and the match is not in the markup,
+      // except reserved elements: they stay until their key moves them.
+      while (oc !== m) {
+        const nx = oc.nextSibling;
+        if (!isReserved(oc)) remove(oc);
+        oc = nx;
+      }
+      morphNode(m, nc);
+      oc = m.nextSibling;
+    } else {
+      inserted(op.insertBefore(nc.cloneNode(true), oc));
+      if (devMode) trace("morph.insert", { key });
+    }
+    nc = nc.nextSibling;
   }
-  while (oc) { const nx = oc.nextSibling; unmountSubtree(oc); op.removeChild(oc); if (devMode) trace("morph.remove", { key: nodeKey(oc) }); oc = nx; }
+  // Every reserved element was moved into place when its key came up.
+  if (reserved && reserved.size !== 0) {
+    throw new Error("[brazier] invariant violated: the morph left " + reserved.size + " keyed element(s) unplaced: " + [...reserved.keys()].join(", "));
+  }
+  while (oc) {
+    const nx = oc.nextSibling;
+    remove(oc);
+    oc = nx;
+  }
+}
+
+// The keys of the new children, each mapped to the first child with that
+// key, or null when no child is keyed. A key repeated among siblings is a
+// bug in the view (only the first match keeps an element's identity): it
+// is logged, and each later child with it is rendered as a new element.
+function newChildKeys(np) {
+  let keys = null;
+  for (let c = np.firstChild; c; c = c.nextSibling) {
+    const key = nodeKey(c);
+    if (key === null) continue;
+    if (keys === null) keys = new Map();
+    if (keys.has(key)) {
+      console.error("[brazier] Duplicate key " + JSON.stringify(key) + " among siblings (" + describeNode(c) + "); only the first keeps its element across renders");
+      continue;
+    }
+    keys.set(key, c);
+  }
+  return keys;
+}
+
+// The old children that the new markup keeps, by key: the first old child
+// with each key of `newKeys` and the same tag as that new child.
+function reservedOldChildren(op, newKeys) {
+  const reserved = new Map();
+  for (let c = op.firstChild; c; c = c.nextSibling) {
+    const key = nodeKey(c);
+    if (key === null || reserved.has(key)) continue;
+    const target = newKeys.get(key);
+    if (target && target.tagName === c.tagName) reserved.set(key, c);
+  }
+  return reserved;
 }
 
 // A subtree the morph inserted: its autofocus and hook elements are new.
@@ -1353,6 +1648,15 @@ function inserted(node) {
 function morphNode(o, n) {
   if (o.nodeType === 3) { if (o.textContent !== n.textContent) o.textContent = n.textContent; return; }
   if (o.nodeType !== 1) return;
+  // A hook element that stays but loses its hook, or names another one,
+  // unmounts the old hook now; a new name mounts when hooks sync. This is
+  // LiveView's View.performPatch (beforeUpdated: a removed or changed
+  // phx-hook destroys the hook, and a changed one is added after the patch).
+  const mounted = mountedHooks.get(o);
+  if (mounted && mounted.hookName !== n.getAttribute("data-brazier-hook")) {
+    if (devMode) trace("morph.hook_removed", { node: describeNode(o), hook: mounted.hookName });
+    unmountHookNode(o);
+  }
   if (morphAttributes(o, n) && o.hasAttribute("data-brazier-hook")) hookTouched.push({ node: o, subtree: false });
   if (o.hasAttribute("data-brazier-preserve-children")) {
     // Other code owns these children, and may have added hook elements.
@@ -1360,7 +1664,7 @@ function morphNode(o, n) {
     return;
   }
   const isFormControl = o.tagName === "INPUT" || o.tagName === "TEXTAREA" || o.tagName === "SELECT";
-  if (isFormControl && o === document.activeElement) {
+  if (isFormControl && o === morphFocused) {
     // The user is typing here: keep their value while it is not yet
     // reflected by the server (LiveView's rule for focused inputs).
     if (inputLocked()) {
@@ -1452,17 +1756,6 @@ function sameNode(a, b) {
   return true;
 }
 
-function findMatch(s, t) {
-  const targetKey = nodeKey(t);
-  let c = s, k = 8;
-  while (c && k > 0) {
-    if (targetKey ? nodeKey(c) === targetKey : sameNode(c, t)) return c;
-    c = c.nextSibling;
-    k--;
-  }
-  return null;
-}
-
 // === Hooks ===
 
 // What the current morph touched that can hold a hook element, in document
@@ -1516,13 +1809,20 @@ function syncHooks(root) {
 
 function syncHook(node) {
   const hookName = node.getAttribute("data-brazier-hook");
+  let existing = mountedHooks.get(node);
+  if (existing && existing.hookName !== hookName) {
+    // The morph unmounts a hook whose name it changes, so only other code
+    // renaming the attribute between renders gets here: a full scan (after
+    // a registration) then finds the element under its new name.
+    unmountHookNode(node);
+    existing = undefined;
+  }
   const hook = hookRegistry.get(hookName);
   if (!hook) {
     trace("hook.unregistered", { hook: hookName });
     return;
   }
   const attrs = serializeHookAttrs(node);
-  const existing = mountedHooks.get(node);
   if (!existing) {
     const state = hook.mount ? hook.mount(node) : undefined;
     mountedHooks.set(node, { hookName, hook, attrs, state });

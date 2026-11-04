@@ -25,9 +25,6 @@ The docs describe the current behaviour; each item is a code change.
 
 Found while merging WS10b (Milestone 117, 2026-11-04).
 
-- **Issue:** `ws_client_ip` parses `trusted_proxies` again on every upgrade
-  (`transport.gleam`); the listener could parse them once when it starts.
-  - **Files:** `src/brazier/transport.gleam`
 - **Issue:** a join without a build id is logged as a warning on every join
   (`transport.check_join_build`). A client that loads the unversioned
   `/brazier_client.js` fills the log; one warning per connection is enough.

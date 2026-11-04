@@ -66,11 +66,18 @@ pub fn esbuild_bundle(
   }
 }
 
-/// An absolute path for `path`, resolved against the current directory.
-pub fn absolute_path(path: String) -> String {
-  let assert Ok(absolute) = do_absolute_path(path)
-    as "filename:absname/1 always returns a path"
-  absolute
+/// An absolute path for `path`, resolved against the current directory. An
+/// `Error` when the current directory cannot be read (it was deleted, or a
+/// parent is no longer searchable): a build run from there cannot name its
+/// files.
+pub fn absolute_path(path: String) -> Result(String, String) {
+  case do_absolute_path(path) {
+    Ok(absolute) -> Ok(absolute)
+    Error(reason) -> {
+      log.error("brazier.build.program", reason)
+      Error(reason)
+    }
+  }
 }
 
 /// The first 16 hex digits of the SHA-256 of `contents`.
@@ -93,4 +100,4 @@ fn run_program(
 ) -> Result(String, String)
 
 @external(erlang, "brazier_build_ffi", "absolute_path")
-fn do_absolute_path(path: String) -> Result(String, Nil)
+fn do_absolute_path(path: String) -> Result(String, String)

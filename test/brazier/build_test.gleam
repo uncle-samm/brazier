@@ -146,10 +146,29 @@ pub fn program_run_missing_executable_is_an_error_test() {
 }
 
 pub fn program_absolute_path_keeps_unicode_test() {
-  let path = program.absolute_path("build/zoë/日本.gleam")
+  let assert Ok(path) = program.absolute_path("build/zoë/日本.gleam")
+    as "the test's current directory exists"
   let assert True = string.starts_with(path, "/")
   let assert True = string.ends_with(path, "/build/zoë/日本.gleam")
 }
+
+/// A current directory deleted under the VM cannot be read: resolving a
+/// path is an `Error` naming the path and the reason. filename:absname/1
+/// used to crash the build with a badmatch instead.
+pub fn program_absolute_path_without_a_current_directory_is_an_error_test() {
+  let assert Error(reason) =
+    in_deleted_directory("build/brazier_test_gone_cwd", fn() {
+      program.absolute_path("src/app.gleam")
+    })
+    as "a deleted current directory cannot be read"
+  assert string.contains(reason, "Cannot resolve src/app.gleam")
+  assert string.contains(reason, "no such file or directory")
+}
+
+/// Run `run` with the current directory set to `dir`, which is deleted
+/// first, then restore the current directory.
+@external(erlang, "brazier_build_test_ffi", "in_deleted_directory")
+fn in_deleted_directory(dir: String, run: fn() -> a) -> a
 
 pub fn program_content_hash_is_stable_test() {
   let hash = program.content_hash("bundle")

@@ -3,8 +3,9 @@
 //// Each session is a runtime started on a peer inside a holder process
 //// (brazier/presence/holder). The holder owns the runtime's link and the
 //// proof subject the app's `update` reports every presence message to, so
-//// the test reads what the app saw through the holder. Waiting is always
-//// a receive or `peer.eventually` with a deadline.
+//// the test reads what the app saw through the holder. Waiting is a
+//// receive with a deadline, or `peer.until` on the diffs a node reports
+//// (brazier/presence/wake) or on a process monitor; nothing polls.
 
 import brazier/cluster/peer.{type Peer, Timeout}
 import brazier/effect
@@ -14,6 +15,7 @@ import brazier/monitored
 import brazier/presence.{type Presence, Tracking}
 import brazier/presence/holder.{type Holder}
 import brazier/presence/sync.{type Diff, type Entry}
+import brazier/presence/wake
 import brazier/pubsub
 import brazier/runtime
 import brazier/test_ctx
@@ -224,21 +226,47 @@ fn refs(entries: List(Entry(String))) -> List(String) {
   })
 }
 
-/// The keys `p`'s tracker lists on `topic`.
-fn listed(p: Peer, topic: String) -> List(Entry(String)) {
-  peer.on(p, fn() {
-    let assert Ok(entries) = presence.list(tracker(), topic)
-      as "presence.list succeeds"
-    entries
-  })
+/// The entries this node's tracker lists on `topic`.
+fn listed_here(topic: String) -> List(Entry(String)) {
+  let assert Ok(entries) = presence.list(tracker(), topic)
+    as "presence.list succeeds"
+  entries
 }
 
-fn keys(p: Peer, topic: String) -> List(String) {
-  listed(p, topic) |> list.map(fn(entry) { entry.key })
+/// The entries `p`'s tracker lists on `topic`.
+fn listed(p: Peer, topic: String) -> List(Entry(String)) {
+  peer.on(p, fn() { listed_here(topic) })
+}
+
+/// Whether `p`'s listing of `topic` comes to satisfy `holds`, re-checked
+/// on each diff `p` reports there.
+fn lists(
+  p: Peer,
+  topic: String,
+  holds: fn(List(Entry(String))) -> Bool,
+) -> Bool {
+  peer.until(
+    p,
+    wake.diffs(tracker(), topic),
+    fn() { holds(listed_here(topic)) },
+    wait_ms,
+  )
 }
 
 fn sees(p: Peer, topic: String, expected: List(String)) -> Bool {
-  peer.eventually(fn() { keys(p, topic) == expected }, wait_ms)
+  lists(p, topic, fn(entries) {
+    list.map(entries, fn(entry) { entry.key }) == expected
+  })
+}
+
+/// Whether `pid` on `p` exits, waiting on a monitor.
+fn exits(p: Peer, pid: Pid) -> Bool {
+  peer.until(
+    p,
+    peer.process_down(pid),
+    fn() { !process.is_alive(pid) },
+    wait_ms,
+  )
 }
 
 /// A holder on `p` tracking `key` on `topic`.
@@ -264,10 +292,6 @@ fn watcher(session: Session) -> Pid {
   let assert Ok(pid) = watcher_of(runtime_pid(session))
     as "the runtime has no presence watcher"
   pid
-}
-
-fn alive(p: Peer, pid: Pid) -> Bool {
-  peer.on(p, fn() { process.is_alive(pid) })
 }
 
 // --- Tests --------------------------------------------------------------------
@@ -390,7 +414,7 @@ pub fn retracks_after_shard_restart_test_() -> peer.Timeout {
     as "presence.shard_pid succeeds"
   assert new_shard != old_shard
   assert refs(listed(a, "lobby")) == [new]
-  assert peer.eventually(fn() { refs(listed(b, "lobby")) == [new] }, wait_ms)
+  assert lists(b, "lobby", fn(entries) { refs(entries) == [new] })
   Nil
 }
 
@@ -410,12 +434,12 @@ pub fn cleanup_when_runtime_dies_test_() -> peer.Timeout {
 
   peer.on(a, fn() { process.kill(runtime_pid(ann)) })
   assert sees(b, "lobby", ["amy"])
-  assert peer.eventually(fn() { !alive(a, ann_watcher) }, wait_ms)
+  assert exits(a, ann_watcher)
 
   peer.on(a, fn() { process.send(amy.runtime, runtime.Shutdown) })
   assert sees(b, "lobby", [])
   assert sees(a, "lobby", [])
-  assert peer.eventually(fn() { !alive(a, amy_watcher) }, wait_ms)
+  assert exits(a, amy_watcher)
   Nil
 }
 
@@ -469,8 +493,7 @@ pub fn refused_trackings_fail_the_start_test_() -> peer.Timeout {
   assert string.contains(reason, "presence")
   assert string.contains(reason, "twice")
 
-  let assert [] = keys(a, "lobby") as "keys returns an empty list"
-  Nil
+  assert listed(a, "lobby") == []
 }
 
 /// A tracker that never comes up stops the runtime with

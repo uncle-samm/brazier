@@ -1,7 +1,7 @@
 //// SEC-2: route-scoped middleware gates a live page, not only its dead
 //// render. `middleware.only("/admin", auth)` refuses `GET /admin`, and the
 //// same middleware refuses the WebSocket that mounts `/admin`
-//// (`/ws?path=%2Fadmin`), a `navigate` to `/admin` on a connection that
+//// (`/ws?path=%2Fadmin`, closed with 4600 after the handshake), a `navigate` to `/admin` on a connection that
 //// mounted another page, and a `join` that names `/admin`. A refused
 //// navigation or join is answered with a hard navigation, so the browser's
 //// page load gets the middleware's own answer, and it never reaches the
@@ -11,6 +11,7 @@
 //// and the runtime's first message must be the admitted one.
 
 import brazier/middleware
+import brazier/monitored
 import brazier/telemetry.{type Event}
 import brazier/transport
 import brazier/transport/server
@@ -57,9 +58,6 @@ fn raw_upgrade_request(
 
 @external(erlang, "brazier_ws_test_ffi", "masked_frame")
 fn masked_frame(fin: Int, opcode: Int, payload: BitArray) -> BitArray
-
-@external(erlang, "erlang", "unique_integer")
-fn unique_integer() -> Int
 
 const host = "127.0.0.1"
 
@@ -193,17 +191,15 @@ fn json_string(text: String) -> String {
 
 const navigation_refused = ["brazier", "ws", "navigation_refused"]
 
-fn listen() -> #(String, Subject(Event)) {
-  let assert Ok(Nil) = telemetry.start()
-  let id = "live_page_gate_" <> int.to_string(unique_integer())
-  let events = process.new_subject()
-  let assert Ok(Nil) =
-    telemetry.attach(
-      id,
-      [navigation_refused, ["brazier", "ws", "upgrade", "stop"]],
-      fn(event) { process.send(events, event) },
-    )
-  #(id, events)
+/// Run `run` with the navigation refusals and upgrade stops sent to a subject it receives. The handler is
+/// detached however `run` ends: telemetry handlers are node-wide, and one
+/// left by a failing test would send every later event to eunit's shared
+/// test process.
+fn listen(run: fn(Subject(Event)) -> a) -> a {
+  monitored.listening(
+    [navigation_refused, ["brazier", "ws", "upgrade", "stop"]],
+    run,
+  )
 }
 
 /// The first event named `name` for which `matches` holds; others are
@@ -241,14 +237,20 @@ pub fn get_of_the_admin_page_is_refused_by_its_middleware_test() {
 
 pub fn websocket_mounting_the_admin_page_is_refused_test() {
   let #(listener, port, observer) = start_server()
-  let #(id, events) = listen()
+  use events <- listen()
   // `/admin`, and readings of it the router also resolves to `/admin`.
   list.each(
     ["%2Fadmin", "%2Fadmin%2Fusers", "%2F%2561dmin", "%2Fx%2F..%2Fadmin"],
     fn(page) {
       let #(socket, status) =
         request_status(port, "/ws?path=" <> page, upgrade_headers(port, []))
-      let assert True = status == "403" as { "upgrade on " <> page }
+      // The handshake completes, then the socket closes with 4600 and the
+      // middleware's status: a browser cannot read a refused upgrade's.
+      let assert True = status == "101" as { "upgrade on " <> page }
+      let assert Ok(#(8, <<4600:16, reason:bits>>)) =
+        raw_recv_frame(socket, 3000)
+        as "a refused mount closes with 4600"
+      let assert <<"middleware refused 403">> = reason
       let stop =
         expect(events, ["brazier", "ws", "upgrade", "stop"], fn(_) { True })
       let assert Ok("rejected_middleware") = telemetry.string(stop, "result")
@@ -262,7 +264,6 @@ pub fn websocket_mounting_the_admin_page_is_refused_test() {
   raw_close(socket)
   let #(socket, _conn_id) = open(port, observer, "%2F", [])
   raw_close(socket)
-  let assert Ok(Nil) = telemetry.detach(id)
   server.stop(listener)
 }
 
@@ -285,7 +286,7 @@ pub fn websocket_without_a_page_or_with_a_foreign_one_is_400_test() {
 
 pub fn navigation_to_the_admin_page_is_answered_with_a_hard_navigation_test() {
   let #(listener, port, observer) = start_server()
-  let #(id, events) = listen()
+  use events <- listen()
   let #(socket, conn_id) = open(port, observer, "%2F", [])
   list.each(["/admin", "/admin/users?tab=1", "/%61dmin", "//admin"], fn(path) {
     case path {
@@ -314,11 +315,10 @@ pub fn navigation_to_the_admin_page_is_answered_with_a_hard_navigation_test() {
   })
   // None of them reached the runtime: its first message is this one.
   send_text(socket, navigate_json("/about"))
-  let assert Ok(GotEvent(cid, transport.ClientNavigate(path: "/about"))) =
+  let assert Ok(GotEvent(cid, transport.ClientNavigate(path: "/about", ..))) =
     process.receive(observer, 3000)
   let assert True = cid == conn_id
   raw_close(socket)
-  let assert Ok(Nil) = telemetry.detach(id)
   server.stop(listener)
 }
 
@@ -326,7 +326,7 @@ pub fn navigation_to_the_admin_page_with_the_cookie_is_admitted_test() {
   let #(listener, port, observer) = start_server()
   let #(socket, conn_id) = open(port, observer, "%2F", [admin_cookie])
   send_text(socket, navigate_json("/admin"))
-  let assert Ok(GotEvent(cid, transport.ClientNavigate(path: "/admin"))) =
+  let assert Ok(GotEvent(cid, transport.ClientNavigate(path: "/admin", ..))) =
     process.receive(observer, 3000)
   let assert True = cid == conn_id
   raw_close(socket)
@@ -337,7 +337,7 @@ pub fn navigation_to_the_admin_page_with_the_cookie_is_admitted_test() {
 
 pub fn join_naming_the_admin_page_is_answered_with_a_hard_navigation_test() {
   let #(listener, port, observer) = start_server()
-  let #(id, events) = listen()
+  use events <- listen()
   let #(socket, conn_id) = open(port, observer, "%2F", [])
   send_text(socket, join_json("/admin"))
   let assert True = recv_text(socket) == hard_navigate_json("/admin")
@@ -354,7 +354,6 @@ pub fn join_naming_the_admin_page_is_answered_with_a_hard_navigation_test() {
     process.receive(observer, 3000)
   let assert True = cid == conn_id
   raw_close(socket)
-  let assert Ok(Nil) = telemetry.detach(id)
   server.stop(listener)
 }
 

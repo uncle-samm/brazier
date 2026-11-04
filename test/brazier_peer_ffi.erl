@@ -27,7 +27,8 @@
 -export([with_cluster/3, with_cluster_args/4, with_members/3, with_members_args/4,
          with_long_name_cluster/3, rpc/3, crash/1, stop/1, partition/2,
          heal/2, restore/2, connect/2, node_of/1, pause/1, alive/1, add_peer/2, add_peer_args/3,
-         await_member/3]).
+         await_member/3, await_members/3, membership_changed/4, monitor_nodes/1, pg_monitor/2, pg_demonitor/2,
+         trace_receive/2, now_ms/0, registered/1, on_node/3]).
 
 -define(START_TIMEOUT_MS, 30000).
 -define(STOP_TIMEOUT_MS, 10000).
@@ -119,7 +120,7 @@ connect(A, B) ->
     NodeB = node_of(B),
     case rpc(A, fun() -> net_kernel:connect_node(NodeB) end, 10000) of
         {ok, true} ->
-            await_members(A, B);
+            await_verified_pair(A, B);
         {ok, Other} ->
             {error, unicode:characters_to_binary(
                 io_lib:format("connect ~p -> ~p returned ~p", [node_of(A), NodeB, Other]))};
@@ -127,7 +128,7 @@ connect(A, B) ->
             {error, Reason}
     end.
 
-await_members(A, B) ->
+await_verified_pair(A, B) ->
     case {manager_running(A), manager_running(B)} of
         {true, true} ->
             case await_member(A, node_of(B), ?VERIFY_TIMEOUT_MS) of
@@ -166,6 +167,98 @@ await_member(Peer, Node, TimeoutMs) ->
                 io_lib:format("~p on ~p: ~p", [Node, node_of(Peer), Outcome]))};
         {error, Reason} ->
             {error, Reason}
+    end.
+
+%% Wait on Peer until its cluster manager's members are exactly Expected
+%% (a list of nodes, in any order): {ok, nil}, or {error, Description} with
+%% the members it had when TimeoutMs ran out.
+%%
+%% Message-driven, with no polling. Every change to the members table is
+%% followed by a message to the waiter:
+%%   - a node joins when the manager verifies it, and the manager tells
+%%     each process that asked (brazier_cluster_ffi:await_verified/1)
+%%     after writing the row. The waiter asks for every missing node, and
+%%     asks again after each nodeup (a node that was not connected when it
+%%     asked is not waited for);
+%%   - a node leaves when it goes down or is rejected. The manager emits
+%%     [brazier, cluster, node, down] or [.., peer, rejected] in the same
+%%     handle_info that deletes the row, before the delete, so after the
+%%     event the waiter calls sys:get_state/1 on the manager: the manager
+%%     answers after that handle_info has returned, and the row is gone.
+%% The wakes are set up before the first read, so a change after any read
+%% is followed by a wake (OTP's monitor-then-check pattern, as in
+%% gen_server:call/3).
+await_members(Peer, Expected, TimeoutMs) ->
+    Want = lists:usort(Expected),
+    Wait = fun() -> membership_wait(Want, TimeoutMs) end,
+    case rpc(Peer, Wait, TimeoutMs + 5000) of
+        {ok, {ok, nil}} ->
+            {ok, nil};
+        {ok, {error, Outcome}} ->
+            {error, unicode:characters_to_binary(
+                io_lib:format("members on ~p: wanted ~p, ~p", [node_of(Peer), Want, Outcome]))};
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+membership_wait(Want, TimeoutMs) ->
+    Alias = erlang:alias(),
+    Id = {?MODULE, membership_wait, Alias},
+    ok = net_kernel:monitor_nodes(true),
+    ok = telemetry:attach_many(Id, [[brazier, cluster, node, down],
+                                    [brazier, cluster, peer, rejected]],
+                               fun ?MODULE:membership_changed/4, Alias),
+    Deadline = erlang:monotonic_time(millisecond) + TimeoutMs,
+    try
+        membership_loop(Want, Alias, Deadline)
+    after
+        ok = telemetry:detach(Id),
+        true = erlang:unalias(Alias),
+        ok = net_kernel:monitor_nodes(false),
+        ok = flush_membership(Alias)
+    end.
+
+membership_loop(Want, Alias, Deadline) ->
+    case whereis(brazier_cluster) of
+        undefined ->
+            {error, no_cluster_manager};
+        Manager ->
+            %% The barrier: a removal whose event already woke this
+            %% process has deleted its row once the manager answers.
+            _ = sys:get_state(Manager),
+            case brazier_cluster_ffi:members() of
+                {ok, Want} ->
+                    {ok, nil};
+                {ok, Have} ->
+                    lists:foreach(fun(Node) -> {ok, nil} = brazier_cluster_ffi:await_verified(Node) end,
+                                  Want -- Have),
+                    Left = max(0, Deadline - erlang:monotonic_time(millisecond)),
+                    receive
+                        {nodeup, _} -> membership_loop(Want, Alias, Deadline);
+                        {nodedown, _} -> membership_loop(Want, Alias, Deadline);
+                        {brazier_cluster_peer_verified, _} -> membership_loop(Want, Alias, Deadline);
+                        {Alias, membership_changed} -> membership_loop(Want, Alias, Deadline)
+                    after Left ->
+                        {error, {members, Have}}
+                    end;
+                {error, not_started} ->
+                    {error, no_cluster_manager}
+            end
+    end.
+
+%% Telemetry handler of await_members/3 (runs in the manager).
+membership_changed(_Name, _Measurements, _Metadata, Alias) ->
+    Alias ! {Alias, membership_changed},
+    ok.
+
+flush_membership(Alias) ->
+    receive
+        {nodeup, _} -> flush_membership(Alias);
+        {nodedown, _} -> flush_membership(Alias);
+        {brazier_cluster_peer_verified, _} -> flush_membership(Alias);
+        {Alias, membership_changed} -> flush_membership(Alias)
+    after 0 ->
+        ok
     end.
 
 node_of({peer, _Pid, Node, _Keeper}) -> Node.
@@ -229,6 +322,53 @@ restore(A, B) ->
 
 pause(Ms) ->
     receive after Ms -> nil end.
+
+%% --- Wakes for peer.until (each runs in the waiting process) ---
+
+%% {nodeup, Node} and {nodedown, Node} messages while On.
+monitor_nodes(On) ->
+    ok = net_kernel:monitor_nodes(On),
+    nil.
+
+%% {Ref, join | leave, Group, Pids} messages for Group in the pg Scope.
+pg_monitor(Scope, Group) ->
+    {Ref, _Members} = pg:monitor(binary_to_existing_atom(Scope), Group),
+    Ref.
+
+pg_demonitor(Scope, Ref) ->
+    ok = pg:demonitor(binary_to_existing_atom(Scope), Ref),
+    nil.
+
+%% A {trace, Pid, 'receive', Message} message for each message Pid
+%% receives, while On.
+trace_receive(Pid, true) ->
+    1 = erlang:trace(Pid, true, ['receive', {tracer, self()}]),
+    nil;
+trace_receive(Pid, false) ->
+    try erlang:trace(Pid, false, ['receive']) of
+        1 -> nil
+    catch
+        error:badarg ->
+            %% Only for a process that has exited, which carries no trace
+            %% flags to clear.
+            false = is_process_alive(Pid),
+            nil
+    end.
+
+now_ms() ->
+    erlang:monotonic_time(millisecond).
+
+%% Run Fun() on Node from a peer (erpc:call/5) and return its result; an
+%% error or exit on Node, or a lost connection, is raised in the caller.
+on_node(Node, Fun, TimeoutMs) ->
+    erpc:call(Node, erlang, apply, [Fun, []], TimeoutMs).
+
+%% The process registered as Name on this node, or {error, nil}.
+registered(Name) ->
+    case erlang:whereis(binary_to_existing_atom(Name)) of
+        undefined -> {error, nil};
+        Pid -> {ok, Pid}
+    end.
 
 %% --- Keeper ---
 

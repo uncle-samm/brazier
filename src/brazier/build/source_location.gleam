@@ -24,6 +24,7 @@ pub fn line_col(source: String, byte_offset: Int) -> LineCol {
   let offset = int.clamp(byte_offset, 0, size)
   // Invariant: offset is clamped to [0, size], so the slice always exists.
   let assert Ok(prefix_bytes) = bit_array.slice(bytes, 0, offset)
+    as "line_col: the offset is clamped to the byte size, so the slice exists"
   let prefix = case bit_array.to_string(prefix_bytes) {
     Ok(text) -> text
     // The offset falls inside a multi-byte code point. Walk back to the
@@ -33,6 +34,7 @@ pub fn line_col(source: String, byte_offset: Int) -> LineCol {
   let lines = string.split(prefix, "\n")
   // Invariant: string.split always returns at least one element.
   let assert Ok(last) = list.last(lines)
+    as "line_col: string.split always returns at least one element"
   LineCol(line: list.length(lines), column: string.length(last) + 1)
 }
 
@@ -43,6 +45,7 @@ fn valid_prefix(bytes: BitArray) -> String {
     _ -> {
       // Invariant: size > 0, so a slice of size - 1 bytes always exists.
       let assert Ok(shorter) = bit_array.slice(bytes, 0, size - 1)
+        as "valid_prefix: size > 0, so a slice of size - 1 bytes exists"
       case bit_array.to_string(shorter) {
         Ok(text) -> text
         Error(Nil) -> valid_prefix(shorter)

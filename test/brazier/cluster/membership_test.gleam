@@ -8,8 +8,13 @@
 //// revocation, each test checks three things. Traffic from `a` reaches `c`
 //// (the control). Nothing goes from `a` to `b`. Nothing from `b` is taken
 //// in: `b` sends nothing, and a message forged on `b`'s behalf is dropped
-//// where it lands. Once `b`'s manager runs again, it rejects the others'
-//// hellos and the nodes disconnect.
+//// where it lands. Once `b`'s manager runs again, it rejects `a` and `c`,
+//// and every connection stays up: the verified pair keeps its membership.
+////
+//// The peers run with OTP's defaults, `global`'s overlapping-partition
+//// prevention included. Under it, one dropped connection makes the other
+//// nodes drop theirs (the control test at the end shows it), which is why
+//// the manager never disconnects a rejected peer.
 ////
 //// The checks on the sending side are exact: the verified member list is
 //// what every sender consults. A dropped revocation is read from the
@@ -55,11 +60,11 @@ pub fn pubsub_exchanges_nothing_with_an_unverified_node_test_() -> peer.Timeout 
   list.each([a, b, c], fn(p) { peer.on(p, pubsub.start) })
   // pg lists every connected node's worker, b's included; membership, not
   // pg, decides where forwards go.
-  assert peer.eventually(
-    fn() {
-      peer.on(a, fn() { remote_worker_nodes(0) })
-      == list.sort([peer.node(b), peer.node(c)], by: node_order)
-    },
+  let others = list.sort([peer.node(b), peer.node(c)], by: node_order)
+  assert peer.until(
+    a,
+    peer.pg_changes("brazier_pubsub_pg", #(atom.create("brazier_pubsub"), 0)),
+    fn() { remote_worker_nodes(0) == others },
     wait_ms,
   )
   let topic = "members-only"
@@ -74,10 +79,7 @@ pub fn pubsub_exchanges_nothing_with_an_unverified_node_test_() -> peer.Timeout 
   let assert Ok(Nil) =
     peer.on(a, fn() { pubsub.try_broadcast(topic, "from-a") })
     as "a broadcast on a running PubSub succeeds"
-  assert peer.eventually(
-    fn() { peer.on(c, fn() { recorded(on_c) }) == ["from-a"] },
-    wait_ms,
-  )
+  assert recorded_on(c, on_c, 1) == Ok(["from-a"])
   let b_node = peer.node(b)
   assert peer.on(a, fn() { pubsub.direct_broadcast(b_node, topic, "direct") })
     == Error(pubsub.NodeNotVerified(node: node_name(b)))
@@ -105,12 +107,9 @@ pub fn pubsub_exchanges_nothing_with_an_unverified_node_test_() -> peer.Timeout 
   // A last broadcast from a, after everything above, reaches c.
   let assert Ok(Nil) = peer.on(a, fn() { pubsub.try_broadcast(topic, "last") })
     as "a broadcast on a running PubSub succeeds"
-  assert peer.eventually(
-    fn() { peer.on(c, fn() { recorded(on_c) }) == ["from-a", "last"] },
-    wait_ms,
-  )
-  assert peer.on(a, fn() { recorded(on_a) }) == ["from-a", "last"]
-  assert peer.on(b, fn() { recorded(on_b) }) == ["from-b"]
+  assert recorded_on(c, on_c, 2) == Ok(["from-a", "last"])
+  assert recorded_on(a, on_a, 2) == Ok(["from-a", "last"])
+  assert recorded_on(b, on_b, 1) == Ok(["from-b"])
 }
 
 // --- Replicated store -------------------------------------------------------
@@ -126,10 +125,10 @@ pub fn store_exchanges_nothing_with_an_unverified_node_test_() -> peer.Timeout {
 
   put_on(a, kv, "from-a", "1")
   put_on(b, kv, "from-b", "2")
-  assert peer.eventually(fn() { get_on(c, kv, "from-a") == Ok("1") }, wait_ms)
+  assert await_value(c, kv, "from-a", "1")
   // Anti-entropy (every 100ms) has had its chance to fill any gap too.
   put_on(c, kv, "from-c", "3")
-  assert peer.eventually(fn() { get_on(a, kv, "from-c") == Ok("3") }, wait_ms)
+  assert await_value(a, kv, "from-c", "3")
   assert get_on(b, kv, "from-a") == Error(Nil)
   assert get_on(b, kv, "from-c") == Error(Nil)
   assert get_on(a, kv, "from-b") == Error(Nil)
@@ -170,14 +169,23 @@ pub fn presence_exchanges_nothing_with_an_unverified_node_test_() -> peer.Timeou
 
   track_on(a, tracker, "alice")
   track_on(b, tracker, "bob")
-  assert peer.eventually(fn() { keys(c, tracker) == ["alice"] }, wait_ms)
-  // a and c hear each other's heartbeats; b hears and is heard by no one.
-  assert peer.eventually(
-    fn() { replicas(a, tracker) == [node_name(c)] },
+  assert peer.until(
+    c,
+    room_diffs(tracker),
+    fn() { local_keys(tracker) == ["alice"] },
     wait_ms,
   )
-  assert peer.eventually(
-    fn() { replicas(c, tracker) == [node_name(a)] },
+  // a and c hear each other's heartbeats; b hears and is heard by no one.
+  assert peer.until(
+    a,
+    replica_changes(),
+    fn() { local_replicas(tracker) == [node_name(c)] },
+    wait_ms,
+  )
+  assert peer.until(
+    c,
+    replica_changes(),
+    fn() { local_replicas(tracker) == [node_name(a)] },
     wait_ms,
   )
   assert replicas(b, tracker) == []
@@ -219,7 +227,7 @@ pub fn revocation_reaches_no_unverified_node_test_() -> peer.Timeout {
   // A logout on a reaches c's socket and skips b's.
   let s = peer.on(a, fn() { session.create(store_a) })
   let _ = bind_on(b, store_b, s.id)
-  let _ = bind_on(c, store_c, s.id)
+  let bound_c = bind_on(c, store_c, s.id)
   assert bound_seen_from(a, name, s.id, 2)
   let #(Nil, lines) =
     peer.on(a, fn() {
@@ -229,10 +237,11 @@ pub fn revocation_reaches_no_unverified_node_test_() -> peer.Timeout {
     "Revocation skipped 1 bound process(es)",
     node_name(b),
   ])
-  assert peer.eventually(
-    fn() { list.contains(peer.on(c, revocations), #(s.id, "deleted")) },
-    wait_ms,
-  )
+  let id = s.id
+  assert peer.on_within(c, wait_ms + 5000, fn() {
+      await_revocation(bound_c, id, "deleted", wait_ms)
+    })
+    == Ok(Nil)
   assert !list.contains(peer.on(b, revocations), #(s.id, "deleted"))
 
   // A logout on b reaches no other node.
@@ -257,21 +266,13 @@ pub fn revocation_reaches_no_unverified_node_test_() -> peer.Timeout {
 
 /// Three connected peers: `a` and `c` are verified members, `b` runs a
 /// suspended manager with another deployment's secret. After `run`, `b`'s
-/// manager is resumed and must reject the others and disconnect.
-///
-/// The peers run without `global`'s overlapping-partition prevention. With
-/// OTP's default, b's `global` tells c that b lost a as soon as b's manager
-/// disconnects a, and c then disconnects a too. Whether that happens
-/// depends on whether the message reaches c before b disconnects c. When
-/// it does, the verified pair a and c ends with no connection to each
-/// other, and the final `members(a)` check fails (3 in 30 runs). The
-/// manager does not handle that yet; it is reported as an open issue, not
-/// hidden by this setting. Under the setting, this test checks what the
-/// manager itself does.
+/// manager is resumed, rejects both, and nobody loses a connection.
 fn with_intruder(prefix: String, run: fn(Peer, Peer, Peer) -> Nil) -> Nil {
-  use peers <- peer.with_cluster_args(3, prefix, no_partition_prevention)
+  use peers <- peer.with_cluster(3, prefix)
   let assert [a, b, c] = peers as "with_cluster(3) starts three peers"
   record_cluster_events(peers)
+  // Every nodeup and nodedown from here on, on every peer.
+  let watchers = list.map(peers, fn(p) { #(p, peer.on(p, watch_nodes)) })
   // The peer check of b never times out during the test.
   let config =
     cluster.new(cluster.NoDiscovery) |> cluster.peer_check_timeout(60_000)
@@ -294,15 +295,133 @@ fn with_intruder(prefix: String, run: fn(Peer, Peer, Peer) -> Nil) -> Nil {
   run(a, b, c)
 
   peer.on(b, manager_resume)
-  assert peer.eventually(fn() { peer.on(b, nodes) == [] }, wait_ms)
-  assert peer.eventually(fn() { rejected(b, a) }, wait_ms)
-  assert peer.eventually(fn() { rejected(b, c) }, wait_ms)
+  // a and c each hand b's manager a hello with their real MAC and return
+  // once it has been handled, so both rejections have happened.
+  hello_from(a, b)
+  hello_from(c, b)
+  assert rejected(b, a)
+  assert rejected(b, c)
+  assert peer.on(b, fn() { peer_status(peer.node(a)) }) == "rejected"
+  assert peer.on(b, fn() { peer_status(peer.node(c)) }) == "rejected"
+  // Rejecting disconnected nobody. A disconnect is synchronous, so b would
+  // already show it; global's reaction to one would reach a and c as a
+  // nodedown, and no node saw any (nor a reconnect).
+  assert_full_mesh(peers)
+  list.each(watchers, fn(w) {
+    let #(p, watcher) = w
+    assert peer.on(p, fn() { node_events(watcher) }) == []
+  })
   assert members(a) == [peer.node(c)]
+  assert members(c) == [peer.node(a)]
+  assert members(b) == []
 }
 
-const no_partition_prevention = [
-  "-kernel", "prevent_overlapping_partitions", "false",
-]
+/// `from` sends `to`'s manager a hello with `from`'s own MAC and returns
+/// once it has been handled.
+fn hello_from(from: Peer, to: Peer) -> Nil {
+  let to_node = peer.node(to)
+  let mac = cluster.peer_mac(secret)
+  peer.on(from, fn() { send_hello(to_node, mac) })
+}
+
+/// Every peer is connected to every other one.
+fn assert_full_mesh(peers: List(Peer)) -> Nil {
+  list.each(peers, fn(p) {
+    let others =
+      list.filter(peers, fn(q) { q != p })
+      |> list.map(peer.node)
+      |> list.sort(by: node_order)
+    assert list.sort(peer.on(p, nodes), by: node_order) == others
+  })
+}
+
+// --- Why rejection does not disconnect ----------------------------------------
+
+/// The control for the design: with OTP's default overlapping-partition
+/// prevention, one node dropping one connection in a full mesh of three
+/// makes a third node, which dropped nothing, lose a connection too.
+/// `global` on the dropping node reports the loss to the third, which
+/// cuts its own link to the lost node in answer. This is what
+/// `erlang:disconnect_node/1` on a rejected peer used to set off, and why
+/// the manager no longer calls it. No cluster manager runs here.
+pub fn one_disconnect_partitions_the_rest_under_the_otp_default_test_() -> peer.Timeout {
+  use <- Timeout(60)
+  use peers <- peer.with_cluster(3, "brazier_mem_pop")
+  let assert [a, b, c] = peers as "with_cluster(3) starts three peers"
+  assert_full_mesh(peers)
+  list.each(peers, fn(p) { peer.on(p, sync_global) })
+  let watcher = peer.on(c, watch_nodes)
+  let b_node = peer.node(b)
+  peer.on(a, fn() { disconnect(b_node) })
+  // c dropped nothing itself, yet it sees a connection go down.
+  let assert [#("down", lost), ..] =
+    peer.on(c, fn() { node_events_after_down(watcher) })
+    as "c loses a connection after a drops b"
+  assert lost == peer.node(a) || lost == b_node
+}
+
+// --- A rejected peer can still pass ------------------------------------------
+
+/// A verified member that then sends a hello with another key is no longer
+/// a member, and stays connected: membership changed, the connection did
+/// not.
+pub fn verified_member_that_fails_a_later_hello_is_rejected_in_place_test_() -> peer.Timeout {
+  use <- Timeout(60)
+  use peers <- peer.with_cluster(2, "brazier_mem_reverify")
+  let assert [a, b] = peers as "with_cluster(2) starts two peers"
+  record_cluster_events(peers)
+  let watcher = peer.on(a, watch_nodes)
+  let config = cluster.new(cluster.NoDiscovery)
+  start_manager(a, config, secret)
+  start_manager(b, config, secret)
+  let assert Ok(Nil) = peer.await_member(a, peer.node(b), wait_ms)
+    as "a and b share the secret key"
+
+  let a_node = peer.node(a)
+  let bad = cluster.peer_mac(other_secret)
+  peer.on(b, fn() { send_hello(a_node, bad) })
+  assert rejected(a, b)
+  assert members(a) == []
+  assert peer.on(a, fn() { peer_status(peer.node(b)) }) == "rejected"
+  assert peer.on(a, nodes) == [peer.node(b)]
+  assert peer.on(a, fn() { node_events(watcher) }) == []
+
+  // The right key again makes it a member again, on the same connection.
+  hello_from(b, a)
+  assert members(a) == [peer.node(b)]
+  assert peer.on(a, fn() { node_events(watcher) }) == []
+}
+
+/// A process waiting for a node to be verified keeps waiting through a
+/// rejection, and is told once the node passes later on the same
+/// connection. It is told nothing while the node stays rejected.
+pub fn waiter_is_told_when_a_rejected_node_passes_later_test_() -> peer.Timeout {
+  use <- Timeout(60)
+  use peers <- peer.with_cluster(2, "brazier_mem_wait")
+  let assert [a, b] = peers as "with_cluster(2) starts two peers"
+  record_cluster_events(peers)
+  let b_node = peer.node(b)
+  // b runs no manager yet; a's check of b would only time out after 60s.
+  start_manager(
+    a,
+    cluster.new(cluster.NoDiscovery) |> cluster.peer_check_timeout(60_000),
+    secret,
+  )
+  let waiter = peer.on(a, fn() { spawn_verified_waiter(b_node) })
+  let a_node = peer.node(a)
+  peer.on(b, fn() { send_hello(a_node, cluster.peer_mac(other_secret)) })
+  assert rejected(a, b)
+  assert peer.on(a, fn() { waiter_result(waiter, False) }) == 0
+  assert peer.on(a, nodes) == [b_node]
+
+  // b's manager starts with the right key: its init hello passes.
+  start_manager(b, cluster.new(cluster.NoDiscovery), secret)
+  assert peer.on(a, fn() { waiter_result(waiter, True) }) == 1
+  assert members(a) == [b_node]
+  // Exactly one notice, even after a further good hello.
+  hello_from(b, a)
+  assert peer.on(a, fn() { waiter_result(waiter, False) }) == 1
+}
 
 fn start_manager(p: Peer, config: cluster.ClusterConfig, key: String) -> Nil {
   let outcome = peer.on(p, fn() { cluster.start(config, secret_key: key) })
@@ -377,6 +496,22 @@ fn get_on(
   peer.on(p, fn() { store.get(kv, key) })
 }
 
+/// Wait on `p` until `key` holds `value` there. The replica writes a
+/// remote change to its table and then announces it on the store topic.
+fn await_value(
+  p: Peer,
+  kv: store.Store(String),
+  key: String,
+  value: String,
+) -> Bool {
+  peer.until(
+    p,
+    peer.broadcasts(store.topic(kv)),
+    fn() { store.get(kv, key) == Ok(value) },
+    wait_ms,
+  )
+}
+
 fn start_presence(
   p: Peer,
   config: presence.PresenceConfig(String),
@@ -400,20 +535,51 @@ fn track_on(p: Peer, tracker: presence.Presence(String), key: String) -> Nil {
 }
 
 fn keys(p: Peer, tracker: presence.Presence(String)) -> List(String) {
-  peer.on(p, fn() {
-    let assert Ok(entries) = presence.list(tracker, "room")
-      as "the tracker started in the test is running"
-    list.map(entries, fn(entry) { entry.key })
-  })
+  peer.on(p, fn() { local_keys(tracker) })
+}
+
+/// The keys tracked in "room", read on the node this runs on.
+fn local_keys(tracker: presence.Presence(String)) -> List(String) {
+  let assert Ok(entries) = presence.list(tracker, "room")
+    as "the tracker started in the test is running"
+  list.map(entries, fn(entry) { entry.key })
 }
 
 /// The nodes whose replica `p`'s shard for "room" hears from.
 fn replicas(p: Peer, tracker: presence.Presence(String)) -> List(String) {
-  peer.on(p, fn() {
-    let assert Ok(replicas) = presence.replicas(tracker, "room")
+  peer.on(p, fn() { local_replicas(tracker) })
+}
+
+/// `replicas` on the node this runs on. A call to the shard, so it is
+/// answered after the shard has handled whatever it was handling.
+fn local_replicas(tracker: presence.Presence(String)) -> List(String) {
+  let assert Ok(replicas) = presence.replicas(tracker, "room")
+    as "the tracker started in the test is running"
+  list.map(replicas, fn(r) { r.0 })
+}
+
+/// Wake on each diff of "room": the shard writes every change to ETS,
+/// where presence.list reads it, and then broadcasts the diff.
+fn room_diffs(tracker: presence.Presence(String)) -> peer.Wake {
+  fn() {
+    let assert Ok(Nil) = presence.subscribe(tracker, "room")
       as "the tracker started in the test is running"
-    list.map(replicas, fn(r) { r.0 })
-  })
+    fn() {
+      let assert Ok(Nil) = presence.unsubscribe(tracker, "room")
+        as "the tracker started in the test is running"
+      Nil
+    }
+  }
+}
+
+/// Wake on each change of a shard's replicas (each is emitted while the
+/// shard handles it, before it answers `presence.replicas`).
+fn replica_changes() -> peer.Wake {
+  peer.events([
+    ["brazier", "presence", "replica", "up"],
+    ["brazier", "presence", "replica", "down"],
+    ["brazier", "presence", "replica", "permdown"],
+  ])
 }
 
 // --- Session helpers --------------------------------------------------------
@@ -437,11 +603,18 @@ fn bind_on(p: Peer, store: SessionStore, id: String) -> Pid {
   })
 }
 
+/// Wait on `p` until `expected` processes are bound to session `id`,
+/// waking on each join and leave of the session's pg group.
 fn bound_seen_from(p: Peer, name: String, id: String, expected: Int) -> Bool {
-  peer.eventually(
-    fn() {
-      peer.on(p, fn() { bound_everywhere("external:" <> name, id) }) == expected
-    },
+  let namespace = "external:" <> name
+  peer.until(
+    p,
+    peer.pg_changes("brazier_session_pg", #(
+      atom.create("brazier_session"),
+      namespace,
+      id,
+    )),
+    fn() { bound_everywhere(namespace, id) == expected },
     wait_ms,
   )
 }
@@ -460,6 +633,33 @@ fn manager_suspend() -> Nil
 @external(erlang, "brazier_cluster_test_ffi", "manager_resume")
 fn manager_resume() -> Nil
 
+@external(erlang, "brazier_cluster_test_ffi", "peer_status")
+fn peer_status(node: Node) -> String
+
+@external(erlang, "brazier_cluster_test_ffi", "send_hello")
+fn send_hello(node: Node, mac: BitArray) -> Nil
+
+@external(erlang, "brazier_cluster_test_ffi", "watch_nodes")
+fn watch_nodes() -> Pid
+
+@external(erlang, "brazier_cluster_test_ffi", "node_events")
+fn node_events(watcher: Pid) -> List(#(String, Node))
+
+@external(erlang, "brazier_cluster_test_ffi", "node_events_after_down")
+fn node_events_after_down(watcher: Pid) -> List(#(String, Node))
+
+@external(erlang, "brazier_cluster_test_ffi", "disconnect")
+fn disconnect(node: Node) -> Nil
+
+@external(erlang, "brazier_cluster_test_ffi", "sync_global")
+fn sync_global() -> Nil
+
+@external(erlang, "brazier_cluster_test_ffi", "spawn_verified_waiter")
+fn spawn_verified_waiter(node: Node) -> Pid
+
+@external(erlang, "brazier_cluster_test_ffi", "waiter_result")
+fn waiter_result(waiter: Pid, await: Bool) -> Int
+
 @external(erlang, "brazier_cluster_test_ffi", "record_events")
 fn record_events(names: List(List(String))) -> Nil
 
@@ -472,8 +672,22 @@ fn remote_worker_nodes(shard: Int) -> List(Node)
 @external(erlang, "brazier_cluster_test_ffi", "spawn_recorders")
 fn spawn_recorders(topic: String, count: Int) -> List(Pid)
 
-@external(erlang, "brazier_cluster_test_ffi", "recorded")
-fn recorded(pid: Pid) -> List(String)
+@external(erlang, "brazier_cluster_test_ffi", "await_recorded")
+fn await_recorded(
+  pid: Pid,
+  count: Int,
+  timeout_ms: Int,
+) -> Result(List(String), List(String))
+
+/// What the recorder `pid` on `p` has received, once it has received at
+/// least `count` broadcasts; an error holds what it had at the deadline.
+fn recorded_on(
+  p: Peer,
+  pid: Pid,
+  count: Int,
+) -> Result(List(String), List(String)) {
+  peer.on_within(p, wait_ms + 5000, fn() { await_recorded(pid, count, wait_ms) })
+}
 
 @external(erlang, "brazier_cluster_test_ffi", "forge_forward")
 fn forge_forward(node: Node, topic: String, message: String) -> Nil
@@ -504,6 +718,14 @@ fn spawn_bound(bind: fn() -> Nil) -> Pid
 
 @external(erlang, "brazier_session_test_ffi", "revocations")
 fn revocations() -> List(#(String, String))
+
+@external(erlang, "brazier_session_test_ffi", "await_revocation")
+fn await_revocation(
+  pid: Pid,
+  id: String,
+  reason: String,
+  timeout_ms: Int,
+) -> Result(Nil, List(#(String, String)))
 
 @external(erlang, "brazier_session_test_ffi", "bound_everywhere")
 fn bound_everywhere(namespace: String, id: String) -> Int

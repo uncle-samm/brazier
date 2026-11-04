@@ -734,11 +734,13 @@ pub fn killed_acceptor_is_restarted_test() {
   let assert [victim, ..] = before
   let assert Ok(pool) =
     raw_acceptor_pool(server.get_supervisor(listener), victim)
-  let restarts = await.watch_exit(pool, victim)
-  raw_kill(victim)
-  // The pool supervisor restarts a child while handling its 'EXIT'; once
-  // it has handled that message the replacement is in which_children.
-  await.expect_info(restarts, pool, "the acceptor pool to handle the kill")
+  {
+    use restarts <- await.with_watch_exit(pool, victim)
+    raw_kill(victim)
+    // The pool supervisor restarts a child while handling its 'EXIT'; once
+    // it has handled that message the replacement is in which_children.
+    await.expect_info(restarts, pool, "the acceptor pool to handle the kill")
+  }
   let after = raw_acceptor_pids(server.get_supervisor(listener))
   let assert True = list.length(after) == list.length(before)
   let assert False = list.contains(after, victim)

@@ -3,13 +3,18 @@
 //// which is kept here verbatim as the oracle (`oracle_*`). The histories
 //// come from fixed seeds, so every failure names a reproducible seed and
 //// step. The single-case tests in store_replicated_test cover the
-//// documented behaviour; this module covers the join's algebra and the
-//// cost of appending.
+//// documented behaviour; this module covers the join's algebra, the cost
+//// of appending, and the compaction of the causal context (against the
+//// sorting compaction it replaced, `oracle_compact`). The digest every
+//// join keeps up to date must equal one computed from the whole state
+//// after every join, and be equal on two replicas exactly when the sorted
+//// fingerprint it replaced (`crdt_oracle.fingerprint`) is.
 
 import brazier/store/crdt.{
   type Change, type Context, type Delta, type Dot, type Dots, type State, Added,
   Context, Delta, Dot, Removed, Replica, State,
 }
+import brazier/store/crdt_oracle
 import brazier/store/hlc.{Timestamp}
 import gleam/dict.{type Dict}
 import gleam/int
@@ -290,9 +295,15 @@ fn check_same(
   check_invariants(label, new.0)
 }
 
-/// No key is kept with no dots, `size` counts the live dots, and the
-/// context has observed every live dot.
+/// No key is kept with no dots, `size` counts the live dots, the context
+/// has observed every live dot, the context is compacted (what
+/// `union_context` relies on to merge without sorting the cloud), and the
+/// digest the joins kept up to date is the one the whole state hashes to.
 fn check_invariants(label: String, state: State(Int)) -> Nil {
+  assert oracle_compact(state.context) == state.context
+    as { label <> ": the context is not compacted" }
+  assert crdt.digest(state) == crdt.recompute_digest(state)
+    as { label <> ": the kept digest differs from the recomputed one" }
   let live =
     dict.fold(state.entries, 0, fn(live, key, dots) {
       assert !dict.is_empty(dots) as { label <> ": " <> key <> " has no dots" }
@@ -687,6 +698,328 @@ pub fn a_clock_never_covers_counters_below_one_test() {
   })
 }
 
+// --- Compacting the causal context --------------------------------------
+
+/// A delta that carries only a context (no key), so a join merges contexts
+/// and nothing else.
+fn context_delta(
+  clock: List(#(crdt.Replica, Int)),
+  cloud: List(Dot),
+) -> Delta(Int) {
+  Delta(
+    entries: dict.new(),
+    context: Context(clock: dict.from_list(clock), cloud: set.from_list(cloud)),
+    topics: [],
+  )
+}
+
+/// One value on ra, and a context that has seen every even counter of rb
+/// from 2 to `2 * gaps`: `gaps` cloud dots that stay out of order.
+fn gappy_state(gaps: Int) -> State(Int) {
+  let cloud =
+    int.range(from: 1, to: gaps + 1, with: [], run: fn(cloud, i) {
+      [Dot(rb, 2 * i), ..cloud]
+    })
+  let state = crdt.join(list_key(1), context_delta([], cloud)).0
+  assert set.size(state.context.cloud) == gaps
+  state
+}
+
+/// rb's write of counter 1, the dot just below the first gap.
+fn gap_fill() -> Delta(Int) {
+  let dot = Dot(rb, 1)
+  let entry = crdt.Entry(value: 1, ts: ts(1), topics: [])
+  Delta(
+    entries: dict.from_list([#("k", dict.from_list([#(dot, entry)]))]),
+    context: Context(clock: dict.new(), cloud: set.from_list([dot])),
+    topics: [],
+  )
+}
+
+const rc = Replica(node: "c@host", incarnation: 1)
+
+/// Merging a context used to sort the state's whole cloud on every join,
+/// O(|cloud| log |cloud|) for a one-dot delta. It now costs the same on a
+/// cloud of 10 dots as on one of 10,000: for a write from a new replica,
+/// and for one that fills a gap (two dots move into the clock).
+pub fn merging_a_delta_does_not_grow_with_the_state_cloud_test() {
+  let small = gappy_state(10)
+  let large = gappy_state(10_000)
+  let #(_, fresh, _) = crdt.put(crdt.new(), rc, "k", 1, ts(1), [])
+  let examples = [
+    #("a new replica's write", fresh),
+    #("a gap fill", gap_fill()),
+  ]
+  list.each(examples, fn(example) {
+    let #(label, delta) = example
+    let cost = fn(state) { reductions(fn() { crdt.join(state, delta) }) }
+    let small_cost = cost(small)
+    let large_cost = cost(large)
+    assert large_cost < small_cost * 3 + 200
+      as {
+        label
+        <> " on a cloud of 10,000 dots cost "
+        <> int.to_string(large_cost)
+        <> " reductions, on 10 dots "
+        <> int.to_string(small_cost)
+      }
+    // The sort is what the bound catches: the old compaction grows.
+    let oracle_cost = reductions(fn() { oracle_join(large, delta) })
+    assert oracle_cost > large_cost * 10
+      as {
+        label
+        <> ": the sorting oracle cost only "
+        <> int.to_string(oracle_cost)
+        <> " reductions"
+      }
+    check_same(label, crdt.join(large, delta), oracle_join(large, delta))
+  })
+  // The gap fill moved rb's counters 1 and 2 into the clock.
+  let joined = crdt.join(large, gap_fill()).0
+  assert dict.get(joined.context.clock, rb) == Ok(2)
+  assert set.size(joined.context.cloud) == 9999
+}
+
+/// A clock that covers some of the state's cloud drops those dots, by
+/// probing each newly covered counter (a raise smaller than the cloud) or
+/// by one scan of the cloud (a larger raise); cloud dots that continue the
+/// clock carry it across the dots already seen. Each matches the sorting
+/// oracle.
+pub fn a_clock_raise_drops_the_cloud_dots_it_covers_test() {
+  // rb's counters 2, 4, ..., 40: 20 cloud dots, and no clock entry.
+  let state = gappy_state(20)
+  let examples = [
+    // 10 probes, fewer than the 20 cloud dots: drops 2..10.
+    #("probe", rb, context_delta([#(rb, 10)], []), Ok(10), 15),
+    // 100 counters, more than the cloud: one scan drops them all.
+    #("scan", rb, context_delta([#(rb, 100)], []), Ok(100), 0),
+    // Fills 1 and 3: the clock runs 1..4 and stops at the gap before 6.
+    #("chain", rb, context_delta([], [Dot(rb, 1), Dot(rb, 3)]), Ok(4), 18),
+    // Raises to 7 (drops 2, 4, 6) and fills 9: the clock runs to 10.
+    #("raise and fill", rb, context_delta([#(rb, 7)], [Dot(rb, 9)]), Ok(10), 15),
+    // A clock below 0 for a replica the state lacks: -1 continues it, 1
+    // stays in the cloud.
+    #(
+      "below zero",
+      rc,
+      context_delta([#(ra, 1), #(rc, -2)], [Dot(rc, -1), Dot(rc, 1)]),
+      Ok(-1),
+      21,
+    ),
+  ]
+  list.each(examples, fn(example) {
+    let #(label, replica, delta, clock, cloud) = example
+    let #(joined, changes) = crdt.join(state, delta)
+    check_same(label, #(joined, changes), oracle_join(state, delta))
+    assert dict.get(joined.context.clock, replica) == clock
+      as { label <> ": wrong clock" }
+    assert set.size(joined.context.cloud) == cloud
+      as {
+        label
+        <> ": "
+        <> int.to_string(set.size(joined.context.cloud))
+        <> " cloud dots"
+      }
+  })
+}
+
+/// Random contexts with large clouds, malformed counters and clock raises
+/// of every size, joined into states whose clouds grow: the result equals
+/// the sorting oracle's on every one, and stays compacted.
+pub fn random_contexts_compact_as_the_sorting_oracle_does_test() {
+  list.each(history_seeds, fn(seed) {
+    let #(_last, _rng) =
+      int.range(
+        from: 0,
+        to: 100,
+        with: #(crdt.new(), Rng(seed)),
+        run: fn(acc, i) {
+          let #(state, rng) = acc
+          let label =
+            "seed " <> int.to_string(seed) <> " context " <> int.to_string(i)
+          let #(clock_count, rng) = next(rng, 3)
+          let #(clock, rng) =
+            repeat_pick(clock_count, rng, fn(rng) {
+              let #(replica, rng) = pick_replica(rng)
+              let #(max, rng) = next(rng, 63)
+              #(#(replica, max - 2), rng)
+            })
+          let #(cloud_count, rng) = next(rng, 30)
+          let #(cloud, rng) =
+            repeat_pick(cloud_count, rng, fn(rng) {
+              let #(replica, rng) = pick_replica(rng)
+              let #(counter, rng) = next(rng, 64)
+              #(Dot(replica:, counter: counter - 2), rng)
+            })
+          let delta = context_delta(clock, cloud)
+          let joined =
+            same_join(label, crdt.join(state, delta), oracle_join(state, delta))
+          // Start again now and then, so low clocks meet big clouds.
+          case i % 25 {
+            24 -> #(crdt.new(), rng)
+            _ -> #(joined, rng)
+          }
+        },
+      )
+    Nil
+  })
+}
+
+// --- The digest ---------------------------------------------------------
+
+/// How often two replicas of a history had equal and unequal states.
+type Agreement {
+  Agreement(equal: Int, unequal: Int)
+}
+
+/// How often a history brings every replica to one state.
+const sync_every = 50
+
+/// Over every seeded history on three replicas, after every step and for
+/// every pair of replicas, the digests are equal exactly when the sorted
+/// fingerprints the replica used to hash are. Every `sync_every` steps the
+/// replicas full-sync with each other, so the histories reach equal states
+/// as well as unequal ones, and the tallies show both were checked.
+pub fn the_digest_is_equal_exactly_when_the_sorted_fingerprint_is_test() {
+  let agreement =
+    list.fold(history_seeds, Agreement(0, 0), fn(agreement, seed) {
+      let start = #(new_world(seed), agreement)
+      let #(_world, agreement) =
+        int.range(from: 0, to: history_steps, with: start, run: fn(acc, step) {
+          let #(world, agreement) = acc
+          let label =
+            "seed " <> int.to_string(seed) <> " step " <> int.to_string(step)
+          let world = step_world(seed, step, world)
+          let world = case step % sync_every == sync_every - 1 {
+            True -> sync_all(label, world)
+            False -> world
+          }
+          #(world, compare_pairs(label, world, agreement))
+        })
+      agreement
+    })
+  let counts =
+    "equal "
+    <> int.to_string(agreement.equal)
+    <> ", unequal "
+    <> int.to_string(agreement.unequal)
+  assert agreement.equal >= 500 as { "too few equal pairs: " <> counts }
+  assert agreement.unequal >= 500 as { "too few unequal pairs: " <> counts }
+}
+
+/// Two rounds of every replica joining every other's full state: after
+/// the first, the last replica holds everything; after the second, all do.
+fn sync_all(label: String, world: World) -> World {
+  let slots = int.range(from: 0, to: replica_count, with: [], run: list.prepend)
+  let round = fn(world) {
+    list.fold(slots, world, fn(world: World, slot) {
+      list.fold(slots, world, fn(world: World, other) {
+        let node = node_at(world, slot)
+        let full = crdt.to_delta(node_at(world, other).state)
+        let state =
+          same_join(
+            label <> " sync " <> int.to_string(other),
+            crdt.join_full(node.state, full),
+            oracle_join_full(node.state, full),
+          )
+        World(
+          ..world,
+          nodes: dict.insert(world.nodes, slot, Node(..node, state:)),
+        )
+      })
+    })
+  }
+  let world = round(round(world))
+  let first = node_at(world, 0).state
+  list.each(slots, fn(slot) {
+    assert node_at(world, slot).state == first
+      as { label <> ": a full-mesh sync did not converge" }
+  })
+  world
+}
+
+fn compare_pairs(
+  label: String,
+  world: World,
+  agreement: Agreement,
+) -> Agreement {
+  let pairs = [#(0, 1), #(0, 2), #(1, 2)]
+  list.fold(pairs, agreement, fn(agreement, pair) {
+    let a = node_at(world, pair.0).state
+    let b = node_at(world, pair.1).state
+    let same_digest = crdt.digest(a) == crdt.digest(b)
+    let same_fingerprint =
+      crdt_oracle.fingerprint(a) == crdt_oracle.fingerprint(b)
+    assert same_digest == same_fingerprint
+      as {
+        label
+        <> ": replicas "
+        <> int.to_string(pair.0)
+        <> " and "
+        <> int.to_string(pair.1)
+        <> " have equal digests "
+        <> bool_text(same_digest)
+        <> " but equal fingerprints "
+        <> bool_text(same_fingerprint)
+      }
+    case same_digest {
+      True -> Agreement(..agreement, equal: agreement.equal + 1)
+      False -> Agreement(..agreement, unequal: agreement.unequal + 1)
+    }
+  })
+}
+
+fn bool_text(value: Bool) -> String {
+  case value {
+    True -> "yes"
+    False -> "no"
+  }
+}
+
+@external(erlang, "brazier_crdt_test_ffi", "sorted_digest")
+fn sorted_digest(
+  fingerprint: #(List(#(String, Dot)), List(#(crdt.Replica, Int)), List(Dot)),
+) -> BitArray
+
+/// `count` keys of one value each, all written by ra.
+fn many_keys(count: Int) -> State(Int) {
+  int.range(from: 0, to: count, with: crdt.new(), run: fn(state, i) {
+    crdt.put(state, ra, "k" <> int.to_string(i), i, ts(i), []).0
+  })
+}
+
+/// The replica reads the digest on every sync tick. The sorted fingerprint
+/// it used to hash there cost O(n log n) in the state; the kept digest
+/// costs the same, write included, on a state of 10 keys as on one of
+/// 10,000.
+pub fn a_digest_after_a_write_does_not_grow_with_the_state_test() {
+  let small = many_keys(10)
+  let large = many_keys(10_000)
+  let write_then_digest = fn(state) {
+    fn() { crdt.digest(crdt.put(state, rb, "fresh", -1, ts(20_000), []).0) }
+  }
+  let small_cost = reductions(write_then_digest(small))
+  let large_cost = reductions(write_then_digest(large))
+  assert large_cost < small_cost * 3 + 200
+    as {
+      "a write and digest on 10,000 keys cost "
+      <> int.to_string(large_cost)
+      <> " reductions, on 10 keys "
+      <> int.to_string(small_cost)
+    }
+  // What the bound catches: the old per-tick digest grows with the state.
+  let sorted_cost =
+    reductions(fn() { sorted_digest(crdt_oracle.fingerprint(large)) })
+  assert sorted_cost > large_cost * 10
+    as {
+      "the sorted digest cost only "
+      <> int.to_string(sorted_cost)
+      <> " reductions"
+    }
+  check_invariants("many keys", large)
+  assert crdt.size(large) == 10_000
+}
+
 // --- The oracle: the full-scan join before PERF-7, verbatim ------------
 
 fn oracle_join(
@@ -752,7 +1085,13 @@ fn oracle_join_keys(
       #(entries, size, list.flatten([added, removed, changes]))
     })
   let context = oracle_union_context(state.context, other_context)
-  #(State(entries:, context:, size:), list.reverse(changes))
+  // The full-scan join kept no digest: give it the one its state hashes
+  // to, so comparing states compares the new join's kept digest with it.
+  let joined = State(entries:, context:, size:, digest: 0)
+  #(
+    State(..joined, digest: crdt.recompute_digest(joined)),
+    list.reverse(changes),
+  )
 }
 
 fn oracle_get_or_empty(

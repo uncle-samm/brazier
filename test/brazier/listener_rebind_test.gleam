@@ -84,9 +84,11 @@ pub fn restart_inside_the_listener_tree_rebinds_its_port_test_() -> peer.Timeout
 fn restart_through_the_connection_owner(sup: Pid) -> Nil {
   let conns = connection_owner(sup)
   let socket_owner = listen_socket_owner(sup)
-  let restarted = await.watch_exit(sup, conns)
-  kill(conns)
-  await.expect_info(restarted, sup, "the listener to restart its children")
+  {
+    use restarted <- await.with_watch_exit(sup, conns)
+    kill(conns)
+    await.expect_info(restarted, sup, "the listener to restart its children")
+  }
   // A failed rebind leaves the socket owner `restarting`.
   let assert True = children_running(sup)
     as "every listener child must be running right after the restart"
@@ -104,7 +106,7 @@ pub fn listen_socket_closed_underneath_restarts_the_acceptors_test() {
   let owner = listen_socket_owner(sup)
   let #(Nil, logs) =
     log_capture.capture(fn() {
-      let restarted = await.watch_exit(sup, owner)
+      use restarted <- await.with_watch_exit(sup, owner)
       close_listen_socket(owner)
       await.expect_info(restarted, sup, "the socket owner to be restarted")
     })

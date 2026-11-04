@@ -20,6 +20,7 @@ import brazier/await
 import brazier/effect
 import brazier/error
 import brazier/internal/context
+import brazier/monitored
 import brazier/runtime
 import brazier/telemetry.{type Event}
 import gleam/dynamic/decode
@@ -130,15 +131,12 @@ fn barrier_owner(started: Started) -> Nil {
   process.call(started.control, waiting: await.deadline_ms, sending: Ping)
 }
 
-fn listen() -> #(String, Subject(Event)) {
-  let assert Ok(Nil) = telemetry.start()
-  let id = "ws8c_runtime_stop_" <> int.to_string(unique_integer())
-  let events = process.new_subject()
-  let assert Ok(Nil) =
-    telemetry.attach(id, [["brazier", "runtime", "stop"]], fn(event) {
-      process.send(events, event)
-    })
-  #(id, events)
+/// Run `run` with the `[brazier, runtime, stop]` events sent to a subject it receives. The handler is
+/// detached however `run` ends: telemetry handlers are node-wide, and one
+/// left by a failing test would send every later event to eunit's shared
+/// test process.
+fn listen(run: fn(Subject(Event)) -> a) -> a {
+  monitored.listening([["brazier", "runtime", "stop"]], run)
 }
 
 fn expect_stop(events: Subject(Event)) -> Event {
@@ -170,7 +168,7 @@ fn await_down(monitor: process.Monitor) -> process.ExitReason {
 
 pub fn crash_in_update_reports_stop_with_its_reason_test() {
   let started = start()
-  let #(id, events) = listen()
+  use events <- listen()
   let monitor = process.monitor(started.runtime_pid)
   let owner_monitor = process.monitor(started.owner)
   // The helper dies from the runtime's exit signal, not from one of ours.
@@ -195,12 +193,11 @@ pub fn crash_in_update_reports_stop_with_its_reason_test() {
   let assert process.Abnormal(_) = await_down(owner_monitor)
   let assert Error(Nil) = process.receive(events, 0)
     as "a crash reports one stop"
-  let assert Ok(Nil) = telemetry.detach(id)
 }
 
 pub fn failing_linked_process_reports_stop_with_exit_test() {
   let started = start()
-  let #(id, events) = listen()
+  use events <- listen()
   let monitor = process.monitor(started.runtime_pid)
   // The runtime dies from the helper's exit signal, not from one of ours,
   // so make it handle the monitor first (the flake this test once had).
@@ -224,12 +221,11 @@ pub fn failing_linked_process_reports_stop_with_exit_test() {
     }
   let assert Error(Nil) = process.receive(events, 0)
     as "an exit signal reports one stop"
-  let assert Ok(Nil) = telemetry.detach(id)
 }
 
 pub fn exit_signal_sent_to_the_runtime_reports_stop_test() {
   let started = start()
-  let #(id, events) = listen()
+  use events <- listen()
   let monitor = process.monitor(started.runtime_pid)
 
   process.send_abnormal_exit(started.runtime_pid, "ws8c stopped from outside")
@@ -239,13 +235,12 @@ pub fn exit_signal_sent_to_the_runtime_reports_stop_test() {
   let assert Ok(description) = telemetry.string(stop, "error")
   let assert True = string.contains(description, "ws8c stopped from outside")
   let assert process.Abnormal(_) = await_down(monitor)
-  let assert Ok(Nil) = telemetry.detach(id)
   process.send(started.control, Release)
 }
 
 pub fn normal_exit_of_a_linked_process_does_not_stop_the_runtime_test() {
   let started = start()
-  let #(id, events) = listen()
+  use events <- listen()
   let owner_monitor = process.monitor(started.owner)
   let monitor = process.monitor(started.runtime_pid)
 
@@ -261,20 +256,15 @@ pub fn normal_exit_of_a_linked_process_does_not_stop_the_runtime_test() {
   let assert Ok("shutdown") = telemetry.string(stop, "reason")
   let assert Error(Nil) = telemetry.string(stop, "kind")
   let assert process.Normal = await_down(monitor)
-  let assert Ok(Nil) = telemetry.detach(id)
 }
 
 pub fn killed_runtime_emits_nothing_test() {
   // `kill` cannot be trapped: the one stop that runs no code.
   let started = start()
-  let #(id, events) = listen()
+  use events <- listen()
   let monitor = process.monitor(started.runtime_pid)
   process.kill(started.runtime_pid)
   let assert process.Killed = await_down(monitor)
   let assert Error(Nil) = process.receive(events, 0)
     as "a killed runtime emits nothing"
-  let assert Ok(Nil) = telemetry.detach(id)
 }
-
-@external(erlang, "erlang", "unique_integer")
-fn unique_integer() -> Int

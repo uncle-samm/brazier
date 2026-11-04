@@ -22,19 +22,22 @@ pub fn navigate_message_type_is_quoted_without_its_query_test() {
   let assert "navigate:\"/a\\nINFO forged\"" =
     transport.get_client_message_type(transport.ClientNavigate(
       path: "/a\nINFO forged?token=s3cr3t",
+      clock: 0,
     ))
 }
 
 pub fn event_message_type_is_quoted_test() {
   let assert "event:\"click\\nINFO forged\"" =
-    transport.get_client_message_type(transport.ClientEvent(
-      name: "click\nINFO forged",
-      handler_id: "h",
-      data: "{}",
-      target_path: "0",
-      clock: 1,
-      ops: "",
-    ))
+    transport.get_client_message_type(
+      transport.ClientEvent(
+        name: "click\nINFO forged",
+        handler_id: "h",
+        data: "{}",
+        target_path: "0",
+        clock: 1,
+        ops: [],
+      ),
+    )
 }
 
 pub fn rejected_origin_log_quotes_client_text_test() {

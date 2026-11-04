@@ -8,8 +8,11 @@ location.search)`), on the first connection and on every reconnect. The server
 resolves the route from it, so `init` sees the same URL as the server render.
 `path` is required: the upgrade is refused with 400 (logging a warning) when
 it is missing or not a same-origin path. The app's middleware runs on a `GET`
-of that page with the upgrade's headers, and the upgrade gets the
-middleware's response when it refuses the page (see
+of that page with the upgrade's headers, once the handshake checks pass. When
+it refuses the page, the server completes the handshake and closes the socket
+with **4600** `middleware refused <status>`, and the client loads the page
+over HTTP to show the middleware's answer (see
+[Close Codes](#close-codes) and
 [MIDDLEWARE.md](MIDDLEWARE.md#the-live-page)).
 
 ## Client Messages (browser to server)
@@ -59,12 +62,39 @@ app's generated codec. The server decodes only the Msg constructors the
 client-reachable code builds, and never renders `view` to resolve handlers.
 `handler_id` and `target_path` are both the position id of the element whose
 handler produced the Msg (`"0"` is the root, `"0.N"` its children); they are
-for logs and traces. `clock` is monotonic per connection. `ops` is optional and
-the browser client does not send it; the server never treats it as
-authoritative state.
+for logs and traces. `clock` is monotonic per connection.
 ```json
 {"type": "event", "name": "click", "handler_id": "0.1.0", "data": "{\"__brazier_msg\":{\"tag\":\"SetName\",\"arg0\":\"Ada\"}}", "target_path": "0.1.0", "clock": 5}
 ```
+`ops` is optional, and the browser client does not send it. It is an array
+of RFC 6902 ops, embedded in the frame as a JSON value like a `patch`'s
+`ops`, never a string holding JSON:
+```json
+{"type": "event", "name": "click", "handler_id": "0.1.0", "data": "{\"__brazier_msg\":{\"tag\":\"Inc\"}}", "target_path": "0.1.0", "clock": 6, "ops": [{"op": "replace", "path": "/count", "value": 2}]}
+```
+The server never applies the ops: its own `update` decides the model, and
+the runtime logs a warning that it ignored them. It still decodes them
+strictly, so a client that sends malformed ops learns at once:
+
+- every op is an object whose `op` is one of `add`, `remove`, `replace`,
+  `move`, `copy`, `test` or `append`;
+- `path`, and `from` for `move` and `copy`, are RFC 6901 JSON Pointers:
+  empty or starting with `/`, with `~` only in `~0` or `~1`, and no
+  `__proto__`, `constructor` or `prototype` segment;
+- `add`, `replace` and `test` carry a `value`, and `append` carries an array
+  `value`. Members an op does not define are ignored (RFC 6902 §4).
+
+An event, or an `event_batch`, with any op that breaks these rules is refused
+whole (RFC 6902 §5): the server logs a warning with the connection id and the
+first error, answers `{"type":"error","reason":"Invalid event ops"}`, and does
+not dispatch it. It counts as a message that failed to decode (see
+[Rate Limiting and Abuse](#rate-limiting-and-abuse)).
+
+`ops` used to be a string holding the JSON array (see `CHANGELOG.md`). That
+form is now refused as invalid ops. A page whose bundle is from before the
+change sends its `build` id on join and gets **4409** `stale build`, so it
+reloads with the current bundle before it sends an event (see `build` under
+**join** above).
 
 **event_batch** -- Bounded batch for explicit non-browser clients that need to
 submit multiple server-visible events in one frame. Generated browser clients do
@@ -83,10 +113,29 @@ reconnect does not release a burst of heartbeats.
 
 **navigate** -- Client-side SPA navigation: a same-origin link click,
 back/forward, or the client following a server `navigate`. Debounced events
-of the old page are sent before it.
+of the old page are sent before it. `path` is the pathname and search; the
+URL's fragment stays in the browser. `clock` comes from the same per-connection
+counter as the events' clocks, and the server acknowledges it like an event:
+the first `model_sync` or `patch` it sends this connection after handling the
+navigation carries `ack_clock` = `clock`, and a navigation that leaves the
+client-visible model as it was is answered with an ack (an empty patch). A
+navigation the server refuses (`hard_navigate`, `error`) gets no ack. A
+`navigate` without `clock` is acknowledged at 0; one whose `clock` is not an
+integer is malformed.
 ```json
-{"type": "navigate", "path": "/about"}
+{"type": "navigate", "path": "/about", "clock": 7}
 ```
+That ack is how the browser client finds the frame that shows the new page.
+After a link click or a server `navigate` to a URL with a fragment
+(`/docs#install`), it scrolls once the first applied frame with `ack_clock` ≥
+the navigate's clock is rendered: to the element whose id is the fragment,
+else to the `<a>` with that `name` (the fragment as written, then
+percent-decoded), and to the top of the page, with a console warning, when
+there is neither. This is LiveView's `Browser.pushState` after a patch reply
+(`getHashTargetEl`, `scrollIntoView`, else `window.scroll(0, 0)`). Back and
+forward keep the browser's scroll restoration and schedule no scroll. A
+navigate written to a socket that dropped before its ack is answered by the
+next connection's join `model_sync`, whose page is the current URL's.
 The middleware runs on a `GET` of the target page first, as it does at the
 upgrade. A page it refuses is not navigated to: the server sends
 `hard_navigate` to the path, so the browser loads it over HTTP and gets the
@@ -127,8 +176,8 @@ client-visible model JSON. `version` is the revision the patch produces.
 {"type": "patch", "ops": [{"op": "replace", "path": "/count", "value": 2}], "version": 2, "ack_clock": 2}
 ```
 A patch with `"ops": []` is an **ack**: the server processed the
-connection's events up to `ack_clock` without changing the client-visible
-model. Its `version` is the current revision, not a new one.
+connection's events and navigations up to `ack_clock` without changing the
+client-visible model. Its `version` is the current revision, not a new one.
 ```json
 {"type": "patch", "ops": [], "version": 2, "ack_clock": 3}
 ```
@@ -152,7 +201,8 @@ server escape every quote in the model and the client parse it twice.
 
 **navigate** -- Server-initiated navigation (`router.push` / `router.replace`).
 The client pushes the path onto the history, or replaces the current entry
-when `replace` is true, and answers with its own `navigate`. A path that is not
+when `replace` is true, and answers with its own `navigate` for the path
+without its fragment, scrolling to the fragment as for a link. A path that is not
 local (does not start with `/`, or starts with `//`) is logged as an error and
 ignored; the current path is not navigated again.
 ```json
@@ -238,8 +288,8 @@ syncs on that connection (a reload recovers). A new connection starts over.
 
 ## Event Clocking
 
-Each `event` has a monotonic `clock`. The server keeps the highest clock it has
-processed per connection and echoes it back as `ack_clock` on `model_sync` and
+Each `event` and `navigate` has a monotonic `clock`, from one counter. The
+server keeps the highest clock it has processed per connection and echoes it back as `ack_clock` on `model_sync` and
 `patch`, so the client knows which of its optimistic events the server state
 already includes. A frame whose `ack_clock` is behind the client's pending
 model event is held until the server catches up. `clock` and `ack_clock` are
@@ -266,13 +316,30 @@ follows.
   `role="alert"` notice (`data-brazier-error-notice`) at the top of the root.
   The guard is what stops a loop: a deployment whose pages keep naming
   another bundle than its manifest gets 3 reloads, then the error state.
-- **Any other close** (including 1001, 1008, 1009, 1011, 1013 and 4500 to
-  4599): reconnect after `min(1s * 2^attempts, 30s)` plus up to 1s of random
+- **4600**: the app's middleware refused this page's live connection. The
+  client stops reconnecting, logs an error naming the middleware's status and
+  loads the current URL (`location.reload()`, which keeps the query and
+  fragment), so the browser shows the middleware's own answer: its redirect,
+  its 403 page, its login page. The load shares the reload guard above. A
+  middleware that admits the page's `GET` but refuses its live connection
+  therefore gets 3 loads, then the error state, never a reconnect loop.
+- **Any other close** (including 1001, 1008, 1009, 1011, 1013, 4500 to
+  4599, and any other 4xxx code, which the client does not know): reconnect
+  after `min(1s * 2^attempts, 30s)` plus up to 1s of random
   jitter. `attempts` resets only after a `model_sync` is applied. A server
   that keeps refusing (4503 while a store is down, 1011 for an `init` that
   crashes) or that accepts and drops sockets is therefore tried at most once
   every 31 seconds per tab. 1001 is a server that is shutting down: the
   reconnect reaches the next instance, or this one once it is back.
+- **A socket that closes before it opens** (1006 without `onopen`) is
+  retried the same way. A browser reports every failed upgrade like this,
+  whatever the server answered: an unreachable server, an origin or host
+  the server does not allow, `ws_auth` refusing the upgrade, or a connection
+  limit. Middleware refusing the page is not one of them: the server
+  completes that handshake so it can close with 4600, which the browser can
+  read. The first two such closes in a row are warnings;
+  from the third the client logs an error that names these causes. A socket
+  that opens resets the count.
 - A `reload` message (dev mode) reloads the page at once, without the guard:
   the server sends it once per rebuild, never in answer to a join.
 - **Outbound pacing**: every message except `heartbeat` passes through one
@@ -317,7 +384,6 @@ the listener refuses to start with invalid ones.
 | `Host` in `allowed_hosts` (see [SECURITY.md](SECURITY.md#allowed-hosts)) | 400 |
 | No request body, and no bytes sent before the handshake | 400 |
 | `path` query parameter present and a same-origin path | 400 |
-| The middleware admits a `GET` of the page | the middleware's response |
 | Global connection limit (`max_connections`, 10,000) | 503 |
 | Per-IP WebSocket cap (`max_ws_connections_per_ip`, 100) | 429 |
 | `Origin` present and allowed (see below) | 403 |
@@ -326,6 +392,24 @@ the listener refuses to start with invalid ones.
 | `Upgrade` contains the `websocket` token, `Connection` contains `upgrade` | 400 |
 | `Sec-WebSocket-Version: 13` | 426 with `Sec-WebSocket-Version: 13` |
 | `Sec-WebSocket-Key` is 24 base64 chars that decode to 16 bytes | 400 |
+| The middleware admits a `GET` of the page | 101, then close **4600** `middleware refused <status>` |
+
+The middleware runs last, on a request that has passed every other check.
+A browser cannot read the status of an upgrade that fails: `onclose` reports
+1006 for a 403 and for an unreachable server alike. So a refusal by the
+middleware completes the handshake and closes the socket at once with 4600,
+whose reason carries the middleware's status (`middleware refused 403`). The
+server logs a warning with the connection id, the peer, the page and the
+status, sends nothing else, and starts no runtime. The connection's slots
+are released before the TCP socket closes. The client answers by loading the
+page (see [Client Connection Behaviour](#client-connection-behaviour)). This
+is LiveView's answer to a refused join: `view.ts` `onJoinError` navigates to
+the page's own URL, so the HTTP request shows the refusal.
+
+Running the middleware after the origin, `ws_auth` and handshake checks
+means a cross-origin page never reaches it, so the 101-then-4600 answer
+tells no foreign page anything about the app's routes. Those checks answer
+over HTTP, as before.
 
 **Origin rules.** The `Origin` header is required. It must match the request's
 own origin on scheme, host and port, or equal one entry of
@@ -401,7 +485,9 @@ the echo.
   `ws_max_rate_violations` (100) violations within one 1-second window closes
   the connection with **1008** `rate limit exceeded`.
 - Each message that fails to decode is answered with
-  `{"type":"error","reason":"Invalid message"}`. More than
+  `{"type":"error","reason":"Invalid message"}`, or with
+  `{"type":"error","reason":"Invalid event ops"}` when only its `ops` are
+  malformed (see **event**). More than
   `ws_max_decode_errors` (10) over the life of the connection close it with
   **1008** `too many invalid messages`.
 
@@ -439,7 +525,24 @@ the echo.
 | 4401 | Session revoked (`session revoked`) or authentication expired (`authentication expired`). The page reloads, so the server renders it for whoever the cookie now names, or the login page |
 | 4409 | Stale build (`stale build`): the join's `build` is not the bundle the server serves now. The page reloads and gets the current bundle |
 | 4500-4599 | `init` refused with a 5xx status (4503 for `error.unavailable`). The client reconnects with backoff |
+| 4600 | The app's middleware refused the page's live connection (`middleware refused <status>`), sent right after the handshake. The client does not reconnect: it loads the current URL behind the reload guard, so the browser shows the middleware's answer |
 
 An `init` refusal with 401 or 409 also closes with 4401 or 4409. The action
 is the same, a reload, and the close reason and the server log tell them
 apart.
+
+**The 4xxx scheme.** RFC 6455 §7.4.2 leaves 4000-4999 to applications.
+Brazier splits it by what the client does, so the client decides from the
+code alone and needs no table of reasons:
+
+| Range | Who closes | Client action |
+|-------|------------|---------------|
+| 4400-4499 | `init` or the session refused (4000 + a 4xx status, 4401, 4409) | Reload the page, behind the guard |
+| 4500-4599 | `init` refused with a 5xx status | Reconnect with backoff |
+| 4600-4699 | The transport refused the connection before any runtime (4600: the middleware) | 4600: load the page, behind the guard |
+| Other 4xxx | Not sent by Brazier | Reconnect with backoff, like any unknown close |
+
+4600 cannot collide with `init`'s codes: 4000 + status stays at or below
+4599 because an HTTP status is at most 599. The client treats only the
+codes it knows specially, so a server from a later release that sends a new
+code does not make an older page reload in a loop.

@@ -11,6 +11,7 @@
 ///
 /// Reference: RFC 9112 (HTTP/1.1), RFC 9110 (HTTP semantics), cowboy_http.
 import brazier/internal/http_status
+import brazier/internal/log_path
 import brazier/log
 import brazier/telemetry
 import brazier/transport/server
@@ -101,7 +102,10 @@ pub fn read_request_head(
 ) -> Result(#(Request(server.Connection), HttpVersion), HeadError) {
   case ffi_read_http_head(socket, limits, timing) {
     Ok(#(method, path, version, headers)) -> {
-      log.debug("brazier.http", "Read request head " <> method <> " " <> path)
+      log.debug(
+        "brazier.http",
+        "Read request head " <> method <> " " <> log_path.describe(path),
+      )
       Ok(#(build_request(socket, #(method, path, headers)), version))
     }
     Error(err) -> {
@@ -251,7 +255,7 @@ pub fn declared_body_length(
       log.warning(
         "brazier.http",
         "Refused the declared body length on "
-          <> req.path
+          <> log_path.describe(req.path)
           <> " ("
           <> int.to_string(err.status)
           <> "): "
@@ -280,7 +284,10 @@ fn check_content_length(
     [], [value] ->
       case parse_content_length(value) {
         Error(Nil) ->
-          Error(FramingError(400, "invalid Content-Length: " <> value))
+          Error(FramingError(
+            400,
+            "invalid Content-Length: " <> string.inspect(value),
+          ))
         Ok(length) if length > max_body_bytes ->
           Error(FramingError(
             413,
@@ -882,14 +889,20 @@ pub fn write_framed_response(
                 Ok(Nil) -> {
                   log.debug(
                     "brazier.http",
-                    "Sent " <> int.to_string(length) <> " bytes of " <> path,
+                    "Sent "
+                      <> int.to_string(length)
+                      <> " bytes of "
+                      <> string.inspect(path),
                   )
                   Ok(Nil)
                 }
                 Error(reason) -> {
                   log.error(
                     "brazier.http",
-                    "sendfile of " <> path <> " failed: " <> reason,
+                    "sendfile of "
+                      <> string.inspect(path)
+                      <> " failed: "
+                      <> reason,
                   )
                   Error(reason)
                 }
