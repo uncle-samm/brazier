@@ -43,14 +43,65 @@ pub fn query_keeps_repeated_keys_test() {
   let assert [#("t", "1"), #("t", "2")] = router.query(parse("/?t=1&t=2"))
 }
 
-pub fn is_local_path_test() {
-  let assert True = router.is_local_path("/")
-  let assert True = router.is_local_path("/users/7?tab=posts")
-  let assert False = router.is_local_path("//evil.example/x")
-  let assert False = router.is_local_path("https://evil.example/")
-  let assert False = router.is_local_path("javascript:alert(1)")
-  let assert False = router.is_local_path("")
-  let assert False = router.is_local_path("users")
+pub fn check_local_path_accepts_same_origin_paths_test() {
+  let assert Ok(Nil) = router.check_local_path("/")
+  let assert Ok(Nil) = router.check_local_path("/users/7?tab=posts")
+  let assert Ok(Nil) = router.check_local_path("/search?q=a%20b#top")
+  let assert Ok(Nil) = router.check_local_path("/users/J%C3%BCrgen")
+  let assert Ok(Nil) = router.check_local_path("/caf\u{E9}/a b")
+}
+
+pub fn check_local_path_refuses_other_origins_test() {
+  let assert Error("it starts with two slashes" <> _) =
+    router.check_local_path("//evil.example/x")
+  let assert Error("it does not start with \"/\"") =
+    router.check_local_path("https://evil.example/")
+  let assert Error("it does not start with \"/\"") =
+    router.check_local_path("javascript:alert(1)")
+  let assert Error("it does not start with \"/\"") = router.check_local_path("")
+  let assert Error("it does not start with \"/\"") =
+    router.check_local_path("users")
+  let assert Error("it does not start with \"/\"") =
+    router.check_local_path("\\\\evil.example")
+}
+
+pub fn check_local_path_refuses_paths_a_browser_reads_as_another_host_test() {
+  // SEC-5: the WHATWG URL parser reads `\` as `/` and strips tab, newline
+  // and carriage return, so each of these loads evil.example.
+  let assert Error("it starts with two slashes" <> _) =
+    router.check_local_path("/\\evil.example")
+  let assert Error("it contains a backslash" <> _) =
+    router.check_local_path("/a\\..\\\\evil.example")
+  let assert Error("it contains a control character" <> _) =
+    router.check_local_path("/\t/evil.example")
+  let assert Error("it contains a control character" <> _) =
+    router.check_local_path("/\n/evil.example")
+  let assert Error("it contains a control character" <> _) =
+    router.check_local_path("/\r/evil.example")
+  let assert Error("it contains a control character" <> _) =
+    router.check_local_path("/x\u{0}y")
+  let assert Error("it contains a control character" <> _) =
+    router.check_local_path("/x\u{7F}y")
+  let assert Error("it contains \"/%09\"" <> _) =
+    router.check_local_path("/%09/evil.example")
+}
+
+pub fn backslash_push_logs_error_with_reason_test() {
+  let #(Nil, logs) =
+    log_capture.capture(fn() { perform(router.push("/\\evil.example")) })
+  let assert True =
+    log_capture.has(logs, level: "error", containing: [
+      "router.push", "same-origin", "evil.example", "two slashes",
+    ])
+}
+
+pub fn tab_redirect_logs_error_with_reason_test() {
+  let #(Nil, logs) =
+    log_capture.capture(fn() { perform(router.redirect("/\t/evil.example")) })
+  let assert True =
+    log_capture.has(logs, level: "error", containing: [
+      "router.redirect", "same-origin", "control character",
+    ])
 }
 
 // --- navigation effects outside a client event ---
