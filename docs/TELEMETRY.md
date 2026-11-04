@@ -70,6 +70,19 @@ laptop, depending on load.
 
 ## Emitting your own events
 
+<!-- docs-check: wrap
+import beacon/telemetry
+import gleam/dict
+
+pub fn checkout() -> Int {
+  {{block}}
+  order
+}
+
+fn place_order() -> Int {
+  1
+}
+-->
 ```gleam
 let assert Ok(Nil) =
   telemetry.execute(
