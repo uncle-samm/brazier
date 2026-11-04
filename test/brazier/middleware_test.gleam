@@ -93,6 +93,29 @@ pub fn secure_headers_sets_x_content_type_test() {
   let assert True = csp == middleware.default_csp
   let assert True = string.contains(csp, "frame-ancestors 'self'")
   let assert True = string.contains(csp, "object-src 'none'")
+  let assert True =
+    csp
+    == "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'self'; object-src 'none'; base-uri 'self'"
+  let directives = csp_directives(csp)
+  // Inline scripts and handlers are refused; only the app's own scripts run.
+  let assert Ok(["'self'"]) = list.key_find(directives, "script-src")
+  // The WebSocket and fetch reach only the page's origin, not any ws: host.
+  let assert Ok(["'self'"]) = list.key_find(directives, "connect-src")
+  // No third-party image host.
+  let assert Ok(["'self'", "data:"]) = list.key_find(directives, "img-src")
+  let assert False = string.contains(csp, "unsafe-eval")
+}
+
+/// A CSP header as `#(directive, sources)` pairs.
+fn csp_directives(csp: String) -> List(#(String, List(String))) {
+  csp
+  |> string.split(";")
+  |> list.filter_map(fn(directive) {
+    case string.split(string.trim(directive), " ") {
+      [name, ..sources] -> Ok(#(name, sources))
+      [] -> Error(Nil)
+    }
+  })
 }
 
 pub fn secure_headers_with_custom_csp_test() {
@@ -101,7 +124,7 @@ pub fn secure_headers_with_custom_csp_test() {
     |> response.set_body(Bytes(bytes_tree.from_string("ok")))
   }
   let custom_csp =
-    "default-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; connect-src 'self' ws: wss:"
+    "default-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; connect-src 'self'"
   let piped =
     middleware.pipeline(
       [middleware.secure_headers_with_csp(custom_csp)],

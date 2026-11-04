@@ -131,12 +131,26 @@ pub fn secure_headers() -> Middleware {
   secure_headers_with_csp(default_csp)
 }
 
-/// Default Content-Security-Policy value. `frame-ancestors 'self'` is the
-/// CSP equivalent of `X-Frame-Options: SAMEORIGIN` (clickjacking);
-/// `object-src 'none'` and `base-uri 'self'` close plugin and `<base>`
-/// injection vectors.
+/// Default Content-Security-Policy value.
+///
+/// - `script-src 'self'`: only scripts served by the app run. Brazier's pages
+///   load the client bundle with `<script src>` and render no inline script
+///   or `on*` attribute, so an injected `<script>` or handler is refused.
+/// - `connect-src 'self'`: the WebSocket and `fetch` reach only the page's
+///   own origin. CSP Level 3 matches `ws:` and `wss:` on the same host and
+///   port against `'self'`. Safari 15 and earlier did not (WebKit bugs
+///   201591 and 235873, fixed in WebKit r292266), so an app that must support
+///   them adds its own `wss://host` with `secure_headers_with_csp`.
+/// - `img-src 'self' data:`: no third-party image hosts.
+/// - `style-src` keeps `'unsafe-inline'`, which `attribute.style` needs.
+/// - `frame-ancestors 'self'` is the CSP equivalent of
+///   `X-Frame-Options: SAMEORIGIN` (clickjacking); `object-src 'none'` and
+///   `base-uri 'self'` close plugin and `<base>` injection.
+///
+/// Reference: CSP Level 3, "Does url match expression in origin with
+/// redirect count?" (the `'self'` upgrade to `ws:`/`wss:`).
 pub const default_csp =
-  "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https://avatars.githubusercontent.com; connect-src 'self' ws: wss:; frame-ancestors 'self'; object-src 'none'; base-uri 'self'"
+  "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'self'; object-src 'none'; base-uri 'self'"
 
 /// Security headers middleware with a custom Content-Security-Policy.
 /// Use this when the default CSP is too strict (e.g., external stylesheets,
@@ -145,7 +159,7 @@ pub const default_csp =
 /// Example:
 /// ```gleam
 /// middleware.secure_headers_with_csp(
-///   "default-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self' https://fonts.gstatic.com; connect-src 'self' ws: wss:",
+///   "default-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self' https://fonts.gstatic.com; connect-src 'self'",
 /// )
 /// ```
 pub fn secure_headers_with_csp(csp: String) -> Middleware {
