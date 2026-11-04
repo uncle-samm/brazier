@@ -426,6 +426,25 @@ with its own changelog, so they are not listed here.
   `cow_ws:frame`), and `gen_tcp:send` writes it without flattening. A
   50 KB `model_sync` costs about 0.3 µs to frame instead of 117 µs, and
   the browser parses each frame once instead of parsing the model again.
+- (Wave 4 test hygiene) Telemetry handlers, sys watches and presence
+  holders in the telemetry, presence and cluster tests are scoped to the
+  test body (`monitored.with_handler`, `await.with_watch_info`,
+  `with_watch_exit`, `with_watch_down`, `holder.with_holder`) and removed
+  even when the body crashes, like ExUnit's `on_exit/1`.
+  `presence/scoped_cleanup_test` shows it for watches and holders.
+- (Wave 4 test hygiene) The multi-node tests wait for messages instead of
+  polling. `peer.until` runs one check on a peer and checks again on each
+  wake-up (`node_changes`, `process_down`, `pg_changes`, `events`,
+  `events_on`, `receives`, `info`, `any`), draining queued wake-ups first.
+  `peer.on_node`, `peer.registered`, `cluster/relay` (telemetry events and
+  PubSub deliveries forwarded from a peer) and `presence/wake` support it.
+  The pubsub, store and presence cluster tests no longer call
+  `peer.eventually`; the store tests wait on the
+  `[brazier, store, sync, stop]` span event.
+- (Wave 4 test hygiene, TS-12) The unused `sleep_ms` helper is gone from
+  `brazier_ws_test_ffi`, the runtime
+  telemetry test asserts the exact exit reason, and every `let assert` in
+  the touched tests carries an `as` message.
 
 ### Fixed
 

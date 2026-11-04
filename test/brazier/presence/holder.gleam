@@ -50,11 +50,17 @@ fn loop(commands: Subject(fn() -> Nil)) -> Nil {
 
 /// Run `run` in the holder and return its result.
 pub fn run(holder: Holder, run: fn() -> a) -> a {
+  run_within(holder, 10_000, run)
+}
+
+/// `run` for a closure that waits (a receive with a deadline): the answer
+/// is awaited for `timeout_ms` instead of `run`'s 10 seconds.
+pub fn run_within(holder: Holder, timeout_ms: Int, run: fn() -> a) -> a {
   let reply = process.new_subject()
   process.send(holder.commands, fn() { process.send(reply, run()) })
   // INVARIANT: test helper. A holder that does not answer is dead or
   // stuck, and the test cannot continue.
-  let assert Ok(value) = process.receive(reply, 10_000)
+  let assert Ok(value) = process.receive(reply, timeout_ms)
     as "holder did not answer"
   value
 }

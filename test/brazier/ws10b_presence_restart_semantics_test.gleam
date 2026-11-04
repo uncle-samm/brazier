@@ -8,7 +8,8 @@
 ////
 //// Sessions are runtimes on peer nodes inside holder processes (see
 //// ws8c_presence_watch_only_test). Waiting is always a receive with a
-//// deadline.
+//// deadline: the app's presence messages, or `peer.until` woken by each
+//// diff the tracker reports (brazier/presence/wake).
 
 import brazier
 import brazier/cluster/peer.{type Peer, Timeout}
@@ -19,6 +20,7 @@ import brazier/internal/presence_watch
 import brazier/presence.{type Presence}
 import brazier/presence/holder.{type Holder}
 import brazier/presence/sync.{type Diff, type Entry, type Meta}
+import brazier/presence/wake
 import brazier/pubsub
 import brazier/runtime
 import brazier/test_ctx
@@ -72,8 +74,8 @@ fn fast_config() -> presence.PresenceConfig(String) {
 }
 
 fn tracker() -> Presence(String) {
-  // INVARIANT: fast_config is a valid configuration.
   let assert Ok(tracker) = presence.handle(fast_config())
+    as "fast_config is a valid presence configuration"
   tracker
 }
 
@@ -154,6 +156,7 @@ fn start_tracker(p: Peer) -> Nil {
   peer.on(p, fn() {
     pubsub.start()
     let assert Ok(_) = presence.start(fast_config())
+      as "presence.start succeeds"
     Nil
   })
 }
@@ -169,7 +172,7 @@ fn start_session(p: Peer, room: String, watched: List(String)) -> Session {
           runtime.start(session_config(room, watched, proof), test_ctx.root()),
         )
       })
-    let assert Ok(rt) = started
+    let assert Ok(rt) = started as "runtime.start succeeds"
     Session(holder: h, runtime: rt, proof:)
   })
 }
@@ -225,8 +228,8 @@ fn first_index(
 fn first_ref(p: Peer, session: Session) -> String {
   let assert Ok(#(diff, view)) = next(p, session)
     as "no first presence message in time"
-  let assert True = diff.topic == topic
-  let assert [ref] = refs_of_me(view)
+  assert diff.topic == topic
+  let assert [ref] = refs_of_me(view) as "the first view holds me once"
   ref
 }
 
@@ -241,14 +244,12 @@ fn assert_leave_then_join(p: Peer, session: Session, old: String) -> Nil {
   let assert Ok(joined) =
     first_index(diffs, fn(diff) { list.contains(refs_of_me(diff.joins), new) })
     as "the new ref never joined"
-  let assert True = left <= joined
+  assert left <= joined
   // Nothing on the way re-joined the old ref or left the new one.
-  let assert False =
-    list.any(diffs, fn(diff) {
-      list.contains(refs_of_me(diff.joins), old)
-      || list.contains(refs_of_me(diff.leaves), new)
-    })
-  Nil
+  assert !list.any(diffs, fn(diff) {
+    list.contains(refs_of_me(diff.joins), old)
+    || list.contains(refs_of_me(diff.leaves), new)
+  })
 }
 
 // --- Tests --------------------------------------------------------------------
@@ -259,7 +260,7 @@ fn assert_leave_then_join(p: Peer, session: Session, old: String) -> Nil {
 pub fn retracked_entry_leaves_and_joins_for_every_watcher_test_() -> peer.Timeout {
   use <- Timeout(60)
   use peers <- peer.with_members(2, "brazier_ws10b_restart_semantics")
-  let assert [a, b] = peers
+  let assert [a, b] = peers as "the cluster starts two peers"
   start_tracker(a)
   start_tracker(b)
   let tracked = start_session(a, topic, [])
@@ -267,17 +268,17 @@ pub fn retracked_entry_leaves_and_joins_for_every_watcher_test_() -> peer.Timeou
 
   let on_a = start_session(a, "", [topic])
   let on_b = start_session(b, "", [topic])
-  let assert True = first_ref(a, on_a) == own
-  let assert True = first_ref(b, on_b) == own
+  assert first_ref(a, on_a) == own
+  assert first_ref(b, on_b) == own
 
   peer.on(a, fn() {
     let assert Ok(shard) = presence.shard_pid(tracker(), topic)
+      as "the lobby has a shard"
     process.kill(shard)
   })
 
   assert_leave_then_join(a, on_a, own)
   assert_leave_then_join(b, on_b, own)
-  Nil
 }
 
 /// The race behind the test above, made certain. A watcher on A is held
@@ -288,52 +289,59 @@ pub fn retracked_entry_leaves_and_joins_for_every_watcher_test_() -> peer.Timeou
 pub fn queued_join_waits_for_the_leave_of_the_restarted_shard_test_() -> peer.Timeout {
   use <- Timeout(60)
   use peers <- peer.with_members(1, "brazier_ws10b_restart_queued")
-  let assert [a] = peers
+  let assert [a] = peers as "the cluster starts one peer"
   start_tracker(a)
   let tracked = start_session(a, topic, [])
   let own = first_ref(a, tracked)
   let on_a = start_session(a, "", [topic])
-  let assert True = first_ref(a, on_a) == own
+  assert first_ref(a, on_a) == own
 
-  let retracked =
+  // `erlang:suspend_process/1` is undone when the suspender exits, so a
+  // holder on A suspends and later resumes the watcher (it ends with A).
+  let #(suspender, w) =
     peer.on(a, fn() {
+      let suspender = holder.start()
       let w = watcher(on_a)
-      suspend(w)
+      holder.run(suspender, fn() { suspend(w) })
       let assert Ok(shard) = presence.shard_pid(tracker(), topic)
+        as "the lobby has a shard"
       process.kill(shard)
-      let retracked =
-        peer.eventually(
-          fn() {
-            case presence.list(tracker(), topic) {
-              // The shard is restarting.
-              Error(presence.TrackerDown) -> False
-              listed -> {
-                let assert Ok(entries) = listed as "the lobby can be listed"
-                case refs_of_me(entries) {
-                  [ref] -> ref != own
-                  _ -> False
-                }
-              }
-            }
-          },
-          receive_ms,
-        )
-      resume(w)
-      retracked
+      #(suspender, w)
     })
-  let assert True = retracked as "the session never tracked itself again"
+  // The session's tracking on the new shard is a join the shard reports
+  // after storing it, so each diff re-checks the listing.
+  let retracked =
+    peer.until(
+      a,
+      wake.diffs(tracker(), topic),
+      fn() {
+        case presence.list(tracker(), topic) {
+          // The shard is restarting.
+          Error(presence.TrackerDown) -> False
+          listed -> {
+            let assert Ok(entries) = listed as "the lobby can be listed"
+            case refs_of_me(entries) {
+              [ref] -> ref != own
+              _ -> False
+            }
+          }
+        }
+      },
+      receive_ms,
+    )
+  peer.on(a, fn() { holder.run(suspender, fn() { resume(w) }) })
+  assert retracked as "the session never tracked itself again"
 
   let #(diffs, new) = collect_until_new_ref(a, on_a, own, [])
   let assert [diff] = diffs as "the leave and the join come in one message"
-  let assert True = refs_of_me(diff.leaves) == [own]
-  let assert True = refs_of_me(diff.joins) == [new]
-  Nil
+  assert refs_of_me(diff.leaves) == [own]
+  assert refs_of_me(diff.joins) == [new]
 }
 
 /// The session's presence watcher; call on the session's node.
 fn watcher(session: Session) -> process.Pid {
-  // INVARIANT: a started runtime's subject is owned by its actor.
   let assert Ok(runtime) = process.subject_owner(session.runtime)
+    as "a started runtime's subject is owned by its actor"
   let assert Ok(pid) = watcher_of(runtime)
     as "the runtime has no presence watcher"
   pid

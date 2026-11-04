@@ -41,9 +41,13 @@ fn drain_loop(
     Error(Nil) -> list.reverse(acc)
     Ok(event) -> {
       let assert Ok(name) = telemetry.string(event, "store")
+        as "telemetry.string succeeds"
       let assert Ok(op) = telemetry.string(event, "op")
+        as "telemetry.string succeeds"
       let assert Ok(mode) = telemetry.string(event, "mode")
+        as "telemetry.string succeeds"
       let assert Ok(count) = telemetry.int(event, "count")
+        as "telemetry.int succeeds"
       drain_loop(events, [#(name, op, mode, count), ..acc])
     }
   }
@@ -57,7 +61,8 @@ pub fn local_key_value_writes_emit_store_write_test() {
   store.delete(kv, "a")
   let assert [#(n1, "put", "local", 1), #(n2, "delete", "local", 1)] =
     drain(events)
-  let assert True = n1 == name && n2 == name
+    as "drain returns [#(..)"
+  assert n1 == name && n2 == name
 }
 
 pub fn local_list_writes_report_how_many_values_test() {
@@ -72,6 +77,7 @@ pub fn local_list_writes_report_how_many_values_test() {
     #(_, "append", "local", 3),
     #(_, "delete_all", "local", 1),
   ] = drain(events)
+    as "the list store reports append, append_many and delete_all in order"
 }
 
 @external(erlang, "erlang", "unique_integer")

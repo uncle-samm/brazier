@@ -36,6 +36,7 @@ fn start(down_period: Int) -> Presence(String) {
       |> presence.down_period(down_period)
       |> presence.permdown_period(down_period * 100),
     )
+    as "presence.start succeeds"
   p
 }
 
@@ -57,6 +58,7 @@ const max_ticks = 250
 
 fn shard(p: Presence(String)) -> Pid {
   let assert Ok(shard) = presence.shard_pid(p, "room")
+    as "presence.shard_pid succeeds"
   shard
 }
 
@@ -66,6 +68,7 @@ fn send_peer(p: Presence(String), message: Dynamic) -> Nil {
   let topic = "brazier_presence:" <> presence.name(p) <> ":1"
   send_peer_ffi(shard(p), topic, message)
   let assert Ok(_) = presence.replicas(p, "room")
+    as "presence.replicas succeeds"
   Nil
 }
 
@@ -87,17 +90,22 @@ pub fn synced_comes_after_the_entries_it_waited_for_test() {
   use <- with_verified(["ghost@host"])
   use p <- with_presence(5000)
   let assert Ok(Nil) = presence.subscribe(p, "room")
+    as "presence.subscribe succeeds"
   let ghost = fake_ref("ghost@host", 1)
   send_peer(p, heartbeat_at(ghost, 1, 1))
   await_sync(shard(p), ["ghost@host"])
   let assert Ok(_) = presence.replicas(p, "room")
+    as "presence.replicas succeeds"
   // A call answered after the request: nothing was sent yet.
   let assert Error(Nil) = receive_synced(shard(p), 0)
+    as "receive_synced returns Error(Nil)"
 
   send_peer(p, transfer_ack(ghost, 1, "room", [#("remote", "\"hi\"")]))
-  let assert Ok("diff") = receive_any(wait_ms)
+  let assert Ok("diff") = receive_any(wait_ms) as "receive_any succeeds"
   let assert Ok(#("ghost@host", "synced")) = answer(shard(p))
+    as "answer succeeds"
   let assert Ok(Nil) = presence.unsubscribe(p, "room")
+    as "presence.unsubscribe succeeds"
 }
 
 /// A node the shard knows and holds everything of is answered at once.
@@ -109,7 +117,9 @@ pub fn synced_at_once_when_already_caught_up_test() {
   send_peer(p, heartbeat_at(ghost, 1, 1))
   await_sync(shard(p), ["ghost@host"])
   let assert Ok(_) = presence.replicas(p, "room")
+    as "presence.replicas succeeds"
   let assert Ok(#("ghost@host", "synced")) = receive_synced(shard(p), 0)
+    as "receive_synced succeeds"
 }
 
 /// A node never heard from is absent once down_period has passed since the
@@ -118,6 +128,7 @@ pub fn absent_for_a_node_never_heard_from_test() {
   use p <- with_presence(100)
   await_sync(shard(p), ["nobody@host"])
   let assert Ok(#("nobody@host", "absent")) = answer(shard(p))
+    as "answer succeeds"
 }
 
 /// A node whose replica is down is answered at once: its entries are
@@ -138,7 +149,7 @@ pub fn down_for_a_node_that_is_down_test() {
     "the ghost's replica marked down",
   )
   await_sync(shard(p), ["ghost@host"])
-  let assert Ok(#("ghost@host", "down")) = answer(shard(p))
+  let assert Ok(#("ghost@host", "down")) = answer(shard(p)) as "answer succeeds"
 }
 
 /// The ghost keeps heartbeating a clock the shard never catches up with
@@ -155,9 +166,8 @@ pub fn timeout_when_the_node_never_catches_up_test() {
       await_sync(shard(p), ["ghost@host"])
       keep_alive_until_answered(p, tick, ghost, max_ticks)
     })
-  let assert Ok(#("ghost@host", "timeout")) = answered
-  let assert True =
-    log_capture.contains(lines, "warning", "did not sync with ghost@host")
+  let assert Ok(#("ghost@host", "timeout")) = answered as "answered is Ok"
+  assert log_capture.contains(lines, "warning", "did not sync with ghost@host")
 }
 
 /// Heartbeat as the ghost once per shard heartbeat tick, so the shard never
@@ -185,13 +195,14 @@ fn keep_alive_until_answered(
 pub fn one_answer_per_distinct_node_test() {
   use p <- with_presence(100)
   await_sync(shard(p), ["b@host", "a@host", "b@host"])
-  let assert Ok(first) = answer(shard(p))
-  let assert Ok(second) = answer(shard(p))
-  let assert True =
-    [first, second] == [#("a@host", "absent"), #("b@host", "absent")]
+  let assert Ok(first) = answer(shard(p)) as "answer succeeds"
+  let assert Ok(second) = answer(shard(p)) as "answer succeeds"
+  assert [first, second] == [#("a@host", "absent"), #("b@host", "absent")]
     || [first, second] == [#("b@host", "absent"), #("a@host", "absent")]
   let assert Ok(_) = presence.replicas(p, "room")
+    as "presence.replicas succeeds"
   let assert Error(Nil) = receive_synced(shard(p), 0)
+    as "receive_synced returns Error(Nil)"
 }
 
 /// Requests with nodes that are not binaries, or without a list, are
@@ -205,14 +216,16 @@ pub fn malformed_requests_are_logged_and_ignored_test() {
       send_raw(before, #(tag, process.self(), [atom.create("a@host")]))
       send_raw(before, #(tag, process.self(), "a@host"))
       let assert Ok(_) = presence.replicas(p, "room")
+        as "presence.replicas succeeds"
       Nil
     })
-  let assert True = log_capture.contains(lines, "warning", "non-binary nodes")
-  let assert True = log_capture.contains(lines, "warning", "unexpected message")
+  assert log_capture.contains(lines, "warning", "non-binary nodes")
+  assert log_capture.contains(lines, "warning", "unexpected message")
   let assert Error(Nil) = receive_synced(before, 0)
+    as "receive_synced returns Error(Nil)"
   await_sync(before, ["a@host"])
-  let assert Ok(#("a@host", "absent")) = answer(before)
-  let assert True = shard(p) == before
+  let assert Ok(#("a@host", "absent")) = answer(before) as "answer succeeds"
+  assert shard(p) == before
 }
 
 // --- FFI ----------------------------------------------------------------------

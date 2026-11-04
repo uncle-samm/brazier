@@ -27,7 +27,8 @@
 -export([with_cluster/3, with_cluster_args/4, with_members/3, with_members_args/4,
          with_long_name_cluster/3, rpc/3, crash/1, stop/1, partition/2,
          heal/2, restore/2, connect/2, node_of/1, pause/1, alive/1, add_peer/2, add_peer_args/3,
-         await_member/3]).
+         await_member/3, monitor_nodes/1, pg_monitor/2, pg_demonitor/2,
+         trace_receive/2, now_ms/0, registered/1, on_node/3]).
 
 -define(START_TIMEOUT_MS, 30000).
 -define(STOP_TIMEOUT_MS, 10000).
@@ -229,6 +230,53 @@ restore(A, B) ->
 
 pause(Ms) ->
     receive after Ms -> nil end.
+
+%% --- Wakes for peer.until (each runs in the waiting process) ---
+
+%% {nodeup, Node} and {nodedown, Node} messages while On.
+monitor_nodes(On) ->
+    ok = net_kernel:monitor_nodes(On),
+    nil.
+
+%% {Ref, join | leave, Group, Pids} messages for Group in the pg Scope.
+pg_monitor(Scope, Group) ->
+    {Ref, _Members} = pg:monitor(binary_to_existing_atom(Scope), Group),
+    Ref.
+
+pg_demonitor(Scope, Ref) ->
+    ok = pg:demonitor(binary_to_existing_atom(Scope), Ref),
+    nil.
+
+%% A {trace, Pid, 'receive', Message} message for each message Pid
+%% receives, while On.
+trace_receive(Pid, true) ->
+    1 = erlang:trace(Pid, true, ['receive', {tracer, self()}]),
+    nil;
+trace_receive(Pid, false) ->
+    try erlang:trace(Pid, false, ['receive']) of
+        1 -> nil
+    catch
+        error:badarg ->
+            %% Only for a process that has exited, which carries no trace
+            %% flags to clear.
+            false = is_process_alive(Pid),
+            nil
+    end.
+
+now_ms() ->
+    erlang:monotonic_time(millisecond).
+
+%% Run Fun() on Node from a peer (erpc:call/5) and return its result; an
+%% error or exit on Node, or a lost connection, is raised in the caller.
+on_node(Node, Fun, TimeoutMs) ->
+    erpc:call(Node, erlang, apply, [Fun, []], TimeoutMs).
+
+%% The process registered as Name on this node, or {error, nil}.
+registered(Name) ->
+    case erlang:whereis(binary_to_existing_atom(Name)) of
+        undefined -> {error, nil};
+        Pid -> {ok, Pid}
+    end.
 
 %% --- Keeper ---
 

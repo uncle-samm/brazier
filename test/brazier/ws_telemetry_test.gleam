@@ -54,7 +54,7 @@ fn limits() -> transport.SecurityLimits {
 }
 
 fn start_server(limits: transport.SecurityLimits) -> Server {
-  let assert Ok(Nil) = telemetry.start()
+  let assert Ok(Nil) = telemetry.start() as "telemetry.start succeeds"
   let connected = process.new_subject()
   let config =
     transport.TransportConfig(
@@ -122,7 +122,7 @@ fn upgrade(
 
 fn open(app: Server) -> Probe {
   let #(socket, status) = upgrade(app.port, upgrade_headers(app.port))
-  let assert "101" = status
+  let assert "101" = status as "status is '101'"
   let assert Ok(Connected(conn_id, runtime, handler)) =
     process.receive(app.connected, 3000)
     as "runtime factory must be called for an upgraded connection"
@@ -228,11 +228,15 @@ pub fn accepted_upgrade_span_reports_ok_test() {
   let probe = open(app)
   let start = expect(events, named(_, ["upgrade", "start"]))
   let assert Ok("/ws") = telemetry.string(start, "route")
+    as "telemetry.string succeeds"
   let assert Error(Nil) = dict.get(start.metadata, "result")
+    as "dict.get returns Error(Nil)"
   let stop = expect(events, upgrade_stop)
   let assert Ok("ok") = telemetry.string(stop, "result")
+    as "telemetry.string succeeds"
   let assert Ok("/ws") = telemetry.string(stop, "route")
-  let assert True = int_of(stop, "duration") >= 0
+    as "telemetry.string succeeds"
+  assert int_of(stop, "duration") >= 0
   raw_close(probe.socket)
   finish(app)
 }
@@ -243,16 +247,18 @@ pub fn refused_upgrade_span_reports_the_refusal_test() {
   let headers =
     list.filter(upgrade_headers(app.port), fn(h) { h.0 != "Origin" })
   let #(socket, status) = upgrade(app.port, headers)
-  let assert "403" = status
+  let assert "403" = status as "status is '403'"
   // The server half-closes after the refusal and lingers, draining the peer,
   // until the peer closes (or 1 s passes); the span stops after that. Close
   // first so the span ends on the peer's close, not on the linger timeout.
   raw_close(socket)
   let stop = expect(events, upgrade_stop)
   let assert Ok("rejected_origin") = telemetry.string(stop, "result")
+    as "telemetry.string succeeds"
   // A refused upgrade never reached the runtime factory. The stop event is
   // emitted after the refusal returns, so the factory has had its chance.
   let assert Error(Nil) = process.receive(app.connected, 0)
+    as "process.receive returns Error(Nil)"
 
   let unsupported =
     list.map(upgrade_headers(app.port), fn(h) {
@@ -262,11 +268,13 @@ pub fn refused_upgrade_span_reports_the_refusal_test() {
       }
     })
   let #(socket, status) = upgrade(app.port, unsupported)
-  let assert "426" = status
+  let assert "426" = status as "status is '426'"
   raw_close(socket)
   let stop = expect(events, upgrade_stop)
   let assert Ok("rejected_version") = telemetry.string(stop, "result")
+    as "telemetry.string succeeds"
   let assert Error(Nil) = process.receive(app.connected, 0)
+    as "process.receive returns Error(Nil)"
   finish(app)
 }
 
@@ -278,18 +286,21 @@ pub fn peer_close_reports_its_code_and_the_traffic_test() {
   let probe = open(app)
   send_text(probe.socket, heartbeat)
   let assert "{\"type\":\"heartbeat_ack\"" <> _ = recv_text(probe.socket)
+    as "recv_text returns '{'type':'heartbeat_ack'' <> _"
   let assert Ok(Nil) =
     raw_send(probe.socket, masked_frame(1, 8, <<4000:16, "bye":utf8>>))
     as "test client close must be sent"
   let close = expect(events, for_connection(probe, ["close"]))
   let assert Ok(4000) = telemetry.int(close, "close_code")
+    as "telemetry.int succeeds"
   let assert Ok("peer_close") = telemetry.string(close, "reason")
+    as "telemetry.string succeeds"
   // In: the heartbeat and the close. Out: the ack and the echoed close.
-  let assert 2 = int_of(close, "frames_in")
-  let assert True = int_of(close, "frames_out") >= 2
-  let assert True = int_of(close, "bytes_in") > string.byte_size(heartbeat)
-  let assert True = int_of(close, "bytes_out") > 0
-  let assert True = int_of(close, "duration") > 0
+  let assert 2 = int_of(close, "frames_in") as "int_of returns 2"
+  assert int_of(close, "frames_out") >= 2
+  assert int_of(close, "bytes_in") > string.byte_size(heartbeat)
+  assert int_of(close, "bytes_out") > 0
+  assert int_of(close, "duration") > 0
   raw_close(probe.socket)
   finish(app)
 }
@@ -302,7 +313,9 @@ pub fn empty_peer_close_reports_1005_test() {
     as "test client close must be sent"
   let close = expect(events, for_connection(probe, ["close"]))
   let assert Ok(1005) = telemetry.int(close, "close_code")
+    as "telemetry.int succeeds"
   let assert Ok("peer_close") = telemetry.string(close, "reason")
+    as "telemetry.string succeeds"
   raw_close(probe.socket)
   finish(app)
 }
@@ -317,7 +330,9 @@ pub fn protocol_error_reports_the_close_sent_test() {
     as "test client send must succeed"
   let close = expect(events, for_connection(probe, ["close"]))
   let assert Ok(1002) = telemetry.int(close, "close_code")
+    as "telemetry.int succeeds"
   let assert Ok("protocol_error") = telemetry.string(close, "reason")
+    as "telemetry.string succeeds"
   raw_close(probe.socket)
   finish(app)
 }
@@ -331,7 +346,9 @@ pub fn invalid_utf8_reports_a_snake_case_label_test() {
     as "test client send must succeed"
   let close = expect(events, for_connection(probe, ["close"]))
   let assert Ok(1007) = telemetry.int(close, "close_code")
+    as "telemetry.int succeeds"
   let assert Ok("invalid_utf8") = telemetry.string(close, "reason")
+    as "telemetry.string succeeds"
   raw_close(probe.socket)
   finish(app)
 }
@@ -343,8 +360,10 @@ pub fn dropped_tcp_connection_reports_1006_test() {
   raw_close(probe.socket)
   let close = expect(events, for_connection(probe, ["close"]))
   let assert Ok(1006) = telemetry.int(close, "close_code")
+    as "telemetry.int succeeds"
   let assert Ok("tcp_closed") = telemetry.string(close, "reason")
-  let assert 0 = int_of(close, "frames_in")
+    as "telemetry.string succeeds"
+  let assert 0 = int_of(close, "frames_in") as "int_of returns 0"
   finish(app)
 }
 
@@ -359,16 +378,19 @@ pub fn event_over_the_rate_is_reported_test() {
   send_text(probe.socket, event_json("b"))
   let assert "{\"type\":\"error\",\"reason\":\"Rate limited\"}" =
     recv_text(probe.socket)
+    as "recv_text returns '{'type':'error','reason':'Rate limited'}'(..)"
   let limited = expect(events, for_connection(probe, ["rate_limited"]))
   let assert Ok("event_rate") = telemetry.string(limited, "kind")
-  let assert 1 = int_of(limited, "count")
-  let assert 1 = int_of(limited, "violations")
+    as "telemetry.string succeeds"
+  let assert 1 = int_of(limited, "count") as "int_of returns 1"
+  let assert 1 = int_of(limited, "violations") as "int_of returns 1"
   // The running count grows with every violation.
   send_text(probe.socket, event_json("c"))
   let assert "{\"type\":\"error\",\"reason\":\"Rate limited\"}" =
     recv_text(probe.socket)
+    as "recv_text returns '{'type':'error','reason':'Rate limited'}'(..)"
   let again = expect(events, for_connection(probe, ["rate_limited"]))
-  let assert 2 = int_of(again, "violations")
+  let assert 2 = int_of(again, "violations") as "int_of returns 2"
   raw_close(probe.socket)
   finish(app)
 }
@@ -383,8 +405,10 @@ pub fn oversized_batch_is_reported_test() {
   send_text(probe.socket, batch_json(101))
   let assert "{\"type\":\"error\",\"reason\":\"Batch too large\"}" =
     recv_text(probe.socket)
+    as "recv_text returns '{'type':'error','reason':'Batch too large'}'(..)"
   let limited = expect(events, for_connection(probe, ["rate_limited"]))
   let assert Ok("batch_size") = telemetry.string(limited, "kind")
+    as "telemetry.string succeeds"
   raw_close(probe.socket)
   finish(app)
 }
@@ -397,7 +421,8 @@ pub fn heartbeat_flood_is_reported_test() {
   list.each([1, 2, 3], fn(_) { send_text(probe.socket, heartbeat) })
   let limited = expect(events, for_connection(probe, ["rate_limited"]))
   let assert Ok("heartbeat_rate") = telemetry.string(limited, "kind")
-  let assert 1 = int_of(limited, "violations")
+    as "telemetry.string succeeds"
+  let assert 1 = int_of(limited, "violations") as "int_of returns 1"
   raw_close(probe.socket)
   finish(app)
 }
@@ -414,10 +439,13 @@ pub fn runtime_backpressure_is_reported_test() {
   )
   let pressure = expect(events, for_connection(probe, ["backpressure"]))
   let assert Ok("runtime") = telemetry.string(pressure, "reason")
-  let assert True = int_of(pressure, "queue_len") >= 0
+    as "telemetry.string succeeds"
+  assert int_of(pressure, "queue_len") >= 0
   let close = expect(events, for_connection(probe, ["close"]))
   let assert Ok(1013) = telemetry.int(close, "close_code")
+    as "telemetry.int succeeds"
   let assert Ok("backpressure") = telemetry.string(close, "reason")
+    as "telemetry.string succeeds"
   raw_close(probe.socket)
   finish(app)
 }
@@ -437,9 +465,11 @@ pub fn outbound_queue_overflow_is_reported_test() {
     as "the connection handler must be resumable"
   let pressure = expect(events, for_connection(probe, ["backpressure"]))
   let assert Ok("outbound_queue") = telemetry.string(pressure, "reason")
-  let assert True = int_of(pressure, "queue_len") > 5
+    as "telemetry.string succeeds"
+  assert int_of(pressure, "queue_len") > 5
   let close = expect(events, for_connection(probe, ["close"]))
   let assert Ok(1013) = telemetry.int(close, "close_code")
+    as "telemetry.int succeeds"
   raw_close(probe.socket)
   finish(app)
 }

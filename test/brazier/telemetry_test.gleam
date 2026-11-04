@@ -251,12 +251,13 @@ pub fn span_without_handlers_runs_body_test() {
       dict.new(),
       fn() { "ran" },
     )
+    as "telemetry.span returns 'ran'"
 }
 
 // --- Catalogue, documented keys and privacy ---------------------------------
 
 pub fn compiled_prefix_matches_constant_test() {
-  let assert True = telemetry.compiled_prefix() == telemetry.prefix
+  assert telemetry.compiled_prefix() == telemetry.prefix
 }
 
 /// The documented keys from the event catalogue in
@@ -401,17 +402,18 @@ fn expected_events() -> List(#(List(String), set.Set(String), set.Set(String))) 
 /// with a crashing body.
 fn emit_everything() -> Nil {
   let crash = fn(run: fn() -> a) {
-    let assert Error(_) = rescue(run)
+    let assert Error(_) = rescue(run) as "rescue returns Error(_)"
     Nil
   }
   let request = fn(run) { telemetry.http_request_span("GET", "c1", run) }
   let assert 1 = request(fn() { #(1, "/items/:id", 200, 10, 20) })
+    as "request returns 1"
   crash(fn() { request(fn() { panic as "request crashed" }) })
   telemetry.http_connection(telemetry.Accepted, 0, "ok")
   telemetry.http_connection(telemetry.Rejected, 0, "limit")
   telemetry.http_connection(telemetry.Closed, 5, "normal")
   let upgrade = fn(run) { telemetry.ws_upgrade_span("/chat", run) }
-  let assert 2 = upgrade(fn() { #(2, "ok") })
+  let assert 2 = upgrade(fn() { #(2, "ok") }) as "upgrade returns 2"
   crash(fn() { upgrade(fn() { panic as "upgrade crashed" }) })
   telemetry.ws_close(100, 1, 2, 30, 40, 1000, "normal", "c1")
   telemetry.ws_rate_limited(5, "event", "c1")
@@ -423,18 +425,18 @@ fn emit_everything() -> Nil {
       let span = fn(run) {
         telemetry.runtime_span(kind, "/", "unknown", "c1", run)
       }
-      let assert 3 = span(fn() { 3 })
+      let assert 3 = span(fn() { 3 }) as "span returns 3"
       crash(fn() { span(fn() { panic as "runtime crashed" }) })
     },
   )
   let render = fn(run) {
     telemetry.runtime_render_span("/", "increment", "c1", run)
   }
-  let assert 4 = render(fn() { #(4, 128) })
+  let assert 4 = render(fn() { #(4, 128) }) as "render returns 4"
   crash(fn() { render(fn() { panic as "render crashed" }) })
   telemetry.runtime_stop(1000, "normal")
   let effect = fn(run) { telemetry.effect_run_span("http", run) }
-  let assert 5 = effect(fn() { 5 })
+  let assert 5 = effect(fn() { 5 }) as "effect returns 5"
   crash(fn() { effect(fn() { panic as "effect crashed" }) })
   telemetry.effect_timer_rejected(32)
   telemetry.effect_after_rejected(100)
@@ -442,7 +444,7 @@ fn emit_everything() -> Nil {
   telemetry.ssr_join_token_too_large(4000, 3800)
   telemetry.store_write(1, "counter", "put", "local")
   let sync = fn(run) { telemetry.store_sync_span("counter", "b@host", run) }
-  let assert 6 = sync(fn() { #(6, 10, 100) })
+  let assert 6 = sync(fn() { #(6, 10, 100) }) as "sync returns 6"
   crash(fn() { sync(fn() { panic as "sync crashed" }) })
   list.each(
     [
@@ -471,16 +473,15 @@ fn emit_everything() -> Nil {
   let transfer = fn(run) {
     telemetry.presence_transfer_span("room", "b@host", run)
   }
-  let assert 7 = transfer(fn() { #(7, 3, 300) })
+  let assert 7 = transfer(fn() { #(7, 3, 300) }) as "transfer returns 7"
   crash(fn() { transfer(fn() { panic as "transfer crashed" }) })
 }
 
 pub fn every_catalogue_event_fires_with_documented_keys_test() {
-  let assert Ok(Nil) = telemetry.start()
+  let assert Ok(Nil) = telemetry.start() as "telemetry.start succeeds"
   let expected = expected_events()
   // The catalogue lists exactly the documented events.
-  let assert True =
-    set.from_list(telemetry.catalogue())
+  assert set.from_list(telemetry.catalogue())
     == set.from_list(list.map(expected, fn(entry) { entry.0 }))
 
   let received = {
@@ -492,6 +493,7 @@ pub fn every_catalogue_event_fires_with_documented_keys_test() {
   let lookup = dict.from_list(list.map(expected, fn(e) { #(e.0, #(e.1, e.2)) }))
   list.each(received, fn(event) {
     let assert Ok(#(measurements, metadata)) = dict.get(lookup, event.name)
+      as "dict.get succeeds"
     case
       keys(event.measurements) == measurements,
       keys(event.metadata) == metadata
@@ -512,7 +514,7 @@ pub fn every_catalogue_event_fires_with_documented_keys_test() {
   })
   // Every catalogue event fired at least once.
   let fired = set.from_list(list.map(received, fn(event) { event.name }))
-  let assert True = fired == set.from_list(telemetry.catalogue())
+  assert fired == set.from_list(telemetry.catalogue())
 }
 
 /// Keys that would leak private data. None may appear in any catalogue
@@ -543,7 +545,7 @@ pub fn no_catalogue_event_carries_private_keys_test() {
 // --- Cost with no handler ---------------------------------------------------
 
 pub fn no_handler_emit_cost_benchmark_test() {
-  let assert Ok(Nil) = telemetry.start()
+  let assert Ok(Nil) = telemetry.start() as "telemetry.start succeeds"
   let iterations = 1_000_000
   let #(emit_ns, loop_ns) = bench_no_handler_emit(iterations)
   print_to_user(
@@ -557,7 +559,7 @@ pub fn no_handler_emit_cost_benchmark_test() {
   )
   // A generous sanity bound: an emit with no handler is a persistent_term
   // read and one ETS lookup, far below 5 microseconds.
-  let assert True = emit_ns <. 5000.0
+  assert emit_ns <. 5000.0
 }
 
 // --- FFI --------------------------------------------------------------------

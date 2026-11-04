@@ -32,7 +32,7 @@ pub type Msg {
 }
 
 fn context_for(path: String) -> context.Context {
-  let assert Ok(parsed) = uri.parse(path)
+  let assert Ok(parsed) = uri.parse(path) as "uri.parse succeeds"
   context.new(
     uri: uri.Uri(
       ..uri.empty,
@@ -184,12 +184,16 @@ fn stop_of(
 
 fn assert_tags(event: Event, label: String, connection_id: String) -> Nil {
   let assert Ok("/*") = telemetry.string(event, "route")
+    as "telemetry.string succeeds"
   let assert Ok(event_label) = telemetry.string(event, "event")
-  let assert True = event_label == label
+    as "telemetry.string succeeds"
+  assert event_label == label
   let assert Ok(conn) = telemetry.string(event, "connection_id")
-  let assert True = conn == connection_id
+    as "telemetry.string succeeds"
+  assert conn == connection_id
   let assert Ok(duration) = telemetry.int(event, "duration")
-  let assert True = duration >= 0
+    as "telemetry.int succeeds"
+  assert duration >= 0
   Nil
 }
 
@@ -212,6 +216,7 @@ pub fn mount_is_a_span_without_a_connection_test() {
   let start =
     expect(events, fn(e) { e.name == ["brazier", "runtime", "mount", "start"] })
   let assert Ok("mount") = telemetry.string(start, "event")
+    as "telemetry.string succeeds"
   let stop = stop_of(events, "mount", "none")
   assert_tags(stop, "mount", "none")
   process.send(subject, runtime.Shutdown)
@@ -230,7 +235,7 @@ pub fn decoded_event_reports_its_constructor_test() {
   )
   let render = stop_of(events, "render", session.conn_id)
   assert_tags(render, "increment", session.conn_id)
-  let assert True = patch_bytes(render) > 0
+  assert patch_bytes(render) > 0
   shutdown(session)
 }
 
@@ -267,7 +272,7 @@ pub fn batch_reports_each_event_and_one_render_test() {
   assert_tags(third, "increment", session.conn_id)
   let render = stop_of(events, "render", session.conn_id)
   assert_tags(render, "batch", session.conn_id)
-  let assert True = patch_bytes(render) > 0
+  assert patch_bytes(render) > 0
   shutdown(session)
 }
 
@@ -277,7 +282,7 @@ pub fn effect_update_renders_without_a_connection_test() {
   process.send(session.runtime, runtime.EffectDispatched(SetCount(9)))
   let render = stop_of(events, "render", "none")
   assert_tags(render, "set_count", "none")
-  let assert True = patch_bytes(render) > 0
+  assert patch_bytes(render) > 0
   shutdown(session)
 }
 
@@ -287,7 +292,7 @@ pub fn unchanged_model_renders_zero_bytes_test() {
   // The model is already 0: nothing to patch.
   process.send(session.runtime, runtime.EffectDispatched(SetCount(0)))
   let render = stop_of(events, "render", "none")
-  let assert 0 = patch_bytes(render)
+  let assert 0 = patch_bytes(render) as "patch_bytes returns 0"
   shutdown(session)
 }
 
@@ -305,6 +310,7 @@ pub fn no_render_span_without_joined_connections_test() {
       || e.name == ["brazier", "runtime", "stop"]
     })
   let assert ["brazier", "runtime", "stop"] = next.name
+    as "next.name is ['brazier', 'runtime', 'stop']"
 }
 
 // --- navigate ---------------------------------------------------------------
@@ -323,7 +329,7 @@ pub fn routed_navigation_reports_the_route_message_test() {
   )
   let render = stop_of(events, "render", session.conn_id)
   assert_tags(render, "visit", session.conn_id)
-  let assert True = patch_bytes(render) > 0
+  assert patch_bytes(render) > 0
   shutdown(session)
 }
 
@@ -341,6 +347,7 @@ pub fn unroutable_navigation_reports_unknown_test() {
   )
   let assert Ok(transport.SendHardNavigate(path: "/nope")) =
     process.receive(session.transport, 2000)
+    as "process.receive succeeds"
   shutdown(session)
 }
 
@@ -368,7 +375,9 @@ pub fn shutdown_reports_uptime_test() {
   process.send(session.runtime, runtime.Shutdown)
   let stop = expect(events, fn(e) { e.name == ["brazier", "runtime", "stop"] })
   let assert Ok("shutdown") = telemetry.string(stop, "reason")
+    as "telemetry.string succeeds"
   let assert Ok(uptime) = telemetry.int(stop, "uptime")
+    as "telemetry.int succeeds"
   let assert True = uptime > 0 as "a runtime that ran reports a positive uptime"
   // Shutdown ends the actor with `actor.stop()`, an exit with reason
   // `normal`; any other reason is a crash during shutdown. The monitor was

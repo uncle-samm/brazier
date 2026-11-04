@@ -240,7 +240,11 @@ pub fn unwatch(watch: InfoWatch) -> Nil {
 /// `watch_info` scoped to `run`: the hook is removed when `run` returns or
 /// crashes, so a failing test never leaves it on a process that outlives
 /// the test. Prefer it to `watch_info` plus `unwatch`.
-pub fn with_watch_info(pid: Pid, message: String, run: fn(InfoWatch) -> a) -> a {
+pub fn with_watch_info(
+  pid: Pid,
+  message: String,
+  run: fn(InfoWatch) -> a,
+) -> a {
   scoped_watch(pid, watch_info(pid, message), run)
 }
 

@@ -19,7 +19,9 @@ import brazier/await
 import brazier/telemetry.{type Event}
 import gleam/dynamic.{type Dynamic}
 import gleam/erlang/atom
-import gleam/erlang/process.{type ExitReason, type Monitor, type Pid, type Subject}
+import gleam/erlang/process.{
+  type ExitReason, type Monitor, type Pid, type Subject,
+}
 import gleam/int
 import gleam/string
 
@@ -135,10 +137,7 @@ pub fn with_handler(
 
 /// `with_handler` with a fresh handler id and a handler that forwards every
 /// event to a subject owned by the calling process, which `run` receives.
-pub fn listening(
-  names: List(List(String)),
-  run: fn(Subject(Event)) -> a,
-) -> a {
+pub fn listening(names: List(List(String)), run: fn(Subject(Event)) -> a) -> a {
   let id = "brazier_listening_" <> int.to_string(unique_integer())
   let events = process.new_subject()
   use <- with_handler(id, names, fn(event) { process.send(events, event) })
