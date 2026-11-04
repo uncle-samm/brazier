@@ -117,7 +117,11 @@ it as `{"__brazier_msg": ...}` encoded by the generated `encode_msg`. The
 runtime decodes it with the generated `brazier_codec.decode_event`, runs
 `update`, performs the effects, encodes the model and sends a `patch` with
 the JSON Patch from the previous model (`patch.gleam`), or nothing when the
-model did not change.
+model did not change. The runtime keeps the last model it sent both as JSON
+and decoded (`patch.Snapshot`), so an event decodes only the new model, and
+not even that when its JSON is the cached string. Encoder output that is not
+JSON is never sent: the connections get an `error` and the next valid model
+is a full `model_sync`.
 
 `decode_event` accepts only the constructors that client code can build.
 Anything else is refused: the runtime logs a warning, sends an `error`, and

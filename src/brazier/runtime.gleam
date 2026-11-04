@@ -97,8 +97,10 @@ pub type CachedModelState {
   /// Nothing trustworthy is cached (no joined connections yet, or the last
   /// broadcast failed). The next broadcast is a full `model_sync`.
   NoCache
-  /// The full client-visible model JSON.
-  FullModelCache(json: String)
+  /// The full client-visible model JSON with its decoded form, so the next
+  /// diff decodes only the new model (PERF-2). Costs the decoded term on the
+  /// runtime heap, roughly the size of the JSON again.
+  FullModelCache(snapshot: patch.Snapshot)
 }
 
 /// Messages the runtime actor can receive.
@@ -1904,39 +1906,69 @@ fn try_load_codec_event_decoder() -> Result(
   Nil,
 )
 
+/// The outcome of diffing the cache against a freshly encoded model. Every
+/// variant but `InvalidJson` carries the snapshot of the new model, which
+/// becomes the cache once it is sent.
 @internal
 pub type SnapshotDiff {
-  /// The client-visible JSON is identical: nothing to send.
-  Unchanged
-  /// Send these ops as a patch.
-  Changed(ops_json: String)
+  /// The client-visible JSON is identical (or decodes equal): nothing to
+  /// send.
+  Unchanged(snapshot: patch.Snapshot)
+  /// Send these ops (a non-empty JSON array) as a patch.
+  Changed(ops_json: String, snapshot: patch.Snapshot)
   /// The cache cannot be diffed against: send a full model_sync.
-  Resync
+  Resync(snapshot: patch.Snapshot)
+  /// The model encoder returned something that is not JSON: nothing can be
+  /// sent.
+  InvalidJson(reason: String)
 }
 
-/// Diff the cached model JSON against the new one. Equal JSON
-/// short-circuits without running the diff.
+/// Diff the cached model against the new model JSON. JSON equal to the
+/// cached string short-circuits without decoding; otherwise only the new
+/// model is decoded, since the cached one is kept decoded (PERF-2).
 @internal
 pub fn diff_snapshot(old: CachedModelState, new_json: String) -> SnapshotDiff {
   case old {
-    FullModelCache(old_json) ->
-      case old_json == new_json {
-        True -> Unchanged
-        False -> {
-          let ops = patch.diff(old_json, new_json)
-          case patch.is_empty(ops) {
-            True -> Unchanged
-            False -> Changed(ops)
+    FullModelCache(cached) ->
+      case patch.snapshot_json(cached) == new_json {
+        True -> Unchanged(cached)
+        False ->
+          case patch.snapshot(new_json) {
+            Error(reason) -> InvalidJson(reason)
+            Ok(new) ->
+              case patch.diff_snapshots(cached, new) {
+                patch.Unchanged -> Unchanged(new)
+                patch.Ops(ops_json) -> Changed(ops_json:, snapshot: new)
+              }
           }
-        }
       }
     NoCache -> {
       log.debug(
         "brazier.runtime",
         "No cached model to diff against; full resync",
       )
-      Resync
+      case patch.snapshot(new_json) {
+        Ok(new) -> Resync(new)
+        Error(reason) -> InvalidJson(reason)
+      }
     }
+  }
+}
+
+/// The snapshot to send for `model_json`: the cached one when the JSON is
+/// the cached string, so a join or resync of an unchanged model decodes
+/// nothing.
+fn snapshot_for(
+  cached: CachedModelState,
+  model_json: String,
+) -> Result(patch.Snapshot, String) {
+  case cached {
+    FullModelCache(snapshot) ->
+      case patch.snapshot_json(snapshot) == model_json {
+        True -> Ok(snapshot)
+        False -> patch.snapshot(model_json)
+      }
+    NoCache -> patch.snapshot(model_json)
   }
 }
 
@@ -1988,18 +2020,48 @@ fn model_too_large(
       <> int.to_string(model_size_max_bytes)
       <> " byte limit — not sent; clients resync once it shrinks",
   )
+  model_not_sent(
+    state,
+    targets,
+    "Model too large: "
+      <> int.to_string(size)
+      <> " bytes exceeds the "
+      <> int.to_string(model_size_max_bytes)
+      <> " byte limit",
+  )
+}
+
+/// The model encoder returned text that is not JSON (an app bug): nothing
+/// is sent, so a client never holds a model it cannot parse. Handled like
+/// `model_too_large`: the affected connections are told, and the cache is
+/// dropped so the next broadcast is a full resync, which decodes again and
+/// fails again until the encoder is fixed.
+fn model_invalid(
+  state: RuntimeState(model, msg),
+  targets: List(transport.ConnectionId),
+  reason: String,
+  context: String,
+) -> RuntimeState(model, msg) {
+  log.error(
+    "brazier.runtime",
+    "Model encoder returned invalid JSON in "
+      <> context
+      <> " — not sent to "
+      <> int.to_string(list.length(targets))
+      <> " connection(s): "
+      <> reason,
+  )
+  model_not_sent(state, targets, "Model encoder returned invalid JSON")
+}
+
+/// Tell `targets` the model could not be sent, and drop the cache.
+fn model_not_sent(
+  state: RuntimeState(model, msg),
+  targets: List(transport.ConnectionId),
+  reason: String,
+) -> RuntimeState(model, msg) {
   list.each(targets, fn(conn_id) {
-    send_to_conn_id(
-      state,
-      conn_id,
-      transport.SendError(
-        reason: "Model too large: "
-        <> int.to_string(size)
-        <> " bytes exceeds the "
-        <> int.to_string(model_size_max_bytes)
-        <> " byte limit",
-      ),
-    )
+    send_to_conn_id(state, conn_id, transport.SendError(reason: reason))
   })
   RuntimeState(..state, cached_model: NoCache)
 }
@@ -2158,7 +2220,6 @@ fn broadcast_to(
 ) -> #(RuntimeState(model, msg), Bool, Int) {
   let model_json = state.model_encoder(state.model)
   let model_bytes = string.byte_size(model_json)
-  let snapshot = FullModelCache(json: model_json)
   case check_model_size(model_bytes, "broadcast") {
     TooLarge(size) -> #(
       model_too_large(state, targets, size, "broadcast"),
@@ -2167,14 +2228,27 @@ fn broadcast_to(
     )
     SizeOk ->
       case diff_snapshot(state.cached_model, model_json) {
-        Unchanged -> {
+        InvalidJson(reason) -> #(
+          model_invalid(state, targets, reason, "broadcast"),
+          False,
+          0,
+        )
+        Unchanged(snapshot) -> {
           log.debug("brazier.runtime", "Model unchanged, skipping broadcast")
-          #(RuntimeState(..state, cached_model: snapshot), False, 0)
+          #(
+            RuntimeState(..state, cached_model: FullModelCache(snapshot)),
+            False,
+            0,
+          )
         }
-        Changed(ops_json) -> {
+        Changed(ops_json, snapshot) -> {
           let revision = state.revision + 1
           let state =
-            RuntimeState(..state, revision: revision, cached_model: snapshot)
+            RuntimeState(
+              ..state,
+              revision: revision,
+              cached_model: FullModelCache(snapshot),
+            )
           log.debug(
             "brazier.runtime",
             "Broadcasting patch revision " <> int.to_string(revision),
@@ -2192,21 +2266,24 @@ fn broadcast_to(
           })
           #(state, True, string.byte_size(ops_json))
         }
-        Resync -> {
+        Resync(snapshot) -> {
           log.debug(
             "brazier.runtime",
             "No usable cache; broadcasting full model_sync",
           )
+          // The model was encoded and decoded above; send that snapshot
+          // rather than encoding it again.
           let state = RuntimeState(..state, revision: state.revision + 1)
-          let state = send_model_sync_to(state, targets, "broadcast_resync")
+          let state =
+            send_snapshot_to(state, targets, snapshot, "broadcast_resync")
           #(state, True, model_bytes)
         }
       }
   }
 }
 
-/// Send the current model as a model_sync (current revision, each
-/// connection's own ack) and cache its snapshot.
+/// Encode the current model and send it as a model_sync (current
+/// revision, each connection's own ack), then cache its snapshot.
 ///
 /// Callers must include every joined connection in `targets` when the
 /// cache is `NoCache`, since the cache is about to describe all of them.
@@ -2218,31 +2295,45 @@ fn send_model_sync_to(
   let model_json = state.model_encoder(state.model)
   case check_model_size(string.byte_size(model_json), context) {
     TooLarge(size) -> model_too_large(state, targets, size, context)
-    SizeOk -> {
-      list.each(targets, fn(conn_id) {
-        send_to_conn_id(
-          state,
-          conn_id,
-          transport.SendModelSync(
-            model_json: model_json,
-            version: state.revision,
-            ack_clock: ack_for(state, conn_id),
-          ),
-        )
-      })
-      log.debug(
-        "brazier.runtime",
-        "Sent model_sync ("
-          <> context
-          <> ") revision "
-          <> int.to_string(state.revision)
-          <> " to "
-          <> int.to_string(list.length(targets))
-          <> " connection(s)",
-      )
-      RuntimeState(..state, cached_model: FullModelCache(json: model_json))
-    }
+    SizeOk ->
+      case snapshot_for(state.cached_model, model_json) {
+        Ok(snapshot) -> send_snapshot_to(state, targets, snapshot, context)
+        Error(reason) -> model_invalid(state, targets, reason, context)
+      }
   }
+}
+
+/// Send an already encoded, size-checked and decoded model as a model_sync
+/// and cache it. Same `targets` rule as `send_model_sync_to`.
+fn send_snapshot_to(
+  state: RuntimeState(model, msg),
+  targets: List(transport.ConnectionId),
+  snapshot: patch.Snapshot,
+  context: String,
+) -> RuntimeState(model, msg) {
+  let model_json = patch.snapshot_json(snapshot)
+  list.each(targets, fn(conn_id) {
+    send_to_conn_id(
+      state,
+      conn_id,
+      transport.SendModelSync(
+        model_json: model_json,
+        version: state.revision,
+        ack_clock: ack_for(state, conn_id),
+      ),
+    )
+  })
+  log.debug(
+    "brazier.runtime",
+    "Sent model_sync ("
+      <> context
+      <> ") revision "
+      <> int.to_string(state.revision)
+      <> " to "
+      <> int.to_string(list.length(targets))
+      <> " connection(s)",
+  )
+  RuntimeState(..state, cached_model: FullModelCache(snapshot))
 }
 
 /// Full resync for one connection (or all joined ones when the cache is

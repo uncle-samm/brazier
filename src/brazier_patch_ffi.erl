@@ -1,5 +1,5 @@
 -module(brazier_patch_ffi).
--export([diff_json/2, apply_json_ops/2, is_empty_ops/1, merge_ops_json/1, count_ops/1,
+-export([decode_snapshot/1, diff_terms/2, apply_json_ops/2, count_ops/1,
          escape_segment/1, parse_pointer/1, unsafe_keys/0]).
 
 %% Brazier state-sync patches.
@@ -25,15 +25,37 @@
 %% Reference: RFC 6901, RFC 6902; the unsafe keys are the ones the OWASP
 %% prototype-pollution guidance and lodash's `baseSet` guard refuse.
 
-%% Diff two JSON strings and produce patch operations.
-%% Returns a JSON-encoded string of the ops array.
-%% Uses OTP 27+'s json:decode/1 and json:encode/1.
--spec diff_json(binary(), binary()) -> binary().
-diff_json(OldJson, NewJson) ->
-    Old = json:decode(OldJson),
-    New = json:decode(NewJson),
-    Ops = diff_values(Old, New, <<>>),
-    iolist_to_binary(json:encode(Ops)).
+%% Decode a model JSON document once, for a snapshot (brazier/patch.Snapshot)
+%% that later diffs reuse, so each new model is decoded exactly once.
+%% {ok, Term} | {error, Reason}. Only the three errors json:decode/1
+%% documents for malformed input (trailing bytes included) become an error;
+%% anything else propagates and crashes the caller.
+%% Uses OTP 27+'s json:decode/1.
+-spec decode_snapshot(binary()) -> {ok, term()} | {error, binary()}.
+decode_snapshot(Json) when is_binary(Json) ->
+    try json:decode(Json) of
+        Term -> {ok, Term}
+    catch
+        error:unexpected_end -> decode_error(unexpected_end);
+        error:{invalid_byte, _} = Reason -> decode_error(Reason);
+        error:{unexpected_sequence, _} = Reason -> decode_error(Reason)
+    end.
+
+decode_error(Reason) ->
+    {error, unicode:characters_to_binary(
+        io_lib:format("the model JSON does not decode: ~0p", [Reason]))}.
+
+%% Diff two decoded JSON documents. `diff_unchanged` when they are equal
+%% (the =:= clause of diff_values/3 short-circuits on equal subtrees),
+%% otherwise {diff_ops, OpsJson} with the ops array encoded once. The tags
+%% are brazier/patch's private TermDiff constructors; the caller learns
+%% emptiness from the tag, so the ops are never decoded again.
+-spec diff_terms(term(), term()) -> diff_unchanged | {diff_ops, binary()}.
+diff_terms(Old, New) ->
+    case diff_values(Old, New, <<>>) of
+        [] -> diff_unchanged;
+        Ops -> {diff_ops, iolist_to_binary(json:encode(Ops))}
+    end.
 
 %% Apply patch operations (JSON string) to a model JSON string.
 %% Returns {ok, NewJsonString} or {error, Reason}. Every malformed op, unknown
@@ -55,14 +77,6 @@ apply_json_ops(ModelJson, OpsJson) ->
                 io_lib:format("Patch apply failed: ~p", [Reason])
             ),
             {error, ReasonBin}
-    end.
-
-%% Check if an ops JSON string represents an empty ops array.
--spec is_empty_ops(binary()) -> boolean().
-is_empty_ops(OpsJson) ->
-    case json:decode(OpsJson) of
-        [] -> true;
-        _ -> false
     end.
 
 %% === RFC 6901 JSON Pointer ===
@@ -431,15 +445,6 @@ parse_index(<<First, _/binary>> = Token) when First >= $1, First =< $9 ->
     end;
 parse_index(Token) ->
     erlang:error({invalid_array_index, Token}).
-
-%% Merge multiple JSON ops arrays into a single array.
-%% Each input is a JSON-encoded string like "[{...}]".
--spec merge_ops_json(list(binary())) -> binary().
-merge_ops_json(OpsList) ->
-    AllOps = lists:flatmap(fun(OpsJson) ->
-        json:decode(OpsJson)
-    end, OpsList),
-    iolist_to_binary(json:encode(AllOps)).
 
 %% Count the number of operations in a JSON ops string.
 %% Returns {error, Reason} when the JSON is malformed or not an array.
