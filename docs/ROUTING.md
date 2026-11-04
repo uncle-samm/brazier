@@ -181,8 +181,15 @@ or a bare `#`: the same path and query) is left to the browser, which
 scrolls to the anchor; nothing is sent. Back and forward between fragments
 of one page send nothing either. A link to another page's fragment
 (`/docs#install`) navigates live: the pushed URL keeps the fragment, and the
-server is sent only the path. The client does not scroll to that fragment
-after the new page renders. This is LiveView's rule (`DOM.isNewPageClick`).
+server is sent only the path. Once the new page is rendered, the client
+scrolls to the element whose id is the fragment (else to the `<a>` with that
+`name`), or to the top of the page with a console warning when the page has
+neither; `router.push("/docs#install")` does the same. These are LiveView's
+rules (`DOM.isNewPageClick`, and `Browser.pushState` scrolling after the
+patch reply). Back and forward keep the browser's scroll restoration. The
+wire side, a `clock` on `navigate` that the server acknowledges, is in
+[WIRE_PROTOCOL.md](WIRE_PROTOCOL.md#client-messages-browser-to-server) and
+[Event Clocking](WIRE_PROTOCOL.md#event-clocking).
 
 Each live navigation (a link, back/forward, `router.push` or
 `router.replace`) passes the app's middleware first, on a `GET` of the

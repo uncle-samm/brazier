@@ -94,9 +94,9 @@ class FakeWebSocket {
     this.readyState = FakeWebSocket.OPEN;
     this.onopen();
   }
-  serverClose(code) {
+  serverClose(code, reason = "") {
     this.readyState = FakeWebSocket.CLOSED;
-    this.onclose({ code, reason: "" });
+    this.onclose({ code, reason });
   }
   deliver(frame) {
     this.onmessage({ data: JSON.stringify(frame) });
@@ -299,6 +299,9 @@ class FakeElement extends FakeNode {
   focus() {
     document.activeElement = this;
   }
+  scrollIntoView() {
+    scrolls.push("#" + this.id + (this.hasAttribute("name") ? "[name=" + this.getAttribute("name") + "]" : ""));
+  }
   setSelectionRange(start, end) {
     this.selectionStart = start;
     this.selectionEnd = end;
@@ -421,6 +424,9 @@ const ok = (value) => ({ isOk: () => true, 0: value });
 const err = (error) => ({ isOk: () => false, 0: error });
 
 let reloads = 0;
+// What the page scrolled to: "#id" for scrollIntoView, "top" for
+// window.scrollTo(0, 0).
+let scrolls = [];
 let decoded = [];
 let renders = 0;
 
@@ -473,6 +479,7 @@ function freshGlobals(options = {}) {
   sockets = [];
   logs = [];
   reloads = 0;
+  scrolls = [];
   decoded = [];
   renders = 0;
   documentListeners = [];
@@ -514,6 +521,8 @@ function freshGlobals(options = {}) {
     // (scriptSrc: null).
     currentScript: options.scriptSrc === null ? null : { src: options.scriptSrc ?? TEST_BUNDLE_URL },
     querySelector: (selector) => (selector === "#brazier-app" ? (options.noRoot ? null : root) : root.querySelector(selector)),
+    getElementById: (id) => root.querySelectorAll("*").find((node) => node.id === id) || null,
+    getElementsByName: (name) => root.querySelectorAll("*").filter((node) => node.getAttribute("name") === name),
     addEventListener(name, fn, opt) {
       documentListeners.push({ name, fn, capture: opt === true || (typeof opt === "object" && opt.capture === true) });
     },
@@ -524,6 +533,10 @@ function freshGlobals(options = {}) {
     __BRAZIER_ENABLE_TEST_HOOKS: options.testHooks === true,
     addEventListener(name, fn) {
       windowListeners.push({ name, fn });
+    },
+    scrollTo(x, y) {
+      assert.deepEqual([x, y], [0, 0], "the client only scrolls to the top");
+      scrolls.push("top");
     },
   };
 }
@@ -1378,7 +1391,7 @@ scenario("server navigation pushes or replaces local paths and flushes pending i
   assert.deepEqual(historyLog.replaced, ["/b?x=1"]);
   assert.equal(location.pathname + location.search, "/b?x=1");
   assert.deepEqual(s.types().slice(-2), ["event", "navigate"], "pending input is sent before the navigate");
-  assert.deepEqual(s.sent.at(-1).msg, { type: "navigate", path: "/b?x=1" });
+  assert.deepEqual(s.sent.at(-1).msg, { type: "navigate", path: "/b?x=1", clock: 2 }, "the navigate's clock follows the input event's");
   for (const path of ["//evil.example/x", "https://evil.example/", "javascript:alert(1)"]) {
     s.deliver({ type: "navigate", path });
   }
@@ -1715,6 +1728,145 @@ scenario("in-page fragment links keep the browser's default, and same-page popst
   assert.deepEqual(navigates(), ["/a?q=1", "/b", "/a"]);
 });
 
+// --- fragment scroll after a live navigation ---
+// The browser does not scroll for pushState, so a link to another page's
+// #fragment scrolls once the server's answer to the navigate is rendered:
+// the first applied frame whose ack_clock covers the navigate's clock. As
+// LiveView's Browser.pushState: getHashTargetEl (an id, else <a name>),
+// scrollIntoView, else window.scroll(0, 0).
+const FRAGMENT_LINKS =
+  '<a id="to-sec" href="/b#sec">s</a>' +
+  '<a id="to-anchor" href="/c#old">o</a>' +
+  '<a id="to-missing" href="/d#nope">n</a>' +
+  '<a id="to-encoded" href="/e#caf%C3%A9">c</a>' +
+  '<a id="to-plain" href="/f">f</a>' +
+  '<a id="here" href="#here">h</a>';
+// Page "a" has none of the targets; every other page has all of them.
+function fragmentView(model) {
+  const targets = model.page === "a" ? "" : '<h2 id="sec">S</h2><a name="old">o</a><p id="café">c</p>';
+  return { html: FRAGMENT_LINKS + targets, handlers: [] };
+}
+function lastNavigate(s) {
+  const found = s.sent.filter((f) => f.msg.type === "navigate");
+  assert.ok(found.length > 0, "no navigate was sent");
+  return found.at(-1).msg;
+}
+
+scenario("a live navigation to another page's #fragment scrolls once that page renders, or to the top", async () => {
+  await loadRuntime({ path: "/a", ssr: FRAGMENT_LINKS, view: fragmentView });
+  const s = sockets[0];
+  s.open();
+  sync(s, 0, { page: "a" });
+  assert.equal(fire(el("#to-sec"), "click").defaultPrevented, true);
+  assert.deepEqual(lastNavigate(s), { type: "navigate", path: "/b", clock: 1 }, "the navigate carries the next clock, no fragment");
+  assert.deepEqual(scrolls, [], "nothing scrolls before the page exists");
+  patch(s, 1, [{ op: "add", path: "/n", value: 1 }], 0);
+  assert.deepEqual(scrolls, [], "a frame from before the navigation does not scroll");
+  patch(s, 2, [{ op: "replace", path: "/page", value: "b" }], 1);
+  assert.deepEqual(scrolls, ["#sec"], "the navigation's patch scrolls to the element with that id");
+  patch(s, 3, [{ op: "add", path: "/n2", value: 1 }], 1);
+  assert.deepEqual(scrolls, ["#sec"], "the scroll happens once");
+
+  // A navigation that leaves the model as it was is answered by an ack.
+  fire(el("#to-anchor"), "click");
+  assert.equal(lastNavigate(s).clock, 2);
+  patch(s, 3, [], 2);
+  assert.deepEqual(scrolls, ["#sec", "#[name=old]"], "an ack covering the navigate scrolls to <a name>");
+
+  // Unhappy path: the page has no such element.
+  fire(el("#to-missing"), "click");
+  patch(s, 4, [{ op: "replace", path: "/page", value: "d" }], 3);
+  assert.deepEqual(scrolls.at(-1), "top", "a missing fragment scrolls to the top");
+  assert.equal(logsMatching("warn", 'no element for the fragment "#nope"').length, 1, "and says so");
+
+  // The fragment is looked up percent-decoded too, as the browser does.
+  fire(el("#to-encoded"), "click");
+  patch(s, 5, [{ op: "replace", path: "/page", value: "e" }], 4);
+  assert.deepEqual(scrolls.at(-1), "#café");
+
+  // A navigation without a fragment schedules nothing.
+  const before = scrolls.length;
+  fire(el("#to-plain"), "click");
+  patch(s, 6, [{ op: "replace", path: "/page", value: "f" }], 5);
+  assert.equal(scrolls.length, before, "a page without a fragment keeps the client's scroll");
+  assert.equal(logsMatching("warn", "no element for the fragment").length, 1);
+});
+
+scenario("a fragment scroll waits for a held navigation, yields to newer URLs, and follows router.push", async () => {
+  const update = (model, msg) => ({ ...model, count: model.count + msg.inc });
+  const view = (model) => ({
+    html: '<button data-brazier-on-click="0.0">' + model.count + "</button>" + fragmentView(model).html,
+    handlers: [{ name: "click", id: "0.0", decode: () => ok({ inc: 1 }) }],
+  });
+  await loadRuntime({ simple: true, update, view, path: "/a" });
+  const s = sockets[0];
+  s.open();
+  sync(s, 0, { page: "a", count: 0 });
+  // The navigate (clock 1), then a predicted click (clock 2): the
+  // navigation's patch does not acknowledge the click, so it is held, and
+  // the scroll waits for the ack that adopts it.
+  fire(el("#to-sec"), "click");
+  fire(el('[data-brazier-on-click="0.0"]'), "click");
+  assert.equal(s.events().at(-1).clock, 2);
+  patch(s, 1, [{ op: "replace", path: "/page", value: "b" }], 1);
+  assert.deepEqual(scrolls, [], "a held patch is not rendered, so nothing scrolls");
+  patch(s, 2, [{ op: "replace", path: "/count", value: 1 }], 2);
+  assert.deepEqual(scrolls, ["#sec"], "the frame that renders the page scrolls");
+
+  // An in-page fragment link before the page arrives: the browser already
+  // scrolled for the newer fragment, so the old one is dropped.
+  fire(el("#to-anchor"), "click");
+  assert.equal(fire(el("#here"), "click").defaultPrevented, false, "the in-page link is the browser's");
+  setPath("/c#here");
+  patch(s, 2, [], 3);
+  assert.deepEqual(scrolls, ["#sec"], "a superseded fragment does not scroll");
+
+  // Back and forward keep the browser's scroll restoration: popstate drops
+  // a pending fragment scroll.
+  fire(el("#to-sec"), "click");
+  popTo("/a");
+  assert.deepEqual(lastNavigate(s), { type: "navigate", path: "/a", clock: 5 });
+  patch(s, 3, [{ op: "replace", path: "/page", value: "a" }], 5);
+  assert.deepEqual(scrolls, ["#sec"], "a popstate navigation does not scroll");
+
+  // router.push with a fragment: the server is sent the path, and the
+  // client scrolls once the page renders.
+  s.deliver({ type: "navigate", path: "/c?x=1#old" });
+  assert.deepEqual(historyLog.pushed.at(-1), "/c?x=1#old");
+  assert.deepEqual(lastNavigate(s), { type: "navigate", path: "/c?x=1", clock: 6 });
+  patch(s, 4, [{ op: "replace", path: "/page", value: "c" }], 6);
+  assert.deepEqual(scrolls, ["#sec", "#[name=old]"]);
+});
+
+scenario("a fragment navigation lost with the socket scrolls on the join; a queued one waits for its ack", async () => {
+  await loadRuntime({ path: "/a", ssr: FRAGMENT_LINKS, view: fragmentView });
+  const s = sockets[0];
+  s.open();
+  sync(s, 0, { page: "a" });
+  fire(el("#to-sec"), "click");
+  assert.equal(lastNavigate(s).clock, 1, "the navigate was written to the first socket");
+  s.serverClose(1006);
+  advance(reconnectDelay());
+  const s1 = sockets[1];
+  assert.ok(s1.url.endsWith("/ws?path=" + encodeURIComponent("/b")), "the join is for the navigation's page");
+  s1.open();
+  sync(s1, 0, { page: "b" }, 0);
+  assert.deepEqual(scrolls, ["#sec"], "the join's model_sync renders the page, so it scrolls");
+
+  // Unhappy path: a navigate still queued when the socket drops keeps its
+  // clock; the join's model_sync does not stand in for its answer.
+  s1.serverClose(1006);
+  fire(el("#to-anchor"), "click");
+  advance(reconnectDelay());
+  const s2 = sockets[2];
+  s2.open();
+  sync(s2, 0, { page: "b" }, 0);
+  assert.deepEqual(scrolls, ["#sec"], "the join does not answer a navigate it has not seen");
+  assert.deepEqual(lastNavigate(s2), { type: "navigate", path: "/c", clock: 2 }, "the queued navigate is sent once synced");
+  patch(s2, 0, [], 2);
+  assert.deepEqual(scrolls, ["#sec", "#[name=old]"]);
+});
+
 // --- refused upgrades ---
 // A browser reports a refused upgrade (the middleware answering 403, a
 // disallowed origin) only as close 1006 without onopen. The client keeps
@@ -1745,6 +1897,66 @@ scenario("closes before the socket opens back off to 30s, warn, then log an erro
   sockets[8].serverClose(1006);
   assert.equal(beforeOpening(), 3, "an open resets the count of unopened closes");
   assert.equal(errorsMatching("The WebSocket upgrade failed").length, 5);
+});
+
+// The server completes the handshake of a mount its route middleware
+// refuses and closes with 4600, so the client can load the page and show
+// the middleware's answer instead of retrying a socket that is refused
+// every time (LiveView's onJoinError navigating to the page's URL).
+scenario("4600 (middleware refused the mount) loads the current URL once, never reconnects", async () => {
+  await loadRuntime({ path: "/admin?tab=1#users" });
+  const s = sockets[0];
+  s.open();
+  assert.equal(s.types()[0], "join");
+  s.serverClose(4600, "middleware refused 403");
+  assert.equal(reloads, 1, "the page is loaded again, at its current URL");
+  assert.equal(location.pathname + location.search + location.hash, "/admin?tab=1#users", "the URL is not changed");
+  assert.equal(pendingTimeouts().length, 0, "no reconnect scheduled");
+  assert.equal(timers.length, 0, "heartbeat stopped");
+  assert.equal(errorsMatching("middleware refused this page's live connection (close 4600 middleware refused 403)").length, 1);
+  assert.equal(logsMatching("warn", "reconnecting").length, 0, "nothing says it reconnects");
+  advance(120000);
+  assert.equal(sockets.length, 1, "never reconnects");
+  assert.equal(reloads, 1);
+});
+
+scenario("4600 shares the reload guard: a middleware that admits the GET but refuses the mount stops after 3 loads", async () => {
+  const storage = new FakeStorage();
+  for (let i = 0; i < 3; i++) {
+    await loadRuntime({ storage, now: 3_000_000 + i * 1000 });
+    sockets[0].open();
+    sockets[0].serverClose(4600, "middleware refused 403");
+    assert.equal(reloads, 1, `refused mount ${i + 1} loads the page`);
+  }
+  await loadRuntime({ storage, now: 3_003_000, ssr: "<p>admin</p>" });
+  sockets[0].open();
+  sockets[0].serverClose(4600, "middleware refused 403");
+  assert.equal(reloads, 0, "the fourth refused mount within 60s does not load the page");
+  assert.ok(root.hasAttribute("data-brazier-error"), "the page shows its error state");
+  assert.equal(errorsMatching("(close 4600 middleware refused 403) after 3 reloads within 60s").length, 1);
+  advance(120000);
+  assert.equal(sockets.length, 1, "never reconnects");
+});
+
+scenario("unknown 4xxx codes and ordinary closes after open reconnect, never load the page", async () => {
+  await loadRuntime();
+  const codes = [4123, 4601, 4999, 1000, 1001];
+  codes.forEach((code, i) => {
+    const s = sockets[i];
+    s.open();
+    s.serverClose(code, "unknown");
+    assert.equal(logsMatching("warn", "WebSocket closed (code " + code + ", unknown); reconnecting").length, 1, `close ${code} warns`);
+    advance(reconnectDelay());
+    assert.equal(sockets.length, i + 2, `reconnected after ${code}`);
+  });
+  assert.equal(reloads, 0, "no close but 4600 and 4400-4499 loads the page");
+  assert.equal(errorsMatching("middleware refused").length, 0);
+  assert.ok(!root.hasAttribute("data-brazier-error"));
+  // A 4600 that arrives without an open (the handshake did not finish on
+  // this side) still means a refused mount.
+  sockets[codes.length].serverClose(4600, "middleware refused 302");
+  assert.equal(reloads, 1);
+  assert.equal(logsMatching("warn", "closed before opening").length, 0, "not counted as an unopened close");
 });
 
 // --- keyed children ---

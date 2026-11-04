@@ -114,7 +114,7 @@ fn event(
       event_data: data,
       target_path: "0",
       clock: clock,
-      ops: "",
+      ops: [],
     ),
   )
 }

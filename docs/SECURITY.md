@@ -140,20 +140,21 @@ pub fn main() {
 
 ## WebSocket Limits
 
-An upgrade request is admitted in this order; the first check that fails
-answers with an HTTP status and no socket is opened:
+An upgrade request is admitted in this order. The first check that fails
+answers with an HTTP status and no socket is opened, except the last, the
+middleware, whose refusal completes the handshake and closes with 4600:
 
 | Check | Refusal |
 |-------|---------|
 | `Host` in `allowed_hosts` (see [Allowed Hosts](#allowed-hosts)) | 400 |
 | No request body, and no bytes sent before the handshake answer | 400 |
 | A `path` query parameter naming a local page path | 400 |
-| The app's middleware, run on a `GET` of that page (see [The Live Page and Middleware](#the-live-page-and-middleware)) | the middleware's response |
 | Global `max_connections` | 503 |
 | `max_ws_connections_per_ip`, keyed on the client address resolved through `trusted_proxies` | 429 |
 | Origin (below) | 403 |
 | `ws_auth`, when configured | 401 |
 | RFC 6455 handshake (method, `Upgrade`, `Connection`, `Sec-WebSocket-Key`) | 400; an unsupported `Sec-WebSocket-Version` gets 426 |
+| The app's middleware, run on a `GET` of that page (see [The Live Page and Middleware](#the-live-page-and-middleware)) | 101, then close 4600 `middleware refused <status>` |
 
 On an open socket, `max_message_bytes`, `max_events_per_second`,
 `ws_max_rate_violations`, `ws_max_decode_errors`, the ping, pong and idle
@@ -225,9 +226,13 @@ and again at every live navigation, the same pipeline gates the live page:
 - **Upgrade.** The upgrade's `path` query parameter is required and must be
   a local path (the [Navigation Targets](#navigation-targets) rule);
   otherwise 400 (`rejected_path`). A `GET` of that page, with the upgrade's
-  headers and cookies, is run through the middleware; when the pipeline
-  does not reach the handler, the upgrade gets the middleware's response
-  (`rejected_middleware`) and no runtime starts.
+  headers and cookies, is run through the middleware once every other
+  upgrade check has passed. When the pipeline does not reach the handler,
+  the handshake completes and the socket closes with 4600 `middleware
+  refused <status>` (`rejected_middleware`); no runtime starts, and the
+  client loads the page over HTTP, where the middleware answers it. Because
+  the origin check runs first, a cross-origin page never reaches the
+  middleware and learns nothing about the app's routes from the answer.
 - **Navigation and join.** Every `navigate`, and every `join` for a page
   other than the one the connection was admitted for, runs the same gate.
   A refused page is answered with `hard_navigate` to it: the browser loads

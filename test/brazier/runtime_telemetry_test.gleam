@@ -131,7 +131,7 @@ fn click(session: Session, handler_id: String) -> Nil {
       event_data: "{}",
       target_path: "0",
       clock: 1,
-      ops: "",
+      ops: [],
     ),
   )
 }
@@ -255,12 +255,12 @@ pub fn undecodable_event_reports_unknown_test() {
 pub fn batch_reports_each_event_and_one_render_test() {
   let session = joined(option.None)
   use events <- listen()
-  let increment = #("click", "increment", "{}", "0", 1, "")
+  let increment = #("click", "increment", "{}", "0", 1, [])
   process.send(
     session.runtime,
     runtime.ClientEventBatchReceived(conn_id: session.conn_id, events: [
       increment,
-      #("click", "nope", "{}", "0", 2, ""),
+      #("click", "nope", "{}", "0", 2, []),
       increment,
     ]),
   )
@@ -320,7 +320,11 @@ pub fn routed_navigation_reports_the_route_message_test() {
   use events <- listen()
   process.send(
     session.runtime,
-    runtime.ClientNavigated(conn_id: session.conn_id, path: "/settings"),
+    runtime.ClientNavigated(
+      conn_id: session.conn_id,
+      path: "/settings",
+      clock: 0,
+    ),
   )
   assert_tags(
     stop_of(events, "navigate", session.conn_id),
@@ -338,7 +342,7 @@ pub fn unroutable_navigation_reports_unknown_test() {
   use events <- listen()
   process.send(
     session.runtime,
-    runtime.ClientNavigated(conn_id: session.conn_id, path: "/nope"),
+    runtime.ClientNavigated(conn_id: session.conn_id, path: "/nope", clock: 0),
   )
   assert_tags(
     stop_of(events, "navigate", session.conn_id),
@@ -356,7 +360,11 @@ pub fn navigation_without_router_reports_unknown_test() {
   use events <- listen()
   process.send(
     session.runtime,
-    runtime.ClientNavigated(conn_id: session.conn_id, path: "/elsewhere"),
+    runtime.ClientNavigated(
+      conn_id: session.conn_id,
+      path: "/elsewhere",
+      clock: 0,
+    ),
   )
   assert_tags(
     stop_of(events, "navigate", session.conn_id),

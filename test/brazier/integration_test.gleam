@@ -288,12 +288,14 @@ pub fn auth_middleware_blocks_ws_upgrade_test() {
     http_get("http://localhost:" <> int.to_string(port) <> "/")
   let assert 401 = status
 
-  // The WebSocket upgrade for that page is blocked too: the middleware runs
-  // on a GET of the page it mounts, and its answer is the upgrade's answer.
+  // A GET of /ws that is not a WebSocket handshake is a 400 before any
+  // middleware runs. A real upgrade for that page completes and closes
+  // with 4600 (`ws_middleware_refusal_test`): the browser cannot read the
+  // status of a refused upgrade, so the middleware's answer is a close.
   let origin = "http://localhost:" <> int.to_string(port)
   let assert Ok(#(ws_status, _headers2, _body2)) =
     http_request("GET", origin <> "/ws?path=%2F", [#("origin", origin)], "")
-  let assert 401 = ws_status
+  let assert 400 = ws_status
   // An upgrade that names no page is refused before any middleware runs.
   let assert Ok(#(no_page_status, _headers3, _body3)) =
     http_request("GET", origin <> "/ws", [#("origin", origin)], "")

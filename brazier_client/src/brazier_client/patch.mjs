@@ -460,6 +460,17 @@ export const CLOSE_STALE_BUILD = 4409;
  */
 export const CLOSE_RELOAD_MIN = 4400;
 export const CLOSE_RELOAD_MAX = 4499;
+/**
+ * Close code for a mount the server's route middleware refused: the server
+ * completed the handshake only to say so, because a browser cannot read
+ * the HTTP status of a refused upgrade. The reason is
+ * `middleware refused <status>`. The client loads the current URL, so the
+ * middleware's own answer (a redirect to a login page, a 403 page) is
+ * shown, behind the same reload guard. Reference: Phoenix LiveView's
+ * `view.ts` `onJoinError` navigates to the page's URL when a join is
+ * refused as unauthorized.
+ */
+export const CLOSE_MIDDLEWARE_REFUSED = 4600;
 
 /**
  * The build id of a client bundle, from the URL its script was loaded from:
@@ -569,15 +580,18 @@ export function classifyPatch(state, version, opsCount) {
 
 /**
  * "reload" for 4400 to 4499 (the server refused this page's session: never
- * reconnect with it), else "reconnect" with backoff. That includes 4500 to
- * 4599 (`init` refused with a server error, such as 4503 for a store that is
- * down) and 1011 (`init` crashed): the server may recover, and the backoff
+ * reconnect with it), "navigate" for CLOSE_MIDDLEWARE_REFUSED (load the
+ * current URL so the middleware's answer shows), else "reconnect" with
+ * backoff. That includes 4500 to 4599 (`init` refused with a server error,
+ * such as 4503 for a store that is down), 1011 (`init` crashed) and every
+ * code this client does not know: the server may recover, and the backoff
  * keeps a server that keeps refusing at one attempt per RECONNECT_MAX_MS.
  */
 export function closeAction(code) {
   if (!Number.isSafeInteger(code)) {
     throw new Error("closeAction: the close code must be an integer, got " + code);
   }
+  if (code === CLOSE_MIDDLEWARE_REFUSED) return "navigate";
   return code >= CLOSE_RELOAD_MIN && code <= CLOSE_RELOAD_MAX ? "reload" : "reconnect";
 }
 
