@@ -280,7 +280,10 @@
       - fix-cluster: TS-2, SEC-3, SEC-8, SEC-9, SEC-10, STAB-3, STAB-4;
       - fix-static-tooling: PERF-3/SEC-15, PERF-10, PERF-13, TS-4 HTTP part, TS-5, TS-6, TS-7, TS-13 and the stale-name lint rule;
       - fix-crdt: PERF-7.
-    - Wave 2: transport and auth. Covers SEC-2, SEC-4, SEC-7, SEC-16, SEC-11 transport part, TS-4 session-store clock, TS-8 and TS-9.
+    - Wave 2: transport and auth. Covers SEC-2, SEC-4, SEC-7, SEC-16, SEC-11 transport part, TS-4 session-store clock, TS-8 and TS-9. Started 2026-11-04 at 0a1ef08 as two agents, while fix-cluster was still running:
+      - W2-A owns transport, runtime, middleware, router and the client JS. It takes SEC-2, SEC-16, SEC-11 transport part, TS-9, SEC-17 recovery, the runtime's own local-path checks, the `hard_navigate` echo and the link-click origin check;
+      - W2-B owns ip, transport/client, auth and session. It takes SEC-4, SEC-7, TS-4 session clock and TS-8, with call-site edits only in transport.gleam.
+      - Both may make small edits to `brazier.gleam` and `application.gleam`, which fix-cluster also edits; the coordinator resolves those merges. Neither touches the `.erl` files fix-cluster owns.
     - Wave 3: wire and encoding performance, PERF-2 and PERF-6. Raw JSON envelopes need a wire version bump.
     - Wave 4: PERF-9, which closes the bench gate's gaps (benches for large models, SSR, static files, client render and CRDT; no ungated metrics) and re-baselines. Then a sweep of the remaining TS-12 items.
     - PERF-11 (about 0.5µs of telemetry span cost per event with no handler) is accepted within the overhead budget already recorded, and is not fixed.
@@ -363,6 +366,43 @@
     - Follow-ups:
       - the STAB-1 monitor race also exists in `store_test.gleam:29` and `:134`, `ws8c_ets_owner_test.gleam:68` and `cluster/app_tree_test.gleam:371` (wave 4 sweep);
       - `docs/DEPLOYMENT.md:56` still says "Join tokens and session tokens".
+  - [x] fix-cluster (TS-2, SEC-3, SEC-8, SEC-9, SEC-10, STAB-3, STAB-4), merged as fa8369c.
+    - SEC-3: cluster PubSub, presence and store-replica messages from a node that is not a verified member are dropped and logged. `brazier_cluster_ffi:verified/1` fails closed when no cluster manager is running. Fake peers in single-node tests become members only through the test-only `with_verified/2` in `test/brazier_presence_test_ffi.erl`, which owns a protected table and cleans it up in `after`, with bounded waits.
+    - TS-2: `to_config` requires a secret key. `cluster.supervised` and `cluster.start` take `secret_key:`. The cluster MAC key is HMAC-SHA256(secret_key, "brazier-cluster-v1"), derived the way Plug.Crypto's KeyGenerator derives keys, so it is never the raw secret.
+    - SEC-8/9/10: the peer check is signed with that key, discovery holds at most `max_discovered_nodes` (default 16384), and plain-TCP distribution refuses to start in production unless the app calls `allow_insecure_distribution(reason)`.
+    - STAB-3/STAB-4: membership changes are serialised through the manager, and a verified row is removed on nodedown.
+    - Coordinator verify on the merge of 0a1ef08 into the branch (e365789): clean build with zero warnings, format and lint clean, 1639 tests passing in each of 3 runs, docs check OK, test-client OK (45 FFI scenarios, patch safety, apply equivalence).
+    - Decisions:
+      - no fallback when no manager is running: no remote node is a member;
+      - accepted the edits outside the agent's file list (pubsub_worker.erl, pubsub.gleam, application.gleam, brazier_application_ffi.erl, the examples' cluster calls, READMEs, test_all_cdp.py, tests, GETTING_STARTED, ARCHITECTURE, STATE_MANAGEMENT), because they follow from the new `secret_key:` argument and the SEC-3 gate;
+      - commit 47a3516's message overstates the TLS refusal: it applies only in production, and `allow_insecure_distribution(reason)` overrides it. The docs say this correctly.
+    - Follow-ups:
+      - session pg group names contain session ids, which any connected node can list;
+      - await interests are lost when the manager restarts;
+      - between a disconnect and the nodedown, a stale verified row remains;
+      - a revocation can be lost while only one side has verified the other;
+      - a remaining STAB-3 race from the asynchronous link signal;
+      - the membership churn test survives some mutants;
+      - 2 `pubsub_test` failures during the agent's work came from subscriptions left by failing tests; pubsub tests should clean up in `after` (wave 4 sweep).
+  - [x] W2-B w2b-session-ip (SEC-4, SEC-7, TS-4 session clock, TS-8, TS-12), merged as e9f529a.
+    - SEC-4: `SecurityLimits.forwarding_header` names the one header a trusted proxy sets (`ip.Forwarded`, `ip.XForwardedFor`, or the default `ip.NoForwardingHeader`). Only that header is read, so the old precedence of `Forwarded` over XFF is gone. The other header from a trusted peer is logged at warning and ignored. Naming a header with no trusted proxies refuses to start. This follows Plug.RewriteOn, Rails RemoteIp and RFC 7239 §7.4.
+    - SEC-7: a socket that was bound to a session (`session.is_current_process_bound`, a pg local-members check) is closed with 4401 when its session is missing, expired or has no user on recheck. An unbound socket stays a guest. This follows LiveView's `live_socket_id` disconnect.
+    - TS-4: the session store takes a clock (`@internal start_store_with_clock`), and every sleep is gone from the session expiry tests, which now check exact boundaries.
+    - TS-8: a failed session delete logs its reason.
+    - TS-12: the `or_crash` assert explains that the crash is deliberate.
+    - DEPLOYMENT.md says which tokens are signed (join tokens, the cluster peer check) and which are random (session ids, CSRF tokens).
+    - Coordinator change: W2-B had copied the pg group key into `brazier_session_binding_ffi.erl` because fix-cluster owned `brazier_session_ffi.erl`. After that merge, `is_bound/3` moved next to `bind_process/3` and the copy was deleted (4baa910).
+    - Coordinator verify on the merge of 0771476 into the branch (6a718f3 plus 4baa910): clean build with zero warnings, format and lint clean, 1655 tests passing in each of 3 runs, docs check OK, test-client OK, and `examples/auth_workspace` builds.
+    - Decisions:
+      - `forwarding_header` defaults to none, which breaks existing configs: an app behind a proxy must set it, or every client address is the proxy's;
+      - the other header from a trusted proxy is warned about, not refused (Rails refuses), because the request is still correctly addressed.
+    - Follow-ups:
+      - `middleware.gleam` (around 240), MIDDLEWARE.md:75 and ARCHITECTURE.md:265 still describe "`Forwarded` / `X-Forwarded-For`" as if both are read (W2-A's files; check after its merge);
+      - stale "signed" wording in `config.gleam:12` and `cluster.gleam:132`;
+      - `X-Forwarded-Proto` is read whatever header is configured, and `Forwarded` `proto=` is never read;
+      - `transport.trusted_proxies(limits)` parses the list again on every call.
+    - The `config.gleam:12` wording is fixed (faab3a0). The `cluster.gleam` wording was already fixed by fix-cluster.
+  - [ ] W4 monitor-race sweep (test files only), started early from faab3a0 because it shares no files with W2-A. It covers the STAB-1 monitor races in `store_test`, `ws8c_ets_owner_test` and `cluster/app_tree_test`, plus pubsub test isolation.
 - [ ] Final verification: build (zero warnings), tests, all examples, CDP browser suite, perf baselines
 
 **Decisions (Milestone 117, coordinator):**

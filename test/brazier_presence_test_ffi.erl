@@ -7,9 +7,44 @@
 
 -export([fake_ref/2, heartbeat/2, transfer_ack/4, graceful_permdown/2,
          send_peer/3, receive_diff/1, flush_diffs/0, unique_positive/0, shard_has_delta/1,
-         malformed_messages/0]).
+         malformed_messages/0, with_verified/2]).
 
 -define(STATE, 'brazier@presence@state').
+%% The cluster manager's table of verified peers (brazier_cluster_ffi).
+-define(MEMBERS, brazier_cluster_members).
+
+%% Run Fun with the nodes NodeNames counted as verified cluster members, as
+%% the cluster manager counts a peer that passed its check: a shard only
+%% takes replication messages from members. No manager may be running (it
+%% owns the real table). The table goes away before this returns, also
+%% when Fun crashes, so no later test sees these members.
+with_verified(NodeNames, Fun) ->
+    undefined = whereis(brazier_cluster),
+    undefined = ets:info(?MEMBERS),
+    Parent = self(),
+    Ref = make_ref(),
+    {Owner, Monitor} = spawn_monitor(fun() ->
+        ?MEMBERS = ets:new(?MEMBERS, [set, protected, named_table, {read_concurrency, true}]),
+        true = ets:insert(?MEMBERS, [{binary_to_atom(N, utf8), 0} || N <- NodeNames]),
+        Parent ! {Ref, ready},
+        receive {Ref, stop} -> true = ets:delete(?MEMBERS) end
+    end),
+    receive
+        {Ref, ready} -> ok;
+        {'DOWN', Monitor, process, Owner, Failed} -> erlang:error({members_table_failed, Failed})
+    after 5000 ->
+        erlang:error(members_table_not_ready)
+    end,
+    try
+        Fun()
+    after
+        Owner ! {Ref, stop},
+        receive
+            {'DOWN', Monitor, process, Owner, Exit} -> normal = Exit
+        after 5000 ->
+            erlang:error(members_table_not_removed)
+        end
+    end.
 
 %% A replica ref {Node, Vsn} for a node that need not exist.
 fake_ref(NodeName, Vsn) ->

@@ -61,7 +61,9 @@ fn counter() -> brazier.App(Int, Int, Nil, Msg) {
 fn config(
   app: brazier.App(state, Int, local, Msg),
 ) -> application.AppConfig(state, Msg) {
-  brazier.to_config(app, int_codec(), 8080)
+  let assert Ok(config) = brazier.to_config(app, int_codec(), 8080)
+    as "every app these tests configure has a secret key"
+  config
 }
 
 fn keyed(
@@ -282,17 +284,16 @@ pub fn explicit_secret_key_is_used_test() {
   let assert "a-test-secret-that-is-long-enough-0123456789" = cfg.secret_key
 }
 
-pub fn missing_secret_key_is_generated_and_warned_test() {
-  let #(#(first, second), logs) =
-    log_capture.capture(fn() {
-      #(config(counter()).secret_key, config(counter()).secret_key)
-    })
-  let assert True = string.byte_size(first) >= 32
-  let assert True = first != second
-  let assert True =
-    log_capture.has(logs, level: "warning", containing: [
-      "auto-generated secret_key",
-    ])
+pub fn missing_secret_key_is_a_config_error_test() {
+  let #(result, logs) =
+    log_capture.capture(fn() { brazier.to_config(counter(), int_codec(), 8080) })
+  let assert Error(error.ConfigError(reason: reason)) = result
+  assert reason == brazier.missing_secret_key_reason
+  // The reason names the setting and where its value comes from.
+  assert string.contains(reason, "brazier.secret_key")
+  assert string.contains(reason, "SECRET_KEY")
+  assert string.contains(reason, "config.secret_key()")
+  assert log_capture.has(logs, level: "error", containing: ["has no secret_key"])
 }
 
 // --- middleware ---

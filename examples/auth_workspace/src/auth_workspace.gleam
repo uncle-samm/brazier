@@ -20,6 +20,7 @@ import auth_workspace/app.{type Model, type Msg}
 import brazier
 import brazier/api
 import brazier/auth
+import brazier/config
 import brazier/cookie
 import brazier/effect.{type Effect}
 import brazier/error
@@ -72,6 +73,8 @@ pub type Session {
 }
 
 pub fn main() {
+  let assert Ok(secret_key) = config.secret_key()
+    as "SECRET_KEY must be set to a private key of at least 32 bytes (config.secret_key logs why it was refused)"
   let store = session.new_store("auth_workspace_sessions")
   let auth_config = auth.dev_session_config()
 
@@ -85,12 +88,12 @@ pub fn main() {
     )
     |> brazier.with_router(parse: parse_route, on_change: app.RouteChanged)
     |> brazier.title(fn(_model) { "Auth Workspace" })
-    |> brazier.secret_key("auth-workspace-session-secret-key-32-chars")
     |> brazier.api_routes(api_handler(store, auth_config))
     |> brazier.ws_auth(auth.allow_guests_ws(store, auth_config))
     |> brazier.with_middleware(issue_login_csrf(auth_config))
     |> brazier.dev_mode(True)
     |> brazier.head_html(favicon)
+    |> brazier.secret_key(secret_key)
     |> brazier.start(8080)
     as "brazier.start failed (it logs the error)"
 }

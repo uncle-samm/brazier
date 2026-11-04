@@ -33,6 +33,7 @@ pub type SecurityLimits {
     send_timeout_ms: Int,             // 30000 per blocked socket send
     drain_timeout_ms: Int,            // 5000 for open connections on stop
     trusted_proxies: List(String),    // [] (see Trusted Proxies)
+    forwarding_header: ip.ForwardingHeader, // ip.NoForwardingHeader
     // WebSocket limits
     max_ws_connections_per_ip: Int,   // 100
     ws_ping_interval_ms: Int,         // 30000
@@ -247,12 +248,13 @@ The limiter (`brazier/rate_limit`) is a fixed-window counter in an ETS table own
 
 ## Trusted Proxies
 
-`SecurityLimits.trusted_proxies` lists the reverse proxies (addresses or CIDRs such as `"10.0.0.0/8"`, `"fd00::/8"`) whose forwarding headers Brazier believes. It is validated at startup; an invalid entry refuses to start. `brazier/transport/client` is the single resolver used by the HTTP rate limiter, the per-IP WebSocket cap and the WebSocket Origin check:
+`SecurityLimits.trusted_proxies` lists the reverse proxies (addresses or CIDRs such as `"10.0.0.0/8"`, `"fd00::/8"`) that Brazier believes. `SecurityLimits.forwarding_header` names the one header those proxies set to name the client: `ip.Forwarded`, `ip.XForwardedFor` or `ip.NoForwardingHeader` (the default). Both are validated at startup: an invalid entry, or a forwarding header with no trusted proxies (it would never be read), refuses to start. `brazier/transport/client` is the single resolver used by the HTTP rate limiter, the per-IP WebSocket cap and the WebSocket Origin check:
 
-- **Client IP:** the socket peer, unless the peer is a trusted proxy. Then it is the right-most `Forwarded` (preferred) or `X-Forwarded-For` hop that is not itself a trusted proxy (RFC 7239 section 7.4; the Plug `RemoteIp` / Rails `remote_ip` rule). A client can prepend hops but cannot forge the ones its proxies append. A malformed hop stops the walk at the last trusted address and is logged.
+- **Client IP:** the socket peer, unless the peer is a trusted proxy and a forwarding header is configured. Then it is the right-most hop of that header that is not itself a trusted proxy (RFC 7239 section 7.4; the Plug `RemoteIp` / Rails `remote_ip` rule). A client can prepend hops but cannot forge the ones its proxies append. A malformed hop stops the walk at the last trusted address and is logged.
+- **One header, chosen by the operator:** Brazier never picks between `Forwarded` and `X-Forwarded-For`. A proxy usually sets only one of them and passes the other through from the client untouched, so preferring either would let a client name its own address whenever the proxy does not set the preferred one. This follows `Plug.RewriteOn`, which rewrites only from the headers the app lists, and Rails `RemoteIp`, which treats disagreeing client headers as a spoof (`IpSpoofAttackError`). The other header is never read; when a trusted proxy passes one through, the request is served and a warning names the ignored value (the configured proxy never sets it, so it came from the client or from a proxy that is set up differently from `forwarding_header`). With `ip.NoForwardingHeader`, both are ignored and logged at debug.
 - **Scheme:** `http` (Brazier does not terminate TLS), unless a trusted proxy sends `X-Forwarded-Proto`, which must then be `http` or `https`; anything else, or several of the header, rejects the request. From an untrusted peer the header is ignored, so a direct client cannot claim `https` to pass an `https://` Origin check.
 
-With the default empty list, no forwarding header is ever honoured. Use the same list for `middleware.rate_limit_behind_proxies` via `ip.parse_trusted_proxies` (or `transport.trusted_proxies(limits)`).
+With the default empty list, no forwarding header is ever honoured. Use the same settings for `middleware.rate_limit_behind_proxies` via `ip.parse_trusted_proxies(entries, header)` (or `transport.trusted_proxies(limits)`).
 
 ## Message Size Limits
 
@@ -348,9 +350,13 @@ the formerly built-in dev secret with a `ConfigError` before any process is
 started or port bound. The key is never logged. `config.secret_key()` reads
 `SECRET_KEY` and applies the same check; there is no default.
 
-`brazier.start` generates a random per-process key when none is set, and warns at
-startup: tokens then die on restart and differ between nodes. Set an explicit
-key for production (generate one with `openssl rand -base64 48`); the full
+The key is required. `brazier.start` refuses an app without
+`brazier.secret_key` with a `ConfigError` that names the setting and the
+`SECRET_KEY` variable. It never generates a key, because a generated key
+would end every token at a restart and differ between nodes. The app has one
+key. The cluster peer check derives its MAC from it with a purpose label
+(`HMAC-SHA256(secret_key, "brazier-cluster-v1")`), so no token signature
+equals the MAC. Generate a key with `openssl rand -base64 48`. The full
 `main` is in [DEPLOYMENT.md](DEPLOYMENT.md#secret-key):
 
 <!-- docs-check: wrap
@@ -433,7 +439,13 @@ past that the page shows an error and stops.
 It binds a signed-in socket exactly as `protect_ws` does, connects a request
 with no cookie, a dead session or a session without a user as an unbound
 guest, and refuses the socket when the store cannot answer, so an outage is
-never hidden behind a guest page. The server then still decides
+never hidden behind a guest page. A socket that was bound never becomes a
+guest: when its recheck finds the session deleted, expired or without a
+user, the check fails, a warning is logged and the socket closes with 4401,
+so the page reloads and opens a new, unbound guest socket. This catches a
+revocation that sent no notice, such as a user removed with
+`session.update`, as Phoenix LiveView disconnects every socket of a
+`live_socket_id` on logout. The server then still decides
 per event: a guest socket can send only messages its page's `view` produces,
 and `update` must refuse signed-in actions from a guest.
 
@@ -566,3 +578,12 @@ whole. The server's `patch.unsafe_keys()` is the canonical list, and
 The build compiles to JavaScript only the code the browser runs: what `view` reaches, plus `init_local` and `update_local` of a `local.layer`, plus `update` for `brazier.simple`. Each reached definition is sliced out of its source file and its imports regenerated, so a function, constant, type or import that the browser does not reach never appears in the bundle. A reference from browser code into a server-only Brazier module (for example `brazier/store`, `brazier/effect` or `brazier/session`) fails the build with the call site.
 
 At runtime, a `full_application` sends the browser only what `sync(state)` returns. Keep secrets, session ids and private records in the server state outside the synced model; `examples/privacy_demo` and `examples/route_server_workspace` show the pattern.
+
+## Clustering
+
+Erlang distribution has no permission model: a node that holds the cookie can run any code on every node. [CLUSTERING.md](CLUSTERING.md#security-first-what-distribution-means) has the full setup. Brazier enforces this much:
+
+- **Production distribution.** With `BRAZIER_ENV=prod`, the cluster manager refuses to start over plain TCP, with a cookie shorter than 32 bytes, or with TLS that does not verify peers. Verifying peers means server `verify_peer` with `fail_if_no_peer_cert`, and client `verify_peer`. `allow_insecure_distribution(reason)` overrides the refusal and logs the reason.
+- **Verified membership.** A connected node becomes a member only after it proves it holds the app's secret key (the peer check). PubSub, replicated stores, presence and session revocation send to members only and drop what other nodes send. There is no fallback to every connected node (see [Membership](CLUSTERING.md#membership)). This keeps a deployment that shares a cookie by mistake out of the data. It does not stop a node with the cookie, which can run code directly.
+- **The MAC is a secret.** The peer-check MAC is derived from the secret key with a purpose label. It is never logged. The manager's `format_status` shows it, and any MAC in a message it holds, as `redacted`. A malformed hello is logged with only its tag, size and sender.
+- **Atoms from DNS are bounded.** DNS discovery makes node names (atoms, never freed) only from well-formed IP addresses. It makes at most `max_discovered_nodes` of them over the VM's life.

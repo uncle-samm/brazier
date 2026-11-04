@@ -557,6 +557,12 @@ pub fn protect_ws(
 ///   does, so logout, rotation or expiry closes it with 4401.
 /// - No session cookie, a cookie naming no live session and a session
 ///   without a user connect as a guest. They are not bound to anything.
+/// - A socket that was bound stays signed in or closes: when a recheck
+///   finds its session gone, expired or without a user, it is refused and
+///   closes with 4401, so the page reloads for whoever the cookie now names.
+///   It never carries on as a guest with the signed-in page still on
+///   screen. This catches a revocation the socket missed (a logout on a
+///   node it could not reach, a row removed from an External database).
 /// - A session store that cannot answer refuses the socket (401 before the
 ///   upgrade, 4401 on a recheck): the socket cannot be verified either way,
 ///   and treating it as a guest would hide the outage.
@@ -564,6 +570,10 @@ pub fn protect_ws(
 /// `protect_ws` refuses guests, so a guest page's socket would reconnect
 /// forever. The server still checks every event against the page's `view`,
 /// and `update` must refuse what a guest may not do.
+///
+/// Reference: Phoenix LiveView disconnects the sockets of a signed-out
+/// `live_socket_id`; the client reconnects and `mount` re-checks the
+/// session.
 pub fn allow_guests_ws(
   store: session.SessionStore,
   config: SessionConfig,
@@ -579,7 +589,10 @@ pub fn allow_guests_ws(
         )
         Ok(Nil)
       }
-      Ok(session_id) ->
+      Ok(session_id) -> {
+        // Read before the lookup: binding happens only on success below, so
+        // this says whether an earlier check signed this socket in.
+        let was_bound = session.is_current_process_bound(store, session_id)
         case session.fetch(store, session_id) {
           Ok(sess) ->
             case current_user(sess) {
@@ -588,24 +601,14 @@ pub fn allow_guests_ws(
                 log.debug("brazier.auth", "WS auth: a signed-in session, bound")
                 Ok(Nil)
               }
-              Error(Nil) -> {
-                log.debug(
-                  "brazier.auth",
-                  "WS auth: a guest (" <> error_to_string(MissingUser) <> ")",
-                )
-                Ok(Nil)
-              }
+              Error(Nil) -> guest_unless_bound(was_bound, MissingUser)
             }
           Error(session.SessionNotFound as err)
-          | Error(session.SessionExpired as err) -> {
-            log.debug(
-              "brazier.auth",
-              "WS auth: a guest ("
-                <> error_to_string(store_failure(err, "WS session lookup"))
-                <> ")",
+          | Error(session.SessionExpired as err) ->
+            guest_unless_bound(
+              was_bound,
+              store_failure(err, "WS session lookup"),
             )
-            Ok(Nil)
-          }
           Error(session.SessionContention as err)
           | Error(session.SessionBackendFailed(_) as err)
           | Error(session.InvalidBackend(_) as err) -> {
@@ -620,6 +623,34 @@ pub fn allow_guests_ws(
             Error(error_to_string(failure))
           }
         }
+      }
+    }
+  }
+}
+
+/// `allow_guests_ws` for a cookie that names no signed-in session: a socket
+/// that never signed in is a guest; one that was bound has lost its
+/// session and must close.
+fn guest_unless_bound(
+  was_bound: Bool,
+  reason: SessionError,
+) -> Result(Nil, String) {
+  case was_bound {
+    False -> {
+      log.debug(
+        "brazier.auth",
+        "WS auth: a guest (" <> error_to_string(reason) <> ")",
+      )
+      Ok(Nil)
+    }
+    True -> {
+      log.warning(
+        "brazier.auth",
+        "WS auth rejected: the socket's signed-in session is no longer valid ("
+          <> error_to_string(reason)
+          <> "); closing it instead of continuing as a guest",
+      )
+      Error(error_to_string(reason))
     }
   }
 }

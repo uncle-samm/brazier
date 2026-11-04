@@ -198,10 +198,15 @@ pub type SecurityLimits {
     /// `BRAZIER_SHUTDOWN_TIMEOUT` overrides it for an application. Default:
     /// 5000.
     drain_timeout_ms: Int,
-    /// Reverse proxies (IP addresses or CIDRs) whose X-Forwarded-For and
-    /// Forwarded headers are believed. Empty means the socket peer address
-    /// is always the client address. Default: [].
+    /// Reverse proxies (IP addresses or CIDRs) whose `forwarding_header`
+    /// and X-Forwarded-Proto are believed. Empty means the socket peer
+    /// address is always the client address. Default: [].
     trusted_proxies: List(String),
+    /// The one header the `trusted_proxies` set to name the client:
+    /// `ip.Forwarded`, `ip.XForwardedFor` or `ip.NoForwardingHeader`. The
+    /// other header is never read. A header with no trusted proxies is
+    /// refused. Default: `ip.NoForwardingHeader`.
+    forwarding_header: ip.ForwardingHeader,
     // WebSocket limits
     /// Maximum concurrent WebSocket connections per peer IP (per listener).
     /// Upgrades beyond it get 429. Default: 100. Behind a reverse proxy every
@@ -271,6 +276,7 @@ pub fn default_security_limits() -> SecurityLimits {
     send_timeout_ms: 30_000,
     drain_timeout_ms: 5000,
     trusted_proxies: [],
+    forwarding_header: ip.NoForwardingHeader,
     max_ws_connections_per_ip: 100,
     ws_ping_interval_ms: 30_000,
     ws_pong_timeout_ms: 20_000,
@@ -396,7 +402,7 @@ fn check_security_limits(
     // HTTP limits: a typo in the proxy list must never silently change who
     // is trusted.
     use _ <- result.try(
-      ip.parse_trusted_proxies(limits.trusted_proxies)
+      ip.parse_trusted_proxies(limits.trusted_proxies, limits.forwarding_header)
       |> result.map(fn(_) { Nil })
       |> result.map_error(fn(reason) { "trusted_proxies: " <> reason }),
     )
@@ -426,7 +432,9 @@ fn check_security_limits(
 pub fn trusted_proxies(
   limits: SecurityLimits,
 ) -> Result(ip.TrustedProxies, String) {
-  case ip.parse_trusted_proxies(limits.trusted_proxies) {
+  case
+    ip.parse_trusted_proxies(limits.trusted_proxies, limits.forwarding_header)
+  {
     Ok(parsed) -> Ok(parsed)
     Error(reason) -> {
       log.error(

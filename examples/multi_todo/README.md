@@ -18,6 +18,7 @@ A per-session todo list built with `brazier.full_application`, with its
 
 ```bash
 cd examples/multi_todo
+export SECRET_KEY="$(openssl rand -base64 48)"   # once per shell
 gleam run -m brazier/build   # first, and after every change
 gleam run
 ```

@@ -233,7 +233,7 @@ fn mentions(diffs: List(Diff(String)), key: String) -> #(Int, Int) {
 /// late leave or join of bob is still on the way.
 pub fn remote_entries_do_not_flap_on_shard_restart_test_() -> peer.Timeout {
   use <- Timeout(60)
-  use peers <- peer.with_cluster(2, "brazier_ws8c_flap")
+  use peers <- peer.with_members(2, "brazier_ws8c_flap")
   let assert [a, b] = peers
   start_tracker(a)
   start_tracker(b)
@@ -271,7 +271,7 @@ pub fn remote_entries_do_not_flap_on_shard_restart_test_() -> peer.Timeout {
 /// B, and never sees bob join again.
 pub fn remote_leave_during_restart_is_reported_once_test_() -> peer.Timeout {
   use <- Timeout(60)
-  use peers <- peer.with_cluster(2, "brazier_ws8c_flap_leave")
+  use peers <- peer.with_members(2, "brazier_ws8c_flap_leave")
   let assert [a, b] = peers
   start_tracker(a)
   start_tracker(b)
@@ -295,7 +295,7 @@ pub fn remote_leave_during_restart_is_reported_once_test_() -> peer.Timeout {
 /// without B, bob leaves, once. When the partition heals bob joins again.
 pub fn unreachable_node_entries_leave_after_down_period_test_() -> peer.Timeout {
   use <- Timeout(60)
-  use peers <- peer.with_cluster(2, "brazier_ws8c_flap_part")
+  use peers <- peer.with_members(2, "brazier_ws8c_flap_part")
   let assert [a, b] = peers
   start_tracker(a)
   start_tracker(b)
@@ -325,7 +325,7 @@ pub fn unreachable_node_entries_leave_after_down_period_test_() -> peer.Timeout 
 /// (cat joining) is the next thing ann sees.
 pub fn stale_and_unknown_sync_answers_are_ignored_test_() -> peer.Timeout {
   use <- Timeout(60)
-  use peers <- peer.with_cluster(2, "brazier_ws8c_flap_stale")
+  use peers <- peer.with_members(2, "brazier_ws8c_flap_stale")
   let assert [a, b] = peers
   start_tracker(a)
   start_tracker(b)

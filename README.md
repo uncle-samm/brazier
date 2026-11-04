@@ -21,6 +21,7 @@ How a page works:
 
 ```gleam
 import brazier
+import brazier/config
 import brazier/element.{type Element}
 import brazier/event
 import brazier/html
@@ -51,12 +52,20 @@ pub fn view(model: Model) -> Element(Msg) {
 }
 
 pub fn main() {
+  let assert Ok(secret_key) = config.secret_key()
+    as "SECRET_KEY must be set to a private key of at least 32 bytes (config.secret_key logs why it was refused)"
   let assert Ok(Nil) =
     brazier.simple(init:, update:, view:)
+    |> brazier.secret_key(secret_key)
     |> brazier.start(8080)
     as "brazier.start failed (it logs the error)"
 }
 ```
+
+Every app needs a secret key of at least 32 bytes. It signs session and join
+tokens and keys the cluster peer check. `brazier.start` refuses an app
+without one and names the setting, and there is no generated default.
+`config.secret_key()` reads it from `SECRET_KEY`.
 
 An app needs two generated artifacts before it starts: the server codec
 (`src/brazier_codec.gleam`) and the client bundle (`priv/static/`). Generate
@@ -69,9 +78,13 @@ first run. To run the counter example from this repository:
 
 ```sh
 cd examples/counter
+export SECRET_KEY="$(openssl rand -base64 48)"   # once per shell
 gleam run -m brazier/build   # first, and after every change
 gleam run
 ```
+
+Keep the same `SECRET_KEY` across restarts: a new key invalidates every
+signed token, so open tabs lose their session.
 
 [Getting Started](docs/GETTING_STARTED.md) walks through a full app.
 

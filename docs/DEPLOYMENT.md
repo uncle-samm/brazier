@@ -53,8 +53,10 @@ is not an integer.
 
 ## Secret Key
 
-Join tokens and session tokens are signed with HMAC-SHA256, so the key must
-be at least 32 bytes (`config.min_secret_key_bytes`). `brazier.start` refuses
+The key signs WebSocket join tokens with HMAC-SHA256 and, in a cluster, the
+peer check between nodes. Session ids and CSRF tokens are random values kept
+in the session store, not signed. The key must be at least 32 bytes
+(`config.min_secret_key_bytes`). `brazier.start` refuses
 an empty key, a shorter key and the old published dev secret with a
 `ConfigError` before opening the port. Generate a key with:
 
@@ -62,9 +64,15 @@ an empty key, a shorter key and the old published dev secret with a
 openssl rand -base64 48
 ```
 
-Without `brazier.secret_key`, `brazier.start` generates a random key per process
-and logs a warning. That key changes on restart (invalidating every token) and
-differs between nodes, so always set an explicit key in production:
+The key is required in every environment, including development. Without
+`brazier.secret_key`, `brazier.start` logs and returns a `ConfigError` that
+names `brazier.secret_key` and `SECRET_KEY`. Brazier never generates a key:
+a generated key would change on every restart, invalidating every token, and
+would differ between nodes. It is the one secret an app configures. The
+cluster peer check derives its MAC from it with a purpose label
+(`HMAC-SHA256(secret_key, "brazier-cluster-v1")`), so the MAC is never a
+token signature. Every node of one deployment needs the same key (see
+[CLUSTERING.md](CLUSTERING.md#the-peer-check)). Read it from the environment:
 
 <!-- docs-check: wrap
 {{block}}
@@ -125,6 +133,7 @@ in [SECURITY.md](SECURITY.md#securitylimits).
 
 <!-- docs-check: wrap
 import brazier
+import brazier/ip
 import brazier/transport
 
 pub fn configure(
@@ -140,8 +149,10 @@ brazier.security_limits(transport.SecurityLimits(
   ..transport.default_security_limits(),
   max_connections: 20_000,
   max_events_per_second: 100,
-  // The reverse proxy's address: believe its forwarding headers.
+  // The reverse proxy's address, and the one header it sets to name the
+  // client.
   trusted_proxies: ["10.0.0.0/8"],
+  forwarding_header: ip.XForwardedFor,
   // Pages served from another origin that may open the WebSocket.
   ws_allowed_origins: ["https://www.example.com"],
   // The names this server answers to (required in production).
@@ -177,6 +188,13 @@ balancer), list the proxy in `trusted_proxies`; without it, Brazier sees every
 client as the proxy's address and ignores the forwarding headers. The rules
 are in [SECURITY.md](SECURITY.md#trusted-proxies); for deployment:
 
+- **`forwarding_header`**: set it to the header your proxy writes the client
+  address into: `ip.XForwardedFor` (nginx `proxy_add_x_forwarded_for`, most
+  load balancers) or `ip.Forwarded` (RFC 7239). Only that header is read; the
+  other is ignored with a warning, because the proxy passes it through from
+  the client. The default `ip.NoForwardingHeader` reads neither, so the client
+  address is the proxy's. Setting a header without `trusted_proxies` refuses
+  to start.
 - **WebSocket upgrades** must reach Brazier: forward `Upgrade` and
   `Connection`. Brazier pings every `ws_ping_interval_ms` (30 s), so a proxy
   idle timeout longer than that keeps quiet sockets open.

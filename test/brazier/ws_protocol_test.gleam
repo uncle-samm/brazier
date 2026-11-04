@@ -8,16 +8,19 @@
 import brazier/auth
 import brazier/await
 import brazier/error
+import brazier/ip
 import brazier/session
 import brazier/sim/test_app
 import brazier/transport
 import brazier/transport/server.{type Connection}
 import gleam/bit_array
+import gleam/dict
 import gleam/erlang/process.{type Pid, type Subject}
 import gleam/http/request.{type Request}
 import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
+import gleam/result
 import gleam/string
 
 // --- Harness ---
@@ -607,9 +610,13 @@ pub fn cross_port_origin_gets_403_test() {
 }
 
 /// The test client connects from 127.0.0.1; trusting that address makes it
-/// act as a reverse proxy.
+/// act as a reverse proxy that sets X-Forwarded-For.
 fn behind_proxy_limits() -> transport.SecurityLimits {
-  transport.SecurityLimits(..test_limits(), trusted_proxies: ["127.0.0.1"])
+  transport.SecurityLimits(
+    ..test_limits(),
+    trusted_proxies: ["127.0.0.1"],
+    forwarding_header: ip.XForwardedFor,
+  )
 }
 
 pub fn invalid_forwarded_proto_from_trusted_proxy_gets_403_test() {
@@ -1099,20 +1106,21 @@ pub fn missing_session_cookie_gets_401_test() {
 }
 
 pub fn expired_session_gets_401_test() {
-  let store =
-    session.new_store_with_config(
-      "ws2_ws_expired",
+  // The store reads a manual clock, so the session expires when the test
+  // says, without sleeping.
+  let clock = new_clock(1_000_000)
+  let assert Ok(store) =
+    session.start_store_with_clock(
+      session.LocalEts("ws2_ws_expired"),
       session.StoreConfig(
         absolute_ttl_ms: 60_000,
         idle_ttl_ms: 40,
         sweep_interval_ms: 60_000,
       ),
+      fn() { clock_now(clock) },
     )
   let assert Ok(sess) = auth.login(store, "user-1")
-  // The sleep is the thing under test: the idle TTL is wall-clock time and
-  // the store has no clock to advance. Sleeping twice the TTL cannot race,
-  // since a slow scheduler only makes the session older.
-  process.sleep(80)
+  advance_clock(clock, 40)
   let server = session_auth_server(store)
   let #(socket, head) =
     raw_upgrade(server.port, cookie_headers(server.port, sess.id))
@@ -1190,6 +1198,52 @@ pub fn failed_auth_recheck_closes_4401_test() {
   let assert True = process.is_alive(probe.handler)
   session.delete(store, sess.id)
   assert_closed_with(probe, server, 4401)
+}
+
+pub fn allow_guests_ws_recheck_closes_a_signed_out_socket_4401_test() {
+  // Removing the user sends no revocation: only the periodic re-check can
+  // see that the bound socket is no longer signed in.
+  let store = session.new_store("ws2_ws_guests_recheck")
+  let assert Ok(sess) = auth.login(store, "user-1")
+  let guests_ws = auth.allow_guests_ws(store, auth.dev_session_config())
+  // Every run of the check is reported with the process it ran in, so the
+  // test waits for a re-check instead of sleeping past the interval.
+  let checks = process.new_subject()
+  let check = fn(req: Request(Connection)) {
+    let result = guests_ws(req)
+    process.send(checks, #(process.self(), result))
+    result
+  }
+  session.ensure_registry()
+  let server =
+    start_server(
+      transport.SecurityLimits(
+        ..test_limits(),
+        ws_auth_recheck_interval_ms: 100,
+      ),
+      Some(check),
+    )
+  let signed_in = open_with(server, cookie_headers(server.port, sess.id))
+  let guest = open_with(server, upgrade_headers(server.port))
+  let assert 1 = session.bound_process_count(store, sess.id)
+  let _ =
+    await.expect(checks, "a signed-in re-check that passes", matching: fn(c) {
+      c == #(signed_in.handler, Ok(Nil))
+    })
+  let assert Ok(_) = session.update(store, sess.id, dict.delete(_, "user_id"))
+  let _ =
+    await.expect(checks, "a signed-in re-check that fails", matching: fn(c) {
+      c.0 == signed_in.handler && result.is_error(c.1)
+    })
+  assert_closed_with(signed_in, server, 4401)
+  // The guest socket stays open through a re-check that ran after the close.
+  let _ = await.drain(checks)
+  let _ =
+    await.expect(checks, "a guest re-check that passes", matching: fn(c) {
+      c == #(guest.handler, Ok(Nil))
+    })
+  let assert True = process.is_alive(guest.handler)
+  raw_close(guest.socket)
 }
 
 // --- Pure helpers ---
@@ -1443,3 +1497,15 @@ fn erlang_format(format: String, args: List(String)) -> Nil
 fn io_println(line: String) -> Nil {
   erlang_format("~ts~n", [line])
 }
+
+/// A manual wall clock for session stores (brazier_session_clock_test_ffi).
+type ManualClock
+
+@external(erlang, "brazier_session_clock_test_ffi", "new")
+fn new_clock(start_ms: Int) -> ManualClock
+
+@external(erlang, "brazier_session_clock_test_ffi", "now")
+fn clock_now(clock: ManualClock) -> Int
+
+@external(erlang, "brazier_session_clock_test_ffi", "advance")
+fn advance_clock(clock: ManualClock, ms: Int) -> Nil

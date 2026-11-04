@@ -219,8 +219,8 @@ For `simple` and `application`, where the state is the model, pass
   token: it refuses the join and the client reloads.
 - A crash in `restore` is handled like a crash in `init`: it is logged with
   its stacktrace and the WebSocket closes with **1011**.
-- An open tab whose server was restarted without a fixed `brazier.secret_key`
-  therefore reloads once on reconnect: the new process generated a new key.
+- An open tab whose server was restarted with a different `brazier.secret_key`
+  therefore reloads once on reconnect: its token no longer verifies.
 - Recovery with an empty secret key is a configuration error: the runtime
   refuses to start.
 - The model must fit in a cookie with its signature: a page whose join token
@@ -511,8 +511,9 @@ Replication, anti-entropy, limits and failure behaviour are described in
 ## PubSub
 
 Low-level publish/subscribe, a port of Phoenix.PubSub over Erlang `pg`.
-`broadcast` reaches subscribers on every connected node; `local_broadcast`
-reaches this node only. See [CLUSTERING.md](CLUSTERING.md#pubsub-across-nodes)
+`broadcast` reaches subscribers on this node and on every verified cluster
+member ([Membership](CLUSTERING.md#membership)); `local_broadcast` reaches
+this node only. See [CLUSTERING.md](CLUSTERING.md#pubsub-across-nodes)
 for what a cluster needs and what happens during a netsplit.
 
 ```gleam

@@ -12,12 +12,29 @@
 %% (crash/1) does not take the test process down, and it monitors the test
 %% process, so the peers are stopped even when a test fails or is killed.
 %% with_cluster/3 also stops them in an `after` clause on the normal path.
+%%
+%% Cluster membership: PubSub, replicated stores, presence and session
+%% revocation exchange messages only with nodes the cluster manager has
+%% verified (brazier_cluster_ffi:verified/1). with_members/3 starts a
+%% manager on every peer (and on peers added later) with one shared test
+%% secret, and connect/2 waits until both sides of a connection have
+%% verified each other whenever both run a manager, so a test body starts
+%% with a cluster whose members already exchange messages.
+%%
+%% Naming: short names by default; with_long_name_cluster/3 starts peers
+%% named Name@127.0.0.1 (DNS discovery builds node names from IP addresses).
 
--export([with_cluster/3, with_cluster_args/4, rpc/3, crash/1, stop/1, partition/2,
-         heal/2, restore/2, connect/2, node_of/1, pause/1, alive/1, add_peer/2, add_peer_args/3]).
+-export([with_cluster/3, with_cluster_args/4, with_members/3, with_members_args/4,
+         with_long_name_cluster/3, rpc/3, crash/1, stop/1, partition/2,
+         heal/2, restore/2, connect/2, node_of/1, pause/1, alive/1, add_peer/2, add_peer_args/3,
+         await_member/3]).
 
 -define(START_TIMEOUT_MS, 30000).
 -define(STOP_TIMEOUT_MS, 10000).
+%% How long connect/2 waits for both managers to verify the connection.
+-define(VERIFY_TIMEOUT_MS, 10000).
+%% The secret key of every with_members/3 cluster (at least 32 bytes).
+-define(MEMBER_SECRET, <<"brazier-test-member-secret-0123456789-abcdefghijklmnop">>).
 
 %% Start Count connected peers, run Fun(Peers), always stop the peers.
 %% Peers is a list of {peer, ControlPid, Node, Keeper}.
@@ -27,9 +44,24 @@ with_cluster(Count, Prefix, Fun) ->
 %% with_cluster/3 with extra command-line arguments for every peer (for
 %% example TLS distribution flags).
 with_cluster_args(Count, Prefix, ExtraArgs, Fun) ->
+    run_cluster(Count, Prefix, ExtraArgs, #{members => false, long_names => false}, Fun).
+
+%% with_cluster/3 where every peer runs a cluster manager and every pair
+%% has verified each other before Fun runs.
+with_members(Count, Prefix, Fun) ->
+    with_members_args(Count, Prefix, [], Fun).
+
+with_members_args(Count, Prefix, ExtraArgs, Fun) ->
+    run_cluster(Count, Prefix, ExtraArgs, #{members => true, long_names => false}, Fun).
+
+%% with_cluster/3 with peers named Name@127.0.0.1.
+with_long_name_cluster(Count, Prefix, Fun) ->
+    run_cluster(Count, Prefix, [], #{members => false, long_names => true}, Fun).
+
+run_cluster(Count, Prefix, ExtraArgs, Opts, Fun) ->
     Owner = self(),
     Cookie = random_cookie(),
-    Keeper = spawn(fun() -> keeper_init(Owner, Cookie) end),
+    Keeper = spawn(fun() -> keeper_init(Owner, Cookie, Opts) end),
     try
         Peers = [start_peer(Keeper, Prefix, ExtraArgs) || _ <- lists:seq(1, Count)],
         ok = mesh(Peers),
@@ -50,9 +82,11 @@ start_peer(Keeper, Prefix, ExtraArgs) ->
     Ref = erlang:monitor(process, Keeper),
     Keeper ! {start_peer, self(), Ref, Prefix, ExtraArgs},
     receive
-        {Ref, {ok, Pid, Node}} ->
+        {Ref, {ok, Pid, Node, Members}} ->
             erlang:demonitor(Ref, [flush]),
-            {peer, Pid, Node, Keeper};
+            Peer = {peer, Pid, Node, Keeper},
+            ok = start_member(Peer, Members),
+            Peer;
         {Ref, {error, Reason}} ->
             erlang:demonitor(Ref, [flush]),
             erlang:error({peer_start_failed, Reason});
@@ -67,15 +101,69 @@ mesh(Peers) ->
     lists:foreach(fun({A, B}) -> {ok, nil} = connect(A, B) end, Pairs),
     ok.
 
-%% Connect peer A to peer B. {ok, nil} | {error, Description}.
+%% A cluster manager on the new peer of a with_members/3 cluster.
+start_member(_Peer, false) ->
+    ok;
+start_member(Peer, true) ->
+    Start = fun() ->
+                    'brazier@cluster':start('brazier@cluster':new(no_discovery), ?MEMBER_SECRET)
+            end,
+    case rpc(Peer, Start, 10000) of
+        {ok, {ok, nil}} -> ok;
+        Other -> erlang:error({cluster_manager_not_started, node_of(Peer), Other})
+    end.
+
+%% Connect peer A to peer B. {ok, nil} | {error, Description}. When both
+%% run a cluster manager, returns once each has verified the other.
 connect(A, B) ->
     NodeB = node_of(B),
     case rpc(A, fun() -> net_kernel:connect_node(NodeB) end, 10000) of
         {ok, true} ->
-            {ok, nil};
+            await_members(A, B);
         {ok, Other} ->
             {error, unicode:characters_to_binary(
                 io_lib:format("connect ~p -> ~p returned ~p", [node_of(A), NodeB, Other]))};
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+await_members(A, B) ->
+    case {manager_running(A), manager_running(B)} of
+        {true, true} ->
+            case await_member(A, node_of(B), ?VERIFY_TIMEOUT_MS) of
+                {ok, nil} -> await_member(B, node_of(A), ?VERIFY_TIMEOUT_MS);
+                Error -> Error
+            end;
+        _ ->
+            {ok, nil}
+    end.
+
+manager_running(Peer) ->
+    {ok, Running} = rpc(Peer, fun() -> whereis(brazier_cluster) =/= undefined end, 5000),
+    Running.
+
+%% Wait on Peer until its cluster manager has verified Node: {ok, nil}, or
+%% {error, Description} when it was not verified within TimeoutMs (the
+%% manager rejected it, or Node went down).
+await_member(Peer, Node, TimeoutMs) ->
+    Wait = fun() ->
+                   case brazier_cluster_ffi:await_verified(Node) of
+                       {ok, nil} ->
+                           receive
+                               {brazier_cluster_peer_verified, Node} -> verified
+                           after TimeoutMs ->
+                               not_verified
+                           end;
+                       {error, not_started} ->
+                           no_cluster_manager
+                   end
+           end,
+    case rpc(Peer, Wait, TimeoutMs + 5000) of
+        {ok, verified} ->
+            {ok, nil};
+        {ok, Outcome} ->
+            {error, unicode:characters_to_binary(
+                io_lib:format("~p on ~p: ~p", [Node, node_of(Peer), Outcome]))};
         {error, Reason} ->
             {error, Reason}
     end.
@@ -144,21 +232,21 @@ pause(Ms) ->
 
 %% --- Keeper ---
 
-keeper_init(Owner, Cookie) ->
+keeper_init(Owner, Cookie, Opts) ->
     process_flag(trap_exit, true),
     OwnerRef = erlang:monitor(process, Owner),
-    keeper_loop(Owner, OwnerRef, Cookie, []).
+    keeper_loop(Owner, OwnerRef, Cookie, Opts, []).
 
-keeper_loop(Owner, OwnerRef, Cookie, Peers) ->
+keeper_loop(Owner, OwnerRef, Cookie, Opts = #{members := Members}, Peers) ->
     receive
         {start_peer, From, Ref, Prefix, ExtraArgs} ->
-            case start_node(Cookie, Prefix, ExtraArgs) of
+            case start_node(Cookie, Prefix, ExtraArgs, Opts) of
                 {ok, Pid, Node} ->
-                    From ! {Ref, {ok, Pid, Node}},
-                    keeper_loop(Owner, OwnerRef, Cookie, [Pid | Peers]);
+                    From ! {Ref, {ok, Pid, Node, Members}},
+                    keeper_loop(Owner, OwnerRef, Cookie, Opts, [Pid | Peers]);
                 {error, Reason} ->
                     From ! {Ref, {error, Reason}},
-                    keeper_loop(Owner, OwnerRef, Cookie, Peers)
+                    keeper_loop(Owner, OwnerRef, Cookie, Opts, Peers)
             end;
         {stop_all, From, Ref} ->
             stop_peers(Peers),
@@ -166,10 +254,10 @@ keeper_loop(Owner, OwnerRef, Cookie, Peers) ->
         {'DOWN', OwnerRef, process, Owner, _Reason} ->
             stop_peers(Peers);
         {'EXIT', Pid, _Reason} ->
-            keeper_loop(Owner, OwnerRef, Cookie, lists:delete(Pid, Peers))
+            keeper_loop(Owner, OwnerRef, Cookie, Opts, lists:delete(Pid, Peers))
     end.
 
-start_node(Cookie, Prefix, ExtraArgs) ->
+start_node(Cookie, Prefix, ExtraArgs, #{long_names := LongNames}) ->
     %% Every non-OTP code path of the runner (the Gleam build directories),
     %% made absolute so the peer resolves them whatever its cwd.
     Root = code:root_dir(),
@@ -179,10 +267,14 @@ start_node(Cookie, Prefix, ExtraArgs) ->
     Args = ["-setcookie", atom_to_list(Cookie),
             "-kernel", "logger_level", "none"
             | [unicode:characters_to_list(A) || A <- ExtraArgs]] ++ ["-pa" | Paths],
-    try peer:start_link(#{name => peer:random_name(unicode:characters_to_list(Prefix)),
-                          connection => standard_io,
-                          args => Args,
-                          wait_boot => ?START_TIMEOUT_MS}) of
+    Naming = case LongNames of
+                 true -> #{longnames => true, host => "127.0.0.1"};
+                 false -> #{}
+             end,
+    try peer:start_link(Naming#{name => peer:random_name(unicode:characters_to_list(Prefix)),
+                                connection => standard_io,
+                                args => Args,
+                                wait_boot => ?START_TIMEOUT_MS}) of
         {ok, Pid, Node} -> start_apps(Pid, Node);
         {ok, Pid} -> {error, {started_without_node, Pid}};
         {error, Reason} -> {error, Reason}

@@ -9,6 +9,7 @@
 /// - SVG rendering with `brazier/svg`.
 import brazier
 import brazier/attribute
+import brazier/config
 import brazier/effect.{type Effect}
 import brazier/element.{type Element}
 import brazier/event
@@ -437,6 +438,8 @@ fn colour_button(colour: String, selected: String) -> Element(Msg) {
 // --- Start ---
 
 pub fn main() {
+  let assert Ok(secret_key) = config.secret_key()
+    as "SECRET_KEY must be set to a private key of at least 32 bytes (config.secret_key logs why it was refused)"
   let strokes = store.new_list("canvas_strokes")
   let assert Ok(Nil) =
     brazier.full_application(
@@ -450,6 +453,7 @@ pub fn main() {
     |> brazier.subscriptions(fn(_model) { [store.list_topic(strokes)] })
     |> brazier.on_notify(fn(_topic) { StrokesChanged })
     |> brazier.head_html(favicon)
+    |> brazier.secret_key(secret_key)
     |> brazier.start(8080)
     as "brazier.start failed (it logs the error)"
 }

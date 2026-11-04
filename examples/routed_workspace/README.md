@@ -27,6 +27,7 @@ Routing, a Local layer and server-authoritative Model updates in one
 
 ```bash
 cd examples/routed_workspace
+export SECRET_KEY="$(openssl rand -base64 48)"   # once per shell
 gleam run -m brazier/build   # first, and after every change
 gleam run -m main
 ```

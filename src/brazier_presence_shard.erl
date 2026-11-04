@@ -9,7 +9,10 @@
 %%
 %%   {{Topic, Key, Pid, Tag}, NodeBin, StoredMeta}
 %%
-%% Replication runs over Brazier PubSub on brazier_presence:<name>:<index>.
+%% Replication runs over Brazier PubSub on brazier_presence:<name>:<index>,
+%% between cluster members only: PubSub forwards only to and from nodes that
+%% passed the cluster peer check, and a message whose replica ref names a
+%% node that is not a verified member is dropped and logged here as well.
 %% Every message is {brazier_presence, Kind, PoolSize, FromRef, ...}:
 %%
 %%   heartbeat         broadcast every broadcast_period: the delta since the
@@ -313,9 +316,21 @@ peer_message(Message, S) ->
 checked_peer_message(_Message, Node, _PoolSize, S) when Node =:= node() ->
     %% Broadcasts are also delivered to this node, so to this shard.
     S;
-checked_peer_message(Message, Node, PoolSize, S = #{config := #{pool_size := PoolSize}}) ->
+checked_peer_message(Message, Node, PoolSize, S) ->
+    case brazier_cluster_ffi:verified(Node) of
+        true ->
+            member_peer_message(Message, Node, PoolSize, S);
+        false ->
+            %% PubSub already drops forwards from unverified nodes; this
+            %% check also covers the replica ref a member could put in one.
+            brazier_log_ffi:warning(<<"brazier.presence">>, "Shard ~ts dropped a ~0P from ~p: not a verified "
+                                   "cluster member", [label(S), element(2, Message), 5, Node]),
+            S
+    end.
+
+member_peer_message(Message, Node, PoolSize, S = #{config := #{pool_size := PoolSize}}) ->
     handle_peer(Message, Node, S);
-checked_peer_message(_Message, Node, PoolSize, S) ->
+member_peer_message(_Message, Node, PoolSize, S) ->
     #{mismatched := Mismatched, config := #{pool_size := Own}} = S,
     case maps:is_key(Node, Mismatched) of
         true ->
@@ -636,6 +651,11 @@ send_direct(S, Node, Topic, Message) ->
         {error, {node_not_connected, _}} ->
             brazier_log_ffi:warning(<<"brazier.presence">>, "Shard ~ts could not send ~p to ~p: not "
                                    "connected", [label(S), element(2, Message), Node]),
+            ok;
+        {error, {node_not_verified, _}} ->
+            %% The peer lost its membership after its message arrived.
+            brazier_log_ffi:warning(<<"brazier.presence">>, "Shard ~ts did not send ~p to ~p: not a "
+                                   "verified cluster member", [label(S), element(2, Message), Node]),
             ok;
         {error, Reason} ->
             brazier_log_ffi:error(<<"brazier.presence">>, "Shard ~ts could not send ~p to ~p: ~p",

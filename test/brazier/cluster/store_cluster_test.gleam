@@ -37,6 +37,7 @@ fn open_on(p: Peer, cfg: replicated.Config) -> store.Store(String) {
   peer.on(p, fn() {
     pubsub.start()
     let assert Ok(kv) = store.open(name, store.Replicated(cfg))
+      as "store.open succeeds"
     kv
   })
 }
@@ -45,7 +46,7 @@ fn open_all(peers: List(Peer)) -> store.Store(String) {
   let stores = list.map(peers, open_on(_, fast()))
   // INVARIANT: every node builds the same handle (registered names) for
   // the same store name and kind.
-  let assert [kv, ..] = stores
+  let assert [kv, ..] = stores as "stores returns a non-empty list"
   kv
 }
 
@@ -53,6 +54,7 @@ fn open_list_on(p: Peer) -> store.ListStore(String) {
   peer.on(p, fn() {
     pubsub.start()
     let assert Ok(messages) = store.open_list(name, store.Replicated(fast()))
+      as "store.open_list succeeds"
     messages
   })
 }
@@ -86,6 +88,7 @@ fn digest_on(
 ) -> Result(BitArray, Nil) {
   peer.on(p, fn() {
     let assert Ok(#(server, _table)) = replicated.start(kind, name, cfg)
+      as "replicated.start succeeds"
     case replicated.digest(server) {
       Ok(digest) -> Ok(digest)
       Error(_) -> Error(Nil)
@@ -124,6 +127,7 @@ fn in_parallel(peers: List(Peer), run: fn(Peer) -> Nil) -> Nil {
   })
   list.each(peers, fn(_) {
     let assert Ok(Nil) = process.receive(done, wait_ms)
+      as "process.receive succeeds"
   })
 }
 
@@ -138,7 +142,7 @@ fn seq(n: Int) -> List(Int) {
 /// converge to the same state, with the same last-writer winner everywhere.
 pub fn concurrent_writes_converge_test_() -> peer.Timeout {
   use <- Timeout(60)
-  use peers <- peer.with_cluster(3, "brazier_rs_conc")
+  use peers <- peer.with_members(3, "brazier_rs_conc")
   let kv = open_all(peers)
   in_parallel(peers, fn(p) {
     let me = node_name(p)
@@ -155,7 +159,7 @@ pub fn concurrent_writes_converge_test_() -> peer.Timeout {
     wait_ms,
   )
   let winners = list.map(peers, get_on(_, kv, "shared"))
-  let assert [Ok(winner), ..] = winners
+  let assert [Ok(winner), ..] = winners as "winners returns a non-empty list"
   assert list.all(winners, fn(w) { w == Ok(winner) })
   assert string.ends_with(winner, ":50")
   assert list.all(peers, fn(p) { count_on(p, kv) == 151 })
@@ -165,9 +169,9 @@ pub fn concurrent_writes_converge_test_() -> peer.Timeout {
 /// (timestamp) order on every node.
 pub fn concurrent_appends_converge_in_one_order_test_() -> peer.Timeout {
   use <- Timeout(60)
-  use peers <- peer.with_cluster(3, "brazier_rs_app")
+  use peers <- peer.with_members(3, "brazier_rs_app")
   let lists = list.map(peers, open_list_on)
-  let assert [messages, ..] = lists
+  let assert [messages, ..] = lists as "every peer opened a list store"
   in_parallel(peers, fn(p) {
     let me = node_name(p)
     peer.on(p, fn() {
@@ -182,11 +186,11 @@ pub fn concurrent_appends_converge_in_one_order_test_() -> peer.Timeout {
     list.map(peers, fn(p) {
       peer.on(p, fn() { store.get_all(messages, "room") })
     })
-  let assert [first, ..] = views
+  let assert [first, ..] = views as "views returns a non-empty list"
   assert list.length(first) == 60
   assert list.all(views, fn(view) { view == first })
   // Each node's own appends keep their order.
-  let assert [a, ..] = peers
+  let assert [a, ..] = peers as "the cluster starts at least one peer"
   let mine =
     list.filter(first, fn(v) { string.starts_with(v, node_name(a) <> ":") })
   assert mine
@@ -200,8 +204,8 @@ pub fn concurrent_appends_converge_in_one_order_test_() -> peer.Timeout {
 /// split.
 pub fn partition_heal_converges_test_() -> peer.Timeout {
   use <- Timeout(60)
-  use peers <- peer.with_cluster(2, "brazier_rs_split")
-  let assert [a, b] = peers
+  use peers <- peer.with_members(2, "brazier_rs_split")
+  let assert [a, b] = peers as "the cluster starts two peers"
   let kv = open_all(peers)
   put_on(a, kv, "k", "before")
   put_on(b, kv, "gone", "x")
@@ -226,7 +230,7 @@ pub fn partition_heal_converges_test_() -> peer.Timeout {
   assert sees(a, kv, "only_b", "b")
   assert sees(b, kv, "only_a", "a")
   assert lacks(b, kv, "gone")
-  let assert Ok(winner) = get_on(a, kv, "k")
+  let assert Ok(winner) = get_on(a, kv, "k") as "get_on succeeds"
   assert get_on(b, kv, "k") == Ok(winner)
   assert winner == "a side" || winner == "b side"
 }
@@ -235,11 +239,11 @@ pub fn partition_heal_converges_test_() -> peer.Timeout {
 /// the deleting node never saw survives on every node (add wins).
 pub fn delete_loses_to_a_concurrent_write_test_() -> peer.Timeout {
   use <- Timeout(60)
-  use peers <- peer.with_cluster(2, "brazier_rs_addwins")
-  let assert [a, b] = peers
+  use peers <- peer.with_members(2, "brazier_rs_addwins")
+  let assert [a, b] = peers as "the cluster starts two peers"
   let kv = open_all(peers)
   let lists = list.map(peers, open_list_on)
-  let assert [messages, ..] = lists
+  let assert [messages, ..] = lists as "every peer opened a list store"
   put_on(a, kv, "k", "v0")
   peer.on(a, fn() { store.append(messages, "room", "old") })
   assert sees(b, kv, "k", "v0")
@@ -275,8 +279,8 @@ pub fn delete_loses_to_a_concurrent_write_test_() -> peer.Timeout {
 /// later pulls the whole state, including deletes made after the crash.
 pub fn new_node_gets_a_full_sync_after_a_crash_test_() -> peer.Timeout {
   use <- Timeout(60)
-  use peers <- peer.with_cluster(3, "brazier_rs_crash")
-  let assert [a, b, c] = peers
+  use peers <- peer.with_members(3, "brazier_rs_crash")
+  let assert [a, b, c] = peers as "the cluster starts three peers"
   let kv = open_all(peers)
   put_on(a, kv, "from_a", "a")
   put_on(b, kv, "from_b", "b")
@@ -293,7 +297,7 @@ pub fn new_node_gets_a_full_sync_after_a_crash_test_() -> peer.Timeout {
   let d = peer.add_peer(a, "brazier_rs_crash_d")
   start_on(d, fast())
   assert get_on(d, kv, "from_c") == Error(Nil)
-  let assert Ok(Nil) = peer.connect(d, a)
+  let assert Ok(Nil) = peer.connect(d, a) as "peer.connect succeeds"
 
   let survivors = [a, b, d]
   assert peer.eventually(
@@ -312,8 +316,8 @@ pub fn new_node_gets_a_full_sync_after_a_crash_test_() -> peer.Timeout {
 /// incarnation with an empty state, and pulls its peers' state back.
 pub fn restarted_replica_resyncs_test_() -> peer.Timeout {
   use <- Timeout(60)
-  use peers <- peer.with_cluster(2, "brazier_rs_restart")
-  let assert [a, b] = peers
+  use peers <- peer.with_members(2, "brazier_rs_restart")
+  let assert [a, b] = peers as "the cluster starts two peers"
   let kv = open_all(peers)
   put_on(a, kv, "k1", "a")
   put_on(b, kv, "k2", "b")
@@ -351,8 +355,8 @@ pub fn restarted_replica_resyncs_test_() -> peer.Timeout {
 /// still reported as a [brazier, store, sync] span.
 pub fn remote_merges_past_the_limits_are_refused_test_() -> peer.Timeout {
   use <- Timeout(60)
-  use peers <- peer.with_cluster(2, "brazier_rs_limits")
-  let assert [a, b] = peers
+  use peers <- peer.with_members(2, "brazier_rs_limits")
+  let assert [a, b] = peers as "the cluster starts two peers"
   let kv = open_on(a, fast())
   let small =
     Config(
@@ -425,10 +429,10 @@ pub fn remote_merges_past_the_limits_are_refused_test_() -> peer.Timeout {
 /// and the per-key topic of an append_notify / delete_all_notify.
 pub fn remote_writes_notify_watchers_test_() -> peer.Timeout {
   use <- Timeout(60)
-  use peers <- peer.with_cluster(2, "brazier_rs_notify")
-  let assert [a, b] = peers
+  use peers <- peer.with_members(2, "brazier_rs_notify")
+  let assert [a, b] = peers as "the cluster starts two peers"
   let lists = list.map(peers, open_list_on)
-  let assert [messages, ..] = lists
+  let assert [messages, ..] = lists as "every peer opened a list store"
   let store_watcher =
     peer.on(b, fn() { spawn_recorder([store.list_topic(messages)]) })
   let key_watcher = peer.on(b, fn() { spawn_recorder(["room:general"]) })
@@ -462,8 +466,8 @@ pub fn remote_writes_notify_watchers_test_() -> peer.Timeout {
 /// node that joins afterwards.
 pub fn convergence_bench_test_() -> peer.Timeout {
   use <- Timeout(120)
-  use peers <- peer.with_cluster(3, "brazier_rs_bench")
-  let assert [a, ..] = peers
+  use peers <- peer.with_members(3, "brazier_rs_bench")
+  let assert [a, ..] = peers as "the cluster starts at least one peer"
   let kv = open_all(peers)
   let per_node = 2000
   let started = now_us()
@@ -483,6 +487,7 @@ pub fn convergence_bench_test_() -> peer.Timeout {
   let slowest =
     list.fold(peers, 0, fn(acc, _) {
       let assert Ok(took) = process.receive(write_us, 0)
+        as "process.receive succeeds"
       int.max(acc, took)
     })
   assert peer.eventually(fn() { converged(peers, replicated.KeyValue) }, 60_000)
@@ -493,7 +498,7 @@ pub fn convergence_bench_test_() -> peer.Timeout {
   let d = peer.add_peer(a, "brazier_rs_bench_d")
   start_on(d, fast())
   let join_started = now_us()
-  let assert Ok(Nil) = peer.connect(d, a)
+  let assert Ok(Nil) = peer.connect(d, a) as "peer.connect succeeds"
   assert peer.eventually(
     fn() { converged([a, d], replicated.KeyValue) },
     60_000,

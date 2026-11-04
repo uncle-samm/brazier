@@ -8,6 +8,13 @@
 //// Code runs on a peer through `rpc` with a closure; peers load the same
 //// compiled modules as the runner. Use `eventually` to wait for a
 //// condition, never a fixed sleep.
+////
+//// PubSub, replicated stores, presence and session revocation exchange
+//// messages only with verified cluster members, so a test of traffic
+//// between nodes uses `with_members`: every peer runs a cluster manager
+//// with one test secret, and `connect` (and `heal`) return once both
+//// managers have verified the connection. `with_cluster` peers run no
+//// manager, for tests of the manager itself and of unverified nodes.
 
 import gleam/erlang/node.{type Node}
 import gleam/erlang/process.{type Pid}
@@ -27,6 +34,38 @@ pub type Timeout {
 /// them, and stop every peer afterwards whatever happens.
 @external(erlang, "brazier_peer_ffi", "with_cluster")
 pub fn with_cluster(count: Int, prefix: String, run: fn(List(Peer)) -> a) -> a
+
+/// `with_cluster` where every peer (and every peer added later) runs a
+/// cluster manager and every pair has verified each other before `run`.
+@external(erlang, "brazier_peer_ffi", "with_members")
+pub fn with_members(count: Int, prefix: String, run: fn(List(Peer)) -> a) -> a
+
+/// `with_members` with extra command-line arguments for every peer.
+@external(erlang, "brazier_peer_ffi", "with_members_args")
+pub fn with_members_args(
+  count: Int,
+  prefix: String,
+  args: List(String),
+  run: fn(List(Peer)) -> a,
+) -> a
+
+/// `with_cluster` with peers named `name@127.0.0.1` (DNS discovery makes
+/// node names from IP addresses).
+@external(erlang, "brazier_peer_ffi", "with_long_name_cluster")
+pub fn with_long_name_cluster(
+  count: Int,
+  prefix: String,
+  run: fn(List(Peer)) -> a,
+) -> a
+
+/// Wait on `peer` until its cluster manager has verified `node`, for at
+/// most `timeout_ms`. An error describes why it was not.
+@external(erlang, "brazier_peer_ffi", "await_member")
+pub fn await_member(
+  peer: Peer,
+  node: Node,
+  timeout_ms: Int,
+) -> Result(Nil, String)
 
 /// `with_cluster` with extra command-line arguments for every peer.
 @external(erlang, "brazier_peer_ffi", "with_cluster_args")
@@ -57,7 +96,7 @@ pub fn on(peer: Peer, run: fn() -> a) -> a {
   let outcome = rpc(peer, run)
   // INVARIANT: test helper. A failed remote call means the test cannot
   // continue, so the reason is surfaced as the crash value.
-  let assert Ok(value) = outcome
+  let assert Ok(value) = outcome as "the remote call on the peer failed"
   value
 }
 
@@ -94,7 +133,8 @@ pub fn stop(peer: Peer) -> Nil
 @external(erlang, "brazier_peer_ffi", "partition")
 pub fn partition(a: Peer, b: Peer) -> Nil
 
-/// Undo `partition` and reconnect `a` and `b`.
+/// Undo `partition` and reconnect `a` and `b` (waiting for the peer check
+/// when both run a cluster manager, as `connect` does).
 @external(erlang, "brazier_peer_ffi", "heal")
 pub fn heal(a: Peer, b: Peer) -> Nil
 
@@ -102,7 +142,8 @@ pub fn heal(a: Peer, b: Peer) -> Nil
 @external(erlang, "brazier_peer_ffi", "restore")
 pub fn restore(a: Peer, b: Peer) -> Nil
 
-/// Connect peer `a` to peer `b`.
+/// Connect peer `a` to peer `b`. When both run a cluster manager, returns
+/// once each has verified the other.
 @external(erlang, "brazier_peer_ffi", "connect")
 pub fn connect(a: Peer, b: Peer) -> Result(Nil, String)
 

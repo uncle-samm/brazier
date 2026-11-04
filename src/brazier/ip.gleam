@@ -1,32 +1,102 @@
 /// IP address helpers: trusted-proxy CIDR lists and client address
-/// resolution from `Forwarded` / `X-Forwarded-For`.
+/// resolution from the one forwarding header the operator configured.
 ///
-/// Forwarding headers are only honoured when the socket peer is a trusted
+/// The operator names exactly one header that their proxies set:
+/// `Forwarded` (RFC 7239), `X-Forwarded-For`, or neither. Brazier never
+/// guesses between them: a proxy that rewrites one header passes the other
+/// through from the client untouched, so honouring "whichever is present"
+/// would let the client choose its own address. Plug.RewriteOn likewise
+/// takes an explicit list of the headers to believe, and Rails `RemoteIp`
+/// raises `IpSpoofAttackError` when the two headers disagree.
+///
+/// The configured header is only read when the socket peer is a trusted
 /// proxy. The client address is then the right-most hop that is NOT a
-/// trusted proxy (RFC 7239 section 7.4; the same rule as Plug.RewriteOn /
-/// Rails `remote_ip`). A client can prepend arbitrary hops to the header but
+/// trusted proxy (RFC 7239 section 7.4; the same rule as Rails
+/// `remote_ip`). A client can prepend arbitrary hops to the header but
 /// cannot forge the hops appended by the trusted proxies to their right.
 import brazier/log
 import gleam/list
 import gleam/string
 
-/// A parsed list of trusted proxy networks.
-pub type TrustedProxies
+/// Which forwarding header the trusted proxies set.
+pub type ForwardingHeader {
+  /// RFC 7239 `Forwarded: for=...`.
+  Forwarded
+  /// `X-Forwarded-For: client, proxy1, ...`.
+  XForwardedFor
+  /// No header is read: the socket peer is always the client address.
+  /// Proxies may still be listed: they are exempt from the per-IP
+  /// connection cap, and their `X-Forwarded-Proto` is believed.
+  NoForwardingHeader
+}
+
+/// A parsed list of trusted proxy networks, without a header. The listener
+/// uses it to exempt proxies from the per-IP connection cap.
+pub type ProxyNetworks
+
+/// Trusted proxy networks and the one forwarding header they set.
+pub opaque type TrustedProxies {
+  TrustedProxies(networks: ProxyNetworks, header: ForwardingHeader)
+}
+
+/// The header name, for logs and error messages.
+pub fn forwarding_header_to_string(header: ForwardingHeader) -> String {
+  case header {
+    Forwarded -> "Forwarded"
+    XForwardedFor -> "X-Forwarded-For"
+    NoForwardingHeader -> "none"
+  }
+}
 
 /// Parse trusted proxy entries such as `"10.0.0.0/8"`, `"127.0.0.1"`,
-/// or `"fd00::/8"`. Any invalid entry is an error — a typo in a proxy list
-/// must never silently widen or narrow trust.
+/// or `"fd00::/8"`, with the header those proxies set. Any invalid entry is
+/// an error: a typo in a proxy list must never silently widen or narrow
+/// trust. A header with no proxies is an error too: it would never be read,
+/// and the operator plainly expected it to be.
 pub fn parse_trusted_proxies(
   entries: List(String),
+  header: ForwardingHeader,
 ) -> Result(TrustedProxies, String) {
-  case ffi_parse_cidrs(entries) {
-    Ok(parsed) -> {
-      log.debug(
-        "brazier.ip",
-        "Parsed " <> string.inspect(list.length(entries)) <> " trusted proxies",
-      )
-      Ok(parsed)
+  case parse_proxy_networks(entries), entries, header {
+    Error(reason), _, _ -> Error(reason)
+    Ok(_), [], Forwarded | Ok(_), [], XForwardedFor -> {
+      let reason =
+        "forwarding header "
+        <> forwarding_header_to_string(header)
+        <> " is configured but no trusted proxies are listed, so it would never be read"
+      log.error("brazier.ip", "Invalid trusted proxy configuration: " <> reason)
+      Error(reason)
     }
+    Ok(networks), _, _ -> {
+      let count = string.inspect(list.length(entries))
+      case entries, header {
+        [_, ..], NoForwardingHeader ->
+          log.info(
+            "brazier.ip",
+            count
+              <> " trusted proxies and no forwarding header: the socket peer is always the client address",
+          )
+        _, _ ->
+          log.debug(
+            "brazier.ip",
+            "Parsed "
+              <> count
+              <> " trusted proxies, forwarding header "
+              <> forwarding_header_to_string(header),
+          )
+      }
+      Ok(TrustedProxies(networks: networks, header: header))
+    }
+  }
+}
+
+/// Parse trusted proxy networks without a header, for the listener's
+/// per-IP cap exemption. Any invalid entry is an error.
+pub fn parse_proxy_networks(
+  entries: List(String),
+) -> Result(ProxyNetworks, String) {
+  case ffi_parse_cidrs(entries) {
+    Ok(parsed) -> Ok(parsed)
     Error(reason) -> {
       log.error("brazier.ip", "Invalid trusted proxy list: " <> reason)
       Error(reason)
@@ -34,11 +104,12 @@ pub fn parse_trusted_proxies(
   }
 }
 
-/// An empty trusted proxy list: forwarding headers are never honoured.
+/// No trusted proxies: forwarding headers are never honoured.
 pub fn no_trusted_proxies() -> TrustedProxies {
-  let assert Ok(parsed) = ffi_parse_cidrs([])
+  // Invariant: the FFI only fails on an invalid entry, and there are none.
+  let assert Ok(networks) = ffi_parse_cidrs([])
     as "parsing an empty CIDR list cannot fail"
-  parsed
+  TrustedProxies(networks: networks, header: NoForwardingHeader)
 }
 
 /// Normalize a textual IP address (IPv4-mapped IPv6 becomes IPv4).
@@ -49,7 +120,7 @@ pub fn parse_ip(text: String) -> Result(String, Nil) {
 /// Is the (textual) address inside one of the trusted networks?
 pub fn is_trusted(address: String, trusted: TrustedProxies) -> Bool {
   case ffi_parse_ip_tuple(address) {
-    Ok(tuple) -> ffi_cidrs_match(tuple, trusted)
+    Ok(tuple) -> ffi_cidrs_match(tuple, trusted.networks)
     Error(Nil) -> False
   }
 }
@@ -57,8 +128,10 @@ pub fn is_trusted(address: String, trusted: TrustedProxies) -> Bool {
 /// Resolve the client address for a request.
 ///
 /// `peer` is the socket peer address. `headers` are the request headers
-/// (lower-case names). When the peer is not trusted the headers are ignored.
-/// `Forwarded` takes precedence over `X-Forwarded-For` when present.
+/// (lower-case names). When the peer is not trusted the headers are
+/// ignored. When it is, only the configured header is read. The other
+/// forwarding header is never read; it is logged as a warning, because a
+/// proxy that sets one header passes the other through from the client.
 pub fn client_address(
   peer: String,
   headers: List(#(String, String)),
@@ -67,12 +140,70 @@ pub fn client_address(
   case is_trusted(peer, trusted) {
     False -> peer
     True -> {
-      let hops = case header_values(headers, "forwarded") {
-        [] -> forwarded_for_hops(header_values(headers, "x-forwarded-for"))
-        values -> forwarded_hops(values)
+      let forwarded = header_values(headers, "forwarded")
+      let x_forwarded_for = header_values(headers, "x-forwarded-for")
+      case trusted.header {
+        NoForwardingHeader -> {
+          case forwarded, x_forwarded_for {
+            [], [] -> Nil
+            _, _ ->
+              log.debug(
+                "brazier.ip",
+                "Ignoring forwarding headers from trusted proxy "
+                  <> peer
+                  <> ": no forwarding header is configured",
+              )
+          }
+          peer
+        }
+        Forwarded -> {
+          warn_unconfigured(x_forwarded_for, "X-Forwarded-For", peer)
+          resolve(forwarded_hops(forwarded), peer, trusted)
+        }
+        XForwardedFor -> {
+          warn_unconfigured(forwarded, "Forwarded", peer)
+          resolve(forwarded_for_hops(x_forwarded_for), peer, trusted)
+        }
       }
-      walk_hops(list.reverse(hops), peer, trusted)
     }
+  }
+}
+
+/// A trusted proxy delivered the forwarding header it is not configured to
+/// set, so the client (or a proxy it controls) sent it. It is not read. A
+/// correct deployment never produces this, and Rails treats the same
+/// situation as an IP spoofing attempt, so it is a warning, not debug.
+fn warn_unconfigured(values: List(String), name: String, peer: String) -> Nil {
+  case values {
+    [] -> Nil
+    _ ->
+      log.warning(
+        "brazier.ip",
+        "Ignoring "
+          <> name
+          <> " "
+          <> string.inspect(string.join(values, ", "))
+          <> " from trusted proxy "
+          <> peer
+          <> ": it is not the configured forwarding header (possible spoofing)",
+      )
+  }
+}
+
+fn resolve(hops: List(Hop), peer: String, trusted: TrustedProxies) -> String {
+  case hops {
+    [] -> {
+      log.debug(
+        "brazier.ip",
+        "Trusted proxy "
+          <> peer
+          <> " sent no "
+          <> forwarding_header_to_string(trusted.header)
+          <> " header; it is the client",
+      )
+      peer
+    }
+    _ -> walk_hops(list.reverse(hops), peer, trusted)
   }
 }
 
@@ -187,7 +318,7 @@ fn strip_port(value: String) -> String {
 type IpTuple
 
 @external(erlang, "brazier_ip_ffi", "parse_cidrs")
-fn ffi_parse_cidrs(entries: List(String)) -> Result(TrustedProxies, String)
+fn ffi_parse_cidrs(entries: List(String)) -> Result(ProxyNetworks, String)
 
 @external(erlang, "brazier_ip_ffi", "parse_ip")
 fn ffi_parse_ip(text: String) -> Result(String, Nil)
@@ -196,4 +327,4 @@ fn ffi_parse_ip(text: String) -> Result(String, Nil)
 fn ffi_parse_ip_tuple(text: String) -> Result(IpTuple, Nil)
 
 @external(erlang, "brazier_ip_ffi", "cidrs_match")
-fn ffi_cidrs_match(ip: IpTuple, trusted: TrustedProxies) -> Bool
+fn ffi_cidrs_match(ip: IpTuple, networks: ProxyNetworks) -> Bool

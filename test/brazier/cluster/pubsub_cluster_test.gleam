@@ -22,8 +22,8 @@ const wait_ms = 5000
 /// has.
 pub fn cross_node_delivery_test_() -> peer.Timeout {
   use <- Timeout(60)
-  use peers <- peer.with_cluster(3, "brazier_ps_fanout")
-  let assert [a, b, c] = peers
+  use peers <- peer.with_members(3, "brazier_ps_fanout")
+  let assert [a, b, c] = peers as "the cluster starts three peers"
   start_all(peers)
   await_workers(a, 2)
   let topic = "fanout"
@@ -34,6 +34,7 @@ pub fn cross_node_delivery_test_() -> peer.Timeout {
   // Hold B's forwarding worker so its mailbox can be counted.
   peer.on(b, fn() { suspend_worker(0) })
   let assert Ok(Nil) = peer.on(a, fn() { pubsub.try_broadcast(topic, "hello") })
+    as "pubsub.try_broadcast succeeds"
   assert peer.eventually(
     fn() { peer.on(b, fn() { worker_queue_len(0) }) == 1 },
     wait_ms,
@@ -50,8 +51,8 @@ pub fn cross_node_delivery_test_() -> peer.Timeout {
 /// `local_broadcast` stays on the node it was called on.
 pub fn local_broadcast_stays_local_test_() -> peer.Timeout {
   use <- Timeout(60)
-  use peers <- peer.with_cluster(2, "brazier_ps_local")
-  let assert [a, b] = peers
+  use peers <- peer.with_members(2, "brazier_ps_local")
+  let assert [a, b] = peers as "the cluster starts two peers"
   start_all(peers)
   await_workers(a, 1)
   let topic = "local-only"
@@ -63,8 +64,10 @@ pub fn local_broadcast_stays_local_test_() -> peer.Timeout {
   let assert Ok(Nil) =
     peer.on(a, fn() {
       let assert Ok(Nil) = pubsub.local_broadcast(topic, "local")
+        as "pubsub.local_broadcast succeeds"
       pubsub.try_broadcast(topic, "marker")
     })
+    as "the marker broadcast succeeds"
   assert peer.eventually(
     fn() { all_recorded(a, on_a, ["local", "marker"]) },
     wait_ms,
@@ -76,8 +79,8 @@ pub fn local_broadcast_stays_local_test_() -> peer.Timeout {
 /// connected is an error, not a silent drop.
 pub fn direct_broadcast_remote_test_() -> peer.Timeout {
   use <- Timeout(60)
-  use peers <- peer.with_cluster(3, "brazier_ps_direct")
-  let assert [a, b, c] = peers
+  use peers <- peer.with_members(3, "brazier_ps_direct")
+  let assert [a, b, c] = peers as "the cluster starts three peers"
   start_all(peers)
   await_workers(a, 2)
   let topic = "direct"
@@ -88,8 +91,10 @@ pub fn direct_broadcast_remote_test_() -> peer.Timeout {
   let assert Ok(Nil) =
     peer.on(a, fn() {
       let assert Ok(Nil) = pubsub.direct_broadcast(b_node, topic, "only-b")
+        as "pubsub.direct_broadcast succeeds"
       pubsub.try_broadcast(topic, "marker")
     })
+    as "the marker broadcast succeeds"
   assert peer.eventually(
     fn() { all_recorded(b, on_b, ["only-b", "marker"]) },
     wait_ms,
@@ -99,6 +104,7 @@ pub fn direct_broadcast_remote_test_() -> peer.Timeout {
   // Invalid topics are rejected before anything is sent.
   let assert Error(pubsub.InvalidTopic(_)) =
     peer.on(a, fn() { pubsub.direct_broadcast(b_node, "", "x") })
+    as "pubsub.direct_broadcast returns Error(InvalidTopic)"
 
   let c_node = peer.node(c)
   let c_name = node_name(c_node)
@@ -109,6 +115,7 @@ pub fn direct_broadcast_remote_test_() -> peer.Timeout {
   )
   let assert Error(pubsub.NodeNotConnected(node: reported)) =
     peer.on(a, fn() { pubsub.direct_broadcast(c_node, topic, "lost") })
+    as "pubsub.direct_broadcast returns Error(NodeNotConnected)"
   assert reported == c_name
 }
 
@@ -118,22 +125,25 @@ pub fn direct_broadcast_remote_test_() -> peer.Timeout {
 /// noticed it is gone; the surviving nodes keep receiving.
 pub fn down_node_does_not_break_broadcast_test_() -> peer.Timeout {
   use <- Timeout(60)
-  use peers <- peer.with_cluster(3, "brazier_ps_down")
-  let assert [a, b, c] = peers
+  use peers <- peer.with_members(3, "brazier_ps_down")
+  let assert [a, b, c] = peers as "the cluster starts three peers"
   start_all(peers)
   await_workers(a, 2)
   let topic = "survivors"
   let on_b = peer.on(b, fn() { spawn_recorders(topic, 1) })
   let assert [_] = peer.on(c, fn() { spawn_recorders(topic, 1) })
+    as "spawn_recorders returns a list of one"
 
   peer.crash(c)
   // Straight away: A's pg view may still list C's worker.
   let assert Ok(Nil) = peer.on(a, fn() { pubsub.try_broadcast(topic, "one") })
+    as "pubsub.try_broadcast succeeds"
   assert peer.eventually(
     fn() { peer.on(a, fn() { remote_worker_nodes(0) }) == [peer.node(b)] },
     wait_ms,
   )
   let assert Ok(Nil) = peer.on(a, fn() { pubsub.try_broadcast(topic, "two") })
+    as "pubsub.try_broadcast succeeds"
   assert peer.eventually(
     fn() { all_recorded(b, on_b, ["one", "two"]) },
     wait_ms,
@@ -144,8 +154,8 @@ pub fn down_node_does_not_break_broadcast_test_() -> peer.Timeout {
 /// during the split arrives after it heals, and delivery resumes.
 pub fn netsplit_isolates_and_heals_test_() -> peer.Timeout {
   use <- Timeout(60)
-  use peers <- peer.with_cluster(2, "brazier_ps_split")
-  let assert [a, b] = peers
+  use peers <- peer.with_members(2, "brazier_ps_split")
+  let assert [a, b] = peers as "the cluster starts two peers"
   start_all(peers)
   await_workers(a, 1)
   await_workers(b, 1)
@@ -164,8 +174,10 @@ pub fn netsplit_isolates_and_heals_test_() -> peer.Timeout {
   )
   let assert Ok(Nil) =
     peer.on(a, fn() { pubsub.try_broadcast(topic, "from-a-split") })
+    as "pubsub.try_broadcast succeeds"
   let assert Ok(Nil) =
     peer.on(b, fn() { pubsub.try_broadcast(topic, "from-b-split") })
+    as "pubsub.try_broadcast succeeds"
   assert peer.eventually(
     fn() { all_recorded(a, on_a, ["from-a-split"]) },
     wait_ms,
@@ -180,6 +192,7 @@ pub fn netsplit_isolates_and_heals_test_() -> peer.Timeout {
   await_workers(b, 1)
   let assert Ok(Nil) =
     peer.on(a, fn() { pubsub.try_broadcast(topic, "from-a-healed") })
+    as "pubsub.try_broadcast succeeds"
   assert peer.eventually(
     fn() { all_recorded(b, on_b, ["from-b-split", "from-a-healed"]) },
     wait_ms,
@@ -194,13 +207,14 @@ pub fn netsplit_isolates_and_heals_test_() -> peer.Timeout {
 /// overload (telemetry) and still delivers every message.
 pub fn forward_overload_reported_test_() -> peer.Timeout {
   use <- Timeout(60)
-  use peers <- peer.with_cluster(2, "brazier_ps_overload")
-  let assert [a, b] = peers
+  use peers <- peer.with_members(2, "brazier_ps_overload")
+  let assert [a, b] = peers as "the cluster starts two peers"
   peer.on(a, pubsub.start)
   let assert Ok(Nil) =
     peer.on(b, fn() {
       pubsub.start_with(pubsub.default_config() |> pubsub.max_forward_queue(2))
     })
+    as "pubsub.start_with succeeds"
   await_workers(a, 1)
   let topic = "flood"
   let on_b = peer.on(b, fn() { spawn_recorders(topic, 1) })
@@ -215,6 +229,7 @@ pub fn forward_overload_reported_test_() -> peer.Timeout {
         pubsub.try_broadcast(topic, message)
       })
     })
+    as "list.try_each succeeds"
   assert peer.eventually(
     fn() { peer.on(b, fn() { worker_queue_len(0) }) == 5 },
     wait_ms,
@@ -228,6 +243,7 @@ pub fn forward_overload_reported_test_() -> peer.Timeout {
   // The first message handled saw the other four queued behind it; the
   // report is rate limited, so the rest of the burst adds no events.
   let assert [queue_len] = peer.on(b, counted_events)
+    as "counted_events returns a list of one"
   assert queue_len > 2
 }
 
@@ -236,13 +252,15 @@ pub fn forward_overload_reported_test_() -> peer.Timeout {
 /// restarted partition accepts new subscriptions.
 pub fn partition_kill_stops_subscribers_test_() -> peer.Timeout {
   use <- Timeout(60)
-  use peers <- peer.with_cluster(1, "brazier_ps_partkill")
-  let assert [a] = peers
+  use peers <- peer.with_members(1, "brazier_ps_partkill")
+  let assert [a] = peers as "the cluster starts one peer"
   peer.on(a, pubsub.start)
   let topic = "partition"
   let assert [subscriber] = peer.on(a, fn() { spawn_recorders(topic, 1) })
+    as "spawn_recorders returns a list of one"
   let assert Ok(partition) =
     peer.on(a, fn() { pubsub.partition_for(subscriber) })
+    as "pubsub.partition_for succeeds"
 
   peer.on(a, fn() { kill(partition) })
   assert peer.on(a, fn() { wait_down(subscriber, wait_ms) })
@@ -257,30 +275,56 @@ pub fn partition_kill_stops_subscribers_test_() -> peer.Timeout {
   )
   let on_a = peer.on(a, fn() { spawn_recorders(topic, 1) })
   let assert Ok(Nil) = peer.on(a, fn() { pubsub.try_broadcast(topic, "again") })
+    as "pubsub.try_broadcast succeeds"
   assert peer.eventually(fn() { all_recorded(a, on_a, ["again"]) }, wait_ms)
+}
+
+/// Subscribing while partitions restart (STAB-3). A partition takes its
+/// name only once its tables exist, and `subscribe` checks the name still
+/// names the partition it linked to after its inserts. So a subscriber
+/// racing a restart gets `Ok` or `NotStarted`, never a crash on a missing
+/// table, and no row is left in a restarted partition's tables for a
+/// process that partition is not linked to (such rows would never be
+/// removed). Every partition is killed once, within the restart intensity
+/// (one per partition per 5s).
+pub fn partition_churn_leaves_no_orphan_rows_test_() -> peer.Timeout {
+  use <- Timeout(60)
+  use peers <- peer.with_cluster(1, "brazier_ps_churn")
+  let assert [a] = peers as "with_cluster(1) starts one peer"
+  let config = pubsub.default_config() |> pubsub.partitions(16)
+  let assert Ok(Nil) = peer.on(a, fn() { pubsub.start_with(config) })
+    as "16 partitions is a valid PubSub config"
+  let #(unexpected, rows) =
+    peer.on(a, fn() { partition_churn("churn", 8, 500) })
+  assert unexpected == []
+  assert rows == 0
 }
 
 /// After `pubsub.stop()` a node reports NotStarted for every operation, and
 /// the other nodes stop forwarding to it without failing.
 pub fn stopped_node_reports_not_started_test_() -> peer.Timeout {
   use <- Timeout(60)
-  use peers <- peer.with_cluster(2, "brazier_ps_stopped")
-  let assert [a, b] = peers
+  use peers <- peer.with_members(2, "brazier_ps_stopped")
+  let assert [a, b] = peers as "the cluster starts two peers"
   start_all(peers)
   await_workers(a, 1)
-  let assert Ok(Nil) = peer.on(b, pubsub.stop)
+  let assert Ok(Nil) = peer.on(b, pubsub.stop) as "pubsub.stop succeeds"
 
   let assert Error(pubsub.NotStarted) =
     peer.on(b, fn() { pubsub.try_broadcast("t", "x") })
+    as "pubsub.try_broadcast returns Error(NotStarted)"
   let assert Error(pubsub.NotStarted) =
     peer.on(b, fn() { pubsub.try_subscribe("t") })
+    as "pubsub.try_subscribe returns Error(NotStarted)"
   let assert Error(pubsub.NotStarted) =
     peer.on(b, fn() { pubsub.local_broadcast("t", "x") })
+    as "pubsub.local_broadcast returns Error(NotStarted)"
   assert peer.eventually(
     fn() { peer.on(a, fn() { remote_worker_nodes(0) }) == [] },
     wait_ms,
   )
   let assert Ok(Nil) = peer.on(a, fn() { pubsub.try_broadcast("t", "x") })
+    as "pubsub.try_broadcast succeeds"
   Nil
 }
 
@@ -288,12 +332,13 @@ pub fn stopped_node_reports_not_started_test_() -> peer.Timeout {
 /// broadcast from another node finds no one left to deliver to there.
 pub fn remote_subscriber_exit_cleans_up_test_() -> peer.Timeout {
   use <- Timeout(60)
-  use peers <- peer.with_cluster(2, "brazier_ps_exit")
-  let assert [a, b] = peers
+  use peers <- peer.with_members(2, "brazier_ps_exit")
+  let assert [a, b] = peers as "the cluster starts two peers"
   start_all(peers)
   await_workers(a, 1)
   let topic = "leaving"
   let assert [leaver, stayer] = peer.on(b, fn() { spawn_recorders(topic, 2) })
+    as "spawn_recorders returns a list of two"
   assert peer.on(b, fn() { pubsub.local_subscriber_count(topic) }) == 2
 
   peer.on(b, fn() { kill(leaver) })
@@ -302,6 +347,7 @@ pub fn remote_subscriber_exit_cleans_up_test_() -> peer.Timeout {
     wait_ms,
   )
   let assert Ok(Nil) = peer.on(a, fn() { pubsub.try_broadcast(topic, "hi") })
+    as "pubsub.try_broadcast succeeds"
   assert peer.eventually(fn() { all_recorded(b, [stayer], ["hi"]) }, wait_ms)
 }
 
@@ -311,16 +357,16 @@ pub fn remote_subscriber_exit_cleans_up_test_() -> peer.Timeout {
 /// table did not change, so its watchers must not be told it did.
 pub fn store_notification_is_node_local_test_() -> peer.Timeout {
   use <- Timeout(60)
-  use peers <- peer.with_cluster(2, "brazier_ps_store")
-  let assert [a, b] = peers
+  use peers <- peer.with_members(2, "brazier_ps_store")
+  let assert [a, b] = peers as "the cluster starts two peers"
   start_all(peers)
   await_workers(a, 1)
   let watch = fn() {
     let s: store.Store(String) = store.new("cluster_regression")
     spawn_recorders(store.topic(s), 1)
   }
-  let assert [on_a] = peer.on(a, watch)
-  let assert [on_b] = peer.on(b, watch)
+  let assert [on_a] = peer.on(a, watch) as "watch returns a list of one"
+  let assert [on_b] = peer.on(b, watch) as "watch returns a list of one"
 
   let assert Ok(Nil) =
     peer.on(a, fn() {
@@ -328,6 +374,7 @@ pub fn store_notification_is_node_local_test_() -> peer.Timeout {
       store.put(s, "k", "v")
       pubsub.try_broadcast(store.topic(s), "marker")
     })
+    as "the marker broadcast succeeds"
   // A saw the change notification and the marker; B only the marker.
   assert peer.eventually(
     fn() { peer.on(a, fn() { recorded_count(on_a) }) == 2 },
@@ -353,8 +400,8 @@ pub fn store_notification_is_node_local_test_() -> peer.Timeout {
 /// peers on this host). Reports the median and worst round.
 pub fn fanout_benchmark_test_() -> peer.Timeout {
   use <- Timeout(120)
-  use peers <- peer.with_cluster(3, "brazier_ps_bench")
-  let assert [a, ..] = peers
+  use peers <- peer.with_members(3, "brazier_ps_bench")
+  let assert [a, ..] = peers as "the cluster starts at least one peer"
   start_all(peers)
   await_workers(a, 2)
   let topic = "bench"
@@ -406,6 +453,7 @@ fn bench_rounds(
           let started_os = os_us()
           let started = now_us()
           let assert Ok(Nil) = pubsub.try_broadcast(topic, round)
+            as "pubsub.try_broadcast succeeds"
           #(started_os, now_us() - started)
         })
       assert peer.eventually(
@@ -419,6 +467,7 @@ fn bench_rounds(
       let finished =
         list.fold(peers, 0, fn(latest, p) {
           let assert Ok(at) = peer.on(p, fn() { round_done_at(round) })
+            as "round_done_at succeeds"
           int.max(latest, at)
         })
       bench_rounds(peers, origin, topic, round + 1, rounds, [
@@ -432,11 +481,12 @@ fn bench_rounds(
 fn median(sorted: List(Int)) -> Int {
   let assert Ok(value) =
     list.drop(sorted, list.length(sorted) / 2) |> list.first
+    as "list.drop succeeds"
   value
 }
 
 fn last(sorted: List(Int)) -> Int {
-  let assert Ok(value) = list.last(sorted)
+  let assert Ok(value) = list.last(sorted) as "list.last succeeds"
   value
 }
 
@@ -501,6 +551,13 @@ fn kill(pid: Pid) -> Nil
 
 @external(erlang, "brazier_cluster_test_ffi", "wait_down")
 fn wait_down(pid: Pid, timeout_ms: Int) -> Bool
+
+@external(erlang, "brazier_cluster_test_ffi", "partition_churn")
+fn partition_churn(
+  topic: String,
+  per_round: Int,
+  iterations: Int,
+) -> #(List(String), Int)
 
 @external(erlang, "brazier_cluster_test_ffi", "spawn_counters")
 fn spawn_counters(topic: String, count: Int) -> Int

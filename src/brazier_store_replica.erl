@@ -19,8 +19,14 @@
 %%   delta     broadcast after every local write: {delta, From, Delta}
 %%   digest    broadcast every sync_interval_ms: a hash of the state
 %%   sync_req  "send me your full state": broadcast when the replica starts,
-%%             sent directly on nodeup and when a peer's digest differs
+%%             sent directly once a connected node passes the cluster peer
+%%             check (brazier_cluster_ffi:await_verified/1) and when a
+%%             peer's digest differs
 %%   sync      the reply: the sender's full state
+%%
+%% Only cluster members replicate: PubSub forwards only to and from verified
+%% nodes, and a message whose From is not a verified member is dropped and
+%% logged here as well.
 %%
 %% Deltas are fire and forget: one lost during a partition (or dropped by an
 %% overloaded PubSub forwarder) is repaired by the digest exchange, which
@@ -296,8 +302,20 @@ handle_info(sync_tick, S = #{config := {config, Interval, _, _, _, _}}) ->
 handle_info({brazier_pubsub, Topic, Message}, S = #{topic := Topic}) ->
     {noreply, peer_message(Message, S)};
 handle_info({nodeup, Node}, S) ->
-    brazier_log_ffi:info(<<"brazier.store">>, "Replica ~ts: ~p connected, requesting its state",
-                        [label(S), Node]),
+    %% A connected node is not yet a cluster member: the state is requested
+    %% once the cluster manager has verified it (brazier_cluster_peer_verified).
+    case brazier_cluster_ffi:await_verified(Node) of
+        {ok, nil} ->
+            brazier_log_ffi:info(<<"brazier.store">>, "Replica ~ts: ~p connected, awaiting its peer check",
+                                [label(S), Node]);
+        {error, not_started} ->
+            brazier_log_ffi:warning(<<"brazier.store">>, "Replica ~ts: ~p connected, but no cluster manager "
+                                   "runs here, so it is not replicated to", [label(S), Node])
+    end,
+    {noreply, S};
+handle_info({brazier_cluster_peer_verified, Node}, S) ->
+    brazier_log_ffi:info(<<"brazier.store">>, "Replica ~ts: ~p is a verified cluster member, requesting "
+                        "its state", [label(S), Node]),
     send_direct(S, Node, {brazier_store, sync_req, node()}),
     {noreply, S};
 handle_info({nodedown, Node}, S) ->
@@ -372,16 +390,32 @@ peer_message({brazier_store, _Kind, From}, S) when From =:= node() ->
     S;
 peer_message({brazier_store, _Kind, From, _}, S) when From =:= node() ->
     S;
-peer_message({brazier_store, delta, From, Delta}, S)
+peer_message(Message, S) when is_tuple(Message), tuple_size(Message) >= 3,
+                              element(1, Message) =:= brazier_store ->
+    From = element(3, Message),
+    case is_atom(From) andalso brazier_cluster_ffi:verified(From) of
+        true ->
+            member_message(Message, S);
+        false ->
+            %% PubSub already drops forwards from unverified nodes; this
+            %% check also covers the From a member could put in a message.
+            brazier_log_ffi:warning(<<"brazier.store">>, "Replica ~ts dropped a ~0P from ~0P: not a "
+                                   "verified cluster member", [label(S), element(2, Message), 5, From, 5]),
+            S
+    end;
+peer_message(Message, S) ->
+    unexpected_message(Message, S).
+
+member_message({brazier_store, delta, From, Delta}, S)
   when is_atom(From), element(1, Delta) =:= delta ->
     #{config := {config, _, _, _, MaxDelta, _}} = S,
     merge(S, From, delta, Delta, MaxDelta, fun ?CRDT:join/2);
-peer_message({brazier_store, sync, From, Full}, S)
+member_message({brazier_store, sync, From, Full}, S)
   when is_atom(From), element(1, Full) =:= delta ->
     #{config := {config, _, _, _, _, MaxSync}} = S,
     brazier_log_ffi:debug(<<"brazier.store">>, "Replica ~ts received the state of ~p", [label(S), From]),
     merge(S, From, sync, Full, MaxSync, fun ?CRDT:join_full/2);
-peer_message({brazier_store, digest, From, Digest}, S)
+member_message({brazier_store, digest, From, Digest}, S)
   when is_atom(From), is_binary(Digest) ->
     case state_digest(S) of
         {Digest, S1} ->
@@ -392,7 +426,7 @@ peer_message({brazier_store, digest, From, Digest}, S)
             send_direct(S1, From, {brazier_store, sync_req, node()}),
             S1
     end;
-peer_message({brazier_store, sync_req, From}, S) when is_atom(From) ->
+member_message({brazier_store, sync_req, From}, S) when is_atom(From) ->
     #{crdt := Crdt, config := {config, _, _, _, _, MaxSync}} = S,
     Message = {brazier_store, sync, node(), ?CRDT:to_delta(Crdt)},
     case erlang:external_size(Message) of
@@ -404,7 +438,10 @@ peer_message({brazier_store, sync_req, From}, S) when is_atom(From) ->
             send_direct(S, From, Message),
             S
     end;
-peer_message(Message, S) ->
+member_message(Message, S) ->
+    unexpected_message(Message, S).
+
+unexpected_message(Message, S) ->
     brazier_log_ffi:warning(<<"brazier.store">>, "Replica ~ts received an unexpected replication "
                            "message ~P", [label(S), Message, 20]),
     S.
@@ -526,6 +563,12 @@ send_direct(S = #{topic := Topic}, Node, Message) ->
             %% Retried by the next digest exchange.
             brazier_log_ffi:warning(<<"brazier.store">>, "Replica ~ts could not send a ~p to ~p: not "
                                    "connected", [label(S), element(2, Message), Node]),
+            ok;
+        {error, {node_not_verified, _}} ->
+            %% The peer lost its membership after its message arrived;
+            %% brazier_pubsub_ffi logged the refusal.
+            brazier_log_ffi:warning(<<"brazier.store">>, "Replica ~ts did not send a ~p to ~p: not a "
+                                   "verified cluster member", [label(S), element(2, Message), Node]),
             ok;
         {error, Reason} ->
             brazier_log_ffi:error(<<"brazier.store">>, "Replica ~ts could not send a ~p to ~p: ~p",

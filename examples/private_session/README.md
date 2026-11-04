@@ -18,6 +18,7 @@ The browser integration tests use this example to check that the signing
 key and audit entries never reach the page or the bundle.
 
 ```sh
+export SECRET_KEY="$(openssl rand -base64 48)"   # once per shell
 gleam run -m brazier/build   # first, and after every change
 gleam run -m private_session
 ```

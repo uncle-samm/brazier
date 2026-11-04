@@ -13,7 +13,7 @@ const wait_ms = 10_000
 pub fn peers_form_a_mesh_test_() -> peer.Timeout {
   use <- Timeout(60)
   use peers <- peer.with_cluster(3, "brazier_peer_mesh")
-  let assert [a, b, c] = peers
+  let assert [a, b, c] = peers as "the cluster starts three peers"
   let seen = peer.on(a, nodes)
   assert list.contains(seen, peer.node(b))
   assert list.contains(seen, peer.node(c))
@@ -32,7 +32,7 @@ pub fn failing_body_stops_peers_test_() -> peer.Timeout {
       })
     })
   assert outcome == Error("error")
-  let assert Ok(peers) = process.receive(out, 0)
+  let assert Ok(peers) = process.receive(out, 0) as "process.receive succeeds"
   assert peers != []
   assert all_gone(peers)
 }
@@ -50,6 +50,7 @@ pub fn owner_death_stops_peers_test_() -> peer.Timeout {
       })
     })
   let assert Ok(peers) = process.receive(out, wait_ms)
+    as "process.receive succeeds"
   process.kill(owner)
   assert all_gone(peers)
 }
@@ -59,7 +60,7 @@ pub fn owner_death_stops_peers_test_() -> peer.Timeout {
 pub fn crash_and_stop_take_nodes_down_test_() -> peer.Timeout {
   use <- Timeout(60)
   use peers <- peer.with_cluster(3, "brazier_peer_down")
-  let assert [a, b, c] = peers
+  let assert [a, b, c] = peers as "the cluster starts three peers"
   peer.crash(b)
   assert !peer.alive(b)
   assert peer.eventually(
@@ -69,7 +70,7 @@ pub fn crash_and_stop_take_nodes_down_test_() -> peer.Timeout {
   peer.stop(c)
   assert !peer.alive(c)
   assert peer.eventually(fn() { peer.on(a, nodes) == [] }, wait_ms)
-  let assert Error(_) = peer.rpc(b, node_self)
+  let assert Error(_) = peer.rpc(b, node_self) as "peer.rpc returns Error"
   Nil
 }
 
@@ -78,11 +79,11 @@ pub fn crash_and_stop_take_nodes_down_test_() -> peer.Timeout {
 pub fn partition_and_heal_test_() -> peer.Timeout {
   use <- Timeout(60)
   use peers <- peer.with_cluster(2, "brazier_peer_split")
-  let assert [a, b] = peers
+  let assert [a, b] = peers as "the cluster starts two peers"
   peer.partition(a, b)
   assert peer.eventually(fn() { peer.on(a, nodes) == [] }, wait_ms)
   assert peer.eventually(fn() { peer.on(b, nodes) == [] }, wait_ms)
-  let assert Error(_) = peer.connect(a, b)
+  let assert Error(_) = peer.connect(a, b) as "peer.connect returns Error"
   peer.heal(a, b)
   assert peer.on(a, nodes) == [peer.node(b)]
 }
@@ -91,10 +92,10 @@ pub fn partition_and_heal_test_() -> peer.Timeout {
 pub fn add_peer_joins_on_connect_test_() -> peer.Timeout {
   use <- Timeout(60)
   use peers <- peer.with_cluster(1, "brazier_peer_add")
-  let assert [a] = peers
+  let assert [a] = peers as "the cluster starts one peer"
   let late = peer.add_peer(a, "brazier_peer_late")
   assert peer.on(late, nodes) == []
-  let assert Ok(Nil) = peer.connect(late, a)
+  let assert Ok(Nil) = peer.connect(late, a) as "peer.connect succeeds"
   assert peer.on(a, nodes) == [peer.node(late)]
 }
 

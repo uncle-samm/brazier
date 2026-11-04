@@ -70,6 +70,7 @@ fn fast_config() -> presence.PresenceConfig(String) {
 fn tracker() -> Presence(String) {
   // INVARIANT: fast_config is a valid configuration.
   let assert Ok(tracker) = presence.handle(fast_config())
+    as "presence.handle succeeds"
   tracker
 }
 
@@ -124,6 +125,7 @@ fn start_tracker(p: Peer) -> Nil {
   peer.on(p, fn() {
     pubsub.start()
     let assert Ok(_) = presence.start(fast_config())
+      as "presence.start succeeds"
     Nil
   })
 }
@@ -154,6 +156,7 @@ fn try_session(
 
 fn start_session(p: Peer, user: String, room: Option(String)) -> Session {
   let assert Ok(session) = try_session(p, user, room, in_room)
+    as "try_session succeeds"
   session
 }
 
@@ -217,6 +220,7 @@ fn refs(entries: List(Entry(String))) -> List(String) {
 fn listed(p: Peer, topic: String) -> List(Entry(String)) {
   peer.on(p, fn() {
     let assert Ok(entries) = presence.list(tracker(), topic)
+      as "presence.list succeeds"
     entries
   })
 }
@@ -235,6 +239,7 @@ fn track_on(p: Peer, topic: String, key: String, meta: String) -> Holder {
     let h = holder.start()
     let assert Ok(_) =
       holder.run(h, fn() { presence.track(tracker(), topic, key, meta) })
+      as "presence.track succeeds"
     h
   })
 }
@@ -242,6 +247,7 @@ fn track_on(p: Peer, topic: String, key: String, meta: String) -> Holder {
 fn runtime_pid(session: Session) -> Pid {
   // INVARIANT: a started runtime's subject is owned by its actor.
   let assert Ok(pid) = process.subject_owner(session.runtime)
+    as "process.subject_owner succeeds"
   pid
 }
 
@@ -263,40 +269,43 @@ fn alive(p: Peer, pid: Pid) -> Bool {
 /// knew left.
 pub fn cross_node_joins_and_leaves_test_() -> peer.Timeout {
   use <- Timeout(60)
-  use peers <- peer.with_cluster(2, "brazier_pw_cross")
-  let assert [a, b] = peers
+  use peers <- peer.with_members(2, "brazier_pw_cross")
+  let assert [a, b] = peers as "the cluster starts two peers"
   start_tracker(a)
   start_tracker(b)
 
   let ann = start_session(a, "ann", Some("lobby"))
   let assert Ok([first]) = await_view(a, ann, ["ann=here"])
-  let assert [] = first.leaves
+    as "await_view succeeds"
+  let assert [] = first.leaves as "first.leaves returns an empty list"
 
   let bob = track_on(b, "lobby", "bob", "idle")
   let assert Ok(_) = await_view(a, ann, ["ann=here", "bob=idle"])
+    as "await_view succeeds"
 
   let bea = start_session(b, "bea", Some("lobby"))
   let all = ["ann=here", "bea=here", "bob=idle"]
-  let assert Ok(_) = await_view(b, bea, all)
-  let assert Ok(_) = await_view(a, ann, all)
+  let assert Ok(_) = await_view(b, bea, all) as "await_view succeeds"
+  let assert Ok(_) = await_view(a, ann, all) as "await_view succeeds"
 
   // A state change updates the tracked meta everywhere.
   send(a, ann, SetStatus("away"))
   let away = ["ann=away", "bea=here", "bob=idle"]
-  let assert Ok(_) = await_view(a, ann, away)
-  let assert Ok(_) = await_view(b, bea, away)
-  let assert True = sees(b, "lobby", ["ann", "bea", "bob"])
+  let assert Ok(_) = await_view(a, ann, away) as "await_view succeeds"
+  let assert Ok(_) = await_view(b, bea, away) as "await_view succeeds"
+  assert sees(b, "lobby", ["ann", "bea", "bob"])
 
   // Leaving the room: the others see the leave, the session sees all leave.
   send(b, bea, Leave)
-  let assert Ok(left) = await_view(b, bea, [])
-  let assert [_, ..] = left
+  let assert Ok(left) = await_view(b, bea, []) as "await_view succeeds"
+  let assert [_, ..] = left as "left returns a non-empty list"
   let assert Ok(_) = await_view(a, ann, ["ann=away", "bob=idle"])
-  let assert True = sees(a, "lobby", ["ann", "bob"])
+    as "await_view succeeds"
+  assert sees(a, "lobby", ["ann", "bob"])
 
   // A tracked process exiting leaves too.
   peer.on(b, fn() { holder.kill(bob) })
-  let assert Ok(_) = await_view(a, ann, ["ann=away"])
+  let assert Ok(_) = await_view(a, ann, ["ann=away"]) as "await_view succeeds"
   Nil
 }
 
@@ -304,11 +313,11 @@ pub fn cross_node_joins_and_leaves_test_() -> peer.Timeout {
 /// message per 100.
 pub fn coalesces_queued_diffs_test_() -> peer.Timeout {
   use <- Timeout(60)
-  use peers <- peer.with_cluster(1, "brazier_pw_coalesce")
-  let assert [a] = peers
+  use peers <- peer.with_members(1, "brazier_pw_coalesce")
+  let assert [a] = peers as "the cluster starts one peer"
   start_tracker(a)
   let ann = start_session(a, "ann", Some("lobby"))
-  let assert Ok(_) = await_view(a, ann, ["ann=here"])
+  let assert Ok(_) = await_view(a, ann, ["ann=here"]) as "await_view succeeds"
 
   let holders =
     peer.on(a, fn() {
@@ -321,20 +330,22 @@ pub fn coalesces_queued_diffs_test_() -> peer.Timeout {
           let key = "u" <> string.pad_start(int.to_string(i), 3, "0")
           let assert Ok(_) =
             holder.run(h, fn() { presence.track(tracker(), "lobby", key, "x") })
+            as "presence.track succeeds"
           h
         })
       resume(w)
       holders
     })
-  let assert 150 = list.length(holders)
+  let assert 150 = list.length(holders) as "list.length returns 150"
 
-  let assert Ok(#(first, _)) = next(a, ann)
-  let assert Ok(#(second, online)) = next(a, ann)
+  let assert Ok(#(first, _)) = next(a, ann) as "next succeeds"
+  let assert Ok(#(second, online)) = next(a, ann) as "next succeeds"
   let assert 100 = list.length(flatten(first.joins))
-  let assert 50 = list.length(flatten(second.joins))
-  let assert [] = first.leaves
-  let assert [] = second.leaves
-  let assert 151 = list.length(online)
+    as "list.length returns 100"
+  let assert 50 = list.length(flatten(second.joins)) as "list.length returns 50"
+  let assert [] = first.leaves as "first.leaves returns an empty list"
+  let assert [] = second.leaves as "second.leaves returns an empty list"
+  let assert 151 = list.length(online) as "list.length returns 151"
   Nil
 }
 
@@ -343,34 +354,35 @@ pub fn coalesces_queued_diffs_test_() -> peer.Timeout {
 /// one joined, in one message.
 pub fn retracks_after_shard_restart_test_() -> peer.Timeout {
   use <- Timeout(60)
-  use peers <- peer.with_cluster(2, "brazier_pw_shard")
-  let assert [a, b] = peers
+  use peers <- peer.with_members(2, "brazier_pw_shard")
+  let assert [a, b] = peers as "the cluster starts two peers"
   start_tracker(a)
   start_tracker(b)
   let ann = start_session(a, "ann", Some("lobby"))
-  let assert Ok(_) = await_view(a, ann, ["ann=here"])
-  let assert True = sees(b, "lobby", ["ann"])
-  let assert [old] = refs(listed(a, "lobby"))
+  let assert Ok(_) = await_view(a, ann, ["ann=here"]) as "await_view succeeds"
+  assert sees(b, "lobby", ["ann"])
+  let assert [old] = refs(listed(a, "lobby")) as "refs returns a list of one"
 
   let old_shard =
     peer.on(a, fn() {
       let assert Ok(shard) = presence.shard_pid(tracker(), "lobby")
+        as "presence.shard_pid succeeds"
       process.kill(shard)
       shard
     })
-  let assert Ok(#(diff, online)) = next(a, ann)
-  let assert [new] = refs(diff.joins)
-  let assert [left] = refs(diff.leaves)
-  let assert True = left == old
-  let assert True = new != old
-  let assert True = refs(online) == [new]
+  let assert Ok(#(diff, online)) = next(a, ann) as "next succeeds"
+  let assert [new] = refs(diff.joins) as "refs returns a list of one"
+  let assert [left] = refs(diff.leaves) as "refs returns a list of one"
+  assert left == old
+  assert new != old
+  assert refs(online) == [new]
 
   let assert Ok(new_shard) =
     peer.on(a, fn() { presence.shard_pid(tracker(), "lobby") })
-  let assert True = new_shard != old_shard
-  let assert True = refs(listed(a, "lobby")) == [new]
-  let assert True =
-    peer.eventually(fn() { refs(listed(b, "lobby")) == [new] }, wait_ms)
+    as "presence.shard_pid succeeds"
+  assert new_shard != old_shard
+  assert refs(listed(a, "lobby")) == [new]
+  assert peer.eventually(fn() { refs(listed(b, "lobby")) == [new] }, wait_ms)
   Nil
 }
 
@@ -378,24 +390,24 @@ pub fn retracks_after_shard_restart_test_() -> peer.Timeout {
 /// every node, and its watcher is gone.
 pub fn cleanup_when_runtime_dies_test_() -> peer.Timeout {
   use <- Timeout(60)
-  use peers <- peer.with_cluster(2, "brazier_pw_cleanup")
-  let assert [a, b] = peers
+  use peers <- peer.with_members(2, "brazier_pw_cleanup")
+  let assert [a, b] = peers as "the cluster starts two peers"
   start_tracker(a)
   start_tracker(b)
   let ann = start_session(a, "ann", Some("lobby"))
   let amy = start_session(a, "amy", Some("lobby"))
-  let assert True = sees(b, "lobby", ["amy", "ann"])
+  assert sees(b, "lobby", ["amy", "ann"])
   let #(ann_watcher, amy_watcher) =
     peer.on(a, fn() { #(watcher(ann), watcher(amy)) })
 
   peer.on(a, fn() { process.kill(runtime_pid(ann)) })
-  let assert True = sees(b, "lobby", ["amy"])
-  let assert True = peer.eventually(fn() { !alive(a, ann_watcher) }, wait_ms)
+  assert sees(b, "lobby", ["amy"])
+  assert peer.eventually(fn() { !alive(a, ann_watcher) }, wait_ms)
 
   peer.on(a, fn() { process.send(amy.runtime, runtime.Shutdown) })
-  let assert True = sees(b, "lobby", [])
-  let assert True = sees(a, "lobby", [])
-  let assert True = peer.eventually(fn() { !alive(a, amy_watcher) }, wait_ms)
+  assert sees(b, "lobby", [])
+  assert sees(a, "lobby", [])
+  assert peer.eventually(fn() { !alive(a, amy_watcher) }, wait_ms)
   Nil
 }
 
@@ -403,20 +415,21 @@ pub fn cleanup_when_runtime_dies_test_() -> peer.Timeout {
 /// runtime with `brazier_pubsub_down`.
 pub fn stops_when_pubsub_partition_dies_test_() -> peer.Timeout {
   use <- Timeout(60)
-  use peers <- peer.with_cluster(1, "brazier_pw_pubsub")
-  let assert [a] = peers
+  use peers <- peer.with_members(1, "brazier_pw_pubsub")
+  let assert [a] = peers as "the cluster starts one peer"
   start_tracker(a)
   let ann = start_session(a, "ann", Some("lobby"))
-  let assert Ok(_) = await_view(a, ann, ["ann=here"])
+  let assert Ok(_) = await_view(a, ann, ["ann=here"]) as "await_view succeeds"
 
   let reason =
     peer.on(a, fn() {
       let assert Ok(partition) = pubsub.partition_for(watcher(ann))
+        as "pubsub.partition_for succeeds"
       process.kill(partition)
       await_exit(runtime_pid(ann), receive_ms)
     })
-  let assert Ok(reason) = reason
-  let assert True = string.contains(reason, "brazier_pubsub_down")
+  let assert Ok(reason) = reason as "the runtime exited within the wait"
+  assert string.contains(reason, "brazier_pubsub_down")
   Nil
 }
 
@@ -424,13 +437,14 @@ pub fn stops_when_pubsub_partition_dies_test_() -> peer.Timeout {
 /// the runtime's start and leave nothing tracked.
 pub fn refused_trackings_fail_the_start_test_() -> peer.Timeout {
   use <- Timeout(60)
-  use peers <- peer.with_cluster(1, "brazier_pw_refused")
-  let assert [a] = peers
+  use peers <- peer.with_members(1, "brazier_pw_refused")
+  let assert [a] = peers as "the cluster starts one peer"
   start_tracker(a)
 
   let assert Error(error.RuntimeError(reason)) =
     try_session(a, "", Some("lobby"), in_room)
-  let assert True = string.contains(reason, "presence")
+    as "try_session returns Error(RuntimeError)"
+  assert string.contains(reason, "presence")
 
   let twice = fn(_model) {
     [
@@ -440,10 +454,11 @@ pub fn refused_trackings_fail_the_start_test_() -> peer.Timeout {
   }
   let assert Error(error.RuntimeError(reason)) =
     try_session(a, "ann", Some("lobby"), twice)
-  let assert True = string.contains(reason, "presence")
-  let assert True = string.contains(reason, "twice")
+    as "try_session returns Error(RuntimeError)"
+  assert string.contains(reason, "presence")
+  assert string.contains(reason, "twice")
 
-  let assert [] = keys(a, "lobby")
+  let assert [] = keys(a, "lobby") as "keys returns an empty list"
   Nil
 }
 
@@ -451,14 +466,14 @@ pub fn refused_trackings_fail_the_start_test_() -> peer.Timeout {
 /// `brazier_presence_down` once the retries run out.
 pub fn stops_when_tracker_never_starts_test_() -> peer.Timeout {
   use <- Timeout(60)
-  use peers <- peer.with_cluster(1, "brazier_pw_down")
-  let assert [a] = peers
+  use peers <- peer.with_members(1, "brazier_pw_down")
+  let assert [a] = peers as "the cluster starts one peer"
   peer.on(a, fn() { pubsub.start() })
   let ann = start_session(a, "ann", Some("lobby"))
 
   let reason = peer.on(a, fn() { await_exit(runtime_pid(ann), 9000) })
-  let assert Ok(reason) = reason
-  let assert True = string.contains(reason, "brazier_presence_down")
+  let assert Ok(reason) = reason as "the runtime exited within the wait"
+  assert string.contains(reason, "brazier_presence_down")
   Nil
 }
 
