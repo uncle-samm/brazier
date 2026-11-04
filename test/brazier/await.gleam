@@ -168,10 +168,12 @@ fn watch_info_ffi(pid: Pid, message: String) -> Result(InfoWatch, String)
 @external(erlang, "brazier_await_ffi", "next_info")
 fn next_info_ffi(watch: InfoWatch, timeout_ms: Int) -> Result(Nil, Nil)
 
-/// Watch for the sys-compliant process `pid` (a gen_server or gleam_otp
-/// actor) receiving the plain atom message `message`, such as a periodic
-/// timer tick, through the OTP sys debug hook. Use it to wait for a timer
-/// to fire instead of sleeping past its interval. The atom must exist.
+/// Watch for the sys-compliant process `pid` (a gen_server or gen_statem)
+/// receiving the plain atom message `message`, such as a periodic timer
+/// tick, through the OTP sys debug hook. Use it to wait for a timer to fire
+/// instead of sleeping past its interval. The atom must exist. Not for a
+/// gleam_otp actor: gleam_otp 1.3 discards sys debug requests, so the
+/// install times out and this panics.
 pub fn watch_info(pid: Pid, message: String) -> InfoWatch {
   case watch_info_ffi(pid, message) {
     Ok(watch) -> watch
@@ -351,6 +353,16 @@ pub fn expect_pg_leave(watch: ScopeWatch, pid: Pid, what: String) -> Nil {
 /// End the subscription and drop its pending notices.
 pub fn unwatch_pg_scope(watch: ScopeWatch) -> Nil {
   unwatch_pg_scope_ffi(watch)
+}
+
+/// `watch_pg_scope` scoped to `run`: the subscription ends when `run`
+/// returns or crashes, so a failing test never leaves pg sending this
+/// (shared eunit) process join and leave notices. Prefer it to
+/// `watch_pg_scope` plus `unwatch_pg_scope`.
+pub fn with_watch_pg_scope(scope: String, run: fn(ScopeWatch) -> a) -> a {
+  let watch = watch_pg_scope(scope)
+  use <- with_cleanup(fn() { unwatch_pg_scope(watch) })
+  run(watch)
 }
 
 /// Return once `condition` holds, re-checking it each time one of `events`

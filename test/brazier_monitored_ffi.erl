@@ -3,7 +3,29 @@
 %% Test processes whose monitor cannot race their exit, and test bodies run
 %% in a process of their own (see test/brazier/monitored.gleam).
 
--export([isolated/1, with_cleanup/2, format_term/1]).
+-export([isolated/1, with_cleanup/2, format_term/1, send_through_alias/3,
+         close_alias/2]).
+
+%% monitored.listening's forwarding (see test/brazier/monitored.gleam): the
+%% handler sends {Tag, Event} to an alias of the subject's owner, so the
+%% owner receives it on the subject as from process.send.
+send_through_alias(Alias, {subject, _Owner, Tag}, Event) ->
+    erlang:send(Alias, {Tag, Event}),
+    nil.
+
+%% After unalias/1 the runtime drops every message sent to Alias, so once
+%% the events already queued are removed none can arrive later. Runs in the
+%% alias's owner, the only process allowed to unalias it.
+close_alias(Alias, {subject, Owner, Tag}) ->
+    Owner = self(),
+    true = erlang:unalias(Alias),
+    flush_tag(Tag).
+
+flush_tag(Tag) ->
+    receive
+        {Tag, _Event} -> flush_tag(Tag)
+    after 0 -> nil
+    end.
 
 %% Run Fun, then Cleanup, whether Fun returned or raised (ExUnit's
 %% on_exit/1). Fun's exception is re-raised unchanged after Cleanup.

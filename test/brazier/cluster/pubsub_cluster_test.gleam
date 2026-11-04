@@ -433,22 +433,15 @@ fn bench_rounds(
             as "pubsub.try_broadcast succeeds"
           #(started_os, now_us() - started)
         })
-      // Polls: the counters (brazier_cluster_test_ffi) store when a round
-      // completes and tell no one, and a counter that sent a notice would
-      // put that send on the path being measured. The poll only paces the
-      // rounds; the times are the ones the counters stored.
-      assert peer.eventually(
-        fn() {
-          list.all(peers, fn(p) {
-            peer.on(p, fn() { round_done_at(round) }) != Error(Nil)
-          })
-        },
-        30_000,
-      )
+      // The counter that completes a round on a peer stores the time and
+      // then tells the waiter (brazier_cluster_test_ffi:await_round/2), so
+      // the notice is not on the path being measured; the times are the
+      // ones the counters stored.
       let finished =
         list.fold(peers, 0, fn(latest, p) {
-          let assert Ok(at) = peer.on(p, fn() { round_done_at(round) })
-            as "round_done_at succeeds"
+          let assert Ok(at) =
+            peer.on_within(p, 35_000, fn() { await_round(round, 30_000) })
+            as "every peer completes the round"
           int.max(latest, at)
         })
       bench_rounds(peers, origin, topic, round + 1, rounds, [
@@ -585,8 +578,8 @@ fn partition_churn(
 @external(erlang, "brazier_cluster_test_ffi", "spawn_counters")
 fn spawn_counters(topic: String, count: Int) -> Int
 
-@external(erlang, "brazier_cluster_test_ffi", "round_done_at")
-fn round_done_at(round: Int) -> Result(Int, Nil)
+@external(erlang, "brazier_cluster_test_ffi", "await_round")
+fn await_round(round: Int, timeout_ms: Int) -> Result(Int, Nil)
 
 @external(erlang, "brazier_cluster_test_ffi", "os_us")
 fn os_us() -> Int

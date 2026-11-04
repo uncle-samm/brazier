@@ -137,12 +137,46 @@ pub fn with_handler(
 
 /// `with_handler` with a fresh handler id and a handler that forwards every
 /// event to a subject owned by the calling process, which `run` receives.
+///
+/// No event outlives the scope in the caller's mailbox. eunit runs every
+/// test of every module in one process, so an event left unreceived (an
+/// accepted upgrade the test did not assert on) once reached a later
+/// module's test. The handler sends through a process alias, and the
+/// cleanup, after the detach, deactivates the alias and removes the scope's
+/// events still in the mailbox. An emitter that looked the handler up
+/// before the detach and sends after it sends to an inactive alias, which
+/// the runtime drops: the pattern OTP uses for late `gen_server:call`
+/// replies, as `erlang:demonitor(Ref, [flush])` is for a late DOWN.
 pub fn listening(names: List(List(String)), run: fn(Subject(Event)) -> a) -> a {
   let id = "brazier_listening_" <> int.to_string(unique_integer())
   let events = process.new_subject()
-  use <- with_handler(id, names, fn(event) { process.send(events, event) })
+  let alias = new_alias()
+  // Registered first, so it runs after with_handler's detach.
+  use <- with_cleanup(fn() { close_alias(alias, events) })
+  use <- with_handler(id, names, fn(event) {
+    send_through_alias(alias, events, event)
+  })
   run(events)
 }
+
+/// A process alias (`erlang:alias/0`) of the calling process.
+type Alias
+
+@external(erlang, "erlang", "alias")
+fn new_alias() -> Alias
+
+/// Send `event` on `subject`'s tag to the alias instead of the owner's pid.
+@external(erlang, "brazier_monitored_ffi", "send_through_alias")
+fn send_through_alias(
+  alias: Alias,
+  subject: Subject(Event),
+  event: Event,
+) -> Nil
+
+/// Deactivate `alias` and remove the messages on `subject`'s tag already in
+/// the mailbox. Crashes if the alias was not active.
+@external(erlang, "brazier_monitored_ffi", "close_alias")
+fn close_alias(alias: Alias, subject: Subject(Event)) -> Nil
 
 /// Cleanup for a test that detaches handler `id` itself (to check detach,
 /// or because telemetry detached a crashing handler): detach it if the body

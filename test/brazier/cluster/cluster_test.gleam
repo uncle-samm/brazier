@@ -15,6 +15,7 @@ import gleam/erlang/node.{type Node}
 import gleam/erlang/process.{type Pid}
 import gleam/erlang/reference.{type Reference}
 import gleam/list
+import gleam/otp/actor
 import gleam/otp/static_supervisor as supervisor
 import gleam/string
 
@@ -41,8 +42,8 @@ pub fn static_connects_and_verifies_test_() -> peer.Timeout {
   record_cluster_events([a, b])
   start_on(b, cluster.new(cluster.NoDiscovery))
   start_on(a, cluster.new(cluster.Static([name(a), name(b)])))
-  assert peer.eventually(fn() { members(a) == [peer.node(b)] }, wait_ms)
-  assert peer.eventually(fn() { members(b) == [peer.node(a)] }, wait_ms)
+  assert peer.await_members(a, [peer.node(b)], wait_ms) == Ok(Nil)
+  assert peer.await_members(b, [peer.node(a)], wait_ms) == Ok(Nil)
   assert has_event(a, "brazier.cluster.node.up", name(b), "connected")
   assert has_event(b, "brazier.cluster.node.up", name(a), "connected")
 }
@@ -60,25 +61,21 @@ pub fn static_target_reconnects_after_netsplit_test_() -> peer.Timeout {
     cluster.new(cluster.Static([name(b)]))
       |> cluster.connect_backoff(initial_ms: 20, max_ms: 100),
   )
-  assert peer.eventually(fn() { members(a) == [peer.node(b)] }, wait_ms)
+  assert peer.await_members(a, [peer.node(b)], wait_ms) == Ok(Nil)
 
   peer.partition(a, b)
-  assert peer.eventually(fn() { members(a) == [] }, wait_ms)
-  assert peer.eventually(
-    fn() {
-      list.any(events(a), is_event(_, "brazier.cluster.node.down", name(b)))
-    },
-    wait_ms,
-  )
+  assert peer.await_members(a, [], wait_ms) == Ok(Nil)
+  assert await_events(a, fn(events) {
+    list.any(events, is_event(_, "brazier.cluster.node.down", name(b)))
+  })
   // At least two failed attempts: the target is retried, not given up on.
-  assert peer.eventually(
-    fn() { count_events(a, "brazier.cluster.connect.failed", name(b)) >= 2 },
-    wait_ms,
-  )
+  assert await_events(a, fn(events) {
+    count_node(events, "brazier.cluster.connect.failed", name(b)) >= 2
+  })
 
   peer.restore(a, b)
-  assert peer.eventually(fn() { members(a) == [peer.node(b)] }, wait_ms)
-  assert peer.eventually(fn() { members(b) == [peer.node(a)] }, wait_ms)
+  assert peer.await_members(a, [peer.node(b)], wait_ms) == Ok(Nil)
+  assert peer.await_members(b, [peer.node(a)], wait_ms) == Ok(Nil)
 }
 
 // --- DNS discovery ---
@@ -102,8 +99,8 @@ pub fn dns_discovery_connects_test_() -> peer.Timeout {
         }
       }),
   )
-  assert peer.eventually(fn() { members(a) == [peer.node(b)] }, wait_ms)
-  assert peer.eventually(fn() { members(b) == [peer.node(a)] }, wait_ms)
+  assert peer.await_members(a, [peer.node(b)], wait_ms) == Ok(Nil)
+  assert peer.await_members(b, [peer.node(a)], wait_ms) == Ok(Nil)
 }
 
 /// Lookup failures, hung lookups, crashing resolvers and oversized answers
@@ -133,10 +130,9 @@ pub fn dns_failures_are_reported_test_() -> peer.Timeout {
     let #(config, reason) = c
     start_on(a, config)
     // Two reports: the first failure, and a later poll that ran after it.
-    assert peer.eventually(
-      fn() { count_reason(a, "brazier.cluster.connect.failed", reason) >= 2 },
-      wait_ms,
-    )
+    assert await_events(a, fn(events) {
+      count_reason(events, "brazier.cluster.connect.failed", reason) >= 2
+    })
     let assert Ok(Nil) = peer.on(a, cluster.stop) as "cluster.stop succeeds"
     Nil
   })
@@ -161,13 +157,14 @@ pub fn dns_entries_that_are_not_addresses_make_no_atoms_test_() -> peer.Timeout 
       |> cluster.dns_resolver(fn(_) { Ok(answer) }),
   )
   // Reported on every poll, not just once.
-  assert peer.eventually(
-    fn() {
-      count_reason(a, "brazier.cluster.connect.failed", "{invalid_addresses,3}")
-      >= 2
-    },
-    wait_ms,
-  )
+  assert await_events(a, fn(events) {
+    count_reason(
+      events,
+      "brazier.cluster.connect.failed",
+      "{invalid_addresses,3}",
+    )
+    >= 2
+  })
   let made = fn(host) { peer.on(a, fn() { atom_exists("dnsbad@" <> host) }) }
   assert made("192.0.2.10")
   assert made("::1")
@@ -195,24 +192,24 @@ pub fn dns_node_names_are_capped_for_the_life_of_the_vm_test_() -> peer.Timeout 
       peer.on(a, fn() { atom_exists("dnscap@" <> host) })
     })
   }
-  let refused = fn() {
+  let refused = fn(events) {
     count_reason(
-      a,
+      events,
       "brazier.cluster.connect.failed",
       "{max_discovered_nodes,3,2}",
     )
   }
 
   start_on(a, config)
-  assert peer.eventually(fn() { refused() >= 2 }, wait_ms)
+  assert await_events(a, fn(events) { refused(events) >= 2 })
   assert made() == 3
 
   let assert Ok(Nil) = peer.on(a, cluster.stop)
     as "the manager started above is running"
-  let before = refused()
+  let before = refused(events(a))
   start_on(a, config)
   // The new manager still refuses the two names past the cap.
-  assert peer.eventually(fn() { refused() >= before + 2 }, wait_ms)
+  assert await_events(a, fn(events) { refused(events) >= before + 2 })
   assert made() == 3
 }
 
@@ -279,8 +276,14 @@ pub fn stale_peer_check_timer_is_ignored_test_() -> peer.Timeout {
   // nodedown, nodeup, then the first connection's timer, queued in order.
   peer.on(a, manager_suspend)
   peer.on(a, fn() { reconnect(node_b) })
-  assert peer.eventually(
-    fn() { peer.on(a, fn() { nodeup_queued(node_b) }) },
+  // a's manager is suspended, so it announces nothing: wake on each
+  // message its mailbox receives, and read the queue.
+  let assert Ok(manager) = peer.on(a, fn() { registered("brazier_cluster") })
+    as "a's manager is registered"
+  assert peer.until(
+    a,
+    peer.receives(manager),
+    fn() { nodeup_queued(node_b) },
     wait_ms,
   )
   peer.on(a, fn() { send_check_timeout(first, node_b) })
@@ -302,8 +305,8 @@ pub fn stale_peer_check_timer_is_ignored_test_() -> peer.Timeout {
   assert second != first
 
   peer.on(b, manager_resume)
-  assert peer.eventually(fn() { members(a) == [node_b] }, wait_ms)
-  assert peer.eventually(fn() { members(b) == [peer.node(a)] }, wait_ms)
+  assert peer.await_members(a, [node_b], wait_ms) == Ok(Nil)
+  assert peer.await_members(b, [peer.node(a)], wait_ms) == Ok(Nil)
   assert count_events(a, "brazier.cluster.peer.rejected", name(b)) == 0
   assert count_events(b, "brazier.cluster.peer.rejected", name(a)) == 0
 }
@@ -322,12 +325,9 @@ pub fn silent_peer_is_rejected_and_can_pass_later_test_() -> peer.Timeout {
     cluster.new(cluster.NoDiscovery)
       |> cluster.peer_check_timeout(100),
   )
-  assert peer.eventually(
-    fn() {
-      has_event(a, "brazier.cluster.peer.rejected", name(b), "no hello within")
-    },
-    wait_ms,
-  )
+  assert await_events(a, fn(events) {
+    has(events, "brazier.cluster.peer.rejected", name(b), "no hello within")
+  })
   assert peer.on(a, fn() { peer_status(peer.node(b)) }) == "rejected"
   assert members(a) == []
   assert peer.on(a, nodes) == [peer.node(b)]
@@ -457,22 +457,27 @@ pub fn supervised_manager_restarts_test_() -> peer.Timeout {
   let assert [a, b] = peers as "the cluster starts two peers"
   start_on(b, cluster.new(cluster.NoDiscovery))
   let config = cluster.new(cluster.NoDiscovery)
-  peer.on(a, fn() { start_supervised(config) })
-  assert peer.eventually(fn() { members(a) == [peer.node(b)] }, wait_ms)
+  let sup = peer.on(a, fn() { start_supervised(config) })
+  assert peer.await_members(a, [peer.node(b)], wait_ms) == Ok(Nil)
 
   let assert Ok(first) = peer.on(a, fn() { registered("brazier_cluster") })
     as "registered succeeds"
   peer.on(a, fn() { kill(first) })
-  assert peer.eventually(
+  // The supervisor restarts the manager while handling the 'EXIT', and
+  // then receives the new manager's start ack, which comes after the name
+  // is registered (gen_server registers it before init).
+  assert peer.until(
+    a,
+    peer.receives(sup),
     fn() {
-      case peer.on(a, fn() { registered("brazier_cluster") }) {
+      case registered("brazier_cluster") {
         Ok(pid) -> pid != first
         Error(Nil) -> False
       }
     },
     wait_ms,
   )
-  assert peer.eventually(fn() { members(a) == [peer.node(b)] }, wait_ms)
+  assert peer.await_members(a, [peer.node(b)], wait_ms) == Ok(Nil)
   // The restart did not disconnect anyone.
   assert peer.on(a, nodes) == [peer.node(b)]
 }
@@ -489,23 +494,22 @@ fn start_with(p: Peer, config: cluster.ClusterConfig, key: String) -> Nil {
 }
 
 /// Start a supervisor that owns the manager, in a process that outlives
-/// the rpc call.
-fn start_supervised(config: cluster.ClusterConfig) -> Nil {
+/// the rpc call, and return the supervisor.
+fn start_supervised(config: cluster.ClusterConfig) -> Pid {
   let ready = process.new_subject()
   process.spawn_unlinked(fn() {
     let assert Ok(child) = cluster.supervised(config, secret_key: secret)
       as "cluster.supervised succeeds"
-    let assert Ok(_) =
+    let assert Ok(actor.Started(pid: sup, ..)) =
       supervisor.new(supervisor.OneForOne)
       |> supervisor.add(child)
       |> supervisor.start
       as "supervisor.new succeeds"
-    process.send(ready, Nil)
+    process.send(ready, sup)
     process.sleep_forever()
   })
-  let assert Ok(Nil) = process.receive(ready, 5000)
-    as "process.receive succeeds"
-  Nil
+  let assert Ok(sup) = process.receive(ready, 5000) as "the supervisor started"
+  sup
 }
 
 fn members(p: Peer) -> List(Node) {
@@ -539,6 +543,20 @@ fn events(p: Peer) -> List(Event) {
   peer.on(p, recorded_events)
 }
 
+/// Wait on `p` until its recorded events satisfy `holds`, rechecking after
+/// each event its recorder records.
+fn await_events(p: Peer, holds: fn(List(Event)) -> Bool) -> Bool {
+  peer.until(p, recorder_changes(), fn() { holds(recorded_events()) }, wait_ms)
+}
+
+/// Wake on each event the peer's recorder (record_cluster_events) records.
+fn recorder_changes() -> peer.Wake {
+  fn() {
+    let watch = watch_recorded()
+    fn() { unwatch_recorded(watch) }
+  }
+}
+
 fn is_event(e: Event, event_name: String, node_name: String) -> Bool {
   e.name == event_name && e.node == node_name
 }
@@ -549,17 +567,38 @@ fn has_event(
   node_name: String,
   reason: String,
 ) -> Bool {
-  list.any(events(p), fn(e) {
+  has(events(p), event_name, node_name, reason)
+}
+
+fn has(
+  events: List(Event),
+  event_name: String,
+  node_name: String,
+  reason: String,
+) -> Bool {
+  list.any(events, fn(e) {
     is_event(e, event_name, node_name) && string.contains(e.reason, reason)
   })
 }
 
 fn count_events(p: Peer, event_name: String, node_name: String) -> Int {
-  list.count(events(p), is_event(_, event_name, node_name))
+  count_node(events(p), event_name, node_name)
 }
 
-fn count_reason(p: Peer, event_name: String, reason: String) -> Int {
-  list.count(events(p), fn(e) {
+fn count_node(
+  events: List(Event),
+  event_name: String,
+  node_name: String,
+) -> Int {
+  list.count(events, is_event(_, event_name, node_name))
+}
+
+fn count_reason(
+  events: List(Event),
+  event_name: String,
+  reason: String,
+) -> Int {
+  list.count(events, fn(e) {
     e.name == event_name && string.contains(e.reason, reason)
   })
 }
@@ -588,6 +627,15 @@ fn record_events(names: List(List(String))) -> Nil
 
 @external(erlang, "brazier_cluster_test_ffi", "recorded_events")
 fn recorded_events() -> List(Event)
+
+/// A subscription to the recorder's notices (watch_recorded/0).
+type RecorderWatch
+
+@external(erlang, "brazier_cluster_test_ffi", "watch_recorded")
+fn watch_recorded() -> RecorderWatch
+
+@external(erlang, "brazier_cluster_test_ffi", "unwatch_recorded")
+fn unwatch_recorded(watch: RecorderWatch) -> Nil
 
 @external(erlang, "brazier_cluster_test_ffi", "putenv")
 fn putenv(name: String, value: String) -> Nil

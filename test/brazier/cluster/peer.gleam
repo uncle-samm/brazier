@@ -27,6 +27,7 @@
 
 import brazier/await
 import brazier/monitored
+import brazier/pubsub
 import brazier/telemetry
 import gleam/erlang/node.{type Node}
 import gleam/erlang/process.{type Pid}
@@ -78,6 +79,19 @@ pub fn with_long_name_cluster(
 pub fn await_member(
   peer: Peer,
   node: Node,
+  timeout_ms: Int,
+) -> Result(Nil, String)
+
+/// Wait on `peer` until its cluster manager's members are exactly
+/// `expected` (in any order), for at most `timeout_ms`: a node joining when
+/// the manager verifies it, a node leaving when it goes down or is
+/// rejected. The wait is message-driven (the manager tells waiters about
+/// verifications, and emits an event for each removal). An error names the
+/// members the peer had when the time ran out.
+@external(erlang, "brazier_peer_ffi", "await_members")
+pub fn await_members(
+  peer: Peer,
+  expected: List(Node),
   timeout_ms: Int,
 ) -> Result(Nil, String)
 
@@ -286,6 +300,18 @@ pub fn info(pid: Pid, message: String) -> Wake {
         False -> Nil
       }
     }
+  }
+}
+
+/// Wake on every broadcast to the PubSub `topic` delivered on the peer,
+/// for state whose owner announces each change on a topic after making
+/// it (a replicated store's `store.topic`, a presence tracker's diffs).
+/// The waiting process subscribes; local delivery is synchronous, so the
+/// subscription is in place before the first check.
+pub fn broadcasts(topic: pubsub.Topic) -> Wake {
+  fn() {
+    pubsub.subscribe(topic)
+    fn() { pubsub.unsubscribe(topic) }
   }
 }
 

@@ -154,7 +154,7 @@ measurements: `system_time` and `monotonic_time` on start, `duration` and
 | `[brazier, effect, after, rejected]` | none | `limit` | yes, `brazier/effect` |
 | `[brazier, effect, background, rejected]` | none | `limit` | yes, `brazier/effect` |
 | `[brazier, store, write]` | `count` | `store`, `op`, `mode`: `local` or `replicated` | yes, `brazier/store` |
-| `[brazier, store, sync]` S | `entries`, `bytes` (stop) | `store`, `peer` | yes, `brazier_store_replica` (replicated stores) |
+| `[brazier, store, sync]` S | `entries`, `bytes` (stop) | `store`, `peer`; `result`, `reason` (stop) | yes, `brazier_store_replica` (replicated stores) |
 | `[brazier, session, created \| revoked \| expired \| contention]` | `count` | `reason` | yes, `brazier/session` |
 | `[brazier, pubsub, broadcast]` | `local_subscribers`, `remote_nodes` | `scope`: `cluster`, `local` or `direct` | yes |
 | `[brazier, pubsub, forward, overloaded]` | `queue_len` | `shard` | yes, at most once per second per worker |
@@ -280,8 +280,19 @@ Notes on individual events:
   refused by a replicated store's limits emits nothing.
 - `[brazier, store, sync]` wraps every remote merge into a replicated
   store, accepted or refused. `entries` and `bytes` describe the payload,
-  and `peer` is the sending node. A payload refused as malformed reports
-  `entries` 0. See
+  and `peer` is the sending node. The stop event's `result` says how the
+  merge ended, and `reason` why:
+
+  | `result` | `reason` |
+  |----------|----------|
+  | `ok` | `none` |
+  | `malformed` | the field that failed the check, for example `a clock counter is not an integer >= 1` |
+  | `too_large` | `max_delta_bytes` or `max_sync_bytes` |
+  | `too_many_entries` | `max_entries` |
+
+  A malformed payload reports `entries` 0, since its entries cannot be
+  counted. Count refusals by `result`, not by `entries`: an empty delta (a
+  removal) is `ok` with `entries` 0. See
   [CLUSTERING.md](CLUSTERING.md#replicated-stores).
 - `[brazier, pubsub, broadcast]`: for `scope: "cluster"`, `remote_nodes` is
   the number of remote nodes forwarded to, one message each, however many

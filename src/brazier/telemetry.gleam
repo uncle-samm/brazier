@@ -376,13 +376,16 @@ pub fn ssr_join_token_too_large(bytes: Int, budget: Int) -> Nil
 pub fn store_write(count: Int, store: String, op: String, mode: String) -> Nil
 
 /// `[brazier, store, sync]` span. `run` returns the result with the number
-/// of entries and bytes synced.
+/// of entries and bytes in the payload, the merge's `result` (`ok`,
+/// `malformed`, `too_large` or `too_many_entries`) and its `reason` (the
+/// malformed field, the limit that refused it, or `none`), which go on the
+/// stop event's metadata.
 @external(erlang, "brazier_telemetry_ffi", "store_sync_span")
 @internal
 pub fn store_sync_span(
   store: String,
   peer: String,
-  run: fn() -> #(a, Int, Int),
+  run: fn() -> #(a, Int, Int, String, String),
 ) -> a
 
 /// `[brazier, session, created | revoked | expired | contention]`.

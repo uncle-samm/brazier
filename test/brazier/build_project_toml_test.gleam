@@ -174,7 +174,7 @@ pub fn pinned_dependency_line_hex_is_exact_test() {
       requirements: [],
       source: HexSource,
     )
-  assert project_toml.pinned_dependency_line(package, fn(p) { p })
+  assert project_toml.pinned_dependency_line(package, fn(p) { Ok(p) })
     == Ok("gleam_json = \"== 3.1.0\"")
 }
 
@@ -186,8 +186,24 @@ pub fn pinned_dependency_line_local_uses_resolved_path_test() {
       requirements: [],
       source: LocalSource("../.."),
     )
-  assert project_toml.pinned_dependency_line(package, fn(p) { "/abs/" <> p })
+  assert project_toml.pinned_dependency_line(package, fn(p) { Ok("/abs/" <> p) })
     == Ok("brazier = { path = \"/abs/../..\" }")
+}
+
+/// A path that cannot be resolved fails the line with the resolver's
+/// reason, instead of pinning an unresolved path.
+pub fn pinned_dependency_line_local_resolve_error_is_returned_test() {
+  let package =
+    LockedPackage(
+      name: "brazier",
+      version: "0.1.0",
+      requirements: [],
+      source: LocalSource("../.."),
+    )
+  assert project_toml.pinned_dependency_line(package, fn(_) {
+      Error("cannot read the current directory")
+    })
+    == Error("cannot read the current directory")
 }
 
 pub fn pinned_dependency_line_git_is_rejected_test() {
@@ -199,7 +215,7 @@ pub fn pinned_dependency_line_git_is_rejected_test() {
       source: GitSource("https://example.com/lib.git", "abc"),
     )
   let assert Error(reason) =
-    project_toml.pinned_dependency_line(package, fn(p) { p })
+    project_toml.pinned_dependency_line(package, fn(p) { Ok(p) })
   assert string.contains(reason, "comes from git")
 }
 

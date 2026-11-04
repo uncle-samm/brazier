@@ -1,6 +1,26 @@
 -module(brazier_await_ffi).
 -export([barrier/2, watch_info/2, watch_exit/2, watch_down/2, next_info/2,
-         unwatch/1, watch_pg_scope/1, next_pg_leave/3, unwatch_pg_scope/1]).
+         unwatch/1, watch_pg_scope/1, next_pg_leave/3, unwatch_pg_scope/1,
+         start_pg_scope/1, stop_pg_scope/1, pg_scope_watched/1]).
+
+%% A pg scope of its own for a test of the watch helpers, unlinked so the
+%% test stops it explicitly. Scope names a new atom chosen by the test.
+start_pg_scope(ScopeName) ->
+    {ok, Pid} = pg:start(binary_to_atom(ScopeName)),
+    Pid.
+
+stop_pg_scope(ScopeName) ->
+    ok = gen_server:stop(binary_to_existing_atom(ScopeName)),
+    nil.
+
+%% Whether the watch's scope monitor is still in place. pg:demonitor/2
+%% removes it if it is (ok) and reports false if not, so the watch must not
+%% be used afterwards.
+pg_scope_watched({Scope, Ref}) ->
+    case pg:demonitor(Scope, Ref) of
+        ok -> true;
+        false -> false
+    end.
 
 %% A mailbox barrier on an OTP process (a gleam_otp actor, gen_server or any
 %% sys-compliant process). sys:get_state/2 is answered in mailbox order, so
@@ -21,9 +41,10 @@ barrier(Pid, TimeoutMs) ->
 %% Tell the caller every time the sys-compliant process Pid receives the
 %% plain (non-call, non-cast) message MessageAtom, e.g. a timer tick sent
 %% with erlang:send_after. Uses the sys debug hook (sys:install/2), which
-%% gen_server, gen_statem and gleam_otp actors run on every incoming
-%% message before handling it. The hook lives as long as Pid, or until
-%% unwatch/1 removes it.
+%% gen_server, gen_statem and supervisor run on every incoming message
+%% before handling it. gleam_otp 1.3 actors discard sys debug requests, so
+%% an install on one times out ({error, timeout}). The hook lives as long
+%% as Pid, or until unwatch/1 removes it.
 watch_info(Pid, MessageName) when is_binary(MessageName) ->
     Message = binary_to_existing_atom(MessageName),
     install_watch(Pid, fun(M) -> M =:= Message end).

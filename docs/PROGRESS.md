@@ -302,6 +302,19 @@
           - the `rejected_middleware` retry;
           - keyed morph;
           - telemetry and presence cleanup, `watch_info`/`unwatch`, `sleep_ms`, the exact exit reason, and the `peer.eventually` polls.
+    - Wave 5: follow-ups from waves 3 and 4 that are worth fixing before final verification. Started 2026-11-04 at e798211 as three agents with disjoint files, while w4-bench-gate is still running:
+      - **w5-transport-client** owns transport, `brazier_client` and `priv/static`. It takes:
+        - the server side of `rejected_middleware`: complete the handshake, then close with a 4xxx refusal code that makes the client hard-navigate;
+        - raw JSON `ops` in client-to-server `event` messages;
+        - the fragment scroll after a live navigation;
+        - the duplicate proxy-hop and security-limits logs;
+        - the bundle, the examples and a CDP desktop run.
+      - **w5-store-build** owns the store, CRDT, replica and build FFI. It takes the refused-payload telemetry event, an incremental `crdt.fingerprint`, and an honest `absolute_path`.
+      - **w5-test-hygiene** owns test files and test FFIs only. It takes:
+        - scoped watch and telemetry cleanup in the remaining tests;
+        - the stray `[brazier, ws, upgrade, stop]` handler leak;
+        - the `peer.eventually` polls in cluster_test and membership_test;
+        - the cluster test FFI counter races.
     - PERF-11 (about 0.5µs of telemetry span cost per event with no handler) is accepted within the overhead budget already recorded, and is not fixed.
   - [x] fix-crdt (PERF-7), merged as 461baf2.
     - The fix: `join_keys` finds removed dots from whichever is smaller, the delta's context or the key. This is the delta-state dot-set join (Almeida, Shoker and Baquero; delta_crdt_ex `join_dot_sets`).
@@ -541,6 +554,39 @@
       - a stray `[brazier, ws, upgrade, stop]` handler leaks, most likely from allowed_hosts_test or live_page_gate_test;
       - `peer.eventually` polls remain in cluster_test (21) and membership_test (10);
       - `brazier_cluster_test_ffi` counters notify no one and `recorded` races between senders; `counted_events` races too.
+  - [x] w5-store-build, merged as 4817e5f (branch `m117-store-crdt-build`, commits ce7943a and 64cb30c).
+    - A refused replica payload is reported on the `[brazier, store, sync]` stop event:
+      - `result` is `ok`, `malformed`, `too_large` or `too_many_entries`, and `reason` names the failing field or limit (the Phoenix and `[brazier, ws, upgrade]` convention of putting the outcome on stop metadata);
+      - the decision is made in `brazier_store_replica:admit/4`;
+      - the 2-node validation test now waits on the event.
+    - The CRDT digest is incremental:
+      - `crdt.State` carries the XOR of SHA-256 hashes of each live (key, dot), clock entry and cloud dot, updated by every join (Riak TicTac AAE, delta_crdt_ex MerkleMap);
+      - `crdt.fingerprint` is removed;
+      - the old sorted fingerprint is kept as a test oracle. A 20 seeds × 500 steps property test on 3 replicas checks that digests are equal exactly when fingerprints are, and the oracle join checks the cached digest against `recompute_digest`;
+      - a write plus digest costs 969 reductions on 10 keys and on 10,000, against about 1.2M before.
+    - `program.absolute_path` returns `Result`: `filename:absname/1` crashes when the current directory has been deleted (`enoent`) or can't be searched (`eacces`), and this is now an error, logged. A test covers a deleted cwd.
+    - Coordinator verify on the merge of 136a22b into the branch (8c21e0c): clean build with zero warnings, format and lint clean, 1743 tests passing in each of 3 runs, and docs check OK (73 modules).
+    - Decisions:
+      - the agent made a small edit outside its files, to `brazier_telemetry_ffi.erl` and `telemetry.gleam`, because the store span callback now returns `result` and `reason`;
+      - the digest changed on the wire between replicas, so a cluster mixing builds full-syncs until every node runs the same build. This is noted in the CHANGELOG; nothing has been released;
+      - the XOR digest resists accidental collisions only, which is enough because members trust each other (documented on `crdt.digest`). A keyed hash would be needed if untrusted members ever became possible.
+    - Follow-up: the `store.crdt_append.*` bench baselines shift by about 2µs per write. The final-verification re-baseline covers it.
+  - [x] w5-test-hygiene, merged as ec8e4a8 (branch `fix-test-hygiene`, commits 37c33ca, b7c624a, 2396adb, bf98f1f and 265deaf).
+    - Cluster tests no longer poll:
+      - the 32 `peer.eventually` polls in cluster_test, membership_test and pubsub_cluster_test are replaced by `peer.await_members` and `peer.broadcasts`, which wait on messages;
+      - `await_recorded/3` and `await_round/2` notify their waiter and no longer race between senders; `counted_events` is removed, and `await_revocation/4` is new;
+      - `record_events` and `record_syncs` crash with `not_on_a_peer_node` when called on the test runner, so a handler can't leak there;
+      - `test/brazier/cluster/harness_ffi_test.gleam` covers the harness itself, unhappy paths included.
+    - Telemetry residue: the suite runs through `brazier_test_runner_ffi:run/0` (gleeunit's discovery and options, unchanged), which adds one check per test module that fails, naming the module, if its tests left a telemetry handler attached or detached one they didn't own. The checks found and fixed the stray `[brazier, ws, upgrade, stop]` handler and the other leaks listed under w4-client-tests.
+    - The agent's cluster loop passed 12 of 12 runs.
+    - Coordinator verify on the merge of 549ef6a into the branch (82daa87): clean build with zero warnings, format and lint clean, 1875 tests passing in each of 3 runs, and docs check OK. The count rises by 132: 11 new test functions and one handler check per module.
+    - Decisions:
+      - the handler check is a test in the module's eunit group (ExUnit reports an `on_exit` failure against its test the same way), so a leak fails the module that caused it, not a later victim;
+      - the runner starts telemetry before the first module, because the production handler-failure logger stays attached for the node's life.
+    - Follow-ups:
+      - 2 `peer.eventually` polls remain in store_replica_validation_test;
+      - `await_restart` spins on `yield`;
+      - mailbox residue (messages a test leaves in the shared eunit process) in build_handshake, child_module, dev_reload, router, runtime_test, runtime_versioning, ws_protocol, presence_test and session_security tests.
 - [ ] Final verification: build (zero warnings), tests, all examples, CDP browser suite, perf baselines
 
 **Decisions (Milestone 117, coordinator):**

@@ -30,7 +30,16 @@ kill_replica(Name) ->
 
 %% Record every [brazier, store, sync, stop] event on this node, in a table
 %% owned by a process that outlives the rpc call that started it.
+%%
+%% The handler and its table live as long as the node, so this runs only
+%% on a peer node, which its test's with_cluster stops (ExUnit's on_exit/1
+%% at node scope); on the test runner, where every module's tests share one
+%% node, it crashes instead of leaving a handler behind.
 record_syncs() ->
+    case erlang:is_alive() of
+        true -> ok;
+        false -> erlang:error({record_syncs, not_on_a_peer_node})
+    end,
     Parent = self(),
     Ref = make_ref(),
     spawn(fun() ->

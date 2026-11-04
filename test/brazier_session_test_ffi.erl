@@ -10,9 +10,11 @@
 %% Bound processes (spawn_bound/1) record every revocation they receive in a
 %% per-node table read back with revocations/0, and also tell the process
 %% that spawned them, so a test on the same node waits for one with
-%% await_revoked/4 instead of polling the table.
+%% await_revoked/4 instead of polling the table. A bound process spawned
+%% by an rpc that has since returned is asked directly, with
+%% await_revocation/4.
 -export([start_db/1, backend/2, set_failing/3, owned/1, spawn_bound/1,
-         revocations/0, await_revoked/4, bound_everywhere/2, raises/1,
+         revocations/0, await_revoked/4, await_revocation/4, bound_everywhere/2, raises/1,
          system_now/0,
          db_create/2, db_fetch/2, db_touch/3, db_replace/3, db_delete/2,
          db_delete_version/3, db_expired/4, db_count/1]).
@@ -165,7 +167,7 @@ spawn_bound(Bind) ->
     {Pid, MRef} = spawn_monitor(fun() ->
         nil = Bind(),
         Parent ! {Ref, bound},
-        bound_loop(Parent)
+        bound_loop(Parent, [], [])
     end),
     receive
         {Ref, bound} ->
@@ -178,16 +180,66 @@ spawn_bound(Bind) ->
     end.
 
 %% Parent may be an erpc worker that has already exited (a bound process
-%% spawned on a peer node); a send to it is then dropped, and the table is
-%% what such tests read.
-bound_loop(Parent) ->
+%% spawned on a peer node); a send to it is then dropped. Such a test asks
+%% the process itself with await_revocation/4: Seen holds every revocation
+%% it received (oldest last), and each alias in Watchers is told of the
+%% ones after it asked.
+bound_loop(Parent, Seen, Watchers) ->
     receive
         {brazier_session_revoked, Id, Reason} ->
             true = ets:insert(?REVOKED, {Id, Reason}),
-            Parent ! {brazier_session_test_revoked, self(), Id, Reason},
-            bound_loop(Parent);
+            Report = {brazier_session_test_revoked, self(), Id, Reason},
+            Parent ! Report,
+            lists:foreach(fun(Alias) -> Alias ! Report end, Watchers),
+            bound_loop(Parent, [{Id, Reason} | Seen], Watchers);
+        {report_to, Alias} ->
+            Alias ! {Alias, seen, Seen},
+            bound_loop(Parent, Seen, [Alias | Watchers]);
         stop ->
             ok
+    end.
+
+%% Wait for the bound process Pid, which may have been spawned by another
+%% process or on another node's rpc, to have received the revocation
+%% {Id, Reason}: {ok, nil}, or {error, Others} with the other revocations it
+%% received. Pid answers with what it has seen and reports each later one
+%% to an alias of the caller, so a revocation is never missed between the
+%% two (ask-then-subscribe in one message, as gen_event's add_sup_handler).
+%% The alias is removed before returning, so later reports are dropped.
+await_revocation(Pid, Id, Reason, TimeoutMs) ->
+    Alias = erlang:alias(),
+    MRef = erlang:monitor(process, Pid),
+    Pid ! {report_to, Alias},
+    try
+        receive
+            {Alias, seen, Seen} ->
+                case lists:member({Id, Reason}, Seen) of
+                    true ->
+                        {ok, nil};
+                    false ->
+                        await_revoked(Pid, Id, Reason,
+                                      erlang:monotonic_time(millisecond) + TimeoutMs,
+                                      %% Newest first, as await_revoked/5
+                                      %% builds its list.
+                                      Seen)
+                end;
+            {'DOWN', MRef, process, Pid, Down} ->
+                erlang:error({bound_process_down, Pid, Down})
+        after TimeoutMs ->
+            erlang:error({bound_process_did_not_answer, Pid})
+        end
+    after
+        true = erlang:unalias(Alias),
+        true = erlang:demonitor(MRef, [flush]),
+        flush_reports(Pid, Alias)
+    end.
+
+flush_reports(Pid, Alias) ->
+    receive
+        {brazier_session_test_revoked, Pid, _, _} -> flush_reports(Pid, Alias);
+        {Alias, seen, _} -> flush_reports(Pid, Alias)
+    after 0 ->
+        ok
     end.
 
 revocations() ->

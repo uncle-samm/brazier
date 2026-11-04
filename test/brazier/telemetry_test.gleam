@@ -143,6 +143,33 @@ pub fn listening_detaches_when_the_body_crashes_test() {
   assert handler_ids(name) == []
 }
 
+pub fn listening_leaves_no_event_in_the_mailbox_test() {
+  let name = ["brazier_test", unique("residue")]
+  // The body lets an event arrive and never receives it, as a test that
+  // asserts on one upgrade and not on the next does.
+  let events =
+    monitored.listening([name], fn(events) {
+      let assert Ok(Nil) = telemetry.execute(name, dict.new(), dict.new())
+        as "execute succeeds while listening"
+      events
+    })
+  let assert Error(Nil) = process.receive(events, 0)
+    as "the scope removed its undelivered event when it ended"
+}
+
+pub fn listening_drops_a_send_that_races_the_detach_test() {
+  let name = ["brazier_test", unique("late")]
+  // An emitter that looked the handler up before the detach and calls it
+  // after: telemetry:execute reads the handler table, then calls each one.
+  let #(events, late_call) =
+    monitored.listening([name], fn(events) {
+      #(events, looked_up_handler(name))
+    })
+  late_call()
+  let assert Error(Nil) = process.receive(events, 0)
+    as "a send after the scope ended was dropped, not delivered"
+}
+
 // --- Crashing handlers ------------------------------------------------------
 
 pub fn crashing_handler_is_detached_and_logged_test() {
@@ -327,7 +354,9 @@ fn documented() -> List(Documented) {
     Plain(["effect", "background", "rejected"], [], ["limit"]),
     Plain(["ssr", "join_token", "too_large"], ["bytes"], ["budget"]),
     Plain(["store", "write"], ["count"], ["store", "op", "mode"]),
-    Span(["store", "sync"], ["store", "peer"], ["entries", "bytes"], []),
+    Span(["store", "sync"], ["store", "peer"], ["entries", "bytes"], [
+      "result", "reason",
+    ]),
     session("created"),
     session("revoked"),
     session("expired"),
@@ -444,7 +473,7 @@ fn emit_everything() -> Nil {
   telemetry.ssr_join_token_too_large(4000, 3800)
   telemetry.store_write(1, "counter", "put", "local")
   let sync = fn(run) { telemetry.store_sync_span("counter", "b@host", run) }
-  let assert 6 = sync(fn() { #(6, 10, 100) }) as "sync returns 6"
+  let assert 6 = sync(fn() { #(6, 10, 100, "ok", "none") }) as "sync returns 6"
   crash(fn() { sync(fn() { panic as "sync crashed" }) })
   list.each(
     [
@@ -572,6 +601,9 @@ fn rescue(run: fn() -> a) -> Result(a, #(String, Dynamic))
 
 @external(erlang, "brazier_telemetry_test_ffi", "handler_ids")
 fn handler_ids(name: List(String)) -> List(String)
+
+@external(erlang, "brazier_telemetry_test_ffi", "looked_up_handler")
+fn looked_up_handler(name: List(String)) -> fn() -> Nil
 
 @external(erlang, "brazier_telemetry_test_ffi", "print_to_user")
 fn print_to_user(line: String) -> Nil

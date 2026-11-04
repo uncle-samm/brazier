@@ -163,7 +163,14 @@ fn lacks(p: Peer, kv: store.Store(String), key: String) -> Bool {
 
 /// One remote merge, as its sync span reports it.
 type Sync {
-  Sync(store: String, from: String, entries: Int, bytes: Int)
+  Sync(
+    store: String,
+    from: String,
+    entries: Int,
+    bytes: Int,
+    result: String,
+    reason: String,
+  )
 }
 
 /// Take relayed sync spans until every one of `wanted` has matched one of
@@ -192,7 +199,11 @@ fn sync_of(event: telemetry.Event) -> Sync {
     as "a sync span counts its entries"
   let assert Ok(bytes) = telemetry.int(event, "bytes")
     as "a sync span counts its bytes"
-  Sync(store: store_name, from:, entries:, bytes:)
+  let assert Ok(result) = telemetry.string(event, "result")
+    as "a sync span says how the merge ended"
+  let assert Ok(reason) = telemetry.string(event, "reason")
+    as "a sync span gives the reason"
+  Sync(store: store_name, from:, entries:, bytes:, result:, reason:)
 }
 
 /// Whether `count` notifications reach `watcher` on `p`, each in time, and
@@ -480,17 +491,36 @@ pub fn remote_merges_past_the_limits_are_refused_test_() -> peer.Timeout {
     != digest_on(b, replicated.KeyValue, small)
 
   // Every merge on b is a span from a, among them an empty one (the
-  // removal's delta, or a's reply to b's startup sync_req), the refused
-  // delta of "big", and, as anti-entropy keeps pulling a's full state, a
-  // refused full state of its four entries.
+  // removal's delta, or a's reply to b's startup sync_req), the delta of
+  // "big" refused as too large, the delta of s4 refused for max_entries,
+  // and, as anti-entropy keeps pulling a's full state, a full state of its
+  // four entries refused as too large.
   let assert Ok(taken) =
     take_syncs(
       b,
       syncs,
       [
-        fn(sync: Sync) { sync.entries == 0 },
-        fn(sync: Sync) { sync.entries == 1 && sync.bytes > 2000 },
-        fn(sync: Sync) { sync.entries == 4 && sync.bytes > 4000 },
+        fn(sync: Sync) {
+          sync.entries == 0 && sync.result == "ok" && sync.reason == "none"
+        },
+        fn(sync: Sync) {
+          sync.entries == 1
+          && sync.bytes > 2000
+          && sync.result == "too_large"
+          && sync.reason == "max_delta_bytes"
+        },
+        fn(sync: Sync) {
+          sync.entries == 1
+          && sync.bytes <= 2000
+          && sync.result == "too_many_entries"
+          && sync.reason == "max_entries"
+        },
+        fn(sync: Sync) {
+          sync.entries == 4
+          && sync.bytes > 4000
+          && sync.result == "too_large"
+          && sync.reason == "max_sync_bytes"
+        },
       ],
       [],
     )
@@ -522,7 +552,12 @@ pub fn remote_writes_notify_watchers_test_() -> peer.Timeout {
   assert peer.on(b, fn() { store.get_all(messages, "general") }) == []
   let from_a = node_name(a)
   let assert Ok(taken) =
-    take_syncs(b, syncs, [fn(sync: Sync) { sync.entries == 1 }], [])
+    take_syncs(
+      b,
+      syncs,
+      [fn(sync: Sync) { sync.entries == 1 && sync.result == "ok" }],
+      [],
+    )
     as "b reports merging a's append"
   assert list.all(taken, fn(sync) { sync.store == name && sync.from == from_a })
 }

@@ -7,6 +7,7 @@ import brazier/monitored
 import brazier/pubsub
 import brazier/store
 import brazier/store/crdt.{type Delta, type State, Replica}
+import brazier/store/crdt_oracle
 import brazier/store/hlc.{Timestamp}
 import brazier/store/replicated.{Config}
 import brazier/telemetry.{type Event}
@@ -60,7 +61,7 @@ pub fn crdt_concurrent_puts_resolve_the_same_in_either_join_order_test() {
   // Same wall time and logical counter: the node name breaks the tie.
   assert crdt.value(ab, "k") == Ok("from b")
   assert crdt.value(ba, "k") == Ok("from b")
-  assert crdt.fingerprint(ab) == crdt.fingerprint(ba)
+  assert crdt_oracle.fingerprint(ab) == crdt_oracle.fingerprint(ba)
   // Both concurrent values stay until a write that observed them.
   assert crdt.size(ab) == 2
   let #(after, _) = put(ab, ra, "k", "resolved", ts(11, ra.node))
@@ -86,7 +87,7 @@ pub fn crdt_remove_only_removes_observed_values_add_wins_test() {
   let sb = join(sb, removal)
   assert crdt.value(sa, "k") == Ok("v1")
   assert crdt.value(sb, "k") == Ok("v1")
-  assert crdt.fingerprint(sa) == crdt.fingerprint(sb)
+  assert crdt_oracle.fingerprint(sa) == crdt_oracle.fingerprint(sb)
 }
 
 pub fn crdt_remove_of_a_value_seen_everywhere_removes_it_everywhere_test() {
@@ -108,8 +109,8 @@ pub fn crdt_join_is_idempotent_and_commutative_test() {
   let forward = crdt.new() |> join(d1) |> join(d2) |> join(d3)
   let backward = crdt.new() |> join(d3) |> join(d2) |> join(d1)
   let twice = forward |> join(d1) |> join(d2) |> join(d3)
-  assert crdt.fingerprint(forward) == crdt.fingerprint(backward)
-  assert crdt.fingerprint(forward) == crdt.fingerprint(twice)
+  assert crdt_oracle.fingerprint(forward) == crdt_oracle.fingerprint(backward)
+  assert crdt_oracle.fingerprint(forward) == crdt_oracle.fingerprint(twice)
   assert crdt.value(forward, "x") == Ok(3)
   assert crdt.value(backward, "y") == Ok(2)
   // A repeated delta changes nothing.
@@ -149,7 +150,7 @@ pub fn crdt_join_full_removes_keys_deleted_since_test() {
   let assert [crdt.Removed(key: "gone", dot: _, entry: _)] = changes
   assert crdt.value(sb, "gone") == Error(Nil)
   assert crdt.value(sb, "kept") == Ok(2)
-  assert crdt.fingerprint(sb) == crdt.fingerprint(sa)
+  assert crdt_oracle.fingerprint(sb) == crdt_oracle.fingerprint(sa)
 }
 
 pub fn crdt_context_compacts_deltas_received_out_of_order_test() {
@@ -157,13 +158,13 @@ pub fn crdt_context_compacts_deltas_received_out_of_order_test() {
   let #(s2, d2) = put(s1, ra, "b", 2, ts(2, ra.node))
   let #(_, d3) = put(s2, ra, "c", 3, ts(3, ra.node))
   let partial = join(crdt.new(), d3)
-  let #(_, clock, cloud) = crdt.fingerprint(partial)
+  let #(_, clock, cloud) = crdt_oracle.fingerprint(partial)
   // Dot 3 alone cannot extend the clock, so it waits in the cloud.
   assert clock == []
   assert cloud == [crdt.Dot(replica: ra, counter: 3)]
   assert !crdt.covers(partial.context, crdt.Dot(replica: ra, counter: 2))
   let complete = partial |> join(d1) |> join(d2)
-  let #(_, clock, cloud) = crdt.fingerprint(complete)
+  let #(_, clock, cloud) = crdt_oracle.fingerprint(complete)
   assert clock == [#(ra, 3)]
   assert cloud == []
   assert crdt.values(complete, "c") == [3]
