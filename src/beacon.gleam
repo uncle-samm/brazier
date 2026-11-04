@@ -551,9 +551,12 @@ pub fn notification_payload(
 
 // ===== Start =====
 
-/// Start the app on `port` under its supervision tree and block forever.
-/// If the tree gives up (a child keeps crashing), the calling process
-/// crashes with the reason instead of running on without it.
+/// Start the app on `port` under its supervision tree and block while it
+/// runs (`application.wait_forever`). It returns `Error` when the app cannot
+/// start, and `Ok(Nil)` once it has stopped: after SIGTERM, when the
+/// listener has drained its connections, or when the tree was stopped
+/// elsewhere. If the tree gives up (a child keeps crashing), the calling
+/// process crashes with the reason instead of running on without it.
 ///
 /// The server codec and the client bundle are build artifacts of
 /// `gleam run -m beacon/build` (or `gleam run -m beacon/dev`); starting
