@@ -39,6 +39,8 @@ the framework, not the console.
 | http | 8 keep-alive clients, 2000 requests per round, 5 rounds against `/bench` | requests/s (median of rounds); per-request p50/p99 |
 | ws | N joined connections × 200 events each, for N = 1, 10, 100. Each event is timed from its send to the patch that acknowledges its clock. | events/s (median of rounds); per-event p50/p99 |
 | runtime | Events pushed straight into a runtime actor holding a 200-item model, 2000 per round. `changed`: every event changes the model and gets a patch. `unchanged`: none does, and each gets an empty acknowledgement. | pipelined µs/event (median of rounds); p50/p99 of one event at a time |
+| runtime list | As `runtime` `changed`, against a model whose list encodes to about 50 KB (1000 items, 200 events per round) and 500 KB (10000 items, 40 events per round). Each event changes one field, so the metric is the cost of the work done on the whole model. | pipelined µs/event (median of rounds); p50/p99 of one event at a time |
+| wire | A one-op `patch` and a `model_sync` of the 50 KB model, each encoded into the frame `send_ws_message` hands `gen_tcp:send/2`, in blocks | ns/frame median and p99 over the blocks |
 | pubsub | 1000 broadcasts to S subscribers (S = 1, 100, 1000), each timed until every subscriber has it | p50/p99 |
 | store | put/get/delete, timed in 50 blocks of 1000 operations | ns/op median and p99 over the blocks |
 
@@ -109,6 +111,16 @@ Why these numbers:
 | `runtime.unchanged.pipelined` | 24.7 µs/event | 22.4..26.8 | 17.5% | 35% |
 | `runtime.unchanged.latency_p50` | 19.3 µs | 19.3..19.3 | 0.2% | 25% |
 | `runtime.unchanged.latency_p99` | 28.7 µs | 25.9..31.5 | 19.5% | 39% |
+| `runtime.list_50kb.changed.pipelined` | 147.7 µs/event | 147.0..152.3 | 3.6% | 25% |
+| `runtime.list_50kb.changed.latency_p50` | 150.7 µs | 150.0..151.0 | 0.6% | 25% |
+| `runtime.list_50kb.changed.latency_p99` | 202.8 µs | 184.2..206.8 | 11.2% | 25% |
+| `runtime.list_500kb.changed.pipelined` | 1864 µs/event | 1827..1874 | 2.5% | 25% |
+| `runtime.list_500kb.changed.latency_p50` | 1877 µs | 1832..1908 | 4.0% | 25% |
+| `runtime.list_500kb.changed.latency_p99` | 2343 µs | 2303..2416 | 4.8% | 25% |
+| `wire.patch.median` | 317 ns/frame | 312..363 | 16.1% | 32.2% |
+| `wire.patch.p99` | 386 ns/frame | 359..706 | 90.1% | not gated |
+| `wire.model_sync_50kb.median` | 328 ns/frame | 315..418 | 31.5% | 62.9% |
+| `wire.model_sync_50kb.p99` | 455 ns/frame | 368..1071 | 155% | not gated |
 | `pubsub.fanout.1.p50` | 1.92 µs | 1.92..1.92 | 0.1% | 25% |
 | `pubsub.fanout.1.p99` | 3.58 µs | 2.92..3.96 | 29.1% | 58.1% |
 | `pubsub.fanout.100.p50` | 148.4 µs | 127.9..153.5 | 17.3% | 34.5% |
@@ -121,6 +133,15 @@ Why these numbers:
 | `store.get.p99` | 323.5 ns/op | 316.3..337.1 | 6.4% | 25% |
 | `store.delete.median` | 1575 ns/op | 1515..1602 | 5.5% | 25% |
 | `store.delete.p99` | 1689 ns/op | 1652..1779 | 7.5% | 25% |
+
+The `runtime.list_*` and `wire.*` rows were added on 2026-11-04 from a
+5-run `make bench-baseline` (load average about 6 to 9); the other rows
+were kept as measured. The `wire` numbers stay flat with model size because
+the frame is iodata: the model JSON goes into it as the binary the runtime
+already holds, so the cost of copying it into the socket, paid in the kernel
+by both the old and the new frame, is not in the metric. The flat encoding
+these rows replaced measured 117 µs per 50 KB `model_sync` and about 1 µs
+per patch.
 
 Two `make bench-check` runs after this baseline both passed. In each, the
 only line not marked as passing was the informational line for the

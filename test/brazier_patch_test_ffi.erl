@@ -1,5 +1,6 @@
 -module(brazier_patch_test_ffi).
--export([random_pair/1, compare_apply/1, run_node/2, write_file/2, scratch_path/1]).
+-export([random_pair/1, random_chain/2, compare_apply/1, run_node/2, write_file/2,
+         scratch_path/1]).
 
 %% Property-test helpers for the patch round trip (server diff -> client apply).
 
@@ -13,6 +14,29 @@ random_pair(Seed) ->
     Old = gen_object(3),
     New = mutate_n(Old, 1 + rand:uniform(4)),
     {iolist_to_binary(json:encode(Old)), iolist_to_binary(json:encode(New))}.
+
+%% A seeded chain of Steps + 1 model JSON documents, each derived from the
+%% one before: mostly by 1-4 random edits, sometimes by none (the same
+%% string again), sometimes by none but with a leading space (a different
+%% string that decodes equal). The runtime's cache must turn every step
+%% into a patch the previous document accepts.
+-spec random_chain(integer(), non_neg_integer()) -> [binary()].
+random_chain(Seed, Steps) ->
+    rand:seed(exsss, {Seed, Seed * 5 + 2, Seed * 17 + 9}),
+    First = gen_object(3),
+    chain(First, Steps, [iolist_to_binary(json:encode(First))]).
+
+chain(_Value, 0, Acc) ->
+    lists:reverse(Acc);
+chain(Value, Steps, Acc) ->
+    {Next, Json} = case rand:uniform(8) of
+        1 -> {Value, iolist_to_binary(json:encode(Value))};
+        2 -> {Value, iolist_to_binary([$\s, json:encode(Value)])};
+        _ ->
+            Mutated = mutate_n(Value, rand:uniform(4)),
+            {Mutated, iolist_to_binary(json:encode(Mutated))}
+    end,
+    chain(Next, Steps - 1, [Json | Acc]).
 
 keys() ->
     [<<"a">>, <<"b">>, <<"count">>, <<"items">>, <<"a/b">>, <<"~">>, <<"~1">>,

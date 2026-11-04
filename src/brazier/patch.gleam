@@ -31,13 +31,63 @@
 ///
 /// Reference: RFC 6902 (JSON Patch), RFC 6901 (JSON Pointer).
 import brazier/log
+import gleam/dynamic.{type Dynamic}
 
-/// Diff two JSON model strings and produce patch operations.
-/// Returns a JSON-encoded string of the ops array (e.g., `[{"op":"replace","path":"/count","value":1}]`).
-/// If the models are identical, returns `"[]"`.
-pub fn diff(old_json: String, new_json: String) -> String {
-  log.debug("brazier.patch", "Diffing model JSON")
-  diff_json(old_json, new_json)
+/// A model JSON document and its decoded form. The runtime keeps the last
+/// snapshot it sent, so each new model is decoded once per event and the
+/// previous one is never decoded again (PERF-2).
+///
+/// Invariant: `term` is the decoding of `json`, and `json` is valid JSON
+/// (`snapshot/1` is the only constructor, and it refuses anything else).
+pub opaque type Snapshot {
+  Snapshot(json: String, term: Dynamic)
+}
+
+/// What changed between two snapshots.
+pub type Diff {
+  /// The documents are equal; there is nothing to send.
+  Unchanged
+  /// A non-empty RFC 6902 ops array (plus the Brazier `append` op), as JSON.
+  Ops(json: String)
+}
+
+/// Decode a model JSON document into a snapshot. An error when it is not a
+/// single valid JSON value (trailing bytes are refused).
+pub fn snapshot(json: String) -> Result(Snapshot, String) {
+  case decode_snapshot(json) {
+    Ok(term) -> Ok(Snapshot(json:, term:))
+    Error(reason) -> {
+      log.warning("brazier.patch", "Snapshot refused: " <> reason)
+      Error(reason)
+    }
+  }
+}
+
+/// The JSON document a snapshot was decoded from.
+pub fn snapshot_json(snapshot: Snapshot) -> String {
+  snapshot.json
+}
+
+/// Diff two snapshots. Neither document is decoded: both terms are cached.
+/// Applying `Ops(json)` to `snapshot_json(old)` gives a document equal to
+/// `snapshot_json(new)`.
+pub fn diff_snapshots(old: Snapshot, new: Snapshot) -> Diff {
+  log.debug("brazier.patch", "Diffing model snapshots")
+  case diff_terms(old.term, new.term) {
+    DiffUnchanged -> Unchanged
+    DiffOps(json) -> Ops(json:)
+  }
+}
+
+/// Diff two JSON model strings. Decodes both, so the runtime uses
+/// `diff_snapshots/2` with its cached snapshot instead. An error when either
+/// document is not valid JSON.
+pub fn diff(old_json: String, new_json: String) -> Result(Diff, String) {
+  case snapshot(old_json), snapshot(new_json) {
+    Ok(old), Ok(new) -> Ok(diff_snapshots(old, new))
+    Error(reason), _ -> Error("old model: " <> reason)
+    _, Error(reason) -> Error("new model: " <> reason)
+  }
 }
 
 /// Apply patch operations to a model JSON string.
@@ -56,14 +106,20 @@ pub fn apply_ops(
   }
 }
 
-/// Check if an ops JSON string represents no changes (empty array).
-pub fn is_empty(ops_json: String) -> Bool {
-  is_empty_ops(ops_json)
+/// Erlang FFI: decode one JSON document; only malformed input is an error.
+@external(erlang, "brazier_patch_ffi", "decode_snapshot")
+fn decode_snapshot(json: String) -> Result(Dynamic, String)
+
+/// The FFI's result for `diff_terms/2`: the atom `unchanged` or the tuple
+/// `{ops, Json}`.
+type TermDiff {
+  DiffUnchanged
+  DiffOps(String)
 }
 
-/// Erlang FFI: diff two JSON strings, produce ops JSON.
-@external(erlang, "brazier_patch_ffi", "diff_json")
-fn diff_json(old_json: String, new_json: String) -> String
+/// Erlang FFI: diff two decoded documents.
+@external(erlang, "brazier_patch_ffi", "diff_terms")
+fn diff_terms(old: Dynamic, new: Dynamic) -> TermDiff
 
 /// Erlang FFI: apply ops JSON to model JSON.
 @external(erlang, "brazier_patch_ffi", "apply_json_ops")
@@ -84,10 +140,6 @@ pub fn count_ops(ops_json: String) -> Result(Int, String) {
 @external(erlang, "brazier_patch_ffi", "unsafe_keys")
 @internal
 pub fn unsafe_keys() -> List(String)
-
-/// Erlang FFI: check if ops are empty.
-@external(erlang, "brazier_patch_ffi", "is_empty_ops")
-fn is_empty_ops(ops_json: String) -> Bool
 
 /// Erlang FFI: count ops in a JSON array string.
 @external(erlang, "brazier_patch_ffi", "count_ops")

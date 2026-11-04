@@ -336,10 +336,14 @@ if (file) {
     const where = `frame ${index} ${raw.substring(0, 160)}`;
     if (msg.type === "model_sync") {
       assert.equal(classifyModelSync(state, msg.version), "apply", where);
-      model = JSON.parse(msg.model);
+      // The server embeds the model raw ("model":{...}), never as a string.
+      assert.ok(msg.model !== null && typeof msg.model === "object", `${where}: model must be a raw JSON object`);
+      model = msg.model;
       state = { version: msg.version, synced: true };
     } else if (msg.type === "patch") {
-      const ops = JSON.parse(msg.ops);
+      // The server embeds the ops raw ("ops":[...]), never as a string.
+      assert.ok(Array.isArray(msg.ops), `${where}: ops must be a raw JSON array`);
+      const ops = msg.ops;
       const verdict = classifyPatch(state, msg.version, ops.length);
       assert.ok(verdict === "apply" || verdict === "ack", `${where}: verdict ${verdict}`);
       if (verdict === "apply") {

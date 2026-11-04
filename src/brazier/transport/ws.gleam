@@ -12,6 +12,7 @@
 import brazier/log
 import brazier/transport/server
 import gleam/bit_array
+import gleam/bytes_tree.{type BytesTree}
 import gleam/dynamic.{type Dynamic}
 import gleam/http
 import gleam/http/request.{type Request}
@@ -20,6 +21,7 @@ import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
+import gleam/string_tree.{type StringTree}
 
 // --- Close codes (RFC 6455 §7.4.1, IANA registry) ---
 
@@ -99,6 +101,9 @@ fn ffi_parse_frame(data: BitArray, max_payload: Int) -> ParseOutcome
 
 @external(erlang, "brazier_transport_ffi", "ws_encode_frame")
 fn ffi_encode_frame(opcode: Int, payload: BitArray) -> BitArray
+
+@external(erlang, "brazier_transport_ffi", "ws_encode_frame_iodata")
+fn ffi_encode_frame_iodata(opcode: Int, payload: StringTree) -> BytesTree
 
 @external(erlang, "brazier_transport_ffi", "ws_encode_close")
 fn ffi_encode_close(code: Int, reason: String) -> BitArray
@@ -351,6 +356,14 @@ fn frame_error_to_string(error: FrameError) -> String {
 /// Encode a server text frame.
 pub fn encode_text(text: String) -> BitArray {
   ffi_encode_frame(1, <<text:utf8>>)
+}
+
+/// Encode a server text frame whose payload is a string tree, as iodata:
+/// the frame header followed by the payload, which is never copied into
+/// one binary. The transport writes state messages this way.
+/// Reference: cowlib cow_ws:frame/2.
+pub fn encode_text_tree(text: StringTree) -> BytesTree {
+  ffi_encode_frame_iodata(1, text)
 }
 
 /// Encode a server ping. Control payloads are at most 125 bytes (§5.5).

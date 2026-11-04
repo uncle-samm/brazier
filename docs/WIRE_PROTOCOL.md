@@ -37,6 +37,15 @@ read on every join:
   and the server logs a warning. The client also warns once when it finds no
   build id in its script URL.
 
+A join without `build` stays accepted because non-browser clients and the
+unversioned bundle have no build id to send, and refusing them would break
+both. The cost is that such a client is not protected from a wire change: a
+client from before `model` and `ops` became raw JSON values gets a
+`model_sync` it cannot read. It does not run on with a wrong model: it fails
+the sync loudly, retries `request_sync` up to 3 times, logs an error and
+stops (see [Versioning](#versioning)). A page that loads its bundle by hash
+always sends `build`, and gets 4409 instead.
+
 A `build` that is not a string makes the join a message that fails to
 decode. The check follows LiveView's `phx-track-static`: the client reports
 the digested assets its page loaded on join, and an outdated page is told to
@@ -105,21 +114,31 @@ error and ignores it.
 **model_sync** -- Full authoritative model state. Sent on join, on rejoin, in
 answer to `request_sync`, and whenever the server must replace the client's
 cached model JSON. `version` is the current revision (see Versioning).
+`model` is the client-visible model as a JSON value, embedded in the frame as
+it is (not a JSON string holding it).
 ```json
-{"type": "model_sync", "model": "{\"count\":1}", "version": 1, "ack_clock": 1}
+{"type": "model_sync", "model": {"count": 1}, "version": 1, "ack_clock": 1}
 ```
 
 **patch** -- Incremental server-computed RFC 6902 JSON Patch ops against the
 client-visible model JSON. `version` is the revision the patch produces.
+`ops` is the array of ops, embedded in the frame as it is.
 ```json
-{"type": "patch", "ops": "[{\"op\":\"replace\",\"path\":\"/count\",\"value\":2}]", "version": 2, "ack_clock": 2}
+{"type": "patch", "ops": [{"op": "replace", "path": "/count", "value": 2}], "version": 2, "ack_clock": 2}
 ```
-A patch with `"ops": "[]"` is an **ack**: the server processed the
+A patch with `"ops": []` is an **ack**: the server processed the
 connection's events up to `ack_clock` without changing the client-visible
 model. Its `version` is the current revision, not a new one.
 ```json
-{"type": "patch", "ops": "[]", "version": 2, "ack_clock": 3}
+{"type": "patch", "ops": [], "version": 2, "ack_clock": 3}
 ```
+The server writes `model` and `ops` into the frame without decoding or
+re-encoding them, as Phoenix's V2 serializer embeds a reply's payload, and a
+client parses each frame once. That is safe because the runtime builds both
+from its own encoder output: the model JSON is checked to be valid JSON
+before it is cached or sent, and the ops come from diffing two decoded
+models. Before this change both fields were JSON strings, which made the
+server escape every quote in the model and the client parse it twice.
 
 **heartbeat_ack** -- Acknowledges heartbeat.
 ```json
@@ -189,7 +208,7 @@ The runtime keeps one `revision` per session (the `version` field on the wire).
 - `model_sync` carries the current revision. A patch carries the revision it
   produces, which is always the previous revision plus one.
 - An event that leaves the model unchanged (or fails) is answered with an ack
-  patch (`"ops": "[]"`) at the current revision. A failed event sends its
+  patch (`"ops": []`) at the current revision. A failed event sends its
   `error` first.
 
 Client rules, which the generated browser client follows:
@@ -207,8 +226,11 @@ Client rules, which the generated browser client follows:
 | `patch` `[]` | `version` < cached | Ignore (stale) |
 | `patch` `[]` | `version` > cached | Gap: `request_sync` |
 
-A patch that fails to parse, apply or decode, or a server frame that is not
-JSON, drops the cached model and sends `request_sync`. Only one
+A patch whose `ops` is not an array, or that fails to apply or decode, or a
+server frame that is not JSON, drops the cached model and sends
+`request_sync`. A `model_sync` with no `model`, or one whose `model` does not
+decode (a JSON string holding the model, as an older server sent, does not),
+is a failed sync. Only one
 `request_sync` is in flight at a time; any `model_sync` answers it. A
 `model_sync` that cannot be decoded is retried with `request_sync` up to 3
 times in a row. After that the client logs an error and stops requesting
