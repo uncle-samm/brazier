@@ -384,6 +384,23 @@
       - a remaining STAB-3 race from the asynchronous link signal;
       - the membership churn test survives some mutants;
       - 2 `pubsub_test` failures during the agent's work came from subscriptions left by failing tests; pubsub tests should clean up in `after` (wave 4 sweep).
+  - [x] W2-B w2b-session-ip (SEC-4, SEC-7, TS-4 session clock, TS-8, TS-12), merged as e9f529a.
+    - SEC-4: `SecurityLimits.forwarding_header` names the one header a trusted proxy sets (`ip.Forwarded`, `ip.XForwardedFor`, or the default `ip.NoForwardingHeader`). Only that header is read, so the old precedence of `Forwarded` over XFF is gone. The other header from a trusted peer is logged at warning and ignored. Naming a header with no trusted proxies refuses to start. This follows Plug.RewriteOn, Rails RemoteIp and RFC 7239 §7.4.
+    - SEC-7: a socket that was bound to a session (`session.is_current_process_bound`, a pg local-members check) is closed with 4401 when its session is missing, expired or has no user on recheck. An unbound socket stays a guest. This follows LiveView's `live_socket_id` disconnect.
+    - TS-4: the session store takes a clock (`@internal start_store_with_clock`), and every sleep is gone from the session expiry tests, which now check exact boundaries.
+    - TS-8: a failed session delete logs its reason.
+    - TS-12: the `or_crash` assert explains that the crash is deliberate.
+    - DEPLOYMENT.md says which tokens are signed (join tokens, the cluster peer check) and which are random (session ids, CSRF tokens).
+    - Coordinator change: W2-B had copied the pg group key into `brazier_session_binding_ffi.erl` because fix-cluster owned `brazier_session_ffi.erl`. After that merge, `is_bound/3` moved next to `bind_process/3` and the copy was deleted (4baa910).
+    - Coordinator verify on the merge of 0771476 into the branch (6a718f3 plus 4baa910): clean build with zero warnings, format and lint clean, 1655 tests passing in each of 3 runs, docs check OK, test-client OK, and `examples/auth_workspace` builds.
+    - Decisions:
+      - `forwarding_header` defaults to none, which breaks existing configs: an app behind a proxy must set it, or every client address is the proxy's;
+      - the other header from a trusted proxy is warned about, not refused (Rails refuses), because the request is still correctly addressed.
+    - Follow-ups:
+      - `middleware.gleam` (around 240), MIDDLEWARE.md:75 and ARCHITECTURE.md:265 still describe "`Forwarded` / `X-Forwarded-For`" as if both are read (W2-A's files; check after its merge);
+      - stale "signed" wording in `config.gleam:12` and `cluster.gleam:132`;
+      - `X-Forwarded-Proto` is read whatever header is configured, and `Forwarded` `proto=` is never read;
+      - `transport.trusted_proxies(limits)` parses the list again on every call.
 - [ ] Final verification: build (zero warnings), tests, all examples, CDP browser suite, perf baselines
 
 **Decisions (Milestone 117, coordinator):**
