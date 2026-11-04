@@ -140,6 +140,7 @@ fn session_config(
     on_notification: None,
     secret_key: "",
     presence: Some(tracking_and_watching()),
+    title: None,
   )
 }
 

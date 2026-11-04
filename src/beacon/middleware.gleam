@@ -229,7 +229,7 @@ pub fn rate_limit_behind_proxies(
   limiter: rate_limit.RateLimiter,
   trusted: ip.TrustedProxies,
 ) -> Middleware {
-  let retry_after = int.to_string(limiter.config.window_seconds)
+  let retry_after = int.to_string(rate_limit.config(limiter).window_seconds)
   fn(
     req: Request(Connection),
     next: fn(Request(Connection)) -> Response(ResponseBody),

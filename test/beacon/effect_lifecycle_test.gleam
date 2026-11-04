@@ -289,6 +289,7 @@ fn lifecycle_config(
     on_notification: option.None,
     secret_key: "",
     presence: None,
+    title: None,
   )
 }
 

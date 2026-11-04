@@ -34,7 +34,7 @@ pub const default_max_keys = 100_000
 
 /// A running rate limiter. Create one with `new` or `new_with_max_keys`,
 /// which validate the settings; read them with `config` and `max_keys`.
-pub type RateLimiter {
+pub opaque type RateLimiter {
   RateLimiter(handle: Handle, config: RateLimitConfig, max_keys: Int)
 }
 

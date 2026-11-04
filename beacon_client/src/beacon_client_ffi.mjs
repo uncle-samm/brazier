@@ -894,9 +894,21 @@ function handleMessage(raw) {
     case "reload": console.log("[beacon] Hot reload: refreshing"); location.reload(); break;
     case "heartbeat_ack": break;
     case "error": handleServerError(msg.reason); break;
+    case "title": handleServerTitle(msg.title); break;
     case "mount": console.error("[beacon] Server sent a mount frame, which this client does not support; ignored"); break;
     default: console.error("[beacon] Unknown server message type:", msg.type); break;
   }
+}
+
+// The server sends the page title on every join and whenever an update
+// changes it (LiveView's page_title).
+function handleServerTitle(title) {
+  if (typeof title !== "string") {
+    console.error("[beacon] Server title frame has no string title:", title);
+    return;
+  }
+  document.title = title;
+  trace("title", { title });
 }
 
 function handleServerError(reason) {

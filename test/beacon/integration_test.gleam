@@ -185,6 +185,9 @@ pub fn ws_connect_and_receive_model_sync_test() {
   let assert True = string.contains(response, "\"type\":\"model_sync\"")
   let assert True = string.contains(response, "\\\"count\\\":0")
   let assert False = string.contains(response, "\"type\":\"mount\"")
+  // The page title follows the join's model_sync.
+  let assert Ok(title) = ws_recv(socket, 3000)
+  let assert "{\"type\":\"title\",\"title\":\"Integration Test\"}" = title
   let assert Ok(Nil) = ws_close_graceful(socket, 5000)
   stop(app)
 }
@@ -222,12 +225,16 @@ pub fn two_connections_have_independent_state_test() {
   let assert True = string.contains(sync_a, "\"type\":\"model_sync\"")
   let assert True = string.contains(sync_a, "\\\"count\\\":0")
   let assert False = string.contains(sync_a, "\"type\":\"mount\"")
+  let assert Ok(title_a) = ws_recv(socket_a, 3000)
+  let assert True = string.contains(title_a, "\"type\":\"title\"")
 
   let assert Ok(Nil) = ws_send(socket_b, "{\"type\":\"join\"}")
   let assert Ok(sync_b) = ws_recv(socket_b, 3000)
   let assert True = string.contains(sync_b, "\"type\":\"model_sync\"")
   let assert True = string.contains(sync_b, "\\\"count\\\":0")
   let assert False = string.contains(sync_b, "\"type\":\"mount\"")
+  let assert Ok(title_b) = ws_recv(socket_b, 3000)
+  let assert True = string.contains(title_b, "\"type\":\"title\"")
 
   // Send increment on connection A only
   let assert Ok(Nil) =

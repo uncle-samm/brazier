@@ -99,6 +99,7 @@ fn session_config(
     on_notification: None,
     secret_key: "",
     presence: Some(presence_watch.new(fast_config(), in_room, Online)),
+    title: None,
   )
 }
 

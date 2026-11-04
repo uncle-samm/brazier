@@ -187,10 +187,9 @@ Notes on individual events:
 - `[beacon, ws, upgrade]` covers the handshake checks and the 101 write.
   `route` is `/ws`. `result` is `ok` or names the refusal:
   `rejected_middleware`, `rejected_early_data`, `rejected_body`,
-  `invalid_limits`, `peer_gone`, `rejected_connection_limit`,
-  `local_port_unavailable`, `rejected_ip_limit`, `rejected_origin`,
-  `rejected_auth`, `rejected_handshake`, `rejected_version` or
-  `upgrade_write_failed`.
+  `peer_gone`, `rejected_connection_limit`, `rejected_ip_limit`,
+  `rejected_origin`, `rejected_auth`, `rejected_handshake`,
+  `rejected_version` or `upgrade_write_failed`.
 - `[beacon, ws, close]` is emitted once per upgraded connection when its
   handler stops. `duration` is the connection's lifetime; the frame and
   byte counters count every frame, control frames included. `close_code`
@@ -200,10 +199,15 @@ Notes on individual events:
   label: `peer_close`; `rate_limit_exceeded`, `too_many_invalid_messages`,
   `protocol_error`, `message_too_big`, `invalid_utf8`,
   `binary_messages_not_supported`, `pong_timeout`, `idle_timeout`,
-  `internal_error`, `authentication_expired`, `session_revoked`,
-  `server_overloaded` or `backpressure` for a close Beacon sent;
-  `tcp_closed`, `tcp_error` or `send_failed` without a close frame; or
-  `startup_failure`.
+  `internal_error` (also a join whose server cannot read its client
+  manifest, and a dev-mode handler that cannot subscribe to reloads),
+  `authentication_expired`, `session_revoked`, `server_overloaded`,
+  `backpressure`, `server_shutting_down` or `stale_build` (4409, a join
+  from a page of another build) for a close Beacon sent; `tcp_closed`,
+  `tcp_error` or `send_failed` without a close frame; or `init_refused`
+  (including a join token that fails its check, 4400) and
+  `startup_failure` when the runtime did not start. Dev mode's `reload`
+  emits no event of its own.
 - `[beacon, ws, rate_limited]` fires for every refused message. `kind` is
   `event_rate`, `batch_size` or `heartbeat_rate`, and `violations` is the
   connection's count in the current rate window; reaching

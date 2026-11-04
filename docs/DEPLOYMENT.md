@@ -94,7 +94,8 @@ import beacon/error.{type BeaconError}
 import gleam/result
 
 pub fn main() -> Nil {
-  // beacon.start blocks while the server runs; returning means it failed.
+  // beacon.start blocks while the server runs. It returns Ok(Nil) once a
+  // SIGTERM drain has stopped the app, and an Error when it cannot start.
   let assert Ok(Nil) = start() as "Beacon did not start"
   Nil
 }

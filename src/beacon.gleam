@@ -278,7 +278,10 @@ pub fn with_router(
   )
 }
 
-/// The page title, computed from the model of the first render.
+/// The page title for the client model. The server render puts it in the
+/// document's `<title>`; after that, the browser's title follows live
+/// updates: each join sends the current title, and so does every update
+/// that changes it.
 pub fn title(
   app: App(state, model, local, msg),
   title: fn(model) -> String,

@@ -132,6 +132,19 @@ ignored; the current path is not navigated again.
 {"type": "navigate", "path": "/search?q=x", "replace": true}
 ```
 
+**title** -- The page title, from the app's `beacon.title`. Sent on every
+join, and after an update to every joined connection when the title differs
+from the last one sent (it is a function of the server state, so it can
+change when the client-visible model does not). The client sets
+`document.title`; a frame without a string `title` is logged as an error and
+ignored. An app without `beacon.title` never sends it. A title over
+`runtime.title_max_bytes` (4096) is not sent: the server logs an error and
+sends `{"type":"error","reason":"Title too large: ..."}` instead, and the
+page keeps its last title.
+```json
+{"type": "title", "title": "Inbox (3)"}
+```
+
 ### hard_navigate (server → client)
 Full page navigation via `window.location.href`. Unlike `navigate` (which uses pushState),
 this triggers a real HTTP request — use when the browser needs to receive HTTP headers
@@ -245,8 +258,13 @@ follows.
 
 1. Client reopens WebSocket to `/ws?path=<current page path>`.
 2. Browser sends `join` with an empty token; the cookie is carried by the WebSocket upgrade request.
-3. Server validates token age (max 24h) and deserializes model.
-4. Success: `model_sync` with recovered state. Failure: uses current model and logs the recovery error.
+3. Server checks the token before `init` runs: it must verify (signature,
+   age at most 24h, the same browser session), and its model must `restore`.
+   With state recovery enabled, a join without a token fails the check too.
+4. Success: `model_sync` with the recovered state. Failure: the refusal is
+   logged and the socket closes with 4400, so the client reloads the page
+   (behind the reload guard) and the new render issues a fresh token. The
+   session never continues with a state it could not recover.
 
 ## Upgrade Handshake
 

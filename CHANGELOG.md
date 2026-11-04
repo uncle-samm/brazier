@@ -116,6 +116,10 @@ with its own changelog, so they are not listed here.
   limiter's settings.
 - (WS10b) `[beacon, subscription, changed]` telemetry: a runtime's PubSub
   listener joined or left a topic.
+- (WS10b) The page title follows live updates. The server sends a `title`
+  frame on every join and after each update that changes `beacon.title`'s
+  result, and the client sets `document.title`, like LiveView's
+  `page_title`.
 - (WS10b) A build-id handshake. The client's `join` carries the content hash
   of the bundle its page loaded (`build`). A server that serves another
   bundle closes with 4409 `stale build`, and the client reloads behind its

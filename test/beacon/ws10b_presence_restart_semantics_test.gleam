@@ -143,6 +143,7 @@ fn session_config(
     on_notification: None,
     secret_key: "",
     presence: Some(presence_of_app()),
+    title: None,
   )
 }
 

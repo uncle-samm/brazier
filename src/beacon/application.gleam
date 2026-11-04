@@ -637,6 +637,7 @@ fn transport_config(
       on_notification: config.on_notification,
       secret_key: config.secret_key,
       presence: config.presence,
+      title: Some(config.title),
     )
 
   let base_transport_config =

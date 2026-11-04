@@ -838,6 +838,18 @@ scenario("Rate limited and Batch too large log an error and request a resync", a
   assert.equal(errorsMatching("Unknown handler").length, 1);
 });
 
+scenario("a title frame sets document.title; one without a string title is logged", async () => {
+  await loadRuntime();
+  const s = sockets[0];
+  s.open();
+  sync(s, 0, { count: 0 });
+  s.deliver({ type: "title", title: "Inbox (3)" });
+  assert.equal(document.title, "Inbox (3)");
+  s.deliver({ type: "title", title: 3 });
+  assert.equal(errorsMatching("no string title").length, 1);
+  assert.equal(document.title, "Inbox (3)", "a malformed title frame changes nothing");
+});
+
 scenario("unknown, unsupported and unparseable server frames are logged", async () => {
   await loadRuntime();
   const s = sockets[0];

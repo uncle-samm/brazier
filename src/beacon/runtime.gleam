@@ -226,6 +226,11 @@ pub type RuntimeState(model, msg) {
     presence: Option(presence_watch.Watcher(model)),
     /// Native monotonic time the runtime started, for its uptime.
     started_at: Int,
+    /// The document title for the server state, when the app has one.
+    title: Option(fn(model) -> String),
+    /// The title the joined connections were last sent. `None` until the
+    /// first join (the server render carried the title until then).
+    last_title: Option(String),
   )
 }
 
@@ -266,6 +271,10 @@ pub type RuntimeConfig(state, msg) {
     /// The app's presence: what the session tracks for its state and the
     /// message for a change on its topics.
     presence: Option(presence_watch.Watch(state, msg)),
+    /// The document title for the server state (the app's `title`). Sent
+    /// on every join and whenever an update changes it, so the browser's
+    /// title follows live updates. `None` sends no title.
+    title: Option(fn(state) -> String),
   )
 }
 
@@ -508,6 +517,8 @@ fn spawn_actor(
           effect_processes: initial_effect_processes,
           presence: watcher,
           started_at: started_at,
+          title: config.title,
+          last_title: None,
         )
       log.debug("beacon.runtime", "Runtime initialising")
       // Trap exits so a stop caused by a linked process still reports
@@ -1086,6 +1097,7 @@ fn accept_join(
     )
   let state =
     send_model_sync_to(state, [conn_id, ..stale_others], "join_model_sync")
+  let state = send_title_on_join(state, conn_id)
   reconcile_subscriptions(state)
 }
 
@@ -1869,9 +1881,120 @@ fn broadcast_model(
         connection_label(conn_id),
         fn() {
           let #(state, changed, sent_bytes) = broadcast_to(state, targets)
-          #(#(state, changed), sent_bytes)
+          #(#(sync_title(state, targets), changed), sent_bytes)
         },
       )
+  }
+}
+
+/// The largest title, in bytes, sent to a browser. A title is one line of
+/// the tab strip; one this large is an app bug, not a title.
+pub const title_max_bytes = 4096
+
+/// The title for the current state, checked against `title_max_bytes`.
+/// `Ok(None)` when the app has no title.
+fn current_title(
+  state: RuntimeState(model, msg),
+) -> Result(Option(String), Int) {
+  case state.title {
+    None -> Ok(None)
+    Some(title_fn) -> {
+      let title = title_fn(state.model)
+      let size = string.byte_size(title)
+      case size > title_max_bytes {
+        True -> Error(size)
+        False -> Ok(Some(title))
+      }
+    }
+  }
+}
+
+/// Report a title over `title_max_bytes` to `targets`; nothing is sent in
+/// its place and the last title sent stays the browsers' title.
+fn title_too_large(
+  state: RuntimeState(model, msg),
+  targets: List(transport.ConnectionId),
+  size: Int,
+) -> Nil {
+  log.error(
+    "beacon.runtime",
+    "Title is "
+      <> int.to_string(size)
+      <> " bytes, over the "
+      <> int.to_string(title_max_bytes)
+      <> " byte limit; not sent to "
+      <> int.to_string(list.length(targets))
+      <> " connection(s)",
+  )
+  list.each(targets, fn(conn_id) {
+    send_to_conn_id(
+      state,
+      conn_id,
+      transport.SendError(
+        reason: "Title too large: "
+        <> int.to_string(size)
+        <> " bytes exceeds the "
+        <> int.to_string(title_max_bytes)
+        <> " byte limit",
+      ),
+    )
+  })
+}
+
+/// Send the title to a connection that just joined. Always sent: the page
+/// may have been rendered long before this (re)join, under another title.
+///
+/// Reference: LiveView sends `page_title` in a join's rendered diff and,
+/// after that, only in diffs where it changed (the `"t"` key; knowledge of
+/// `Phoenix.LiveView.Diff`, not code read here).
+fn send_title_on_join(
+  state: RuntimeState(model, msg),
+  conn_id: transport.ConnectionId,
+) -> RuntimeState(model, msg) {
+  case current_title(state) {
+    Ok(None) -> state
+    Ok(Some(title)) -> {
+      log.debug("beacon.runtime", "Sending title to joined " <> conn_id)
+      send_to_conn_id(state, conn_id, transport.SendTitle(title: title))
+      RuntimeState(..state, last_title: Some(title))
+    }
+    Error(size) -> {
+      title_too_large(state, [conn_id], size)
+      state
+    }
+  }
+}
+
+/// After an update, send the title to `targets` (every joined connection)
+/// when it differs from the one they were last sent. The title is a
+/// function of the server state, so it can change when the client-visible
+/// model does not.
+fn sync_title(
+  state: RuntimeState(model, msg),
+  targets: List(transport.ConnectionId),
+) -> RuntimeState(model, msg) {
+  case current_title(state) {
+    Ok(None) -> state
+    Ok(Some(title)) ->
+      case state.last_title == Some(title) {
+        True -> state
+        False -> {
+          log.info(
+            "beacon.runtime",
+            "Title changed; sending it to "
+              <> int.to_string(list.length(targets))
+              <> " connection(s)",
+          )
+          list.each(targets, fn(conn_id) {
+            send_to_conn_id(state, conn_id, transport.SendTitle(title: title))
+          })
+          RuntimeState(..state, last_title: Some(title))
+        }
+      }
+    Error(size) -> {
+      title_too_large(state, targets, size)
+      state
+    }
   }
 }
 

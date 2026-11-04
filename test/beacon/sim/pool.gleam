@@ -304,7 +304,7 @@ fn execute_action(
     WaitForResponse(timeout_ms) -> {
       case socket {
         Some(s) -> {
-          case ws_recv(s, timeout_ms) {
+          case recv(mt, s, timeout_ms) {
             Ok(payload) -> {
               record_response(mt, payload)
               Ok(Some(s))
@@ -319,7 +319,7 @@ fn execute_action(
     WaitForPatch(timeout_ms) -> {
       case socket {
         Some(s) -> {
-          case ws_recv(s, timeout_ms) {
+          case recv(mt, s, timeout_ms) {
             Ok(payload) -> {
               record_response(mt, payload)
               case string.contains(payload, "\"type\":\"patch\"") {
@@ -338,7 +338,7 @@ fn execute_action(
     WaitForModelSync(timeout_ms) -> {
       case socket {
         Some(s) -> {
-          case ws_recv(s, timeout_ms) {
+          case recv(mt, s, timeout_ms) {
             Ok(payload) -> {
               record_response(mt, payload)
               case string.contains(payload, "\"type\":\"model_sync\"") {
@@ -359,7 +359,7 @@ fn execute_action(
     AssertResponseContains(timeout_ms, expected) -> {
       case socket {
         Some(s) -> {
-          case ws_recv(s, timeout_ms) {
+          case recv(mt, s, timeout_ms) {
             Ok(payload) -> {
               record_response(mt, payload)
               case string.contains(payload, expected) {
@@ -466,7 +466,7 @@ fn receive_until(
   expected: String,
 ) -> Result(Option(WsSocket), String) {
   let remaining_ms = int.max(0, { deadline_us - metrics.now_us() } / 1000)
-  case ws_recv(socket, remaining_ms) {
+  case recv(mt, socket, remaining_ms) {
     Ok(payload) -> {
       case string.contains(payload, expected) {
         True -> {
@@ -480,6 +480,37 @@ fn receive_until(
       }
     }
     Error(reason) -> Error("waiting for '" <> expected <> "': " <> reason)
+  }
+}
+
+/// Receive the next frame that is not a `title` frame. A browser applies a
+/// title frame on its own (`document.title`); it answers no event, so the
+/// simulated client counts its bytes and reads on, within the same
+/// `timeout_ms`.
+fn recv(
+  mt: MetricsTable,
+  socket: WsSocket,
+  timeout_ms: Int,
+) -> Result(String, String) {
+  recv_before(mt, socket, metrics.now_us() + timeout_ms * 1000)
+}
+
+fn recv_before(
+  mt: MetricsTable,
+  socket: WsSocket,
+  deadline_us: Int,
+) -> Result(String, String) {
+  let remaining_ms = int.max(0, { deadline_us - metrics.now_us() } / 1000)
+  case ws_recv(socket, remaining_ms) {
+    Ok(payload) ->
+      case string.contains(payload, "\"type\":\"title\"") {
+        True -> {
+          metrics.increment_by(mt, "bytes_received", string.byte_size(payload))
+          recv_before(mt, socket, deadline_us)
+        }
+        False -> Ok(payload)
+      }
+    Error(reason) -> Error(reason)
   }
 }
 

@@ -36,8 +36,8 @@ join(Socket, Host, Events, Deadline) ->
             case send_text(Socket, Join) of
                 ok ->
                     case recv_text(Socket, Buffer0, Deadline) of
-                        {ok, _Mount, Buffer1} ->
-                            events(Socket, Buffer1, Events, 1, Deadline);
+                        {ok, _ModelSync, Buffer1} ->
+                            join_title(Socket, Buffer1, Events, Deadline);
                         {error, Reason} ->
                             {error, <<"join reply: ", Reason/binary>>}
                     end;
@@ -46,6 +46,21 @@ join(Socket, Host, Events, Deadline) ->
             end;
         {error, Reason} ->
             {error, Reason}
+    end.
+
+%% The join's model_sync is followed by the page title (the stress app's
+%% title is constant, so no event is answered by another one).
+join_title(Socket, Buffer, Events, Deadline) ->
+    case recv_text(Socket, Buffer, Deadline) of
+        {ok, Title, Buffer1} ->
+            case binary:match(Title, <<"\"type\":\"title\"">>) of
+                {_, _} ->
+                    events(Socket, Buffer1, Events, 1, Deadline);
+                nomatch ->
+                    {error, <<"join title: got ", Title/binary>>}
+            end;
+        {error, Reason} ->
+            {error, <<"join title: ", Reason/binary>>}
     end.
 
 %% Send events one at a time; each must be answered by a patch whose

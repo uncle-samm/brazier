@@ -72,7 +72,18 @@ is dropped and answered with `{"type":"error","reason":"Rate limited"}`.
 Heartbeats have their own limit of 2 per second: one over it is not acked.
 Every rejection counts as a violation, and a connection with more than
 `ws_max_rate_violations` (default 100) closes with 1008. A new window
-resets the budget and forgives earlier violations.
+resets the budget and forgives earlier violations. The limit is not
+advertised to the client, as in Phoenix channels; the generated client
+paces itself at 40 messages per second, and a `max_events_per_second`
+below 50 is logged as a warning when the listener starts.
+
+## Stale Builds
+
+A `join` carries the build id of the client bundle its page loaded. When the
+server serves another bundle (the app was redeployed or rebuilt since the
+page loaded), it closes with 4409 `stale build`, and the client reloads
+behind its reload guard to get the current bundle. A server that cannot
+read its client manifest closes the join with 1011 and logs an error.
 
 ## Join Tokens
 

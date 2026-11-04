@@ -237,24 +237,12 @@ If a failure shows `eaddrinuse`, first check for a concurrent run
 (`pgrep -f "gleam test"`, `pgrep -f test_all_cdp.py`) before treating it
 as a flake.
 
-**Known failure: a listener restart can hit `eaddrinuse`.** This is a
-source bug, not a test fault. `beacon_http_acceptors_sup` owns the listen
-socket and never closes it, so the runtime closes it when the process
-exits. With acceptors blocked in `accept`, that close can land after the
-parent supervisor has seen the exit and restarted the listener on the
-same port.
-
-- A standalone reproduction (no Beacon code: owner, 10 acceptors in
-  `accept`, stop, rebind on `DOWN`) failed 366 and 376 of 20000 rebinds
-  under 8 busy loops.
-- With an explicit `gen_tcp:close` before the owner exits, it failed 0
-  of 20000.
-- In the suite, the failed restart counts against the restart tolerance.
-  `app_tree_test`'s `wait_forever_crashes_when_the_tree_gives_up_test_`
-  then fails with an rpc `which_children` error, because the tree gave up
-  one crash early (1 of 5 flake runs, 2026-11-03).
-- The fix belongs in `src`: close the socket synchronously before the
-  owner exits.
+A listener restarted under load used to hit `eaddrinuse`, because the
+acceptors owned the listen socket and the runtime closed it some time after
+they exited. The socket now has an owner process of its own
+(`beacon_http_listen_socket`) that closes it before it exits, so a restart
+on the same port never races the old socket; an `eaddrinuse` in a test run
+is another process on the port.
 
 ## Example and CDP tests (browser)
 
@@ -307,13 +295,16 @@ re-evaluates its condition, reading CDP events in between, until it holds
 or `BEACON_CDP_WAIT_SECONDS` (default 10) passes. A passing check returns
 immediately.
 
-There are two deliberate windows:
+A check that the browser sent *no* model event waits on the client, not on
+a quiet period: after the local update is visible, `wait_outbound_drained`
+waits until `window.__beaconOutboundPendingForTest()` (behind
+`__BEACON_ENABLE_TEST_HOOKS`) reports an empty paced queue and no scheduled
+send, then takes a CDP barrier so every frame written before it is
+recorded. The hook does not yet count a debounced send whose timer has not
+fired (see [TODO.md](TODO.md)).
 
-- `drain_quiet` (`BEACON_CDP_QUIET_SECONDS`, default 0.5) is for checks
-  that the browser sent *no* model event, which cannot be waited for. It
-  starts after the local update is visible.
-- Pong's "frozen while paused" check holds still for many ticks, because
-  the stillness is the thing under test.
+One deliberate window remains: Pong's "frozen while paused" check holds
+still for many ticks, because the stillness is the thing under test.
 
 ### Concurrency
 
@@ -386,11 +377,10 @@ baseline and how tolerances are chosen.
   4. `gleam build --warnings-as-errors`
   5. `gleam test`
   6. `gleam run -m beacon/lint`
-- **Browser all desktop.** 23 shards, each running
-  `make browser-all-shard` with `BEACON_CDP_VIEWPORTS=desktop`.
-
-The mobile viewport is not in CI. Run `make browser-all-mobile` locally
-before changing layout or the client.
+  7. `scripts/check_docs.sh`
+- **Browser all.** 23 shards at each viewport (desktop and mobile), each
+  running `make browser-all-shard` with `BEACON_CDP_VIEWPORTS` set to the
+  viewport.
 
 ## Deliberate waits
 
@@ -403,18 +393,4 @@ These are the waits that remain, and why.
 | `ws_protocol_test` idle session | `process.sleep(80)` | The session idle TTL is wall-clock time, and the store has no clock to advance. |
 | `beacon/stress` | `hold_duration_ms` | Holding connections open is the load being measured (0 in tests). |
 | `beacon/sim` pool | `stagger_ms` | Connection pacing is part of the scenario. |
-| CDP `drain_quiet`, pong pause | see [Waiting](#waiting) | An absence, or stillness, is under test. |
-
-### Needs a source hook
-
-These waits cannot become event-driven from test code alone:
-
-- **Client outbound queue.** The CDP "no model event was sent" checks use
-  a quiet window. A test hook under `__BEACON_ENABLE_TEST_HOOKS` would
-  replace it: `window.__beaconOutboundPendingForTest()`, returning the
-  queue length plus whether a pump timer is pending.
-- **Upload 413 ordering.** When an upload is refused early, the server
-  discards the unread body (bounded by the body read timeout) before it
-  writes the 413, so the refusal arrives about 0.5 s late. It should
-  write the refusal first, or close instead of discarding. The discard
-  should also end when the peer closes.
+| CDP pong pause | see [Waiting](#waiting) | The stillness is under test. |

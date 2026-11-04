@@ -129,6 +129,7 @@ fn session_config(
     on_notification: None,
     secret_key: "",
     presence: Some(watching()),
+    title: None,
   )
 }
 

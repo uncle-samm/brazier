@@ -50,6 +50,7 @@ fn config() -> runtime.RuntimeConfig(Model, Msg) {
     on_notification: option.None,
     secret_key: "",
     presence: option.None,
+    title: option.None,
   )
 }
 

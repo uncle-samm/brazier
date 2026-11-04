@@ -336,6 +336,7 @@ fn runtime_config() -> runtime.RuntimeConfig(BenchModel, BenchMsg) {
     on_notification: option.None,
     secret_key: "bench-secret-key-that-is-long-enough-for-hmac",
     presence: option.None,
+    title: option.None,
   )
 }
 

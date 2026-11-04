@@ -84,6 +84,7 @@ fn config() -> runtime.RuntimeConfig(Model, Msg) {
     on_notification: None,
     secret_key: secret,
     presence: None,
+    title: None,
   )
 }
 
@@ -746,5 +747,5 @@ pub fn client_replay_of_server_frames_matches_final_sync_test() {
 /// harness exits non-zero on any failed scenario.
 pub fn client_runtime_behaviour_harness_test() {
   let assert Ok(output) = run_node("beacon_client/test/ffi_harness.mjs", "")
-  let assert True = string.contains(output, "ffi harness ok: 38 scenarios")
+  let assert True = string.contains(output, "ffi harness ok: 39 scenarios")
 }

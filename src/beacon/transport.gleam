@@ -105,6 +105,9 @@ pub type ServerMessage {
   ServerHardNavigate(path: String)
   /// Dev mode: tell browser to reload.
   ServerReload
+  /// The document title for the session's state: sent on every join and
+  /// whenever an update changes it. The client sets `document.title`.
+  ServerTitle(title: String)
 }
 
 /// Internal messages that the connection process can receive.
@@ -124,6 +127,8 @@ pub type InternalMessage {
   SendReplaceNavigate(path: String)
   /// Send hard navigation to the client (full page reload).
   SendHardNavigate(path: String)
+  /// Send the document title to the client.
+  SendTitle(title: String)
   /// Close the connection because the server has detected sustained pressure.
   CloseForBackpressure(reason: String)
   // --- TCP/WebSocket events (internal to transport layer) ---
@@ -671,6 +676,12 @@ pub fn encode_server_message(msg: ServerMessage) -> String {
       |> json.to_string
     ServerReload ->
       json.object([#("type", json.string("reload"))])
+      |> json.to_string
+    ServerTitle(title) ->
+      json.object([
+        #("type", json.string("title")),
+        #("title", json.string(title)),
+      ])
       |> json.to_string
   }
 }
@@ -1679,6 +1690,7 @@ fn handle_runtime_message(
           send_or_stop(state, ServerReplaceNavigate(path: path))
         SendHardNavigate(path) ->
           send_or_stop(state, ServerHardNavigate(path: path))
+        SendTitle(title) -> send_or_stop(state, ServerTitle(title: title))
         CloseForBackpressure(reason) -> {
           log.warning(
             "beacon.transport",

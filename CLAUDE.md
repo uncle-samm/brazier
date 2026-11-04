@@ -4,7 +4,7 @@ Full-stack Gleam web framework on BEAM. MVU architecture, one process per sessio
 
 ## Codex Project Instructions
 
-Codex reads `AGENTS.md` for project-local guidance. There is no repo-editable Codex system prompt file such as codex.md; do not touch `~/.codex` for this project. Project skills live in `.agents/skills/*/SKILL.md` and are the Codex source of truth. The old Claude tigerstyle slash command is superseded by `.agents/skills/tigerstyle/SKILL.md` unless a future command adds genuinely new behavior.
+Codex reads `AGENTS.md` for project-local guidance. There is no repo-editable Codex system prompt file such as codex.md; do not touch `~/.codex` for this project. Project skills live in `.agents/skills/*/SKILL.md` and are the Codex source of truth.
 
 ## Learn More
 
