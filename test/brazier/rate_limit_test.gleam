@@ -152,18 +152,80 @@ pub fn sweep_deletes_expired_windows_test() {
       "test_sweep_" <> unique_id(),
       rate_limit.RateLimitConfig(max_requests: 1, window_seconds: 1),
     )
+  // The counters are in windows from `before` to `after` (1s windows).
+  let before = system_time_seconds()
   let assert rate_limit.Allowed(..) = rate_limit.check(limiter, "a")
+    as "the first request for a key is within a budget of 1"
   let assert rate_limit.Allowed(..) = rate_limit.check(limiter, "b")
-  // Let the 1s window roll over, then sweep. The periodic sweep may have
-  // removed some counters first, so only an upper bound is exact. The sleep
-  // is the thing under test: windows are wall-clock seconds, and sleeping
-  // past one cannot race, since a slow scheduler only makes it older.
-  process.sleep(1100)
-  let assert Ok(deleted) = rate_limit.sweep(limiter)
-  let assert True = deleted <= 2
-  let assert Ok(0) = rate_limit.key_count(limiter)
-  // A new window starts a fresh budget.
+    as "the first request for a key is within a budget of 1"
+  let after = system_time_seconds()
+  // A sweep as of `before` deletes only windows older than every counter.
+  let assert Ok(0) = rate_limit.sweep_with(limiter, before, 5000)
+    as "no counter is older than the window the checks started in"
+  // A sweep as of two windows after `after` deletes every counter. The
+  // periodic sweep may have removed some first if the clock ticked, so only
+  // an upper bound on this sweep's count is exact; the table being empty
+  // is. The clock is injected, so nothing waits for a window to roll over.
+  let assert Ok(deleted) = rate_limit.sweep_with(limiter, after + 2, 5000)
+    as "a running owner answers a sweep"
+  assert deleted <= 2
+  assert rate_limit.key_count(limiter) == Ok(0)
+  // With the counter gone the key has a fresh budget.
   let assert rate_limit.Allowed(..) = rate_limit.check(limiter, "a")
+    as "a key whose counter was swept has a fresh budget"
+}
+
+// --- Errors name their cause ---
+
+pub fn sweep_of_a_suspended_owner_is_a_timeout_test() {
+  let limiter = start("test_timeout_", 5)
+  let owner = rate_limit.owner(limiter)
+  suspend(owner)
+  let result = rate_limit.sweep_with(limiter, system_time_seconds(), 10)
+  resume(owner)
+  assert result == Error(rate_limit.LimiterTimeout(timeout_ms: 10))
+  // The owner is fine once resumed (it answers the late call to nobody).
+  let assert Ok(_) = rate_limit.sweep(limiter)
+    as "a resumed owner answers a sweep"
+}
+
+pub fn sweep_of_an_owner_that_dies_mid_call_is_a_call_failure_test() {
+  // The owner is linked to its creator, so the creator traps exits and
+  // outlives the kill.
+  let reply = process.new_subject()
+  let creator =
+    process.spawn_unlinked(fn() {
+      process.trap_exits(True)
+      let assert Ok(limiter) =
+        rate_limit.new(
+          "test_mid_call_" <> unique_id(),
+          rate_limit.RateLimitConfig(max_requests: 5, window_seconds: 60),
+        )
+        as "valid settings and a unique name start a limiter"
+      process.send(reply, limiter)
+      process.sleep_forever()
+    })
+  let assert Ok(limiter) = process.receive(reply, 5000)
+    as "the creator sends its limiter as soon as it starts"
+  let owner = rate_limit.owner(limiter)
+  // Hold the call in the owner's mailbox, then kill the owner under it.
+  // The trace says when the call has arrived, so nothing sleeps.
+  suspend(owner)
+  trace_receives(owner)
+  let results = process.new_subject()
+  process.spawn(fn() {
+    process.send(results, rate_limit.sweep_with(limiter, 0, 5000))
+  })
+  let assert Ok(Nil) = await_call_received(owner, 5000)
+    as "the caller's sweep reaches the owner's mailbox"
+  process.kill(owner)
+  let assert Ok(result) = process.receive(results, 5000)
+    as "the caller returns as soon as the owner dies"
+  assert result == Error(rate_limit.LimiterCallFailed(reason: "killed"))
+  // After the owner is gone, the same call is "not running".
+  assert rate_limit.sweep_with(limiter, 0, 5000)
+    == Error(rate_limit.LimiterNotRunning)
+  process.kill(creator)
 }
 
 pub fn periodic_sweep_runs_without_being_asked_test() {
@@ -202,8 +264,10 @@ pub fn owner_stops_when_creator_exits_and_checks_fail_closed_test() {
   await.expect_down(rate_limit.owner(limiter), "the limiter's owner")
   // The table is gone with its owner: requests are refused, not let through.
   let assert rate_limit.RateLimited = rate_limit.check(limiter, "x")
-  let assert Error(Nil) = rate_limit.key_count(limiter)
-  let assert Error(Nil) = rate_limit.reset(limiter, "x")
+  let assert Error(rate_limit.LimiterNotRunning) = rate_limit.key_count(limiter)
+  let assert Error(rate_limit.LimiterNotRunning) =
+    rate_limit.reset(limiter, "x")
+  let assert Error(rate_limit.LimiterNotRunning) = rate_limit.sweep(limiter)
 }
 
 // --- Concurrency ---
@@ -243,6 +307,21 @@ fn unique_id() -> String {
 
 @external(erlang, "erlang", "unique_integer")
 fn do_unique() -> Int
+
+@external(erlang, "brazier_test_ffi", "system_time_seconds")
+fn system_time_seconds() -> Int
+
+@external(erlang, "brazier_rate_limit_test_ffi", "suspend")
+fn suspend(pid: process.Pid) -> Nil
+
+@external(erlang, "brazier_rate_limit_test_ffi", "resume")
+fn resume(pid: process.Pid) -> Nil
+
+@external(erlang, "brazier_rate_limit_test_ffi", "trace_receives")
+fn trace_receives(pid: process.Pid) -> Nil
+
+@external(erlang, "brazier_rate_limit_test_ffi", "await_call_received")
+fn await_call_received(pid: process.Pid, timeout_ms: Int) -> Result(Nil, Nil)
 
 /// Inclusive integer sequence.
 fn seq(from: Int, to: Int) -> List(Int) {

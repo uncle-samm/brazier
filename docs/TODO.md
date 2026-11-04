@@ -22,10 +22,6 @@ The docs describe the current behaviour; each item is a code change.
   is `api.read_text` / `api.read_form`. Older docs pointed users at
   `read_body`.
   - **Files:** `src/brazier/transport/http.gleam`
-- **Issue:** several simulation tests allow leaked processes or failed
-  connections (`sim_test.gleam:177`, `:247`, `:320`, `:377-379`), against
-  TIGERSTYLE's zero-leak rule.
-  - **Files:** `test/brazier/sim_test.gleam`
 
 Found while merging WS10b (Milestone 117, 2026-11-04).
 
@@ -65,6 +61,20 @@ Found while merging WS10b (Milestone 117, 2026-11-04).
 ## Resolved Issues
 
 <!-- Move resolved issues here with full resolution details -->
+
+- **Issue:** several simulation tests allow leaked processes or failed
+  connections (`sim_test.gleam:177`, `:247`, `:320`, `:377-379`), against
+  TIGERSTYLE's zero-leak rule.
+  - **Files:** `test/brazier/sim_test.gleam`
+  - **Resolution:** (Milestone 117 audit, TS-6) Every simulation test ends
+    with `assert_all_clean`: no failed connection, every worker succeeded,
+    and exactly 0 processes kept after teardown. `sim_memory_leak_test`,
+    which measured memory but asserted nothing about it, now runs two
+    rounds of 100 connect/disconnect cycles and asserts that the second
+    keeps no ETS table, no ETS object and no atom
+    (`test/brazier_sim_memory_ffi.erl`). Bytes are logged, not asserted:
+    heap and ETS sizes depend on GC history and peak load, so no bound on
+    them is both stable and tight.
 
 - **Issue:** `brazier.title` was computed only for the HTML render
   (`ssr.gleam:308`); a client navigation or a live update left

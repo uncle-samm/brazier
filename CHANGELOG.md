@@ -102,6 +102,12 @@ with its own changelog, so they are not listed here.
   `TableTypeMismatch` or `TableOwnerUnavailable`, not an alias of the
   internal `state_manager.EtsError`. `replicated.InvalidName` carries
   `name` and `reason`.
+- (Audit TS-7) `rate_limit.reset`, `rate_limit.key_count` and
+  `rate_limit.sweep` return `Error(rate_limit.LimiterError)` instead of
+  `Error(Nil)`: `LimiterNotRunning` (the owner and its table are gone),
+  `LimiterTimeout(timeout_ms)` (the owner is alive but did not answer) or
+  `LimiterCallFailed(reason)` (the owner exited during the call).
+  `rate_limit.describe_error` renders one for logs.
 - (Final audit) `element.memo` is removed (see Removed).
   `attribute.attribute` crashes on `srcdoc` (use `attribute.unsafe_srcdoc`)
   and on `attributeName` with a value containing `href`, and rendering
@@ -242,6 +248,41 @@ with its own changelog, so they are not listed here.
 - (WS10b) A `max_events_per_second` below 50, the rate the generated client
   paces itself for, is logged as a warning when the listener starts. The
   limit is still not advertised to the client, as in Phoenix channels.
+- (Audit PERF-3) A static file's ETag digest is cached in an ETS table
+  keyed by path and checked against the file's size, mtime, ctime, inode
+  and device, so a repeat request does not read and hash the whole file.
+  As in git's racy-clean rule, an entry cached within 2 s of the file's last
+  change is not trusted and the file is hashed again. The cache holds at
+  most 2048 files.
+- (Audit PERF-13) The HTTP server sends a response as iodata: the head is
+  prepended to the body's bytes tree, which goes to `gen_tcp:send` without
+  being flattened into one binary.
+- (Audit PERF-10) `brazier/log` asks `logger:allow/2` whether a level is
+  enabled before it prefixes the module and calls the logger, as OTP's
+  `?LOG_*` macros do, so a disabled `debug` line skips both.
+- (Audit TS-13) `brazier/lint` visits every node of a function body:
+  `use` callbacks, `assert` and `let assert` messages, case guards, list
+  tails, bit array segments, record updates, captures and `echo`. Before,
+  a `todo`, a `panic`, a `let _ =` discard or a log call in any of those
+  places was not seen. The walker matches every glance expression variant
+  without a catch-all, so a new variant is a compile error, not a blind
+  spot. A new `stale-name` rule reports the pre-rename project name in
+  `src/`, `test/` and `examples/`; only `config.gleam`'s refusal of the old
+  variables and the tests of that refusal may name it.
+- (Audit TS-4) The rate-limit sweep test and the HTTP slow-header test no
+  longer sleep: the sweep takes the time as an argument
+  (`rate_limit.sweep_with`), and the slow client sends a byte each time a
+  receive times out. `docs/TESTING.md` lists these patterns.
+- (Audit TS-5) The CDP suite stops with a `CdpError` when a `*.enable`
+  command or a viewport setting gets no answer or an error, and when a
+  `Runtime.evaluate` script throws or returns no JSON value. Before, an
+  evaluation returned the strings `"TIMEOUT"`, `"ERR"` or `"EXCEPTION: ..."`,
+  which a check could compare against, and a failed enable went unnoticed.
+  A wait still retries while a navigation replaces the page's context.
+- (Audit TS-6) `sim_memory_leak_test` asserts what it measures: a second
+  round of 100 connect/disconnect cycles keeps no ETS table, ETS object or
+  atom, besides no process. Before, it measured memory and asserted nothing
+  about it.
 - (Final audit) `middleware.default_csp` is `default-src 'self'; script-src
   'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:;
   connect-src 'self'; frame-ancestors 'self'; object-src 'none'; base-uri

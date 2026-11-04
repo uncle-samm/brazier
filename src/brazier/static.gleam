@@ -262,41 +262,115 @@ fn check_segment(segment: String) -> Result(Nil, PathProblem) {
   }
 }
 
-/// Why `ffi_file_digest` could not digest a path.
-type DigestError {
+/// Why `file_digest_at` could not digest a path.
+@internal
+pub type DigestError {
   /// Missing, or not a regular file (a directory, FIFO, socket or device).
   NotAFile
   /// The file exists but could not be read.
   ReadFailed(String)
+  /// The digest cache table could not be had (its owner is gone).
+  CacheUnavailable(String)
 }
 
-/// The length and the first `hex_chars` lowercase hex characters of the
-/// SHA-256 of a regular file, read in bounded chunks.
+/// A static file's length and the first `etag_hash_chars` lowercase hex
+/// characters of its SHA-256, and where the hash came from.
+@internal
+pub type Digest {
+  Digest(length: Int, hash: String, source: DigestSource)
+}
+
+@internal
+pub type DigestSource {
+  /// The cached hash was used: the stat data matched and is not racy.
+  Cached
+  /// The file was read and hashed, and the entry was (re)cached.
+  Hashed(reason: HashReason)
+}
+
+/// Why the cached digest of a file was not used.
+@internal
+pub type HashReason {
+  /// No entry for the path.
+  NotCached
+  /// Size, mtime, ctime, inode or device differ from the entry's.
+  StatChanged
+  /// The stat data matched, but the entry was recorded within the racy
+  /// window of the file's last change, so an edit may not show in it.
+  RacilyClean
+}
+
 @external(erlang, "brazier_static_ffi", "file_digest")
 fn ffi_file_digest(
   path: String,
   hex_chars: Int,
-) -> Result(#(Int, String), DigestError)
+  now_seconds: Int,
+  capacity: Int,
+) -> Result(Digest, DigestError)
+
+@external(erlang, "brazier_static_ffi", "now_seconds")
+fn now_seconds() -> Int
+
+/// Entries in the digest cache. For tests.
+@external(erlang, "brazier_static_ffi", "cache_size")
+@internal
+pub fn digest_cache_size() -> Int
+
+/// Most digests kept. An entry is a path and a few integers, so a full
+/// table stays well under a megabyte; past the cap entries are evicted.
+@internal
+pub const digest_cache_capacity = 2048
 
 /// Characters of the content hash shown in an ETag (128 bits).
 const etag_hash_chars = 32
 
+/// The digest of the regular file at `path`, using the cache when its entry
+/// is trusted at time `now_seconds`, and bounding the cache to `capacity`
+/// entries. `serve_file` passes the clock and `digest_cache_capacity`; tests
+/// pass their own to place an entry inside or outside the racy window.
+@internal
+pub fn file_digest_at(
+  path: String,
+  now_seconds: Int,
+  capacity: Int,
+) -> Result(Digest, DigestError) {
+  let digest = ffi_file_digest(path, etag_hash_chars, now_seconds, capacity)
+  case digest {
+    Ok(Digest(source: Hashed(reason), ..)) ->
+      log.debug(
+        "brazier.static",
+        "digest cache miss (" <> hash_reason_name(reason) <> "): " <> path,
+      )
+    Ok(Digest(source: Cached, ..)) | Error(_) -> Nil
+  }
+  digest
+}
+
+fn hash_reason_name(reason: HashReason) -> String {
+  case reason {
+    NotCached -> "not cached"
+    StatChanged -> "stat changed"
+    RacilyClean -> "racily clean"
+  }
+}
+
 /// Serve a single file from the filesystem.
 /// If `if_none_match` matches the file's ETag, returns 304 Not Modified.
 ///
-/// The file is never loaded whole: its content hash (the ETag) is computed
-/// over bounded chunks, and the body is a `File` that the listener sends
-/// with `file:sendfile`. The ETag stays content-based, so an edit that keeps
-/// the size and the modification second is not answered 304. A stat-based
-/// tag as in Plug.Static and cowboy_static (`phash2({size, mtime})`) would
-/// be.
+/// The file is never loaded whole, and is not read at all while its cached
+/// digest is trusted: the ETag is the content hash, cached against the
+/// file's stat data under git's racy-clean rule (see brazier_static_ffi),
+/// and the body is a `File` that the listener sends with `file:sendfile`.
+/// The ETag stays content-based, so an edit that keeps the size and the
+/// modification second is not answered 304. A stat-based tag as in
+/// Plug.Static and cowboy_static (`phash2({size, mtime})`) would be.
 fn serve_file(
   path: String,
   cache: String,
   if_none_match: String,
 ) -> Result(Response(ResponseBody), Nil) {
-  case ffi_file_digest(path, etag_hash_chars) {
-    Ok(#(length, hash)) -> {
+  case file_digest_at(path, now_seconds(), digest_cache_capacity) {
+    Ok(Digest(length:, hash:, source: _)) -> {
       let mime = mime_type(path)
       let etag = "\"" <> hash <> "\""
       case etag_matches(if_none_match, etag) {
@@ -336,6 +410,16 @@ fn serve_file(
       log.error(
         "brazier.static",
         "Cannot read static file " <> path <> ": " <> reason,
+      )
+      Ok(plain_response(500, "Internal Server Error"))
+    }
+    Error(CacheUnavailable(reason)) -> {
+      log.error(
+        "brazier.static",
+        "Cannot serve static file "
+          <> path
+          <> ": digest cache unavailable: "
+          <> reason,
       )
       Ok(plain_response(500, "Internal Server Error"))
     }

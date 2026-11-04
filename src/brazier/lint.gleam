@@ -1,13 +1,25 @@
 /// Brazier's custom linting tool — enforces engineering principles via AST analysis.
 /// Uses Glance to parse source files and check for violations.
 ///
-/// Rules:
-/// 1. No `todo` or `panic` in non-test source code
-/// 2. No catch-all `_` patterns in case expressions that don't log
-/// 3. Public functions in key modules should have logging
-/// 4. No degraded-path phrases in shipped source
-/// 5. No `let _ =` discards in `src/` (see `check_no_discarded_results`)
-/// 6. Every file must be readable and parse; failures are violations
+/// Rules, over `src/` and `examples/` unless a rule says otherwise:
+/// 1. No `todo` or `panic` (`no-todo`, `no-panic`)
+/// 2. Public functions in `brazier/transport*` and `brazier/runtime*`
+///    modules contain a `log.*` call, unless their name marks them as pure
+///    (`public-fn-must-log`)
+/// 3. No degraded-path phrases (`no-degraded-path-phrases`)
+/// 4. No `let _ =` discards in `src/` (`no-discarded-result`, see
+///    `check_no_discarded_results`)
+/// 5. Examples do not use the removed route API (`deprecated-route-api`)
+/// 6. `docs/` does not describe the removed routing model
+///    (`stale-docs-model`)
+/// 7. No pre-rename project name in `src/`, `test/` and `examples/`
+///    (`stale-name`, see `lint_stale_names`)
+/// 8. Every file must be readable and parse; failures are violations
+///
+/// The AST rules (1, 2 and 4) visit every statement and expression of a
+/// function body at any depth (see `body_nodes`): code inside `use`
+/// callbacks, `assert`s, case guards, record updates, captures, bit arrays
+/// and `as` messages is checked like any other.
 ///
 /// Reference: CLAUDE.md engineering principles, TigerBeetle approach.
 import brazier/build/source_location
@@ -74,8 +86,10 @@ fn io_violation(
 
 /// Lint Markdown documentation for stale public model language.
 /// Every file named `PROGRESS.md`, at any depth, is excluded: these are
-/// progress logs (`docs/PROGRESS.md` and the archived
-/// `docs/archive/PROGRESS.md`) that record old names on purpose.
+/// progress logs that record old names on purpose. The exclusion is by file
+/// name, not by directory: `docs/archive/PROGRESS.md` is skipped because it
+/// is named `PROGRESS.md`, and any other file under `docs/archive/` is
+/// linted like the rest of `docs/`.
 pub fn lint_docs_directory(dir: String) -> List(Violation) {
   log.info("brazier.lint", "Linting docs directory: " <> dir)
   case simplifile.read_directory(dir) {
@@ -135,6 +149,132 @@ pub fn lint_doc_source(file_path: String, source: String) -> List(Violation) {
       False -> Error(Nil)
     }
   })
+}
+
+/// The project's name before the rename to Brazier, built from parts so
+/// that this file does not contain it.
+const old_name = "bea" <> "con"
+
+/// The old name as it starts an environment variable (`<OLD>_ENV`).
+const old_env_prefix = "BEA" <> "CON_"
+
+/// The dev secret the old name published, which `brazier/config` refuses.
+const old_dev_secret = old_name <> "-dev-secret-change-in-production"
+
+/// The file that refuses the old names at start.
+const config_module_path = "src/brazier/config.gleam"
+
+/// Files whose old name is checked: source, FFI, scripts and package files.
+const text_source_extensions = [
+  ".gleam", ".erl", ".hrl", ".mjs", ".js", ".toml", ".md", ".sh", ".py", ".html",
+  ".css", ".json",
+]
+
+/// Lint every text file under `dir`, at any depth, for the project's
+/// pre-rename name (see `lint_stale_names`). `main` runs it over `src`,
+/// `test` and `examples`.
+pub fn lint_names_directory(dir: String) -> List(Violation) {
+  log.info("brazier.lint", "Linting names in directory: " <> dir)
+  case simplifile.read_directory(dir) {
+    Ok(entries) ->
+      list.flat_map(entries, fn(entry) {
+        let path = dir <> "/" <> entry
+        case should_skip_entry(entry), simplifile.is_directory(path) {
+          True, _ -> []
+          False, Ok(True) -> lint_names_directory(path)
+          False, Ok(False) ->
+            case list.any(text_source_extensions, string.ends_with(entry, _)) {
+              True -> lint_names_file(path)
+              False -> []
+            }
+          False, Error(err) -> [
+            io_violation(path, "Cannot stat " <> path, err),
+          ]
+        }
+      })
+    Error(err) -> [io_violation(dir, "Cannot read directory " <> dir, err)]
+  }
+}
+
+fn lint_names_file(path: String) -> List(Violation) {
+  case simplifile.read(path) {
+    Ok(source) -> lint_stale_names(path, source)
+    Error(err) -> [io_violation(path, "Cannot read file " <> path, err)]
+  }
+}
+
+/// Flag every line of `source` that uses the project's pre-rename name, in
+/// any case. The uses allowed are the ones that keep the rename safe, each
+/// only where it belongs:
+/// - `src/brazier/config.gleam` refuses old-named environment variables
+///   (`<OLD>_ENV`, ...) by their prefix (the string `"<OLD>_"`) and the old
+///   published dev secret, and its comment names the rename
+///   (`` `<old>` to `brazier` ``);
+/// - tests under `test/` set those variables and that secret to check the
+///   refusals.
+///
+/// Nothing else may keep the old name: not an alias, a comment or a log
+/// line. `gleam.toml`'s repository is outside the linted directories.
+pub fn lint_stale_names(file_path: String, source: String) -> List(Violation) {
+  let allowed = allowed_old_name_uses(file_path)
+  source
+  |> string.split("\n")
+  |> list.index_map(fn(line, index) { #(index + 1, line) })
+  |> list.filter_map(fn(numbered) {
+    let #(number, line) = numbered
+    let uses = occurrences(string.lowercase(line), old_name)
+    let allowed_uses =
+      list.fold(allowed, 0, fn(sum, count_uses) { sum + count_uses(line) })
+    case uses > allowed_uses {
+      True ->
+        Ok(Violation(
+          file: file_path,
+          location: "line " <> int.to_string(number),
+          rule: "stale-name",
+          message: "Found the pre-rename name `"
+            <> old_name
+            <> "`. Use `brazier`; only "
+            <> config_module_path
+            <> " and test/ may name the old environment variables and dev secret it refuses.",
+        ))
+      False -> Error(Nil)
+    }
+  })
+}
+
+/// How many allowed uses of the old name a line of `file_path` has, as one
+/// counter per allowed form. Each form contains the old name exactly once.
+fn allowed_old_name_uses(file_path: String) -> List(fn(String) -> Int) {
+  let refusals = [old_env_name_uses, occurrences(_, old_dev_secret)]
+  case file_path == config_module_path, string.starts_with(file_path, "test/") {
+    True, _ -> [
+      occurrences(_, "`" <> old_name <> "` to `brazier`"),
+      // The prefix itself, as the string the refusal matches on.
+      occurrences(_, "\"" <> old_env_prefix <> "\""),
+      ..refusals
+    ]
+    False, True -> refusals
+    False, False -> []
+  }
+}
+
+/// Uses of the old name as an environment variable: the prefix followed by
+/// an upper-case letter.
+fn old_env_name_uses(line: String) -> Int {
+  case string.split(line, old_env_prefix) {
+    [] | [_] -> 0
+    [_, ..after] ->
+      list.count(after, fn(rest) {
+        case string.first(rest) {
+          Ok(first) -> string.contains("ABCDEFGHIJKLMNOPQRSTUVWXYZ", first)
+          Error(Nil) -> False
+        }
+      })
+  }
+}
+
+fn occurrences(haystack: String, needle: String) -> Int {
+  list.length(string.split(haystack, needle)) - 1
 }
 
 fn should_skip_entry(entry: String) -> Bool {
@@ -215,11 +355,30 @@ fn check_no_discarded_results(
     True ->
       list.flat_map(module.functions, fn(def) {
         let func = def.definition
-        list.flat_map(func.body, discards_in_statement)
+        body_nodes(func.body)
+        |> list.flat_map(discard_location)
         |> list.filter_map(fn(span) {
           discard_violation(file_path, source, func.name, span)
         })
       })
+  }
+}
+
+/// The span of a `let _ =` (or `let _name =`), if the node is one. A
+/// `let assert _ =` is an assertion, not a discard, and is not flagged.
+fn discard_location(node: Node) -> List(glance.Span) {
+  case node {
+    StatementNode(glance.Assignment(
+      kind: glance.Let,
+      pattern: glance.PatternDiscard(..),
+      location:,
+      ..,
+    )) -> [location]
+    StatementNode(glance.Assignment(..))
+    | StatementNode(glance.Use(..))
+    | StatementNode(glance.Assert(..))
+    | StatementNode(glance.Expression(..))
+    | ExpressionNode(..) -> []
   }
 }
 
@@ -283,81 +442,146 @@ fn parse_allow_discard(line: String) -> DiscardOptOut {
   }
 }
 
-fn discards_in_statement(statement: glance.Statement) -> List(glance.Span) {
-  case statement {
-    glance.Assignment(
-      kind: glance.Let,
-      pattern: glance.PatternDiscard(..),
-      value:,
-      location:,
-      ..,
-    ) -> [location, ..discards_in_expression(value)]
-    glance.Assignment(value:, ..) -> discards_in_expression(value)
-    glance.Use(function:, ..) -> discards_in_expression(function)
-    glance.Assert(expression:, ..) -> discards_in_expression(expression)
-    glance.Expression(expression) -> discards_in_expression(expression)
+/// One node of a function body: a statement or an expression.
+type Node {
+  StatementNode(glance.Statement)
+  ExpressionNode(glance.Expression)
+}
+
+/// Every statement and expression in `body`, at any depth, each before the
+/// nodes inside it. The AST rules filter this list, so a node kind a rule
+/// does not name is still searched for the nodes the rule does name.
+fn body_nodes(body: List(glance.Statement)) -> List(Node) {
+  list.flat_map(body, fn(statement) { nodes_under(StatementNode(statement)) })
+}
+
+fn nodes_under(node: Node) -> List(Node) {
+  [node, ..list.flat_map(children(node), nodes_under)]
+}
+
+/// The nodes directly inside `node`. Exhaustive over glance's AST, with no
+/// catch-all arm: a new node kind fails to compile here instead of being
+/// skipped by every rule.
+fn children(node: Node) -> List(Node) {
+  case node {
+    StatementNode(statement) ->
+      list.map(statement_children(statement), ExpressionNode)
+    ExpressionNode(expression) -> expression_children(expression)
   }
 }
 
-fn discards_in_expression(expression: glance.Expression) -> List(glance.Span) {
+fn statement_children(statement: glance.Statement) -> List(glance.Expression) {
+  case statement {
+    glance.Use(function:, ..) -> [function]
+    glance.Assignment(kind: glance.Let, value:, ..) -> [value]
+    glance.Assignment(kind: glance.LetAssert(message:), value:, ..) -> [
+      value,
+      ..optional(message)
+    ]
+    glance.Assert(expression:, message:, ..) -> [
+      expression,
+      ..optional(message)
+    ]
+    glance.Expression(expression) -> [expression]
+  }
+}
+
+fn expression_children(expression: glance.Expression) -> List(Node) {
   case expression {
-    glance.Block(statements:, ..) ->
-      list.flat_map(statements, discards_in_statement)
-    glance.Fn(body:, ..) -> list.flat_map(body, discards_in_statement)
-    glance.Case(subjects:, clauses:, ..) ->
-      list.append(
-        list.flat_map(subjects, discards_in_expression),
-        list.flat_map(clauses, fn(clause) {
-          discards_in_expression(clause.body)
-        }),
-      )
-    glance.Call(function:, arguments:, ..) ->
-      list.append(
-        discards_in_expression(function),
-        list.flat_map(arguments, discards_in_field),
-      )
-    glance.FnCapture(function:, arguments_before:, arguments_after:, ..) ->
-      list.flatten([
-        discards_in_expression(function),
-        list.flat_map(arguments_before, discards_in_field),
-        list.flat_map(arguments_after, discards_in_field),
-      ])
-    glance.BinaryOperator(left:, right:, ..) ->
-      list.append(discards_in_expression(left), discards_in_expression(right))
-    glance.List(elements:, ..) | glance.Tuple(elements:, ..) ->
-      list.flat_map(elements, discards_in_expression)
-    glance.NegateInt(value:, ..) | glance.NegateBool(value:, ..) ->
-      discards_in_expression(value)
-    glance.FieldAccess(container:, ..) -> discards_in_expression(container)
-    glance.TupleIndex(tuple:, ..) -> discards_in_expression(tuple)
-    glance.RecordUpdate(record:, fields:, ..) ->
-      list.append(
-        discards_in_expression(record),
-        list.flat_map(fields, fn(field) {
-          case field.item {
-            option.Some(item) -> discards_in_expression(item)
-            option.None -> []
-          }
-        }),
-      )
+    glance.Block(statements:, ..) -> list.map(statements, StatementNode)
+    glance.Fn(body:, ..) -> list.map(body, StatementNode)
     glance.Int(..)
     | glance.Float(..)
     | glance.String(..)
-    | glance.Variable(..)
-    | glance.Panic(..)
-    | glance.Todo(..)
-    | glance.BitString(..)
-    | glance.Echo(..) -> []
+    | glance.Variable(..) -> []
+    glance.NegateInt(value:, ..) | glance.NegateBool(value:, ..) ->
+      expressions([value])
+    glance.Panic(message:, ..) | glance.Todo(message:, ..) ->
+      expressions(optional(message))
+    glance.Tuple(elements:, ..) -> expressions(elements)
+    glance.List(elements:, rest:, ..) ->
+      expressions(list.append(elements, optional(rest)))
+    glance.RecordUpdate(record:, fields:, ..) ->
+      expressions([
+        record,
+        ..list.flat_map(fields, fn(field) { optional(field.item) })
+      ])
+    glance.FieldAccess(container:, ..) -> expressions([container])
+    glance.Call(function:, arguments:, ..) ->
+      expressions([function, ..list.flat_map(arguments, field_items)])
+    glance.TupleIndex(tuple:, ..) -> expressions([tuple])
+    glance.FnCapture(function:, arguments_before:, arguments_after:, ..) ->
+      expressions(
+        list.flatten([
+          [function],
+          list.flat_map(arguments_before, field_items),
+          list.flat_map(arguments_after, field_items),
+        ]),
+      )
+    glance.BitString(segments:, ..) ->
+      expressions(
+        list.flat_map(segments, fn(segment) {
+          let #(value, options) = segment
+          [value, ..list.flat_map(options, size_expressions)]
+        }),
+      )
+    glance.Case(subjects:, clauses:, ..) ->
+      expressions(list.append(
+        subjects,
+        list.flat_map(clauses, fn(clause) {
+          list.append(optional(clause.guard), [clause.body])
+        }),
+      ))
+    glance.BinaryOperator(left:, right:, ..) -> expressions([left, right])
+    glance.Echo(expression:, message:, ..) ->
+      expressions(list.append(optional(expression), optional(message)))
   }
 }
 
-fn discards_in_field(
+fn expressions(items: List(glance.Expression)) -> List(Node) {
+  list.map(items, ExpressionNode)
+}
+
+/// An optional child (a message, a guard, a list tail) as zero or one items.
+fn optional(child: option.Option(a)) -> List(a) {
+  case child {
+    option.Some(item) -> [item]
+    option.None -> []
+  }
+}
+
+fn field_items(
   field: glance.Field(glance.Expression),
-) -> List(glance.Span) {
+) -> List(glance.Expression) {
   case field {
-    glance.LabelledField(item:, ..) | glance.UnlabelledField(item:) ->
-      discards_in_expression(item)
+    glance.LabelledField(item:, ..) | glance.UnlabelledField(item:) -> [item]
+    // `label:` with no value names a variable; there is nothing inside.
     glance.ShorthandField(..) -> []
+  }
+}
+
+fn size_expressions(
+  option: glance.BitStringSegmentOption(glance.Expression),
+) -> List(glance.Expression) {
+  case option {
+    glance.SizeValueOption(size) -> [size]
+    glance.BytesOption
+    | glance.IntOption
+    | glance.FloatOption
+    | glance.BitsOption
+    | glance.Utf8Option
+    | glance.Utf16Option
+    | glance.Utf32Option
+    | glance.Utf8CodepointOption
+    | glance.Utf16CodepointOption
+    | glance.Utf32CodepointOption
+    | glance.SignedOption
+    | glance.UnsignedOption
+    | glance.BigOption
+    | glance.LittleOption
+    | glance.NativeOption
+    | glance.SizeOption(..)
+    | glance.UnitOption(..) -> []
   }
 }
 
@@ -394,7 +618,9 @@ fn check_deprecated_route_api(
 }
 
 /// Check that public functions in key modules contain logging calls.
-/// Only applies to files in brazier/transport, brazier/runtime, brazier/diff.
+/// Only applies to files whose path contains `brazier/transport` or
+/// `brazier/runtime`: `brazier/transport.gleam`, `brazier/transport/*` and
+/// `brazier/runtime.gleam`.
 fn check_public_functions_log(
   file_path: String,
   source: String,
@@ -404,7 +630,6 @@ fn check_public_functions_log(
   let is_key_module =
     string.contains(file_path, "brazier/transport")
     || string.contains(file_path, "brazier/runtime")
-    || string.contains(file_path, "brazier/diff")
   case is_key_module {
     False -> []
     True -> {
@@ -503,55 +728,21 @@ fn is_pure_function_name(name: String) -> Bool {
   || name == "connection_tracker_init"
 }
 
-/// Check if a function body contains any call to log.info/debug/warning/error.
+/// Whether a function body calls `log.<anything>` anywhere.
 fn body_contains_log_call(body: List(glance.Statement)) -> Bool {
-  list.any(body, fn(stmt) { statement_has_log(stmt) })
+  list.any(body_nodes(body), is_log_call)
 }
 
-/// Check a statement for log calls.
-fn statement_has_log(stmt: glance.Statement) -> Bool {
-  case stmt {
-    glance.Expression(expr) -> expression_has_log(expr)
-    glance.Assignment(value: expr, ..) -> expression_has_log(expr)
-    _ -> False
-  }
-}
-
-/// Check an expression for log calls (looking for `log.info`, `log.debug`, etc).
-fn expression_has_log(expr: glance.Expression) -> Bool {
-  case expr {
-    // Direct call to log.something
-    glance.Call(
+fn is_log_call(node: Node) -> Bool {
+  case node {
+    ExpressionNode(glance.Call(
       function: glance.FieldAccess(
         container: glance.Variable(name: "log", ..),
         ..,
       ),
       ..,
-    ) -> True
-
-    // Recurse into sub-expressions
-    glance.Call(function: func, arguments: args, ..) -> {
-      expression_has_log(func)
-      || list.any(args, fn(arg) {
-        case arg {
-          glance.LabelledField(item: value, ..) -> expression_has_log(value)
-          glance.UnlabelledField(item: value) -> expression_has_log(value)
-          glance.ShorthandField(..) -> False
-        }
-      })
-    }
-
-    glance.Block(statements: stmts, ..) -> list.any(stmts, statement_has_log)
-
-    glance.Case(clauses: clauses, ..) ->
-      list.any(clauses, fn(c) { expression_has_log(c.body) })
-
-    glance.BinaryOperator(left: l, right: r, ..) ->
-      expression_has_log(l) || expression_has_log(r)
-
-    glance.Fn(body: body, ..) -> list.any(body, statement_has_log)
-
-    _ -> False
+    )) -> True
+    ExpressionNode(..) | StatementNode(..) -> False
   }
 }
 
@@ -564,119 +755,41 @@ fn check_no_todo_panic(
 ) -> List(Violation) {
   list.flat_map(module.functions, fn(def) {
     let func = def.definition
-    list.flat_map(func.body, fn(statement) {
-      find_todo_panic_in_statement(file_path, source, func.name, statement)
+    body_nodes(func.body)
+    |> list.flat_map(fn(node) {
+      todo_panic_violation(file_path, source, func.name, node)
     })
   })
 }
 
-/// Recursively search a statement for todo/panic expressions.
-fn find_todo_panic_in_statement(
+fn todo_panic_violation(
   file_path: String,
   source: String,
   func_name: String,
-  statement: glance.Statement,
+  node: Node,
 ) -> List(Violation) {
-  case statement {
-    glance.Expression(expr) ->
-      find_todo_panic_in_expression(file_path, source, func_name, expr)
-    glance.Assignment(value: expr, ..) ->
-      find_todo_panic_in_expression(file_path, source, func_name, expr)
-    _ -> []
-  }
-}
-
-/// Recursively search an expression for todo/panic.
-fn find_todo_panic_in_expression(
-  file_path: String,
-  source: String,
-  func_name: String,
-  expr: glance.Expression,
-) -> List(Violation) {
-  case expr {
-    glance.Todo(location: loc, ..) -> [
+  case node {
+    ExpressionNode(glance.Todo(location:, ..)) -> [
       Violation(
         file: file_path,
-        location: source_location.format_span(source, loc),
+        location: source_location.format_span(source, location),
         rule: "no-todo",
         message: "Found `todo` in function `"
           <> func_name
           <> "`. Remove before shipping.",
       ),
     ]
-    glance.Panic(location: loc, ..) -> [
+    ExpressionNode(glance.Panic(location:, ..)) -> [
       Violation(
         file: file_path,
-        location: source_location.format_span(source, loc),
+        location: source_location.format_span(source, location),
         rule: "no-panic",
         message: "Found `panic` in function `"
           <> func_name
           <> "`. Use proper error handling instead.",
       ),
     ]
-
-    // Recurse into sub-expressions
-    glance.Call(function: func, arguments: args, ..) -> {
-      let func_violations =
-        find_todo_panic_in_expression(file_path, source, func_name, func)
-      let arg_violations =
-        list.flat_map(args, fn(arg) {
-          case arg {
-            glance.LabelledField(item: value, ..) ->
-              find_todo_panic_in_expression(file_path, source, func_name, value)
-            glance.UnlabelledField(item: value) ->
-              find_todo_panic_in_expression(file_path, source, func_name, value)
-            glance.ShorthandField(..) -> []
-          }
-        })
-      list.append(func_violations, arg_violations)
-    }
-
-    glance.BinaryOperator(left: left, right: right, ..) ->
-      list.append(
-        find_todo_panic_in_expression(file_path, source, func_name, left),
-        find_todo_panic_in_expression(file_path, source, func_name, right),
-      )
-
-    glance.Block(statements: stmts, ..) ->
-      list.flat_map(stmts, fn(s) {
-        find_todo_panic_in_statement(file_path, source, func_name, s)
-      })
-
-    glance.Case(subjects: subjects, clauses: clauses, ..) -> {
-      let subj_v =
-        list.flat_map(subjects, fn(s) {
-          find_todo_panic_in_expression(file_path, source, func_name, s)
-        })
-      let clause_v =
-        list.flat_map(clauses, fn(c) {
-          find_todo_panic_in_expression(file_path, source, func_name, c.body)
-        })
-      list.append(subj_v, clause_v)
-    }
-
-    glance.Fn(body: body, ..) ->
-      list.flat_map(body, fn(s) {
-        find_todo_panic_in_statement(file_path, source, func_name, s)
-      })
-
-    glance.List(elements: elems, ..) ->
-      list.flat_map(elems, fn(e) {
-        find_todo_panic_in_expression(file_path, source, func_name, e)
-      })
-
-    glance.Tuple(elements: elems, ..) ->
-      list.flat_map(elems, fn(e) {
-        find_todo_panic_in_expression(file_path, source, func_name, e)
-      })
-
-    glance.NegateInt(value: inner, ..) | glance.NegateBool(value: inner, ..) ->
-      find_todo_panic_in_expression(file_path, source, func_name, inner)
-
-    glance.FieldAccess(container: inner, ..) ->
-      find_todo_panic_in_expression(file_path, source, func_name, inner)
-
-    _ -> []
+    ExpressionNode(..) | StatementNode(..) -> []
   }
 }
 
@@ -691,10 +804,14 @@ pub fn main() {
   log.configure()
   log.info("brazier.lint", "Starting lint check")
   let violations =
-    list.append(
-      list.append(lint_directory("src"), lint_directory("examples")),
+    list.flatten([
+      lint_directory("src"),
+      lint_directory("examples"),
       lint_docs_directory("docs"),
-    )
+      lint_names_directory("src"),
+      lint_names_directory("test"),
+      lint_names_directory("examples"),
+    ])
   log.info(
     "brazier.lint",
     "Found " <> int.to_string(list.length(violations)) <> " violation(s)",
