@@ -460,7 +460,31 @@
     - Follow-ups:
       - `make bench-check` fails because the PERF-7 `store.crdt_append.*` metrics have no baseline (wave 4 PERF-9);
       - client-to-server `event` messages still carry `ops` as a JSON string.
-  - [ ] fix-cluster-reject: rejecting an intruder must not partition verified members under OTP's default `prevent_overlapping_partitions`; remove `no_partition_prevention` from `membership_test`.
+  - [x] fix-cluster-reject: rejecting an intruder must not partition verified members under OTP's default `prevent_overlapping_partitions`; remove `no_partition_prevention` from `membership_test`. Merged as 107aec8.
+    - Mechanism:
+      - `disconnect_node` on a gives `global` on a a nodedown of b with reason `disconnected`;
+      - global on a reports the lost connection to c, which believes it (global does not check that the reporter is a member), drops b and tells b to drop c;
+      - the overlapping-partition rule then separates a and c, and with no discovery they stay apart.
+      - A plain three-node OTP mesh splits the same way on one `disconnect_node` (10 of 10). The mechanism is written up in the manager header and in the CLUSTERING.md section "Why a rejected peer is not disconnected".
+    - Fix:
+      - rejecting a peer changes only membership: the manager marks it `rejected`, removes it from the members table, and logs and counts it, but never disconnects it;
+      - a rejected peer that later passes becomes a member, and a member that fails a later check is rejected in place;
+      - the invariant "verified in state" equals "in the members table" is asserted on every change;
+      - waiters survive a rejection and are released only by nodedown, and dead waiters are pruned;
+      - requests are accepted only from local pids.
+      - Precedent: OTP docs (`global:disconnect/0` is the only disconnect that does not cascade), `global_group` exclusion, Mnesia `db_nodes`, Phoenix.Tracker.
+    - Tests:
+      - `membership_test` runs on OTP defaults, using explicit hellos and nodeup/nodedown watchers on every node, with no polls or sleeps;
+      - new tests: a control showing the OTP cascade, rejection in place, and a waiter released on a later pass;
+      - the `cluster_test` mismatch and silent-peer tests check that the peer is rejected yet still connected.
+      - Results: the old code passed 27 of 30 runs; the fix passed 30 of 30, twice (the second time on a clean rebuild).
+    - Coordinator verify on the merge of 75a71a8 into the branch (db50eb2): clean build with zero warnings, format and lint clean, 1698 tests passing in each of 3 runs, and docs check OK (73 modules).
+    - Decisions:
+      - a rejected node now stays connected at the distribution level. The coordinator checked every cross-node path before accepting this. PubSub `remote_workers`, session revocation (`notify_revoked`), presence shards and store replicas each gate on `brazier_cluster_ffi:verified/1`, so a rejected node receives nothing. CLUSTERING.md already states that the check is not a security boundary: TLS, the cookie and the network rules are;
+      - this is listed in the CHANGELOG.
+    - Follow-ups:
+      - with `no_discovery`, a member lost to a real netsplit is never reconnected;
+      - global can still drop members on a genuine netsplit, which `session_cluster_test` simulates deliberately.
 - [ ] Final verification: build (zero warnings), tests, all examples, CDP browser suite, perf baselines
 
 **Decisions (Milestone 117, coordinator):**
