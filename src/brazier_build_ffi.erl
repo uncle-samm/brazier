@@ -49,8 +49,21 @@ collect_port_output(Port, Acc) ->
             ])}
     end.
 
+%% Path resolved against the current directory. filename:absname/1 reads the
+%% current directory with a badmatch on failure, so it is read here and its
+%% error returned: file:get_cwd/0 fails when the directory was deleted under
+%% the VM (enoent) or a parent stopped being searchable (eacces).
 absolute_path(Path) ->
-    {ok, unicode:characters_to_binary(filename:absname(unicode:characters_to_list(Path)))}.
+    case file:get_cwd() of
+        {ok, Cwd} ->
+            Absolute = filename:absname(unicode:characters_to_list(Path), Cwd),
+            {ok, unicode:characters_to_binary(Absolute)};
+        {error, Reason} ->
+            {error, unicode:characters_to_binary(
+                io_lib:format("Cannot resolve ~ts: cannot read the current directory: ~ts",
+                              [Path, file:format_error(Reason)])
+            )}
+    end.
 
 exit_failure(Reason) ->
     io:format(standard_error, "~ts~n", [Reason]),

@@ -190,9 +190,8 @@ fn write_codec(
   use codec <- result.try(server_codec.generate(analysis))
   let staged = files.join(project, "build/brazier_codegen/" <> codec_file)
   use Nil <- result.try(files.write(staged, codec))
-  use _output <- result.try(
-    program.run(".", "gleam", ["format", program.absolute_path(staged)]),
-  )
+  use staged_path <- result.try(program.absolute_path(staged))
+  use _output <- result.try(program.run(".", "gleam", ["format", staged_path]))
   use formatted <- result.try(files.read(staged))
   let path = files.join(src_dir, codec_file)
   use written <- result.try(files.write_if_changed(path, formatted))

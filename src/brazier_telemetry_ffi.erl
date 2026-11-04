@@ -300,12 +300,15 @@ store_write(Count, Store, Op, Mode) ->
     telemetry:execute([?PREFIX, store, write], #{count => Count},
                       #{store => Store, op => Op, mode => Mode}).
 
-%% [brazier, store, sync] span. Run returns {Result, Entries, Bytes}.
+%% [brazier, store, sync] span. Run returns
+%% {Result, Entries, Bytes, Outcome, Reason}; the stop metadata adds
+%% Outcome as `result` and Reason as `reason`, as [brazier, ws, upgrade]
+%% adds `result`.
 store_sync_span(Store, Peer, Run) ->
     Meta = #{store => Store, peer => Peer},
     telemetry:span([?PREFIX, store, sync], Meta, fun() ->
-        {Result, Entries, Bytes} = Run(),
-        {Result, #{entries => Entries, bytes => Bytes}, Meta}
+        {Result, Entries, Bytes, Outcome, Reason} = Run(),
+        {Result, #{entries => Entries, bytes => Bytes}, Meta#{result => Outcome, reason => Reason}}
     end).
 
 %% [brazier, session, created | revoked | expired | contention]

@@ -1,6 +1,7 @@
 //// A replica refuses a malformed delta or full state from a cluster member:
 //// it logs an error, reports the merge in its `[brazier, store, sync]` span
-//// with 0 entries, keeps its state, and keeps running. Before, the CRDT
+//// with 0 entries, `result` malformed and the failing field as `reason`,
+//// keeps its state, and keeps running. Before, the CRDT
 //// functions read the payload unchecked, so a malformed term crashed the
 //// replica (or was joined, breaking convergence).
 ////
@@ -9,15 +10,18 @@
 //// store_replica_payload_test.
 
 import brazier/cluster/log_capture
-import brazier/cluster/peer.{Timeout}
+import brazier/cluster/peer.{type Peer, Timeout}
+import brazier/cluster/relay.{type Events}
 import brazier/pubsub
 import brazier/store
 import brazier/store/replicated.{Config}
+import brazier/telemetry
 import gleam/dynamic.{type Dynamic}
 import gleam/erlang/atom
 import gleam/erlang/node.{type Node}
 import gleam/erlang/process.{type Pid}
 import gleam/list
+import gleam/string
 
 const wait_ms = 10_000
 
@@ -45,7 +49,7 @@ pub fn malformed_peer_payloads_are_refused_test_() -> peer.Timeout {
   )
   let assert Ok(pid) = peer.on(b, fn() { replica_pid(name) })
     as "b's replica runs"
-  peer.on(b, record_syncs)
+  let syncs = relay.events(b, [["brazier", "store", "sync", "stop"]])
 
   let from = peer.node(a)
   let cases = malformed_payloads()
@@ -70,13 +74,30 @@ pub fn malformed_peer_payloads_are_refused_test_() -> peer.Timeout {
   assert peer.on(b, fn() { store.get(kv, "before") }) == Ok("1")
   assert peer.on(b, fn() { store.count(kv) }) == 1
 
-  // Each refusal ran in a sync span from a, with no entries counted.
+  // Each refusal ran in a sync span from a, in injection order, with no
+  // entries counted, result malformed and the failing field as its reason.
   let from_a = atom.to_string(node.name(from))
-  let refused =
-    list.filter(peer.on(b, recorded_syncs), fn(sync) {
-      sync.0 == name && sync.1 == from_a && sync.2 == 0
-    })
-  assert list.length(refused) >= list.length(cases)
+  list.each(cases, fn(entry) {
+    let #(label, _what, _payload, fragment) = entry
+    let assert Ok(event) = next_refusal(b, syncs)
+      as "every malformed payload is reported by its sync span"
+    assert telemetry.string(event, "store") == Ok(name)
+    assert telemetry.string(event, "peer") == Ok(from_a)
+    assert telemetry.int(event, "entries") == Ok(0)
+    let assert Ok(reason) = telemetry.string(event, "reason")
+      as "a refused sync names its reason"
+    case string.contains(reason, fragment) {
+      True -> Nil
+      False ->
+        panic as {
+          label
+          <> ": the sync span's reason "
+          <> string.inspect(reason)
+          <> " does not name "
+          <> string.inspect(fragment)
+        }
+    }
+  })
 
   // Replication still works.
   peer.on(a, fn() { store.put(kv, "after", "2") })
@@ -84,6 +105,25 @@ pub fn malformed_peer_payloads_are_refused_test_() -> peer.Timeout {
     fn() { peer.on(b, fn() { store.get(kv, "after") }) == Ok("2") },
     wait_ms,
   )
+}
+
+/// The next sync span on `p` whose result is malformed. Anti-entropy may
+/// report accepted merges between the injected ones; only an injection is
+/// malformed, and the replica handles them in the order they were sent.
+fn next_refusal(p: Peer, syncs: Events) -> Result(telemetry.Event, Nil) {
+  case relay.next_event(p, syncs, wait_ms) {
+    Error(Nil) -> Error(Nil)
+    Ok(event) ->
+      case telemetry.string(event, "result") {
+        Ok("malformed") -> Ok(event)
+        Ok("ok") -> next_refusal(p, syncs)
+        other ->
+          panic as {
+            "an unexpected sync result during injection: "
+            <> string.inspect(other)
+          }
+      }
+  }
 }
 
 @external(erlang, "brazier_store_replica_test_ffi", "malformed_payloads")
@@ -94,9 +134,3 @@ fn inject(name: String, from: Node, what: Dynamic, payload: Dynamic) -> Nil
 
 @external(erlang, "brazier_store_test_ffi", "replica_pid")
 fn replica_pid(name: String) -> Result(Pid, Nil)
-
-@external(erlang, "brazier_store_test_ffi", "record_syncs")
-fn record_syncs() -> Nil
-
-@external(erlang, "brazier_store_test_ffi", "recorded_syncs")
-fn recorded_syncs() -> List(#(String, String, Int, Int, Int))
