@@ -42,6 +42,7 @@ import collections
 import json
 import os
 import re
+import secrets
 import signal
 import socket
 import subprocess
@@ -111,6 +112,10 @@ ALL_EXAMPLES = [
 CDP_PORT = int(os.environ.get("CDP_PORT", "9223"))
 BRAZIER_PORT = int(os.environ.get("BRAZIER_PORT", "8080"))
 SERVER_START_TIMEOUT_SECONDS = int(os.environ.get("BRAZIER_CDP_SERVER_TIMEOUT", "90"))
+# Every example reads its required secret key from SECRET_KEY. The run
+# makes one test key, the same for every example and restart in the run,
+# so tokens signed before a restart still verify after it.
+EXAMPLE_SECRET_KEY = secrets.token_urlsafe(48)
 # The first brazier/build of an example compiles Brazier and its deps.
 BUILD_TIMEOUT_SECONDS = int(os.environ.get("BRAZIER_CDP_BUILD_TIMEOUT", "300"))
 # The deadline for a condition a test expects. A passing check returns as
@@ -960,6 +965,7 @@ def start_example(name, module=None):
     server_proc = subprocess.Popen(
         ["gleam", "run", "-m", mod],
         cwd=d, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        env={**os.environ, "SECRET_KEY": EXAMPLE_SECRET_KEY},
         start_new_session=True,
     )
     server_reader = threading.Thread(

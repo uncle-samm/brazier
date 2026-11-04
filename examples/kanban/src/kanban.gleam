@@ -9,6 +9,7 @@
 /// - a PubSub subscription that re-reads the log when any session changes it.
 import brazier
 import brazier/attribute
+import brazier/config
 import brazier/effect.{type Effect}
 import brazier/element.{type Element}
 import brazier/event
@@ -478,6 +479,8 @@ fn render_card(card: Card, is_dragging: Bool) -> Element(Msg) {
 // --- Start ---
 
 pub fn main() {
+  let assert Ok(secret_key) = config.secret_key()
+    as "SECRET_KEY must be set to a private key of at least 32 bytes (config.secret_key logs why it was refused)"
   let changes = store.new_list("kanban_changes")
   let assert Ok(Nil) =
     brazier.full_application(
@@ -491,6 +494,7 @@ pub fn main() {
     |> brazier.subscriptions(fn(_state) { [store.list_topic(changes)] })
     |> brazier.on_notify(fn(_topic) { BoardChanged })
     |> brazier.head_html(favicon)
+    |> brazier.secret_key(secret_key)
     |> brazier.start(8080)
     as "brazier.start failed (it logs the error)"
 }

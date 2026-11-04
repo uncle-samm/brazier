@@ -7,6 +7,7 @@
 ///   list and re-read when any session records a score.
 import brazier
 import brazier/attribute
+import brazier/config
 import brazier/effect.{type Effect}
 import brazier/element.{type Element}
 import brazier/event
@@ -507,6 +508,8 @@ fn view_high_scores(high_scores: List(HighScore)) -> Element(Msg) {
 // --- Start ---
 
 pub fn main() {
+  let assert Ok(secret_key) = config.secret_key()
+    as "SECRET_KEY must be set to a private key of at least 32 bytes (config.secret_key logs why it was refused)"
   let scores = store.new_list("snake_scores")
   let assert Ok(Nil) =
     brazier.full_application(
@@ -520,6 +523,7 @@ pub fn main() {
     |> brazier.subscriptions(fn(_model) { [store.list_topic(scores)] })
     |> brazier.on_notify(fn(_topic) { ScoresChanged })
     |> brazier.head_html(favicon)
+    |> brazier.secret_key(secret_key)
     |> brazier.start(8080)
     as "brazier.start failed (it logs the error)"
 }

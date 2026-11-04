@@ -13,6 +13,7 @@ Counter demonstrating the Model + Local state split.
 
 ```bash
 cd examples/counter_local
+export SECRET_KEY="$(openssl rand -base64 48)"   # once per shell
 gleam run -m brazier/build   # first, and after every change
 gleam run
 ```

@@ -19,6 +19,7 @@ A shared todo list built with `brazier.full_application`.
 
 ```bash
 cd examples/todo
+export SECRET_KEY="$(openssl rand -base64 48)"   # once per shell
 gleam run -m brazier/build   # first, and after every change
 gleam run
 ```

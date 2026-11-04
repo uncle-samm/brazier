@@ -23,6 +23,7 @@ Routed pages that are components with private server state.
 
 ```bash
 cd examples/route_server_workspace
+export SECRET_KEY="$(openssl rand -base64 48)"   # once per shell
 gleam run -m brazier/build   # first, and after every change
 gleam run -m main
 ```
