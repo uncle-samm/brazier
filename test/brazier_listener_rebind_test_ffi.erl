@@ -49,7 +49,7 @@ answer_ok(Socket) ->
 http_status(Port) ->
     case gen_tcp:connect({127, 0, 0, 1}, Port, [binary, {active, false}], 5000) of
         {ok, Sock} ->
-            Result = case gen_tcp:send(Sock, <<"GET / HTTP/1.1\r\nHost: t\r\n\r\n">>) of
+            Result = case gen_tcp:send(Sock, <<"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n">>) of
                 ok -> read_status(Sock, <<>>);
                 {error, Reason} -> {error, format(Reason)}
             end,

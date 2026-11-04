@@ -5,9 +5,12 @@ Brazier communicates over WebSocket at `/ws` using JSON messages with a `type` d
 The browser connects to `/ws?path=<page path>`, the URL-encoded path and
 query string of the page (`encodeURIComponent(location.pathname +
 location.search)`), on the first connection and on every reconnect. The server
-resolves the route from it, so `init` sees the same URL as the server render,
-and refuses the connection (logging a warning) when `path` is missing or not a
-local path.
+resolves the route from it, so `init` sees the same URL as the server render.
+`path` is required: the upgrade is refused with 400 (logging a warning) when
+it is missing or not a same-origin path. The app's middleware runs on a `GET`
+of that page with the upgrade's headers, and the upgrade gets the
+middleware's response when it refuses the page (see
+[MIDDLEWARE.md](MIDDLEWARE.md#the-live-page)).
 
 ## Client Messages (browser to server)
 
@@ -75,6 +78,12 @@ of the old page are sent before it.
 ```json
 {"type": "navigate", "path": "/about"}
 ```
+The middleware runs on a `GET` of the target page first, as it does at the
+upgrade. A page it refuses is not navigated to: the server sends
+`hard_navigate` to the path, so the browser loads it over HTTP and gets the
+middleware's answer. A path that is not a same-origin path gets
+`{"type":"error","reason":"Invalid page path"}`. A `join` whose `path` is
+not the upgrade's page is gated the same way.
 
 **request_sync** -- Client requests a full authoritative model sync after it
 cannot safely apply a server patch. The server responds with `model_sync`
@@ -148,7 +157,8 @@ page keeps its last title.
 ### hard_navigate (server → client)
 Full page navigation via `window.location.href`. Unlike `navigate` (which uses pushState),
 this triggers a real HTTP request — use when the browser needs to receive HTTP headers
-(e.g., Set-Cookie after login).
+(e.g., Set-Cookie after login). The server also sends it for a `navigate` or
+`join` the middleware refuses. The client follows only a same-origin path.
 
 ```json
 {"type": "hard_navigate", "path": "/api/auth/session/TOKEN"}
@@ -262,8 +272,12 @@ follows.
 1. Client reopens WebSocket to `/ws?path=<current page path>`.
 2. Browser sends `join` with an empty token; the cookie is carried by the WebSocket upgrade request.
 3. Server checks the token before `init` runs: it must verify (signature,
-   age at most 24h, the same browser session), and its model must `restore`.
-   With state recovery enabled, a join without a token fails the check too.
+   age at most 24h, the same browser session). With state recovery enabled,
+   a join without a token fails the check too. Then `init` and the route
+   run, and the token's model must decode; the app's `restore` puts it onto
+   the fresh state (see
+   [STATE_MANAGEMENT.md](STATE_MANAGEMENT.md#recovering-state-after-a-reconnect)). A `restore`
+   that crashes closes the socket with 1011.
 4. Success: `model_sync` with the recovered state. Failure: the refusal is
    logged and the socket closes with 4400, so the client reloads the page
    (behind the reload guard) and the new render issues a fresh token. The
@@ -278,6 +292,10 @@ the listener refuses to start with invalid ones.
 
 | Check | Rejection |
 |-------|-----------|
+| `Host` in `allowed_hosts` (see [SECURITY.md](SECURITY.md#allowed-hosts)) | 400 |
+| No request body, and no bytes sent before the handshake | 400 |
+| `path` query parameter present and a same-origin path | 400 |
+| The middleware admits a `GET` of the page | the middleware's response |
 | Global connection limit (`max_connections`, 10,000) | 503 |
 | Per-IP WebSocket cap (`max_ws_connections_per_ip`, 100) | 429 |
 | `Origin` present and allowed (see below) | 403 |

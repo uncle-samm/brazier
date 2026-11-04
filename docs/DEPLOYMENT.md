@@ -39,7 +39,7 @@ variables:
 |----------|---------|---------|---------|
 | `PORT` | `config.port()`, when the app calls it | `8080` | Listen port, `0..65535` (`0` binds an ephemeral port). A set value that is not an integer in range is an `Error`. |
 | `SECRET_KEY` | `config.secret_key()`, when the app calls it | none | Token signing key, at least 32 bytes. Unset, empty, short or the old published dev secret is an `Error`. |
-| `BRAZIER_ENV` | `config.is_production()`, which `brazier/cluster` calls when the app joins a cluster | not production | `production` or `prod` makes the cluster refuse insecure distribution (see [CLUSTERING.md](CLUSTERING.md)). It does not change logging or anything else. |
+| `BRAZIER_ENV` | `config.is_production()`, which the listener calls when it starts and `brazier/cluster` calls when the app joins a cluster | not production | `production` or `prod` makes the listener refuse to start with an empty `allowed_hosts` (see [Allowed Hosts](#allowed-hosts)) and the cluster refuse insecure distribution (see [CLUSTERING.md](CLUSTERING.md)). It does not change logging or anything else. |
 | `BRAZIER_SHUTDOWN_TIMEOUT` | `brazier.start`, when it starts the application | `SecurityLimits.drain_timeout_ms` (5000) | Milliseconds the listener waits for open connections when it stops (see [Graceful Shutdown](#graceful-shutdown)), `0..4294967295`. A set value that is not an integer in range refuses the start with a `ConfigError`. |
 
 The `BRAZIER_*` variables had another prefix before the package was renamed
@@ -155,8 +155,31 @@ brazier.security_limits(transport.SecurityLimits(
   forwarding_header: ip.XForwardedFor,
   // Pages served from another origin that may open the WebSocket.
   ws_allowed_origins: ["https://www.example.com"],
+  // The names this server answers to (required in production).
+  allowed_hosts: ["example.com", ".example.com"],
 ))
 ```
+
+## Allowed Hosts
+
+`SecurityLimits.allowed_hosts` names the hosts the server answers to, as
+Django's `ALLOWED_HOSTS` does. A request or WebSocket upgrade whose `Host`
+header names another host gets 400. This stops DNS rebinding: a page on an
+attacker's domain whose name is rebound to your server's address would
+otherwise be same-origin with itself and pass the WebSocket Origin check.
+
+- `"example.com"` is that host, `".example.com"` the domain and every
+  subdomain, and `"*"` every host (no protection; logged as a warning).
+  Ports are not compared. The rules are in
+  [SECURITY.md](SECURITY.md#allowed-hosts).
+- With `BRAZIER_ENV=production` an empty list refuses to start, and the
+  error names `SecurityLimits.allowed_hosts`. In development an empty list
+  answers only `localhost` names, `127.0.0.1` and `[::1]`.
+- **Health checks and probes** send a `Host` too. A load balancer or
+  Kubernetes probe that requests `http://10.1.2.3:8080/health` sends
+  `Host: 10.1.2.3:8080`, which gets 400 unless that address is listed. Set
+  the probe's `Host` header to a listed name (Kubernetes `httpHeaders`,
+  `curl -H 'Host: example.com'`), or list the address the probe uses.
 
 ## Behind a Reverse Proxy
 
@@ -175,7 +198,8 @@ are in [SECURITY.md](SECURITY.md#trusted-proxies); for deployment:
 - **WebSocket upgrades** must reach Brazier: forward `Upgrade` and
   `Connection`. Brazier pings every `ws_ping_interval_ms` (30 s), so a proxy
   idle timeout longer than that keeps quiet sockets open.
-- **`Host`**: pass the client's `Host` header through unchanged. The
+- **`Host`**: pass the client's `Host` header through unchanged. It must be
+  in `allowed_hosts` (see [Allowed Hosts](#allowed-hosts)), and the
   WebSocket Origin check compares the browser's `Origin` with the request's
   scheme, `Host` and port; Brazier does not read `X-Forwarded-Host`.
 - **`X-Forwarded-Proto`**: the proxy must send `https` for HTTPS clients.
@@ -210,7 +234,9 @@ a liveness check: it shows the HTTP listener accepts and answers requests,
 not that sessions, stores or the cluster work. It runs after the middleware
 pipeline and the app's API routes, so an API route for `/health` replaces it,
 and a middleware that refuses the request (authentication, rate limiting)
-refuses it too. Add your own API route when the check must cover more.
+refuses it too. Like every request, it must name a host in `allowed_hosts`,
+or it gets 400 (see [Allowed Hosts](#allowed-hosts)). Add your own API route
+when the check must cover more.
 
 ## Docker
 
@@ -236,7 +262,12 @@ when the package and the app module share a name.
 
 For your own app, copy your project instead of the repository and drop the
 `examples/` prefix. The image's `HEALTHCHECK` requests `/`, which renders the
-app's first page; `/health` (above) is the cheaper check.
+app's first page; `/health` (above) is the cheaper check. It requests
+`http://127.0.0.1:8080/`, so once your app sets `allowed_hosts`, list
+`"127.0.0.1"` in it as well, or give `wget` a listed name with
+`--header 'Host: example.com'`. A rebound page sends its own name as
+`Host`, never `127.0.0.1`, so listing the loopback address keeps the
+protection.
 
 ## Graceful Shutdown
 

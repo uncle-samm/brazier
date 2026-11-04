@@ -1397,6 +1397,37 @@ scenario("server navigate and hard_navigate refuse paths a browser resolves to a
   assert.equal(window.location.href, "/café?q=a%20b", "a same-origin path still loads");
 });
 
+// A link is intercepted only when its origin (scheme, host and port) is the
+// page's: the same host on another port or scheme is another site.
+scenario("link clicks are intercepted only for the page's own origin", async () => {
+  const links =
+    '<a id="port" href="http://localhost:8080/x">p</a>' +
+    '<a id="scheme" href="https://localhost/x">s</a>' +
+    '<a id="other" href="http://evil.example/x">o</a>' +
+    '<a id="same" href="/b?q=1">b</a>' +
+    '<a id="absolute" href="http://localhost/c">c</a>' +
+    '<a id="relative" href="d">d</a>';
+  await loadRuntime({ path: "/a", ssr: links, view: () => ({ html: links, handlers: [] }) });
+  const s = sockets[0];
+  s.open();
+  sync(s, 0, {});
+  for (const id of ["port", "scheme", "other"]) {
+    const event = fire(el("#" + id), "click");
+    assert.equal(event.defaultPrevented, false, id + ": the browser loads another origin's link");
+  }
+  assert.deepEqual(historyLog.pushed, [], "no other-origin link is pushed");
+  assert.equal(s.types().filter((t) => t === "navigate").length, 0, "nothing is sent for another origin");
+  for (const id of ["same", "absolute", "relative"]) {
+    const event = fire(el("#" + id), "click");
+    assert.equal(event.defaultPrevented, true, id + ": a same-origin link navigates in place");
+  }
+  assert.deepEqual(historyLog.pushed, ["/b?q=1", "/c", "/d"]);
+  assert.deepEqual(
+    s.sent.filter((f) => f.msg.type === "navigate").map((f) => f.msg.path),
+    ["/b?q=1", "/c", "/d"],
+  );
+});
+
 scenario("a model_sync or patch without a valid ack_clock is a protocol error that resyncs", async () => {
   await loadRuntime();
   const s = sockets[0];

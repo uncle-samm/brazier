@@ -145,6 +145,7 @@ measurements: `system_time` and `monotonic_time` on start, `duration` and
 | `[brazier, ws, close]` | `duration`, `frames_in`, `frames_out`, `bytes_in`, `bytes_out` | `close_code`, `reason`, `connection_id` | yes, `brazier/transport` |
 | `[brazier, ws, rate_limited]` | `count`, `violations` | `kind`, `connection_id` | yes, `brazier/transport` |
 | `[brazier, ws, backpressure]` | `queue_len` | `reason`, `connection_id` | yes, `brazier/transport` |
+| `[brazier, ws, navigation_refused]` | `count` | `kind`, `status`, `connection_id` | yes, `brazier/transport` |
 | `[brazier, runtime, mount \| handle_event \| navigate]` S | none | `route`, `event`, `connection_id` | yes, `brazier/runtime` |
 | `[brazier, runtime, render]` S | `patch_bytes` (stop) | `route`, `event`, `connection_id` | yes, `brazier/runtime` |
 | `[brazier, runtime, stop]` | `uptime` | `reason`; `kind`, `error` (crash, exit) | yes, `brazier/runtime` |
@@ -181,8 +182,11 @@ Notes on individual events:
     content-hashed client bundle;
   - pages: `/*`, the shared page pattern (Brazier's router is typed, so a
     page has no textual pattern);
-  - `*` for `OPTIONS *`, and `/ws` for a WebSocket upgrade's middleware
-    pass, which runs as a request span and reports status 101.
+  - `*` for `OPTIONS *`, and `/ws` for the middleware pass on a live page
+    (at the upgrade, and for each gated live navigation and join; see
+    [MIDDLEWARE.md](MIDDLEWARE.md#the-live-page)), which runs as a request
+    span and reports status 101 when the page is admitted, or the
+    middleware's status when it is refused.
 
   A raw `api_handler` that does not use `api.routes`, and a response an
   HTTP middleware returns without calling `next`, report `"unknown"`. A
@@ -194,7 +198,10 @@ Notes on individual events:
   [SECURITY.md](SECURITY.md#join-tokens).
 - `[brazier, ws, upgrade]` covers the handshake checks and the 101 write.
   `route` is `/ws`. `result` is `ok` or names the refusal:
-  `rejected_middleware`, `rejected_early_data`, `rejected_body`,
+  `rejected_host` (a `Host` not in `allowed_hosts`), `rejected_early_data`,
+  `rejected_body`, `rejected_path` (no `path` parameter, or one that is not
+  a same-origin path), `rejected_middleware` (the middleware refused the
+  page),
   `peer_gone`, `rejected_connection_limit`, `rejected_ip_limit`,
   `rejected_origin`, `rejected_auth`, `rejected_handshake`,
   `rejected_version` or `upgrade_write_failed`.

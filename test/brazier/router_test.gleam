@@ -201,7 +201,7 @@ pub fn push_without_connection_logs_warning_test() {
   let #(Nil, logs) = log_capture.capture(fn() { perform(router.push("/x")) })
   let assert True =
     log_capture.has(logs, level: "warning", containing: [
-      "router.push to /x", "no connection",
+      "router.push to \"/x\"", "no connection",
     ])
 }
 

@@ -144,7 +144,7 @@ pub opaque type App(state, model, local, msg) {
     view: fn(model, local) -> Element(msg),
     route: Option(fn(Uri) -> Result(msg, Nil)),
     title: fn(model) -> String,
-    restore: Option(fn(model) -> state),
+    restore: Option(fn(model, state) -> state),
     subscriptions: Option(fn(state) -> List(String)),
     on_notify: Option(fn(String) -> msg),
     on_notification: Option(fn(Notification) -> msg),
@@ -524,12 +524,16 @@ pub fn track_and_watch_presence(
 }
 
 /// Recover the session after a reconnect to a new server process: the
-/// page carries the Model in a signed join token, and `restore` rebuilds
-/// the server state from it. For `simple` and `application`, where the
-/// state is the Model, pass `function.identity`.
+/// page carries the Model in a signed join token. `init` (and the initial
+/// route) run first for the new connection, as LiveView re-runs `mount`;
+/// `restore` then gets the recovered Model and that fresh state and
+/// returns the state to start from. Server-only fields the Model does not
+/// carry (a user loaded from the session, a handle) come from the fresh
+/// state, so they are never left empty. For `simple` and `application`,
+/// where the state is the Model, pass `fn(model, _fresh) { model }`.
 pub fn with_state_recovery(
   app: App(state, model, local, msg),
-  restore restore: fn(model) -> state,
+  restore restore: fn(model, state) -> state,
 ) -> App(state, model, local, msg) {
   App(..app, restore: Some(restore))
 }
@@ -625,7 +629,9 @@ pub fn to_config(
     restore_model: case app.restore {
       None -> None
       Some(restore) ->
-        Some(fn(json) { codec.decode_model(json) |> result.map(restore) })
+        Some(fn(json, fresh) {
+          codec.decode_model(json) |> result.map(restore(_, fresh))
+        })
     },
     route: app.route,
     secret_key: secret_key,

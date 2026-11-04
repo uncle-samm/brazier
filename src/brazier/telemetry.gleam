@@ -139,6 +139,7 @@ pub fn catalogue() -> List(List(String)) {
     ["ws", "close"],
     ["ws", "rate_limited"],
     ["ws", "backpressure"],
+    ["ws", "navigation_refused"],
     ["runtime", "stop"],
     ["effect", "timer", "rejected"],
     ["effect", "after", "rejected"],
@@ -283,6 +284,18 @@ pub fn ws_rate_limited(
 pub fn ws_backpressure(
   queue_len: Int,
   reason: String,
+  connection_id: String,
+) -> Nil
+
+/// `[brazier, ws, navigation_refused]`: the middleware gate refused a live
+/// page. `kind` is `"navigate"` or `"join"`; `status` is the middleware's
+/// answer (400 for a path that is not a page path), and the client was sent
+/// a hard navigation (or an error, for a path that is not same-origin).
+@external(erlang, "brazier_telemetry_ffi", "ws_navigation_refused")
+@internal
+pub fn ws_navigation_refused(
+  kind: String,
+  status: Int,
   connection_id: String,
 ) -> Nil
 

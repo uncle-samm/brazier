@@ -132,25 +132,93 @@ pub fn main() {
 ### Recovering state after a reconnect
 
 When a browser reconnects and a new server process serves it (after a
-restart, or on another node), `init` runs again for it. `brazier.with_state_recovery(restore:)` replaces the state
-`init` returned: the page carries the model in its signed join token, and
-`restore(model)` returns the state. Anything that is not in the model must be
-rebuilt or reloaded by `restore`. For `simple` and `application`, where the
-state is the model, pass `function.identity`.
+restart, or on another node), `init` runs again for it.
+`brazier.with_state_recovery(restore:)` carries the model across: the page
+puts the model in its signed join token, `init` and the initial route run
+for the new connection as usual (as LiveView re-runs `mount` on every
+reconnect), and then `restore(model, fresh)` gets the recovered model and
+the fresh state they built, and returns the state to start from.
+Server-only fields come from `fresh`, so the ones `init` loads (a user, an
+API key, a handle) are never left empty or taken from the client:
+
+<!-- docs-check: wrap
+import brazier/effect.{type Effect}
+import brazier/element.{type Element}
+import gleam/int
+
+pub type Model {
+  Model(count: Int)
+}
+
+pub type Msg {
+  Increment
+}
+
+fn init(_ctx: brazier.Context) -> Result(#(Session, Effect(Msg)), brazier.InitError) {
+  Ok(#(Session(model: Model(count: 0), api_key: "loaded on the server"), effect.none()))
+}
+
+fn update(session: Session, msg: Msg) -> #(Session, Effect(Msg)) {
+  case msg {
+    Increment -> #(
+      Session(..session, model: Model(count: session.model.count + 1)),
+      effect.none(),
+    )
+  }
+}
+
+fn view(model: Model, _local: Nil) -> Element(Msg) {
+  element.text(int.to_string(model.count))
+}
+
+{{block}}
+-->
+```gleam
+import brazier
+import brazier/local
+
+pub type Session {
+  Session(model: Model, api_key: String)
+}
+
+fn sync(session: Session) -> Model {
+  session.model
+}
+
+/// The count comes back from the token; the API key is the one `init`
+/// just loaded.
+fn restore(model: Model, fresh: Session) -> Session {
+  Session(..fresh, model: model)
+}
+
+pub fn main() {
+  brazier.full_application(init:, update:, sync:, local: local.none(), view:)
+  |> brazier.with_state_recovery(restore:)
+  |> brazier.start(8080)
+}
+```
+
+For `simple` and `application`, where the state is the model, pass
+`fn(model, _fresh) { model }`.
 
 - The token is signed with the app's secret key. Recovery after a restart or
   on another node needs the same `brazier.secret_key` on every node (see
   [DEPLOYMENT.md](DEPLOYMENT.md#secret-key)).
-- The join token is checked before `init` runs. A token that does not verify
+- The token's signature, age and browser session are checked before `init`
+  runs; its model is decoded and restored once `init` and the initial route
+  have run, before the session starts. A token that does not verify
   (malformed, signed with another key, older than 24 hours, or issued to
-  another browser session), a token whose model `restore` cannot decode, a
-  token without a model, and a missing token refuse the connection. The
-  refusal is logged as a warning, the WebSocket closes with **4400**, and the
-  browser reloads the page, whose server render issues a fresh token (at most
-  3 reloads per tab within 60 seconds, then the page shows an error state).
-  The session never continues from `init`'s state in place of a token it
-  could not use. LiveView does the same with a stale session token: it
-  refuses the join and the client reloads.
+  another browser session), a token without a model, a missing token, and a
+  token whose model the codec cannot decode or `restore` refuses all refuse
+  the connection. The refusal is logged as a warning, the WebSocket closes
+  with **4400**, and the browser reloads the page, whose server render
+  issues a fresh token (at most 3 reloads per tab within 60 seconds, then
+  the page shows an error state). `init`'s effects never run for a refused
+  connection, and the session never continues from `init`'s state in place
+  of a token it could not use. LiveView does the same with a stale session
+  token: it refuses the join and the client reloads.
+- A crash in `restore` is handled like a crash in `init`: it is logged with
+  its stacktrace and the WebSocket closes with **1011**.
 - An open tab whose server was restarted with a different `brazier.secret_key`
   therefore reloads once on reconnect: its token no longer verifies.
 - Recovery with an empty secret key is a configuration error: the runtime
@@ -158,8 +226,9 @@ state is the model, pass `function.identity`.
 - The model must fit in a cookie with its signature: a page whose join token
   is over 3800 bytes is refused with a 500 (see
   [ERROR_HANDLING.md](ERROR_HANDLING.md#join-tokens)).
-- `restore` sees only the recovered model, which can be up to 24 hours old.
-  Do not keep authorization in the client-visible model (see
+- The recovered model can be up to 24 hours old. Do not keep authorization
+  in the client-visible model: take it from `fresh`, which `init` built from
+  the current request and session (see
   [SECURITY.md](SECURITY.md#join-tokens)).
 - Without `with_state_recovery` the session starts from `init`. A missing
   token is then fine, but a token that does not verify still refuses the

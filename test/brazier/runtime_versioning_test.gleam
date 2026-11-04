@@ -240,7 +240,9 @@ pub fn rejoin_is_full_resync_and_never_resets_state_test() {
   let cfg =
     runtime.RuntimeConfig(
       ..config(),
-      restore_model: Some(fn(_json) { Ok(Model(count: 0, blob: "", path: "")) }),
+      restore_model: Some(fn(_json, _fresh) {
+        Ok(Model(count: 0, blob: "", path: ""))
+      }),
     )
   let assert Ok(rt) = runtime.start(cfg, test_ctx.root())
   // With state recovery every first join carries a token with the model;
@@ -505,7 +507,7 @@ pub fn join_reconciles_dynamic_subscriptions_test() {
   let cfg =
     runtime.RuntimeConfig(
       ..config(),
-      restore_model: Some(fn(json) {
+      restore_model: Some(fn(json, _fresh) {
         case json {
           "recovered" -> Ok(Model(count: 5, blob: "", path: ""))
           _ -> Error("unexpected model json")
@@ -751,6 +753,6 @@ pub fn client_replay_of_server_frames_matches_final_sync_test() {
 pub fn client_runtime_behaviour_harness_test() {
   let assert Ok(output) = run_node("brazier_client/test/ffi_harness.mjs", "")
     as "the client FFI harness failed; run node brazier_client/test/ffi_harness.mjs"
-  let assert True = string.contains(output, "ffi harness ok: 45 scenarios")
-    as "the client FFI harness did not run all 45 scenarios"
+  let assert True = string.contains(output, "ffi harness ok: 46 scenarios")
+    as "the client FFI harness did not run all 46 scenarios"
 }

@@ -165,6 +165,32 @@ pub fn only_matches_paths_the_router_normalises_test() {
   let assert Error(Nil) = tagged(piped(path_request("/public")))
 }
 
+/// Regression: `only` read the path undecoded, while the page router
+/// decodes each segment, so `/%61dmin` rendered the admin page without the
+/// middleware.
+pub fn only_matches_percent_encoded_readings_test() {
+  let piped = middleware.pipeline([middleware.only("/admin", tag())], ok)
+  let assert Ok("yes") = tagged(piped(path_request("/%61dmin")))
+  let assert Ok("yes") = tagged(piped(path_request("/%61%64%6D%69%6E/users")))
+  let assert Ok("yes") = tagged(piped(path_request("/%2Fadmin")))
+  let assert Ok("yes") = tagged(piped(path_request("/x/%2E%2E/admin")))
+  // Its raw reading still counts too, and an undecodable path is matched
+  // on its raw readings alone.
+  let assert Ok("yes") = tagged(piped(path_request("/admin/%ZZ")))
+  let assert Error(Nil) = tagged(piped(path_request("/%61dministrator")))
+  let assert Error(Nil) = tagged(piped(path_request("/public/%ZZ")))
+}
+
+pub fn except_applies_to_percent_encoded_escapes_test() {
+  let piped = middleware.pipeline([middleware.except("/public", tag())], ok)
+  let assert Ok("yes") = tagged(piped(path_request("/public/%2E%2E/admin")))
+  let assert Ok("yes") = tagged(piped(path_request("/public%2F..%2Fadmin")))
+  // Skipping is the risky answer, so it needs every reading under the
+  // prefix: an encoded `/public` still gets the middleware.
+  let assert Ok("yes") = tagged(piped(path_request("/%70ublic/style.css")))
+  let assert Error(Nil) = tagged(piped(path_request("/public/a%20b.css")))
+}
+
 /// Regression: `except("/public", auth)` skipped auth for
 /// `/public/../admin`, which the API router resolves to `/admin`.
 pub fn except_still_applies_to_dot_segment_escapes_test() {

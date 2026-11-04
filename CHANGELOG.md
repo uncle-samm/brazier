@@ -135,6 +135,27 @@ with its own changelog, so they are not listed here.
   crashes on an attribute that reaches it with a refused name.
   `middleware.default_csp` no longer allows inline scripts, any `ws:`/`wss:`
   host or `avatars.githubusercontent.com` (see Changed).
+- (Audit SEC-2) The middleware no longer runs on the `/ws` upgrade request.
+  It runs on a `GET` of the live page, with the upgrade's headers, at the
+  upgrade and at every live navigation and join to another page (see
+  Security). `middleware.only("/ws", ..)` and other scopes on `/ws` never
+  apply; check the socket with `brazier.ws_auth`. The upgrade's `path`
+  query parameter is required (400 without it).
+- (Audit SEC-16) `SecurityLimits` has an `allowed_hosts` field. With
+  `BRAZIER_ENV=production` an empty list refuses to start the listener;
+  in development it means `transport.development_allowed_hosts`
+  (`.localhost`, `127.0.0.1`, `[::1]`). Every request, `/health` included,
+  whose `Host` is not listed gets 400, so health checks and probes must send
+  a listed `Host`.
+- (Audit SEC-17) `brazier.with_state_recovery` takes
+  `restore: fn(model, state) -> state`, called with the recovered model and
+  the state `init` and the route produced for this connection. `init` runs
+  before the token's model is decoded, so the server state comes from this
+  connection, not from the token. Pass `fn(model, _fresh) { model }` for
+  `simple` and `application`. The token's signature, age and session are
+  still checked before `init`; a model that does not decode refuses the
+  join (4400) after `init` has run, and a crash in `restore` closes with
+  1011. `AppConfig.restore_model` takes the fresh state too.
 - (Final audit SEC-4) `SecurityLimits` has a `forwarding_header` field
   (`ip.Forwarded`, `ip.XForwardedFor` or the default `ip.NoForwardingHeader`)
   naming the one header trusted proxies set. An app behind a proxy must set
@@ -374,6 +395,10 @@ with its own changelog, so they are not listed here.
   covered only through the cloud. The bench suite has a new
   `store.crdt_append.{10,1000,10000}` case; its metrics need a re-baseline
   before `brazier_bench_check` accepts them.
+- (Audit TS-9) The listener parses `ws_allowed_origins` and
+  `allowed_hosts` once, when it starts, as Phoenix compiles `check_origin`,
+  and refuses to start with an invalid entry. Origins used to be parsed on
+  every upgrade, and an invalid entry silently matched nothing.
 
 ### Fixed
 
@@ -564,6 +589,30 @@ with its own changelog, so they are not listed here.
 - (Final audit) `srcdoc` and an SVG `attributeName` targeting `href` or
   `xlink:href` are refused, as DOMPurify refuses them: both put markup or a
   URL in the page past the URL policy.
+- (Audit SEC-2) A live session can no longer reach a page the middleware
+  refuses over HTTP. The middleware ran only on the `/ws` request, so an
+  auth middleware scoped to `/admin` never saw a WebSocket mounting or
+  navigating to `/admin`. It now runs on a `GET` of the page at the
+  upgrade (a refusal answers the upgrade), and at every `navigate` and
+  every `join` for another page, where a refusal sends `hard_navigate` so
+  the browser loads the page and gets the middleware's response. A refusal
+  is logged and emits `[brazier, ws, navigation_refused]`. This follows
+  Phoenix LiveView, which runs a `live_session`'s `on_mount` hooks at the
+  connected mount and at each live navigation. Scoped middleware also
+  matches the percent-decoded path, so `/%61dmin` is under `/admin`.
+- (Audit SEC-16) The `Host` header is checked against
+  `SecurityLimits.allowed_hosts` on every request and upgrade (400
+  otherwise), following Django's `ALLOWED_HOSTS`: `.example.com` matches
+  the domain and its subdomains, `*` matches any host, the port and case
+  are ignored. Without it a DNS-rebinding page under the attacker's name
+  passed the origin check, since its `Origin` and `Host` agreed.
+- (Audit SEC-11) Text from the client (a page path, a `Host`, an `Origin`,
+  a navigation target) is quoted with `string.inspect` in the transport,
+  runtime, router and `middleware.logger` logs, and a path is logged
+  without its query and fragment, so a CR or LF cannot forge a log line.
+- (Audit SEC-17) State recovery no longer lets a join token decide the
+  server state: `restore` receives the state this connection's `init` and
+  route produced, and only the client-visible model comes from the token.
 
 ## Before Milestone 117 (never released)
 

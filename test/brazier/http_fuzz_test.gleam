@@ -59,6 +59,8 @@ fn start_server() -> server.Listener {
       keepalive_idle_timeout_ms: 300,
       body_read_timeout_ms: 300,
       request_timeout_ms: 1000,
+      // brazier_http_fuzz_ffi names the hosts "test" and "other".
+      allowed_hosts: ["test", "other"],
     )
   let config =
     transport.TransportConfig(
