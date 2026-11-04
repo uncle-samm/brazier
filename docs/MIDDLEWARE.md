@@ -109,7 +109,7 @@ Consequences for a middleware:
 | `secure_headers()` | Sets CSP, X-Frame-Options, and other security headers (in every app's list from the start) |
 | `logger()` | Logs request method, path, and response status |
 | `rate_limit(limiter)` | Returns 429 (with `Retry-After`) when a client exceeds the configured rate. Keys on the socket peer IP; forwarding headers are ignored |
-| `rate_limit_behind_proxies(limiter, trusted)` | Like `rate_limit`, but the client is resolved through trusted proxies (right-most untrusted `Forwarded` / `X-Forwarded-For` hop). See SECURITY.md, Trusted Proxies |
+| `rate_limit_behind_proxies(limiter, trusted)` | Like `rate_limit`, but the client is resolved through trusted proxies (the right-most untrusted hop of the one forwarding header `trusted` names). See SECURITY.md, Trusted Proxies |
 | `hsts(max_age_seconds, include_subdomains)` | Sets `Strict-Transport-Security`. Returns `Result` (negative max-age is an error). Use only behind HTTPS |
 | `compress()` | Gzip-compresses text responses when client sends `Accept-Encoding: gzip`. A file body (a static file sent with `sendfile`) is passed through uncompressed |
 | `request_id()` | Generates a unique `x-request-id` response header |

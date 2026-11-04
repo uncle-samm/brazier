@@ -237,10 +237,11 @@ pub fn rate_limit(limiter: rate_limit.RateLimiter) -> Middleware {
 }
 
 /// Rate limiting keyed on the client IP resolved through trusted proxies:
-/// forwarding headers are honoured only when the socket peer is one of
-/// `trusted`, and the client is the right-most hop that is not a trusted
-/// proxy. Build `trusted` with `ip.parse_trusted_proxies` (use the same
-/// list as `SecurityLimits.trusted_proxies`).
+/// only the forwarding header that `trusted` names is read, only when the
+/// socket peer is one of its proxies, and the client is the right-most hop
+/// that is not a trusted proxy. Build `trusted` with
+/// `ip.parse_trusted_proxies` or `transport.trusted_proxies(limits)`, so it
+/// matches `SecurityLimits.trusted_proxies` and `forwarding_header`.
 pub fn rate_limit_behind_proxies(
   limiter: rate_limit.RateLimiter,
   trusted: ip.TrustedProxies,
