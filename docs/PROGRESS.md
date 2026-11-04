@@ -571,6 +571,22 @@
       - the digest changed on the wire between replicas, so a cluster mixing builds full-syncs until every node runs the same build. This is noted in the CHANGELOG; nothing has been released;
       - the XOR digest resists accidental collisions only, which is enough because members trust each other (documented on `crdt.digest`). A keyed hash would be needed if untrusted members ever became possible.
     - Follow-up: the `store.crdt_append.*` bench baselines shift by about 2µs per write. The final-verification re-baseline covers it.
+  - [x] w5-test-hygiene, merged as ec8e4a8 (branch `fix-test-hygiene`, commits 37c33ca, b7c624a, 2396adb, bf98f1f and 265deaf).
+    - Cluster tests no longer poll:
+      - the 32 `peer.eventually` polls in cluster_test, membership_test and pubsub_cluster_test are replaced by `peer.await_members` and `peer.broadcasts`, which wait on messages;
+      - `await_recorded/3` and `await_round/2` notify their waiter and no longer race between senders; `counted_events` is removed, and `await_revocation/4` is new;
+      - `record_events` and `record_syncs` crash with `not_on_a_peer_node` when called on the test runner, so a handler can't leak there;
+      - `test/brazier/cluster/harness_ffi_test.gleam` covers the harness itself, unhappy paths included.
+    - Telemetry residue: the suite runs through `brazier_test_runner_ffi:run/0` (gleeunit's discovery and options, unchanged), which adds one check per test module that fails, naming the module, if its tests left a telemetry handler attached or detached one they didn't own. The checks found and fixed the stray `[brazier, ws, upgrade, stop]` handler and the other leaks listed under w4-client-tests.
+    - The agent's cluster loop passed 12 of 12 runs.
+    - Coordinator verify on the merge of 549ef6a into the branch (82daa87): clean build with zero warnings, format and lint clean, 1875 tests passing in each of 3 runs, and docs check OK. The count rises by 132: 11 new test functions and one handler check per module.
+    - Decisions:
+      - the handler check is a test in the module's eunit group (ExUnit reports an `on_exit` failure against its test the same way), so a leak fails the module that caused it, not a later victim;
+      - the runner starts telemetry before the first module, because the production handler-failure logger stays attached for the node's life.
+    - Follow-ups:
+      - 2 `peer.eventually` polls remain in store_replica_validation_test;
+      - `await_restart` spins on `yield`;
+      - mailbox residue (messages a test leaves in the shared eunit process) in build_handshake, child_module, dev_reload, router, runtime_test, runtime_versioning, ws_protocol, presence_test and session_security tests.
 - [ ] Final verification: build (zero warnings), tests, all examples, CDP browser suite, perf baselines
 
 **Decisions (Milestone 117, coordinator):**
