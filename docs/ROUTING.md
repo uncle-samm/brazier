@@ -176,6 +176,14 @@ WebSocket. A link opens a normal page load instead when it has a modifier key
 held, a `target` other than `_self`, a `download` attribute, or a
 `data-brazier-external` attribute. Links to other hosts are not intercepted.
 
+Each live navigation (a link, back/forward, `router.push` or
+`router.replace`) passes the app's middleware first, on a `GET` of the
+target page with the connection's headers, just as a page load would. When
+the middleware refuses the page, the server tells the browser to load it, so
+the middleware's own response (a 403, a redirect to a login page) answers
+it, and `on_change` does not run. See
+[MIDDLEWARE.md](MIDDLEWARE.md#the-live-page).
+
 ## Navigation Effects
 
 `update` navigates with effects from `brazier/router`:

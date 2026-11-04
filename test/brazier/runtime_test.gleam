@@ -1039,7 +1039,7 @@ fn recovery_config(
   runtime.RuntimeConfig(
     ..counter_config(),
     encode_model: fn(m: CounterModel) { int.to_string(m.count) },
-    restore_model: option.Some(fn(s: String) {
+    restore_model: option.Some(fn(s: String, _fresh: CounterModel) {
       case int.parse(s) {
         Ok(n) -> Ok(CounterModel(count: n))
         Error(Nil) -> Error("invalid count")
@@ -1274,6 +1274,30 @@ pub fn state_recovery_from_token_test() {
   let #(_, first) = join_and_receive(subject, "recovery_conn", token)
   let assert transport.SendModelSync(model_json: "3", version: 0, ack_clock: 0) =
     first
+}
+
+/// SEC-17: at join, `restore` gets the state `init` built, so server-only
+/// fields come from the fresh state and never from the client.
+pub fn state_recovery_at_join_restores_onto_the_init_state_test() {
+  let config =
+    runtime.RuntimeConfig(
+      ..recovery_config(recovery_secret),
+      init: fn(_ctx) { Ok(#(CounterModel(count: 5), effect.none())) },
+      restore_model: option.Some(fn(s: String, fresh: CounterModel) {
+        case int.parse(s) {
+          Ok(n) -> Ok(CounterModel(count: n + fresh.count))
+          Error(Nil) -> Error("invalid count")
+        }
+      }),
+    )
+  let assert Ok(subject) = runtime.start(config, test_context())
+  let token =
+    ssr.sign_join_token(recovery_secret, "", option.Some("77"), ssr_now())
+  let #(_, first) = join_and_receive(subject, "fresh_join_conn", token)
+  // 77 recovered + 5 from init.
+  let assert transport.SendModelSync(model_json: "82", ..) = first
+    as "restore receives the state init built"
+  Nil
 }
 
 pub fn state_recovery_from_session_bound_token_test() {
@@ -2389,7 +2413,7 @@ pub fn join_recovers_state_from_httponly_cookie_test() {
   let config =
     runtime.RuntimeConfig(
       ..counter_config(),
-      restore_model: option.Some(fn(raw: String) {
+      restore_model: option.Some(fn(raw: String, _fresh: CounterModel) {
         case int.parse(raw) {
           Ok(count) -> Ok(CounterModel(count: count))
           Error(Nil) -> Error("invalid count")
@@ -2426,7 +2450,7 @@ fn cookie_recovery_config(
       process.send(init_ran, Nil)
       counter_init(ctx)
     },
-    restore_model: option.Some(fn(raw: String) {
+    restore_model: option.Some(fn(raw: String, _fresh: CounterModel) {
       case int.parse(raw) {
         Ok(count) -> Ok(CounterModel(count: count))
         Error(Nil) -> Error("invalid count")
@@ -2444,6 +2468,18 @@ fn assert_cookie_refused(
   config: runtime.RuntimeConfig(CounterModel, CounterMsg),
   init_ran: process.Subject(Nil),
   cookie: Option(String),
+) -> Nil {
+  assert_cookie_refused_after(config, init_ran, cookie, init_runs: False)
+}
+
+/// `assert_cookie_refused`, where `init_runs` says whether `init` ran
+/// first: a token that verifies but whose model `restore` refuses is
+/// refused after `init`, which `restore` needs (SEC-17).
+fn assert_cookie_refused_after(
+  config: runtime.RuntimeConfig(CounterModel, CounterMsg),
+  init_ran: process.Subject(Nil),
+  cookie: Option(String),
+  init_runs init_runs: Bool,
 ) -> Nil {
   let req = case cookie {
     option.Some(token) ->
@@ -2463,8 +2499,19 @@ fn assert_cookie_refused(
   let assert 4400 = error.init_close_code(refusal)
   let assert True =
     string.contains(error.init_error_reason(refusal), "join token refused")
-  // Refused before init: no init ran and nothing was sent.
-  let assert Error(Nil) = process.receive(init_ran, 0)
+  case init_runs {
+    True -> {
+      let assert Ok(Nil) = process.receive(init_ran, 0)
+        as "init runs before restore"
+      Nil
+    }
+    False -> {
+      let assert Error(Nil) = process.receive(init_ran, 0)
+        as "a token that does not verify is refused before init"
+      Nil
+    }
+  }
+  // Nothing was sent: the runtime never started.
   let assert Error(Nil) = process.receive(transport_subject, 0)
   Nil
 }
@@ -2495,11 +2542,89 @@ pub fn session_join_refuses_model_that_does_not_restore_test() {
       option.Some("not-a-count"),
       ssr_now(),
     )
-  assert_cookie_refused(
+  assert_cookie_refused_after(
     cookie_recovery_config(cookie_secret, init_ran),
     init_ran,
     option.Some(token),
+    init_runs: True,
   )
+}
+
+/// SEC-17: `init` and the initial route run first, and `restore` gets the
+/// recovered model with the fresh state they built.
+pub fn session_join_restores_onto_the_fresh_state_test() {
+  let token =
+    ssr.sign_join_token(cookie_secret, "", option.Some("77"), ssr_now())
+  let req =
+    ws_request(option.Some("path=%2F"))
+    |> request.set_header("cookie", ssr.session_cookie_name <> "=" <> token)
+  let config =
+    runtime.RuntimeConfig(
+      ..counter_config(),
+      init: fn(_ctx) { Ok(#(CounterModel(count: 5), effect.none())) },
+      restore_model: option.Some(fn(raw: String, fresh: CounterModel) {
+        case int.parse(raw) {
+          Ok(count) -> Ok(CounterModel(count: count + fresh.count))
+          Error(Nil) -> Error("invalid count")
+        }
+      }),
+      secret_key: cookie_secret,
+    )
+  let transport_subject = process.new_subject()
+  let assert Ok(#(on_event, shutdown)) =
+    runtime.start_and_connect_with_request(
+      config,
+      "fresh_state_conn",
+      transport_subject,
+      req,
+    )
+  on_event("fresh_state_conn", transport.ClientJoin(token: "", path: "/"))
+  let assert Ok(first) = process.receive(transport_subject, await.deadline_ms)
+    as "the join answers with a model sync"
+  // 77 recovered + 5 from init: restore saw init's state.
+  let assert True = has_count_sync([first], 82)
+  shutdown()
+}
+
+/// A crash in `restore` on the cookie path is caught like a crash in
+/// `init`: a startup error (close 1011), logged with the page, and the
+/// handler survives.
+pub fn session_join_with_a_crashing_restore_is_a_startup_error_test() {
+  let token =
+    ssr.sign_join_token(cookie_secret, "", option.Some("77"), ssr_now())
+  let req =
+    ws_request(option.Some("path=%2F"))
+    |> request.set_header("cookie", ssr.session_cookie_name <> "=" <> token)
+  let config =
+    runtime.RuntimeConfig(
+      ..counter_config(),
+      restore_model: option.Some(fn(raw: String, _fresh: CounterModel) {
+        // The crash must not escape into the caller (the WebSocket handler).
+        let assert "never" = raw
+        Ok(CounterModel(count: 0))
+      }),
+      secret_key: cookie_secret,
+    )
+  let transport_subject = process.new_subject()
+  let #(started, logs) =
+    log_capture.capture(fn() {
+      runtime.start_and_connect_with_request(
+        config,
+        "crashing_restore_conn",
+        transport_subject,
+        req,
+      )
+    })
+  let assert Error(error.RuntimeError(reason)) = started
+    as "a crashing restore is a startup error"
+  let assert True = string.starts_with(reason, "restore crashed: ")
+  let assert True =
+    log_capture.has(logs, level: "error", containing: [
+      "restore crashed for \"/\" (connection crashing_restore_conn)",
+    ])
+  let assert Error(Nil) = process.receive(transport_subject, 0)
+    as "nothing is sent for a runtime that never started"
+  Nil
 }
 
 pub fn session_join_refuses_missing_cookie_with_recovery_test() {

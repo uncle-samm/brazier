@@ -240,7 +240,9 @@ pub fn rejoin_is_full_resync_and_never_resets_state_test() {
   let cfg =
     runtime.RuntimeConfig(
       ..config(),
-      restore_model: Some(fn(_json) { Ok(Model(count: 0, blob: "", path: "")) }),
+      restore_model: Some(fn(_json, _fresh) {
+        Ok(Model(count: 0, blob: "", path: ""))
+      }),
     )
   let assert Ok(rt) = runtime.start(cfg, test_ctx.root())
   // With state recovery every first join carries a token with the model;
@@ -505,7 +507,7 @@ pub fn join_reconciles_dynamic_subscriptions_test() {
   let cfg =
     runtime.RuntimeConfig(
       ..config(),
-      restore_model: Some(fn(json) {
+      restore_model: Some(fn(json, _fresh) {
         case json {
           "recovered" -> Ok(Model(count: 5, blob: "", path: ""))
           _ -> Error("unexpected model json")

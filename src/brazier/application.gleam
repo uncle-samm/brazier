@@ -91,9 +91,10 @@ pub type AppConfig(state, msg) {
     /// `brazier_codec.decode_event`).
     decode_event: fn(String, String, String, String) ->
       Result(msg, error.BrazierError),
-    /// Rebuild a state from client-visible model JSON (state recovery).
-    /// When set, the dead render embeds the model in the signed join token.
-    restore_model: Option(fn(String) -> Result(state, String)),
+    /// Rebuild a state from client-visible model JSON and the fresh state
+    /// `init` built for the connection (state recovery). When set, the dead
+    /// render embeds the model in the signed join token.
+    restore_model: Option(fn(String, state) -> Result(state, String)),
     /// The app's `parse` composed with `on_change`, when it has a router.
     route: Option(fn(Uri) -> Result(msg, Nil)),
     /// Secret key for join tokens: at least 32 bytes

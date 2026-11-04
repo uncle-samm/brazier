@@ -1208,7 +1208,7 @@ fn gate_live_page(
           <> " from "
           <> ctx(state)
           <> " to "
-          <> string.inspect(path)
+          <> log_path.describe(path)
           <> ": not a same-origin path, "
           <> reason,
       )

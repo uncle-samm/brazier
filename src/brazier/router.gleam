@@ -27,8 +27,7 @@ import gleam/uri.{type Uri}
 /// `/users/J%C3%BCrgen/` → `["users", "Jürgen"]`.
 ///
 /// Brazier only passes URIs whose encoding it checked to `parse`; calling
-/// this on
-/// an unchecked URI with invalid percent-encoding crashes.
+/// this on an unchecked URI with invalid percent-encoding crashes.
 pub fn segments(uri: Uri) -> List(String) {
   uri.path_segments(uri.path)
   |> list.map(fn(segment) {
