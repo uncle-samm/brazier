@@ -10,7 +10,7 @@
 
 ## Current Status
 
-**Active Milestone:** 118 (proposed; see below)
+**Active Milestone:** 118 — Streams, open issues, the runtime-stop flake
 **Last Completed:** 117 — Full Review Remediation (merged into main 2026-11-05, perf re-baseline deferred to 118)
 **Build Status:** GREEN (zero errors, zero warnings) on Gleam 1.19.2
 **Test Status:** GREEN (1932 tests passed, 0 failures)
@@ -725,7 +725,25 @@
   - R7: shared cluster is fine. Avoid the `brazier_` prefix and Brazier's pg scopes. The HMAC peer check is membership, not security, and prod requires TLS distribution even on a tailnet. Asked Modorra whether agent nodes should share a cookie with UI nodes at all.
   - R8 is for Sam (glite), not Brazier.
 
-### Milestone 118 (proposed, after the M117 merge)
+### Milestone 118: streams, open issues, the runtime-stop flake 🚧
+> Started 2026-11-05 at Sam's request: build Milestone 118, fix every open
+> issue in `docs/TODO.md` and the M117 follow-ups that are still open, and
+> resolve the `ws8c_runtime_stop_test` flake at its root cause. Same
+> workflow as 117: each workstream in its own worktree with disjoint file
+> ownership, merged into `claude/distracted-robinson-07e77d` after the
+> coordinator's verify, then into `main`.
+
+**Phase A (parallel):**
+- [ ] m118-lifecycle: `runtime.gleam`, `application.gleam`, `brazier_application_ffi.erl`, `ws8c_runtime_stop_test`. Resolve the atom-DOWN flake; title over `title_max_bytes` reported once, not every update; `receive_wait_event` takes only its parent's `EXIT`; a crashed tree's `persistent_term` entry is cleared.
+- [ ] m118-transport: `transport*`, `ssr`, `error.gleam`, `brazier_client/src` except `patch.mjs`, `test_all_cdp.py`. Join build-id warning once per connection; manifest read once in production; 4409 split from the init-409 close; dev reload not missed while reconnecting; `read_body` error type; outbound-pending hook counts debounced sends; server side of `rejected_middleware` (4000 + status); scroll to `#fragment` after live navigation.
+- [ ] m118-diff-shift: `brazier_patch_ffi.erl`, `brazier_client/src/brazier_client/patch.mjs` and their tests (the shift item below).
+- [ ] m118-tests: existing tests and test FFI outside the files above. Scoped cleanup and detach-on-failure, the stray `[brazier, ws, upgrade, stop]` handler, the `peer.eventually` polls, the cluster test FFI races.
+- [ ] Streams design (`docs/design/STREAMS.md`), posted to Modorra before the build.
+- [ ] Follow-up audit (read-only): every M117 follow-up checked against the code; the open ones go into `docs/TODO.md` and phase B.
+
+**Phase B (after phase A merges):** the streams build, the follow-ups the audit finds open, then the perf re-baseline last, so it measures the final code.
+
+- Decision, 2026-11-05: the re-baseline runs last, after every code change of 118, on an idle machine (Sam asked to quiet it then). A baseline taken now would be stale after the streams build.
 - [ ] Perf re-baseline, deferred from M117 final verification: `make bench-baseline` on an idle machine (no other agents, no audio apps), then `make bench-check` against it must pass. The gate's spread rule stays as it is.
 - [ ] LiveView-style streams (Modorra R1, answered 2026-11-04), following `stream`, `stream_insert`, `stream_delete` and `limit`:
   - keyed items sent as ops (insert, update, delete, reset), not kept in the synced model;
