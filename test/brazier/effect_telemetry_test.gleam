@@ -1,11 +1,14 @@
 /// Telemetry emitted by effects: the `[brazier, effect, run]` span around
-/// effect callbacks and `[brazier, effect, timer, rejected]` at the timer
-/// cap.
+/// effect callbacks, and the event each per-runtime cap emits when it
+/// refuses an effect: `[brazier, effect, timer, rejected]` (`every`),
+/// `[brazier, effect, after, rejected]` (`after`) and
+/// `[brazier, effect, background, rejected]` (`background`).
 ///
 /// Sync and keyed callbacks run in the calling process; background work
 /// runs in its own process. Every handler forwards to a subject owned by
 /// the test, and tests synchronize on those events; nothing sleeps.
 import brazier/effect
+import brazier/log_capture
 import brazier/telemetry.{type Event}
 import gleam/dynamic
 import gleam/erlang/process.{type Subject}
@@ -153,6 +156,78 @@ pub fn timer_cap_emits_rejected_with_limit_test() {
   let assert Ok(10) = telemetry.int(rejected, "limit")
   stop_all(fillers)
   let assert Ok(Nil) = telemetry.detach(id)
+}
+
+pub fn after_cap_emits_rejected_with_limit_test() {
+  let event_name = ["brazier", "effect", "after", "rejected"]
+  let #(id, events) = listen([event_name])
+  let fired = process.new_subject()
+  // Fill every slot with timers that do not fire during the test.
+  list.each(list.repeat(Nil, effect.max_after_timers), fn(_) {
+    let assert [] =
+      perform(effect.after(60_000, fn() { 0 }), process.send(fired, _))
+  })
+  let assert 100 = effect.pending_after_timers()
+  let #(rejected_pids, logs) =
+    log_capture.capture(fn() {
+      perform(effect.after(0, fn() { 1 }), process.send(fired, _))
+    })
+  let assert [] = rejected_pids
+  let assert True =
+    log_capture.has(logs, level: "warning", containing: [
+      "After-timer limit reached", "100/100",
+    ])
+  let assert 100 = effect.pending_after_timers()
+    as "the rejected timer must not be armed"
+  let rejected = expect(events, fn(event: Event) { event.name == event_name })
+  let assert Ok(100) = telemetry.int(rejected, "limit")
+  let assert #(0, 100) = effect.stop_owned()
+  let assert Error(Nil) = process.receive(fired, 0)
+  let assert Ok(Nil) = telemetry.detach(id)
+}
+
+pub fn background_cap_emits_rejected_with_limit_test() {
+  let event_name = ["brazier", "effect", "background", "rejected"]
+  let #(id, events) = listen([event_name])
+  let ran = process.new_subject()
+  let workers =
+    list.repeat(Nil, effect.max_background_processes)
+    |> list.flat_map(fn(_) {
+      perform(
+        effect.background(fn(_dispatch) { process.sleep_forever() }),
+        fn(_) { Nil },
+      )
+    })
+  let assert 32 = list.length(workers)
+  let #(rejected_pids, logs) =
+    log_capture.capture(fn() {
+      perform(
+        effect.background(fn(_dispatch) { process.send(ran, Nil) }),
+        fn(_) { Nil },
+      )
+    })
+  let assert [] = rejected_pids as "the 33rd worker must not start"
+  let assert True =
+    log_capture.has(logs, level: "warning", containing: [
+      "Background effect limit reached", "32/32",
+    ])
+  let rejected = expect(events, fn(event: Event) { event.name == event_name })
+  let assert Ok(32) = telemetry.int(rejected, "limit")
+  // A finished worker frees its slot: stop one and the next one starts.
+  stop_all([first_worker(workers)])
+  let assert [_worker] =
+    perform(effect.background(fn(_dispatch) { process.send(ran, Nil) }), fn(_) {
+      Nil
+    })
+  let assert Ok(Nil) = process.receive(ran, 2000)
+    as "a worker under the cap must run"
+  let assert #(_, 0) = effect.stop_owned()
+  let assert Ok(Nil) = telemetry.detach(id)
+}
+
+fn first_worker(workers: List(process.Pid)) -> process.Pid {
+  let assert [first, ..] = workers as "the cap test started workers"
+  first
 }
 
 pub fn effect_without_handler_runs_normally_test() {

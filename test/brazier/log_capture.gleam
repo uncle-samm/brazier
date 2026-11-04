@@ -2,6 +2,7 @@
 
 import gleam/list
 import gleam/string
+import logging
 
 /// A captured log event: the level name (e.g. "warning") and its text.
 pub type Captured {
@@ -12,6 +13,16 @@ pub type Captured {
 /// emitted while it ran, in order.
 pub fn capture(fun: fn() -> a) -> #(a, List(Captured)) {
   let #(result, events) = do_capture(fun)
+  #(result, list.map(events, fn(event) { Captured(event.0, event.1) }))
+}
+
+/// As `capture`, with the logger's primary level set to `level` while
+/// `fun` runs, so the events below it are filtered as in production.
+pub fn capture_at(
+  level: logging.LogLevel,
+  fun: fn() -> a,
+) -> #(a, List(Captured)) {
+  let #(result, events) = do_capture_at(level, fun)
   #(result, list.map(events, fn(event) { Captured(event.0, event.1) }))
 }
 
@@ -31,3 +42,9 @@ pub fn has(
 
 @external(erlang, "brazier_own_log_capture_ffi", "capture")
 fn do_capture(fun: fn() -> a) -> #(a, List(#(String, String)))
+
+@external(erlang, "brazier_own_log_capture_ffi", "capture_at")
+fn do_capture_at(
+  level: logging.LogLevel,
+  fun: fn() -> a,
+) -> #(a, List(#(String, String)))

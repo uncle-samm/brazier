@@ -51,43 +51,51 @@ pub fn response_header_accepts_rfc_token_name_test() {
 
 // === Token Expiration Tests ===
 
-pub fn token_expiration_capped_at_24h_test() {
-  // CVE: callers could set max_age to years, keeping tokens alive forever
-  // Fix: hard cap at 86400 seconds (24 hours)
+pub fn token_lifetime_is_24h_test() {
+  // A join token cannot be kept alive past its fixed 24 h lifetime: the
+  // expiry is signed into it (Phoenix.Token's max_age), not chosen by the
+  // verifier.
   let secret = "test-secret-key-long-enough-32chars!!"
   let now = system_time_seconds()
   let hour = 3600
-  // A max_age of 999999 (~11 days) asked for, a token 25 hours old: the
-  // 24 h cap rejects it.
   let stale = ssr.sign_join_token(secret, "", None, now - 25 * hour)
-  let assert Error("Session token expired") =
-    ssr.verify_session_token(stale, secret, 999_999)
-  // Inside the cap the same max_age accepts, and reports the issue time.
+  let assert Error(ssr.JoinTokenExpired(expired_at: expired_at, now: _)) =
+    ssr.verify_join_token(stale, secret, "", now)
+  assert expired_at == now - 25 * hour + ssr.join_token_lifetime_seconds
+  // Inside the lifetime the token verifies and reports its issue time.
   let issued_at = now - 23 * hour
   let fresh = ssr.sign_join_token(secret, "", None, issued_at)
-  let assert Ok(verified_at) = ssr.verify_session_token(fresh, secret, 999_999)
-  assert verified_at == issued_at
+  let assert Ok(verified) = ssr.verify_join_token(fresh, secret, "", now)
+  assert verified.issued_at == issued_at
 }
 
 @external(erlang, "brazier_ssr_ffi", "system_time_seconds")
 fn system_time_seconds() -> Int
 
-pub fn token_expired_rejected_test() {
-  // Tokens with negative age should fail
+pub fn token_issued_in_the_future_rejected_test() {
+  // A token whose issue time is past the clock-skew allowance is refused.
   let secret = "test-secret-key-long-enough-32chars!!"
-  let token = ssr.create_session_token(secret)
-  // With max_age of -1 (already expired), must reject
-  let assert Error(_) = ssr.verify_session_token(token, secret, -1)
+  let now = system_time_seconds()
+  let token = ssr.sign_join_token(secret, "", None, now + 3600)
+  let assert Error(ssr.JoinTokenInvalid(reason: "issued in the future")) =
+    ssr.verify_join_token(token, secret, "", now)
 }
 
 pub fn token_wrong_secret_rejected_test() {
+  let now = system_time_seconds()
   let token =
-    ssr.create_session_token("correct-secret-key-long-enough-32chars!!")
-  let assert Error(_) =
-    ssr.verify_session_token(
+    ssr.sign_join_token(
+      "correct-secret-key-long-enough-32chars!!",
+      "",
+      None,
+      now,
+    )
+  let assert Error(ssr.JoinTokenInvalid(reason: "signature verification failed")) =
+    ssr.verify_join_token(
       token,
       "wrong-secret-key-long-enough-32chars!!",
-      3600,
+      "",
+      now,
     )
 }
 

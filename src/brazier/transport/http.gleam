@@ -14,7 +14,6 @@ import brazier/internal/http_status
 import brazier/log
 import brazier/telemetry
 import brazier/transport/server
-import gleam/bit_array
 import gleam/bytes_tree
 import gleam/http
 import gleam/http/request.{type Request}
@@ -639,6 +638,8 @@ pub fn tag_route(pattern: String) -> Nil {
           <> ")",
       )
   }
+  // Invariant: route patterns come from developer code, are never empty and
+  // fit the tag buffer; anything else is a bug in the caller, logged above.
   let assert True = size > 0 && size <= max_route_tag_bytes
     as "tag_route: a route pattern is 1 to 255 bytes"
   ffi_route_tag(pattern)
@@ -715,9 +716,10 @@ fn response_body_bytes(resp: Response(server.ResponseBody)) -> Int {
   }
 }
 
-/// What a response body puts on the wire after the head.
+/// What a response body puts on the wire after the head. A byte body stays
+/// a tree: it goes to `gen_tcp:send` as iodata, never flattened.
 type WireBody {
-  WireBytes(BitArray)
+  WireBytes(bytes_tree.BytesTree)
   WireFile(path: String, offset: Int, length: Int)
 }
 
@@ -776,10 +778,7 @@ pub fn write_framed_response(
     }
     Ok(Nil) -> {
       let #(wire_body, body_size) = case resp.body {
-        server.Bytes(tree) -> {
-          let bits = bytes_tree.to_bit_array(tree)
-          #(WireBytes(bits), bit_array.byte_size(bits))
-        }
+        server.Bytes(tree) -> #(WireBytes(tree), bytes_tree.byte_size(tree))
         server.File(path:, offset:, length:) -> {
           // A negative offset or length is a programming error in the
           // handler that built the body.
@@ -870,8 +869,11 @@ pub fn write_framed_response(
         <> "\r\n"
       let send_body = !bodyless_status && !framing.head_request
       case send_body, wire_body {
-        True, WireBytes(bits) ->
-          server.send_bytes(socket, bit_array.append(<<header_str:utf8>>, bits))
+        // One send of the head and the body as iodata, as cowboy and
+        // Plug.Cowboy hand iolists to the socket: the body is not copied
+        // into one binary first.
+        True, WireBytes(tree) ->
+          send_tree(socket, bytes_tree.prepend_string(tree, header_str))
         True, WireFile(path:, offset:, length:) ->
           case server.send_bytes(socket, <<header_str:utf8>>) {
             Error(reason) -> Error(reason)
@@ -989,6 +991,14 @@ fn ffi_linger_close(
   timeout_ms: Int,
   max_bytes: Int,
 ) -> LingerOutcome
+
+/// Send a bytes tree over a socket as iodata (`gen_tcp:send/2` takes an
+/// iolist; a `BytesTree` is one on Erlang).
+@external(erlang, "brazier_transport_ffi", "tcp_send")
+fn send_tree(
+  socket: server.Socket,
+  data: bytes_tree.BytesTree,
+) -> Result(Nil, String)
 
 /// Send `length` bytes of the file at `path` from `offset` with
 /// `file:sendfile`. Fails when fewer bytes could be sent. The caller,

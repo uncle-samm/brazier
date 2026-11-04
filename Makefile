@@ -12,6 +12,7 @@ test:
 test-client:
 	node brazier_client/test/ffi_harness.mjs
 	node brazier_client/test/patch_safety.mjs
+	node brazier_client/test/apply_equivalence.mjs
 
 # gleam test FLAKE_RUNS times (default 5) under FLAKE_BUSY busy loops
 # (default 8); fails if any run fails.

@@ -463,6 +463,7 @@ function freshGlobals(options = {}) {
   parseInto(root, options.ssr || "");
   globalThis.location = {
     protocol: "http:",
+    origin: "http://localhost",
     host: "localhost",
     hostname: "localhost",
     pathname: "/",
@@ -1367,6 +1368,175 @@ scenario("server navigation pushes or replaces local paths and flushes pending i
   assert.equal(window.location.href, undefined);
   s.deliver({ type: "hard_navigate", path: "/login" });
   assert.equal(window.location.href, "/login");
+});
+
+// SEC-5: the URL parser reads "\" as "/" and strips tab, newline and
+// carriage return, so each of these would load evil.example.
+const OFF_ORIGIN_PATHS = ["/\\evil.example", "/\t/evil.example", "/\n/evil.example", "/\r/evil.example", "/x\\..\\\\evil.example", "/%09/evil.example", "\\\\evil.example"];
+
+scenario("server navigate and hard_navigate refuse paths a browser resolves to another host", async () => {
+  await loadRuntime({ path: "/a" });
+  const s = sockets[0];
+  s.open();
+  sync(s, 0, {});
+  const navigatesBefore = s.types().filter((t) => t === "navigate").length;
+  for (const path of OFF_ORIGIN_PATHS) {
+    s.deliver({ type: "navigate", path });
+    s.deliver({ type: "navigate", path, replace: true });
+    s.deliver({ type: "hard_navigate", path });
+  }
+  assert.deepEqual(historyLog.pushed, [], "no refused path is pushed");
+  assert.deepEqual(historyLog.replaced, [], "no refused path replaces the entry");
+  assert.equal(window.location.href, undefined, "no refused path is loaded");
+  assert.equal(location.pathname, "/a");
+  assert.equal(s.types().filter((t) => t === "navigate").length, navigatesBefore, "nothing is sent for a refused path");
+  assert.equal(errorsMatching("Server navigate rejected: not a local path (").length, 2 * OFF_ORIGIN_PATHS.length);
+  assert.equal(errorsMatching("Hard navigate rejected: not a local path (").length, OFF_ORIGIN_PATHS.length);
+  assert.equal(errorsMatching("control character").length, 3 * 3, "tab, newline and carriage return name their reason");
+  s.deliver({ type: "hard_navigate", path: "/café?q=a%20b" });
+  assert.equal(window.location.href, "/café?q=a%20b", "a same-origin path still loads");
+});
+
+scenario("a model_sync or patch without a valid ack_clock is a protocol error that resyncs", async () => {
+  await loadRuntime();
+  const s = sockets[0];
+  s.open();
+  const requests = () => s.types().filter((t) => t === "request_sync").length;
+  s.deliver({ type: "model_sync", model: JSON.stringify({ count: 1 }), version: 0 });
+  assert.equal(decoded.length, 0, "a model_sync without ack_clock is not applied");
+  assert.equal(errorsMatching("invalid ack_clock undefined").length, 1);
+  assert.equal(requests(), 1);
+  sync(s, 0, { count: 0 });
+  assert.deepEqual(decoded.at(-1), { count: 0 }, "a valid model_sync recovers");
+  for (const [i, ackClock] of [undefined, "1", -1, 1.5, null].entries()) {
+    sync(s, i, { count: i });
+    s.deliver({ type: "patch", ops: JSON.stringify([{ op: "replace", path: "/count", value: 99 }]), version: i + 1, ack_clock: ackClock });
+    assert.deepEqual(decoded.at(-1), { count: i }, `a patch with ack_clock ${JSON.stringify(ackClock)} is not applied`);
+    assert.equal(s.types().at(-1), "request_sync", `a patch with ack_clock ${JSON.stringify(ackClock)} resyncs`);
+  }
+  assert.equal(errorsMatching("has invalid ack_clock").length, 5);
+  s.deliver({ type: "model_sync", model: JSON.stringify({ count: 7 }), version: 9, ack_clock: "9" });
+  assert.notDeepEqual(decoded.at(-1), { count: 7 }, "a model_sync with a string ack_clock is not applied");
+  assert.equal(errorsMatching('invalid ack_clock "9"').length, 1);
+});
+
+scenario("an event without a valid clock is refused before it is queued", async () => {
+  const runtime = await loadRuntime();
+  const s = sockets[0];
+  s.open();
+  sync(s, 0, { count: 0 });
+  const { clock: _dropped, ...unclocked } = event(1);
+  for (const bad of [unclocked, { ...event(1), clock: "1" }, { ...event(1), clock: -1 }]) {
+    assert.throws(() => runtime.ws_send(JSON.stringify(bad)), /every event needs a clock/);
+    assert.throws(() => runtime.ws_send(JSON.stringify({ type: "event_batch", events: [event(2), bad] })), /every event needs a clock/);
+  }
+  assert.equal(s.events().length, 0, "nothing was queued");
+  runtime.ws_send(JSON.stringify(event(3)));
+  assert.equal(s.events().at(-1).clock, 3, "a clocked event is sent");
+});
+
+// --- hooks and render cost (PERF-1) ---
+const hookView = (model) => ({
+  html:
+    `<ul>${model.items.map((i) => `<li>${i}</li>`).join("")}</ul>` +
+    `<div id="h1" data-brazier-hook="probe" data-x="${model.x}"></div>` +
+    (model.extra ? '<p><span id="h2" data-brazier-hook="probe"></span></p>' : "") +
+    '<div id="late" data-brazier-hook="later"></div>' +
+    '<div id="owned" data-brazier-preserve-children="true"></div>',
+  handlers: [],
+});
+
+function probeHook(calls) {
+  return {
+    mount: (node) => calls.push("mount " + node.id),
+    update: (node) => calls.push("update " + node.id),
+    unmount: (node) => calls.push("unmount " + node.id),
+  };
+}
+
+scenario("hooks mount, update and unmount only for what a render changed", async () => {
+  await loadRuntime({ view: hookView });
+  const s = sockets[0];
+  s.open();
+  const calls = [];
+  window.brazierClient.registerHook("probe", probeHook(calls));
+  const base = { items: ["a", "b"], x: 1, extra: false };
+  let version = 0;
+  const render = (model) => sync(s, version++, model);
+  render(base);
+  assert.deepEqual(calls.splice(0), ["mount h1"], "the first render mounts every registered hook element");
+  render({ ...base, items: ["a", "c", "d"] });
+  assert.deepEqual(calls.splice(0), [], "a render that does not touch a hook element calls no hook");
+  render({ ...base, x: 2 });
+  assert.deepEqual(calls.splice(0), ["update h1"], "a changed attribute updates its hook");
+  render({ ...base, x: 2, extra: true });
+  assert.deepEqual(calls.splice(0), ["mount h2"], "an inserted hook element mounts");
+  render({ ...base, x: 2 });
+  assert.deepEqual(calls.splice(0), ["unmount h2"], "a removed hook element unmounts");
+  window.brazierClient.registerHook("later", probeHook(calls));
+  render({ ...base, x: 2 });
+  assert.deepEqual(calls.splice(0), ["mount late"], "a hook registered after its element rendered mounts on the next render");
+  const inner = createElement("i");
+  inner.setAttribute("id", "inner");
+  inner.setAttribute("data-brazier-hook", "probe");
+  el("#owned").appendChild(inner);
+  render({ ...base, x: 2 });
+  assert.deepEqual(calls.splice(0), ["mount inner"], "a hook element other code adds under preserve-children mounts");
+  render({ ...base, x: 2 });
+  assert.deepEqual(calls.splice(0), [], "an unchanged render calls no hook");
+  el("#h1").setAttribute("data-x", "drifted");
+  render({ ...base, x: 2 });
+  assert.equal(el("#h1").getAttribute("data-x"), "2", "the morph restores a drifted attribute");
+  assert.deepEqual(calls.splice(0), [], "restoring the attribute it was mounted with does not update the hook");
+});
+
+scenario("a hook unmount that removes an element the morph touched fails the render loudly", async () => {
+  await loadRuntime({ view: hookView });
+  const s = sockets[0];
+  s.open();
+  window.brazierClient.registerHook("probe", {
+    unmount: (node) => {
+      if (node.id === "h2") root.removeChild(el("#h1"));
+    },
+  });
+  const base = { items: ["a"], x: 1, extra: true };
+  sync(s, 0, base);
+  // x changes h1's attribute (touched), then removing h2 runs its unmount.
+  // The model_sync fails as any render error does, and asks for a resync.
+  sync(s, 1, { ...base, x: 2, extra: false });
+  const failed = errorsMatching("model_sync v1 could not be applied");
+  assert.equal(failed.length, 1, "the render failure is logged");
+  assert.match(failed[0].text, /invariant violated: an element the morph touched \(div#h1\) left the app root/);
+  assert.equal(s.types().at(-1), "request_sync", "the client asks for a resync");
+});
+
+scenario("a render with identical markup parses it once and still morphs the DOM back", async () => {
+  await loadRuntime({ view: hookView });
+  const s = sockets[0];
+  s.open();
+  let templates = 0;
+  const createTemplate = document.createElement;
+  document.createElement = (tag) => {
+    if (tag === "template") templates++;
+    return createTemplate(tag);
+  };
+  const model = { items: ["a", "b"], x: 1, extra: false };
+  sync(s, 0, model);
+  sync(s, 1, model);
+  sync(s, 2, model);
+  assert.equal(templates, 1, "identical markup is parsed once");
+  el("#h1").setAttribute("data-x", "drifted");
+  const firstItem = () => root.childNodes[0].childNodes[0];
+  firstItem().textContent = "typed";
+  sync(s, 3, model);
+  assert.equal(templates, 1);
+  assert.equal(el("#h1").getAttribute("data-x"), "1", "the cached fragment still restores attributes");
+  assert.equal(firstItem().textContent, "a", "the cached fragment still restores text");
+  sync(s, 4, { ...model, x: 2 });
+  assert.equal(templates, 2, "new markup is parsed");
+  sync(s, 5, model);
+  assert.equal(templates, 3, "only the last markup is cached");
+  assert.equal(el("#h1").getAttribute("data-x"), "1");
 });
 
 scenario("a dev reload message reloads the page every time, outside the reload guard", async () => {

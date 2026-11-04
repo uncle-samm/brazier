@@ -1,7 +1,7 @@
 //// Lifecycle tests: every framework-owned effect process (background
-//// workers and their guardians, every/after timers, the PubSub listener)
-//// must die with the process that owns it, and keyed effects must replace
-//// rather than leak their previous process.
+//// workers and their guardians, every timers, the PubSub listener) and
+//// every `after` timer must die with the process that owns it, and keyed
+//// effects must replace rather than leak their previous process or timer.
 ////
 //// Synchronisation uses monitors and selectors only — no sleeps.
 
@@ -17,6 +17,14 @@ import gleam/option.{type Option, None, Some}
 
 @external(erlang, "brazier_effect_test_ffi", "effect_guardian")
 fn effect_guardian(worker: Pid) -> Result(Pid, Nil)
+
+type TimerRef
+
+@external(erlang, "brazier_effect_test_ffi", "after_timer_refs")
+fn after_timer_refs(owner: Pid) -> List(TimerRef)
+
+@external(erlang, "brazier_effect_test_ffi", "timer_pending")
+fn timer_pending(ref: TimerRef) -> Bool
 
 @external(erlang, "brazier_effect_test_ffi", "pg_members")
 fn pg_members(topic: String) -> List(Pid)
@@ -66,8 +74,9 @@ fn perform(eff: effect.Effect(a)) -> List(Pid) {
 }
 
 /// An owner process performs a background effect, an `every` timer and an
-/// `after` timer, reports every pid (worker, guardian, timers), then waits
-/// for the `stop` instruction. Returns #(owner, owned_pids).
+/// `after` timer, reports every pid (worker, guardian, interval timer; the
+/// `after` timer is not a process), then waits for the `stop` instruction.
+/// Returns #(owner, owned_pids).
 fn spawn_owner_with_effects(stop: fn() -> Nil) -> #(Pid, List(Pid)) {
   let report = process.new_subject()
   let owner =
@@ -80,6 +89,8 @@ fn spawn_owner_with_effects(stop: fn() -> Nil) -> #(Pid, List(Pid)) {
             effect.after(60_000, fn() { Nil }),
           ]),
         )
+      let assert [_interval] = timer_pids as "only the every timer is a process"
+      let assert 1 = effect.pending_after_timers()
       let worker_pids =
         perform(
           effect.background(fn(_dispatch) {
@@ -103,7 +114,7 @@ fn spawn_owner_with_effects(stop: fn() -> Nil) -> #(Pid, List(Pid)) {
 pub fn owned_processes_die_when_owner_is_killed_test() {
   let #(owner, owned) =
     spawn_owner_with_effects(fn() { process.sleep_forever() })
-  let assert 4 = list.length(owned)
+  let assert 3 = list.length(owned)
   list.each(owned, fn(pid) {
     let assert True = process.is_alive(pid)
   })
@@ -175,6 +186,61 @@ pub fn rekeyed_every_replaces_previous_timer_test() {
   let all = [last_pid, ..others]
   list.each(all, process.kill)
   assert_all_down(all)
+}
+
+pub fn rekeyed_after_replaces_pending_timer_test() {
+  let fired = process.new_subject()
+  // Re-keying 20 times leaves exactly one pending timer: each perform
+  // cancels the previous "toast" timer before arming the new one.
+  list.each(list.repeat(Nil, 20), fn(_) {
+    let assert [] =
+      perform(effect.keyed(
+        "toast",
+        effect.after(60_000, fn() { process.send(fired, 1) }),
+      ))
+  })
+  let assert 1 = effect.pending_after_timers()
+  let assert #(0, 1) = effect.stop_owned()
+  let assert Error(Nil) = process.receive(fired, 0)
+}
+
+pub fn cancel_cancels_keyed_after_timer_test() {
+  let #(eff, token) = effect.cancellable(effect.after(60_000, fn() { Nil }))
+  let assert [] = perform(eff)
+  let assert 1 = effect.pending_after_timers()
+  let assert [] = perform(effect.cancel(token))
+  let assert 0 = effect.pending_after_timers()
+  // Nothing is left for stop_owned to cancel.
+  let assert #(0, 0) = effect.stop_owned()
+}
+
+pub fn after_timers_die_with_their_owner_test() {
+  let report = process.new_subject()
+  let owner =
+    process.spawn_unlinked(fn() {
+      let assert [] =
+        perform(
+          effect.batch([
+            effect.after(60_000, fn() { Nil }),
+            effect.after(60_000, fn() { Nil }),
+          ]),
+        )
+      process.send(report, Nil)
+      process.sleep_forever()
+    })
+  let assert Ok(Nil) = process.receive(report, down_timeout_ms)
+  let refs = after_timer_refs(owner)
+  let assert 2 = list.length(refs)
+  list.each(refs, fn(ref) {
+    let assert True = timer_pending(ref) as "armed timers are pending"
+  })
+  process.kill(owner)
+  assert_all_down([owner])
+  // The VM cancels a send_after timer whose destination process exits.
+  list.each(refs, fn(ref) {
+    let assert False = timer_pending(ref)
+      as "an after timer must not outlive its owner"
+  })
 }
 
 pub fn rekeyed_timer_stops_ticking_test() {
@@ -269,6 +335,8 @@ fn lifecycle_config(
             process.send(reports, process.self())
             LifeTick
           }),
+          // A pending after timer, armed in the runtime's own process.
+          effect.after(60_000, fn() { LifeTick }),
         ]),
       ))
     },
@@ -295,11 +363,11 @@ fn lifecycle_config(
 
 /// Start a lifecycle runtime and collect: runtime subject and pid, and the
 /// background worker, its guardian, the interval timer and the PubSub
-/// listener. The runtime is unlinked from the test process so killing it
-/// does not kill the test.
+/// listener, plus the runtime's pending after timer. The runtime is
+/// unlinked from the test process so killing it does not kill the test.
 fn start_lifecycle_runtime(
   topic: String,
-) -> #(Subject(runtime.RuntimeMessage(LifeMsg)), Pid, List(Pid)) {
+) -> #(Subject(runtime.RuntimeMessage(LifeMsg)), Pid, List(Pid), List(TimerRef)) {
   pubsub.start()
   let reports = process.new_subject()
   let assert Ok(subject) =
@@ -313,7 +381,10 @@ fn start_lifecycle_runtime(
   // The listener subscribes to its initial topics before runtime.start
   // returns, so membership is already established — exactly once.
   let assert [listener] = pg_members(topic)
-  #(subject, runtime_pid, [worker, guardian, timer, listener])
+  // init's effects run in the initialiser, before runtime.start returns.
+  let assert [after_timer] = after_timer_refs(runtime_pid)
+  let assert True = timer_pending(after_timer)
+  #(subject, runtime_pid, [worker, guardian, timer, listener], [after_timer])
 }
 
 fn collect_worker_and_timer(
@@ -339,25 +410,28 @@ fn unique_topic(prefix: String) -> String {
 
 pub fn runtime_kill_reaps_all_owned_processes_test() {
   let topic = unique_topic("lifecycle_kill")
-  let #(_subject, runtime_pid, owned) = start_lifecycle_runtime(topic)
+  let #(_subject, runtime_pid, owned, timers) = start_lifecycle_runtime(topic)
   process.kill(runtime_pid)
   assert_all_down([runtime_pid, ..owned])
+  assert_timers_cancelled(timers)
   let assert [] = await_pg_empty(topic, down_timeout_ms)
 }
 
 pub fn runtime_crash_reaps_all_owned_processes_test() {
   let topic = unique_topic("lifecycle_crash")
-  let #(_subject, runtime_pid, owned) = start_lifecycle_runtime(topic)
+  let #(_subject, runtime_pid, owned, timers) = start_lifecycle_runtime(topic)
   process.send_abnormal_exit(runtime_pid, "simulated runtime crash")
   assert_all_down([runtime_pid, ..owned])
+  assert_timers_cancelled(timers)
   let assert [] = await_pg_empty(topic, down_timeout_ms)
 }
 
 pub fn runtime_shutdown_reaps_all_owned_processes_test() {
   let topic = unique_topic("lifecycle_shutdown")
-  let #(subject, runtime_pid, owned) = start_lifecycle_runtime(topic)
+  let #(subject, runtime_pid, owned, timers) = start_lifecycle_runtime(topic)
   process.send(subject, runtime.Shutdown)
   assert_all_down([runtime_pid, ..owned])
+  assert_timers_cancelled(timers)
   let assert [] = await_pg_empty(topic, down_timeout_ms)
 }
 
@@ -365,8 +439,65 @@ pub fn listener_crash_is_loud_and_takes_runtime_down_test() {
   // A dead listener means silently lost notifications; it is linked to the
   // runtime so the failure is loud instead.
   let topic = unique_topic("lifecycle_listener_crash")
-  let #(_subject, runtime_pid, owned) = start_lifecycle_runtime(topic)
+  let #(_subject, runtime_pid, owned, _timers) = start_lifecycle_runtime(topic)
   let assert [_worker, _guardian, _timer, listener] = owned
   process.send_abnormal_exit(listener, "simulated listener crash")
   assert_all_down([runtime_pid, ..owned])
+}
+
+fn assert_timers_cancelled(timers: List(TimerRef)) -> Nil {
+  list.each(timers, fn(ref) {
+    let assert False = timer_pending(ref)
+      as "an after timer must not outlive its runtime"
+  })
+}
+
+pub type AfterMsg {
+  AfterFired(fired_in: Pid)
+}
+
+/// `after` dispatches through the runtime's mailbox: make_msg runs in the
+/// runtime process itself (no process is spawned for the timer) and the
+/// message reaches update.
+pub fn runtime_after_fires_in_the_runtime_process_test() {
+  let fired = process.new_subject()
+  let config =
+    runtime.RuntimeConfig(
+      init: fn(_ctx) {
+        Ok(#(
+          Nil,
+          effect.after(0, fn() { AfterFired(fired_in: process.self()) }),
+        ))
+      },
+      update: fn(model, msg) {
+        case msg {
+          AfterFired(fired_in:) -> {
+            process.send(fired, #(fired_in, process.self()))
+            #(model, effect.none())
+          }
+        }
+      },
+      decode_event: fn(_, _, _, _) {
+        Error(error.RuntimeError(reason: "after test decodes no events"))
+      },
+      encode_model: fn(_model) { "nil" },
+      route: option.None,
+      restore_model: option.None,
+      dynamic_subscriptions: option.None,
+      on_notify: option.None,
+      on_notification: option.None,
+      secret_key: "",
+      presence: None,
+      title: None,
+    )
+  let assert Ok(subject) = runtime.start(config, test_ctx.root())
+  let assert Ok(runtime_pid) = process.subject_owner(subject)
+  let assert Ok(#(made_in, updated_in)) =
+    process.receive(fired, down_timeout_ms)
+    as "the after timer must reach update"
+  let assert True = made_in == runtime_pid
+  let assert True = updated_in == runtime_pid
+  let assert [] = after_timer_refs(runtime_pid)
+  process.send(subject, runtime.Shutdown)
+  assert_all_down([runtime_pid])
 }

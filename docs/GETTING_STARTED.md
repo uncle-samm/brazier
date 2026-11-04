@@ -907,7 +907,8 @@ SignedIn -> #(model, router.redirect("/dashboard"))
 `router.push` and `router.replace` change the URL without a page load and run
 `on_change`. `router.redirect` loads the page, so use it when the browser
 must make a real HTTP request, for example to receive a `Set-Cookie` header.
-All three take same-origin paths only.
+All three take same-origin paths only (see
+[Navigation Targets](SECURITY.md#navigation-targets)).
 
 ## Production Deployment
 

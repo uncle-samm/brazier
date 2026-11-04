@@ -17,11 +17,13 @@ import brazier/error.{type InitError}
 import brazier/error_page
 import brazier/internal/context
 import brazier/internal/http_status
+import brazier/internal/log_path
 import brazier/internal/render
 import brazier/internal/uri_check
 import brazier/log
 import brazier/session
 import brazier/static
+import brazier/telemetry
 import brazier/transport/server.{type ResponseBody, Bytes}
 import gleam/bit_array
 import gleam/bytes_tree
@@ -95,9 +97,18 @@ const join_token_version = 2
 const join_token_clock_skew_seconds = 60
 
 /// Largest join-token cookie value we emit. Browsers cap a cookie (name +
-/// value) at 4096 bytes; a larger token would be silently dropped, so the
-/// model is omitted instead (logged).
-const join_token_cookie_budget_bytes = 3800
+/// value) at 4096 bytes and silently drop a larger one, which would lose
+/// the session's state with no error anywhere. A page whose token is over
+/// the budget is refused instead (see `JoinTokenTooLarge`).
+pub const join_token_cookie_budget_bytes = 3800
+
+/// A page's join token, with the state-recovery model in it, is `bytes`
+/// long: over the cookie `budget`. The page is answered with a 500 and no
+/// cookie rather than a cookie the browser would drop (logged at error,
+/// with `[brazier, ssr, join_token, too_large]`).
+pub type JoinTokenTooLarge {
+  JoinTokenTooLarge(bytes: Int, budget: Int)
+}
 
 /// Why a join token was rejected. Every variant means "do not trust the
 /// embedded model"; the variants exist so the runtime can log precisely.
@@ -145,7 +156,7 @@ pub type RenderedPage {
     html: String,
     /// Sign a join token for the given session fingerprint (see
     /// `session_fingerprint`). Use `join_token_for`.
-    sign_join_token: fn(String) -> String,
+    sign_join_token: fn(String) -> Result(String, JoinTokenTooLarge),
     /// Whether the response sets the join cookie. True for a page that
     /// loads the client script; False for a static error page, which opens
     /// no session, so it neither mints a join token nor replaces the one a
@@ -332,7 +343,7 @@ fn render_state(
       log.debug("brazier.ssr", "Dead render complete for " <> path)
       RenderedPage(
         html: html,
-        sign_join_token: join_token_signer(config.secret_key, model_json),
+        sign_join_token: join_token_signer(config.secret_key, model_json, path),
         join_cookie: True,
         cookie_secure: !config.dev_mode,
         status: 200,
@@ -379,26 +390,29 @@ fn render_error_page(
     )
   RenderedPage(
     html: html,
-    sign_join_token: join_token_signer(config.secret_key, None),
+    sign_join_token: join_token_signer(
+      config.secret_key,
+      None,
+      "the " <> int.to_string(status) <> " error page",
+    ),
     join_cookie: False,
     cookie_secure: !config.dev_mode,
     status: status,
   )
 }
 
-/// Path and query for logs.
+/// A page URL for logs: its path only (see `brazier/internal/log_path`).
 fn describe_uri(page_uri: Uri) -> String {
-  case page_uri.query {
-    Some(query) -> page_uri.path <> "?" <> query
-    None -> page_uri.path
-  }
+  log_path.describe_uri(page_uri)
 }
 
 /// Convert a RenderedPage to an HTTP response whose join token is not bound
 /// to a browser session (fingerprint ""). Prefer `to_response_for_request`,
 /// which binds the token to the request's session cookie; an unbound token
 /// only verifies for a connection that also has no session cookie.
-/// A page whose `join_cookie` is False gets no join cookie.
+/// A page whose `join_cookie` is False gets no join cookie, and a page
+/// whose join token is over the cookie budget is answered with a 500 and no
+/// cookie (see `JoinTokenTooLarge`).
 /// Errors when the join token cannot be set as a cookie.
 pub fn to_response(
   page: RenderedPage,
@@ -408,7 +422,9 @@ pub fn to_response(
 
 /// Convert a RenderedPage to an HTTP response whose join token is bound to
 /// the session cookie on `req` (see `session_fingerprint`).
-/// A page whose `join_cookie` is False gets no join cookie.
+/// A page whose `join_cookie` is False gets no join cookie, and a page
+/// whose join token is over the cookie budget is answered with a 500 and no
+/// cookie (see `JoinTokenTooLarge`).
 /// Errors when the join token cannot be set as a cookie.
 pub fn to_response_for_request(
   page: RenderedPage,
@@ -427,12 +443,17 @@ fn page_response(
     |> response.set_body(Bytes(bytes_tree.from_string(page.html)))
   case page.join_cookie {
     True ->
-      cookie.set(
-        resp,
-        session_cookie_name,
-        join_token_for(page, fingerprint),
-        session_cookie_options(page.cookie_secure),
-      )
+      case join_token_for(page, fingerprint) {
+        Ok(token) ->
+          cookie.set(
+            resp,
+            session_cookie_name,
+            token,
+            session_cookie_options(page.cookie_secure),
+          )
+        // The signer logged it at error and emitted telemetry.
+        Error(JoinTokenTooLarge(..)) -> Ok(join_token_too_large_response())
+      }
     False -> {
       log.debug(
         "brazier.ssr",
@@ -445,8 +466,21 @@ fn page_response(
   }
 }
 
-/// Mint a fresh join token for this page, bound to `fingerprint`.
-pub fn join_token_for(page: RenderedPage, fingerprint: String) -> String {
+/// The answer to a page whose join token does not fit in a cookie: the
+/// page would load, but its state could never be recovered, so it is not
+/// served at all.
+fn join_token_too_large_response() -> Response(ResponseBody) {
+  response.new(500)
+  |> response.set_header("content-type", "text/plain; charset=utf-8")
+  |> response.set_body(Bytes(bytes_tree.from_string("Internal Server Error")))
+}
+
+/// Mint a fresh join token for this page, bound to `fingerprint`. Errors
+/// when the token is over the cookie budget (already logged at error).
+pub fn join_token_for(
+  page: RenderedPage,
+  fingerprint: String,
+) -> Result(String, JoinTokenTooLarge) {
   page.sign_join_token(fingerprint)
 }
 
@@ -489,42 +523,52 @@ pub fn fingerprint_session_id(session_id: String) -> String {
 /// Build the per-response join-token signer for a rendered page. The model
 /// JSON is encoded once, by the caller; each call signs with a fresh issue
 /// time. `model_json` is None unless the app opted into state recovery.
+/// `path` names the page in the log line of a refused token.
 fn join_token_signer(
   secret_key: String,
   model_json: Option(String),
-) -> fn(String) -> String {
+  path: String,
+) -> fn(String) -> Result(String, JoinTokenTooLarge) {
   fn(fingerprint) {
-    sign_join_token_within_budget(
+    sign_join_token(
       secret_key,
       fingerprint,
       model_json,
       erlang_system_time_seconds(),
     )
+    |> check_join_token_size(path)
   }
 }
 
-/// Sign a join token, dropping the model when the token would not fit in a
-/// cookie (a browser silently discards an oversized cookie).
-fn sign_join_token_within_budget(
-  secret_key: String,
-  fingerprint: String,
-  model_json: Option(String),
-  issued_at: Int,
-) -> String {
-  let token = sign_join_token(secret_key, fingerprint, model_json, issued_at)
-  case model_json, string.byte_size(token) > join_token_cookie_budget_bytes {
-    Some(_), True -> {
-      log.warning(
+/// Refuse a join token over the cookie budget. The model is never dropped
+/// to make it fit: the session would then restart from `init` on its next
+/// reconnect with nothing in the logs to say why.
+fn check_join_token_size(
+  token: String,
+  path: String,
+) -> Result(String, JoinTokenTooLarge) {
+  let bytes = string.byte_size(token)
+  case bytes > join_token_cookie_budget_bytes {
+    False -> Ok(token)
+    True -> {
+      log.error(
         "brazier.ssr",
-        "Join token is "
-          <> int.to_string(string.byte_size(token))
-          <> " bytes (cookie budget "
+        "Refusing "
+          <> path
+          <> " (500): its join token is "
+          <> int.to_string(bytes)
+          <> " bytes, over the "
           <> int.to_string(join_token_cookie_budget_bytes)
-          <> "); omitting the model, state will not be recovered on reconnect",
+          <> "-byte cookie budget. The state-recovery model is too large for"
+          <> " a cookie: keep less client-visible state, or do not use"
+          <> " brazier.with_state_recovery",
       )
-      sign_join_token(secret_key, fingerprint, None, issued_at)
+      telemetry.ssr_join_token_too_large(bytes, join_token_cookie_budget_bytes)
+      Error(JoinTokenTooLarge(
+        bytes: bytes,
+        budget: join_token_cookie_budget_bytes,
+      ))
     }
-    _, _ -> token
   }
 }
 
@@ -538,14 +582,11 @@ pub fn sign_join_token(
   model_json: Option(String),
   issued_at: Int,
 ) -> String {
-  case secret_key {
-    "" ->
-      log.warning(
-        "brazier.ssr",
-        "Signing a join token with an empty secret_key; it will never verify",
-      )
-    _ -> Nil
-  }
+  // INVARIANT: `brazier.start` and the cluster refuse an empty or weak
+  // secret_key at start, so every caller has a real key. A token signed
+  // with "" would never verify.
+  let assert True = secret_key != ""
+    as "sign_join_token: secret_key is empty; brazier.start refuses an empty secret_key"
   let payload =
     json.object([
       #("v", json.int(join_token_version)),
@@ -683,35 +724,6 @@ fn try_or(
   }
 }
 
-/// Create a signed join token with no model and no session binding.
-/// Kept for callers of the v1 API; see `sign_join_token`.
-pub fn create_session_token(secret_key: String) -> String {
-  sign_join_token(secret_key, "", None, erlang_system_time_seconds())
-}
-
-/// Maximum accepted `max_age_seconds` for `verify_session_token`.
-const max_token_lifetime_seconds = join_token_lifetime_seconds
-
-/// Verify an unbound join token (see `create_session_token`) and return its
-/// issue time. `max_age_seconds` is capped at 24 hours.
-pub fn verify_session_token(
-  token: String,
-  secret_key: String,
-  max_age_seconds: Int,
-) -> Result(Int, String) {
-  let capped_max_age = int.min(max_age_seconds, max_token_lifetime_seconds)
-  let now = erlang_system_time_seconds()
-  case verify_join_token(token, secret_key, "", now) {
-    Ok(verified) ->
-      case now - verified.issued_at > capped_max_age {
-        True -> Error("Session token expired")
-        False -> Ok(verified.issued_at)
-      }
-    Error(JoinTokenExpired(_, _)) -> Error("Session token expired")
-    Error(err) -> Error(describe_join_token_error(err))
-  }
-}
-
 /// Build a full HTML document with the view and, for a live page, the
 /// script tag of the client bundle named `bundle`.
 fn build_html_document(
@@ -763,9 +775,57 @@ pub fn client_assets_dir() -> String {
 /// The bundle file named by `brazier_client.manifest` in `assets_dir`. The
 /// name must be exact build output (`static.is_client_bundle_name`), and
 /// the file must exist.
+///
+/// Every page render and every join asks for the name, so it is cached per
+/// manifest and validated against the manifest's stat on each call: a hit
+/// costs a stat of the manifest and one of the bundle, with no read. A
+/// rebuild (`brazier/dev` rebuilds into a running server) changes the stat
+/// and is seen on the next call; a manifest rewritten within the second it
+/// was read is never trusted (see `brazier_bundle_manifest_ffi`).
 pub fn client_bundle_name(assets_dir: String) -> Result(String, String) {
   let manifest_path = assets_dir <> "/brazier_client.manifest"
-  let hint = " Run `gleam run -m brazier/build`."
+  case manifest_stamp(manifest_path) {
+    // The read reports why the manifest cannot be stat'ed.
+    Error(Nil) -> read_client_bundle_name(assets_dir, manifest_path)
+    Ok(stamp) ->
+      case cached_bundle_name(manifest_path, stamp) {
+        Ok(name) -> check_client_bundle_exists(assets_dir, manifest_path, name)
+        Error(Nil) -> {
+          use name <- result.map(read_client_bundle_name(
+            assets_dir,
+            manifest_path,
+          ))
+          remember_bundle_name(manifest_path, stamp, name)
+          name
+        }
+      }
+  }
+}
+
+/// Manifest paths whose bundle name is cached (at most 4).
+@external(erlang, "brazier_bundle_manifest_ffi", "cached_manifests")
+pub fn cached_bundle_manifests() -> List(String)
+
+/// A manifest's size, mtime and inode, and the second they were read.
+type ManifestStamp
+
+@external(erlang, "brazier_bundle_manifest_ffi", "stamp")
+fn manifest_stamp(path: String) -> Result(ManifestStamp, Nil)
+
+@external(erlang, "brazier_bundle_manifest_ffi", "cached")
+fn cached_bundle_name(path: String, stamp: ManifestStamp) -> Result(String, Nil)
+
+@external(erlang, "brazier_bundle_manifest_ffi", "remember")
+fn remember_bundle_name(path: String, stamp: ManifestStamp, name: String) -> Nil
+
+fn client_bundle_hint() -> String {
+  " Run `gleam run -m brazier/build`."
+}
+
+fn read_client_bundle_name(
+  assets_dir: String,
+  manifest_path: String,
+) -> Result(String, String) {
   use contents <- result.try(
     simplifile.read(manifest_path)
     |> result.map_error(fn(err) {
@@ -774,7 +834,7 @@ pub fn client_bundle_name(assets_dir: String) -> Result(String, String) {
       <> " ("
       <> simplifile.describe_error(err)
       <> ")."
-      <> hint
+      <> client_bundle_hint()
     }),
   )
   let name = string.trim(contents)
@@ -786,14 +846,26 @@ pub fn client_bundle_name(assets_dir: String) -> Result(String, String) {
         <> " names an invalid bundle "
         <> string.inspect(name)
         <> "."
-        <> hint,
+        <> client_bundle_hint(),
       )
   })
+  check_client_bundle_exists(assets_dir, manifest_path, name)
+}
+
+fn check_client_bundle_exists(
+  assets_dir: String,
+  manifest_path: String,
+  name: String,
+) -> Result(String, String) {
   case simplifile.is_file(assets_dir <> "/" <> name) {
     Ok(True) -> Ok(name)
     Ok(False) ->
       Error(
-        manifest_path <> " names " <> name <> ", which does not exist." <> hint,
+        manifest_path
+        <> " names "
+        <> name
+        <> ", which does not exist."
+        <> client_bundle_hint(),
       )
     Error(err) ->
       Error(
@@ -804,7 +876,7 @@ pub fn client_bundle_name(assets_dir: String) -> Result(String, String) {
         <> " ("
         <> simplifile.describe_error(err)
         <> ")."
-        <> hint,
+        <> client_bundle_hint(),
       )
   }
 }

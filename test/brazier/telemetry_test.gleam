@@ -265,6 +265,9 @@ fn documented() -> List(Documented) {
     Plain(["runtime", "stop"], ["uptime"], ["reason"]),
     Span(["effect", "run"], ["effect"], [], []),
     Plain(["effect", "timer", "rejected"], [], ["limit"]),
+    Plain(["effect", "after", "rejected"], [], ["limit"]),
+    Plain(["effect", "background", "rejected"], [], ["limit"]),
+    Plain(["ssr", "join_token", "too_large"], ["bytes"], ["budget"]),
     Plain(["store", "write"], ["count"], ["store", "op", "mode"]),
     Span(["store", "sync"], ["store", "peer"], ["entries", "bytes"], []),
     session("created"),
@@ -376,6 +379,9 @@ fn emit_everything() -> Nil {
   let assert 5 = effect(fn() { 5 })
   crash(fn() { effect(fn() { panic as "effect crashed" }) })
   telemetry.effect_timer_rejected(32)
+  telemetry.effect_after_rejected(100)
+  telemetry.effect_background_rejected(32)
+  telemetry.ssr_join_token_too_large(4000, 3800)
   telemetry.store_write(1, "counter", "put", "local")
   let sync = fn(run) { telemetry.store_sync_span("counter", "b@host", run) }
   let assert 6 = sync(fn() { #(6, 10, 100) })

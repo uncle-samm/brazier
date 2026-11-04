@@ -7,9 +7,14 @@
 %% crashes. Handlers run in the logging process, so every event is in the
 %% mailbox by the time the function returns.
 -module(brazier_own_log_capture_ffi).
--export([capture/1, log/2]).
+-export([capture/1, capture_at/2, log/2]).
 
 capture(Fun) ->
+    capture_at(all, Fun).
+
+%% As capture/1, with the primary level set to PrimaryLevel instead of
+%% `all`: events below it are filtered out before any handler sees them.
+capture_at(PrimaryLevel, Fun) ->
     Id = list_to_atom(
         "brazier_own_log_capture_" ++ integer_to_list(erlang:unique_integer([positive]))
     ),
@@ -20,7 +25,7 @@ capture(Fun) ->
         filters => [],
         config => #{target => self()}
     }),
-    ok = logger:set_primary_config(level, all),
+    ok = logger:set_primary_config(level, PrimaryLevel),
     Result =
         try
             Fun()

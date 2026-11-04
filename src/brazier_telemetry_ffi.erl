@@ -42,6 +42,9 @@
     runtime_stop_failed/4,
     effect_run_span/2,
     effect_timer_rejected/1,
+    effect_after_rejected/1,
+    effect_background_rejected/1,
+    ssr_join_token_too_large/2,
     store_write/4,
     store_sync_span/3,
     session_event/2,
@@ -272,6 +275,19 @@ effect_run_span(Effect, Run) ->
 %% [brazier, effect, timer, rejected]
 effect_timer_rejected(Limit) ->
     telemetry:execute([?PREFIX, effect, timer, rejected], #{}, #{limit => Limit}).
+
+%% [brazier, effect, after, rejected]
+effect_after_rejected(Limit) ->
+    telemetry:execute([?PREFIX, effect, 'after', rejected], #{}, #{limit => Limit}).
+
+%% [brazier, effect, background, rejected]
+effect_background_rejected(Limit) ->
+    telemetry:execute([?PREFIX, effect, background, rejected], #{}, #{limit => Limit}).
+
+%% [brazier, ssr, join_token, too_large]
+ssr_join_token_too_large(Bytes, Budget) ->
+    telemetry:execute([?PREFIX, ssr, join_token, too_large], #{bytes => Bytes},
+                      #{budget => Budget}).
 
 %% [brazier, store, write]
 store_write(Count, Store, Op, Mode) ->
