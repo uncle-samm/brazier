@@ -168,7 +168,7 @@ exports at startup: `decode_model`, `init_local`, `render`, `lookup_handler`,
 - **Rendering.** `render(model, local)` returns the HTML and the handler
   table from `internal/render.gleam`, the same target-neutral module SSR
   uses. Handlers are keyed by event name and position id (`"0.1"`); keyed
-  and memo nodes are transparent, so server and browser agree on ids. The DOM
+  nodes are transparent, so server and browser agree on ids. The DOM
   is morphed toward the new HTML; `data-brazier-key` gives a node identity.
 - **Events.** One capture listener per event name matches elements carrying
   `data-brazier-on-<name>`. Handler options apply prevent-default,
@@ -354,7 +354,7 @@ drain under one node-local `global:trans` lock, so an app is stopped once.
 
 | Module | Contents |
 |---|---|
-| `element` | `Element(msg)`: `element`, `text`, `none`, `keyed`, `memo`, `map`, `unsafe_raw_html`, `to_string` |
+| `element` | `Element(msg)`: `element`, `text`, `none`, `keyed`, `map`, `unsafe_raw_html`, `to_string` |
 | `html`, `svg` | Element helpers ([HTML_ELEMENTS.md](HTML_ELEMENTS.md), [SVG.md](SVG.md)) |
 | `attribute` | Attributes; URL attributes go through `internal/url` |
 | `event` | Listeners holding a `Decoder(msg)`; payload decoders; modifiers |
