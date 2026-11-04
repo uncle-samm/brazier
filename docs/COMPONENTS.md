@@ -1,6 +1,6 @@
 # Components
 
-Beacon has no component type. A reusable piece of UI is a plain Gleam module with its own `Model`, `Msg`, `update` and `view`, nested inside a parent the way Elm and Lustre nest modules:
+Brazier has no component type. A reusable piece of UI is a plain Gleam module with its own `Model`, `Msg`, `update` and `view`, nested inside a parent the way Elm and Lustre nest modules:
 
 - the parent keeps the child's model in a field of its own model;
 - the parent has one message constructor that wraps the child's messages;
@@ -14,10 +14,10 @@ The child's state lives in the parent's state, so it is synced, kept on the serv
 <!-- docs-check: module my_app/counter -->
 ```gleam
 // src/my_app/counter.gleam
-import beacon/effect.{type Effect}
-import beacon/element.{type Element}
-import beacon/event
-import beacon/html
+import brazier/effect.{type Effect}
+import brazier/element.{type Element}
+import brazier/event
+import brazier/html
 import gleam/int
 
 pub type Model {
@@ -49,17 +49,17 @@ pub fn view(model: Model) -> Element(Msg) {
 }
 ```
 
-A child used from a `beacon.simple` app has `update: fn(Model, Msg) -> Model` instead, and the parent calls it without `effect.map`.
+A child used from a `brazier.simple` app has `update: fn(Model, Msg) -> Model` instead, and the parent calls it without `effect.map`.
 
 ## Nesting it in a parent
 
 <!-- docs-check: module my_app -->
 ```gleam
 // src/my_app.gleam
-import beacon
-import beacon/effect.{type Effect}
-import beacon/element.{type Element}
-import beacon/html
+import brazier
+import brazier/effect.{type Effect}
+import brazier/element.{type Element}
+import brazier/html
 import my_app/counter
 
 pub type Model {
@@ -71,7 +71,7 @@ pub type Msg {
   RightMsg(counter.Msg)
 }
 
-pub fn init(_ctx: beacon.Context) -> Result(#(Model, Effect(Msg)), beacon.InitError) {
+pub fn init(_ctx: brazier.Context) -> Result(#(Model, Effect(Msg)), brazier.InitError) {
   Ok(#(Model(left: counter.init(), right: counter.init()), effect.none()))
 }
 
@@ -96,8 +96,8 @@ pub fn view(model: Model) -> Element(Msg) {
 }
 
 pub fn main() {
-  beacon.application(init:, update:, view:)
-  |> beacon.start(8080)
+  brazier.application(init:, update:, view:)
+  |> brazier.start(8080)
 }
 ```
 
@@ -105,7 +105,7 @@ pub fn main() {
 
 ## What the build does with child modules
 
-The build follows references from `view` (see `docs/ARCHITECTURE.md`). The child's `view`, and its `Msg` and `Model` types, are compiled into the client bundle because the parent's `view` reaches them. The child's `update` is compiled only for a `beacon.simple` app.
+The build follows references from `view` (see `docs/ARCHITECTURE.md`). The child's `view`, and its `Msg` and `Model` types, are compiled into the client bundle because the parent's `view` reaches them. The child's `update` is compiled only for a `brazier.simple` app.
 
 The server accepts a child message only when the constructors that build it are reachable from `view`. `element.map(counter.view(model.left), LeftMsg)` counts as a use of `LeftMsg`, and `event.on_click(Increment)` inside `counter.view` counts as a use of `counter.Increment`. A child message that only an effect produces (for example a `Loaded(data)` dispatched by `effect.from`) is never accepted from the browser.
 
@@ -114,7 +114,7 @@ The server accepts a child message only when the constructors that build it are 
 A child that needs to tell its parent something returns that information from `update` instead of sending a message upwards. Lustre and Elm use the same pattern:
 
 <!-- docs-check: wrap
-import beacon/effect.{type Effect}
+import brazier/effect.{type Effect}
 
 pub type Model {
   Model(draft: String)
@@ -142,7 +142,7 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg), List(OutMsg)) {
 
 The parent pattern-matches the returned list in its own `update`.
 
-## Migrating from `beacon/component`
+## Migrating from `brazier/component`
 
 | Old | New |
 |---|---|
@@ -151,4 +151,4 @@ The parent pattern-matches the returned list in its own `update`.
 | `component.update_component(comp, model, msg)` | `child.update(model, msg)` plus `effect.map(eff, ToParent)` |
 | `component.map_node(node, f)` | `element.map(element, f)` |
 
-`test/beacon/child_module_test.gleam` runs this pattern through the runtime.
+`test/brazier/child_module_test.gleam` runs this pattern through the runtime.

@@ -9,7 +9,7 @@
 #   - CHANGELOG.md has no `## [X.Y.Z]` heading for that version;
 #   - a clean `gleam build --warnings-as-errors` fails;
 #   - `gleam format --check src test` fails;
-#   - `gleam run -m beacon/lint` reports a violation;
+#   - `gleam run -m brazier/lint` reports a violation;
 #   - `gleam test` fails;
 #   - `scripts/check_docs.sh` fails;
 #   - `gleam export hex-tarball` cannot build the package;
@@ -61,7 +61,7 @@ release_step "format check"
 gleam format --check src test
 
 release_step "lint"
-gleam run -m beacon/lint
+gleam run -m brazier/lint
 
 release_step "tests"
 gleam test
@@ -71,25 +71,25 @@ scripts/check_docs.sh
 
 # A Hex tarball carries only src/, priv/ and the metadata files, and Gleam
 # does not follow symlinks into it. The build tool of an app that gets
-# Beacon from Hex reads the client runtime from priv/beacon_client_src
-# (project_toml.client_runtime_dir), so copy beacon_client/src there for
+# Brazier from Hex reads the client runtime from priv/brazier_client_src
+# (project_toml.client_runtime_dir), so copy brazier_client/src there for
 # the tarball and for `gleam publish`, and remove the copy on exit.
-# priv/beacon_client_src/ is gitignored, so the clean-tree checks pass.
-runtime_copy=priv/beacon_client_src
+# priv/brazier_client_src/ is gitignored, so the clean-tree checks pass.
+runtime_copy=priv/brazier_client_src
 if [ -e "$runtime_copy" ]; then
   release_refuse "$runtime_copy already exists; remove it, it is staged by this script"
 fi
 trap 'rm -rf "$ROOT/$runtime_copy"' EXIT
-release_step "stage beacon_client/src as $runtime_copy"
+release_step "stage brazier_client/src as $runtime_copy"
 mkdir -p "$runtime_copy"
-cp -R beacon_client/src/. "$runtime_copy/"
-if [ ! -f "$runtime_copy/beacon_client_ffi.mjs" ]; then
-  release_refuse "$runtime_copy/beacon_client_ffi.mjs is missing after the copy"
+cp -R brazier_client/src/. "$runtime_copy/"
+if [ ! -f "$runtime_copy/brazier_client_ffi.mjs" ]; then
+  release_refuse "$runtime_copy/brazier_client_ffi.mjs is missing after the copy"
 fi
 
 release_step "build the Hex tarball"
 gleam export hex-tarball
-release_require_tarball_file "build/$name-$version.tar" "$runtime_copy/beacon_client_ffi.mjs"
+release_require_tarball_file "build/$name-$version.tar" "$runtime_copy/brazier_client_ffi.mjs"
 
 # The gate must not have changed the tree (a test or tool writing a tracked
 # file would mean the tarball is not the commit).

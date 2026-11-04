@@ -1,15 +1,15 @@
-# Beacon production image for one of the example apps.
+# Brazier production image for one of the example apps.
 #
-#   docker build -t beacon-counter .
-#   docker build --build-arg EXAMPLE=todo --build-arg APP_MODULE=todo -t beacon-todo .
-#   docker run --rm -p 8080:8080 beacon-counter
+#   docker build -t brazier-counter .
+#   docker build --build-arg EXAMPLE=todo --build-arg APP_MODULE=todo -t brazier-todo .
+#   docker run --rm -p 8080:8080 brazier-counter
 #
 # EXAMPLE is the directory under examples/, APP_MODULE the Gleam module whose
-# main/0 starts the app (the module `gleam run -m beacon/build` reports as the
+# main/0 starts the app (the module `gleam run -m brazier/build` reports as the
 # app module). To ship your own app, use this file as a template: copy your
 # project instead of the repository and drop the examples/ prefix.
 #
-# Every step fails the image build on error: the Beacon build generates the
+# Every step fails the image build on error: the Brazier build generates the
 # server codec and client bundle, and the app refuses to start without them.
 
 # Stage 1: build the app and export it as an Erlang shipment.
@@ -18,14 +18,14 @@ FROM ghcr.io/gleam-lang/gleam:v1.19.2-erlang-alpine AS builder
 # The client bundle is built with the pinned esbuild through npx.
 RUN apk add --no-cache nodejs npm
 
-# Examples depend on Beacon by path (../..), so the whole repository is
+# Examples depend on Brazier by path (../..), so the whole repository is
 # copied; .dockerignore keeps local build output out.
 WORKDIR /src
 COPY . .
 
 ARG EXAMPLE=counter
 WORKDIR /src/examples/${EXAMPLE}
-RUN gleam run -m beacon/build
+RUN gleam run -m brazier/build
 RUN gleam export erlang-shipment
 
 # Stage 2: run on a plain Erlang image of the same OTP release.
@@ -35,15 +35,15 @@ ARG EXAMPLE=counter
 ARG APP_MODULE=counter
 ENV APP_MODULE=${APP_MODULE}
 
-RUN addgroup -S beacon && adduser -S -G beacon beacon
+RUN addgroup -S brazier && adduser -S -G brazier brazier
 
 WORKDIR /app
 COPY --from=builder /src/examples/${EXAMPLE}/build/erlang-shipment/ ./lib/
-# beacon.start reads the client manifest and bundle from priv/static,
+# brazier.start reads the client manifest and bundle from priv/static,
 # relative to the working directory.
 COPY --from=builder /src/examples/${EXAMPLE}/priv/ ./priv/
 
-# beacon.start blocks while the server runs, so main/0 returning means the
+# brazier.start blocks while the server runs, so main/0 returning means the
 # app stopped: an Error result or a crash exits with status 1.
 COPY <<'EOF' /app/start
 #!/bin/sh
@@ -62,10 +62,10 @@ exec erl -pa /app/lib/*/ebin -noshell -eval "
 EOF
 RUN chmod 0755 /app/start
 
-USER beacon
+USER brazier
 EXPOSE 8080
 
-# Beacon answers /health with 200 (see docs/DEPLOYMENT.md), but that only
+# Brazier answers /health with 200 (see docs/DEPLOYMENT.md), but that only
 # shows the listener is up. This check requests / instead, which renders the
 # app's first page, so it also fails when the app cannot render it. Use
 # /health for a cheaper liveness check.

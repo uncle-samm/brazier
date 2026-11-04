@@ -55,7 +55,7 @@ Follow the getting started guide step by step and verify:
 - **Prerequisites:** Are the listed versions correct? Does Gleam version match `gleam.toml`?
 - **Install steps:** Do all commands work? `gleam new`, `gleam add`, etc.
 - **First app example:** Does the example code compile? Does it match current API signatures?
-- **Builder pattern:** Do documented builder functions (`beacon.app()`, `beacon.title()`, `beacon.start()`) match actual function signatures and return types?
+- **Builder pattern:** Do documented builder functions (`brazier.app()`, `brazier.title()`, `brazier.start()`) match actual function signatures and return types?
 - **Configuration:** Are all documented config options real? Are there undocumented options that users need?
 - **Running:** Do `gleam run` / `gleam build` / `gleam test` commands work as described?
 - **Code snippets:** Copy each code snippet, paste it into a test file, check if it compiles.
@@ -63,7 +63,7 @@ Follow the getting started guide step by step and verify:
 **For each broken step:**
 ```
 [BROKEN-GUIDE] Step 3 "Add dependencies" — Missing gleam_crypto dependency
-  Reality: beacon requires gleam_crypto but the guide doesn't mention adding it
+  Reality: brazier requires gleam_crypto but the guide doesn't mention adding it
   Fix: Add `gleam add gleam_crypto` to the dependency installation step
 ```
 
@@ -92,19 +92,19 @@ Check that AGENTS.md accurately describes:
 
 Check doc comments on all public functions in these key modules:
 
-- `src/beacon.gleam` — Builder functions, start, configuration
-- `src/beacon/transport.gleam` — SecurityLimits, TransportConfig, message types
-- `src/beacon/runtime.gleam` — RuntimeConfig, RuntimeState, start, start_and_connect
-- `src/beacon/effect.gleam` — every, from, background, after, batch
-- `src/beacon/element.gleam` — el, text, attr, on, to_string
-- `src/beacon/middleware.gleam` — pipeline, secure_headers, rate_limit, only, except
-- `src/beacon/router/scanner.gleam` — RouteDefinition, scan_routes
-- `src/beacon/router/codegen.gleam` — generate
-- `src/beacon/router/manager.gleam` — RouteDispatcher, start
-- `src/beacon/patch.gleam` — diff, apply_ops, is_empty
-- `src/beacon/pubsub.gleam` — subscribe, broadcast, unsubscribe
-- `src/beacon/ssr.gleam` — SsrConfig, render_page, session tokens
-- `src/beacon/component.gleam` — Component, new, render, map_node
+- `src/brazier.gleam` — Builder functions, start, configuration
+- `src/brazier/transport.gleam` — SecurityLimits, TransportConfig, message types
+- `src/brazier/runtime.gleam` — RuntimeConfig, RuntimeState, start, start_and_connect
+- `src/brazier/effect.gleam` — every, from, background, after, batch
+- `src/brazier/element.gleam` — el, text, attr, on, to_string
+- `src/brazier/middleware.gleam` — pipeline, secure_headers, rate_limit, only, except
+- `src/brazier/router/scanner.gleam` — RouteDefinition, scan_routes
+- `src/brazier/router/codegen.gleam` — generate
+- `src/brazier/router/manager.gleam` — RouteDispatcher, start
+- `src/brazier/patch.gleam` — diff, apply_ops, is_empty
+- `src/brazier/pubsub.gleam` — subscribe, broadcast, unsubscribe
+- `src/brazier/ssr.gleam` — SsrConfig, render_page, session tokens
+- `src/brazier/component.gleam` — Component, new, render, map_node
 
 For each public function, check:
 - Does the doc comment accurately describe what the function does?
@@ -115,7 +115,7 @@ For each public function, check:
 
 **For each issue:**
 ```
-[STALE-API] src/beacon/effect.gleam:96 — every() doc comment doesn't mention timer cap
+[STALE-API] src/brazier/effect.gleam:96 — every() doc comment doesn't mention timer cap
   Reality: every() now rejects timers when count >= 10 per runtime
   Fix: Add note about max_timers limit to the doc comment
 ```
@@ -152,7 +152,7 @@ Search for comments that reference:
 
 **For each stale comment:**
 ```
-[STALE-COMMENT] src/beacon/runtime.gleam:42 — "Reference: Lustre runtime/server/runtime.gleam"
+[STALE-COMMENT] src/brazier/runtime.gleam:42 — "Reference: Lustre runtime/server/runtime.gleam"
   Reality: Lustre may have restructured; verify path is still valid
   Fix: Update reference path or remove if no longer applicable
 ```
@@ -171,10 +171,10 @@ Check for important topics that have NO documentation:
 
 - **Security configuration:** SecurityLimits, origin checking, rate limiting, CSP — are these documented for users?
 - **File-based routing:** How to create routes, dynamic params, guards — is there a routing guide?
-- **Deployment:** How to deploy a Beacon app to production — any guidance?
+- **Deployment:** How to deploy a Brazier app to production — any guidance?
 - **WebSocket protocol:** Is the wire format documented for custom client implementations?
 - **Error handling:** How errors propagate, what users should expect
-- **Testing:** How to test Beacon apps, what test utilities exist
+- **Testing:** How to test Brazier apps, what test utilities exist
 - **Configuration reference:** All builder functions and their effects
 
 **For each gap:**

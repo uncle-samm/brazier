@@ -1,8 +1,8 @@
-name = "beacon_private_session"
+name = "brazier_private_session"
 version = "0.1.0"
 target = "erlang"
 
 [dependencies]
 gleam_stdlib = ">= 0.44.0 and < 2.0.0"
-beacon = { path = "../.." }
+brazier = { path = "../.." }
 gleam_json = ">= 3.1.0 and < 4.0.0"

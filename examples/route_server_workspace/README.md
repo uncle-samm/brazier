@@ -4,7 +4,7 @@ Routed pages that are components with private server state.
 
 ## Features
 
-- `beacon.full_application` with `beacon.with_router`: `/` (accounts) and
+- `brazier.full_application` with `brazier.with_router`: `/` (accounts) and
   `/settings`. Any other path is a 404.
 - Each page module is a component with a public `Model`, a `Msg`, a `view`
   and a server-only `Server` record built by `init_server`. Its `update`
@@ -23,7 +23,7 @@ Routed pages that are components with private server state.
 
 ```bash
 cd examples/route_server_workspace
-gleam run -m beacon/build   # first, and after every change
+gleam run -m brazier/build   # first, and after every change
 gleam run -m main
 ```
 

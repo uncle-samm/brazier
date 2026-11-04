@@ -4,15 +4,15 @@ A view is built from four modules, following Lustre's layout:
 
 <!-- docs-check: fragment an import list; each module is used by the samples below -->
 ```gleam
-import beacon/attribute
-import beacon/element.{type Element}
-import beacon/event
-import beacon/html
+import brazier/attribute
+import brazier/element.{type Element}
+import brazier/event
+import brazier/html
 ```
 
-SVG elements are in `beacon/svg` (see [SVG.md](SVG.md)).
+SVG elements are in `brazier/svg` (see [SVG.md](SVG.md)).
 
-## Elements (`beacon/html`)
+## Elements (`brazier/html`)
 
 Elements take `(attributes: List(Attribute(msg)), children: List(Element(msg)))`.
 
@@ -34,22 +34,22 @@ Elements take `(attributes: List(Attribute(msg)), children: List(Element(msg)))`
 
 **Text:** `html.text("content")`, escaped when rendered.
 
-## Element Helpers (`beacon/element`)
+## Element Helpers (`brazier/element`)
 
 | Function | Description |
 |----------|-------------|
 | `element.element(tag, attributes, children)` | Any tag. A tag with characters outside `a-z A-Z 0-9 - _ : .` crashes. |
 | `element.text(content)` | Escaped text |
 | `element.none()` | Renders nothing; use it for conditional content |
-| `element.keyed(key, child)` | Gives `child` an identity (`data-beacon-key`) so the browser keeps or replaces its DOM node by key instead of by position |
+| `element.keyed(key, child)` | Gives `child` an identity (`data-brazier-key`) so the browser keeps or replaces its DOM node by key instead of by position |
 | `element.memo(key, deps, child)` | The browser skips the subtree while `deps` are unchanged |
 | `element.map(element, f)` | Changes the message type, for child modules |
 | `element.unsafe_raw_html(html)` | Inserts HTML without escaping or the URL policy |
 | `element.to_string(element)` | Renders to an HTML string |
 
 <!-- docs-check: wrap
-import beacon/element.{type Element}
-import beacon/html
+import brazier/element.{type Element}
+import brazier/html
 
 pub type Item {
   Item(id: String, title: String)
@@ -81,8 +81,8 @@ Key list items whose order can change, so focus and input state stay with
 the right item:
 
 <!-- docs-check: wrap
-import beacon/element.{type Element}
-import beacon/html
+import brazier/element.{type Element}
+import brazier/html
 import gleam/list
 
 pub type Item {
@@ -114,7 +114,7 @@ html.ul([], list.map(model.items, fn(item) {
 produced or sanitized yourself, such as rendered markdown output, never text
 a user controls.
 
-## Attributes (`beacon/attribute`)
+## Attributes (`brazier/attribute`)
 
 | Function | HTML |
 |----------|------|
@@ -140,7 +140,7 @@ a user controls.
 
 `attribute.attribute(name, value)` crashes on an inline event name such as
 `onclick` or a name with characters outside `a-z A-Z 0-9 - _ : .`: use
-`beacon/event` for handlers.
+`brazier/event` for handlers.
 
 ### URL attributes
 
@@ -156,10 +156,10 @@ a warning. See [SECURITY.md](SECURITY.md#url-policy).
 | Function | LiveView | Description |
 |----------|----------|-------------|
 | `attribute.ignore_updates()` | `phx-update="ignore"` | The browser does not touch the element's children after the first render |
-| `attribute.hook("Chart")` | `phx-hook` | Attaches a JavaScript hook registered with `Beacon.hooks` |
+| `attribute.hook("Chart")` | `phx-hook` | Attaches a JavaScript hook registered with `Brazier.hooks` |
 | `attribute.watch(["data-points"])` | | Attribute changes that call the hook's `updated` callback |
 
-## Events (`beacon/event`)
+## Events (`brazier/event`)
 
 | Function | Event | Message |
 |----------|-------|---------|
@@ -184,8 +184,8 @@ in the browser; a decode failure is logged with `console.warn` and the event
 is dropped.
 
 <!-- docs-check: wrap
-import beacon/attribute
-import beacon/event
+import brazier/attribute
+import brazier/event
 import gleam/dynamic/decode
 
 pub type Item {
@@ -227,9 +227,9 @@ Payload decoders: `event.value()`, `event.checked()`, `event.key()`,
 | `event.throttle(handler, ms)` | Dispatches at most one event every `ms` |
 
 <!-- docs-check: wrap
-import beacon/element.{type Element}
-import beacon/event
-import beacon/html
+import brazier/element.{type Element}
+import brazier/event
+import brazier/html
 
 pub type Item {
   Item(id: String, title: String)
@@ -261,10 +261,10 @@ browser; any other message is refused by the server. See
 ## Example: Login Form
 
 <!-- docs-check: wrap
-import beacon/attribute
-import beacon/element.{type Element}
-import beacon/event
-import beacon/html
+import brazier/attribute
+import brazier/element.{type Element}
+import brazier/event
+import brazier/html
 
 pub type Item {
   Item(id: String, title: String)

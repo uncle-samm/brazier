@@ -4,14 +4,14 @@
 ///   renders in the browser with no server traffic.
 /// - Submitting forwards the form's fields to the server, which validates
 ///   them and saves them in the Model.
-import beacon
-import beacon/attribute
-import beacon/effect.{type Effect}
-import beacon/element.{type Element}
-import beacon/event
-import beacon/html
-import beacon/local
-import beacon/log
+import brazier
+import brazier/attribute
+import brazier/effect.{type Effect}
+import brazier/element.{type Element}
+import brazier/event
+import brazier/html
+import brazier/local
+import brazier/log
 import gleam/int
 import gleam/list
 import gleam/string
@@ -45,8 +45,8 @@ const max_query_length = 200
 // --- Init and update (server) ---
 
 fn init(
-  _ctx: beacon.Context,
-) -> Result(#(Model, Effect(Msg)), beacon.InitError) {
+  _ctx: brazier.Context,
+) -> Result(#(Model, Effect(Msg)), brazier.InitError) {
   Ok(#(
     Model(saved_query: "", saved_filter: "all", submissions: 0),
     effect.none(),
@@ -241,15 +241,15 @@ fn preview(draft: String, filter: String) -> String {
 
 pub fn main() {
   let assert Ok(Nil) =
-    beacon.full_application(
+    brazier.full_application(
       init:,
       update:,
       sync:,
       local: local.layer(init: init_local, update: update_local),
       view:,
     )
-    |> beacon.title(fn(_model) { "Local First Form" })
-    |> beacon.head_html(favicon)
-    |> beacon.start(8080)
-    as "beacon.start failed (it logs the error)"
+    |> brazier.title(fn(_model) { "Local First Form" })
+    |> brazier.head_html(favicon)
+    |> brazier.start(8080)
+    as "brazier.start failed (it logs the error)"
 }

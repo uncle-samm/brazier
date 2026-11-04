@@ -1,11 +1,11 @@
 # Routed Workspace
 
 Routing, a Local layer and server-authoritative Model updates in one
-`beacon.full_application`.
+`brazier.full_application`.
 
 ## Features
 
-- `beacon.with_router` maps `/` (overview), `/pipeline` and `/settings` to
+- `brazier.with_router` maps `/` (overview), `/pipeline` and `/settings` to
   a `Route` in the Model. Any other path is a 404. Nav links and the back
   and forward buttons change the page without a reload.
 - Local state (`local.layer`): the inspector panel, the selected tab, the
@@ -27,7 +27,7 @@ Routing, a Local layer and server-authoritative Model updates in one
 
 ```bash
 cd examples/routed_workspace
-gleam run -m beacon/build   # first, and after every change
+gleam run -m brazier/build   # first, and after every change
 gleam run -m main
 ```
 

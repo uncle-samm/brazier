@@ -1,6 +1,6 @@
 # Wire Protocol
 
-Beacon communicates over WebSocket at `/ws` using JSON messages with a `type` discriminator.
+Brazier communicates over WebSocket at `/ws` using JSON messages with a `type` discriminator.
 
 The browser connects to `/ws?path=<page path>`, the URL-encoded path and
 query string of the page (`encodeURIComponent(location.pathname +
@@ -11,14 +11,14 @@ local path.
 
 ## Client Messages (browser to server)
 
-**join** -- Sent after WebSocket opens. `path` drives routing. `token` remains in the JSON shape for direct runtime tests and non-browser clients, but browser join/session recovery uses the HttpOnly `beacon_join_token` cookie from the WebSocket upgrade request.
+**join** -- Sent after WebSocket opens. `path` drives routing. `token` remains in the JSON shape for direct runtime tests and non-browser clients, but browser join/session recovery uses the HttpOnly `brazier_join_token` cookie from the WebSocket upgrade request.
 ```json
 {"type": "join", "token": "", "path": "/", "build": "8a13610f74006aaf"}
 ```
 `build` is optional. It is the build id of the client bundle the page
-loaded: the content hash in `/beacon_client_<hash>.js`, which the client
+loaded: the content hash in `/brazier_client_<hash>.js`, which the client
 reads from the URL of its own script (`document.currentScript`). The server
-compares it with the bundle `priv/static/beacon_client.manifest` names now,
+compares it with the bundle `priv/static/brazier_client.manifest` names now,
 read on every join:
 
 - the same bundle: the join goes on;
@@ -30,7 +30,7 @@ read on every join:
 - the manifest cannot be read, or names a bundle that does not exist: the
   server logs an error and closes with **1011** `internal error`;
 - no `build` (the page loaded the client from the unversioned
-  `/beacon_client.js`, or a non-browser client): the join goes on unchecked,
+  `/brazier_client.js`, or a non-browser client): the join goes on unchecked,
   and the server logs a warning. The client also warns once when it finds no
   build id in its script URL.
 
@@ -42,7 +42,7 @@ reload.
 **event** -- A Msg the browser decoded from a DOM event. The client runs the
 handler's decoder against the event, applies the Msg locally, and sends it
 unless the Local layer handled it. `data` is the generated entry's
-`encode_msg` output: a JSON string `{"__beacon_msg": <Msg>}`, the Msg in the
+`encode_msg` output: a JSON string `{"__brazier_msg": <Msg>}`, the Msg in the
 app's generated codec. The server decodes only the Msg constructors the
 client-reachable code builds, and never renders `view` to resolve handlers.
 `handler_id` and `target_path` are both the position id of the element whose
@@ -51,7 +51,7 @@ for logs and traces. `clock` is monotonic per connection. `ops` is optional and
 the browser client does not send it; the server never treats it as
 authoritative state.
 ```json
-{"type": "event", "name": "click", "handler_id": "0.1.0", "data": "{\"__beacon_msg\":{\"tag\":\"SetName\",\"arg0\":\"Ada\"}}", "target_path": "0.1.0", "clock": 5}
+{"type": "event", "name": "click", "handler_id": "0.1.0", "data": "{\"__brazier_msg\":{\"tag\":\"SetName\",\"arg0\":\"Ada\"}}", "target_path": "0.1.0", "clock": 5}
 ```
 
 **event_batch** -- Bounded batch for explicit non-browser clients that need to
@@ -132,12 +132,12 @@ ignored; the current path is not navigated again.
 {"type": "navigate", "path": "/search?q=x", "replace": true}
 ```
 
-**title** -- The page title, from the app's `beacon.title`. Sent on every
+**title** -- The page title, from the app's `brazier.title`. Sent on every
 join, and after an update to every joined connection when the title differs
 from the last one sent (it is a function of the server state, so it can
 change when the client-visible model does not). The client sets
 `document.title`; a frame without a string `title` is logged as an error and
-ignored. An app without `beacon.title` never sends it. A title over
+ignored. An app without `brazier.title` never sends it. A title over
 `runtime.title_max_bytes` (4096) is not sent: the server logs an error and
 sends `{"type":"error","reason":"Title too large: ..."}` instead, and the
 page keeps its last title.
@@ -155,8 +155,8 @@ this triggers a real HTTP request — use when the browser needs to receive HTTP
 ```
 
 **reload** -- Dev mode only: the app was rebuilt, reload the page. Under
-`gleam run -m beacon/dev` every WebSocket handler subscribes to the PubSub
-topic `beacon:dev:reload`, and each successful rebuild broadcasts on it, so
+`gleam run -m brazier/dev` every WebSocket handler subscribes to the PubSub
+topic `brazier:dev:reload`, and each successful rebuild broadcasts on it, so
 every open page gets one `reload`. The server keeps the socket open; the
 page's reload closes it. Outside dev mode no handler subscribes and the
 server never sends it.
@@ -224,11 +224,11 @@ follows.
   The new page load decides: the server renders the page again (a fresh
   session, the login page, or the page with the current bundle) or answers
   with its error page, which opens no socket.
-  A reload guard in `sessionStorage` (`beacon:reloads`) allows at most 3 such
+  A reload guard in `sessionStorage` (`brazier:reloads`) allows at most 3 such
   reloads per tab within 60 seconds, whatever the code. After that, or when
   `sessionStorage` cannot be used, the client does not reload. It logs the
-  reason, marks the app root with `data-beacon-error` and puts a
-  `role="alert"` notice (`data-beacon-error-notice`) at the top of the root.
+  reason, marks the app root with `data-brazier-error` and puts a
+  `role="alert"` notice (`data-brazier-error-notice`) at the top of the root.
   The guard is what stops a loop: a deployment whose pages keep naming
   another bundle than its manifest gets 3 reloads, then the error state.
 - **Any other close** (including 1001, 1008, 1009, 1011, 1013 and 4500 to
@@ -291,7 +291,7 @@ applied (`http` 80, `https` 443), and comparison is case-insensitive. The
 request scheme is the first `X-Forwarded-Proto` token when the peer is one of
 `trusted_proxies` (only `http` or `https` are accepted, and several
 `X-Forwarded-Proto` headers are refused; either is a 403), and plain `http`
-otherwise: the header is ignored from any other peer, since Beacon does not
+otherwise: the header is ignored from any other peer, since Brazier does not
 terminate TLS itself. So `https://app.example`
 is rejected against a plain-http request for the same host, and so is
 `http://app.example:8080` against `app.example:3000`.
@@ -330,7 +330,7 @@ the echo.
 ## Backpressure
 
 - Each socket send has a timeout of `ws_send_timeout_ms` (15s). A send that
-  times out or fails closes the connection. Beacon does not retry it.
+  times out or fails closes the connection. Brazier does not retry it.
 - If more than `ws_max_outbound_queue` (1000) messages are waiting in the
   connection's mailbox, it closes with **1013** `server overloaded`.
 - When the runtime asks for a slow connection to be dropped
@@ -345,7 +345,7 @@ the echo.
   A batch with more than 100 events is rejected with `Batch too large`, so a
   batch larger than `max_events_per_second` can never be accepted. Clients
   should cap batches at `max_events_per_second`.
-- The limit is not sent to the client. Like Phoenix channels, Beacon does
+- The limit is not sent to the client. Like Phoenix channels, Brazier does
   not advertise it: it is there for clients that do not pace themselves, and
   an advertised number would not slow those down. The generated client paces
   itself at 40 events per second against the default of 50 (see

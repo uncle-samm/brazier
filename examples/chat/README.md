@@ -1,18 +1,18 @@
 # Chat
 
 A multi-room chat with presence and typing indicators, built with
-`beacon.full_application` and a `local.layer`.
+`brazier.full_application` and a `local.layer`.
 
 ## Features
 
 - Three rooms: general, random and help. Each session subscribes only to
-  its current room. `beacon.subscriptions` is recomputed after every
+  its current room. `brazier.subscriptions` is recomputed after every
   update, so switching rooms moves the subscriptions too.
-- Messages are appended to a `beacon/store` list keyed by room with
+- Messages are appended to a `brazier/store` list keyed by room with
   `store.append_notify`, which also broadcasts on the room's topic. A
   session re-reads the room when that topic fires and shows the latest
   100 messages.
-- Who is in each room comes from `beacon/presence`. A session tracks
+- Who is in each room comes from `brazier/presence`. A session tracks
   itself when it joins or switches rooms. The tracker monitors the session
   process, so a closed tab leaves the room on its own.
 - Typing is part of the presence meta. A keydown handler throttled to one
@@ -33,7 +33,7 @@ A multi-room chat with presence and typing indicators, built with
 
 ```bash
 cd examples/chat
-gleam run -m beacon/build   # first, and after every change
+gleam run -m brazier/build   # first, and after every change
 gleam run
 ```
 

@@ -2,13 +2,13 @@
 /// - `Model.count` is synced: the server holds it and the browser renders it.
 /// - `Local.input` and `Local.menu_open` are client-only: they change at once
 ///   in the browser and are never sent to the server.
-import beacon
-import beacon/attribute
-import beacon/effect.{type Effect}
-import beacon/element.{type Element}
-import beacon/event
-import beacon/html
-import beacon/local
+import brazier
+import brazier/attribute
+import brazier/effect.{type Effect}
+import brazier/element.{type Element}
+import brazier/event
+import brazier/html
+import brazier/local
 import gleam/int
 
 /// The tab icon, inline so the browser does not request `/favicon.ico`.
@@ -33,8 +33,8 @@ pub type Msg {
 }
 
 fn init(
-  _ctx: beacon.Context,
-) -> Result(#(Model, Effect(Msg)), beacon.InitError) {
+  _ctx: brazier.Context,
+) -> Result(#(Model, Effect(Msg)), brazier.InitError) {
   Ok(#(Model(count: 0), effect.none()))
 }
 
@@ -100,15 +100,15 @@ pub fn view(model: Model, local: Local) -> Element(Msg) {
 
 pub fn main() {
   let assert Ok(Nil) =
-    beacon.full_application(
+    brazier.full_application(
       init:,
       update:,
       sync:,
       local: local.layer(init: init_local, update: update_local),
       view:,
     )
-    |> beacon.title(fn(_model) { "Counter with Local State" })
-    |> beacon.head_html(favicon)
-    |> beacon.start(8080)
-    as "beacon.start failed (it logs the error)"
+    |> brazier.title(fn(_model) { "Counter with Local State" })
+    |> brazier.head_html(favicon)
+    |> brazier.start(8080)
+    as "brazier.start failed (it logs the error)"
 }

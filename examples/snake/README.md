@@ -1,7 +1,7 @@
 # Snake
 
 Snake played with the arrow keys, with high scores shared between players,
-built with `beacon.full_application` and a `local.layer`.
+built with `brazier.full_application` and a `local.layer`.
 
 ## Features
 
@@ -17,15 +17,15 @@ built with `beacon.full_application` and a `local.layer`.
   itself.
 - Food is placed on a random free cell. A board with no free cell left
   ends the game.
-- When a game ends, its score is appended to a `beacon/store` list. Every
+- When a game ends, its score is appended to a `brazier/store` list. Every
   session re-reads the list when it changes and shows the top five.
-- The board is drawn with `beacon/svg`.
+- The board is drawn with `brazier/svg`.
 
 ## Run
 
 ```bash
 cd examples/snake
-gleam run -m beacon/build   # first, and after every change
+gleam run -m brazier/build   # first, and after every change
 gleam run
 ```
 

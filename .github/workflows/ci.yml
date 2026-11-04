@@ -13,9 +13,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Build CI image
-        run: docker build -f Dockerfile.ci -t beacon-ci .
+        run: docker build -f Dockerfile.ci -t brazier-ci .
       - name: Run build, tests, and lint
-        run: docker run --rm --shm-size=1g beacon-ci
+        run: docker run --rm --shm-size=1g brazier-ci
 
   # Every example in both viewport profiles (test_all_cdp.py --viewport):
   # mobile adds the horizontal-overflow checks and touch emulation.
@@ -30,12 +30,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Build CI image
-        run: docker build -f Dockerfile.ci -t beacon-ci .
+        run: docker build -f Dockerfile.ci -t brazier-ci .
       - name: Run browser shard
         run: |
           docker run --rm \
             --shm-size=1g \
-            -e BEACON_CDP_VIEWPORTS=${{ matrix.viewport }} \
-            -e BEACON_CDP_SHARD=${{ matrix.shard }}/23 \
-            beacon-ci \
+            -e BRAZIER_CDP_VIEWPORTS=${{ matrix.viewport }} \
+            -e BRAZIER_CDP_SHARD=${{ matrix.shard }}/23 \
+            brazier-ci \
             make browser-all-shard

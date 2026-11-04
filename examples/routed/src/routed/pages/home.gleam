@@ -1,10 +1,10 @@
 /// The home page: a nested component with its own Model, Msg, update and
 /// view (Elm/Lustre style). The root app maps its messages with
 /// `element.map(Home)`.
-import beacon/attribute
-import beacon/element.{type Element}
-import beacon/event
-import beacon/html
+import brazier/attribute
+import brazier/element.{type Element}
+import brazier/event
+import brazier/html
 import gleam/int
 
 pub type Model {
@@ -20,7 +20,7 @@ pub fn init() -> Model {
   Model(count: 0, server_updates: 0)
 }
 
-/// Runs on the server (the root is a `beacon.application`), so
+/// Runs on the server (the root is a `brazier.application`), so
 /// `server_updates` counts the events the server handled.
 pub fn update(model: Model, msg: Msg) -> Model {
   let model = Model(..model, server_updates: model.server_updates + 1)
@@ -34,7 +34,7 @@ pub fn view(model: Model) -> Element(Msg) {
   html.section([], [
     html.h1([], [html.text("Routed")]),
     html.p([], [
-      html.text("Home owns a route-local Model and Msg inside one Beacon app."),
+      html.text("Home owns a route-local Model and Msg inside one Brazier app."),
     ]),
     html.div(
       [

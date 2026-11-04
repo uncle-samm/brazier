@@ -1,11 +1,11 @@
 /// The accounts page: a component with a public Model and private server
 /// state. Only `view` and the Model reach the browser; the signing key is
 /// reached from `init_server` alone, so it is not in the client bundle.
-import beacon/attribute
-import beacon/element.{type Element}
-import beacon/event
-import beacon/html
-import beacon/log
+import brazier/attribute
+import brazier/element.{type Element}
+import brazier/event
+import brazier/html
+import brazier/log
 import gleam/int
 
 const signing_key = "route_accounts_private_key_must_not_ship"

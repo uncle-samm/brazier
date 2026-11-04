@@ -1,7 +1,7 @@
 # Auth Workspace
 
 Cookie sessions, CSRF-protected API routes and a role-gated page, on a
-`beacon.full_application` with `beacon.with_router`.
+`brazier.full_application` with `brazier.with_router`.
 
 - A page load without a login CSRF token gets a random one in the HttpOnly
   `auth_workspace_login_csrf` cookie (a middleware), and the login form
@@ -15,7 +15,7 @@ Cookie sessions, CSRF-protected API routes and a role-gated page, on a
   session's CSRF token for API clients.
 - `GET /api/me`, `POST /api/profile` and `POST /api/logout` use
   `auth.protect_api` and `auth.protect_api_with_csrf`. Logout deletes the
-  session, and Beacon closes its live sockets.
+  session, and Brazier closes its live sockets.
 - `init` is `auth.init_from_session`: it reads the session cookie from the
   `Context` on the HTML render and on the connected mount, and loads the
   account from the session store. No cookie or an expired session is a
@@ -37,7 +37,7 @@ Cookie sessions, CSRF-protected API routes and a role-gated page, on a
 
 ```sh
 cd examples/auth_workspace
-gleam run -m beacon/build   # first, and after every change
+gleam run -m brazier/build   # first, and after every change
 gleam run -m auth_workspace
 ```
 

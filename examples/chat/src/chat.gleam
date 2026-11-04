@@ -1,26 +1,26 @@
 /// Multi-room chat, demonstrating:
-/// - `beacon.full_application`: the session keeps its presence key and
+/// - `brazier.full_application`: the session keeps its presence key and
 ///   typing flag on the server, and syncs only the Model;
 /// - a `local.layer` for the name and message drafts, so typing sends no
 ///   frames except a throttled typing signal;
 /// - dynamic subscriptions: a session is notified only for its current
 ///   room;
-/// - `beacon/store` for the message history;
-/// - `beacon.presence` for who is in each room and who is typing: each
+/// - `brazier/store` for the message history;
+/// - `brazier.presence` for who is in each room and who is typing: each
 ///   session declares its tracking from its state, and the framework
 ///   tracks, updates and untracks it and delivers every change as a
 ///   message.
-import beacon
-import beacon/attribute
-import beacon/effect.{type Effect}
-import beacon/element.{type Element}
-import beacon/event
-import beacon/html
-import beacon/local
-import beacon/log
-import beacon/presence
-import beacon/presence/sync
-import beacon/store.{type ListStore}
+import brazier
+import brazier/attribute
+import brazier/effect.{type Effect}
+import brazier/element.{type Element}
+import brazier/event
+import brazier/html
+import brazier/local
+import brazier/log
+import brazier/presence
+import brazier/presence/sync
+import brazier/store.{type ListStore}
 import gleam/bit_array
 import gleam/crypto
 import gleam/dynamic/decode
@@ -114,8 +114,8 @@ const tracker_name = "chat"
 // --- Server ---
 
 fn init(
-  _ctx: beacon.Context,
-) -> Result(#(Session, Effect(Msg)), beacon.InitError) {
+  _ctx: brazier.Context,
+) -> Result(#(Session, Effect(Msg)), brazier.InitError) {
   Ok(#(
     Session(
       model: Model(
@@ -345,7 +345,7 @@ fn presence_topic(room: String) -> String {
 // --- Presence ---
 
 /// What this session is present as: nothing until it joins, then its name
-/// and typing flag in its current room. `beacon.presence` runs this after
+/// and typing flag in its current room. `brazier.presence` runs this after
 /// every update and tracks, updates or untracks to match.
 fn track(session: Session) -> List(presence.Tracking(Member)) {
   case session.model.username {
@@ -461,7 +461,7 @@ pub fn view(model: Model, local: Local) -> Element(Msg) {
 
 fn view_login(local: Local) -> Element(Msg) {
   html.div([attribute.class("chat-login")], [
-    html.h1([], [html.text("Beacon Chat")]),
+    html.h1([], [html.text("Brazier Chat")]),
     html.p([], [html.text("Enter your name to join:")]),
     html.form(
       [
@@ -600,24 +600,24 @@ fn view_typing(typing: List(String)) -> Element(Msg) {
 pub fn main() {
   let messages = store.new_list("chat_messages")
   let assert Ok(Nil) =
-    beacon.full_application(
+    brazier.full_application(
       init:,
       update: fn(session, msg) { update(messages, session, msg) },
       sync:,
       local: local.layer(init: init_local, update: update_local),
       view:,
     )
-    |> beacon.title(fn(_model) { "Beacon Chat" })
-    |> beacon.subscriptions(fn(session: Session) {
+    |> brazier.title(fn(_model) { "Brazier Chat" })
+    |> brazier.subscriptions(fn(session: Session) {
       [room_topic(session.model.room)]
     })
-    |> beacon.on_notify(Notified)
-    |> beacon.presence(
+    |> brazier.on_notify(Notified)
+    |> brazier.presence(
       tracker: presence.new(tracker_name, encode_member, member_decoder()),
       track:,
       on_presence: PresenceChanged,
     )
-    |> beacon.head_html(favicon)
-    |> beacon.start(8080)
-    as "beacon.start failed (it logs the error)"
+    |> brazier.head_html(favicon)
+    |> brazier.start(8080)
+    as "brazier.start failed (it logs the error)"
 }

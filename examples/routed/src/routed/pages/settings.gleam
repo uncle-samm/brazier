@@ -1,7 +1,7 @@
-import beacon/attribute
-import beacon/element.{type Element}
-import beacon/event
-import beacon/html
+import brazier/attribute
+import brazier/element.{type Element}
+import brazier/event
+import brazier/html
 
 pub fn view(name: String, on_input: fn(String) -> msg) -> Element(msg) {
   html.section([], [

@@ -1,18 +1,18 @@
 /// Shopping Cart, demonstrating:
 /// - derived values in the view (subtotal, tax and total are not stored);
-/// - stock shared by every session, kept in a `beacon/store` list as an
+/// - stock shared by every session, kept in a `brazier/store` list as an
 ///   append-only log of takes and returns, so two shoppers can never take
 ///   the same last item;
 /// - server-only state: each session's cart id never reaches the browser.
-import beacon
-import beacon/attribute
-import beacon/effect.{type Effect}
-import beacon/element.{type Element}
-import beacon/event
-import beacon/html
-import beacon/local
-import beacon/log
-import beacon/store.{type ListStore}
+import brazier
+import brazier/attribute
+import brazier/effect.{type Effect}
+import brazier/element.{type Element}
+import brazier/event
+import brazier/html
+import brazier/local
+import brazier/log
+import brazier/store.{type ListStore}
 import gleam/bit_array
 import gleam/crypto
 import gleam/dict.{type Dict}
@@ -155,7 +155,7 @@ fn record(changes: ListStore(StockChange), change: StockChange) -> Effect(Msg) {
 
 fn init(
   changes: ListStore(StockChange),
-) -> Result(#(State, Effect(Msg)), beacon.InitError) {
+) -> Result(#(State, Effect(Msg)), brazier.InitError) {
   let cart = new_cart_id()
   log.info("cart", "New cart " <> cart)
   Ok(#(State(cart:, model: read_model(changes, cart)), effect.none()))
@@ -518,17 +518,17 @@ fn total_row(label: String, amount: Int) -> Element(Msg) {
 pub fn main() {
   let changes = store.new_list("cart_stock")
   let assert Ok(Nil) =
-    beacon.full_application(
+    brazier.full_application(
       init: fn(_ctx) { init(changes) },
       update: fn(state, msg) { update(changes, state, msg) },
       sync:,
       local: local.none(),
       view:,
     )
-    |> beacon.title(fn(_model) { "Shopping Cart" })
-    |> beacon.subscriptions(fn(_state) { [store.list_topic(changes)] })
-    |> beacon.on_notify(fn(_topic) { StockChanged })
-    |> beacon.head_html(favicon)
-    |> beacon.start(8080)
-    as "beacon.start failed (it logs the error)"
+    |> brazier.title(fn(_model) { "Shopping Cart" })
+    |> brazier.subscriptions(fn(_state) { [store.list_topic(changes)] })
+    |> brazier.on_notify(fn(_topic) { StockChanged })
+    |> brazier.head_html(favicon)
+    |> brazier.start(8080)
+    as "brazier.start failed (it logs the error)"
 }

@@ -1,6 +1,6 @@
 # Private Session
 
-A `beacon.full_application` whose session holds private state next to a
+A `brazier.full_application` whose session holds private state next to a
 public Model.
 
 - The session keeps a signing key, an audit trail of the newest 100
@@ -18,6 +18,6 @@ The browser integration tests use this example to check that the signing
 key and audit entries never reach the page or the bundle.
 
 ```sh
-gleam run -m beacon/build   # first, and after every change
+gleam run -m brazier/build   # first, and after every change
 gleam run -m private_session
 ```

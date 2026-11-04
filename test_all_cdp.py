@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CDP test suite for Beacon examples.
+"""CDP test suite for Brazier examples.
 CDP DOES NOT CAUSE BUGS. If it fails, the bug is REAL.
 
 Usage:
@@ -20,14 +20,14 @@ Waiting (the Playwright auto-wait model)
 Nothing sleeps for a fixed time and hopes the page has settled. After an
 action, a test waits for the condition it asserts: `wait_until` re-checks a
 predicate every RETRY_SECONDS, reading CDP events between checks, and gives
-up at a deadline (BEACON_CDP_WAIT_SECONDS, default 10). A passing check
+up at a deadline (BRAZIER_CDP_WAIT_SECONDS, default 10). A passing check
 returns as soon as the condition holds, so the deadline can be generous for
 a loaded CI machine. A check that misses its deadline fails, naming what it
 waited for.
 
 A check that the browser sent NO model event (local-only messages) waits,
 after the local update is visible, for the client's outbound queue to be
-empty with no paced send scheduled (`window.__beaconOutboundPendingForTest`,
+empty with no paced send scheduled (`window.__brazierOutboundPendingForTest`,
 installed by the test hooks), then takes a CDP barrier so every frame the
 page wrote has been recorded. Pong's "frozen while paused" check is the one
 deliberate time window: holding still for many ticks is the thing under
@@ -52,14 +52,25 @@ import urllib.request
 
 import websocket
 
-parser = argparse.ArgumentParser(description="Beacon CDP tests")
+# The BRAZIER_* variables were named BEACON_* until the package was renamed
+# to brazier (2026-11-04). An old name is refused, never read, so a stale
+# setting cannot let the run go ahead with a default instead.
+RENAMED_ENV_PREFIX = "BEACON_"
+renamed_env = sorted(name for name in os.environ if name.startswith(RENAMED_ENV_PREFIX))
+if renamed_env:
+    for name in renamed_env:
+        new_name = "BRAZIER_" + name[len(RENAMED_ENV_PREFIX):]
+        print(f"{name} is set, but it is no longer read: set {new_name} instead", file=sys.stderr)
+    sys.exit(1)
+
+parser = argparse.ArgumentParser(description="Brazier CDP tests")
 parser.add_argument("filter", nargs="?", default=None, help="Run only tests matching this name")
 parser.add_argument("--canonical", action="store_true", help="Run the canonical conformance examples")
-parser.add_argument("--shard", default=os.environ.get("BEACON_CDP_SHARD"), help="Run shard INDEX/TOTAL, 1-based")
+parser.add_argument("--shard", default=os.environ.get("BRAZIER_CDP_SHARD"), help="Run shard INDEX/TOTAL, 1-based")
 parser.add_argument(
     "--viewport",
     choices=("desktop", "mobile"),
-    default=os.environ.get("BEACON_CDP_VIEWPORT", "desktop"),
+    default=os.environ.get("BRAZIER_CDP_VIEWPORT", "desktop"),
     help="Browser viewport profile",
 )
 parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
@@ -98,13 +109,13 @@ ALL_EXAMPLES = [
 ]
 
 CDP_PORT = int(os.environ.get("CDP_PORT", "9223"))
-BEACON_PORT = int(os.environ.get("BEACON_PORT", "8080"))
-SERVER_START_TIMEOUT_SECONDS = int(os.environ.get("BEACON_CDP_SERVER_TIMEOUT", "90"))
-# The first beacon/build of an example compiles Beacon and its deps.
-BUILD_TIMEOUT_SECONDS = int(os.environ.get("BEACON_CDP_BUILD_TIMEOUT", "300"))
+BRAZIER_PORT = int(os.environ.get("BRAZIER_PORT", "8080"))
+SERVER_START_TIMEOUT_SECONDS = int(os.environ.get("BRAZIER_CDP_SERVER_TIMEOUT", "90"))
+# The first brazier/build of an example compiles Brazier and its deps.
+BUILD_TIMEOUT_SECONDS = int(os.environ.get("BRAZIER_CDP_BUILD_TIMEOUT", "300"))
 # The deadline for a condition a test expects. A passing check returns as
 # soon as the condition holds; only a failing one waits this long.
-WAIT_SECONDS = float(os.environ.get("BEACON_CDP_WAIT_SECONDS", "10"))
+WAIT_SECONDS = float(os.environ.get("BRAZIER_CDP_WAIT_SECONDS", "10"))
 # How long wait_until reads CDP events between two checks of a condition.
 RETRY_SECONDS = 0.05
 # Lines of server output kept for a failure report.
@@ -132,7 +143,7 @@ CANONICAL_EXAMPLES = {
 CONTRACT_REPORTS = {}
 # Examples whose view has no event handlers: the browser sends no messages.
 NO_HANDLER_EXAMPLES = {"dashboard"}
-STARTED_LINE = re.compile(r"Beacon application started \((?:supervised|unsupervised)\) on port (\d+)")
+STARTED_LINE = re.compile(r"Brazier application started \((?:supervised|unsupervised)\) on port (\d+)")
 
 def parse_shard(value):
     if not value:
@@ -232,10 +243,10 @@ def record_cdp_message(data):
             browser_errors.append(str(description))
         elif method == "Log.entryAdded":
             entry = data.get("params", {}).get("entry", {})
-            # The examples' pages carry an inline icon, but pages Beacon
+            # The examples' pages carry an inline icon, but pages Brazier
             # renders without the app's head (error pages) do not, and on
             # those Chrome requests /favicon.ico on its own (not the page or
-            # Beacon), so that one 404 is not an app error. It is still
+            # Brazier), so that one 404 is not an app error. It is still
             # logged in verbose mode.
             if (entry.get("source") == "network"
                     and str(entry.get("url", "")).endswith("/favicon.ico")):
@@ -335,8 +346,8 @@ def barrier():
     evl("0")
 
 OUTBOUND_PENDING_JS = (
-    'JSON.stringify(typeof window.__beaconOutboundPendingForTest === "function"'
-    ' ? window.__beaconOutboundPendingForTest() : "missing")'
+    'JSON.stringify(typeof window.__brazierOutboundPendingForTest === "function"'
+    ' ? window.__brazierOutboundPendingForTest() : "missing")'
 )
 OUTBOUND_DRAINED = json.dumps({"queued": 0, "scheduled": False}, separators=(",", ":"))
 
@@ -477,10 +488,10 @@ def check_local_ws_quiet(msg):
     check(websocket_type_count("Received", "mount") == 0, f"{msg}: receives no HTML mount")
 
 APP_READY_JS = (
-    '(document.getElementById("beacon-app")?.textContent || "").length > 5'
-    ' && typeof window.__beaconWsState === "function" && window.__beaconWsState() === 1'
-    ' && typeof window.__beaconConnectionReady === "function"'
-    ' && window.__beaconConnectionReady() === true'
+    '(document.getElementById("brazier-app")?.textContent || "").length > 5'
+    ' && typeof window.__brazierWsState === "function" && window.__brazierWsState() === 1'
+    ' && typeof window.__brazierConnectionReady === "function"'
+    ' && window.__brazierConnectionReady() === true'
 )
 
 def navigate(path="/", expect_app=True):
@@ -494,13 +505,13 @@ def navigate(path="/", expect_app=True):
     # The old document keeps this marker; a fresh one has none, so the wait
     # below cannot be satisfied by the page being navigated away from.
     marker = json.dumps(f"nav-{time.time_ns()}")
-    evl(f"window.__beaconCdpNav = {marker}; 0")
-    r = cdp("Page.navigate", {"url": f"http://localhost:{BEACON_PORT}{path}"})
+    evl(f"window.__brazierCdpNav = {marker}; 0")
+    r = cdp("Page.navigate", {"url": f"http://localhost:{BRAZIER_PORT}{path}"})
     if r is None or "errorText" in r.get("result", {}):
         reason = "no response" if r is None else r["result"]["errorText"]
         check(False, f"navigate {path}: browser starts the navigation ({reason})")
         return False
-    fresh = f'window.__beaconCdpNav !== {marker} && document.readyState === "complete"'
+    fresh = f'window.__brazierCdpNav !== {marker} && document.readyState === "complete"'
     if expect_app:
         ready = wait_for_js(f"{fresh} && {APP_READY_JS}")
     else:
@@ -508,19 +519,19 @@ def navigate(path="/", expect_app=True):
     if not ready:
         state = evl(
             "JSON.stringify({path: location.pathname, ready: document.readyState, "
-            "ws: window.__beaconWsState ? window.__beaconWsState() : -1, "
-            "joined: window.__beaconConnectionReady ? window.__beaconConnectionReady() : null, "
-            'text: (document.getElementById("beacon-app")?.textContent || "NO APP").slice(0, 80)})'
+            "ws: window.__brazierWsState ? window.__brazierWsState() : -1, "
+            "joined: window.__brazierConnectionReady ? window.__brazierConnectionReady() : null, "
+            'text: (document.getElementById("brazier-app")?.textContent || "NO APP").slice(0, 80)})'
         )
         check(False, f"navigate {path}: page becomes ready within {WAIT_SECONDS} s ({state})")
         return False
     return True
 
 def text():
-    return evl('document.getElementById("beacon-app")?.textContent ?? "NO APP"')
+    return evl('document.getElementById("brazier-app")?.textContent ?? "NO APP"')
 
 def html():
-    return evl('document.getElementById("beacon-app")?.innerHTML ?? "NO APP"')
+    return evl('document.getElementById("brazier-app")?.innerHTML ?? "NO APP"')
 
 def squashed_text():
     return re.sub(r"\s+", "", str(text()))
@@ -550,7 +561,7 @@ def click_by_text(button_text):
     """Click the first handled element whose text contains `button_text`."""
     text_js = json.dumps(button_text)
     return js_click(
-        'Array.from(document.querySelectorAll("[data-beacon-on-click]"))'
+        'Array.from(document.querySelectorAll("[data-brazier-on-click]"))'
         f".find(function(b){{return b.textContent.includes({text_js})}})",
         f"clickable containing {button_text!r}",
     )
@@ -562,7 +573,7 @@ def click_button(label, nth=0):
     """
     label_js = json.dumps(label)
     return js_click(
-        'Array.from(document.querySelectorAll("button[data-beacon-on-click]"))'
+        'Array.from(document.querySelectorAll("button[data-brazier-on-click]"))'
         f".filter(function(b){{return b.textContent.trim()==={label_js}}})[{nth}]",
         f"button {label!r} #{nth}",
     )
@@ -574,7 +585,7 @@ def submit_by_text(button_text):
     """
     text_js = json.dumps(button_text)
     return js_click(
-        'Array.from(document.querySelectorAll("form[data-beacon-on-submit] button[type=submit]"))'
+        'Array.from(document.querySelectorAll("form[data-brazier-on-submit] button[type=submit]"))'
         f".find(function(b){{return b.textContent.includes({text_js})}})",
         f"submit button {button_text!r}",
     )
@@ -643,7 +654,7 @@ def check_history_go(delta, path, text_fragment, label):
     check(went == "ok", f"{label}: history.go({delta}) evaluated ({went})")
     restored = wait_for_js(
         f"location.pathname === {json.dumps(path)} && "
-        f'(document.getElementById("beacon-app")?.textContent || "").includes({json.dumps(text_fragment)})'
+        f'(document.getElementById("brazier-app")?.textContent || "").includes({json.dumps(text_fragment)})'
     )
     after = str(evl("location.pathname"))
     length = str(evl("history.length"))
@@ -656,15 +667,15 @@ def check_history_go(delta, path, text_fragment, label):
 
 def force_socket_reconnect(label, expected_text):
     clear_cdp_events()
-    before_state = evl('window.__beaconCloseSocketForTest ? window.__beaconCloseSocketForTest() : "missing"')
+    before_state = evl('window.__brazierCloseSocketForTest ? window.__brazierCloseSocketForTest() : "missing"')
     check(str(before_state) != "missing", f"{label}: test socket close hook is available")
     check(str(before_state) == "1", f"{label}: socket was open before forced close (state={before_state})")
     expect(lambda: cdp_method_count("Network.webSocketClosed") > 0, f"{label}: browser reports WebSocket close")
     # The client backs off before reconnecting, so this wait is longer.
     reconnected = wait_for_js(
-        "window.__beaconWsState && window.__beaconWsState() === 1"
-        " && window.__beaconConnectionReady && window.__beaconConnectionReady() === true"
-        f' && (document.getElementById("beacon-app")?.textContent || "").includes({json.dumps(expected_text)})',
+        "window.__brazierWsState && window.__brazierWsState() === 1"
+        " && window.__brazierConnectionReady && window.__brazierConnectionReady() === true"
+        f' && (document.getElementById("brazier-app")?.textContent || "").includes({json.dumps(expected_text)})',
         timeout=2 * WAIT_SECONDS,
     )
     check(reconnected, f"{label}: socket reconnects and app is ready")
@@ -681,7 +692,7 @@ def install_dom_monitor():
         return
     script = r"""
 (() => {
-  window.__BEACON_ENABLE_TEST_HOOKS = true;
+  window.__BRAZIER_ENABLE_TEST_HOOKS = true;
   window.__e = [];
   const previousConsoleError = console.error;
   console.error = function(...args) {
@@ -706,17 +717,17 @@ def install_dom_monitor():
     };
   }
 
-  window.__beaconMonitor = freshMonitor();
+  window.__brazierMonitor = freshMonitor();
 
   function recordSample() {
-    const app = document.getElementById("beacon-app");
+    const app = document.getElementById("brazier-app");
     if (!app) return;
     const textLength = (app.textContent || "").trim().length;
-    if (textLength > 0) window.__beaconMonitor.sawContent = true;
-    if (window.__beaconMonitor.sawContent && textLength === 0) {
-      window.__beaconMonitor.emptyAfterContent += 1;
+    if (textLength > 0) window.__brazierMonitor.sawContent = true;
+    if (window.__brazierMonitor.sawContent && textLength === 0) {
+      window.__brazierMonitor.emptyAfterContent += 1;
     }
-    window.__beaconMonitor.bodySamples.push({
+    window.__brazierMonitor.bodySamples.push({
       t: performance.now(),
       textLength,
       htmlLength: app.innerHTML.length
@@ -724,12 +735,12 @@ def install_dom_monitor():
   }
 
   function setupObserver() {
-    const app = document.getElementById("beacon-app");
-    if (!app || app.__beaconMonitorAttached) return;
-    app.__beaconMonitorAttached = true;
+    const app = document.getElementById("brazier-app");
+    if (!app || app.__brazierMonitorAttached) return;
+    app.__brazierMonitorAttached = true;
     new MutationObserver((records) => {
       recordSample();
-      window.__beaconMonitor.mutations.push({
+      window.__brazierMonitor.mutations.push({
         t: performance.now(),
         count: records.length,
         textLength: (app.textContent || "").trim().length,
@@ -750,14 +761,14 @@ def install_dom_monitor():
     requestAnimationFrame(sampleFrame);
   }
 
-  window.__beaconResetMonitor = function() {
-    window.__beaconMonitor = freshMonitor();
+  window.__brazierResetMonitor = function() {
+    window.__brazierMonitor = freshMonitor();
     recordSample();
     setupObserver();
   };
 
-  window.__beaconMonitorSummary = function(bucketMs) {
-    const m = window.__beaconMonitor || freshMonitor();
+  window.__brazierMonitorSummary = function(bucketMs) {
+    const m = window.__brazierMonitor || freshMonitor();
     const buckets = {};
     for (const item of m.mutations || []) {
       const key = Math.floor(item.t / bucketMs);
@@ -788,9 +799,9 @@ def install_dom_monitor():
       new PerformanceObserver((list) => {
         for (const entry of list.getEntries()) {
           if (!entry.hadRecentInput) {
-            window.__beaconMonitor.layoutShifts.push(entry.value);
+            window.__brazierMonitor.layoutShifts.push(entry.value);
             for (const source of entry.sources || []) {
-              window.__beaconMonitor.layoutShiftSources.push(describeShiftSource(source));
+              window.__brazierMonitor.layoutShiftSources.push(describeShiftSource(source));
             }
           }
         }
@@ -808,12 +819,12 @@ def install_dom_monitor():
     DOM_MONITOR_INSTALLED = True
 
 def reset_dom_monitor():
-    evl('window.__beaconResetMonitor ? (window.__beaconResetMonitor(), "ok") : "missing"')
+    evl('window.__brazierResetMonitor ? (window.__brazierResetMonitor(), "ok") : "missing"')
 
 def mutation_bucket_summary(bucket_ms=100):
     return evl("""
 (() => {
-  if (window.__beaconMonitorSummary) return window.__beaconMonitorSummary(BUCKET_MS);
+  if (window.__brazierMonitorSummary) return window.__brazierMonitorSummary(BUCKET_MS);
   return JSON.stringify({{mutationCount: 0, maxBucket: 0, emptyAfterContent: 0, layoutShiftCount: 0, layoutShiftTotal: 0}});
 })()
 """.replace("BUCKET_MS", str(bucket_ms)).replace("{{", "{").replace("}}", "}"))
@@ -881,30 +892,30 @@ def report_server_failure(name, why):
         print(f"    | {line}")
 
 def build_example(name, directory):
-    """Run the Beacon build (`gleam run -m beacon/build`) for the example:
-    the server codec, the client bundle and `build/beacon_contract.json`,
+    """Run the Brazier build (`gleam run -m brazier/build`) for the example:
+    the server codec, the client bundle and `build/brazier_contract.json`,
     which report_contract checks. The build is deterministic, so it
     rewrites the committed bundle unchanged unless the bundle is stale."""
-    vlog(f"Building {name} with beacon/build")
+    vlog(f"Building {name} with brazier/build")
     try:
         built = subprocess.run(
-            ["gleam", "run", "-m", "beacon/build"],
+            ["gleam", "run", "-m", "brazier/build"],
             cwd=directory, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             timeout=BUILD_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired as exc:
         output = (exc.output or b"").decode("utf-8", errors="replace").splitlines()
-        print(f"  * {name}: beacon/build did not finish within {BUILD_TIMEOUT_SECONDS} s. Last {SERVER_LOG_LINES} lines:")
+        print(f"  * {name}: brazier/build did not finish within {BUILD_TIMEOUT_SECONDS} s. Last {SERVER_LOG_LINES} lines:")
         for line in output[-SERVER_LOG_LINES:]:
             print(f"    | {line}")
-        check(False, f"{name}: beacon/build finishes")
+        check(False, f"{name}: brazier/build finishes")
         return False
     if built.returncode != 0:
         output = built.stdout.decode("utf-8", errors="replace").splitlines()
-        print(f"  * {name}: beacon/build exited with status {built.returncode}. Last {SERVER_LOG_LINES} lines:")
+        print(f"  * {name}: brazier/build exited with status {built.returncode}. Last {SERVER_LOG_LINES} lines:")
         for line in output[-SERVER_LOG_LINES:]:
             print(f"    | {line}")
-        check(False, f"{name}: beacon/build succeeds")
+        check(False, f"{name}: brazier/build succeeds")
         return False
     return True
 
@@ -935,8 +946,8 @@ def start_example(name, module=None):
     stop_server()
     if not reset_tab_history(name):
         return False
-    if port_accepts_connections(BEACON_PORT):
-        check(False, f"{name}: port {BEACON_PORT} is free before start (another server, or a concurrent CDP run, holds it)")
+    if port_accepts_connections(BRAZIER_PORT):
+        check(False, f"{name}: port {BRAZIER_PORT} is free before start (another server, or a concurrent CDP run, holds it)")
         return False
     d = os.path.join(ROOT, "examples", name)
     if not build_example(name, d):
@@ -969,17 +980,17 @@ def start_example(name, module=None):
         check(False, f"{name}: server starts ({why})")
         return False
     port = int(STARTED_LINE.search(line).group(1))
-    if port != BEACON_PORT:
-        report_server_failure(name, f"started on port {port}, not {BEACON_PORT}")
+    if port != BRAZIER_PORT:
+        report_server_failure(name, f"started on port {port}, not {BRAZIER_PORT}")
         stop_server()
-        check(False, f"{name}: server listens on port {BEACON_PORT} (got {port})")
+        check(False, f"{name}: server listens on port {BRAZIER_PORT} (got {port})")
         return False
     report_contract(name, d)
     vlog("Server ready")
     return True
 
 def report_contract(name, directory):
-    path = os.path.join(directory, "build", "beacon_contract.json")
+    path = os.path.join(directory, "build", "brazier_contract.json")
     if not os.path.exists(path):
         check(False, f"{name}: generated contract report exists")
         return
@@ -997,7 +1008,7 @@ def report_contract(name, directory):
     check(bool(report.get("view")) and bool(report.get("model")) and bool(report.get("msg")), f"{name}: generated contract names view, Model and Msg")
     check(
         (kind == "simple") == bool(report.get("client_update")),
-        f"{name}: only beacon.simple compiles its update for the browser",
+        f"{name}: only brazier.simple compiles its update for the browser",
     )
     if name in NO_HANDLER_EXAMPLES:
         check(client_messages == [], f"{name}: generated contract lists no browser messages (view has no handlers)")
@@ -1021,10 +1032,10 @@ def stop_server():
                 print(f"  * {server_name}: server output reader still running after the server exited")
         server_proc = None
         server_reader = None
-    if os.environ.get("BEACON_CDP_KILL_PORT") == "1":
-        os.system(f"lsof -ti:{BEACON_PORT} 2>/dev/null | xargs kill -9 2>/dev/null")
-    if not wait_until_port_free(BEACON_PORT):
-        check(False, f"port {BEACON_PORT} refuses connections after the server stopped")
+    if os.environ.get("BRAZIER_CDP_KILL_PORT") == "1":
+        os.system(f"lsof -ti:{BRAZIER_PORT} 2>/dev/null | xargs kill -9 2>/dev/null")
+    if not wait_until_port_free(BRAZIER_PORT):
+        check(False, f"port {BRAZIER_PORT} refuses connections after the server stopped")
 
 def wait_until_port_free(port):
     deadline = time.time() + WAIT_SECONDS
@@ -1049,12 +1060,12 @@ def check(cond, msg):
         print(f"  FAIL {msg}")
         FAIL += 1
         if VERBOSE:
-            t = evl('document.getElementById("beacon-app")?.textContent?.substring(0,200) || "NO APP"')
+            t = evl('document.getElementById("brazier-app")?.textContent?.substring(0,200) || "NO APP"')
             print(f"    [v] DOM text: {t}")
-            h = evl('document.getElementById("beacon-app")?.innerHTML?.substring(0,300) || "NO HTML"')
+            h = evl('document.getElementById("brazier-app")?.innerHTML?.substring(0,300) || "NO HTML"')
             print(f"    [v] HTML: {h}")
 
-print("=== Beacon CDP Test Suite ===")
+print("=== Brazier CDP Test Suite ===")
 if ONLY:
     print(f"Filter: {ONLY}")
 if CANONICAL_ONLY:
@@ -1132,7 +1143,7 @@ if start_example("counter_local"):
     check_local_ws_quiet("Counter local menu off")
     # LOCAL: input
     clear_cdp_events()
-    type_input("[data-beacon-on-input]", "testlocal")
+    type_input("[data-brazier-on-input]", "testlocal")
     expect_text("testlocal", "Local input shows text")
     check_local_ws_quiet("Counter local input")
     clear_cdp_events()
@@ -1160,7 +1171,7 @@ if start_example("kanban"):
     check("(3)" in kanban_column("todo"), "Todo shows (3)")
     check("(1)" in kanban_column("doing"), "In Progress shows (1)")
     # Add card
-    type_input("[data-beacon-on-input]", "CDP Card")
+    type_input("[data-brazier-on-input]", "CDP Card")
     submit_by_text("Add Card")
     expect(lambda: "CDP Card" in kanban_column("todo"), "Added card visible in Todo")
     expect(lambda: "(4)" in kanban_column("todo"), "Todo shows (4)")
@@ -1272,7 +1283,7 @@ if start_example("snake"):
     navigate()
     t = text()
     check("Snake" in t, "Title")
-    type_input("[data-beacon-on-input]", "CDPPlayer")
+    type_input("[data-brazier-on-input]", "CDPPlayer")
     submit_by_text("Play")
     expect_text("Snake: CDPPlayer", "Game started for the player")
     expect_text("Score", "Score visible")
@@ -1289,9 +1300,9 @@ print("-- 6: Chat --")
 if start_example("chat"):
     navigate()
     t = text()
-    check("Beacon Chat" in t, "Title")
+    check("Brazier Chat" in t, "Title")
     # Login
-    type_input("[data-beacon-on-input]", "TestUser")
+    type_input("[data-brazier-on-input]", "TestUser")
     submit_by_text("Join")
     expect_text("Online: TestUser", "Presence lists the joined user")
     t = text()
@@ -1305,7 +1316,7 @@ if start_example("chat"):
     check("TestUser" in str(text()), "Sender shown")
     # MULTI-USER: a new session joins and reads the message from the store
     navigate()
-    type_input("[data-beacon-on-input]", "User2")
+    type_input("[data-brazier-on-input]", "User2")
     submit_by_text("Join")
     expect_text("Online: User2", "Second user joins")
     expect_text("Hello from CDP", "Multi-user: message persists for new user")
@@ -1368,7 +1379,7 @@ if start_example("pong"):
 stop_server(); print()
 
 # == 9. Triple Counter ==
-TRIPLE_COUNTS_JS = 'Array.from(document.querySelectorAll("#beacon-app strong")).map(function(s){return s.textContent.trim()}).join(",")'
+TRIPLE_COUNTS_JS = 'Array.from(document.querySelectorAll("#brazier-app strong")).map(function(s){return s.textContent.trim()}).join(",")'
 
 def expect_triple(expected, msg):
     """Counts as "shared,server,local"."""
@@ -1381,7 +1392,7 @@ if start_example("triple_counter"):
     check("Shared Counter" in t, "Shared section")
     check("Server Counter" in t, "Server section")
     check("Local Counter" in t, "Local section")
-    bc = count_js('document.querySelectorAll("[data-beacon-on-click]").length')
+    bc = count_js('document.querySelectorAll("[data-brazier-on-click]").length')
     check(bc == 6, f"6 buttons ({bc})")
     expect_triple("0,0,0", "Initial counts 0,0,0")
     clear_cdp_events()
@@ -1415,12 +1426,12 @@ if start_example("todo", module="todo_app"):
     check("Todo App" in t, "Title")
     check("0 items left" in t, f"Items left counter starts at 0 ({t[:60]})")
     # Add todo
-    type_input("[data-beacon-on-input]", "Buy milk")
+    type_input("[data-brazier-on-input]", "Buy milk")
     submit_by_text("Add")
     expect_text("Buy milk", "Added todo visible")
     expect_text("1 item left", "1 item left")
     # Add another
-    type_input("[data-beacon-on-input]", "Walk dog")
+    type_input("[data-brazier-on-input]", "Walk dog")
     submit_by_text("Add")
     expect_text("Walk dog", "Second todo visible")
     expect_text("2 items left", "2 items left")
@@ -1522,13 +1533,13 @@ if start_example("ai_chat"):
     t = text()
     check("AI" in t or "Chat" in t or "chat" in t.lower(), f"UI renders")
     h = html()
-    check("data-beacon-on-input" in h, "Input field present")
-    check("data-beacon-on-click" in h, "Send button present")
-    type_input("input[data-beacon-on-input]", "hello cdp")
+    check("data-brazier-on-input" in h, "Input field present")
+    check("data-brazier-on-click" in h, "Send button present")
+    type_input("input[data-brazier-on-input]", "hello cdp")
     clear_cdp_events()
     click_button("Send")
     check(
-        wait_for_js('(document.getElementById("beacon-app")?.textContent || "").includes("Server stream received: hello cdp. Beacon keeps")', timeout=15),
+        wait_for_js('(document.getElementById("brazier-app")?.textContent || "").includes("Server stream received: hello cdp. Brazier keeps")', timeout=15),
         "Server stream drips the response to the browser",
     )
     check(
@@ -1550,7 +1561,7 @@ if start_example("privacy_demo"):
     check(all(s not in str(html()) for s in secrets), "Server secrets not present in DOM")
     bundle_text = evl_async("""
       (async () => {
-        const src = Array.from(document.scripts).map(s => s.src).find(s => s.includes('beacon_client_'));
+        const src = Array.from(document.scripts).map(s => s.src).find(s => s.includes('brazier_client_'));
         return src ? await fetch(src).then(r => r.text()) : '';
       })()
     """)
@@ -1605,7 +1616,7 @@ if start_example("middleware_demo", module="app"):
 stop_server(); print()
 
 # == 15. Multi-File Domains ==
-FIRST_ITEM_JS = 'document.querySelector("#beacon-app .item")?.textContent || "none"'
+FIRST_ITEM_JS = 'document.querySelector("#brazier-app .item")?.textContent || "none"'
 
 print("-- 15: Multi-File Domains --")
 if start_example("domains", module="app"):
@@ -1620,7 +1631,7 @@ if start_example("domains", module="app"):
     check("Items (2)" in t, "Two items")
     # Toggle the first item
     check(str(evl(FIRST_ITEM_JS)) == "[ ] Buy groceries", f"First item starts open ({evl(FIRST_ITEM_JS)})")
-    click("#beacon-app .item")
+    click("#brazier-app .item")
     expect_value(FIRST_ITEM_JS, "[x] Buy groceries", "Toggle marks the first item done")
     # Add an item
     type_input('input[aria-label="New item"]', "New item")
@@ -1647,7 +1658,7 @@ if start_example("multi_kanban", module="app"):
     type_input('input[type="text"]', "Deploy")
     submit_by_text("Add Card")
     expect_text("Deploy", "New card added")
-    check("data-beacon-on-dragstart" in str(html()), "Drag handlers present")
+    check("data-brazier-on-dragstart" in str(html()), "Drag handlers present")
     check(errors() == "0", f"Zero errors ({error_list()})")
 stop_server(); print()
 
@@ -1658,7 +1669,7 @@ if start_example("multi_todo", module="app"):
     t = text()
     check("Multi-File Todo" in t, "Title")
     check("Learn Gleam" in t, "Initial item 1")
-    check("Build with Beacon" in t, "Initial item 2")
+    check("Build with Brazier" in t, "Initial item 2")
     check("Ship it" in t, "Initial item 3")
     check("2 items remaining" in t, "Remaining count (1 completed, 2 active)")
     # Add a todo
@@ -1687,15 +1698,15 @@ if start_example("private_session"):
     check("Private Session" in t, "SSR: private session renders")
     check("User: Ada" in t, "SSR: public user renders")
     check("Visible balance: 1200" in t, "SSR: public balance renders")
-    check("beacon_private_session_signing_key_must_not_ship" not in str(html()), "Server signing key not present in DOM")
+    check("brazier_private_session_signing_key_must_not_ship" not in str(html()), "Server signing key not present in DOM")
     bundle_text = evl_async("""
       (async () => {
-        const src = Array.from(document.scripts).map(s => s.src).find(s => s.includes('beacon_client_'));
+        const src = Array.from(document.scripts).map(s => s.src).find(s => s.includes('brazier_client_'));
         return src ? await fetch(src).then(r => r.text()) : '';
       })()
     """)
     check(len(str(bundle_text)) > 1000, f"Client bundle fetched ({len(str(bundle_text))} bytes)")
-    check("beacon_private_session_signing_key_must_not_ship" not in str(bundle_text), "Server signing key not present in client bundle")
+    check("brazier_private_session_signing_key_must_not_ship" not in str(bundle_text), "Server signing key not present in client bundle")
     check("session-created" not in str(bundle_text), "Server audit seed not present in client bundle")
 
     reset_dom_monitor()
@@ -1714,7 +1725,7 @@ if start_example("private_session"):
     clear_cdp_events()
     click_by_text("Refresh public summary")
     expect_text("Public summary refreshed", "Refresh uses server state without exposing it")
-    check("beacon_private_session_signing_key_must_not_ship" not in str(html()), "Server signing key still absent after updates")
+    check("brazier_private_session_signing_key_must_not_ship" not in str(html()), "Server signing key still absent after updates")
     check_model_ws_update("Private session refresh", events=1)
     check_dom_conformance("Private session")
     check(errors() == "0", f"Zero errors ({error_list()})")
@@ -1724,7 +1735,7 @@ stop_server(); print()
 def expect_path_and_text(path, fragment, msg):
     return expect_js(
         f"location.pathname === {json.dumps(path)} && "
-        f'(document.getElementById("beacon-app")?.textContent || "").includes({json.dumps(fragment)})',
+        f'(document.getElementById("brazier-app")?.textContent || "").includes({json.dumps(fragment)})',
         msg,
     )
 
@@ -1910,7 +1921,7 @@ if start_example("route_server_workspace", module="main"):
     check("Balance: 1200" in t, "SSR: account model renders")
     bundle_text = evl_async("""
       (async () => {
-        const src = Array.from(document.scripts).map(s => s.src).find(s => s.includes('beacon_client_'));
+        const src = Array.from(document.scripts).map(s => s.src).find(s => s.includes('brazier_client_'));
         return src ? await fetch(src).then(r => r.text()) : '';
       })()
     """)
@@ -1935,7 +1946,7 @@ if start_example("route_server_workspace", module="main"):
 stop_server(); print()
 
 # == 21. Auth Workspace ==
-AUDIT_COUNT_JS = 'var m=(document.getElementById("beacon-app")?.textContent||"").match(/Audit events: (\\d+)/); m ? Number(m[1]) : -1'
+AUDIT_COUNT_JS = 'var m=(document.getElementById("brazier-app")?.textContent||"").match(/Audit events: (\\d+)/); m ? Number(m[1]) : -1'
 
 print("-- 21: Auth Workspace --")
 if start_example("auth_workspace", module="auth_workspace"):

@@ -1,7 +1,7 @@
 # Spreadsheet
 
 An editable 10x5 grid shared by every open tab, built with
-`beacon.full_application` and a `local.layer`.
+`brazier.full_application` and a `local.layer`.
 
 ## Features
 
@@ -9,7 +9,7 @@ An editable 10x5 grid shared by every open tab, built with
   Save button) saves and Escape cancels.
 - The selection and the edit buffer are Local state, kept in the browser.
   Clicking and typing send nothing to the server; only a saved cell does.
-- Each cell is its own `beacon/store` entry (`A1`, `B2`, ...), so two tabs
+- Each cell is its own `brazier/store` entry (`A1`, `B2`, ...), so two tabs
   editing different cells never overwrite each other.
 - When any session saves, the store broadcasts on its topic. Every session
   subscribes to that topic and re-reads the grid.
@@ -20,7 +20,7 @@ An editable 10x5 grid shared by every open tab, built with
 
 ```bash
 cd examples/spreadsheet
-gleam run -m beacon/build   # first, and after every change
+gleam run -m brazier/build   # first, and after every change
 gleam run
 ```
 

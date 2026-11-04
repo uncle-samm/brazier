@@ -1,25 +1,25 @@
-name = "beacon"
+name = "brazier"
 version = "0.1.0"
 description = "A full-stack Gleam web framework combining LiveView-style server rendering with type-safe routing and VDOM diffing on the BEAM."
 licences = ["MIT"]
 repository = { type = "github", user = "uncle-samm", repo = "beacon" }
 target = "erlang"
-# Hidden from the generated docs. `beacon/transport` and
-# `beacon/transport/server` stay public while `beacon.security_limits`,
-# `beacon.api_routes` and `beacon.ws_auth` take their types.
+# Hidden from the generated docs. `brazier/transport` and
+# `brazier/transport/server` stay public while `brazier.security_limits`,
+# `brazier.api_routes` and `brazier.ws_auth` take their types.
 internal_modules = [
-  "beacon/application",
-  "beacon/build",
-  "beacon/build/*",
-  "beacon/debug",
-  "beacon/internal/*",
-  "beacon/patch",
-  "beacon/runtime",
-  "beacon/ssr",
-  "beacon/state_manager",
-  "beacon/transport/client",
-  "beacon/transport/http",
-  "beacon/transport/ws",
+  "brazier/application",
+  "brazier/build",
+  "brazier/build/*",
+  "brazier/debug",
+  "brazier/internal/*",
+  "brazier/patch",
+  "brazier/runtime",
+  "brazier/ssr",
+  "brazier/state_manager",
+  "brazier/transport/client",
+  "brazier/transport/http",
+  "brazier/transport/ws",
 ]
 
 [dependencies]

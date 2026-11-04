@@ -5,7 +5,7 @@ __pycache__
 *.pyc
 
 /build
-/beacon_client/build
+/brazier_client/build
 /examples/*/build
 /examples/*/node_modules
 

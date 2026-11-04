@@ -1,7 +1,7 @@
 # Kanban Board
 
 A drag-and-drop board shared by every open tab, built with
-`beacon.full_application` and a `local.layer`.
+`brazier.full_application` and a `local.layer`.
 
 ## Features
 
@@ -15,7 +15,7 @@ A drag-and-drop board shared by every open tab, built with
 - The new-card draft is Local state too. A blank card is refused in the
   browser, and the server checks again: it rejects empty titles and titles
   over 100 characters.
-- The board is an append-only change log in a `beacon/store` list, replayed
+- The board is an append-only change log in a `brazier/store` list, replayed
   after a constant starting board. Concurrent edits from different tabs
   never overwrite each other. Each write broadcasts on the store's topic,
   and every session re-reads the log.
@@ -24,7 +24,7 @@ A drag-and-drop board shared by every open tab, built with
 
 ```bash
 cd examples/kanban
-gleam run -m beacon/build   # first, and after every change
+gleam run -m brazier/build   # first, and after every change
 gleam run
 ```
 

@@ -1,12 +1,12 @@
 ---
 name: stability
-description: Audit Beacon stability and reliability — concurrency, lifecycle, resource bounds, flakes, reconnects, ordering, backpressure, recovery, and production failure modes.
+description: Audit Brazier stability and reliability — concurrency, lifecycle, resource bounds, flakes, reconnects, ordering, backpressure, recovery, and production failure modes.
 user_invocable: true
 ---
 
 # Stability Audit
 
-Run a stability audit on Beacon as a long-running BEAM web framework. Focus on
+Run a stability audit on Brazier as a long-running BEAM web framework. Focus on
 whether real apps keep behaving predictably under concurrency, disconnects,
 slow clients, large state, repeated navigation, failed builds, and resource
 pressure.
@@ -27,7 +27,7 @@ pressure.
 
 ## Philosophy
 
-Beacon should be boring under stress:
+Brazier should be boring under stress:
 
 - First paint is SSR, then client rendering from state sync/patch messages.
 - No normal runtime HTML morph fallback.
@@ -39,7 +39,7 @@ Beacon should be boring under stress:
 
 Stability audits must distinguish:
 
-- **Framework stability risk** — Beacon could fail for users in production.
+- **Framework stability risk** — Brazier could fail for users in production.
 - **Test/harness flake** — the framework may be fine, but the check is timing
   sensitive or environment dependent.
 - **Example bug** — example code teaches or exercises an unreliable pattern.
@@ -48,8 +48,8 @@ Stability audits must distinguish:
 
 ### 1. Process Lifecycle
 
-Check `src/beacon/runtime.gleam`, `src/beacon/transport.gleam`,
-`src/beacon/application.gleam`, supervisors, and tests.
+Check `src/brazier/runtime.gleam`, `src/brazier/transport.gleam`,
+`src/brazier/application.gleam`, supervisors, and tests.
 
 - Are runtime processes spawned, linked, monitored, and stopped deliberately?
 - Are disconnects, reconnects, and duplicate joins handled deterministically?
@@ -60,7 +60,7 @@ Check `src/beacon/runtime.gleam`, `src/beacon/transport.gleam`,
 
 Flag:
 ```
-[HIGH][FRAMEWORK] src/beacon/runtime.gleam:421 — runtime can survive after last connection
+[HIGH][FRAMEWORK] src/brazier/runtime.gleam:421 — runtime can survive after last connection
   Risk: Long-lived apps leak BEAM processes under reconnect churn.
   Fix: Add deterministic shutdown on zero connections and test repeated connect/disconnect.
 ```
@@ -98,7 +98,7 @@ Check all network, runtime, PubSub, store, and build boundaries.
 
 ### 5. Client Runtime Stability
 
-Check `beacon_client/src`, generated bundles, and CDP tests.
+Check `brazier_client/src`, generated bundles, and CDP tests.
 
 - Does hydration run once and take ownership without replacing stable DOM
   repeatedly?
@@ -152,7 +152,7 @@ Classify flakes as harness, environment, or framework risks.
 Use `rg` first. Useful patterns:
 
 ```sh
-rg -n "sleep|timeout|timer|heartbeat|reconnect|disconnect|join|buffer|queue|limit|max_|spawn|monitor|link|send|receive|Error\\(_\\)|panic|todo|fallback|retry" src test beacon_client examples --glob '!**/build/**'
+rg -n "sleep|timeout|timer|heartbeat|reconnect|disconnect|join|buffer|queue|limit|max_|spawn|monitor|link|send|receive|Error\\(_\\)|panic|todo|fallback|retry" src test brazier_client examples --glob '!**/build/**'
 rg -n "MutationObserver|console|network|websocket|wait|sleep|timeout|shard|docker|boxd" test_all_cdp.py scripts .github
 ```
 
@@ -180,7 +180,7 @@ Severity:
 
 Scope:
 
-- `FRAMEWORK` — Beacon code can fail for users.
+- `FRAMEWORK` — Brazier code can fail for users.
 - `CLIENT` — browser runtime, hydration, DOM, or patch stability.
 - `EXAMPLE` — example app teaches or exercises an unstable pattern.
 - `TEST` — tests give flaky or incomplete stability signal.

@@ -1,4 +1,4 @@
-/// Middleware Demo: route-scoped HTTP middleware around a `beacon.simple`
+/// Middleware Demo: route-scoped HTTP middleware around a `brazier.simple`
 /// counter. Shows `group`, `only`, `except`, `at` and `methods`.
 ///
 /// Routes:
@@ -6,14 +6,14 @@
 ///   /admin/*    -> requires the `x-admin: true` header
 ///   /api/*      -> adds `x-api-version`; POST and PUT are refused
 ///   /healthz    -> health check (exact match)
-import beacon
-import beacon/api
-import beacon/attribute
-import beacon/element.{type Element}
-import beacon/event
-import beacon/html
-import beacon/log
-import beacon/middleware
+import brazier
+import brazier/api
+import brazier/attribute
+import brazier/element.{type Element}
+import brazier/event
+import brazier/html
+import brazier/log
+import brazier/middleware
 import gleam/http
 import gleam/http/request
 import gleam/http/response
@@ -32,7 +32,7 @@ pub type Msg {
   Decrement
 }
 
-fn init(_ctx: beacon.Context) -> Result(Model, beacon.InitError) {
+fn init(_ctx: brazier.Context) -> Result(Model, brazier.InitError) {
   Ok(Model(count: 0))
 }
 
@@ -183,24 +183,24 @@ fn block_writes() -> middleware.Middleware {
 
 pub fn main() {
   let assert Ok(Nil) =
-    beacon.simple(init:, update:, view:)
-    |> beacon.title(fn(_model) { "Middleware Demo" })
+    brazier.simple(init:, update:, view:)
+    |> brazier.title(fn(_model) { "Middleware Demo" })
     // Secure headers are already on by default; these run after them.
-    |> beacon.with_middleware(
+    |> brazier.with_middleware(
       middleware.group([
         middleware.request_id(),
         // Health probes are frequent, so they stay out of the request log.
         middleware.except("/healthz", middleware.logger()),
       ]),
     )
-    |> beacon.with_middleware(middleware.at("/healthz", health_handler()))
-    |> beacon.with_middleware(middleware.only("/admin", require_admin()))
-    |> beacon.with_middleware(middleware.only("/api", api_version()))
-    |> beacon.with_middleware(middleware.only(
+    |> brazier.with_middleware(middleware.at("/healthz", health_handler()))
+    |> brazier.with_middleware(middleware.only("/admin", require_admin()))
+    |> brazier.with_middleware(middleware.only("/api", api_version()))
+    |> brazier.with_middleware(middleware.only(
       "/api",
       middleware.methods([http.Post, http.Put], block_writes()),
     ))
-    |> beacon.head_html(favicon)
-    |> beacon.start(8080)
-    as "beacon.start failed (it logs the error)"
+    |> brazier.head_html(favicon)
+    |> brazier.start(8080)
+    as "brazier.start failed (it logs the error)"
 }

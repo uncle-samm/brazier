@@ -1,6 +1,6 @@
-import beacon/attribute
-import beacon/element.{type Element}
-import beacon/html
+import brazier/attribute
+import brazier/element.{type Element}
+import brazier/html
 import gleam/int
 
 pub fn view(visits: Int) -> Element(msg) {

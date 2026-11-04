@@ -1,6 +1,6 @@
-# Beacon Conformance Matrix
+# Brazier Conformance Matrix
 
-Beacon's framework contract is tested through a small set of canonical apps.
+Brazier's framework contract is tested through a small set of canonical apps.
 Each canonical app must cover a real composition of features, not isolated smoke
 checks.
 
@@ -42,7 +42,7 @@ PYTHONUNBUFFERED=1 .venv/bin/python test_all_cdp.py --canonical --viewport mobil
 ```
 
 For a narrower loop, use `make browser-canonical-desktop`,
-`make browser-canonical-mobile`, or set `BEACON_CDP_VIEWPORTS`.
+`make browser-canonical-mobile`, or set `BRAZIER_CDP_VIEWPORTS`.
 
 The canonical target intentionally runs the contract examples only. To exercise
 every example covered by `test_all_cdp.py`, run the full matrix:
@@ -61,7 +61,7 @@ PYTHONUNBUFFERED=1 .venv/bin/python test_all_cdp.py canvas --viewport desktop
 For container-parallel CI, shard the selected example list with `--shard`:
 
 ```sh
-BEACON_CDP_VIEWPORTS=desktop BEACON_CDP_SHARD=1/4 make browser-all-shard
+BRAZIER_CDP_VIEWPORTS=desktop BRAZIER_CDP_SHARD=1/4 make browser-all-shard
 PYTHONUNBUFFERED=1 .venv/bin/python test_all_cdp.py --canonical --shard 2/4
 ```
 
@@ -71,15 +71,15 @@ optional canonical/filter selection.
 For local per-container sharding, use the Docker runner:
 
 ```sh
-BEACON_CDP_TOTAL_SHARDS=23 BEACON_CDP_VIEWPORTS=desktop BEACON_CDP_PARALLEL=5 make browser-all-docker-shards
+BRAZIER_CDP_TOTAL_SHARDS=23 BRAZIER_CDP_VIEWPORTS=desktop BRAZIER_CDP_PARALLEL=5 make browser-all-docker-shards
 ```
 
 The Docker runner also supports selected shard lists and warmed images:
 
 ```sh
-BEACON_CDP_SHARDS="1,6,11" BEACON_CDP_TOTAL_SHARDS=23 make browser-all-docker-shards
-BEACON_CDP_PREBUILD_EXAMPLES=1 BEACON_CDP_TOTAL_SHARDS=23 make browser-all-docker-shards
-BEACON_CDP_SKIP_DOCKER_BUILD=1 BEACON_CDP_DOCKER_IMAGE=beacon-cdp:boxd make browser-all-docker-shards
+BRAZIER_CDP_SHARDS="1,6,11" BRAZIER_CDP_TOTAL_SHARDS=23 make browser-all-docker-shards
+BRAZIER_CDP_PREBUILD_EXAMPLES=1 BRAZIER_CDP_TOTAL_SHARDS=23 make browser-all-docker-shards
+BRAZIER_CDP_SKIP_DOCKER_BUILD=1 BRAZIER_CDP_DOCKER_IMAGE=brazier-cdp:boxd make browser-all-docker-shards
 ```
 
 Latest measured local timings on the 10 CPU / 16 GB development host:
@@ -98,14 +98,14 @@ base image but before example build artifacts were baked into the image:
 - Aggregate run was not accepted: several examples timed out at startup during
   first compile, and Pong had one timing assertion failure on one worker.
 - Conclusion: Boxd has enough aggregate CPU/RAM, but the runner must use
-  `BEACON_CDP_PREBUILD_EXAMPLES=1` on the base image and
-  `BEACON_CDP_SKIP_DOCKER_BUILD=1` on forks before comparing throughput.
+  `BRAZIER_CDP_PREBUILD_EXAMPLES=1` on the base image and
+  `BRAZIER_CDP_SKIP_DOCKER_BUILD=1` on forks before comparing throughput.
 
 Latest Boxd measurement after baking example build artifacts and skipping the
 Docker image probe on forks:
 
 - 22 of 23 shards passed; slowest VM completed in 5:42.
-- The remaining shard exposed a real Beacon auto-build bug:
+- The remaining shard exposed a real Brazier auto-build bug:
   `route_server_workspace` selected an imported route page as the app module.
 - After fixing app-module discovery, focused shard 22 passed in 1:14.
 
@@ -113,7 +113,7 @@ CDP example startup is part of the assertion surface. If an attempted example
 server exits or fails to become ready before timeout, the browser run fails.
 
 CI should run `make browser-canonical` after `gleam build`, `gleam test`, and
-`gleam run -m beacon/lint`. Set `CHROME_BIN`, `CDP_PORT`, or `PYTHON_BIN`
+`gleam run -m brazier/lint`. Set `CHROME_BIN`, `CDP_PORT`, or `PYTHON_BIN`
 explicitly when the CI image does not expose the defaults.
 
 ## Auth Workspace Contract
@@ -126,14 +126,14 @@ following guarantees:
   `auth_workspace_login_csrf` cookie on a page load, and the login form
   carries it. `POST /api/login` answers 403 unless the form's `csrf` field
   matches that cookie; on success it creates a server-side session, sets
-  `beacon_session` as an HttpOnly cookie and deletes the login CSRF cookie.
-- `GET /api/me` requires `beacon_session`.
+  `brazier_session` as an HttpOnly cookie and deletes the login CSRF cookie.
+- `GET /api/me` requires `brazier_session`.
 - `POST /api/profile` requires the authenticated session and matching CSRF token.
 - `POST /api/logout` requires CSRF, deletes the server session, and clears the cookie.
-- A WebSocket upgrade without `beacon_session` connects as a guest
+- A WebSocket upgrade without `brazier_session` connects as a guest
   (`auth.allow_guests_ws`); one with a signed-in session is bound to it, so
   logout closes the socket.
-- `init` loads the account from `beacon_session` through
+- `init` loads the account from `brazier_session` through
   `auth.init_from_session`, on the HTML render and on the connected mount. A
   session store that cannot answer refuses the page with 503 and the socket
   with close code 4503.
@@ -167,7 +167,7 @@ The permanent harness now asserts:
 - Reconnect tests force a real browser WebSocket close, wait for the reconnect
   `join`, then prove the app remains interactive without duplicate model events.
   The forced-close hook is only enabled when the CDP harness injects
-  `window.__BEACON_ENABLE_TEST_HOOKS`.
+  `window.__BRAZIER_ENABLE_TEST_HOOKS`.
 
 Latest routed slice run:
 

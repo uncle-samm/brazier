@@ -13,7 +13,7 @@ A change is done when all of the following pass:
 - `gleam build --warnings-as-errors`
 - `gleam format --check src test`
 - `gleam test`
-- `gleam run -m beacon/lint`
+- `gleam run -m brazier/lint`
 - the CDP suite
 
 CI runs the same steps (see [CI](#ci)).
@@ -25,17 +25,17 @@ running it, so a missing node is a test failure, never a skip. Several
 tests depend on it:
 
 - `patch_test`: runs the client's patch application on server-made vectors
-  (`beacon_client/test/patch_vectors.mjs`) and its patch safety checks
+  (`brazier_client/test/patch_vectors.mjs`) and its patch safety checks
   (`patch_safety.mjs`).
 - `runtime_versioning_test`: runs the client sync state machine
   (`sync_vectors.mjs`) and its FFI harness (`ffi_harness.mjs`).
 - `build_fixture_test`: also needs **npx**, which runs the pinned esbuild
-  (`esbuild@0.25.12` in `src/beacon/build/program.gleam`) exactly as
-  `beacon/build` does. The first run downloads it into the npx cache.
+  (`esbuild@0.25.12` in `src/brazier/build/program.gleam`) exactly as
+  `brazier/build` does. The first run downloads it into the npx cache.
 
 `make test-client` runs `ffi_harness.mjs` and `patch_safety.mjs` directly.
 These are the client checks that need no Gleam-generated input. It is the
-quick loop when you are changing `beacon_client/src`, and it fails
+quick loop when you are changing `brazier_client/src`, and it fails
 immediately, by name, when node is missing.
 
 The CDP suite needs Chrome and the project-local Python environment
@@ -63,9 +63,9 @@ These follow CLAUDE.md, applied to tests.
   passes, the test crashes and says what it waited for and what arrived
   instead.
 
-## Waiting for events: `beacon/await`
+## Waiting for events: `brazier/await`
 
-`test/beacon/await.gleam` follows the ExUnit and LiveView test helpers. A
+`test/brazier/await.gleam` follows the ExUnit and LiveView test helpers. A
 passing test never waits a deadline out. The deadline
 (`await.deadline_ms`, 5000 ms) is generous enough that the flake gate's
 busy loops never trip it.
@@ -80,7 +80,7 @@ busy loops never trip it.
 | `watch_info(pid, atom)` + `expect_info` | Wait for an OTP process to receive and handle a timer tick (through the sys debug hook) instead of sleeping past its interval. |
 | `watch_exit(sup, child)` + `expect_info` | Wait for a supervisor to handle a child's exit, i.e. to have restarted it. |
 | `watch_pg_scope` + `expect_pg_leave` | Wait for pg to drop an exited member before reading group membership. |
-| `until_telemetry(events, what, condition)` | Re-check state that another process updates and then announces with a telemetry event (e.g. an HTTP slot released before `[beacon, http, connection, closed]`). |
+| `until_telemetry(events, what, condition)` | Re-check state that another process updates and then announces with a telemetry event (e.g. an HTTP slot released before `[brazier, http, connection, closed]`). |
 
 A bounded wait for *nothing* to arrive is still a time window. Use one
 only after a barrier proves that the work which could produce the
@@ -88,7 +88,7 @@ message is done.
 
 Example: a runtime test, connected through a fake transport subject:
 
-<!-- docs-check: fragment uses the test-only helpers in test/beacon (test_ctx, await), which apps cannot import -->
+<!-- docs-check: fragment uses the test-only helpers in test/brazier (test_ctx, await), which apps cannot import -->
 ```gleam
 let assert Ok(rt) = runtime.start(config, test_ctx.root())
 let transport_subject = process.new_subject()
@@ -112,7 +112,7 @@ also assert that a live join and normal post-mount updates send no
 Client-sent `ops` are untrusted. Runtime tests send malicious ops and
 assert that the server-computed update wins.
 
-## Capturing logs: `beacon/log_capture`
+## Capturing logs: `brazier/log_capture`
 
 `log_capture.capture(fun)` runs `fun` and returns its result together with
 every log event the calling process emitted while it ran, as
@@ -120,13 +120,13 @@ every log event the calling process emitted while it ran, as
 primary logger level so that debug events are captured. `log_capture.has`
 checks for a level plus message fragments.
 
-<!-- docs-check: fragment uses the test-only helpers in test/beacon (log_capture), which apps cannot import -->
+<!-- docs-check: fragment uses the test-only helpers in test/brazier (log_capture), which apps cannot import -->
 ```gleam
 let #(Nil, logs) = log_capture.capture(fn() { log.warning("my_mod", "slow") })
 assert logs == [Captured(level: "warning", message: "[my_mod] slow")]
 ```
 
-The test runner (`test/beacon_test.gleam`) sets the logger to `critical`
+The test runner (`test/brazier_test.gleam`) sets the logger to `critical`
 to keep output quiet. Do not call `log.configure()` in a test: it resets
 that level for every test that runs after it.
 
@@ -135,7 +135,7 @@ that level for every test that runs after it.
 Round-trip the wire protocol, including malformed and hostile input:
 
 <!-- docs-check: wrap
-import beacon/transport
+import brazier/transport
 
 {{block}}
 -->
@@ -154,12 +154,12 @@ The security transport tests cover:
 - RFC 6455 frame validation;
 - HTTP pre-upgrade limits.
 
-## Simulation tests (`beacon/sim`)
+## Simulation tests (`brazier/sim`)
 
 These tests drive real WebSocket connections against an app started on an
 OS-assigned port:
 
-<!-- docs-check: fragment uses the test-only helpers in test/beacon (sim/test_app, sim/pool, sim/metrics, sim/teardown), which apps cannot import -->
+<!-- docs-check: fragment uses the test-only helpers in test/brazier (sim/test_app, sim/pool, sim/metrics, sim/teardown), which apps cannot import -->
 ```gleam
 let assert Ok(app) = test_app.start_counter_app()
 let mt = metrics.new()
@@ -176,7 +176,7 @@ let assert [] = result.failures
 the pool opened and every process those connections reported has exited.
 Leak snapshots taken after it measure cleanup that has finished, not
 cleanup that a sleep hoped had finished. See `run_measured` in
-`test/beacon/sim_test.gleam`.
+`test/brazier/sim_test.gleam`.
 
 The 1000-connection test requires all 1000 connections to succeed and all
 5000 events to be acknowledged, with no leaked processes.
@@ -193,7 +193,7 @@ Scenarios:
 - `server_push(ms)`
 - `corrupt()`
 
-## Stress tests (`beacon/stress`)
+## Stress tests (`brazier/stress`)
 
 `stress.run` opens N joined connections. On each it sends M events and
 waits for the patch acknowledging each one. It holds all connections open
@@ -206,14 +206,14 @@ result reports:
 - events acknowledged;
 - process count and memory, before the run and while everything was held.
 
-`test/beacon/stress_test.gleam` asserts on these values and on process
+`test/brazier/stress_test.gleam` asserts on these values and on process
 identity, not on node-wide count deltas.
 
 Against a running server:
 
 ```sh
 gleam run -m counter        # in examples/counter
-gleam run -m beacon/stress  # in the repository root; exits non-zero on any failure
+gleam run -m brazier/stress  # in the repository root; exits non-zero on any failure
 ```
 
 ## Flake gate
@@ -240,7 +240,7 @@ as a flake.
 A listener restarted under load used to hit `eaddrinuse`, because the
 acceptors owned the listen socket and the runtime closed it some time after
 they exited. The socket now has an owner process of its own
-(`beacon_http_listen_socket`) that closes it before it exits, so a restart
+(`brazier_http_listen_socket`) that closes it before it exits, so a restart
 on the same port never races the old socket; an `eaddrinuse` in a test run
 is another process on the port.
 
@@ -252,7 +252,7 @@ Protocol (`test_all_cdp.py`):
 ```sh
 make browser-canonical  # contract examples, desktop + mobile
 make browser-all        # every example, desktop + mobile
-PYTHON_BIN=.venv/bin/python BEACON_CDP_VIEWPORTS=desktop sh scripts/run_all_cdp.sh
+PYTHON_BIN=.venv/bin/python BRAZIER_CDP_VIEWPORTS=desktop sh scripts/run_all_cdp.sh
 PYTHONUNBUFFERED=1 .venv/bin/python test_all_cdp.py auth_workspace --viewport desktop
 ```
 
@@ -264,12 +264,12 @@ Narrower loops: `make browser-canonical-desktop`,
 
 For each example:
 
-1. **Build.** It runs `gleam run -m beacon/build` in the example, so the
-   client bundle and `build/beacon_contract.json` exist and match the
-   source. A build failure or timeout (`BEACON_CDP_BUILD_TIMEOUT`, 300 s)
+1. **Build.** It runs `gleam run -m brazier/build` in the example, so the
+   client bundle and `build/brazier_contract.json` exist and match the
+   source. A build failure or timeout (`BRAZIER_CDP_BUILD_TIMEOUT`, 300 s)
    fails the example and prints the build output.
 2. **Start.** It starts the server and waits for its started line. If the
-   line does not come within `BEACON_CDP_SERVER_TIMEOUT` (90 s), or the
+   line does not come within `BRAZIER_CDP_SERVER_TIMEOUT` (90 s), or the
    server dies, the example fails and the last 40 lines of server output
    are printed.
 3. **Check.** It opens the page, acts on it, and asserts the concrete
@@ -292,13 +292,13 @@ counts as a failure) and 0 otherwise.
 
 The harness uses Playwright's auto-wait model. After an action, a check
 re-evaluates its condition, reading CDP events in between, until it holds
-or `BEACON_CDP_WAIT_SECONDS` (default 10) passes. A passing check returns
+or `BRAZIER_CDP_WAIT_SECONDS` (default 10) passes. A passing check returns
 immediately.
 
 A check that the browser sent *no* model event waits on the client, not on
 a quiet period: after the local update is visible, `wait_outbound_drained`
-waits until `window.__beaconOutboundPendingForTest()` (behind
-`__BEACON_ENABLE_TEST_HOOKS`) reports an empty paced queue and no scheduled
+waits until `window.__brazierOutboundPendingForTest()` (behind
+`__BRAZIER_ENABLE_TEST_HOOKS`) reports an empty paced queue and no scheduled
 send, then takes a CDP barrier so every frame written before it is
 recorded. The hook does not yet count a debounced send whose timer has not
 fired (see [TODO.md](TODO.md)).
@@ -315,25 +315,25 @@ The full matrix shards deterministically. Use one container per shard so
 each shard has its own ports:
 
 ```sh
-BEACON_CDP_VIEWPORTS=desktop BEACON_CDP_SHARD=1/4 make browser-all-shard
+BRAZIER_CDP_VIEWPORTS=desktop BRAZIER_CDP_SHARD=1/4 make browser-all-shard
 make browser-all-docker-shards
-BEACON_CDP_TOTAL_SHARDS=23 BEACON_CDP_VIEWPORTS=desktop BEACON_CDP_PARALLEL=5 make browser-all-docker-shards
+BRAZIER_CDP_TOTAL_SHARDS=23 BRAZIER_CDP_VIEWPORTS=desktop BRAZIER_CDP_PARALLEL=5 make browser-all-docker-shards
 ```
 
 Docker runner knobs:
 
-- `BEACON_CDP_SHARDS="1,6,11"` runs a selected shard list from the
+- `BRAZIER_CDP_SHARDS="1,6,11"` runs a selected shard list from the
   configured total (for multi-VM runners).
-- `BEACON_CDP_PREBUILD_EXAMPLES=1` bakes `gleam build` output for the root
+- `BRAZIER_CDP_PREBUILD_EXAMPLES=1` bakes `gleam build` output for the root
   package and every example into the image, which avoids per-shard first
   compiles.
-- `BEACON_CDP_SKIP_DOCKER_BUILD=1` reuses an existing image and fails if
+- `BRAZIER_CDP_SKIP_DOCKER_BUILD=1` reuses an existing image and fails if
   it is missing. Use it only with warmed images, such as forked Boxd
   workers.
-- `BEACON_CDP_KILL_PORT=1` kills whatever holds the app port. Use it only
+- `BRAZIER_CDP_KILL_PORT=1` kills whatever holds the app port. Use it only
   when you are deliberately cleaning up a stuck local port.
 
-On the 10-CPU, 16 GB development host, `BEACON_CDP_PARALLEL=5` is the
+On the 10-CPU, 16 GB development host, `BRAZIER_CDP_PARALLEL=5` is the
 measured stable setting. Higher local parallelism ran faster but was
 unreliable:
 
@@ -345,17 +345,17 @@ For Boxd-style VM fan-out:
 1. Build a warmed image once:
 
    ```sh
-   BEACON_CDP_DOCKER_IMAGE=beacon-cdp:boxd BEACON_CDP_PREBUILD_EXAMPLES=1 \
-     BEACON_CDP_TOTAL_SHARDS=23 BEACON_CDP_SHARDS=1 BEACON_CDP_PARALLEL=1 \
+   BRAZIER_CDP_DOCKER_IMAGE=brazier-cdp:boxd BRAZIER_CDP_PREBUILD_EXAMPLES=1 \
+     BRAZIER_CDP_TOTAL_SHARDS=23 BRAZIER_CDP_SHARDS=1 BRAZIER_CDP_PARALLEL=1 \
      sh scripts/run_cdp_shards_docker.sh
    ```
 
 2. Fork the VM and run non-overlapping shard lists on each fork:
 
    ```sh
-   BEACON_CDP_DOCKER_IMAGE=beacon-cdp:boxd BEACON_CDP_SKIP_DOCKER_BUILD=1 \
-     BEACON_CDP_TOTAL_SHARDS=23 BEACON_CDP_SHARDS="1,6,11,16,21" \
-     BEACON_CDP_PARALLEL=2 sh scripts/run_cdp_shards_docker.sh
+   BRAZIER_CDP_DOCKER_IMAGE=brazier-cdp:boxd BRAZIER_CDP_SKIP_DOCKER_BUILD=1 \
+     BRAZIER_CDP_TOTAL_SHARDS=23 BRAZIER_CDP_SHARDS="1,6,11,16,21" \
+     BRAZIER_CDP_PARALLEL=2 sh scripts/run_cdp_shards_docker.sh
    ```
 
 ## Benchmarks
@@ -376,10 +376,10 @@ baseline and how tolerances are chosen.
   3. `make test-client`
   4. `gleam build --warnings-as-errors`
   5. `gleam test`
-  6. `gleam run -m beacon/lint`
+  6. `gleam run -m brazier/lint`
   7. `scripts/check_docs.sh`
 - **Browser all.** 23 shards at each viewport (desktop and mobile), each
-  running `make browser-all-shard` with `BEACON_CDP_VIEWPORTS` set to the
+  running `make browser-all-shard` with `BRAZIER_CDP_VIEWPORTS` set to the
   viewport.
 
 ## Deliberate waits
@@ -391,6 +391,6 @@ These are the waits that remain, and why.
 | `rate_limit_test` sweep | `process.sleep(1100)` | Rate-limit windows are wall-clock seconds; the window rolling over is under test. |
 | `ws_protocol_test` idle timeout | 4 × `process.sleep(550)` | Wall-clock time must pass the idle timeout while only heartbeats arrive. |
 | `ws_protocol_test` idle session | `process.sleep(80)` | The session idle TTL is wall-clock time, and the store has no clock to advance. |
-| `beacon/stress` | `hold_duration_ms` | Holding connections open is the load being measured (0 in tests). |
-| `beacon/sim` pool | `stagger_ms` | Connection pacing is part of the scenario. |
+| `brazier/stress` | `hold_duration_ms` | Holding connections open is the load being measured (0 in tests). |
+| `brazier/sim` pool | `stagger_ms` | Connection pacing is part of the scenario. |
 | CDP pong pause | see [Waiting](#waiting) | The stillness is under test. |

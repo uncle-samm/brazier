@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Check the docs mechanically:
 #   1. every relative link and backticked `.md` path resolves (and its #anchor);
-#   2. every ```gleam sample compiles against the current Beacon API, with
+#   2. every ```gleam sample compiles against the current Brazier API, with
 #      zero warnings, in a scratch project at build/docs_check.
 #
 # Usage: scripts/check_docs.sh [links | samples [DOC...] | all]   (default: all)

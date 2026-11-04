@@ -1,4 +1,4 @@
-# Beacon
+# Brazier
 
 Full-stack Gleam web framework on BEAM. MVU architecture, one process per session, WebSocket transport.
 
@@ -41,7 +41,7 @@ root `gleam run`; run an app from `examples/` (see `README.md`).
 ```sh
 gleam build                    # Must exit 0 with zero warnings
 gleam format --check src test  # Must exit 0
-gleam run -m beacon/lint       # Must report 0 violations
+gleam run -m brazier/lint       # Must report 0 violations
 gleam test                     # Must exit 0 with all tests passing (needs node and npx)
 scripts/check_docs.sh          # Doc samples compile, doc links resolve
 ```
@@ -116,7 +116,7 @@ Non-negotiable. Every change must follow these.
 
 1. `gleam build` exits 0 with **zero warnings**
 2. `gleam test` exits 0 with **all tests passing**
-3. `gleam format --check src test`, `gleam run -m beacon/lint` and `scripts/check_docs.sh` pass
+3. `gleam format --check src test`, `gleam run -m brazier/lint` and `scripts/check_docs.sh` pass
 4. `docs/PROGRESS.md` is updated — completed tasks checked off
 5. No debug leftovers, no `todo` or `panic` in shipped code
 6. All new code has error handling, logging, and assertions per principles above

@@ -1,23 +1,24 @@
 #!/usr/bin/env sh
 # Run the browser (CDP) conformance harness, test_all_cdp.py, against a
-# temporary headless Chrome, once per viewport in BEACON_CDP_VIEWPORTS.
+# temporary headless Chrome, once per viewport in BRAZIER_CDP_VIEWPORTS.
 #
 # Usage: scripts/run_all_cdp.sh [test_all_cdp.py ARGS...]
 #   scripts/run_canonical_cdp.sh is this script with --canonical.
 #
 # Environment: PYTHON_BIN, CDP_PORT (9223), CHROME_BIN, CHROME_PROFILE_DIR,
-# CHROME_EXTRA_ARGS, BEACON_CDP_VIEWPORTS ("desktop mobile").
+# CHROME_EXTRA_ARGS, BRAZIER_CDP_VIEWPORTS ("desktop mobile").
 #
 # POSIX sh on purpose: the Makefile and the Dockerfile.ci container run it
 # with `sh`.
 set -eu
 
 ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+. "$ROOT/scripts/refuse_renamed_env.sh"
 PYTHON_BIN="${PYTHON_BIN:-$ROOT/.venv/bin/python}"
 CDP_PORT="${CDP_PORT:-9223}"
 PROFILE_DIR="${CHROME_PROFILE_DIR:-$ROOT/.tmp/chrome-cdp-profile}"
 CHROME_LOG="$ROOT/.tmp/cdp-chrome-$CDP_PORT.log"
-VIEWPORTS="${BEACON_CDP_VIEWPORTS:-desktop mobile}"
+VIEWPORTS="${BRAZIER_CDP_VIEWPORTS:-desktop mobile}"
 
 if [ ! -x "$PYTHON_BIN" ]; then
   echo "missing executable Python environment: $PYTHON_BIN" >&2
@@ -97,6 +98,6 @@ fi
 
 cd "$ROOT"
 for VIEWPORT in $VIEWPORTS; do
-  echo "== Beacon browser conformance: viewport=$VIEWPORT args=[$*] =="
+  echo "== Brazier browser conformance: viewport=$VIEWPORT args=[$*] =="
   PYTHONUNBUFFERED=1 "$PYTHON_BIN" test_all_cdp.py --viewport "$VIEWPORT" "$@"
 done

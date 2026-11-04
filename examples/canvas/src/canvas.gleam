@@ -4,19 +4,19 @@
 ///   stroke costs no traffic while it is drawn;
 /// - a finished stroke forwarded to the server in one message, which the
 ///   view builds from Local state;
-/// - strokes shared by every session in a `beacon/store` list, re-read when
+/// - strokes shared by every session in a `brazier/store` list, re-read when
 ///   any session draws or clears;
-/// - SVG rendering with `beacon/svg`.
-import beacon
-import beacon/attribute
-import beacon/effect.{type Effect}
-import beacon/element.{type Element}
-import beacon/event
-import beacon/html
-import beacon/local
-import beacon/log
-import beacon/store.{type ListStore}
-import beacon/svg
+/// - SVG rendering with `brazier/svg`.
+import brazier
+import brazier/attribute
+import brazier/effect.{type Effect}
+import brazier/element.{type Element}
+import brazier/event
+import brazier/html
+import brazier/local
+import brazier/log
+import brazier/store.{type ListStore}
+import brazier/svg
 import gleam/dynamic/decode
 import gleam/float
 import gleam/int
@@ -105,7 +105,7 @@ fn read_strokes(strokes: ListStore(Stroke)) -> List(Stroke) {
 
 fn init(
   strokes: ListStore(Stroke),
-) -> Result(#(Model, Effect(Msg)), beacon.InitError) {
+) -> Result(#(Model, Effect(Msg)), brazier.InitError) {
   Ok(#(Model(strokes: read_strokes(strokes), pen_ups: 0), effect.none()))
 }
 
@@ -439,17 +439,17 @@ fn colour_button(colour: String, selected: String) -> Element(Msg) {
 pub fn main() {
   let strokes = store.new_list("canvas_strokes")
   let assert Ok(Nil) =
-    beacon.full_application(
+    brazier.full_application(
       init: fn(_ctx) { init(strokes) },
       update: fn(model, msg) { update(strokes, model, msg) },
       sync:,
       local: local.layer(init: init_local, update: update_local),
       view:,
     )
-    |> beacon.title(fn(_model) { "Collaborative Canvas" })
-    |> beacon.subscriptions(fn(_model) { [store.list_topic(strokes)] })
-    |> beacon.on_notify(fn(_topic) { StrokesChanged })
-    |> beacon.head_html(favicon)
-    |> beacon.start(8080)
-    as "beacon.start failed (it logs the error)"
+    |> brazier.title(fn(_model) { "Collaborative Canvas" })
+    |> brazier.subscriptions(fn(_model) { [store.list_topic(strokes)] })
+    |> brazier.on_notify(fn(_topic) { StrokesChanged })
+    |> brazier.head_html(favicon)
+    |> brazier.start(8080)
+    as "brazier.start failed (it logs the error)"
 }

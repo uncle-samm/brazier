@@ -1,6 +1,6 @@
 # Multi-File Kanban
 
-A per-session kanban board built with `beacon.simple`, whose `Card` and
+A per-session kanban board built with `brazier.simple`, whose `Card` and
 `Column` types live in a separate domain module.
 
 ## Features
@@ -27,7 +27,7 @@ between sessions.
 
 ```bash
 cd examples/multi_kanban
-gleam run -m beacon/build   # first, and after every change
+gleam run -m brazier/build   # first, and after every change
 gleam run
 ```
 

@@ -1,12 +1,12 @@
 ---
 name: performance
-description: Audit Beacon performance — first page load, SSR, hydration, final render, WebSocket throughput, high-frequency apps, multi-user load, CPU, RAM, allocations, and benchmark quality.
+description: Audit Brazier performance — first page load, SSR, hydration, final render, WebSocket throughput, high-frequency apps, multi-user load, CPU, RAM, allocations, and benchmark quality.
 user_invocable: true
 ---
 
 # Performance Audit
 
-Run a performance audit on Beacon as a full-stack Gleam framework. Focus on
+Run a performance audit on Brazier as a full-stack Gleam framework. Focus on
 user-visible latency, throughput, CPU/RAM efficiency, allocation pressure, and
 whether current tests can prove performance under realistic load.
 
@@ -29,7 +29,7 @@ whether current tests can prove performance under realistic load.
 
 ## Philosophy
 
-Beacon should be fast by construction:
+Brazier should be fast by construction:
 
 - SSR must make first paint useful without waiting for WebSocket hydration.
 - Hydration should take over once and avoid visible flicker.
@@ -64,7 +64,7 @@ Check SSR, static assets, generated bundles, and startup path.
 
 Flag:
 ```text
-[HIGH][FIRST-LOAD] src/beacon/ssr.gleam:180 — full model serialized twice before first paint
+[HIGH][FIRST-LOAD] src/brazier/ssr.gleam:180 — full model serialized twice before first paint
   Impact: Large models pay avoidable CPU and latency on every initial request.
   Measure: Add SSR benchmark with 1KB, 100KB, and 1MB model JSON.
   Fix: Reuse encoded model or generate only the HttpOnly recovery payload needed.
@@ -72,7 +72,7 @@ Flag:
 
 ### 2. Hydration And Final Render
 
-Check `beacon_client/src`, generated client app code, and CDP traces.
+Check `brazier_client/src`, generated client app code, and CDP traces.
 
 - Hydration must run once and attach event handlers without replacing stable DOM.
 - First `ServerModelSync` should not cause visible flicker when it matches SSR.
@@ -135,9 +135,9 @@ For each scenario, record:
 
 ### 5. Server Hot Paths
 
-Check `src/beacon/runtime.gleam`, `src/beacon/transport.gleam`,
-`src/beacon/patch.gleam`, `src/beacon/element.gleam`,
-`src/beacon/view.gleam`, build/codegen, stores, and PubSub.
+Check `src/brazier/runtime.gleam`, `src/brazier/transport.gleam`,
+`src/brazier/patch.gleam`, `src/brazier/element.gleam`,
+`src/brazier/view.gleam`, build/codegen, stores, and PubSub.
 
 - Full view render per event vs dirty/substate render.
 - JSON encode/decode cost and repeated serialization.
@@ -160,7 +160,7 @@ Look for accidental O(n²) behavior in:
 
 ### 6. Client Hot Paths
 
-Check `beacon_client/src/*.mjs` and generated bundles.
+Check `brazier_client/src/*.mjs` and generated bundles.
 
 - Patch apply complexity and allocation.
 - DOM query frequency and selector/path lookup cost.
@@ -169,7 +169,7 @@ Check `beacon_client/src/*.mjs` and generated bundles.
 - Large text/list update behavior.
 - Local-only state update cost without WebSocket traffic.
 - Browser memory growth after long sessions.
-- Animation/game loop compatibility: Beacon should not block the main thread.
+- Animation/game loop compatibility: Brazier should not block the main thread.
 
 For game-like apps, prefer:
 
@@ -194,7 +194,7 @@ Performance tests must be repeatable and actionable.
 Flag weak benchmarks:
 
 ```text
-[MEDIUM][BENCHMARK] test/beacon/sim/load_test.gleam:88 — only asserts no crash
+[MEDIUM][BENCHMARK] test/brazier/sim/load_test.gleam:88 — only asserts no crash
   Impact: A 10x latency regression would still pass.
   Measure: Track events/sec, p95 latency, RAM/session, and mailbox growth.
   Fix: Add thresholds and write a summary artifact.
@@ -229,7 +229,7 @@ If instrumentation is missing, report it as a performance blocker.
 Use `rg` first. Useful patterns:
 
 ```sh
-rg -n "render|to_string|json|encode|decode|diff|patch|sync|broadcast|pubsub|send|receive|timer|sleep|batch|queue|mailbox|memory|byte_size|length|map|fold|append|concat" src beacon_client test examples --glob '!**/build/**'
+rg -n "render|to_string|json|encode|decode|diff|patch|sync|broadcast|pubsub|send|receive|timer|sleep|batch|queue|mailbox|memory|byte_size|length|map|fold|append|concat" src brazier_client test examples --glob '!**/build/**'
 rg -n "performance|mark|measure|MutationObserver|requestAnimationFrame|WebSocket|network|cpu|memory|shard|load|users|latency|p95|p99" test_all_cdp.py scripts docs .github
 ```
 
