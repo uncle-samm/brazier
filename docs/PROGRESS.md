@@ -284,6 +284,18 @@
     - Wave 3: wire and encoding performance, PERF-2 and PERF-6. Raw JSON envelopes need a wire version bump.
     - Wave 4: PERF-9, which closes the bench gate's gaps (benches for large models, SSR, static files, client render and CRDT; no ungated metrics) and re-baselines. Then a sweep of the remaining TS-12 items.
     - PERF-11 (about 0.5µs of telemetry span cost per event with no handler) is accepted within the overhead budget already recorded, and is not fixed.
+  - [x] fix-crdt (PERF-7), merged as 461baf2.
+    - The fix: `join_keys` finds removed dots from whichever is smaller, the delta's context or the key. This is the delta-state dot-set join (Almeida, Shoker and Baquero; delta_crdt_ex `join_dot_sets`).
+    - Effect: an append to a 10,000-value key went from 2184µs to 0.99µs, and the peer's join is just as flat. `join_full` gives unchanged results.
+    - Tests: an oracle comparison against the old join over 20 seeds × 500 steps on 3 replicas, the algebra laws, and reduction-count cost bounds.
+    - Coordinator verify on the branch (a fast-forward of bf1b9a2): clean build with zero warnings, format and lint clean, 1538 tests passing in each of 3 runs.
+    - Decisions:
+      - a clock entry covers only counters of 1 and above;
+      - the order of changes returned by `crdt.join` is unspecified;
+      - the new `store.crdt_append.*` bench metrics need a baseline (PERF-9 owner).
+    - Follow-ups:
+      - `brazier_store_replica.erl` does not validate the shape of incoming peer deltas;
+      - `compact` sorts the whole cloud on every join.
 - [ ] Final verification: build (zero warnings), tests, all examples, CDP browser suite, perf baselines
 
 **Decisions (Milestone 117, coordinator):**
