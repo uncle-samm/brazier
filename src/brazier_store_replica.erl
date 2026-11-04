@@ -17,7 +17,9 @@
 %% {brazier_store, Kind, FromNode, ...}:
 %%
 %%   delta     broadcast after every local write: {delta, From, Delta}
-%%   digest    broadcast every sync_interval_ms: a hash of the state
+%%   digest    broadcast every sync_interval_ms: the state's digest
+%%             (brazier/store/crdt.digest, kept up to date by every join,
+%%             so a tick never walks the state)
 %%   sync_req  "send me your full state": broadcast when the replica starts,
 %%             sent directly once a connected node passes the cluster peer
 %%             check (brazier_cluster_ffi:await_verified/1) and when a
@@ -37,7 +39,9 @@
 %% Every remote merge runs inside the [brazier, store, sync] span and is
 %% refused (logged, not merged) when the payload is malformed (see
 %% check_payload/2), larger than max_delta_bytes / max_sync_bytes, or would
-%% grow the replica past max_entries. A refused merge leaves the digests
+%% grow the replica past max_entries. The span's stop metadata says which:
+%% `result` is malformed, too_large, too_many_entries or ok, and `reason`
+%% the failing field or limit. A refused merge leaves the digests
 %% different, so the next exchange retries it, and logs again.
 %%
 %% A peer's payload is checked field by field before anything reads it:
@@ -55,7 +59,7 @@
 -export([start/3, start_link/1, stop/1, call/2,
          put/3, remove/3, append/4, config/1, digest/1, size/1,
          read_get/2, read_get_all/2, read_count/1, names/2,
-         check_payload/2]).
+         check_payload/2, admit/4]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -define(CRDT, 'brazier@store@crdt').
@@ -251,8 +255,7 @@ init(Args) ->
                     S = Args#{replica => Replica,
                               node_bin => NodeBin,
                               crdt => ?CRDT:new(),
-                              hlc => ?HLC:zero(NodeBin),
-                              digest => undefined},
+                              hlc => ?HLC:zero(NodeBin)},
                     %% Up to one interval of initial jitter so replicas
                     %% started together do not exchange digests in lockstep.
                     schedule_sync(rand:uniform(max(1, Interval))),
@@ -288,8 +291,7 @@ handle_call({remove, Key, Topics}, _From, S) ->
 handle_call(config, _From, S = #{config := Config}) ->
     {reply, {ok, Config}, S};
 handle_call(digest, _From, S) ->
-    {Digest, S1} = state_digest(S),
-    {reply, {ok, Digest}, S1};
+    {reply, {ok, state_digest(S)}, S};
 handle_call(size, _From, S = #{crdt := Crdt}) ->
     {reply, {ok, ?CRDT:size(Crdt)}, S};
 handle_call(Request, From, S) ->
@@ -303,10 +305,9 @@ handle_cast(Request, S) ->
     {noreply, S}.
 
 handle_info(sync_tick, S = #{config := {config, Interval, _, _, _, _}}) ->
-    {Digest, S1} = state_digest(S),
-    publish(S1, {brazier_store, digest, node(), Digest}),
+    publish(S, {brazier_store, digest, node(), state_digest(S)}),
     schedule_sync(Interval),
-    {noreply, S1};
+    {noreply, S};
 handle_info({brazier_pubsub, Topic, Message}, S = #{topic := Topic}) ->
     {noreply, peer_message(Message, S)};
 handle_info({nodeup, Node}, S) ->
@@ -379,7 +380,7 @@ local_write(S, OpName, Values, Op) ->
                 true ->
                     mirror(S, Crdt1, Changes),
                     publish(S, Message),
-                    {reply, {ok, nil}, S#{crdt := Crdt1, hlc := Hlc1, digest := undefined}}
+                    {reply, {ok, nil}, S#{crdt := Crdt1, hlc := Hlc1}}
             end
     end.
 
@@ -426,13 +427,13 @@ member_message({brazier_store, sync, From, Full}, S) when is_atom(From) ->
 member_message({brazier_store, digest, From, Digest}, S)
   when is_atom(From), is_binary(Digest) ->
     case state_digest(S) of
-        {Digest, S1} ->
-            S1;
-        {_Other, S1} ->
+        Digest ->
+            S;
+        _Other ->
             brazier_log_ffi:debug(<<"brazier.store">>, "Replica ~ts differs from ~p, requesting its state",
-                                 [label(S1), From]),
-            send_direct(S1, From, {brazier_store, sync_req, node()}),
-            S1
+                                 [label(S), From]),
+            send_direct(S, From, {brazier_store, sync_req, node()}),
+            S
     end;
 member_message({brazier_store, sync_req, From}, S) when is_atom(From) ->
     #{crdt := Crdt, config := {config, _, _, _, _, MaxSync}} = S,
@@ -454,31 +455,52 @@ unexpected_message(Message, S) ->
                            "message ~P", [label(S), Message, 20]),
     S.
 
-%% Merge a delta or a full state from From inside the sync span. A
-%% malformed payload is refused before anything reads it: its entries are
-%% reported as 0, since they cannot be counted.
+%% Merge a delta or a full state from From inside the sync span. The span's
+%% stop event says how the merge ended: `result` is ok, malformed,
+%% too_large or too_many_entries, and `reason` names the malformed field
+%% (check_payload/2), the limit that refused it, or is none. A malformed
+%% payload is refused before anything reads it, so its entries are 0.
 merge(S = #{name := Name}, From, What, Payload, MaxBytes, Join) ->
-    Bytes = erlang:external_size(Payload),
     Peer = atom_to_binary(From, utf8),
-    case check_payload(What, Payload) of
-        {error, Reason} ->
-            brazier_telemetry_ffi:store_sync_span(Name, Peer, fun() ->
+    brazier_telemetry_ffi:store_sync_span(Name, Peer, fun() ->
+        Bytes = erlang:external_size(Payload),
+        case admit(What, Payload, Bytes, MaxBytes) of
+            {refused, Entries, <<"malformed">> = Result, Reason} ->
                 brazier_log_ffi:error(<<"brazier.store">>, "Replica ~ts refused a malformed ~p of ~b "
                                      "bytes from ~p: ~ts", [label(S), What, Bytes, From, Reason]),
-                {S, 0, Bytes}
-            end);
+                {S, Entries, Bytes, Result, Reason};
+            {refused, Entries, <<"too_large">> = Result, Limit} ->
+                brazier_log_ffi:error(<<"brazier.store">>, "Replica ~ts refused a ~p of ~b bytes from ~p: "
+                                     "over ~ts ~b", [label(S), What, Bytes, From, Limit, MaxBytes]),
+                {S, Entries, Bytes, Result, Limit};
+            {admitted, Entries} ->
+                {S1, Result, Reason} = checked_merge(S, From, What, Payload, Join),
+                {S1, Entries, Bytes, Result, Reason}
+        end
+    end).
+
+%% Whether a payload of Bytes may be joined, before anything reads it:
+%% {admitted, Entries}, or {refused, Entries, Result, Reason} with the
+%% span's result and reason. Entries is the number of dots it carries, 0
+%% for a malformed payload (it cannot be counted).
+admit(What, Payload, Bytes, MaxBytes) ->
+    case check_payload(What, Payload) of
+        {error, Reason} ->
+            {refused, 0, <<"malformed">>, Reason};
         {ok, nil} ->
             Entries = ?CRDT:delta_size(Payload),
-            brazier_telemetry_ffi:store_sync_span(Name, Peer, fun() ->
-                {checked_merge(S, From, What, Payload, Bytes, MaxBytes, Join), Entries, Bytes}
-            end)
+            case Bytes > MaxBytes of
+                true -> {refused, Entries, <<"too_large">>, byte_limit(What)};
+                false -> {admitted, Entries}
+            end
     end.
 
-checked_merge(S, From, What, _Payload, Bytes, MaxBytes, _Join) when Bytes > MaxBytes ->
-    brazier_log_ffi:error(<<"brazier.store">>, "Replica ~ts refused a ~p of ~b bytes from ~p "
-                         "(limit ~b bytes)", [label(S), What, Bytes, From, MaxBytes]),
-    S;
-checked_merge(S, From, What, Payload, _Bytes, _MaxBytes, Join) ->
+byte_limit(delta) -> <<"max_delta_bytes">>;
+byte_limit(sync) -> <<"max_sync_bytes">>.
+
+%% Join an admitted payload unless it would grow the replica past
+%% max_entries. Returns {State, Result, Reason} for the sync span.
+checked_merge(S, From, What, Payload, Join) ->
     #{crdt := Crdt, config := {config, _, MaxEntries, _, _, _}} = S,
     {Crdt1, Changes} = Join(Crdt, Payload),
     Size = ?CRDT:size(Crdt1),
@@ -486,17 +508,17 @@ checked_merge(S, From, What, Payload, _Bytes, _MaxBytes, Join) ->
         true ->
             brazier_log_ffi:error(<<"brazier.store">>, "Replica ~ts refused a ~p from ~p: ~b entries would "
                                  "exceed max_entries ~b", [label(S), What, From, Size, MaxEntries]),
-            S;
+            {S, <<"too_many_entries">>, <<"max_entries">>};
         false ->
-            S1 = S#{crdt := Crdt1, digest := undefined, hlc := advance_clock(S, From, Payload)},
+            S1 = S#{crdt := Crdt1, hlc := advance_clock(S, From, Payload)},
             case Changes of
                 [] ->
-                    S1;
+                    ok;
                 _ ->
                     mirror(S1, Crdt1, Changes),
-                    announce(S1, Changes, element(4, Payload)),
-                    S1
-            end
+                    announce(S1, Changes, element(4, Payload))
+            end,
+            {S1, <<"ok">>, <<"none">>}
     end.
 
 %% The HLC after a merge is ahead of every timestamp merged.
@@ -668,12 +690,10 @@ announce(S = #{name := Name}, Changes, DeltaTopics) ->
 
 %% --- Anti-entropy ---
 
-state_digest(S = #{digest := Digest}) when is_binary(Digest) ->
-    {Digest, S};
-state_digest(S = #{crdt := Crdt}) ->
-    Canonical = term_to_binary(?CRDT:fingerprint(Crdt), [deterministic, {minor_version, 2}]),
-    Digest = crypto:hash(sha256, Canonical),
-    {Digest, S#{digest := Digest}}.
+%% The digest as the 32 bytes a digest message carries. The CRDT keeps it
+%% up to date on every join, so this costs O(1) whatever the state's size.
+state_digest(#{crdt := Crdt}) ->
+    <<(?CRDT:digest(Crdt)):256>>.
 
 schedule_sync(Ms) ->
     _TimerRef = erlang:send_after(Ms, self(), sync_tick),
