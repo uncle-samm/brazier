@@ -29,7 +29,8 @@ pub fn spoofed_forwarded_for_from_untrusted_peer_shares_one_bucket_test() {
 }
 
 pub fn trusted_proxy_buckets_use_the_forwarded_client_test() {
-  let assert Ok(trusted) = ip.parse_trusted_proxies(["127.0.0.0/8"])
+  let assert Ok(trusted) =
+    ip.parse_trusted_proxies(["127.0.0.0/8"], ip.XForwardedFor)
   let piped = rate_limited(limiter("mw_trusted_", 1), trusted)
   let socket = loopback_socket()
   let assert 200 = piped(xff_request(socket, "203.0.113.1")).status
@@ -41,7 +42,8 @@ pub fn trusted_proxy_buckets_use_the_forwarded_client_test() {
 /// The client controls the left of X-Forwarded-For; the right-most
 /// untrusted hop (added by the trusted proxy) is what counts.
 pub fn prepended_hops_do_not_escape_the_limit_test() {
-  let assert Ok(trusted) = ip.parse_trusted_proxies(["127.0.0.1", "10.0.0.0/8"])
+  let assert Ok(trusted) =
+    ip.parse_trusted_proxies(["127.0.0.1", "10.0.0.0/8"], ip.XForwardedFor)
   let piped = rate_limited(limiter("mw_prepend_", 1), trusted)
   let socket = loopback_socket()
   let assert 200 = piped(xff_request(socket, "203.0.113.9, 10.1.2.3")).status
@@ -98,7 +100,8 @@ pub fn scheme_ignores_forwarded_proto_from_untrusted_peer_test() {
 }
 
 pub fn scheme_honours_forwarded_proto_from_trusted_proxy_test() {
-  let assert Ok(trusted) = ip.parse_trusted_proxies(["10.0.0.0/8"])
+  let assert Ok(trusted) =
+    ip.parse_trusted_proxies(["10.0.0.0/8"], ip.NoForwardingHeader)
   let assert Ok("http") = client.scheme_from("10.0.0.1", [], trusted)
   let assert Ok("https") =
     client.scheme_from("10.0.0.1", [#("x-forwarded-proto", "https")], trusted)
@@ -111,7 +114,8 @@ pub fn scheme_honours_forwarded_proto_from_trusted_proxy_test() {
 }
 
 pub fn scheme_rejects_bad_forwarded_proto_from_trusted_proxy_test() {
-  let assert Ok(trusted) = ip.parse_trusted_proxies(["10.0.0.0/8"])
+  let assert Ok(trusted) =
+    ip.parse_trusted_proxies(["10.0.0.0/8"], ip.NoForwardingHeader)
   let assert Error(_) =
     client.scheme_from("10.0.0.1", [#("x-forwarded-proto", "gopher")], trusted)
   let assert Error(_) =

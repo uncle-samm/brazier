@@ -6,9 +6,10 @@
 /// check all call it, so they can never disagree about who a client is.
 ///
 /// - The client IP is the socket peer, unless the peer is a trusted proxy:
-///   then it is the right-most `Forwarded` / `X-Forwarded-For` hop that is
-///   not itself a trusted proxy (see `brazier/ip`). A direct client cannot
-///   spoof its address with these headers.
+///   then it is the right-most hop of the one configured forwarding header
+///   (`Forwarded` or `X-Forwarded-For`) that is not itself a trusted proxy
+///   (see `brazier/ip`). A direct client cannot spoof its address with
+///   these headers, and a client behind the proxy cannot pick the header.
 /// - The scheme is `http` (Brazier does not terminate TLS), unless the peer is
 ///   a trusted proxy that sent `X-Forwarded-Proto`, which must then be
 ///   `http` or `https`.

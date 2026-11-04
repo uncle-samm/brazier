@@ -135,6 +135,16 @@ with its own changelog, so they are not listed here.
   crashes on an attribute that reaches it with a refused name.
   `middleware.default_csp` no longer allows inline scripts, any `ws:`/`wss:`
   host or `avatars.githubusercontent.com` (see Changed).
+- (Final audit SEC-4) `SecurityLimits` has a `forwarding_header` field
+  (`ip.Forwarded`, `ip.XForwardedFor` or the default `ip.NoForwardingHeader`)
+  naming the one header trusted proxies set. An app behind a proxy must set
+  it, or the client address stays the proxy's. A header with an empty
+  `trusted_proxies` refuses to start. `ip.parse_trusted_proxies(entries,
+  header)` takes the header, and the listener's address set is
+  `ip.parse_proxy_networks` returning `ip.ProxyNetworks`.
+- (Final audit SEC-7) `auth.allow_guests_ws` refuses a bound socket whose
+  session is gone, expired or has no user (4401, the page reloads) instead
+  of keeping it open as a guest.
 
 ### Added
 
@@ -367,6 +377,12 @@ with its own changelog, so they are not listed here.
 
 ### Fixed
 
+- (Final audit TS-8) A failed `session.try_delete` logs the store's error
+  reason.
+- (Final audit TS-4) The session store reads its time from a clock, so the
+  expiry tests advance a manual clock instead of sleeping, and check each
+  boundary to the millisecond. The clock is injectable only from tests
+  (`session.start_store_with_clock` is internal).
 - A `background` worker could run for a moment with no guardian watching
   its owner, so an owner dying in that window left it orphaned. The
   guardian now starts first, monitors the owner, and only then starts the
@@ -460,6 +476,18 @@ with its own changelog, so they are not listed here.
 
 ### Security
 
+- (Final audit SEC-4) A client behind a trusted proxy could name its own
+  address: the resolver preferred `Forwarded` over `X-Forwarded-For`, and a
+  proxy that sets only `X-Forwarded-For` passes a client's `Forwarded`
+  through. Now only the configured `forwarding_header` is read, and a
+  trusted proxy that passes the other one through is logged at warning
+  (Plug.RewriteOn; Rails `RemoteIp`, `IpSpoofAttackError`; RFC 7239
+  section 7.4).
+- (Final audit SEC-7) An `allow_guests_ws` socket that was bound to a
+  signed-in session became a guest on recheck once the session was deleted,
+  expired or lost its user, so a revocation that sent no notice left it
+  open. Its recheck now fails and the socket closes with 4401, as LiveView
+  disconnects a `live_socket_id` on logout.
 - A page whose join token is over the 3800-byte cookie budget is refused
   with a 500 and no cookie, logged at error and reported as
   `[brazier, ssr, join_token, too_large]`. It used to drop the model from
