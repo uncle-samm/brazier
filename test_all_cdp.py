@@ -25,11 +25,13 @@ returns as soon as the condition holds, so the deadline can be generous for
 a loaded CI machine. A check that misses its deadline fails, naming what it
 waited for.
 
-There is one deliberate time window: `drain_quiet` for checks that the
-browser sent NO model event (local-only messages). Absence cannot be waited
-for; the window starts after the local update has visibly happened, so it
-only guards against a late, paced send. Pong's "frozen while paused" check
-is the other: holding still for many ticks is the thing under test.
+A check that the browser sent NO model event (local-only messages) waits,
+after the local update is visible, for the client's outbound queue to be
+empty with no paced send scheduled (`window.__beaconOutboundPendingForTest`,
+installed by the test hooks), then takes a CDP barrier so every frame the
+page wrote has been recorded. Pong's "frozen while paused" check is the one
+deliberate time window: holding still for many ticks is the thing under
+test.
 
 Exit status: 0 when every check passed, 1 when any check failed (an example
 that does not start counts as a failure).
@@ -105,8 +107,6 @@ BUILD_TIMEOUT_SECONDS = int(os.environ.get("BEACON_CDP_BUILD_TIMEOUT", "300"))
 WAIT_SECONDS = float(os.environ.get("BEACON_CDP_WAIT_SECONDS", "10"))
 # How long wait_until reads CDP events between two checks of a condition.
 RETRY_SECONDS = 0.05
-# The window for "the browser sent nothing" checks (see drain_quiet).
-QUIET_SECONDS = float(os.environ.get("BEACON_CDP_QUIET_SECONDS", "0.5"))
 # Lines of server output kept for a failure report.
 SERVER_LOG_LINES = 40
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -332,12 +332,27 @@ def barrier():
     has been recorded."""
     evl("0")
 
-def drain_quiet():
-    """The one deliberate window: record events for QUIET_SECONDS. Only for
+OUTBOUND_PENDING_JS = (
+    'JSON.stringify(typeof window.__beaconOutboundPendingForTest === "function"'
+    ' ? window.__beaconOutboundPendingForTest() : "missing")'
+)
+OUTBOUND_DRAINED = json.dumps({"queued": 0, "scheduled": False}, separators=(",", ":"))
+
+def wait_outbound_drained(msg):
+    """Wait until the client owes the server nothing: its paced queue is
+    empty and no paced send is scheduled. Then take a barrier, so the CDP
+    events for every frame the page wrote before that are recorded. Only for
     checks that something did NOT happen (no model event for a local
-    message), and only after the local update is visible, so it guards
-    against a late paced send, not against a slow page."""
-    pump(QUIET_SECONDS)
+    message), and only after the local update is visible: a model event the
+    update caused is then written, queued or scheduled, never still to come."""
+    ok = wait_until(lambda: evl(OUTBOUND_PENDING_JS) == OUTBOUND_DRAINED)
+    check(
+        ok,
+        f"{msg}: client outbound queue drains"
+        + ("" if ok else f" (pending: {evl(OUTBOUND_PENDING_JS)})"),
+    )
+    barrier()
+    return ok
 
 def wait_until(predicate, timeout=None):
     """Re-check `predicate` every RETRY_SECONDS (recording CDP events in
@@ -454,8 +469,8 @@ def check_model_ws_update(msg, events=None):
         check(sent == events, f"{msg}: sends exactly {events} model event(s) ({sent})")
 
 def check_local_ws_quiet(msg):
-    """Call after the local update is visible. See drain_quiet."""
-    drain_quiet()
+    """Call after the local update is visible. See wait_outbound_drained."""
+    wait_outbound_drained(msg)
     check(sent_event_count() == 0, f"{msg}: sends zero model events ({sent_model_event_units()})")
     check(websocket_type_count("Received", "mount") == 0, f"{msg}: receives no HTML mount")
 
