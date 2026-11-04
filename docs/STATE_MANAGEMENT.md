@@ -1,6 +1,6 @@
 # State Management
 
-A Beacon session keeps its state in up to three layers, and sessions share
+A Brazier session keeps its state in up to three layers, and sessions share
 state through stores and PubSub:
 
 - **Model**: what the browser sees. The server sends it to the browser, and
@@ -13,11 +13,11 @@ state through stores and PubSub:
   below).
 
 State that must outlive a page load, such as who is signed in, belongs in a
-cookie session from `beacon/session`: the cookie holds only an id, and the
+cookie session from `brazier/session`: the cookie holds only an id, and the
 data stays in a server-side store (`LocalEts` on one node, or `External`
 functions you supply for a cluster). See
 [GETTING_STARTED.md](GETTING_STARTED.md#session-auth) and
-[SECURITY.md](SECURITY.md). `beacon.session_id(ctx)` gives `init` a stable
+[SECURITY.md](SECURITY.md). `brazier.session_id(ctx)` gives `init` a stable
 id for the browser session, for keying a store.
 
 Pick the constructor by the layers the app needs (the full table is in
@@ -25,9 +25,9 @@ Pick the constructor by the layers the app needs (the full table is in
 
 | Constructor | Server state | Local state |
 |---|---|---|
-| `beacon.simple(init:, update:, view:)` | The model itself | None |
-| `beacon.application(init:, update:, view:)` | The model itself | None |
-| `beacon.full_application(init:, update:, sync:, local:, view:)` | Any `state`; `sync` derives the model | `local.layer(..)` or `local.none()` |
+| `brazier.simple(init:, update:, view:)` | The model itself | None |
+| `brazier.application(init:, update:, view:)` | The model itself | None |
+| `brazier.full_application(init:, update:, sync:, local:, view:)` | Any `state`; `sync` derives the model | `local.layer(..)` or `local.none()` |
 
 ## Model (Server-Authoritative)
 
@@ -37,9 +37,9 @@ browser what changed. With `simple` the browser also runs `update` at once,
 and the server's model wins when the two differ.
 
 <!-- docs-check: wrap
-import beacon
-import beacon/effect.{type Effect}
-import beacon/element.{type Element}
+import brazier
+import brazier/effect.{type Effect}
+import brazier/element.{type Element}
 import gleam/int
 
 pub fn main() {
@@ -54,7 +54,7 @@ pub type Msg {
   Increment
 }
 
-fn init(_ctx: beacon.Context) -> Result(#(Model, Effect(Msg)), beacon.InitError) {
+fn init(_ctx: brazier.Context) -> Result(#(Model, Effect(Msg)), brazier.InitError) {
   Ok(#(Model(count: 0), effect.none()))
 }
 
@@ -69,8 +69,8 @@ fn view(model: Model) -> Element(Msg) {
 }
 -->
 ```gleam
-beacon.application(init:, update:, view:)
-|> beacon.start(8080)
+brazier.application(init:, update:, view:)
+|> brazier.start(8080)
 ```
 
 ## Server State (Private)
@@ -80,8 +80,8 @@ sees. `sync(state) -> model` runs after every update and chooses what is
 sent; secrets, tokens and bookkeeping stay in the state.
 
 <!-- docs-check: wrap
-import beacon/effect.{type Effect}
-import beacon/element.{type Element}
+import brazier/effect.{type Effect}
+import brazier/element.{type Element}
 import gleam/int
 
 pub type Model {
@@ -92,7 +92,7 @@ pub type Msg {
   Increment
 }
 
-fn init(_ctx: beacon.Context) -> Result(#(Session, Effect(Msg)), beacon.InitError) {
+fn init(_ctx: brazier.Context) -> Result(#(Session, Effect(Msg)), brazier.InitError) {
   Ok(#(Session(model: Model(count: 0), api_key: "loaded on the server"), effect.none()))
 }
 
@@ -112,8 +112,8 @@ fn view(model: Model, _local: Nil) -> Element(Msg) {
 {{block}}
 -->
 ```gleam
-import beacon
-import beacon/local
+import brazier
+import brazier/local
 
 pub type Session {
   Session(model: Model, api_key: String)
@@ -124,22 +124,22 @@ fn sync(session: Session) -> Model {
 }
 
 pub fn main() {
-  beacon.full_application(init:, update:, sync:, local: local.none(), view:)
-  |> beacon.start(8080)
+  brazier.full_application(init:, update:, sync:, local: local.none(), view:)
+  |> brazier.start(8080)
 }
 ```
 
 ### Recovering state after a reconnect
 
 When a browser reconnects and a new server process serves it (after a
-restart, or on another node), `init` runs again for it. `beacon.with_state_recovery(restore:)` replaces the state
+restart, or on another node), `init` runs again for it. `brazier.with_state_recovery(restore:)` replaces the state
 `init` returned: the page carries the model in its signed join token, and
 `restore(model)` returns the state. Anything that is not in the model must be
 rebuilt or reloaded by `restore`. For `simple` and `application`, where the
 state is the model, pass `function.identity`.
 
 - The token is signed with the app's secret key. Recovery after a restart or
-  on another node needs the same `beacon.secret_key` on every node (see
+  on another node needs the same `brazier.secret_key` on every node (see
   [DEPLOYMENT.md](DEPLOYMENT.md#secret-key)).
 - The join token is checked before `init` runs. A token that does not verify
   (malformed, signed with another key, older than 24 hours, or issued to
@@ -151,7 +151,7 @@ state is the model, pass `function.identity`.
   The session never continues from `init`'s state in place of a token it
   could not use. LiveView does the same with a stale session token: it
   refuses the join and the client reloads.
-- An open tab whose server was restarted without a fixed `beacon.secret_key`
+- An open tab whose server was restarted without a fixed `brazier.secret_key`
   therefore reloads once on reconnect: the new process generated a new key.
 - Recovery with an empty secret key is a configuration error: the runtime
   refuses to start.
@@ -167,10 +167,10 @@ keeps the message in the browser (no traffic), and `local.forward(local)`
 also sends it to the server. `view` receives the model and the local state.
 
 <!-- docs-check: wrap
-import beacon
-import beacon/effect.{type Effect}
-import beacon/element.{type Element}
-import beacon/local
+import brazier
+import brazier/effect.{type Effect}
+import brazier/element.{type Element}
+import brazier/local
 import gleam/int
 
 pub type Model {
@@ -186,7 +186,7 @@ pub type Msg {
   ToggleMenu
 }
 
-fn init(_ctx: beacon.Context) -> Result(#(Model, Effect(Msg)), beacon.InitError) {
+fn init(_ctx: brazier.Context) -> Result(#(Model, Effect(Msg)), brazier.InitError) {
   Ok(#(Model(count: 0), effect.none()))
 }
 
@@ -221,14 +221,14 @@ pub fn main() {
 }
 -->
 ```gleam
-beacon.full_application(
+brazier.full_application(
   init:,
   update:,
   sync:,
   local: local.layer(init: init_local, update: update_local),
   view:,
 )
-|> beacon.start(8080)
+|> brazier.start(8080)
 ```
 
 `examples/counter_local` is a complete app with a local layer.
@@ -238,7 +238,7 @@ beacon.full_application(
 ETS-backed stores visible to all connections. Auto-broadcasts via PubSub on mutation.
 
 ```gleam
-import beacon/store
+import brazier/store
 
 pub fn theme_round_trip() -> Result(String, Nil) {
   let s = store.new("settings")       // create (or reuse) the store
@@ -256,17 +256,17 @@ store whose contents every node shares, open it in replicated mode (see
 
 Creation is **idempotent**: `store.new("settings")` called again -- from any
 process, at any time -- returns a handle to the same data. The backing ETS
-tables are owned by a long-lived Beacon table-owner process, not by the
+tables are owned by a long-lived Brazier table-owner process, not by the
 caller, so a store created inside a request handler, a runtime or `init`
 survives that process exiting.
 
-Under `beacon.start` the table owner is the first child of the application's
+Under `brazier.start` the table owner is the first child of the application's
 supervision tree, so a restart of PubSub, the session scope or the listener
-never touches store data. A store created in `main` before `beacon.start`
+never touches store data. A store created in `main` before `brazier.start`
 keeps its contents: the tree's owner adopts the table. `application.stop`
 deletes every local store's table, so a store handle from before the stop
 must not be used after it (it crashes with `badarg`). If the owner itself
-crashes while it owns tables, their data is gone: Beacon does not restart it
+crashes while it owns tables, their data is gone: Brazier does not restart it
 with empty tables but stops the application loudly, and creating a store on
 that node fails with `TableOwnerUnavailable` until the application starts
 again. See [ARCHITECTURE.md](ARCHITECTURE.md#supervision-applicationgleam).
@@ -278,8 +278,8 @@ Store names are developer-chosen constants: 1-255 bytes of `[A-Za-z0-9_-]`
 `Result(_, store.StoreError)` instead:
 
 <!-- docs-check: wrap
-import beacon/log
-import beacon/store
+import brazier/log
+import brazier/store
 
 pub fn open_named(name: String) -> Nil {
   {{block}}
@@ -299,7 +299,7 @@ case store.try_new(name) {
 `store.StoreError` is `InvalidName` (empty, too long, or a character
 outside `[A-Za-z0-9_-]`), `TableTypeMismatch` (a table of that name exists
 with the other type) or `TableOwnerUnavailable`. Its `name` is the table
-name, the store name with its prefix (`beacon_store_` or `beacon_ls_`),
+name, the store name with its prefix (`brazier_store_` or `brazier_ls_`),
 which counts toward the 255 bytes.
 
 A `Store` and a `ListStore` with the same name are separate tables, but they
@@ -312,7 +312,7 @@ and logs: appending the same value twice stores it twice, and `get_all`
 returns values in insertion order.
 
 <!-- docs-check: wrap
-import beacon/store
+import brazier/store
 
 pub fn chat(room_id: String, msg: String, a: String, b: String) -> List(String) {
   {{block}}
@@ -331,13 +331,13 @@ store.append_notify(msgs, room_id, msg, "room:")  // also broadcasts to "room:" 
 ### Reacting to Store Changes
 
 Mutations broadcast `Nil` on the store's topic. Subscribe to it with
-`beacon.subscriptions` and re-read the store in the handler:
+`brazier.subscriptions` and re-read the store in the handler:
 
 <!-- docs-check: wrap
-import beacon
-import beacon/effect.{type Effect}
-import beacon/element.{type Element}
-import beacon/store
+import brazier
+import brazier/effect.{type Effect}
+import brazier/element.{type Element}
+import brazier/store
 import gleam/int
 
 pub type Model {
@@ -348,7 +348,7 @@ pub type Msg {
   MessagesChanged
 }
 
-fn init(_ctx: beacon.Context) -> Result(#(Model, Effect(Msg)), beacon.InitError) {
+fn init(_ctx: brazier.Context) -> Result(#(Model, Effect(Msg)), brazier.InitError) {
   Ok(#(Model(message_count: 0), effect.none()))
 }
 
@@ -369,10 +369,10 @@ pub fn main() {
 ```gleam
 let messages: store.ListStore(String) = store.new_list("messages")
 
-beacon.application(init:, update:, view:)
-|> beacon.subscriptions(fn(_model) { [store.list_topic(messages)] })
-|> beacon.on_notify(fn(_topic) { MessagesChanged })
-|> beacon.start(8080)
+brazier.application(init:, update:, view:)
+|> brazier.subscriptions(fn(_model) { [store.list_topic(messages)] })
+|> brazier.on_notify(fn(_topic) { MessagesChanged })
+|> brazier.start(8080)
 ```
 
 Write to a store from an effect, so the write runs on the server and never
@@ -386,8 +386,8 @@ the `Replicated` mode. Every other call (`get`, `put`, `append`,
 `get_all`, `topic`, ...) is the same as for a local store.
 
 ```gleam
-import beacon/store
-import beacon/store/replicated
+import brazier/store
+import brazier/store/replicated
 import gleam/result
 
 pub fn open_shared() -> Result(store.ListStore(String), store.OpenError) {
@@ -441,7 +441,7 @@ reaches this node only. See [CLUSTERING.md](CLUSTERING.md#pubsub-across-nodes)
 for what a cluster needs and what happens during a netsplit.
 
 ```gleam
-import beacon/pubsub
+import brazier/pubsub
 
 pub fn lobby() -> Nil {
   pubsub.subscribe("chat:lobby")
@@ -452,14 +452,14 @@ pub fn lobby() -> Nil {
 
 ## Dynamic Subscriptions
 
-`beacon.subscriptions(fn(state) -> List(String))` computes the session's
-topics from its state after every update. Beacon diffs the list against the
+`brazier.subscriptions(fn(state) -> List(String))` computes the session's
+topics from its state after every update. Brazier diffs the list against the
 previous one and subscribes or unsubscribes as needed.
 
 <!-- docs-check: wrap
-import beacon
-import beacon/effect.{type Effect}
-import beacon/element.{type Element}
+import brazier
+import brazier/effect.{type Effect}
+import brazier/element.{type Element}
 
 pub type Model {
   Model(current_room: String)
@@ -469,7 +469,7 @@ pub type Msg {
   RoomUpdated(String)
 }
 
-fn init(_ctx: beacon.Context) -> Result(#(Model, Effect(Msg)), beacon.InitError) {
+fn init(_ctx: brazier.Context) -> Result(#(Model, Effect(Msg)), brazier.InitError) {
   Ok(#(Model(current_room: "lobby"), effect.none()))
 }
 
@@ -488,32 +488,32 @@ pub fn main() {
 }
 -->
 ```gleam
-beacon.application(init:, update:, view:)
-|> beacon.subscriptions(fn(model) { ["room:" <> model.current_room] })
-|> beacon.on_notify(fn(topic) { RoomUpdated(topic) })
-|> beacon.start(8080)
+brazier.application(init:, update:, view:)
+|> brazier.subscriptions(fn(model) { ["room:" <> model.current_room] })
+|> brazier.on_notify(fn(topic) { RoomUpdated(topic) })
+|> brazier.start(8080)
 ```
 
 When `model.current_room` changes, the old topic is unsubscribed and the
 new one subscribed.
 
-- `beacon.on_notify(fn(topic) -> msg)` turns every notification into a
+- `brazier.on_notify(fn(topic) -> msg)` turns every notification into a
   message, by topic.
-- `beacon.broadcast(topic)` notifies subscribers without a store write.
-- `beacon.broadcast_payload(topic, payload)` sends a value with the
-  notification. Read it with `beacon.on_notification(fn(Notification) ->
-  msg)` and `beacon.notification_payload(notification, decoder)`, which
+- `brazier.broadcast(topic)` notifies subscribers without a store write.
+- `brazier.broadcast_payload(topic, payload)` sends a value with the
+  notification. Read it with `brazier.on_notification(fn(Notification) ->
+  msg)` and `brazier.notification_payload(notification, decoder)`, which
   returns an `Error` when the payload does not decode.
 
 ## Presence
 
-`beacon.presence(tracker:, track:, on_presence:)` tracks which sessions are
+`brazier.presence(tracker:, track:, on_presence:)` tracks which sessions are
 on a topic, on every node, from each session's state. Every join and leave
 arrives as an `on_presence(diff)` message, and `sync.merge` (from
-`beacon/presence/sync`) applies it to the list the session keeps.
-`beacon.watch_presence(tracker:, watch:, on_presence:)` gets the same
+`brazier/presence/sync`) applies it to the list the session keeps.
+`brazier.watch_presence(tracker:, watch:, on_presence:)` gets the same
 messages for the topics `watch` returns without tracking the session.
-`beacon.track_and_watch_presence(tracker:, track:, watch:, on_presence:)`
+`brazier.track_and_watch_presence(tracker:, track:, watch:, on_presence:)`
 does both. See [CLUSTERING.md](CLUSTERING.md#session-presence).
 
 ## Cross-Route State Sharing
@@ -527,7 +527,7 @@ idempotent, so every call returns the same store. Subscribe to
 <!-- docs-check: module shared -->
 ```gleam
 // shared.gleam
-import beacon/store
+import brazier/store
 
 pub fn cart() -> store.Store(List(String)) {
   store.new("cart")

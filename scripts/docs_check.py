@@ -1,4 +1,4 @@
-"""Mechanical checks for Beacon's Markdown docs.
+"""Mechanical checks for Brazier's Markdown docs.
 
 Run it through `scripts/check_docs.sh`, which also compiles the samples.
 
@@ -7,7 +7,7 @@ Two checks:
 - `links`: every relative Markdown link, and every backticked path ending in
   `.md`, names a file that exists; a `#anchor` names a heading in that file.
 - `samples`: every ```gleam block in a compiled doc is written into a scratch
-  Gleam project (`build/docs_check`) that depends on Beacon by path. The
+  Gleam project (`build/docs_check`) that depends on Brazier by path. The
   shell script then runs `gleam build --warnings-as-errors` on it.
 
 Sample markers, an HTML comment on the line directly above the fence (GitHub
@@ -247,10 +247,10 @@ def write_samples(only: list[str]) -> int:
 
 
 def write_project_files() -> None:
-    """The scratch project depends on Beacon by path, with Beacon's own
-    dependency constraints, so samples may import what Beacon's users get."""
-    beacon_toml = (ROOT / "gleam.toml").read_text(encoding="utf-8")
-    deps = section(beacon_toml, "dependencies")
+    """The scratch project depends on Brazier by path, with Brazier's own
+    dependency constraints, so samples may import what Brazier's users get."""
+    brazier_toml = (ROOT / "gleam.toml").read_text(encoding="utf-8")
+    deps = section(brazier_toml, "dependencies")
     if not deps:
         raise CheckError("gleam.toml has no [dependencies] section")
     toml = (
@@ -258,7 +258,7 @@ def write_project_files() -> None:
         'version = "0.0.0"\n'
         'target = "erlang"\n\n'
         "[dependencies]\n"
-        'beacon = { path = "../.." }\n' + "\n".join(deps) + "\n"
+        'brazier = { path = "../.." }\n' + "\n".join(deps) + "\n"
     )
     (SCRATCH / "gleam.toml").write_text(toml, encoding="utf-8")
 

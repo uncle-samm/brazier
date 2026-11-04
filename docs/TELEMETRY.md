@@ -1,8 +1,8 @@
 # Telemetry
 
-`beacon/telemetry` is a thin layer over the Erlang
+`brazier/telemetry` is a thin layer over the Erlang
 [`telemetry`](https://hexdocs.pm/telemetry) library (1.4), the event bus used
-by Phoenix, Ecto and most of the BEAM ecosystem. Beacon emits named events
+by Phoenix, Ecto and most of the BEAM ecosystem. Brazier emits named events
 with measurements and metadata. You attach handlers to the events you care
 about and forward them to logs, metrics or traces.
 
@@ -13,7 +13,7 @@ too.
 ## Attaching a handler
 
 ```gleam
-import beacon/telemetry
+import brazier/telemetry
 import gleam/int
 import gleam/io
 
@@ -21,7 +21,7 @@ pub fn log_slow_requests() {
   let assert Ok(Nil) =
     telemetry.attach(
       "slow-request-logger",
-      [["beacon", "http", "request", "stop"]],
+      [["brazier", "http", "request", "stop"]],
       fn(event) {
         let assert Ok(duration) = telemetry.int(event, "duration")
         let assert Ok(route) = telemetry.string(event, "route")
@@ -42,7 +42,7 @@ pub fn log_slow_requests() {
 - A handler receives `Event(name, measurements, metadata)`. Keys are
   strings, and values keep the type they were emitted with. `int(event, key)`
   and `string(event, key)` read a measurement or a metadata value.
-- `start()` starts the `telemetry` application and is idempotent. Beacon's
+- `start()` starts the `telemetry` application and is idempotent. Brazier's
   subsystems call it themselves.
 
 ## Handlers run in the emitting process
@@ -55,14 +55,14 @@ aggregations) in a separate process that the handler sends a message to.
 ## Crashing handlers
 
 When a handler crashes, `telemetry` detaches it and emits
-`[telemetry, handler, failure]`. Beacon logs that event at error level with
+`[telemetry, handler, failure]`. Brazier logs that event at error level with
 the handler id, the event, and the kind, reason and stacktrace. The process
 that emitted the event is never affected. Reattach the handler after fixing
 it; nothing reattaches it automatically.
 
 ## Cost when nothing is attached
 
-Beacon's own events are emitted from Erlang functions with literal atoms,
+Brazier's own events are emitted from Erlang functions with literal atoms,
 so emitting never creates atoms. With no handler attached, an emit is one
 `persistent_term` read plus one ETS lookup inside `telemetry:execute/3`.
 The test suite measures this on every run: 40 to 65 ns per emit on a
@@ -71,7 +71,7 @@ laptop, depending on load.
 ## Emitting your own events
 
 <!-- docs-check: wrap
-import beacon/telemetry
+import brazier/telemetry
 import gleam/dict
 
 pub fn checkout() -> Int {
@@ -130,7 +130,7 @@ the HTTP, WebSocket and runtime call sites pass in:
 
 ## Event catalogue
 
-All of Beacon's events start with `beacon`, the `telemetry.prefix`
+All of Brazier's events start with `brazier`, the `telemetry.prefix`
 constant. `telemetry.catalogue()` returns every name. A span (S) is three
 events: `start`, `stop` and `exception`. Each carries the standard span
 measurements: `system_time` and `monotonic_time` on start, `duration` and
@@ -138,45 +138,45 @@ measurements: `system_time` and `monotonic_time` on start, `duration` and
 
 | Event | Measurements | Metadata | Emitted |
 |---|---|---|---|
-| `[beacon, http, request]` S | `req_body_bytes`, `resp_body_bytes` (stop) | `method`, `connection_id`; `route`, `status` (stop) | yes, `beacon/transport/http.run_handler` |
-| `[beacon, http, connection, accepted \| rejected \| closed]` | `count`, `duration` | `reason` | yes, `beacon_http_acceptor` (accepted, rejected), `beacon_http_conns` (closed) |
-| `[beacon, ws, upgrade]` S | none | `route`; `result` (stop) | yes, `beacon/transport` |
-| `[beacon, ws, close]` | `duration`, `frames_in`, `frames_out`, `bytes_in`, `bytes_out` | `close_code`, `reason`, `connection_id` | yes, `beacon/transport` |
-| `[beacon, ws, rate_limited]` | `count`, `violations` | `kind`, `connection_id` | yes, `beacon/transport` |
-| `[beacon, ws, backpressure]` | `queue_len` | `reason`, `connection_id` | yes, `beacon/transport` |
-| `[beacon, runtime, mount \| handle_event \| navigate]` S | none | `route`, `event`, `connection_id` | yes, `beacon/runtime` |
-| `[beacon, runtime, render]` S | `patch_bytes` (stop) | `route`, `event`, `connection_id` | yes, `beacon/runtime` |
-| `[beacon, runtime, stop]` | `uptime` | `reason`; `kind`, `error` (crash, exit) | yes, `beacon/runtime` |
-| `[beacon, effect, run]` S | none | `effect`: `sync`, `keyed` or `background` | yes, `beacon/effect` |
-| `[beacon, effect, timer, rejected]` | none | `limit` | yes, `beacon/effect` |
-| `[beacon, store, write]` | `count` | `store`, `op`, `mode`: `local` or `replicated` | yes, `beacon/store` |
-| `[beacon, store, sync]` S | `entries`, `bytes` (stop) | `store`, `peer` | yes, `beacon_store_replica` (replicated stores) |
-| `[beacon, session, created \| revoked \| expired \| contention]` | `count` | `reason` | yes, `beacon/session` |
-| `[beacon, pubsub, broadcast]` | `local_subscribers`, `remote_nodes` | `scope`: `cluster`, `local` or `direct` | yes |
-| `[beacon, pubsub, forward, overloaded]` | `queue_len` | `shard` | yes, at most once per second per worker |
-| `[beacon, subscription, changed]` | `subscriptions` | `action`: `subscribe` or `unsubscribe` | yes, `beacon/runtime` |
-| `[beacon, cluster, node, up \| down]` | `count` | `node`, `reason` | yes |
-| `[beacon, cluster, peer, rejected]` | `count` | `node`, `reason` | yes |
-| `[beacon, cluster, connect, failed]` | `count` | `node`, `reason` | yes |
-| `[beacon, presence, track \| untrack \| limit_exceeded]` | `count` | `tracker`, `shard` | yes |
-| `[beacon, presence, replica, up \| down \| permdown]` | none | `replica`, `tracker` | yes |
-| `[beacon, presence, transfer]` S | `entries`, `bytes` (stop) | `tracker`, `peer` | yes |
+| `[brazier, http, request]` S | `req_body_bytes`, `resp_body_bytes` (stop) | `method`, `connection_id`; `route`, `status` (stop) | yes, `brazier/transport/http.run_handler` |
+| `[brazier, http, connection, accepted \| rejected \| closed]` | `count`, `duration` | `reason` | yes, `brazier_http_acceptor` (accepted, rejected), `brazier_http_conns` (closed) |
+| `[brazier, ws, upgrade]` S | none | `route`; `result` (stop) | yes, `brazier/transport` |
+| `[brazier, ws, close]` | `duration`, `frames_in`, `frames_out`, `bytes_in`, `bytes_out` | `close_code`, `reason`, `connection_id` | yes, `brazier/transport` |
+| `[brazier, ws, rate_limited]` | `count`, `violations` | `kind`, `connection_id` | yes, `brazier/transport` |
+| `[brazier, ws, backpressure]` | `queue_len` | `reason`, `connection_id` | yes, `brazier/transport` |
+| `[brazier, runtime, mount \| handle_event \| navigate]` S | none | `route`, `event`, `connection_id` | yes, `brazier/runtime` |
+| `[brazier, runtime, render]` S | `patch_bytes` (stop) | `route`, `event`, `connection_id` | yes, `brazier/runtime` |
+| `[brazier, runtime, stop]` | `uptime` | `reason`; `kind`, `error` (crash, exit) | yes, `brazier/runtime` |
+| `[brazier, effect, run]` S | none | `effect`: `sync`, `keyed` or `background` | yes, `brazier/effect` |
+| `[brazier, effect, timer, rejected]` | none | `limit` | yes, `brazier/effect` |
+| `[brazier, store, write]` | `count` | `store`, `op`, `mode`: `local` or `replicated` | yes, `brazier/store` |
+| `[brazier, store, sync]` S | `entries`, `bytes` (stop) | `store`, `peer` | yes, `brazier_store_replica` (replicated stores) |
+| `[brazier, session, created \| revoked \| expired \| contention]` | `count` | `reason` | yes, `brazier/session` |
+| `[brazier, pubsub, broadcast]` | `local_subscribers`, `remote_nodes` | `scope`: `cluster`, `local` or `direct` | yes |
+| `[brazier, pubsub, forward, overloaded]` | `queue_len` | `shard` | yes, at most once per second per worker |
+| `[brazier, subscription, changed]` | `subscriptions` | `action`: `subscribe` or `unsubscribe` | yes, `brazier/runtime` |
+| `[brazier, cluster, node, up \| down]` | `count` | `node`, `reason` | yes |
+| `[brazier, cluster, peer, rejected]` | `count` | `node`, `reason` | yes |
+| `[brazier, cluster, connect, failed]` | `count` | `node`, `reason` | yes |
+| `[brazier, presence, track \| untrack \| limit_exceeded]` | `count` | `tracker`, `shard` | yes |
+| `[brazier, presence, replica, up \| down \| permdown]` | none | `replica`, `tracker` | yes |
+| `[brazier, presence, transfer]` S | `entries`, `bytes` (stop) | `tracker`, `peer` | yes |
 
 Notes on individual events:
 
-- `[beacon, http, request]`: the span covers the request handler, including
+- `[brazier, http, request]`: the span covers the request handler, including
   reading the request body, but not writing the response. `route` and
   `status` are known only once the handler returns, so they are on the stop
   event only. `route` is the pattern the routing code reported with
-  `beacon/transport/http.tag_route`; when a request passes through
+  `brazier/transport/http.tag_route`; when a request passes through
   several routing steps, the last tag wins. The built-in routes report:
   - an `api.routes` route: its declared path, normalised (`/api/items/`
     reports `/api/items`, `/api/users/:id` stays as written);
   - static files: the prefix pattern (`/assets/*`), including a 405 for a
     method the files do not answer;
-  - `/health`, `/beacon_client.js`, and `/beacon_client_:hash` for a
+  - `/health`, `/brazier_client.js`, and `/brazier_client_:hash` for a
     content-hashed client bundle;
-  - pages: `/*`, the shared page pattern (Beacon's router is typed, so a
+  - pages: `/*`, the shared page pattern (Brazier's router is typed, so a
     page has no textual pattern);
   - `*` for `OPTIONS *`, and `/ws` for a WebSocket upgrade's middleware
     pass, which runs as a request span and reports status 101.
@@ -184,13 +184,13 @@ Notes on individual events:
   A raw `api_handler` that does not use `api.routes`, and a response an
   HTTP middleware returns without calling `next`, report `"unknown"`. A
   crashed handler reports status 500.
-- `[beacon, ws, upgrade]` covers the handshake checks and the 101 write.
+- `[brazier, ws, upgrade]` covers the handshake checks and the 101 write.
   `route` is `/ws`. `result` is `ok` or names the refusal:
   `rejected_middleware`, `rejected_early_data`, `rejected_body`,
   `peer_gone`, `rejected_connection_limit`, `rejected_ip_limit`,
   `rejected_origin`, `rejected_auth`, `rejected_handshake`,
   `rejected_version` or `upgrade_write_failed`.
-- `[beacon, ws, close]` is emitted once per upgraded connection when its
+- `[brazier, ws, close]` is emitted once per upgraded connection when its
   handler stops. `duration` is the connection's lifetime; the frame and
   byte counters count every frame, control frames included. `close_code`
   is the code sent or echoed, `1005` when the peer's close frame carried no
@@ -203,33 +203,33 @@ Notes on individual events:
   manifest, and a dev-mode handler that cannot subscribe to reloads),
   `authentication_expired`, `session_revoked`, `server_overloaded`,
   `backpressure`, `server_shutting_down` or `stale_build` (4409, a join
-  from a page of another build) for a close Beacon sent; `tcp_closed`,
+  from a page of another build) for a close Brazier sent; `tcp_closed`,
   `tcp_error` or `send_failed` without a close frame; or `init_refused`
   (including a join token that fails its check, 4400) and
   `startup_failure` when the runtime did not start. Dev mode's `reload`
   emits no event of its own.
-- `[beacon, ws, rate_limited]` fires for every refused message. `kind` is
+- `[brazier, ws, rate_limited]` fires for every refused message. `kind` is
   `event_rate`, `batch_size` or `heartbeat_rate`, and `violations` is the
   connection's count in the current rate window; reaching
   `ws_max_rate_violations` closes it with 1008.
-- `[beacon, ws, backpressure]` fires before a 1013 close. `reason` is
+- `[brazier, ws, backpressure]` fires before a 1013 close. `reason` is
   `outbound_queue` (the handler's mailbox passed
   `ws_max_outbound_queue`; `queue_len` is its length) or `runtime` (the
   runtime asked the connection to close; `queue_len` is the handler's
   mailbox length at that point).
-- `[beacon, runtime, mount]` wraps `init` and the first route, in the
+- `[brazier, runtime, mount]` wraps `init` and the first route, in the
   process that starts the runtime. `handle_event` wraps each client
   event's `update` (an undecodable event is a span with event
   `"unknown"`), and `navigate` each navigation's (an unroutable path, or a
   runtime without a router, is `"unknown"`); a join whose page is at
   another route is a `navigate`. Updates from effects have no
   `handle_event` span.
-- `[beacon, runtime, render]` wraps each broadcast to the joined
+- `[brazier, runtime, render]` wraps each broadcast to the joined
   connections; with none joined it is not emitted. `event` is the message
   that caused it, or `batch` for an event batch. `patch_bytes` is the size
   of the patch sent, the model's size for a full resync, and 0 when the
   model did not change.
-- `[beacon, runtime, stop]` is emitted by every runtime stop that runs
+- `[brazier, runtime, stop]` is emitted by every runtime stop that runs
   code, with `uptime` in native time units. `reason` is `shutdown` for a
   `Shutdown`; `crash` for a crash in the runtime's message handler (the
   app's `update`, `view` or codec, an effect run in the runtime), with the
@@ -242,46 +242,46 @@ Notes on individual events:
   either way it then leaves with the original reason, so its links and the
   VM's crash report see what they did before. A normal exit of a linked
   process does not stop it. Only an untrappable `kill` emits nothing.
-- `[beacon, http, connection, *]`: `duration` is the time from accept to
+- `[brazier, http, connection, *]`: `duration` is the time from accept to
   handoff (accepted, rejected) or the connection's lifetime (closed).
   `reason` for a rejection names the limit that refused it, or is
   `peer_address_unavailable`.
-- `[beacon, effect, run]` wraps each effect callback as it runs. Timer
+- `[brazier, effect, run]` wraps each effect callback as it runs. Timer
   ticks and cancellations are not spans; a timer refused because the live
-  timer limit was reached emits `[beacon, effect, timer, rejected]`
+  timer limit was reached emits `[brazier, effect, timer, rejected]`
   with that `limit`.
-- `[beacon, session, *]` is emitted only after the session backend
+- `[brazier, session, *]` is emitted only after the session backend
   confirmed the change, so a failed backend call emits nothing. `reason`
   is a fixed label (for example `deleted`, `rotated`, `sweep`, `update`).
   A session found deleted when a node rejoins (a logout during a
   netsplit) emits `revoked` with reason `recheck`.
-- `[beacon, store, write]` is emitted after a write succeeds. A write
+- `[brazier, store, write]` is emitted after a write succeeds. A write
   refused by a replicated store's limits emits nothing.
-- `[beacon, store, sync]` wraps every remote merge into a replicated
+- `[brazier, store, sync]` wraps every remote merge into a replicated
   store, accepted or refused. `entries` and `bytes` describe the payload,
   and `peer` is the sending node. See
   [CLUSTERING.md](CLUSTERING.md#replicated-stores).
-- `[beacon, pubsub, broadcast]`: for `scope: "cluster"`, `remote_nodes` is
+- `[brazier, pubsub, broadcast]`: for `scope: "cluster"`, `remote_nodes` is
   the number of remote nodes forwarded to, one message each, however many
   subscribers they have. `local_broadcast` reports `remote_nodes` 0, and a
   `direct_broadcast` to another node reports 0 local subscribers and 1
   remote node.
-- `[beacon, subscription, changed]`: a runtime's PubSub listener joined
+- `[brazier, subscription, changed]`: a runtime's PubSub listener joined
   or left one topic: the initial topics at start, a change in
   `dynamic_subscriptions`' result after an update or join, and every
   topic at shutdown. `subscriptions` is the listener's topic count after
   the change. The event is emitted after the pg membership changed, so a
   handler that reads `pubsub.subscriber_count` sees it. The topic is not
   reported, since app topics often name a user or a document.
-- `[beacon, presence, untrack]`: `count` is the number of entries removed,
+- `[brazier, presence, untrack]`: `count` is the number of entries removed,
   so a process that exits with five entries emits one event with count 5.
-- `[beacon, presence, limit_exceeded]` fires for every refused track or
+- `[brazier, presence, limit_exceeded]` fires for every refused track or
   update (meta too large, a per-process or per-shard limit), and for every
   rejected transfer. See [CLUSTERING.md](CLUSTERING.md#limits).
-- `[beacon, presence, replica, *]`: `replica` is the peer node's name.
-- `[beacon, cluster, peer, rejected]`: `reason` says whether the peer's key
+- `[brazier, presence, replica, *]`: `replica` is the peer node's name.
+- `[brazier, cluster, peer, rejected]`: `reason` says whether the peer's key
   differed, its protocol version differed, or it did not answer in time.
-- `[beacon, cluster, connect, failed]`: for a failed DNS lookup, `node` is
+- `[brazier, cluster, connect, failed]`: for a failed DNS lookup, `node` is
   the DNS query and `reason` starts with `dns: `.
 
 Third-party libraries emit their own events, for example

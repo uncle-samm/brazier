@@ -1,0 +1,359 @@
+/// Builds an app's client bundle: the code the app's view (and a `simple`
+/// app's update, and a Local layer) reaches, compiled to JavaScript together
+/// with the Brazier client runtime, written to `priv/static` under a content
+/// hash.
+///
+/// The build writes a JavaScript-target Gleam project to
+/// `build/brazier_client_app`:
+///
+/// - Each user module with reached definitions, at its own module path,
+///   holding only those definitions (see `brazier/build/reach`), plus the
+///   JavaScript FFI files their externals load.
+/// - The Brazier modules those import (`brazier/element`, `brazier/html`, ...),
+///   copied from Brazier's sources, and a generated `brazier/log` (see
+///   `client_shim`).
+/// - The client runtime: `brazier_client_ffi.mjs` and the
+///   `brazier_client/*.mjs` modules.
+/// - `src/brazier_app_entry.gleam`, the interface the runtime calls.
+/// - `gleam.toml`, pinning every package the sources import to the exact
+///   version in the app's `manifest.toml`.
+///
+/// The project is compiled with `gleam build` and bundled with the pinned
+/// esbuild. Every step's failure stops the build; no bundle is written until
+/// all of them succeed.
+import brazier/build/analyzer.{type Analysis}
+import brazier/build/client_entry
+import brazier/build/client_shim
+import brazier/build/discovery.{type AppModule}
+import brazier/build/files
+import brazier/build/program
+import brazier/build/project_toml.{type LockedPackage}
+import brazier/build/sources
+import brazier/log
+import gleam/dict.{type Dict}
+import gleam/list
+import gleam/result
+import gleam/set.{type Set}
+import gleam/string
+
+/// The client project, relative to the app project.
+pub const client_dir = "build/brazier_client_app"
+
+/// Where bundles and their manifest are written, relative to the app project.
+pub const static_dir = "priv/static"
+
+/// The file in `static_dir` naming the current bundle.
+pub const manifest_file = "brazier_client.manifest"
+
+/// Bundle file names: `brazier_client_<hash>.js`.
+pub const bundle_prefix = "brazier_client_"
+
+/// A written bundle.
+pub type Bundle {
+  Bundle(
+    /// File name in `static_dir`, e.g. `brazier_client_0123456789abcdef.js`.
+    filename: String,
+    /// Path of the bundle file.
+    path: String,
+  )
+}
+
+/// One file of the client project: #(path relative to the project, contents).
+type ProjectFile =
+  #(String, String)
+
+/// Build the client bundle of `app` in the app project at `project`, whose
+/// Gleam sources are in `src_dir`, whose Brazier sources are at
+/// `brazier_root`, and whose client runtime is in `runtime_dir` (see
+/// `project_toml.client_runtime_dir`).
+pub fn build(
+  project: String,
+  src_dir: String,
+  brazier_root: String,
+  runtime_dir: String,
+  app: AppModule,
+  analysis: Analysis,
+) -> Result(Bundle, String) {
+  log.info(
+    "brazier.build.client_bundle",
+    "Building client bundle for " <> app.path,
+  )
+  use project_files <- result.try(project_files(
+    src_dir,
+    brazier_root,
+    runtime_dir,
+    analysis,
+  ))
+  use dependencies <- result.try(dependencies(project, project_files))
+  let dir = files.join(project, client_dir)
+  use Nil <- result.try(write_project(dir, project_files, dependencies))
+  use Nil <- result.try(program.gleam_build(dir))
+  use Nil <- result.try(files.write(files.join(dir, "bundle_entry.mjs"), entry))
+  use Nil <- result.try(program.esbuild_bundle(
+    dir,
+    "bundle_entry.mjs",
+    "bundle.js",
+  ))
+  use bundle <- result.try(files.read(files.join(dir, "bundle.js")))
+  publish(files.join(project, static_dir), bundle)
+}
+
+/// Write `contents` to `static_dir` as `brazier_client_<hash>.js`, point the
+/// manifest at it, and delete the bundles it replaces.
+pub fn publish(static: String, contents: String) -> Result(Bundle, String) {
+  let filename = bundle_prefix <> program.content_hash(contents) <> ".js"
+  let path = files.join(static, filename)
+  use Nil <- result.try(files.write(path, contents))
+  use Nil <- result.try(files.write(files.join(static, manifest_file), filename))
+  use entries <- result.try(files.list_directory(static))
+  use Nil <- result.try(
+    entries
+    |> list.filter(fn(entry) {
+      entry != filename
+      && string.starts_with(entry, bundle_prefix)
+      && string.ends_with(entry, ".js")
+    })
+    |> list.try_each(fn(entry) {
+      files.delete_if_exists(files.join(static, entry))
+    }),
+  )
+  log.info(
+    "brazier.build.client_bundle",
+    "Wrote "
+      <> path
+      <> " ("
+      <> string.inspect(string.byte_size(contents))
+      <> " bytes) and "
+      <> files.join(static, manifest_file),
+  )
+  Ok(Bundle(filename:, path:))
+}
+
+/// The esbuild entry: starts the runtime with the generated entry module.
+const entry =
+  "import { start } from './build/dev/javascript/brazier_client_app/brazier_client_ffi.mjs';
+import * as App from './build/dev/javascript/brazier_client_app/brazier_app_entry.mjs';
+start(App);
+"
+
+fn project_files(
+  src_dir: String,
+  brazier_root: String,
+  runtime_dir: String,
+  analysis: Analysis,
+) -> Result(List(ProjectFile), String) {
+  use entry_module <- result.try(client_entry.generate(analysis))
+  use ffi <- result.try(
+    analysis.client
+    |> list.flat_map(fn(emitted) { emitted.ffi_files })
+    |> list.unique
+    |> list.try_map(fn(path) {
+      use text <- result.map(files.read(files.join(src_dir, path)))
+      #("src/" <> path, text)
+    }),
+  )
+  use framework <- result.try(
+    sources.framework_closure(brazier_root, [
+      entry_module,
+      ..list.map(analysis.client, fn(emitted) { emitted.source })
+    ]),
+  )
+  use runtime <- result.try(runtime_files(runtime_dir))
+  let project_files =
+    list.flatten([
+      list.map(analysis.client, fn(emitted) {
+        #(module_file(emitted.path), emitted.source)
+      }),
+      ffi,
+      list.map(framework, fn(s) { #(module_file(s.0), s.1) }),
+      [
+        #(module_file("brazier/log"), client_shim.log_module),
+        #(module_file(client_entry.module_path), entry_module),
+      ],
+      runtime,
+    ])
+  use Nil <- result.try(unique_paths(project_files))
+  log.debug(
+    "brazier.build.client_bundle",
+    "Client project: "
+      <> string.inspect(list.length(analysis.client))
+      <> " app modules, "
+      <> string.inspect(list.length(ffi))
+      <> " FFI files, "
+      <> string.inspect(list.length(framework))
+      <> " framework modules",
+  )
+  Ok(project_files)
+}
+
+/// The client runtime from `runtime_src`: the FFI module and every `.mjs`
+/// module in `brazier_client/`.
+fn runtime_files(runtime_src: String) -> Result(List(ProjectFile), String) {
+  let package_dir = files.join(runtime_src, "brazier_client")
+  use entries <- result.try(files.list_directory(package_dir))
+  use package_files <- result.try(
+    entries
+    |> list.filter(string.ends_with(_, ".mjs"))
+    |> list.sort(string.compare)
+    |> list.try_map(fn(entry) {
+      files.read(files.join(package_dir, entry))
+      |> result.map(fn(text) { #("src/brazier_client/" <> entry, text) })
+    }),
+  )
+  use ffi <- result.map(
+    files.read(files.join(runtime_src, "brazier_client_ffi.mjs")),
+  )
+  [#("src/brazier_client_ffi.mjs", ffi), ..package_files]
+}
+
+/// Two sources for one path means a user module shadows a module the build
+/// writes, e.g. a user `brazier_app_entry.gleam`.
+fn unique_paths(project_files: List(ProjectFile)) -> Result(Nil, String) {
+  let duplicates =
+    project_files
+    |> list.group(fn(f) { f.0 })
+    |> dict.filter(fn(_path, group) { list.length(group) > 1 })
+    |> dict.keys
+    |> list.sort(string.compare)
+  case duplicates {
+    [] -> Ok(Nil)
+    _ ->
+      Error(
+        "The client project would contain more than one "
+        <> string.join(duplicates, ", ")
+        <> ". Rename the user module so it does not clash with a module the Brazier build generates.",
+      )
+  }
+}
+
+/// The `[dependencies]` lines of the client project: every package that
+/// provides a module the project's Gleam sources import, and everything
+/// those packages need, pinned to the version in the app's manifest.
+fn dependencies(
+  project: String,
+  project_files: List(ProjectFile),
+) -> Result(List(String), String) {
+  let gleam_files =
+    list.filter(project_files, fn(f) { string.ends_with(f.0, ".gleam") })
+  let own_modules =
+    gleam_files
+    |> list.map(fn(f) {
+      f.0 |> string.drop_start(4) |> string.drop_end(string.length(".gleam"))
+    })
+    |> set.from_list
+  use imported <- result.try(imported_modules(gleam_files))
+  let external = set.difference(imported, own_modules) |> set.to_list
+  let manifest_path = files.join(project, "manifest.toml")
+  use manifest <- result.try(project_toml.read_manifest(manifest_path))
+  use providers <- result.try(
+    list.try_map(external, fn(module) { provider(project, manifest, module) }),
+  )
+  use packages <- result.try(project_toml.locked_closure(
+    manifest,
+    list.unique(providers),
+  ))
+  list.try_map(packages, fn(package) {
+    project_toml.pinned_dependency_line(package, fn(path) {
+      program.absolute_path(files.join(project, path))
+    })
+  })
+}
+
+fn imported_modules(
+  gleam_files: List(ProjectFile),
+) -> Result(Set(String), String) {
+  list.try_fold(gleam_files, set.new(), fn(acc, file) {
+    use module <- result.map(analyzer.parse(client_dir <> "/" <> file.0, file.1))
+    list.fold(module.imports, acc, fn(acc, def) {
+      set.insert(acc, def.definition.module)
+    })
+  })
+}
+
+/// The manifest package whose sources contain `module`.
+fn provider(
+  project: String,
+  manifest: Dict(String, LockedPackage),
+  module: String,
+) -> Result(String, String) {
+  use found <- result.try(
+    manifest
+    |> dict.values
+    |> list.try_fold([], fn(acc, package) {
+      let path =
+        files.join(package_dir(project, package), "src/" <> module <> ".gleam")
+      use exists <- result.map(files.is_file(path))
+      case exists {
+        True -> [package.name, ..acc]
+        False -> acc
+      }
+    }),
+  )
+  case found {
+    [name] -> {
+      log.debug(
+        "brazier.build.client_bundle",
+        "Module " <> module <> " comes from package " <> name,
+      )
+      Ok(name)
+    }
+    [] ->
+      Error(
+        "The client-visible code imports `"
+        <> module
+        <> "`, which no package in "
+        <> files.join(project, "manifest.toml")
+        <> " provides. Add the package to gleam.toml and run `gleam deps download`, or move the import out of client-visible code.",
+      )
+    many ->
+      Error(
+        "Module `"
+        <> module
+        <> "` is provided by several packages: "
+        <> string.join(list.sort(many, string.compare), ", "),
+      )
+  }
+}
+
+fn package_dir(project: String, package: LockedPackage) -> String {
+  case package.source {
+    project_toml.LocalSource(path:) -> files.join(project, path)
+    project_toml.HexSource | project_toml.GitSource(..) ->
+      files.join(project, "build/packages/" <> package.name)
+  }
+}
+
+/// Replace the project's sources and `gleam.toml`. The project's own
+/// `build` directory is kept so unchanged packages are not recompiled.
+fn write_project(
+  dir: String,
+  project_files: List(ProjectFile),
+  dependencies: List(String),
+) -> Result(Nil, String) {
+  use Nil <- result.try(files.delete_if_exists(files.join(dir, "src")))
+  use Nil <- result.try(
+    list.try_each(project_files, fn(file) {
+      files.write(files.join(dir, file.0), file.1)
+    }),
+  )
+  let toml =
+    "name = \"brazier_client_app\"\nversion = \"0.1.0\"\ntarget = \"javascript\"\n\n[dependencies]\n"
+    <> string.join(dependencies, "\n")
+    <> "\n"
+  use Nil <- result.try(files.write(files.join(dir, "gleam.toml"), toml))
+  log.info(
+    "brazier.build.client_bundle",
+    "Wrote client project "
+      <> dir
+      <> " with "
+      <> string.inspect(list.length(project_files))
+      <> " files and "
+      <> string.inspect(list.length(dependencies))
+      <> " pinned dependencies",
+  )
+  Ok(Nil)
+}
+
+fn module_file(module_path: String) -> String {
+  "src/" <> module_path <> ".gleam"
+}

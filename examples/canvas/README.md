@@ -1,6 +1,6 @@
 # Collaborative Canvas
 
-A shared drawing canvas built with `beacon.full_application` and a
+A shared drawing canvas built with `brazier.full_application` and a
 `local.layer`. Strokes drawn in one tab appear in every other tab.
 
 ## Features
@@ -19,15 +19,15 @@ A shared drawing canvas built with `beacon.full_application` and a
   counts the `PenUp` messages it has handled for the session, and the
   browser drops a sent stroke once that count reaches it, whether the
   stroke was accepted or rejected.
-- Accepted strokes are appended to a `beacon/store` list. Every session
+- Accepted strokes are appended to a `brazier/store` list. Every session
   re-reads the list when it changes, and Clear empties it for everyone.
-- Strokes are drawn with `beacon/svg`. A single click draws a dot.
+- Strokes are drawn with `brazier/svg`. A single click draws a dot.
 
 ## Run
 
 ```bash
 cd examples/canvas
-gleam run -m beacon/build   # first, and after every change
+gleam run -m brazier/build   # first, and after every change
 gleam run
 ```
 

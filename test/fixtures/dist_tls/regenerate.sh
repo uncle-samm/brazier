@@ -7,7 +7,7 @@
 #   rogue.pem, rogue.key   a node certificate signed by rogue_ca.pem
 #
 # TEST ONLY. The node keys are committed so the tests run anywhere; never
-# use these files outside test/beacon/cluster/tls_dist_test.gleam. The CA
+# use these files outside test/brazier/cluster/tls_dist_test.gleam. The CA
 # keys are discarded, so nothing else can be signed by these CAs.
 #
 # The certificates name no real host: the test turns server name checking
@@ -27,7 +27,7 @@ cat > "$WORK/node.ext" <<'EXT'
 basicConstraints = critical, CA:FALSE
 keyUsage = critical, digitalSignature, keyEncipherment
 extendedKeyUsage = serverAuth, clientAuth
-subjectAltName = DNS:beacon-test-node
+subjectAltName = DNS:brazier-test-node
 EXT
 
 cat > "$WORK/ca.ext" <<'EXT'
@@ -54,10 +54,10 @@ make_node() {
     -extfile "$WORK/node.ext" -sha256 -out "$DIR/$1.pem"
 }
 
-make_ca ca "/CN=Beacon dist test CA"
-make_node node ca "/CN=beacon-test-node"
-make_ca rogue_ca "/CN=Beacon dist rogue CA"
-make_node rogue rogue_ca "/CN=beacon-test-rogue"
+make_ca ca "/CN=Brazier dist test CA"
+make_node node ca "/CN=brazier-test-node"
+make_ca rogue_ca "/CN=Brazier dist rogue CA"
+make_node rogue rogue_ca "/CN=brazier-test-rogue"
 
 chmod 0644 "$DIR"/*.pem
 chmod 0600 "$DIR"/*.key

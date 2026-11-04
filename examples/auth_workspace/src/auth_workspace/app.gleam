@@ -3,10 +3,10 @@
 /// Everything here is compiled for the browser. The session id, the private
 /// audit trail and the store live in the server-only `Session` record in
 /// `auth_workspace.gleam`.
-import beacon/attribute
-import beacon/element.{type Element}
-import beacon/event
-import beacon/html
+import brazier/attribute
+import brazier/element.{type Element}
+import brazier/event
+import brazier/html
 import gleam/int
 
 pub type Route {

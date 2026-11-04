@@ -1,6 +1,6 @@
 # Multi-File Todo
 
-A per-session todo list built with `beacon.full_application`, with its
+A per-session todo list built with `brazier.full_application`, with its
 `TodoItem` and `Filter` types defined in a separate domain module.
 
 ## Features
@@ -18,7 +18,7 @@ A per-session todo list built with `beacon.full_application`, with its
 
 ```bash
 cd examples/multi_todo
-gleam run -m beacon/build   # first, and after every change
+gleam run -m brazier/build   # first, and after every change
 gleam run
 ```
 

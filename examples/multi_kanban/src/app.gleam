@@ -1,5 +1,5 @@
 /// Multi-file Kanban, demonstrating:
-/// - `beacon.simple` with model and message types from another module
+/// - `brazier.simple` with model and message types from another module
 ///   (`domains/board.gleam`): the build generates their codecs and compiles
 ///   `update`, imports included, to JavaScript;
 /// - drag and drop on a simple app. `update` runs in the browser first, so a
@@ -11,12 +11,12 @@
 ///
 /// The board belongs to one session; see the `kanban` example for a board
 /// shared between sessions.
-import beacon
-import beacon/attribute
-import beacon/element.{type Element}
-import beacon/event
-import beacon/html
-import beacon/log
+import brazier
+import brazier/attribute
+import brazier/element.{type Element}
+import brazier/event
+import brazier/html
+import brazier/log
 import domains/board
 import gleam/int
 import gleam/list
@@ -51,7 +51,7 @@ const max_title_length = 100
 
 const columns = [board.Todo, board.Doing, board.Done]
 
-fn init(_ctx: beacon.Context) -> Result(Model, beacon.InitError) {
+fn init(_ctx: brazier.Context) -> Result(Model, brazier.InitError) {
   Ok(Model(
     cards: [
       board.Card(id: 1, title: "Design API", column: board.Todo),
@@ -327,9 +327,9 @@ fn render_card(card: board.Card, is_dragging: Bool) -> Element(Msg) {
 
 pub fn main() {
   let assert Ok(Nil) =
-    beacon.simple(init:, update:, view:)
-    |> beacon.title(fn(_model) { "Multi-File Kanban" })
-    |> beacon.head_html(favicon)
-    |> beacon.start(8080)
-    as "beacon.start failed (it logs the error)"
+    brazier.simple(init:, update:, view:)
+    |> brazier.title(fn(_model) { "Multi-File Kanban" })
+    |> brazier.head_html(favicon)
+    |> brazier.start(8080)
+    as "brazier.start failed (it logs the error)"
 }

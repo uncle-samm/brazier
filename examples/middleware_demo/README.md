@@ -1,11 +1,11 @@
 # Middleware Demo
 
-Route-scoped HTTP middleware around a `beacon.simple` counter.
+Route-scoped HTTP middleware around a `brazier.simple` counter.
 
 ## Features
 
 - Secure headers are on by default for every app. The middleware added with
-  `beacon.with_middleware` runs after them, in the order it is added.
+  `brazier.with_middleware` runs after them, in the order it is added.
 - `middleware.group([...])` adds a request id to every response and logs
   each request. The logger is wrapped in `middleware.except("/healthz", ...)`
   so health probes stay out of the log.
@@ -20,7 +20,7 @@ Route-scoped HTTP middleware around a `beacon.simple` counter.
 
 ```bash
 cd examples/middleware_demo
-gleam run -m beacon/build   # first, and after every change
+gleam run -m brazier/build   # first, and after every change
 gleam run -m app
 ```
 

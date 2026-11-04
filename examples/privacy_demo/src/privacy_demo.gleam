@@ -7,14 +7,14 @@
 ///
 /// The subtotal, tax and total are not stored: `view` derives them from
 /// the Model, and those functions run in the browser too.
-import beacon
-import beacon/attribute
-import beacon/effect.{type Effect}
-import beacon/element.{type Element}
-import beacon/event
-import beacon/html
-import beacon/local
-import beacon/log
+import brazier
+import brazier/attribute
+import brazier/effect.{type Effect}
+import brazier/element.{type Element}
+import brazier/event
+import brazier/html
+import brazier/local
+import brazier/log
 import gleam/float
 import gleam/int
 import gleam/list
@@ -52,8 +52,8 @@ pub type Msg {
 }
 
 fn init(
-  _ctx: beacon.Context,
-) -> Result(#(Session, Effect(Msg)), beacon.InitError) {
+  _ctx: brazier.Context,
+) -> Result(#(Session, Effect(Msg)), brazier.InitError) {
   Ok(#(
     Session(
       model: Model(
@@ -165,9 +165,9 @@ fn view_item(item: Item) -> Element(Msg) {
 
 pub fn main() {
   let assert Ok(Nil) =
-    beacon.full_application(init:, update:, sync:, local: local.none(), view:)
-    |> beacon.title(fn(_model) { app_title })
-    |> beacon.head_html(favicon)
-    |> beacon.start(8080)
-    as "beacon.start failed (it logs the error)"
+    brazier.full_application(init:, update:, sync:, local: local.none(), view:)
+    |> brazier.title(fn(_model) { app_title })
+    |> brazier.head_html(favicon)
+    |> brazier.start(8080)
+    as "brazier.start failed (it logs the error)"
 }

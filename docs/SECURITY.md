@@ -1,16 +1,16 @@
 # Security
 
-Beacon includes built-in security protections across the transport, middleware, and SSR layers.
+Brazier includes built-in security protections across the transport, middleware, and SSR layers.
 
 ## SecurityLimits
 
-The `SecurityLimits` type in `beacon/transport` controls connection-level
+The `SecurityLimits` type in `brazier/transport` controls connection-level
 protections. `transport.validate_security_limits` checks it when the listener
 starts; an invalid value (a non-positive size or interval, a timer too large
 for `erlang:send_after/3`, a malformed trusted proxy or allowed origin)
 refuses to start.
 
-<!-- docs-check: fragment an excerpt of the SecurityLimits type in beacon/transport, defaults as comments -->
+<!-- docs-check: fragment an excerpt of the SecurityLimits type in brazier/transport, defaults as comments -->
 ```gleam
 pub type SecurityLimits {
   SecurityLimits(
@@ -48,7 +48,7 @@ pub type SecurityLimits {
 
 ## HTTP Server Hardening
 
-The HTTP/1.1 server (`beacon/transport/server`, `beacon/transport/http`)
+The HTTP/1.1 server (`brazier/transport/server`, `brazier/transport/http`)
 follows the cowboy/ranch and Plug conventions:
 
 - **Request line:** origin-form and absolute-form (the path is taken from an
@@ -74,7 +74,7 @@ follows the cowboy/ranch and Plug conventions:
   and drained for at most 1 s or 1 MiB before the socket closes, so unread
   request bytes do not make the kernel reset the connection and destroy the
   response (cowboy's `linger_timeout`).
-- **Connections:** the listener's connection owner (`beacon_http_conns`)
+- **Connections:** the listener's connection owner (`brazier_http_conns`)
   holds the connection slots, per peer IP and in all, and the WebSocket
   slots per client IP; a slot is released when its process exits for any
   reason. Connections over `max_connections` or `max_connections_per_ip` get
@@ -86,10 +86,10 @@ follows the cowboy/ranch and Plug conventions:
 - **Shutdown:** a stopping listener first stops its acceptors and closes the
   listen socket, then gives open connections `drain_timeout_ms` (0 kills
   them at once; at most 4294967295) to finish, and kills the rest.
-  `BEACON_SHUTDOWN_TIMEOUT` overrides it. See
+  `BRAZIER_SHUTDOWN_TIMEOUT` overrides it. See
   [DEPLOYMENT.md](DEPLOYMENT.md#graceful-shutdown).
 
-A seeded raw-socket fuzz test (`test/beacon/http_fuzz_test.gleam`) sends
+A seeded raw-socket fuzz test (`test/brazier/http_fuzz_test.gleam`) sends
 mutated and random requests and checks that the server never crashes, hangs,
 leaks a connection slot or loses an acceptor.
 
@@ -106,7 +106,7 @@ pub type Msg {
   Noop
 }
 
-fn init(_ctx: beacon.Context) -> Result(Model, beacon.InitError) {
+fn init(_ctx: brazier.Context) -> Result(Model, brazier.InitError) {
   Ok(Model)
 }
 
@@ -119,18 +119,18 @@ pub fn view(_model: Model) -> element.Element(Msg) {
 }
 -->
 ```gleam
-import beacon
-import beacon/element
-import beacon/transport
+import brazier
+import brazier/element
+import brazier/transport
 
 pub fn main() {
-  beacon.simple(init:, update:, view:)
-  |> beacon.security_limits(transport.SecurityLimits(
+  brazier.simple(init:, update:, view:)
+  |> brazier.security_limits(transport.SecurityLimits(
     ..transport.default_security_limits(),
     max_connections: 5000,
     max_events_per_second: 100,
   ))
-  |> beacon.start(8080)
+  |> brazier.start(8080)
 }
 ```
 
@@ -182,14 +182,14 @@ entry with a path, or one that does not parse, refuses to start.
 
 **HTTP middleware:** The `middleware.rate_limit(limiter)` middleware returns HTTP 429 (with `Retry-After` set to the window length) when a client exceeds the configured request rate. It keys on the socket peer address and ignores `X-Forwarded-For` / `Forwarded`, so a client cannot get a fresh budget by inventing addresses. Behind a reverse proxy use `middleware.rate_limit_behind_proxies(limiter, trusted)` (see Trusted Proxies). A request whose peer address cannot be read gets 400.
 
-The limiter (`beacon/rate_limit`) is a fixed-window counter in an ETS table owned by a dedicated process, linked to and monitoring its creator. Memory is bounded: expired windows are swept every window, and the table holds at most `max_keys` clients (default `rate_limit.default_max_keys`, 100,000; set it with `rate_limit.new_with_max_keys`). At the cap, new clients are refused (fail closed) while known clients keep their budget, and every sweep logs an error with the number of refusals. If the limiter process is gone, every check is refused and logged.
+The limiter (`brazier/rate_limit`) is a fixed-window counter in an ETS table owned by a dedicated process, linked to and monitoring its creator. Memory is bounded: expired windows are swept every window, and the table holds at most `max_keys` clients (default `rate_limit.default_max_keys`, 100,000; set it with `rate_limit.new_with_max_keys`). At the cap, new clients are refused (fail closed) while known clients keep their budget, and every sweep logs an error with the number of refusals. If the limiter process is gone, every check is refused and logged.
 
 ## Trusted Proxies
 
-`SecurityLimits.trusted_proxies` lists the reverse proxies (addresses or CIDRs such as `"10.0.0.0/8"`, `"fd00::/8"`) whose forwarding headers Beacon believes. It is validated at startup; an invalid entry refuses to start. `beacon/transport/client` is the single resolver used by the HTTP rate limiter, the per-IP WebSocket cap and the WebSocket Origin check:
+`SecurityLimits.trusted_proxies` lists the reverse proxies (addresses or CIDRs such as `"10.0.0.0/8"`, `"fd00::/8"`) whose forwarding headers Brazier believes. It is validated at startup; an invalid entry refuses to start. `brazier/transport/client` is the single resolver used by the HTTP rate limiter, the per-IP WebSocket cap and the WebSocket Origin check:
 
 - **Client IP:** the socket peer, unless the peer is a trusted proxy. Then it is the right-most `Forwarded` (preferred) or `X-Forwarded-For` hop that is not itself a trusted proxy (RFC 7239 section 7.4; the Plug `RemoteIp` / Rails `remote_ip` rule). A client can prepend hops but cannot forge the ones its proxies append. A malformed hop stops the walk at the last trusted address and is logged.
-- **Scheme:** `http` (Beacon does not terminate TLS), unless a trusted proxy sends `X-Forwarded-Proto`, which must then be `http` or `https`; anything else, or several of the header, rejects the request. From an untrusted peer the header is ignored, so a direct client cannot claim `https` to pass an `https://` Origin check.
+- **Scheme:** `http` (Brazier does not terminate TLS), unless a trusted proxy sends `X-Forwarded-Proto`, which must then be `http` or `https`; anything else, or several of the header, rejects the request. From an untrusted peer the header is ignored, so a direct client cannot claim `https` to pass an `https://` Origin check.
 
 With the default empty list, no forwarding header is ever honoured. Use the same list for `middleware.rate_limit_behind_proxies` via `ip.parse_trusted_proxies` (or `transport.trusted_proxies(limits)`).
 
@@ -203,7 +203,7 @@ A supervised tracker counts every HTTP and WebSocket connection. When `max_conne
 
 ## HTTP Pre-Upgrade Limits
 
-Before WebSocket upgrade, Beacon limits total header count, total request/header bytes, and total request/header read time using one monotonic deadline. Slow or oversized pre-upgrade requests fail before any runtime process is started.
+Before WebSocket upgrade, Brazier limits total header count, total request/header bytes, and total request/header read time using one monotonic deadline. Slow or oversized pre-upgrade requests fail before any runtime process is started.
 
 ## Response Header Validation
 
@@ -211,7 +211,7 @@ HTTP responses are validated immediately before serialization. Header names must
 
 ## HTML Attribute Validation
 
-Beacon escapes text and attribute values during SSR. `attribute.attribute(name, value)` crashes on an inline event attribute name such as `onclick`, or a name with characters outside `a-z A-Z 0-9 - _ : .`: attribute names come from application code, so such a name is a bug in the view. Use `beacon/event` for event handlers. Event handler IDs are rendered as escaped attribute values.
+Brazier escapes text and attribute values during SSR. `attribute.attribute(name, value)` crashes on an inline event attribute name such as `onclick`, or a name with characters outside `a-z A-Z 0-9 - _ : .`: attribute names come from application code, so such a name is a bug in the view. Use `brazier/event` for event handlers. Event handler IDs are rendered as escaped attribute values.
 
 ### URL Policy
 
@@ -225,7 +225,7 @@ Any other value (`javascript:`, `vbscript:`, `data:text/html`, ...) drops the at
 
 ### Escape Hatches
 
-`element.unsafe_raw_html` and `beacon.head_html` insert trusted HTML without escaping or the URL policy. Do not pass user input to them.
+`element.unsafe_raw_html` and `brazier.head_html` insert trusted HTML without escaping or the URL policy. Do not pass user input to them.
 
 ## Build And Dev Command Execution
 
@@ -242,7 +242,7 @@ The `middleware.secure_headers()` middleware (included by default in all apps) s
 - `Permissions-Policy: camera=(), microphone=(), geolocation=()`
 - `Content-Security-Policy:` `middleware.default_csp`, which is `default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https://avatars.githubusercontent.com; connect-src 'self' ws: wss:; frame-ancestors 'self'; object-src 'none'; base-uri 'self'`. `frame-ancestors 'self'` is the CSP form of `X-Frame-Options: SAMEORIGIN`.
 
-HSTS is opt-in because Beacon does not terminate TLS: add `middleware.hsts(31_536_000, True)` (it returns a `Result`; a negative max-age is an error) when the app is served over HTTPS behind a TLS proxy.
+HSTS is opt-in because Brazier does not terminate TLS: add `middleware.hsts(31_536_000, True)` (it returns a `Result`; a negative max-age is an error) when the app is served over HTTPS behind a TLS proxy.
 
 ## Route Scoping
 
@@ -250,7 +250,7 @@ HSTS is opt-in because Beacon does not terminate TLS: add `middleware.hsts(31_53
 
 ## Session Tokens
 
-SSR pages set a signed join/state recovery token in the HttpOnly `beacon_join_token` cookie; static error pages (4xx/5xx, which load no client) set none. The browser client sends an empty join token; the runtime reads the cookie from the WebSocket upgrade request. Tokens are created with `crypto.sign_message` using HMAC-SHA256 and contain a JSON payload with a timestamp, version, and optionally serialized model state. The `verify_session_token` function checks the signature and rejects tokens older than `max_age_seconds` (default 24 hours / 86400 seconds).
+SSR pages set a signed join/state recovery token in the HttpOnly `brazier_join_token` cookie; static error pages (4xx/5xx, which load no client) set none. The browser client sends an empty join token; the runtime reads the cookie from the WebSocket upgrade request. Tokens are created with `crypto.sign_message` using HMAC-SHA256 and contain a JSON payload with a timestamp, version, and optionally serialized model state. The `verify_session_token` function checks the signature and rejects tokens older than `max_age_seconds` (default 24 hours / 86400 seconds).
 
 The cookie is `HttpOnly`, `SameSite=Lax`, path `/`, and has `Max-Age=86400`. JavaScript cannot read it, so XSS cannot directly steal the join token from DOM state.
 
@@ -261,31 +261,31 @@ the formerly built-in dev secret with a `ConfigError` before any process is
 started or port bound. The key is never logged. `config.secret_key()` reads
 `SECRET_KEY` and applies the same check; there is no default.
 
-`beacon.start` generates a random per-process key when none is set, and warns at
+`brazier.start` generates a random per-process key when none is set, and warns at
 startup: tokens then die on restart and differ between nodes. Set an explicit
 key for production (generate one with `openssl rand -base64 48`); the full
 `main` is in [DEPLOYMENT.md](DEPLOYMENT.md#secret-key):
 
 <!-- docs-check: wrap
-import beacon
-import beacon/config
-import beacon/error.{type BeaconError}
+import brazier
+import brazier/config
+import brazier/error.{type BrazierError}
 import gleam/result
 
 pub fn with_secret(
-  app: beacon.App(state, model, local, msg),
-) -> Result(beacon.App(state, model, local, msg), BeaconError) {
+  app: brazier.App(state, model, local, msg),
+) -> Result(brazier.App(state, model, local, msg), BrazierError) {
   {{block}}
 }
 -->
 ```gleam
 use secret <- result.try(config.secret_key())
-Ok(beacon.secret_key(app, secret))
+Ok(brazier.secret_key(app, secret))
 ```
 
 ## CSRF Tokens
 
-`beacon/form` CSRF tokens are 256 random bits from
+`brazier/form` CSRF tokens are 256 random bits from
 `crypto.strong_random_bytes`, hex encoded; they are not derived from the
 secret key, the time or a counter. `form.verify_session_csrf` compares the
 submitted token with `crypto:hash_equals` (constant time) and consumes it with
@@ -295,8 +295,8 @@ Issuing a new token for a session replaces the old one.
 
 ## Application Session Auth
 
-For application auth, prefer `beacon/auth` helpers over hand-written cookie and
-CSRF handling. `auth.default_session_config()` sets an opaque `beacon_session`
+For application auth, prefer `brazier/auth` helpers over hand-written cookie and
+CSRF handling. `auth.default_session_config()` sets an opaque `brazier_session`
 cookie with `HttpOnly`, `Secure`, `SameSite=Lax`, and path `/`.
 
 `auth.login_json_response()` and `auth.login_route()` create a server-side
@@ -315,7 +315,7 @@ Use `auth.dev_session_config()` only for localhost HTTP development, where the
 
 - `auth.login`, `login_rotating`, `create_login` and `create_login_rotating`
   return `Result(_, auth.SessionError)`. A store that cannot answer is
-  `SessionStoreUnavailable(reason)`, logged as an error by `beacon/auth`.
+  `SessionStoreUnavailable(reason)`, logged as an error by `brazier/auth`.
 - The response helpers (`login_response`, `login_json_response`,
   `logout_response`) return `Result(_, auth.ResponseError)`: `StoreFailed` or
   `CookieRejected`. The cookie config is checked before a session is created,
@@ -352,7 +352,7 @@ and `update` must refuse signed-in actions from a guest.
 
 ## Cookies
 
-`beacon/cookie` validates every cookie it sets against RFC 6265 and returns a
+`brazier/cookie` validates every cookie it sets against RFC 6265 and returns a
 `Result`; nothing is stripped or rewritten:
 
 - the name must be an RFC 7230 token;
@@ -380,7 +380,7 @@ exact host, with `Secure` and `Path=/`.
 
 ## File Uploads
 
-`beacon/upload` trusts nothing the client sends in a multipart request:
+`brazier/upload` trusts nothing the client sends in a multipart request:
 
 - **Bounded reading.** `upload.read_multipart(req, config)` refuses a
   non-multipart Content-Type (415) before touching the body, and a declared
@@ -421,16 +421,16 @@ The runtime tracks serialized model size. Models exceeding 1MB trigger a warning
 
 ## WebSocket Authentication
 
-`beacon.ws_auth(fn(api.Request) -> Result(Nil, String))` runs before the WebSocket upgrade and again every `ws_auth_recheck_interval_ms`. `Error(reason)` rejects the upgrade with HTTP 401, or closes a live socket with 4401. For Beacon sessions use `auth.protect_ws`, or `auth.allow_guests_ws` when guests may open the page (see Application Session Auth).
+`brazier.ws_auth(fn(api.Request) -> Result(Nil, String))` runs before the WebSocket upgrade and again every `ws_auth_recheck_interval_ms`. `Error(reason)` rejects the upgrade with HTTP 401, or closes a live socket with 4401. For Brazier sessions use `auth.protect_ws`, or `auth.allow_guests_ws` when guests may open the page (see Application Session Auth).
 
 ## Events From the Browser
 
-The server decodes every event with the generated `beacon_codec.decode_event`. The accepted messages are exactly the `Msg` constructors that client code (what `view`, a Local layer and a `simple` app's `update` reach) can build, as found by the build. Any other message is refused before `update` runs: the server logs a warning, answers with an error, and the browser drops its optimistic state. Messages that only effects, subscriptions or the router produce cannot be sent from the browser.
+The server decodes every event with the generated `brazier_codec.decode_event`. The accepted messages are exactly the `Msg` constructors that client code (what `view`, a Local layer and a `simple` app's `update` reach) can build, as found by the build. Any other message is refused before `update` runs: the server logs a warning, answers with an error, and the browser drops its optimistic state. Messages that only effects, subscriptions or the router produce cannot be sent from the browser.
 
-An accepted message is still only a request: `update` runs on the server and must check that the session may perform it (for example, that a guest is not sending a signed-in action). With `beacon.simple` the browser runs `update` first for instant feedback, but the server runs it too and its model wins; a mismatch is logged in the browser.
+An accepted message is still only a request: `update` runs on the server and must check that the session may perform it (for example, that a guest is not sending a signed-in action). With `brazier.simple` the browser runs `update` first for instant feedback, but the server runs it too and its model wins; a mismatch is logged in the browser.
 
 ## Client Bundle Privacy
 
-The build compiles to JavaScript only the code the browser runs: what `view` reaches, plus `init_local` and `update_local` of a `local.layer`, plus `update` for `beacon.simple`. Each reached definition is sliced out of its source file and its imports regenerated, so a function, constant, type or import that the browser does not reach never appears in the bundle. A reference from browser code into a server-only Beacon module (for example `beacon/store`, `beacon/effect` or `beacon/session`) fails the build with the call site.
+The build compiles to JavaScript only the code the browser runs: what `view` reaches, plus `init_local` and `update_local` of a `local.layer`, plus `update` for `brazier.simple`. Each reached definition is sliced out of its source file and its imports regenerated, so a function, constant, type or import that the browser does not reach never appears in the bundle. A reference from browser code into a server-only Brazier module (for example `brazier/store`, `brazier/effect` or `brazier/session`) fails the build with the call site.
 
 At runtime, a `full_application` sends the browser only what `sync(state)` returns. Keep secrets, session ids and private records in the server state outside the synced model; `examples/privacy_demo` and `examples/route_server_workspace` show the pattern.

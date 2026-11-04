@@ -1,6 +1,6 @@
 # TigerStyle Coding Principles
 
-> Adapted from [TigerBeetle's TigerStyle](https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/TIGER_STYLE.md) for the Beacon framework. TigerStyle is the coding methodology used by the TigerBeetle database team — we adopt its principles because building a web framework has the same requirement: if something goes wrong, you need to know immediately, not three hours later from a user report.
+> Adapted from [TigerBeetle's TigerStyle](https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/TIGER_STYLE.md) for the Brazier framework. TigerStyle is the coding methodology used by the TigerBeetle database team — we adopt its principles because building a web framework has the same requirement: if something goes wrong, you need to know immediately, not three hours later from a user report.
 
 ## Core Philosophy
 
@@ -15,7 +15,7 @@ A process that crashes with a clear assertion message is easy to fix: you see th
 Every error must be explicitly handled or propagated. Never write:
 
 <!-- docs-check: wrap
-import beacon/log
+import brazier/log
 import gleam/string
 
 pub type Thing {
@@ -66,7 +66,7 @@ If you catch yourself writing `Error(_) -> Nil`, stop. Either:
 All significant state transitions, errors, warnings, and decisions must be logged with structured context.
 
 <!-- docs-check: wrap
-import beacon/log
+import brazier/log
 
 pub fn levels() -> Nil {
   {{block}}
@@ -170,12 +170,12 @@ Error("Failed to save file")
 Error("Failed to save " <> path <> ": " <> string.inspect(os_error))
 ```
 
-Custom error types should carry structured context, as Beacon's own
-`error.BeaconError` does:
+Custom error types should carry structured context, as Brazier's own
+`error.BrazierError` does:
 
-<!-- docs-check: fragment an excerpt of src/beacon/error.gleam, which has more constructors -->
+<!-- docs-check: fragment an excerpt of src/brazier/error.gleam, which has more constructors -->
 ```gleam
-pub type BeaconError {
+pub type BrazierError {
   TransportError(reason: String)
   CodecError(reason: String, raw: String)
   RuntimeError(reason: String)
@@ -199,8 +199,8 @@ Test what happens when things go wrong, not just when they go right:
 - What happens when 1000 connections hit the server simultaneously?
 - What happens when a process crashes during an update?
 
-The simulation tests (`test/beacon/sim_test.gleam`, with the harness in
-`test/beacon/sim/`) open real WebSocket connections against a running app:
+The simulation tests (`test/brazier/sim_test.gleam`, with the harness in
+`test/brazier/sim/`) open real WebSocket connections against a running app:
 
 - **Scale**: 10, 50, 100 and 1000 concurrent connections.
 - **Corrupt data**: partial JSON, binary noise, oversized payloads and
@@ -234,8 +234,8 @@ a tolerance to copy.
 
 ## How We Enforce This
 
-1. **Custom linter** (`gleam run -m beacon/lint`, `src/beacon/lint.gleam`) — parses the source and reports `todo`, `panic`, catch-all branches that do not log, `let _ =` discards, degraded-path phrases, and public functions in key modules that never log
-2. **Simulation tests** (`test/beacon/sim/`) — real connections, fault injection, leak detection
+1. **Custom linter** (`gleam run -m brazier/lint`, `src/brazier/lint.gleam`) — parses the source and reports `todo`, `panic`, catch-all branches that do not log, `let _ =` discards, degraded-path phrases, and public functions in key modules that never log
+2. **Simulation tests** (`test/brazier/sim/`) — real connections, fault injection, leak detection
 3. **Code review** — every `Error(_) -> Nil` is a red flag
 4. **CI** — `gleam build` (zero warnings) + `gleam test` (all pass) + linter (zero violations)
 5. **Docs that compile** (`scripts/check_docs.sh`) — every Gleam sample in the docs compiles with zero warnings, or is marked as a fragment with a reason

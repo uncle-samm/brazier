@@ -2,19 +2,19 @@
 
 ## Build Step (Required)
 
-Run the Beacon build from the app project's root before compiling or
+Run the Brazier build from the app project's root before compiling or
 deploying:
 
 ```bash
-gleam run -m beacon/build                        # find the app module in src/
-gleam run -m beacon/build -- src/my_app.gleam    # or name it
+gleam run -m brazier/build                        # find the app module in src/
+gleam run -m brazier/build -- src/my_app.gleam    # or name it
 ```
 
-It finds the app module (the one that calls `beacon.start`, including through
-`import beacon as b` or unqualified imports; text in comments and strings does
-not count), generates the server codec `src/beacon_codec.gleam`, runs
+It finds the app module (the one that calls `brazier.start`, including through
+`import brazier as b` or unqualified imports; text in comments and strings does
+not count), generates the server codec `src/brazier_codec.gleam`, runs
 `gleam build`, and writes the client bundle
-`priv/static/beacon_client_<hash>.js` with `priv/static/beacon_client.manifest`
+`priv/static/brazier_client_<hash>.js` with `priv/static/brazier_client.manifest`
 naming it. It needs `node` and `npx` (esbuild is pinned and fetched by `npx`).
 
 The build exits with status 1 on any failure: no app module or more than one,
@@ -23,24 +23,29 @@ or Msg field type the codec cannot encode (the error names the type and the
 field), a codec that does not compile, or a failed client bundle. A failed
 step leaves no half-written artifact behind.
 
-Production never builds. `beacon.start` refuses to start when the manifest or
+Production never builds. `brazier.start` refuses to start when the manifest or
 the bundle it names is missing, so run the build in your image or release
 pipeline, not at startup. Automatic rebuilding exists only in dev mode
-(`gleam run -m beacon/dev`).
+(`gleam run -m brazier/dev`).
 
 ## Environment Variables
 
-`beacon.start` takes its port and secret key as arguments and options, not
+`brazier.start` takes its port and secret key as arguments and options, not
 from the environment. An app that wants them from the environment reads them
-itself with `beacon/config` (see the example below). Beacon reads these
+itself with `brazier/config` (see the example below). Brazier reads these
 variables:
 
 | Variable | Read by | Default | Meaning |
 |----------|---------|---------|---------|
 | `PORT` | `config.port()`, when the app calls it | `8080` | Listen port, `0..65535` (`0` binds an ephemeral port). A set value that is not an integer in range is an `Error`. |
 | `SECRET_KEY` | `config.secret_key()`, when the app calls it | none | Token signing key, at least 32 bytes. Unset, empty, short or the old published dev secret is an `Error`. |
-| `BEACON_ENV` | `config.is_production()`, which `beacon/cluster` calls when the app joins a cluster | not production | `production` or `prod` makes the cluster refuse insecure distribution (see [CLUSTERING.md](CLUSTERING.md)). It does not change logging or anything else. |
-| `BEACON_SHUTDOWN_TIMEOUT` | `beacon.start`, when it starts the application | `SecurityLimits.drain_timeout_ms` (5000) | Milliseconds the listener waits for open connections when it stops (see [Graceful Shutdown](#graceful-shutdown)), `0..4294967295`. A set value that is not an integer in range refuses the start with a `ConfigError`. |
+| `BRAZIER_ENV` | `config.is_production()`, which `brazier/cluster` calls when the app joins a cluster | not production | `production` or `prod` makes the cluster refuse insecure distribution (see [CLUSTERING.md](CLUSTERING.md)). It does not change logging or anything else. |
+| `BRAZIER_SHUTDOWN_TIMEOUT` | `brazier.start`, when it starts the application | `SecurityLimits.drain_timeout_ms` (5000) | Milliseconds the listener waits for open connections when it stops (see [Graceful Shutdown](#graceful-shutdown)), `0..4294967295`. A set value that is not an integer in range refuses the start with a `ConfigError`. |
+
+The `BRAZIER_*` variables had another prefix before the package was renamed
+(see the [changelog](../CHANGELOG.md)). One still set under its old name is
+never read: `brazier.start` and `cluster.start` refuse with an error that
+names the variable to set instead.
 
 `config.get_env`, `config.get_env_or` and `config.get_env_int` read any other
 variable the app needs; `get_env_int` returns an `Error` for a set value that
@@ -49,7 +54,7 @@ is not an integer.
 ## Secret Key
 
 Join tokens and session tokens are signed with HMAC-SHA256, so the key must
-be at least 32 bytes (`config.min_secret_key_bytes`). `beacon.start` refuses
+be at least 32 bytes (`config.min_secret_key_bytes`). `brazier.start` refuses
 an empty key, a shorter key and the old published dev secret with a
 `ConfigError` before opening the port. Generate a key with:
 
@@ -57,7 +62,7 @@ an empty key, a shorter key and the old published dev secret with a
 openssl rand -base64 48
 ```
 
-Without `beacon.secret_key`, `beacon.start` generates a random key per process
+Without `brazier.secret_key`, `brazier.start` generates a random key per process
 and logs a warning. That key changes on restart (invalidating every token) and
 differs between nodes, so always set an explicit key in production:
 
@@ -72,7 +77,7 @@ pub type Msg {
   Increment
 }
 
-fn init(_ctx: beacon.Context) -> Result(Model, beacon.InitError) {
+fn init(_ctx: brazier.Context) -> Result(Model, brazier.InitError) {
   Ok(Model(count: 0))
 }
 
@@ -87,25 +92,25 @@ pub fn view(_model: Model) -> element.Element(Msg) {
 }
 -->
 ```gleam
-import beacon
-import beacon/config
-import beacon/element
-import beacon/error.{type BeaconError}
+import brazier
+import brazier/config
+import brazier/element
+import brazier/error.{type BrazierError}
 import gleam/result
 
 pub fn main() -> Nil {
-  // beacon.start blocks while the server runs. It returns Ok(Nil) once a
+  // brazier.start blocks while the server runs. It returns Ok(Nil) once a
   // SIGTERM drain has stopped the app, and an Error when it cannot start.
-  let assert Ok(Nil) = start() as "Beacon did not start"
+  let assert Ok(Nil) = start() as "Brazier did not start"
   Nil
 }
 
-fn start() -> Result(Nil, BeaconError) {
+fn start() -> Result(Nil, BrazierError) {
   use secret <- result.try(config.secret_key())
   use port <- result.try(config.port())
-  beacon.simple(init:, update:, view:)
-  |> beacon.secret_key(secret)
-  |> beacon.start(port)
+  brazier.simple(init:, update:, view:)
+  |> brazier.secret_key(secret)
+  |> brazier.start(port)
 }
 ```
 
@@ -119,19 +124,19 @@ validated at startup and an invalid value refuses to start. The full list is
 in [SECURITY.md](SECURITY.md#securitylimits).
 
 <!-- docs-check: wrap
-import beacon
-import beacon/transport
+import brazier
+import brazier/transport
 
 pub fn configure(
-  app: beacon.App(state, model, local, msg),
-) -> beacon.App(state, model, local, msg) {
+  app: brazier.App(state, model, local, msg),
+) -> brazier.App(state, model, local, msg) {
   app
   |>
   {{block}}
 }
 -->
 ```gleam
-beacon.security_limits(transport.SecurityLimits(
+brazier.security_limits(transport.SecurityLimits(
   ..transport.default_security_limits(),
   max_connections: 20_000,
   max_events_per_second: 100,
@@ -144,19 +149,19 @@ beacon.security_limits(transport.SecurityLimits(
 
 ## Behind a Reverse Proxy
 
-Beacon does not terminate TLS. Behind a TLS-terminating proxy (nginx, a load
-balancer), list the proxy in `trusted_proxies`; without it, Beacon sees every
+Brazier does not terminate TLS. Behind a TLS-terminating proxy (nginx, a load
+balancer), list the proxy in `trusted_proxies`; without it, Brazier sees every
 client as the proxy's address and ignores the forwarding headers. The rules
 are in [SECURITY.md](SECURITY.md#trusted-proxies); for deployment:
 
-- **WebSocket upgrades** must reach Beacon: forward `Upgrade` and
-  `Connection`. Beacon pings every `ws_ping_interval_ms` (30 s), so a proxy
+- **WebSocket upgrades** must reach Brazier: forward `Upgrade` and
+  `Connection`. Brazier pings every `ws_ping_interval_ms` (30 s), so a proxy
   idle timeout longer than that keeps quiet sockets open.
 - **`Host`**: pass the client's `Host` header through unchanged. The
   WebSocket Origin check compares the browser's `Origin` with the request's
-  scheme, `Host` and port; Beacon does not read `X-Forwarded-Host`.
+  scheme, `Host` and port; Brazier does not read `X-Forwarded-Host`.
 - **`X-Forwarded-Proto`**: the proxy must send `https` for HTTPS clients.
-  Beacon reads it only from a trusted proxy. Without it the request's scheme is
+  Brazier reads it only from a trusted proxy. Without it the request's scheme is
   `http`, and a browser on `https://` fails the Origin check with 403. Several
   `X-Forwarded-Proto` headers, or a value other than `http` or `https`, reject
   the request.
@@ -182,7 +187,7 @@ are in [SECURITY.md](SECURITY.md#trusted-proxies); for deployment:
 
 ## Health Check
 
-Beacon answers `/health` with HTTP 200 and the body `{"status":"ok"}`. It is
+Brazier answers `/health` with HTTP 200 and the body `{"status":"ok"}`. It is
 a liveness check: it shows the HTTP listener accepts and answers requests,
 not that sessions, stores or the cluster work. It runs after the middleware
 pipeline and the app's API routes, so an API route for `/health` replaces it,
@@ -195,15 +200,15 @@ The repository's `Dockerfile` builds one of the examples and doubles as a
 template for your own app:
 
 ```bash
-docker build -t beacon-counter .
-docker build --build-arg EXAMPLE=todo --build-arg APP_MODULE=todo -t beacon-todo .
-docker run --rm -p 8080:8080 beacon-counter
+docker build -t brazier-counter .
+docker build --build-arg EXAMPLE=todo --build-arg APP_MODULE=todo -t brazier-todo .
+docker run --rm -p 8080:8080 brazier-counter
 ```
 
 `EXAMPLE` is the directory under `examples/` and `APP_MODULE` is the module
 whose `main/0` starts the app (the build logs it as the app module). The
 builder stage (`ghcr.io/gleam-lang/gleam:v1.19.2-erlang-alpine` plus Node)
-runs `gleam run -m beacon/build` and `gleam export erlang-shipment`; any
+runs `gleam run -m brazier/build` and `gleam export erlang-shipment`; any
 failure fails the image build. The runtime stage (`erlang:28-alpine`, the same
 OTP release) copies the shipment and `priv/`, runs as a non-root user, and
 starts `APP_MODULE:main()` through a small start script. The script exits with
@@ -217,7 +222,7 @@ app's first page; `/health` (above) is the cheaper check.
 
 ## Graceful Shutdown
 
-`application.wait_forever`, which `beacon.start` calls once the application
+`application.wait_forever`, which `brazier.start` calls once the application
 is up, turns SIGTERM (what `docker stop`, Kubernetes and systemd send) into a
 drain:
 
@@ -231,14 +236,14 @@ drain:
 3. Connections still open after the drain timeout are killed, with one
    error log naming how many.
 4. The rest of the tree stops, `wait_forever` returns, and so does
-   `beacon.start`.
+   `brazier.start`.
 
 The drain timeout is `SecurityLimits.drain_timeout_ms` (default 5000), or
-`BEACON_SHUTDOWN_TIMEOUT` when set. Keep it below the orchestrator's grace
+`BRAZIER_SHUTDOWN_TIMEOUT` when set. Keep it below the orchestrator's grace
 period: `docker stop` sends SIGKILL after 10 seconds, and Kubernetes after
 `terminationGracePeriodSeconds` (30 by default).
 
-While `wait_forever` waits and drains, Beacon's handler replaces OTP's on
+While `wait_forever` waits and drains, Brazier's handler replaces OTP's on
 the `erl_signal_server` event manager, and puts OTP's back once nothing
 waits. Every application running on the node is drained, whichever process
 started it. A second SIGTERM during the drain is logged as a warning and
@@ -251,7 +256,7 @@ A page that reconnects to an instance running a different build (a new
 release, or a rolling deploy that sends it to an old instance) is refused
 with **4409** `stale build` when it joins, and reloads to fetch the bundle
 that instance serves. The join carries the page's build id, the hash in its
-`beacon_client_<hash>.js` URL; the server compares it with its own manifest.
+`brazier_client_<hash>.js` URL; the server compares it with its own manifest.
 The reload goes through the client's reload guard (at most 3 per tab within
 60 s), so a rolling deploy that keeps sending a tab between builds ends in an
 error page rather than a reload loop: route a client to one build at a time
@@ -263,7 +268,7 @@ warning.
 
 ## Logging and Connections
 
-`beacon.start` configures the Erlang logger at `info` level: debug messages
-are not printed, whatever `BEACON_ENV` says. When `max_connections` is
+`brazier.start` configures the Erlang logger at `info` level: debug messages
+are not printed, whatever `BRAZIER_ENV` says. When `max_connections` is
 reached, a new connection gets 503 before its request is read. WebSocket limits,
 Origin rules and close codes are in [SECURITY.md](SECURITY.md#websocket-limits).

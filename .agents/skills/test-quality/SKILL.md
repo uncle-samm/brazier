@@ -11,7 +11,7 @@ Critically evaluate whether the test suite provides honest, useful feedback — 
 ## Usage
 
 - `/test-quality` — audit all tests (unit, sim, CDP)
-- `/test-quality src/beacon/runtime.gleam` — audit tests for a specific module
+- `/test-quality src/brazier/runtime.gleam` — audit tests for a specific module
 - `/test-quality gaps` — focus on finding test gaps
 - `/test-quality honesty` — focus on whether tests are honest
 - `/test-quality sim` — audit simulation tests only
@@ -41,14 +41,14 @@ Patterns that indicate dishonest tests:
 
 **For each dishonest test found, report:**
 ```
-[DISHONEST] test/beacon/foo_test.gleam:42 — test_bar_works
+[DISHONEST] test/brazier/foo_test.gleam:42 — test_bar_works
   Problem: Asserts html contains "div" — passes for ANY div, not just the right one
   Honest version: Assert specific content like "Count: 0" or check element structure
 ```
 
 ### 2. Test Gaps — What's NOT Tested?
 
-**For each module in `src/beacon/`, check if there's a corresponding test file. Then check if the test file actually covers the important paths.**
+**For each module in `src/brazier/`, check if there's a corresponding test file. Then check if the test file actually covers the important paths.**
 
 Checklist per module:
 - [ ] Happy path tested
@@ -67,7 +67,7 @@ Checklist per module:
 
 **For each gap, report:**
 ```
-[GAP] src/beacon/pubsub.gleam — No test for concurrent subscribe/unsubscribe race
+[GAP] src/brazier/pubsub.gleam — No test for concurrent subscribe/unsubscribe race
   Risk: Two processes subscribing and unsubscribing simultaneously could corrupt subscriber list
   Suggested test: Spawn 10 processes, each subscribing/unsubscribing rapidly, verify final state
 ```
@@ -84,7 +84,7 @@ Checklist per module:
 
 **For each outdated test, report:**
 ```
-[OUTDATED] test/beacon/diff_test.gleam:120 — test_old_patch_format
+[OUTDATED] test/brazier/diff_test.gleam:120 — test_old_patch_format
   Reason: The patch format changed in milestone 72, this test was updated to match
   but now just tests the same thing as test_new_patch_format on line 150.
   Action: Remove — duplicate coverage, adds maintenance burden
@@ -92,7 +92,7 @@ Checklist per module:
 
 ### 4. Simulation Test Quality
 
-**File: `test/beacon/sim_test.gleam` + `test/beacon/sim/`**
+**File: `test/brazier/sim_test.gleam` + `test/brazier/sim/`**
 
 Sim tests simulate multiple clients connecting and interacting. Check:
 
@@ -102,7 +102,7 @@ Sim tests simulate multiple clients connecting and interacting. Check:
 - **Fault injection:** Do any sims test server crashes, network drops, or slow clients?
 - **Load testing:** Are there sims that test with enough connections to find concurrency bugs? (10 is not enough — try 100+)
 - **State verification:** After a sim runs, is the final model state verified? Or just "it didn't crash"?
-- **Report accuracy:** Does the sim report (`test/beacon/sim/report.gleam`) actually check actionable things?
+- **Report accuracy:** Does the sim report (`test/brazier/sim/report.gleam`) actually check actionable things?
 
 **Sim-specific patterns to flag:**
 ```

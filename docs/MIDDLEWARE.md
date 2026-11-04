@@ -1,21 +1,21 @@
 # Middleware
 
-Beacon's middleware system processes HTTP requests and responses. Middleware can inspect/modify requests, modify responses, or short-circuit (e.g., return 401).
+Brazier's middleware system processes HTTP requests and responses. Middleware can inspect/modify requests, modify responses, or short-circuit (e.g., return 401).
 
 ## Pipeline
 
 A `Middleware` takes a request and a `next` function, returning a response.
-Add one to an app with `beacon.with_middleware(app, mw)`; they run in the order
+Add one to an app with `brazier.with_middleware(app, mw)`; they run in the order
 they are added, before the app's API routes, the framework routes
 (`/health`, the client bundle, `/static`) and page rendering. They also run on
 a WebSocket upgrade request: a middleware that answers instead of calling
 `next` refuses the upgrade with its response.
-`beacon.simple`, `beacon.application` and `beacon.full_application` start with
+`brazier.simple`, `brazier.application` and `brazier.full_application` start with
 `secure_headers()` already in the list.
 
 <!-- docs-check: wrap
-import beacon/effect.{type Effect}
-import beacon/element.{type Element}
+import brazier/effect.{type Effect}
+import brazier/element.{type Element}
 
 {{block}}
 
@@ -27,7 +27,7 @@ pub type Msg {
   Noop
 }
 
-fn init(_ctx: beacon.Context) -> Result(#(Model, Effect(Msg)), beacon.InitError) {
+fn init(_ctx: brazier.Context) -> Result(#(Model, Effect(Msg)), brazier.InitError) {
   Ok(#(Model, effect.none()))
 }
 
@@ -40,13 +40,13 @@ pub fn view(_model: Model) -> Element(Msg) {
 }
 -->
 ```gleam
-import beacon
-import beacon/error.{type BeaconError}
-import beacon/middleware
-import beacon/rate_limit
+import brazier
+import brazier/error.{type BrazierError}
+import brazier/middleware
+import brazier/rate_limit
 import gleam/result
 
-pub fn start() -> Result(Nil, BeaconError) {
+pub fn start() -> Result(Nil, BrazierError) {
   use limiter <- result.try(
     rate_limit.new(
       "api",
@@ -54,10 +54,10 @@ pub fn start() -> Result(Nil, BeaconError) {
     )
     |> result.map_error(error.ConfigError),
   )
-  beacon.application(init:, update:, view:)
-  |> beacon.with_middleware(middleware.logger())
-  |> beacon.with_middleware(middleware.rate_limit(limiter))
-  |> beacon.start(8080)
+  brazier.application(init:, update:, view:)
+  |> brazier.with_middleware(middleware.logger())
+  |> brazier.with_middleware(middleware.rate_limit(limiter))
+  |> brazier.start(8080)
 }
 ```
 
@@ -85,7 +85,7 @@ chains middleware around a handler of your own, in the same order.
 Apply middleware conditionally using scope functions:
 
 <!-- docs-check: wrap
-import beacon/middleware.{type Middleware}
+import brazier/middleware.{type Middleware}
 import gleam/http
 
 pub fn scoped(
@@ -112,15 +112,15 @@ Paths are matched on segment boundaries, the way the routers read them:
 dot segments are normalised, so `//admin` and `/public/../admin` cannot slip
 past a scoped auth middleware. A trailing slash is ignored.
 
-Route-aware apps use the same `beacon.with_middleware` builder because there
+Route-aware apps use the same `brazier.with_middleware` builder because there
 is only one app startup path.
 
 ## Writing Custom Middleware
 
 ```gleam
-import beacon/api
-import beacon/middleware.{type Middleware}
-import beacon/session
+import brazier/api
+import brazier/middleware.{type Middleware}
+import brazier/session
 import gleam/http/request
 
 /// Refuse requests whose `x-api-key` header is not `expected`.

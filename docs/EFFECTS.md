@@ -1,20 +1,20 @@
 # Effects
 
-Effects are descriptions of side effects that the Beacon runtime executes. Following Lustre's design, effects are data -- not actions. The `Effect(msg)` type is opaque and composed via combinators.
+Effects are descriptions of side effects that the Brazier runtime executes. Following Lustre's design, effects are data -- not actions. The `Effect(msg)` type is opaque and composed via combinators.
 
 ## Where Effects Come From
 
-`beacon.application` and `beacon.full_application` return effects from
+`brazier.application` and `brazier.full_application` return effects from
 `init` and `update`, as Lustre's `application` does. Both functions run only
 on the server, so an effect may use stores, PubSub, HTTP, the environment,
 randomness and any other BEAM-only code.
 
 ```gleam
-import beacon
-import beacon/effect.{type Effect}
-import beacon/element.{type Element}
-import beacon/event
-import beacon/html
+import brazier
+import brazier/effect.{type Effect}
+import brazier/element.{type Element}
+import brazier/event
+import brazier/html
 import gleam/list
 
 pub type Model {
@@ -26,7 +26,7 @@ pub type Msg {
   Save(String)
 }
 
-fn init(_ctx: beacon.Context) -> Result(#(Model, Effect(Msg)), beacon.InitError) {
+fn init(_ctx: brazier.Context) -> Result(#(Model, Effect(Msg)), brazier.InitError) {
   Ok(#(
     Model(loading: True, items: []),
     effect.background(fn(dispatch) { dispatch(ItemsLoaded(load_items())) }),
@@ -50,8 +50,8 @@ fn view(model: Model) -> Element(Msg) {
 }
 
 pub fn main() {
-  beacon.application(init:, update:, view:)
-  |> beacon.start(8080)
+  brazier.application(init:, update:, view:)
+  |> brazier.start(8080)
 }
 
 // The app's own database calls.
@@ -64,17 +64,17 @@ fn save_item(_item: String) -> Nil {
 }
 ```
 
-`beacon.simple` has no effects: its `update` is also compiled to JavaScript
+`brazier.simple` has no effects: its `update` is also compiled to JavaScript
 and runs in the browser. Use `application` as soon as an update needs
 server-only work.
 
 `init` runs twice per page, as LiveView's mount does. On the HTML render
-(`beacon.is_connected(ctx)` is False) Beacon drops the returned effect. When
+(`brazier.is_connected(ctx)` is False) Brazier drops the returned effect. When
 the WebSocket connects, it runs `init` again and performs the effect. A
 startup effect therefore runs once per connected session, not once per HTTP
 request.
 
-Beacon performs an effect after the update that returned it and after the
+Brazier performs an effect after the update that returned it and after the
 new model is sent to the browser.
 
 ## Core Functions
@@ -96,7 +96,7 @@ new model is sent to the browser.
 **`effect.keyed(key, effect)`** -- Tag an effect with a stable key. Messages from an older generation of the same key are dropped by the runtime. For spawned effects (`background`, `every`, `after`) the key is also single-flight: performing a keyed spawned effect first stops the process previously started under that key. Re-keying a timer therefore replaces it and never consumes an extra timer slot:
 
 <!-- docs-check: wrap
-import beacon/effect.{type Effect}
+import brazier/effect.{type Effect}
 
 pub type Msg {
   Poll
@@ -126,7 +126,7 @@ Effects that spawn their own processes inside `effect.from` are not tracked; use
 
 ## Navigation Effects
 
-`beacon/router` returns navigation as effects (LiveView's `push_patch`,
+`brazier/router` returns navigation as effects (LiveView's `push_patch`,
 `push_navigate` and `redirect`):
 
 - **`router.push(path)`**: change the URL and add a history entry without
@@ -141,8 +141,8 @@ All three take same-origin paths only (`/` but not `//`). Any other value is
 logged as an error and not sent.
 
 <!-- docs-check: wrap
-import beacon/effect.{type Effect}
-import beacon/router
+import brazier/effect.{type Effect}
+import brazier/router
 
 pub type Model {
   Model

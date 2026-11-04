@@ -1,6 +1,6 @@
 # Clustering
 
-Beacon nodes form a cluster with ordinary Erlang distribution. Once nodes
+Brazier nodes form a cluster with ordinary Erlang distribution. Once nodes
 are connected:
 
 - PubSub broadcasts reach subscribers on every node.
@@ -20,25 +20,25 @@ The telemetry events mentioned below are listed in
 
 ## The supervision tree
 
-`beacon.start` runs the application under one root supervisor with the
+`brazier.start` runs the application under one root supervisor with the
 `RestForOne` strategy (Phoenix's application structure). Its children start
 in this order:
 
-1. PubSub, configured with `beacon.pubsub_config`.
-2. The cluster manager, when `beacon.cluster(config)` is set.
+1. PubSub, configured with `brazier.pubsub_config`.
+2. The cluster manager, when `brazier.cluster(config)` is set.
 3. The session revocation scope, which carries logouts and rotations to
    bound sockets on every node.
-4. The presence tracker, when `beacon.presence(..)` or
-   `beacon.watch_presence(..)` is set.
+4. The presence tracker, when `brazier.presence(..)` or
+   `brazier.watch_presence(..)` is set.
 5. The HTTP and WebSocket listener.
 
 <!-- docs-check: wrap
-import beacon
-import beacon/effect.{type Effect}
-import beacon/element.{type Element}
-import beacon/presence
-import beacon/presence/sync
-import beacon/cluster
+import brazier
+import brazier/effect.{type Effect}
+import brazier/element.{type Element}
+import brazier/presence
+import brazier/presence/sync
+import brazier/cluster
 
 pub fn main(
   discovery: cluster.Discovery,
@@ -56,7 +56,7 @@ pub type Msg {
   PresenceChanged(sync.Diff(String))
 }
 
-fn init(_ctx: beacon.Context) -> Result(#(Model, Effect(Msg)), beacon.InitError) {
+fn init(_ctx: brazier.Context) -> Result(#(Model, Effect(Msg)), brazier.InitError) {
   Ok(#(Model(room: "1", user: "ada", status: "online"), effect.none()))
 }
 
@@ -75,10 +75,10 @@ fn track(model: Model) -> List(presence.Tracking(String)) {
 }
 -->
 ```gleam
-beacon.application(init:, update:, view:)
-|> beacon.cluster(cluster.new(discovery, secret_key: secret_key))
-|> beacon.presence(tracker: online, track: track, on_presence: PresenceChanged)
-|> beacon.start(8080)
+brazier.application(init:, update:, view:)
+|> brazier.cluster(cluster.new(discovery, secret_key: secret_key))
+|> brazier.presence(tracker: online, track: track, on_presence: PresenceChanged)
+|> brazier.start(8080)
 ```
 
 - **A crash restarts that child and every child after it.** A PubSub
@@ -87,10 +87,10 @@ beacon.application(init:, update:, view:)
   restart touches nothing before it. A single presence shard that crashes
   is restarted by the tracker's own supervisor instead.
 - **Past the restart tolerance the root gives up.** It exits, and
-  `beacon.start` crashes the main process with the reason instead of
+  `brazier.start` crashes the main process with the reason instead of
   running on without PubSub or the listener. Run the release under a
   process manager that restarts it.
-- **The tree owns these processes.** `beacon.start` refuses to start, with
+- **The tree owns these processes.** `brazier.start` refuses to start, with
   a `ConfigError` and an error log, when PubSub, the cluster manager, the
   session scope or the tracker is already running outside a tree.
 - **`application.stop` stops the whole tree** and frees the port.
@@ -105,7 +105,7 @@ Erlang distribution has no permission model. Anyone who holds the cookie,
 or a certificate your CA signed, owns the cluster. Treat the cookie and the
 node keys like the database root password.
 
-Beacon does not turn distribution on for you, and in production it refuses
+Brazier does not turn distribution on for you, and in production it refuses
 to start the cluster manager over an unsafe setup.
 
 ### 1. Give the node a name
@@ -142,7 +142,7 @@ ERL_FLAGS="-name app@node1.internal -proto_dist inet_tls -ssl_dist_optfile /etc/
 
 - `verify_peer` together with `fail_if_no_peer_cert` makes both sides prove
   who they are. A node without a certificate, or with one from another CA,
-  is refused during the handshake. `test/beacon/cluster/tls_dist_test.gleam`
+  is refused during the handshake. `test/brazier/cluster/tls_dist_test.gleam`
   checks both cases.
 - Each node's certificate must name its host (`subjectAltName`) as it
   appears in the node name (`node1.internal` above), and server name
@@ -177,9 +177,9 @@ TLS authenticates nodes. The cookie is still checked after the handshake.
   claimed by the connecting side, so this only means something with TLS,
   where the certificate backs the name.
 
-### 5. What Beacon refuses
+### 5. What Brazier refuses
 
-With `BEACON_ENV=prod`, `cluster.start` and `cluster.supervised` return
+With `BRAZIER_ENV=prod`, `cluster.start` and `cluster.supervised` return
 `Error(InsecureDistribution(reason))` in two cases:
 
 - distribution is not `inet_tls` or `inet6_tls`;
@@ -191,7 +191,7 @@ and logged at info level.
 To run a production node over an insecure setup on purpose, say why:
 
 <!-- docs-check: wrap
-import beacon/cluster
+import brazier/cluster
 
 pub fn config(discovery: cluster.Discovery, secret: String) -> cluster.ClusterConfig {
   {{block}}
@@ -209,8 +209,8 @@ reason. If distribution is not started at all, the result is
 ## The cluster manager
 
 <!-- docs-check: wrap
-import beacon/effect.{type Effect}
-import beacon/element.{type Element}
+import brazier/effect.{type Effect}
+import brazier/element.{type Element}
 
 {{block}}
 
@@ -222,7 +222,7 @@ pub type Msg {
   Increment
 }
 
-fn init(_ctx: beacon.Context) -> Result(#(Model, Effect(Msg)), beacon.InitError) {
+fn init(_ctx: brazier.Context) -> Result(#(Model, Effect(Msg)), brazier.InitError) {
   Ok(#(Model(count: 0), effect.none()))
 }
 
@@ -237,8 +237,8 @@ fn view(_model: Model) -> Element(Msg) {
 }
 -->
 ```gleam
-import beacon
-import beacon/cluster
+import brazier
+import brazier/cluster
 
 pub fn start(secret_key: String) {
   let config =
@@ -247,15 +247,15 @@ pub fn start(secret_key: String) {
       secret_key: secret_key,
     )
 
-  beacon.application(init:, update:, view:)
-  |> beacon.cluster(config)
-  |> beacon.start(8080)
+  brazier.application(init:, update:, view:)
+  |> brazier.cluster(config)
+  |> brazier.start(8080)
 }
 ```
 
-`beacon.cluster` runs the manager in the application's supervision tree,
-right after PubSub; `beacon.start` fails when the configuration or this
-node's distribution does not pass the checks above. Outside a Beacon app,
+`brazier.cluster` runs the manager in the application's supervision tree,
+right after PubSub; `brazier.start` fails when the configuration or this
+node's distribution does not pass the checks above. Outside a Brazier app,
 `cluster.supervised(config)` builds a child for your own supervisor, and
 `cluster.start(config)` runs it unsupervised; `cluster.stop()` stops it. Stopping keeps existing connections up, but
 they are no longer reconnected or checked.
@@ -283,20 +283,20 @@ Settings:
   when distribution reports them down. A DNS blip therefore never splits
   the cluster.
 - **Failure telemetry.** Every failed connection or lookup is logged and
-  emits `[beacon, cluster, connect, failed]`.
-- **Membership telemetry.** `[beacon, cluster, node, up | down]` reports
+  emits `[brazier, cluster, connect, failed]`.
+- **Membership telemetry.** `[brazier, cluster, node, up | down]` reports
   membership.
 
 ### The peer check
 
 When a node connects, both sides exchange
-`HMAC-SHA256(secret_key, "beacon-cluster-v1")` and a protocol version.
+`HMAC-SHA256(secret_key, "brazier-cluster-v1")` and a protocol version.
 
 - If the key or the version differs, the peer is disconnected.
 - If the peer sends nothing within `peer_check_timeout` (default 5s), it is
   disconnected.
 - Each rejection is logged at error level and emits
-  `[beacon, cluster, peer, rejected]`.
+  `[brazier, cluster, peer, rejected]`.
 - `cluster.members()` returns the connected peers that passed the check.
 
 The check catches misconfiguration, for example staging and production
@@ -307,7 +307,7 @@ boundary.
 
 ## PubSub across nodes
 
-`beacon/pubsub` is a port of Phoenix.PubSub with its pg adapter.
+`brazier/pubsub` is a port of Phoenix.PubSub with its pg adapter.
 
 - **Delivery.** `broadcast` delivers to local subscribers, then sends one
   message per remote node. The receiving node's forwarding worker delivers
@@ -320,7 +320,7 @@ boundary.
   other completely (see above). Do not connect nodes you do not trust.
 - **Overload is reported, never hidden.** A forwarding worker whose queue
   passes `max_forward_queue` (default 10,000) logs an error and emits
-  `[beacon, pubsub, forward, overloaded]` at most once per second. It
+  `[brazier, pubsub, forward, overloaded]` at most once per second. It
   never drops messages.
 - **Topics.** Each topic is 1 to 255 bytes. A subscriber may hold at most
   `max_topics_per_subscriber` topics (default 1,000).
@@ -334,7 +334,7 @@ Start PubSub before presence and before anything that subscribes:
 
 ## Stores
 
-A `beacon/store` store is local or replicated, chosen when it is opened.
+A `brazier/store` store is local or replicated, chosen when it is opened.
 
 - **Local** (the default, `store.new` / `store.new_list`). The table is per
   node. A write changes this node's table and notifies watchers on this
@@ -350,8 +350,8 @@ Presence is the better fit for "who is here".
 ## Replicated stores
 
 <!-- docs-check: wrap
-import beacon/store
-import beacon/store/replicated
+import brazier/store
+import brazier/store/replicated
 
 pub fn open_cart() -> store.Store(Int) {
   {{block}}
@@ -367,7 +367,7 @@ Each node runs one replica process per replicated store, under its own
 supervisor. The design follows Phoenix.Tracker (one process owns the
 replicated state, deltas go out over PubSub, and a periodic exchange repairs
 what was lost). Its state is an add-wins last-writer-wins map ported from
-delta_crdt_ex's `AWLWWMap` (`beacon/store/crdt`). The replica mirrors its
+delta_crdt_ex's `AWLWWMap` (`brazier/store/crdt`). The replica mirrors its
 values into ETS, so reads never leave the node or call the replica. The API
 is the one in [STATE_MANAGEMENT.md](STATE_MANAGEMENT.md#replicated-stores).
 
@@ -375,7 +375,7 @@ is the one in [STATE_MANAGEMENT.md](STATE_MANAGEMENT.md#replicated-stores).
 
 1. A write is a call to this node's replica. The replica checks the limits,
    applies the write, updates its ETS mirror, and broadcasts the write's
-   delta on `beacon_store:<kv|list>:<name>`. The writer then notifies this
+   delta on `brazier_store:<kv|list>:<name>`. The writer then notifies this
    node's watchers.
 2. Each receiving replica merges the delta, then notifies its own node's
    watchers on the store topic and on any `append_notify` /
@@ -396,7 +396,7 @@ or after a full state that already contained it changes nothing.
 ### Conflicts
 
 - **Timestamps.** Every write is stamped with a hybrid logical clock
-  (`beacon/store/hlc`): the wall clock in milliseconds, a logical counter,
+  (`brazier/store/hlc`): the wall clock in milliseconds, a logical counter,
   and the node name. A replica that merges a remote write advances its
   clock past that write, so a later write on any node gets a later
   timestamp.
@@ -455,10 +455,10 @@ gets `Error(InvalidConfig(_))`.
 
 ### Telemetry
 
-- Every write emits `[beacon, store, write]` with `mode: "replicated"`. A
+- Every write emits `[brazier, store, write]` with `mode: "replicated"`. A
   rejected write emits nothing.
 - Every remote merge (delta or full state, accepted or refused) runs in a
-  `[beacon, store, sync]` span. The stop event's `entries` is the number of
+  `[brazier, store, sync]` span. The stop event's `entries` is the number of
   entries the payload carried and `bytes` its size; `peer` is the sending
   node. See [TELEMETRY.md](TELEMETRY.md).
 
@@ -490,7 +490,7 @@ A session store has one of two backends.
     session is never treated as valid.
 
 <!-- docs-check: wrap
-import beacon/session
+import brazier/session
 
 pub fn start(postgres_backend: session.ExternalBackend) -> session.SessionStore {
   {{block}}
@@ -505,7 +505,7 @@ let assert Ok(store) =
 Across the cluster:
 
 - **Revocation is cluster-wide.** Deleting, rotating or expiring a session
-  sends `{beacon_session_revoked, Id, Reason}` to every process bound to it
+  sends `{brazier_session_revoked, Id, Reason}` to every process bound to it
   (`bind_current_process`) on every connected node.
 - **Netsplits.** A revocation cannot cross a netsplit. When a node
   connects, every store re-checks the sessions its local processes are
@@ -518,18 +518,18 @@ Across the cluster:
 
 ## Presence
 
-`beacon/presence` is a port of Phoenix.Tracker and Phoenix.Presence. It
+`brazier/presence` is a port of Phoenix.Tracker and Phoenix.Presence. It
 tracks which processes are on a topic, on every connected node.
 
 ### Session presence
 
-Most apps track their sessions with `beacon.presence`. The tracker runs in
+Most apps track their sessions with `brazier.presence`. The tracker runs in
 the application's supervision tree, and each session declares what it is
 present as from its state:
 
 <!-- docs-check: wrap
-import beacon/effect.{type Effect}
-import beacon/element.{type Element}
+import brazier/effect.{type Effect}
+import brazier/element.{type Element}
 import gleam/dynamic/decode
 import gleam/json
 
@@ -548,7 +548,7 @@ pub type Profile {
   Profile(name: String)
 }
 
-fn init(_ctx: beacon.Context) -> Result(#(Model, Effect(Msg)), beacon.InitError) {
+fn init(_ctx: brazier.Context) -> Result(#(Model, Effect(Msg)), brazier.InitError) {
   let profile = Profile(name: "Ada")
   Ok(#(Model(room: "1", user: "ada", profile:, online: []), effect.none()))
 }
@@ -567,9 +567,9 @@ fn profile_decoder() -> decode.Decoder(Profile) {
 }
 -->
 ```gleam
-import beacon
-import beacon/presence
-import beacon/presence/sync
+import brazier
+import brazier/presence
+import brazier/presence/sync
 
 pub type Msg {
   PresenceChanged(sync.Diff(Profile))
@@ -578,15 +578,15 @@ pub type Msg {
 pub fn main() {
   let online = presence.new("online", encode_profile, profile_decoder())
 
-  beacon.application(init:, update:, view:)
-  |> beacon.presence(
+  brazier.application(init:, update:, view:)
+  |> brazier.presence(
     tracker: online,
     track: fn(model) {
       [presence.Tracking(topic: "room:" <> model.room, key: model.user, meta: model.profile)]
     },
     on_presence: PresenceChanged,
   )
-  |> beacon.start(8080)
+  |> brazier.start(8080)
 }
 
 fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
@@ -597,9 +597,9 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
 }
 ```
 
-`Diff`, `Entry` and `Meta` are in `beacon/presence/sync`, which runs in the
+`Diff`, `Entry` and `Meta` are in `brazier/presence/sync`, which runs in the
 browser, so `Msg` and the Model can carry them. The rest of
-`beacon/presence` runs only on the server. `examples/chat` tracks who is in
+`brazier/presence` runs only on the server. `examples/chat` tracks who is in
 each room and who is typing this way.
 
 - **Tracking follows the state.** `track` runs after every update. A new
@@ -662,10 +662,10 @@ This is Phoenix.Tracker's model, kept on purpose:
   rule Phoenix does not have.
 - `Phoenix.Tracker.Shard.handle_heartbeat` treats a known node with a new
   `vsn` as down, then permanently down, then up: the old replica's entries
-  leave at once, and the new replica's join when they replicate. Beacon's
-  shard does the same (`beacon_presence_shard.erl`, `handle_heartbeat`).
+  leave at once, and the new replica's join when they replicate. Brazier's
+  shard does the same (`brazier_presence_shard.erl`, `handle_heartbeat`).
 - Holding the leaves until the entries come back would not be bounded by
-  anything the watcher can know. Only Beacon sessions track again, a
+  anything the watcher can know. Only Brazier sessions track again, a
   process that called `presence.track` itself does not, and a session may
   have ended meanwhile. Phoenix does not track again at all: the shard
   links its tracked processes, so a shard crash ends them, and their
@@ -680,21 +680,21 @@ the shard reports.
 - **Failures stop the session loudly.** A tracking the tracker refuses (a
   limit, an invalid topic or key, the same key twice on a topic), a
   tracker that stays down, or the loss of the session's PubSub partition
-  stops the session with a logged error. `beacon.start` fails when the
+  stops the session with a logged error. `brazier.start` fails when the
   tracker configuration is invalid.
 
 ### Watching without tracking
 
 A session that only shows who is here, such as a dashboard or a lobby
-list, uses `beacon.watch_presence`. It follows the topics `watch` returns
+list, uses `brazier.watch_presence`. It follows the topics `watch` returns
 for its state and tracks nothing, so it never appears in a list:
 
 <!-- docs-check: wrap
-import beacon
-import beacon/effect.{type Effect}
-import beacon/element.{type Element}
-import beacon/presence
-import beacon/presence/sync
+import brazier
+import brazier/effect.{type Effect}
+import brazier/element.{type Element}
+import brazier/presence
+import brazier/presence/sync
 
 pub fn main(online: presence.PresenceConfig(String)) {
   {{block}}
@@ -708,7 +708,7 @@ pub type Msg {
   PresenceChanged(sync.Diff(String))
 }
 
-fn init(_ctx: beacon.Context) -> Result(#(Model, Effect(Msg)), beacon.InitError) {
+fn init(_ctx: brazier.Context) -> Result(#(Model, Effect(Msg)), brazier.InitError) {
   Ok(#(Model(room: "1", user: "ada", status: "online"), effect.none()))
 }
 
@@ -723,8 +723,8 @@ fn view(model: Model) -> Element(Msg) {
 }
 -->
 ```gleam
-beacon.application(init:, update:, view:)
-|> beacon.watch_presence(
+brazier.application(init:, update:, view:)
+|> brazier.watch_presence(
   tracker: online,
   watch: fn(model) { ["room:" <> model.room] },
   on_presence: PresenceChanged,
@@ -743,14 +743,14 @@ session later, with a logged error.
 ### Tracking and watching
 
 A session that is on some topics and follows others, such as a user in a
-room who also sees the lobby, uses `beacon.track_and_watch_presence`:
+room who also sees the lobby, uses `brazier.track_and_watch_presence`:
 
 <!-- docs-check: wrap
-import beacon
-import beacon/effect.{type Effect}
-import beacon/element.{type Element}
-import beacon/presence
-import beacon/presence/sync
+import brazier
+import brazier/effect.{type Effect}
+import brazier/element.{type Element}
+import brazier/presence
+import brazier/presence/sync
 
 pub fn main(online: presence.PresenceConfig(String)) {
   {{block}}
@@ -764,7 +764,7 @@ pub type Msg {
   PresenceChanged(sync.Diff(String))
 }
 
-fn init(_ctx: beacon.Context) -> Result(#(Model, Effect(Msg)), beacon.InitError) {
+fn init(_ctx: brazier.Context) -> Result(#(Model, Effect(Msg)), brazier.InitError) {
   Ok(#(Model(room: "1", user: "ada", status: "online"), effect.none()))
 }
 
@@ -779,8 +779,8 @@ fn view(model: Model) -> Element(Msg) {
 }
 -->
 ```gleam
-beacon.application(init:, update:, view:)
-|> beacon.track_and_watch_presence(
+brazier.application(init:, update:, view:)
+|> brazier.track_and_watch_presence(
   tracker: online,
   track: fn(model) {
     [presence.Tracking(topic: "room:" <> model.room, key: model.user, meta: model.status)]
@@ -793,15 +793,15 @@ beacon.application(init:, update:, view:)
 Its topics are those `track` returns plus those `watch` returns, each
 followed once. The session appears only on its tracked topics.
 
-`beacon.presence`, `beacon.watch_presence` and
-`beacon.track_and_watch_presence` set the same thing. When more than one
+`brazier.presence`, `brazier.watch_presence` and
+`brazier.track_and_watch_presence` set the same thing. When more than one
 is called, the last call wins. A session that tracks itself already hears
 its tracked topics, so it does not also need to watch them.
 
 ### The tracker API
 
 The rest of this section describes the tracker itself, for processes that
-are not Beacon sessions.
+are not Brazier sessions.
 
 <!-- docs-check: wrap
 import gleam/dynamic/decode
@@ -823,7 +823,7 @@ fn user_meta_decoder() -> decode.Decoder(UserMeta) {
 }
 -->
 ```gleam
-import beacon/presence
+import brazier/presence
 
 fn users_config() -> presence.PresenceConfig(UserMeta) {
   presence.new("users", encode_user_meta, user_meta_decoder())
@@ -861,7 +861,7 @@ Start the tracker on every node with the same:
 - `broadcast_period`, `max_silent_periods`, `down_period` and
   `permdown_period`.
 
-Start it after PubSub (`beacon.presence` does this in the application's
+Start it after PubSub (`brazier.presence` does this in the application's
 tree). Shards replicate only with the shard of the same
 name and index on other nodes, so a node with a different pool size sees
 some topics on the wrong shard.
@@ -884,7 +884,7 @@ rejects configs that break this rule. The default `down_period` is 30s.
 Every change is delivered as a diff to processes subscribed to the topic,
 both on the node where it happened and on each node that learns about it.
 
-- Subscribers receive `{beacon_pubsub, presence.diff_topic(users, topic), Diff}`.
+- Subscribers receive `{brazier_pubsub, presence.diff_topic(users, topic), Diff}`.
   Pass the Diff to `presence.decode_diff(users, diff)` to get a
   `sync.Diff(topic, joins, leaves)`.
 - An update appears as a leave of the old meta and a join of the new one,
@@ -895,7 +895,7 @@ both on the node where it happened and on each node that learns about it.
 ### Limits
 
 Every limit violation is an `Error`, is logged, and emits
-`[beacon, presence, limit_exceeded]`. Nothing is dropped silently.
+`[brazier, presence, limit_exceeded]`. Nothing is dropped silently.
 
 | Limit | Default | Error |
 |---|---|---|
@@ -918,20 +918,20 @@ Further constraints:
 | Situation | What happens |
 |---|---|
 | A tracked process exits | Its entries leave on every node. |
-| A node crashes or is unreachable | After `down_period` without a heartbeat, peers mark it `Down` (`[beacon, presence, replica, down]`) and its entries leave. After `permdown_period` its data is dropped (`replica, permdown`). |
+| A node crashes or is unreachable | After `down_period` without a heartbeat, peers mark it `Down` (`[brazier, presence, replica, down]`) and its entries leave. After `permdown_period` its data is dropped (`replica, permdown`). |
 | A netsplit | Each side marks the other down after `down_period` and sees only its own entries. When the split heals, the sides exchange state and converge, including changes made during the split. |
 | A node comes back before `permdown_period` | Its entries rejoin from its heartbeats or a transfer (`replica, up`). |
 | A tracker stops normally | It tells its peers, which drop its entries at once instead of waiting for `down_period`. |
-| A shard crashes and restarts | The new shard has a new version, and peers drop the old version's entries at once. Tracked processes must track again. They can monitor `presence.shard_pid(users, topic)` to find out. The new shard learns each peer's entries from the peer's heartbeat and the transfer that follows, and Beacon sessions keep those entries until it has (see Session presence). |
-| A new node joins | It asks a peer for a transfer of the current state (`[beacon, presence, transfer]`). |
+| A shard crashes and restarts | The new shard has a new version, and peers drop the old version's entries at once. Tracked processes must track again. They can monitor `presence.shard_pid(users, topic)` to find out. The new shard learns each peer's entries from the peer's heartbeat and the transfer that follows, and Brazier sessions keep those entries until it has (see Session presence). |
+| A new node joins | It asks a peer for a transfer of the current state (`[brazier, presence, transfer]`). |
 
 `presence.replicas(users, topic)` returns the peers a shard knows, with
-`Up` or `Down`. `test/beacon/cluster/presence_cluster_test.gleam` runs
+`Up` or `Down`. `test/brazier/cluster/presence_cluster_test.gleam` runs
 each row of this table on real peer nodes.
 
 ## Testing clusters
 
-`test/beacon/cluster/peer.gleam` starts real peer nodes with OTP's `peer`
+`test/brazier/cluster/peer.gleam` starts real peer nodes with OTP's `peer`
 module. It can:
 
 - connect peers into a mesh;

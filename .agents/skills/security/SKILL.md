@@ -6,33 +6,33 @@ user_invocable: true
 
 # Security Audit
 
-Run a security audit on the Beacon codebase (or a specific file/module).
+Run a security audit on the Brazier codebase (or a specific file/module).
 
 ## Usage
 
 - `/security` — audit the full codebase
-- `/security src/beacon/transport.gleam` — audit a specific file
+- `/security src/brazier/transport.gleam` — audit a specific file
 - `/security auth` — audit authentication/authorization code
 - `/security client` — audit client-side JavaScript
 
 ## What to Check
 
-Scan all `.gleam`, `.erl`, `.mjs` files in `src/`, `test/`, and `beacon_client/src/`. For each category below, search for the listed patterns and report every instance found.
+Scan all `.gleam`, `.erl`, `.mjs` files in `src/`, `test/`, and `brazier_client/src/`. For each category below, search for the listed patterns and report every instance found.
 
 ### 1. Cross-Site Scripting (XSS)
 
-**Where to look:** `element.gleam`, `ssr.gleam`, `view.gleam`, `html.gleam`, `beacon_client_ffi.mjs`
+**Where to look:** `element.gleam`, `ssr.gleam`, `view.gleam`, `html.gleam`, `brazier_client_ffi.mjs`
 
 - Text content rendered without HTML escaping — check `element.to_string()` and `to_html()` for raw string interpolation
 - `innerHTML` assignments in `.mjs` files without sanitization — especially `morphInnerHTML`, `morphChildren`
 - User-controlled strings injected into HTML attributes (check `href`, `src`, `style`, `on*` attributes)
-- Generated HTML in codegen (route_dispatcher, beacon_codec) — are user values escaped?
+- Generated HTML in codegen (route_dispatcher, brazier_codec) — are user values escaped?
 - Template rendering (`view.gleam` rendered struct) — are dynamic values in statics/dynamics escaped?
 - Check: does `html.text()` escape `<`, `>`, `&`, `"`? Does `html.attribute()` escape attribute values?
 
 ### 2. Injection Attacks
 
-**Where to look:** `build.gleam`, `beacon_build_ffi.erl`, all `_ffi.erl` files
+**Where to look:** `build.gleam`, `brazier_build_ffi.erl`, all `_ffi.erl` files
 
 - **Command injection:** `run_command()` calls in build.gleam — are user/file paths shell-escaped? Could a malicious filename like `; rm -rf /` be injected?
 - **Path traversal:** File read/write operations — can `../` in route names or module paths escape the project directory?
@@ -52,7 +52,7 @@ Scan all `.gleam`, `.erl`, `.mjs` files in `src/`, `test/`, and `beacon_client/s
 
 ### 4. WebSocket Security
 
-**Where to look:** `transport.gleam`, `beacon_client_ffi.mjs`
+**Where to look:** `transport.gleam`, `brazier_client_ffi.mjs`
 
 - **Origin checking:** Does the WS upgrade check the Origin header? Can cross-origin pages connect?
 - **Rate limiting:** Is there per-connection message rate limiting? Can a client flood the server with events?
@@ -95,7 +95,7 @@ Scan all `.gleam`, `.erl`, `.mjs` files in `src/`, `test/`, and `beacon_client/s
 
 ### 8. Client-Side Security
 
-**Where to look:** `beacon_client_ffi.mjs`, `patch.mjs`, generated JS bundles
+**Where to look:** `brazier_client_ffi.mjs`, `patch.mjs`, generated JS bundles
 
 - **eval/Function usage:** Any `eval()`, `new Function()`, or `setTimeout(string)` calls?
 - **Prototype pollution:** Does `applyOps` or `diffModels` guard against `__proto__`, `constructor`, `prototype` keys in model JSON?
@@ -124,19 +124,19 @@ Scan all `.gleam`, `.erl`, `.mjs` files in `src/`, `test/`, and `beacon_client/s
 
 For each finding, report severity and details:
 ```
-[CRITICAL] src/beacon/transport.gleam:42 — No Origin check on WebSocket upgrade
+[CRITICAL] src/brazier/transport.gleam:42 — No Origin check on WebSocket upgrade
   Risk: Cross-origin WebSocket hijacking — any page can connect and control user sessions
   Fix: Add Origin validation in ws_auth or create a default origin-checking middleware
 
-[HIGH] src/beacon/build.gleam:335 — Shell command with unescaped file path
+[HIGH] src/brazier/build.gleam:335 — Shell command with unescaped file path
   Risk: Command injection via malicious filenames (e.g., "; rm -rf /")
   Fix: Use erlang:open_port with argument list instead of os:cmd with string interpolation
 
-[MEDIUM] src/beacon/ssr.gleam:510 — Secret key generated from unique_integer (not cryptographic)
+[MEDIUM] src/brazier/ssr.gleam:510 — Secret key generated from unique_integer (not cryptographic)
   Risk: Predictable session tokens if the BEAM's integer sequence is known
   Fix: Use crypto:strong_rand_bytes/1 for secret key generation
 
-[LOW] beacon_client/src/beacon_client_ffi.mjs:420 — No CSP meta tag in generated HTML
+[LOW] brazier_client/src/brazier_client_ffi.mjs:420 — No CSP meta tag in generated HTML
   Risk: XSS via injected scripts has no browser-level defense
   Fix: Add Content-Security-Policy header in secure_headers middleware
 

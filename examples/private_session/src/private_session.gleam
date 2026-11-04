@@ -4,14 +4,14 @@
 /// transfers. `sync` hands only the Model to the browser, and the build
 /// compiles only what `view` reaches, so none of the private state is in
 /// the HTML, the model sync or the client bundle.
-import beacon
-import beacon/attribute
-import beacon/effect.{type Effect}
-import beacon/element.{type Element}
-import beacon/event
-import beacon/html
-import beacon/local
-import beacon/log
+import brazier
+import brazier/attribute
+import brazier/effect.{type Effect}
+import brazier/element.{type Element}
+import brazier/event
+import brazier/html
+import brazier/local
+import brazier/log
 import gleam/int
 import gleam/list
 
@@ -19,7 +19,7 @@ import gleam/list
 const favicon =
   "<link rel=\"icon\" href=\"data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='7' fill='%23f59e0b'/></svg>\">"
 
-const signing_key = "beacon_private_session_signing_key_must_not_ship"
+const signing_key = "brazier_private_session_signing_key_must_not_ship"
 
 const transfer_amount = 25
 
@@ -55,8 +55,8 @@ pub type Msg {
 }
 
 fn init(
-  _ctx: beacon.Context,
-) -> Result(#(Session, Effect(Msg)), beacon.InitError) {
+  _ctx: brazier.Context,
+) -> Result(#(Session, Effect(Msg)), brazier.InitError) {
   Ok(#(
     Session(
       model: Model(
@@ -230,9 +230,9 @@ pub fn view(model: Model, _local: Nil) -> Element(Msg) {
 
 pub fn main() {
   let assert Ok(Nil) =
-    beacon.full_application(init:, update:, sync:, local: local.none(), view:)
-    |> beacon.title(fn(_model) { "Private Session" })
-    |> beacon.head_html(favicon)
-    |> beacon.start(8080)
-    as "beacon.start failed (it logs the error)"
+    brazier.full_application(init:, update:, sync:, local: local.none(), view:)
+    |> brazier.title(fn(_model) { "Private Session" })
+    |> brazier.head_html(favicon)
+    |> brazier.start(8080)
+    as "brazier.start failed (it logs the error)"
 }

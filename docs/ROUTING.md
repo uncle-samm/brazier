@@ -1,15 +1,15 @@
 # Routing
 
-A Beacon app routes by URL with one `Route` type, one `parse` function and
-`beacon.with_router`. This is LiveView's `mount` plus `handle_params`: the
+A Brazier app routes by URL with one `Route` type, one `parse` function and
+`brazier.with_router`. This is LiveView's `mount` plus `handle_params`: the
 route is part of the model, and `update` handles route changes like any other
-message. Beacon does not discover routes from the file system; every page is
+message. Brazier does not discover routes from the file system; every page is
 an explicit `case` branch.
 
 ## Declaring Routes
 
 <!-- docs-check: wrap
-import beacon/element.{type Element}
+import brazier/element.{type Element}
 
 {{block}}
 
@@ -17,7 +17,7 @@ pub type Model {
   Model(route: Route)
 }
 
-fn init(_ctx: beacon.Context) -> Result(#(Model, Effect(Msg)), beacon.InitError) {
+fn init(_ctx: brazier.Context) -> Result(#(Model, Effect(Msg)), brazier.InitError) {
   Ok(#(Model(route: HomePage), effect.none()))
 }
 
@@ -32,9 +32,9 @@ fn view(_model: Model) -> Element(Msg) {
 }
 -->
 ```gleam
-import beacon
-import beacon/effect.{type Effect}
-import beacon/router
+import brazier
+import brazier/effect.{type Effect}
+import brazier/router
 import gleam/list
 import gleam/uri.{type Uri}
 
@@ -63,9 +63,9 @@ fn parse_route(uri: Uri) -> Result(Route, Nil) {
 }
 
 pub fn main() {
-  beacon.application(init:, update:, view:)
-  |> beacon.with_router(parse: parse_route, on_change: RouteChanged)
-  |> beacon.start(8080)
+  brazier.application(init:, update:, view:)
+  |> brazier.with_router(parse: parse_route, on_change: RouteChanged)
+  |> brazier.start(8080)
 }
 ```
 
@@ -75,12 +75,12 @@ pub fn main() {
 - **`router.query(uri)`** returns the percent-decoded query parameters in
   order: `?q=a%20b&page=2` becomes `[#("q", "a b"), #("page", "2")]`.
 
-Beacon checks the URL's encoding before it calls `parse`, so both functions
+Brazier checks the URL's encoding before it calls `parse`, so both functions
 always succeed inside `parse`.
 
 ## When `on_change` Runs
 
-Beacon runs `update(model, on_change(route))`:
+Brazier runs `update(model, on_change(route))`:
 
 1. right after `init`, before the first render, for the requested URL, on both
    the HTML render and the connected mount;
@@ -91,9 +91,9 @@ Beacon runs `update(model, on_change(route))`:
 initial model; `on_change` replaces it before anything is rendered.
 
 <!-- docs-check: wrap
-import beacon
-import beacon/effect.{type Effect}
-import beacon/element.{type Element}
+import brazier
+import brazier/effect.{type Effect}
+import brazier/element.{type Element}
 
 pub type Route {
   HomePage
@@ -123,12 +123,12 @@ fn view(_model: Model) -> Element(Msg) {
 }
 
 pub fn main() {
-  beacon.application(init:, update:, view:)
-  |> beacon.start(8080)
+  brazier.application(init:, update:, view:)
+  |> brazier.start(8080)
 }
 -->
 ```gleam
-fn init(_ctx: beacon.Context) -> Result(#(Model, Effect(Msg)), beacon.InitError) {
+fn init(_ctx: brazier.Context) -> Result(#(Model, Effect(Msg)), brazier.InitError) {
   Ok(#(Model(route: HomePage, users: []), effect.none()))
 }
 
@@ -159,9 +159,9 @@ the page, so the 404 or 400 comes from a real HTTP response.
 Plain `<a href>` links to the same host navigate without a page load:
 
 <!-- docs-check: wrap
-import beacon/attribute
-import beacon/element.{type Element}
-import beacon/html
+import brazier/attribute
+import brazier/element.{type Element}
+import brazier/html
 
 pub fn profile_link() -> Element(msg) {
   {{block}}
@@ -174,11 +174,11 @@ html.a([attribute.href("/users/7")], [html.text("Profile")])
 The browser pushes a history entry and sends the new path over the
 WebSocket. A link opens a normal page load instead when it has a modifier key
 held, a `target` other than `_self`, a `download` attribute, or a
-`data-beacon-external` attribute. Links to other hosts are not intercepted.
+`data-brazier-external` attribute. Links to other hosts are not intercepted.
 
 ## Navigation Effects
 
-`update` navigates with effects from `beacon/router`:
+`update` navigates with effects from `brazier/router`:
 
 | Effect | LiveView | Behaviour |
 |---|---|---|
@@ -192,8 +192,8 @@ error and not sent. Use `redirect` when the browser must make a real HTTP
 request, for example to receive a `Set-Cookie` header after login.
 
 <!-- docs-check: wrap
-import beacon/effect.{type Effect}
-import beacon/router
+import brazier/effect.{type Effect}
+import brazier/router
 
 pub type User {
   User(id: String)
@@ -228,10 +228,10 @@ effects (see [COMPONENTS.md](COMPONENTS.md)). The child:
 
 <!-- docs-check: module routed/pages/home -->
 ```gleam
-import beacon/effect.{type Effect}
-import beacon/element.{type Element}
-import beacon/event
-import beacon/html
+import brazier/effect.{type Effect}
+import brazier/element.{type Element}
+import brazier/event
+import brazier/html
 import gleam/int
 
 pub type Model {
@@ -270,9 +270,9 @@ pub type Route {
 }
 -->
 ```gleam
-import beacon/effect.{type Effect}
-import beacon/element.{type Element}
-import beacon/html
+import brazier/effect.{type Effect}
+import brazier/element.{type Element}
+import brazier/html
 import routed/pages/home
 
 pub type Model {
@@ -330,7 +330,7 @@ The examples show the pattern at three sizes:
 
 ## Private Server State per Page
 
-With `beacon.full_application`, the server keeps a state type that is larger
+With `brazier.full_application`, the server keeps a state type that is larger
 than the model it sends. A page module can expose a public `Model` and a
 server-only record; the root state holds both, and `sync` returns only the
 model:
@@ -346,9 +346,9 @@ fn sync(session: Session) -> Model {
 }
 
 pub fn main() {
-  beacon.full_application(init:, update:, sync:, local: local.none(), view:)
-  |> beacon.with_router(parse: parse_route, on_change: RouteChanged)
-  |> beacon.start(8080)
+  brazier.full_application(init:, update:, sync:, local: local.none(), view:)
+  |> brazier.with_router(parse: parse_route, on_change: RouteChanged)
+  |> brazier.start(8080)
 }
 ```
 
@@ -359,11 +359,11 @@ Server records and the functions that use them never reach the browser. See
 
 ## Route-Dependent Titles
 
-`beacon.title(fn(model) { ... })` sets the document title on the HTML render,
+`brazier.title(fn(model) { ... })` sets the document title on the HTML render,
 from the model after `on_change` has run, so it can depend on the route:
 
 <!-- docs-check: wrap
-import beacon
+import brazier
 
 pub type Route {
   HomePage
@@ -376,14 +376,14 @@ pub type Model {
 }
 
 pub fn with_title(
-  app: beacon.App(Model, Model, Nil, msg),
-) -> beacon.App(Model, Model, Nil, msg) {
+  app: brazier.App(Model, Model, Nil, msg),
+) -> brazier.App(Model, Model, Nil, msg) {
   app
   {{block}}
 }
 -->
 ```gleam
-|> beacon.title(fn(model) {
+|> brazier.title(fn(model) {
   case model.route {
     HomePage -> "Home"
     UserPage(id:) -> "User " <> id

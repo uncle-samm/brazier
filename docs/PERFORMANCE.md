@@ -1,6 +1,6 @@
 # Performance
 
-Beacon has one benchmark suite. It measures the HTTP listener, WebSocket
+Brazier has one benchmark suite. It measures the HTTP listener, WebSocket
 event round trips, the runtime actor, PubSub fan-out and the store. Its
 baseline is committed, and `make bench-check` fails when a metric regresses
 past its tolerance.
@@ -15,8 +15,8 @@ failure, not a misleadingly fast number.
 | Command | What it does |
 |---------|--------------|
 | `make bench` | One run. Prints every metric and writes `build/bench/latest.json`. |
-| `make bench-check` | `BEACON_BENCH_RUNS` runs (default 3), combined by median and compared with `bench/baselines.json`. Exits non-zero on a regression, a missing or new metric, or a different machine. |
-| `make bench-baseline` | `BEACON_BENCH_RUNS` runs (default 5, minimum 3) back to back, written to `bench/baselines.json`. |
+| `make bench-check` | `BRAZIER_BENCH_RUNS` runs (default 3), combined by median and compared with `bench/baselines.json`. Exits non-zero on a regression, a missing or new metric, or a different machine. |
+| `make bench-baseline` | `BRAZIER_BENCH_RUNS` runs (default 5, minimum 3) back to back, written to `bench/baselines.json`. |
 
 Run `bench-baseline` on an otherwise idle machine. Commit the new
 `bench/baselines.json` together with the change that moved the numbers,
@@ -28,8 +28,8 @@ compared. Baselines do not transfer between machines.
 
 ## Scenarios
 
-The suite lives in `test/beacon/bench/suite.gleam`, with the generators in
-`test/beacon_bench_ffi.erl`. It starts its own counter app on an
+The suite lives in `test/brazier/bench/suite.gleam`, with the generators in
+`test/brazier_bench_ffi.erl`. It starts its own counter app on an
 OS-assigned port. Every scenario is warmed up before it is measured.
 Logging is raised to `warning` once the app is up, so the numbers measure
 the framework, not the console.
@@ -66,7 +66,7 @@ Why these numbers:
   sessions do, so the observed range is doubled.
 - **25% floor.** Back-to-back runs never see drift between sessions
   (thermal state, other load, power management), and that drift is
-  large. The old `beacon_runtime_bench` was rerun in this session on
+  large. The old `brazier_runtime_bench` was rerun in this session on
   source unchanged since commit efc9412, which had recorded it at
   45–47 µs/event for changed events. It measured 58–61 µs/event, +28%
   for the same code. A tighter floor would fail unchanged code.
@@ -130,7 +130,7 @@ Some notes on reading the numbers:
 
 - **The ws.1x200 rows** measure one connection, so they are one scheduler
   waiting on one socket. Their spread comes from scheduler placement and
-  wake-up, not from Beacon. 10 and 100 connections are the stable ws
+  wake-up, not from Brazier. 10 and 100 connections are the stable ws
   numbers.
 - **Repeated p50 values.** On Darwin, `erlang:monotonic_time` ticks at
   about 41.67 ns, so every timing is a whole number of ticks. A
@@ -142,7 +142,7 @@ Some notes on reading the numbers:
 ## Runtime re-measurement
 
 The previous runtime figures in docs/PROGRESS.md (WS8b) are 45–47 µs/event
-changed and 18–21 µs/event unchanged, from `beacon_runtime_bench`. Here is
+changed and 18–21 µs/event unchanged, from `brazier_runtime_bench`. Here is
 what that bench measured in this session, interleaved with the new
 suite's runtime scenario, on the same source:
 

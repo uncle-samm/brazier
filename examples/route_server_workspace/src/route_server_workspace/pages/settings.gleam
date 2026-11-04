@@ -1,10 +1,10 @@
 /// The settings page: a component with a public Model and a private audit
 /// log. Only `view` and the Model reach the browser.
-import beacon/attribute
-import beacon/element.{type Element}
-import beacon/event
-import beacon/html
-import beacon/log
+import brazier/attribute
+import brazier/element.{type Element}
+import brazier/event
+import brazier/html
+import brazier/log
 import gleam/int
 import gleam/list
 import gleam/string

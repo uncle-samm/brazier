@@ -1,13 +1,13 @@
 /// Live Dashboard, demonstrating:
 /// - server push with `effect.every` (no client events needed);
 /// - real BEAM runtime metrics, read on the server only;
-/// - SVG sparklines rendered with `beacon/svg`.
-import beacon
-import beacon/attribute
-import beacon/effect.{type Effect}
-import beacon/element.{type Element}
-import beacon/html
-import beacon/svg
+/// - SVG sparklines rendered with `brazier/svg`.
+import brazier
+import brazier/attribute
+import brazier/effect.{type Effect}
+import brazier/element.{type Element}
+import brazier/html
+import brazier/svg
 import gleam/float
 import gleam/int
 import gleam/list
@@ -57,8 +57,8 @@ fn memory_mb() -> Float {
 // --- Init and update (server) ---
 
 fn init(
-  _ctx: beacon.Context,
-) -> Result(#(Model, Effect(Msg)), beacon.InitError) {
+  _ctx: brazier.Context,
+) -> Result(#(Model, Effect(Msg)), brazier.InitError) {
   let processes = process_count()
   let memory = memory_mb()
   Ok(#(
@@ -285,9 +285,9 @@ fn one_decimal(value: Float) -> String {
 
 pub fn main() {
   let assert Ok(Nil) =
-    beacon.application(init:, update:, view:)
-    |> beacon.title(fn(_model) { "Live Dashboard" })
-    |> beacon.head_html(favicon)
-    |> beacon.start(8080)
-    as "beacon.start failed (it logs the error)"
+    brazier.application(init:, update:, view:)
+    |> brazier.title(fn(_model) { "Live Dashboard" })
+    |> brazier.head_html(favicon)
+    |> brazier.start(8080)
+    as "brazier.start failed (it logs the error)"
 }

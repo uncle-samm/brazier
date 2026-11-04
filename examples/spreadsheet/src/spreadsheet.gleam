@@ -1,18 +1,18 @@
 /// Spreadsheet, demonstrating:
-/// - a grid shared by every session, one `beacon/store` entry per cell, so
+/// - a grid shared by every session, one `brazier/store` entry per cell, so
 ///   edits to different cells never overwrite each other;
 /// - selection and the edit buffer in Local state: clicking and typing
 ///   never reach the server, only a saved cell does;
 /// - a PubSub subscription that re-reads the grid when any session saves.
-import beacon
-import beacon/attribute
-import beacon/effect.{type Effect}
-import beacon/element.{type Element}
-import beacon/event
-import beacon/html
-import beacon/local
-import beacon/log
-import beacon/store.{type Store}
+import brazier
+import brazier/attribute
+import brazier/effect.{type Effect}
+import brazier/element.{type Element}
+import brazier/event
+import brazier/html
+import brazier/local
+import brazier/log
+import brazier/store.{type Store}
 import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
@@ -95,7 +95,7 @@ fn read_grid(cells: Store(String)) -> Model {
 
 fn init(
   cells: Store(String),
-) -> Result(#(Model, Effect(Msg)), beacon.InitError) {
+) -> Result(#(Model, Effect(Msg)), brazier.InitError) {
   Ok(#(read_grid(cells), effect.none()))
 }
 
@@ -386,17 +386,17 @@ fn render_cell(
 pub fn main() {
   let cells = store.new("spreadsheet_cells")
   let assert Ok(Nil) =
-    beacon.full_application(
+    brazier.full_application(
       init: fn(_ctx) { init(cells) },
       update: fn(model, msg) { update(cells, model, msg) },
       sync:,
       local: local.layer(init: init_local, update: update_local),
       view:,
     )
-    |> beacon.title(fn(_model) { "Spreadsheet" })
-    |> beacon.subscriptions(fn(_model) { [store.topic(cells)] })
-    |> beacon.on_notify(fn(_topic) { CellsChanged })
-    |> beacon.head_html(favicon)
-    |> beacon.start(8080)
-    as "beacon.start failed (it logs the error)"
+    |> brazier.title(fn(_model) { "Spreadsheet" })
+    |> brazier.subscriptions(fn(_model) { [store.topic(cells)] })
+    |> brazier.on_notify(fn(_topic) { CellsChanged })
+    |> brazier.head_html(favicon)
+    |> brazier.start(8080)
+    as "brazier.start failed (it logs the error)"
 }

@@ -17,17 +17,17 @@
 /// - The session id, the audit key and the audit trail stay in the
 ///   server-only `Session` record; `sync` sends only the Model.
 import auth_workspace/app.{type Model, type Msg}
-import beacon
-import beacon/api
-import beacon/auth
-import beacon/cookie
-import beacon/effect.{type Effect}
-import beacon/error
-import beacon/local
-import beacon/log
-import beacon/middleware
-import beacon/router
-import beacon/session
+import brazier
+import brazier/api
+import brazier/auth
+import brazier/cookie
+import brazier/effect.{type Effect}
+import brazier/error
+import brazier/local
+import brazier/log
+import brazier/middleware
+import brazier/router
+import brazier/session
 import gleam/dict
 import gleam/http
 import gleam/http/request
@@ -76,23 +76,23 @@ pub fn main() {
   let auth_config = auth.dev_session_config()
 
   let assert Ok(Nil) =
-    beacon.full_application(
+    brazier.full_application(
       init: init(store, auth_config),
       update:,
       sync:,
       local: local.none(),
       view: app.view,
     )
-    |> beacon.with_router(parse: parse_route, on_change: app.RouteChanged)
-    |> beacon.title(fn(_model) { "Auth Workspace" })
-    |> beacon.secret_key("auth-workspace-session-secret-key-32-chars")
-    |> beacon.api_routes(api_handler(store, auth_config))
-    |> beacon.ws_auth(auth.allow_guests_ws(store, auth_config))
-    |> beacon.with_middleware(issue_login_csrf(auth_config))
-    |> beacon.dev_mode(True)
-    |> beacon.head_html(favicon)
-    |> beacon.start(8080)
-    as "beacon.start failed (it logs the error)"
+    |> brazier.with_router(parse: parse_route, on_change: app.RouteChanged)
+    |> brazier.title(fn(_model) { "Auth Workspace" })
+    |> brazier.secret_key("auth-workspace-session-secret-key-32-chars")
+    |> brazier.api_routes(api_handler(store, auth_config))
+    |> brazier.ws_auth(auth.allow_guests_ws(store, auth_config))
+    |> brazier.with_middleware(issue_login_csrf(auth_config))
+    |> brazier.dev_mode(True)
+    |> brazier.head_html(favicon)
+    |> brazier.start(8080)
+    as "brazier.start failed (it logs the error)"
 }
 
 fn parse_route(uri: Uri) -> Result(app.Route, Nil) {
@@ -145,9 +145,9 @@ fn issue_login_csrf(config: auth.SessionConfig) -> middleware.Middleware {
   }
 }
 
-/// The route of a request path, decoded as Beacon decodes it before it
-/// calls `parse_route`. Middleware runs before Beacon validates the path, so
-/// a segment that does not decode is not a page here (Beacon refuses it).
+/// The route of a request path, decoded as Brazier decodes it before it
+/// calls `parse_route`. Middleware runs before Brazier validates the path, so
+/// a segment that does not decode is not a page here (Brazier refuses it).
 fn page_route(path: String) -> Result(app.Route, Nil) {
   uri.path_segments(path)
   |> list.try_map(uri.percent_decode)
@@ -164,7 +164,7 @@ fn page_route(path: String) -> Result(app.Route, Nil) {
 fn init(
   store: session.SessionStore,
   config: auth.SessionConfig,
-) -> fn(beacon.Context) -> Result(#(Session, Effect(Msg)), beacon.InitError) {
+) -> fn(brazier.Context) -> Result(#(Session, Effect(Msg)), brazier.InitError) {
   auth.init_from_session(
     store,
     config,
@@ -183,13 +183,13 @@ fn init(
 /// `issue_login_csrf` gives one to every page load, so only a browser that
 /// refuses cookies reaches `init` without it; it could not sign in anyway,
 /// so the page is refused (400) rather than shown with a form that fails.
-fn login_csrf_from(ctx: beacon.Context) -> Result(String, beacon.InitError) {
-  case beacon.cookie(ctx, login_csrf_cookie) {
+fn login_csrf_from(ctx: brazier.Context) -> Result(String, brazier.InitError) {
+  case brazier.cookie(ctx, login_csrf_cookie) {
     Ok("") | Error(Nil) -> {
       log.warning(
         "auth_workspace",
         "Guest page without a login CSRF cookie (connected: "
-          <> string.inspect(beacon.is_connected(ctx))
+          <> string.inspect(brazier.is_connected(ctx))
           <> "); refusing it",
       )
       Error(error.refuse(400, "no " <> login_csrf_cookie <> " cookie"))
@@ -212,7 +212,7 @@ fn new_session(store: session.SessionStore, model: Model) -> Session {
 fn restore(
   store: session.SessionStore,
   sess: session.Session,
-  ctx: beacon.Context,
+  ctx: brazier.Context,
 ) -> Session {
   let account = account_from_session(sess)
   log.info(
@@ -220,7 +220,7 @@ fn restore(
     "Session restored for "
       <> account.user
       <> " (connected: "
-      <> string.inspect(beacon.is_connected(ctx))
+      <> string.inspect(brazier.is_connected(ctx))
       <> ")",
   )
   Session(

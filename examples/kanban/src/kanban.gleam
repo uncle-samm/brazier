@@ -3,19 +3,19 @@
 ///   on a card and `on_drop(DropOn(column))` on a column;
 /// - the high-frequency `dragover` events and the new-card draft handled in
 ///   Local state, so they never reach the server;
-/// - a board shared by every session, kept in a `beacon/store` list as an
+/// - a board shared by every session, kept in a `brazier/store` list as an
 ///   append-only change log, so concurrent sessions never overwrite each
 ///   other's changes;
 /// - a PubSub subscription that re-reads the log when any session changes it.
-import beacon
-import beacon/attribute
-import beacon/effect.{type Effect}
-import beacon/element.{type Element}
-import beacon/event
-import beacon/html
-import beacon/local
-import beacon/log
-import beacon/store.{type ListStore}
+import brazier
+import brazier/attribute
+import brazier/effect.{type Effect}
+import brazier/element.{type Element}
+import brazier/event
+import brazier/html
+import brazier/local
+import brazier/log
+import brazier/store.{type ListStore}
 import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
@@ -158,7 +158,7 @@ fn record(changes: ListStore(Change), change: Change) -> Effect(Msg) {
 
 fn init(
   changes: ListStore(Change),
-) -> Result(#(State, Effect(Msg)), beacon.InitError) {
+) -> Result(#(State, Effect(Msg)), brazier.InitError) {
   Ok(#(State(model: read_board(changes), dragging: None), effect.none()))
 }
 
@@ -480,17 +480,17 @@ fn render_card(card: Card, is_dragging: Bool) -> Element(Msg) {
 pub fn main() {
   let changes = store.new_list("kanban_changes")
   let assert Ok(Nil) =
-    beacon.full_application(
+    brazier.full_application(
       init: fn(_ctx) { init(changes) },
       update: fn(state, msg) { update(changes, state, msg) },
       sync:,
       local: local.layer(init: init_local, update: update_local),
       view:,
     )
-    |> beacon.title(fn(_model) { "Kanban Board" })
-    |> beacon.subscriptions(fn(_state) { [store.list_topic(changes)] })
-    |> beacon.on_notify(fn(_topic) { BoardChanged })
-    |> beacon.head_html(favicon)
-    |> beacon.start(8080)
-    as "beacon.start failed (it logs the error)"
+    |> brazier.title(fn(_model) { "Kanban Board" })
+    |> brazier.subscriptions(fn(_state) { [store.list_topic(changes)] })
+    |> brazier.on_notify(fn(_topic) { BoardChanged })
+    |> brazier.head_html(favicon)
+    |> brazier.start(8080)
+    as "brazier.start failed (it logs the error)"
 }

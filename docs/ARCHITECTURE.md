@@ -1,6 +1,6 @@
-# Beacon Architecture
+# Brazier Architecture
 
-Beacon is a full-stack Gleam web framework on the BEAM. An app is an MVU loop
+Brazier is a full-stack Gleam web framework on the BEAM. An app is an MVU loop
 that runs on the server, one runtime process per WebSocket connection. The
 server renders the first page as HTML (LiveView's dead render); after the
 WebSocket joins, the browser renders the view itself from the model the
@@ -10,17 +10,17 @@ and compiles only the code the browser needs to JavaScript.
 
 ## The App
 
-`beacon.gleam` is the public entry point. An app is built with one of three
-constructors and started with `beacon.start(app, port)`:
+`brazier.gleam` is the public entry point. An app is built with one of three
+constructors and started with `brazier.start(app, port)`:
 
 | Constructor | `update` runs | State |
 |---|---|---|
-| `beacon.simple(init:, update:, view:)` | in the browser and on the server | `model` |
-| `beacon.application(init:, update:, view:)` | on the server, with effects | `model` |
-| `beacon.full_application(init:, update:, sync:, local:, view:)` | on the server, with effects | server `state`, synced `model`, browser `local` |
+| `brazier.simple(init:, update:, view:)` | in the browser and on the server | `model` |
+| `brazier.application(init:, update:, view:)` | on the server, with effects | `model` |
+| `brazier.full_application(init:, update:, sync:, local:, view:)` | on the server, with effects | server `state`, synced `model`, browser `local` |
 
-- **`init(Context)`** receives the request context (`beacon.uri`,
-  `beacon.cookie`, `beacon.is_connected`, `beacon.session_id`). It runs twice:
+- **`init(Context)`** receives the request context (`brazier.uri`,
+  `brazier.cookie`, `brazier.is_connected`, `brazier.session_id`). It runs twice:
   once for the HTML render and once for the connected mount. Effects returned
   on the HTML render are dropped. It returns `Result(_, InitError)`: an
   `Error` is answered with its status on the HTML render and closes the
@@ -42,16 +42,16 @@ Builder functions add the rest: `with_router`, `title`, `subscriptions`,
 `pubsub_config`, `cluster`, `presence`, `watch_presence` and
 `with_state_recovery`.
 
-`beacon.start` checks for the build artifacts (`priv/static/beacon_client.manifest`
-must name a bundle that exists, and the generated `beacon_codec` module must
+`brazier.start` checks for the build artifacts (`priv/static/brazier_client.manifest`
+must name a bundle that exists, and the generated `brazier_codec` module must
 load) and returns the error when one is missing. It then composes the app
 with its `sync` and local layer into an `application.AppConfig`, starts the
 supervision tree with `application.start_supervised` (see
 [Supervision](#supervision-applicationgleam)), and blocks in
 `application.wait_forever` until a SIGTERM drains the node or the tree
 exits. It does not read environment variables; apps read them with
-`beacon/config` (`config.port()`, `config.secret_key()`,
-`config.is_production()`). Without `beacon.secret_key`, start generates a
+`brazier/config` (`config.port()`, `config.secret_key()`,
+`config.is_production()`). Without `brazier.secret_key`, start generates a
 random key and logs a warning; `start_supervised` refuses a weak key before
 it starts any process.
 
@@ -78,12 +78,12 @@ On HTTP GET, after middleware, API routes and static files, `ssr.gleam`:
 2. runs `init(ctx)` and, with a router, `update` with the route message for
    the URL (404 when `parse` rejects it). An `Error(InitError)` from `init`
    answers a static error page with its status and skips the route message;
-3. renders `view` to HTML with `internal/render` and the `beacon.title`;
+3. renders `view` to HTML with `internal/render` and the `brazier.title`;
 4. sets a signed HttpOnly join-token cookie (Phoenix.Token style: purpose,
    version, issue time, expiry and the browser-session fingerprint, signed
    with HMAC); with `with_state_recovery` the token carries the model;
-5. returns the page shell: `<div id="beacon-app">` with the HTML and the
-   bundle named in `beacon_client.manifest`.
+5. returns the page shell: `<div id="brazier-app">` with the HTML and the
+   bundle named in `brazier_client.manifest`.
 
 ### 2. Live mount (`runtime.gleam`)
 
@@ -96,7 +96,7 @@ runtime starts and the socket closes with `4000 + status` and the reason
 URL, a refused presence track) closes it with 1011 `startup failure`.
 
 The client then sends `join` with the content hash of the bundle it runs.
-The transport compares it with the bundle `beacon_client.manifest` names: a
+The transport compares it with the bundle `brazier_client.manifest` names: a
 page from another build is closed with 4409 `stale build` and reloads, and
 an unreadable manifest closes with 1011. A join from the current build (or
 one with no build id, which is logged as a warning) goes to the runtime,
@@ -107,8 +107,8 @@ produced. See [WIRE_PROTOCOL.md](WIRE_PROTOCOL.md#close-codes).
 ### 3. Events
 
 The browser decodes a DOM event into a `Msg`, applies it locally, and sends
-it as `{"__beacon_msg": ...}` encoded by the generated `encode_msg`. The
-runtime decodes it with the generated `beacon_codec.decode_event`, runs
+it as `{"__brazier_msg": ...}` encoded by the generated `encode_msg`. The
+runtime decodes it with the generated `brazier_codec.decode_event`, runs
 `update`, performs the effects, encodes the model and sends a `patch` with
 the JSON Patch from the previous model (`patch.gleam`), or nothing when the
 model did not change.
@@ -120,7 +120,7 @@ acknowledges the event clock so the browser drops its prediction. See
 
 ### 4. Navigation (`router.gleam`)
 
-`beacon.with_router(parse:, on_change:)` makes the route part of the model.
+`brazier.with_router(parse:, on_change:)` makes the route part of the model.
 A same-origin link click or the back button sends `navigate`; the runtime
 parses the path and runs `update(model, on_change(route))`. `router.push` and
 `router.replace` are effects that change the URL and run the same path;
@@ -147,19 +147,19 @@ secret key.
   `after`, `every`, `batch`, `map`, `keyed` and `cancellable`/`cancel`.
   Timers, background processes and PubSub listeners belong to the runtime and
   stop when it stops. See [EFFECTS.md](EFFECTS.md).
-- **Subscriptions.** `beacon.subscriptions(fn(model) -> List(topic))` is
+- **Subscriptions.** `brazier.subscriptions(fn(model) -> List(topic))` is
   re-evaluated after each update; the runtime joins and leaves PubSub topics
   to match, and `on_notify`/`on_notification` turn broadcasts into messages.
 
-## Client Runtime (`beacon_client/`)
+## Client Runtime (`brazier_client/`)
 
-`beacon_client_ffi.mjs` is the only hand-written JavaScript in the browser.
+`brazier_client_ffi.mjs` is the only hand-written JavaScript in the browser.
 It owns the WebSocket, event delegation and DOM morphing.
-`beacon_client/patch.mjs` holds the JSON Patch, version classification,
+`brazier_client/patch.mjs` holds the JSON Patch, version classification,
 send budget and reconnect backoff, mirroring `patch.gleam`.
 
 The app's own code reaches the runtime through the generated entry module
-`beacon_app_entry` (`build/client_entry.gleam`). The runtime checks these
+`brazier_app_entry` (`build/client_entry.gleam`). The runtime checks these
 exports at startup: `decode_model`, `init_local`, `render`, `lookup_handler`,
 `run_handler`, `handler_options`, `event_names`, `update_local`,
 `encode_msg`, `same_model` and `is_simple`. A `simple` app also exports
@@ -169,9 +169,9 @@ exports at startup: `decode_model`, `init_local`, `render`, `lookup_handler`,
   table from `internal/render.gleam`, the same target-neutral module SSR
   uses. Handlers are keyed by event name and position id (`"0.1"`); keyed
   and memo nodes are transparent, so server and browser agree on ids. The DOM
-  is morphed toward the new HTML; `data-beacon-key` gives a node identity.
+  is morphed toward the new HTML; `data-brazier-key` gives a node identity.
 - **Events.** One capture listener per event name matches elements carrying
-  `data-beacon-on-<name>`. Handler options apply prevent-default,
+  `data-brazier-on-<name>`. Handler options apply prevent-default,
   stop-propagation, debounce and throttle. The decoder runs against the real
   event; a decode failure is a `console.warn` and the event is dropped.
 - **Before hydration** there is no handler table. Events on marked elements
@@ -187,40 +187,40 @@ exports at startup: `decode_model`, `init_local`, `render`, `lookup_handler`,
 
 ## Build (`build.gleam`, `build/`)
 
-`gleam run -m beacon/build` (or `gleam run -m beacon/dev`, which rebuilds and
+`gleam run -m brazier/build` (or `gleam run -m brazier/dev`, which rebuilds and
 hot-reloads on change, then sends every open page a `reload`) runs, from the
 app project:
 
 1. **Discovery** (`discovery`, `sources`, `app_call`): find the app module,
-   whose `pub fn main` reaches a `beacon.simple`, `beacon.application` or
-   `beacon.full_application` call, and the user modules it imports.
+   whose `pub fn main` reaches a `brazier.simple`, `brazier.application` or
+   `brazier.full_application` call, and the user modules it imports.
 2. **Analysis** (`analyzer`, `field_type`): read the constructor call, the
    synced `Model` and the `Msg` type.
 3. **Reachability** (`reach`): walk from `view`, a `simple` app's `update`,
    and the Local layer's `init` and `update`, following references to user
    functions, constants, types and constructors with scope tracking. A
-   reference to a Beacon module outside the client allowlist
-   (`beacon/attribute`, `element`, `event`, `html`, `local`, `log`, `svg`)
+   reference to a Brazier module outside the client allowlist
+   (`brazier/attribute`, `element`, `event`, `html`, `local`, `log`, `svg`)
    fails the build, naming the call site. The Msg constructors reached are the
    ones `decode_event` will accept.
-4. **Contract** (`contract`): write `build/beacon_contract.json`, listing
+4. **Contract** (`contract`): write `build/brazier_contract.json`, listing
    what crosses the wire and what code reaches the browser.
 5. **Server codec** (`server_codec`, `codec_gen`, `gleam_code`): generate
-   `src/beacon_codec.gleam` (`encode_model`, `decode_model`, `decode_event`)
+   `src/brazier_codec.gleam` (`encode_model`, `decode_model`, `decode_event`)
    and compile the project. A codec that does not compile is deleted.
 6. **Client bundle** (`client_bundle`, `client_entry`, `client_shim`): write a
-   JavaScript-target project to `build/beacon_client_app` holding only the
+   JavaScript-target project to `build/brazier_client_app` holding only the
    reached definitions (sliced out of their files, with imports regenerated),
-   the Beacon client modules, a JavaScript `beacon/log`, the runtime and
-   `beacon_app_entry.gleam`, with packages pinned to `manifest.toml`. Compile
+   the Brazier client modules, a JavaScript `brazier/log`, the runtime and
+   `brazier_app_entry.gleam`, with packages pinned to `manifest.toml`. Compile
    it, bundle it with the pinned esbuild, and write
-   `priv/static/beacon_client_<hash>.js` and the manifest. A failure deletes
-   the manifest, so `beacon.start` refuses stale artifacts. The `<hash>` is
+   `priv/static/brazier_client_<hash>.js` and the manifest. A failure deletes
+   the manifest, so `brazier.start` refuses stale artifacts. The `<hash>` is
    the build id the client sends in `join`, so a running server closes a
    page from an older bundle with 4409 and the page reloads.
 
-`gleam run -m beacon/build/runtime_bundle` rebuilds the repository's
-prebuilt runtime bundle from `beacon_client/src`.
+`gleam run -m brazier/build/runtime_bundle` rebuilds the repository's
+prebuilt runtime bundle from `brazier_client/src`.
 
 ## Wire Protocol
 
@@ -253,9 +253,9 @@ JSON text frames over `/ws`. Full examples are in
 
 ## Transport (`transport.gleam`, `transport/`)
 
-Beacon has its own HTTP/1.1 and WebSocket server on `gen_tcp`
+Brazier has its own HTTP/1.1 and WebSocket server on `gen_tcp`
 (`transport/server.gleam`, `http.gleam`, `ws.gleam`, `client.gleam` and the
-`beacon_http_*` Erlang modules), with one process per connection.
+`brazier_http_*` Erlang modules), with one process per connection.
 `transport.SecurityLimits` bounds everything that comes from the network:
 message size (64 KB), events per second (50), connections (10,000 in all,
 256 per peer IP, 100 WebSockets per client IP), header counts and sizes,
@@ -282,35 +282,35 @@ that closes instead half-closes and drains the peer for up to 1 s or 1 MiB
 A listener is a small `RestForOne` tree modelled on Ranch's, with the listen
 socket in a process of its own as in Thousand Island:
 
-1. **The connection owner** (`beacon_http_conns`) links every connection
+1. **The connection owner** (`brazier_http_conns`) links every connection
    process and keeps the slot counts in its ETS table: connections in all
    and per peer IP, taken when an acceptor hands over a socket, and
    WebSockets per client IP (the forwarded client behind a trusted proxy),
    taken at the upgrade. A handler's slots are released when its socket
    closes, and on its `EXIT` in any case, so a crash never leaks one. The
    counts live and die with the listener.
-2. **The listen-socket owner** (`beacon_http_listen_socket`) opens the
+2. **The listen-socket owner** (`brazier_http_listen_socket`) opens the
    socket, traps exits and closes it in `terminate`. The runtime closes a
    port asynchronously after its owner exits, so without this a listener
    restarted at once could find its port still bound (`eaddrinuse`).
-3. **The acceptors** (`beacon_http_acceptors_sup`, one-for-one), which accept
+3. **The acceptors** (`brazier_http_acceptors_sup`, one-for-one), which accept
    on that socket.
 
 Stopping a listener stops the acceptors first, then closes the listen
 socket, then drains: the connection owner sends each connection
-`{beacon_http_drain, Owner}` and waits up to `drain_timeout_ms` for them to
+`{brazier_http_drain, Owner}` and waits up to `drain_timeout_ms` for them to
 exit, with no polling. A WebSocket closes with 1001, an HTTP response in
 progress is sent with `connection: close`, and an idle keep-alive connection
 closes. Whatever remains is killed and logged.
 
-Erlang modules log through `beacon_log_ffi`, which formats the message and
-logs it with the same module tag and format as `beacon/log`, and carries the
-tag in the log metadata (`beacon_context`). The build's `exit_failure` is the
+Erlang modules log through `brazier_log_ffi`, which formats the message and
+logs it with the same module tag and format as `brazier/log`, and carries the
+tag in the log metadata (`brazier_context`). The build's `exit_failure` is the
 one exception: it prints its reason to standard error and halts.
 
 ## Supervision (`application.gleam`)
 
-`beacon.start` runs `application.start_supervised`. Before it starts any
+`brazier.start` runs `application.start_supervised`. Before it starts any
 process, it refuses a weak secret key, and PubSub, a cluster manager, a
 session scope or a presence tracker already running on the node outside a
 tree (the tree must own them). It then starts one root supervisor with the
@@ -340,12 +340,12 @@ unsupervised, and the table owner on demand runs until the node stops.
 returns when a SIGTERM arrives (it stops every app running on the node, so
 each listener drains), or when the linked root supervisor exits normally.
 It crashes when that supervisor exits abnormally. SIGTERM reaches it
-through `beacon_signal_handler`, a `gen_event` handler that replaces OTP's
+through `brazier_signal_handler`, a `gen_event` handler that replaces OTP's
 `erl_signal_handler` while any process waits or drains, and puts it back
 afterwards. The handler forwards the first SIGTERM only; a later one is
 logged and ignored, as `init:stop()` ignores a second call. Running apps are
 recorded node-wide, one `persistent_term` per app written by `start` and
-erased by `stop` (as `beacon_http_conns` records a bound port). Waiters
+erased by `stop` (as `brazier_http_conns` records a bound port). Waiters
 drain under one node-local `global:trans` lock, so an app is stopped once.
 
 ## Modules
@@ -373,7 +373,7 @@ drain under one node-local `global:trans` lock, so an app is stopped once.
 | `effect` | Effects |
 | `router` | `segments`, `query`, `push`, `replace`, `redirect` |
 | `patch` | JSON Patch diff and apply (Erlang FFI) |
-| `api` | Typed handlers for `beacon.api_routes` |
+| `api` | Typed handlers for `brazier.api_routes` |
 | `middleware` | HTTP middleware pipeline ([MIDDLEWARE.md](MIDDLEWARE.md)) |
 | `static` | Static files with traversal prevention |
 | `cookie`, `session`, `auth` | Cookies, server-side sessions, login/logout and session-bound WebSockets |
@@ -395,7 +395,7 @@ drain under one node-local `global:trans` lock, so an app is stopped once.
 |---|---|
 | `build`, `build/*` | The build pipeline above |
 | `dev` | Build, run, rebuild and hot-reload on change (with `fswatch` or `inotifywait`, required), then tell every open page to reload |
-| `lint` | Glance-based linter for the engineering principles (`gleam run -m beacon/lint`) |
+| `lint` | Glance-based linter for the engineering principles (`gleam run -m brazier/lint`) |
 
 ## Dependencies
 
@@ -412,24 +412,24 @@ drain under one node-local `global:trans` lock, so an app is stopped once.
 | telemetry | Telemetry events |
 | gleeunit | Tests (dev only) |
 
-Beacon does not depend on Lustre, Wisp or Mist; it follows their designs
+Brazier does not depend on Lustre, Wisp or Mist; it follows their designs
 (see below) with its own element type, middleware and server.
 
 ## Project Structure
 
 ```
 src/
-  beacon.gleam            # Public API: constructors, builders, start
-  beacon/                 # Modules above
+  brazier.gleam            # Public API: constructors, builders, start
+  brazier/                 # Modules above
     build/                # Build pipeline
     internal/             # render, url, uri_check, context
     presence/, store/     # Presence and replicated-store internals (and presence/sync)
     transport/            # HTTP/WebSocket server
-  beacon_*.erl            # Erlang FFI and OTP processes
-beacon_client/src/
-  beacon_client_ffi.mjs   # Browser runtime
-  beacon_client/patch.mjs # JSON Patch, versions, send budget, backoff
-examples/                 # 24 apps, each built with `gleam run -m beacon/build`
+  brazier_*.erl            # Erlang FFI and OTP processes
+brazier_client/src/
+  brazier_client_ffi.mjs   # Browser runtime
+  brazier_client/patch.mjs # JSON Patch, versions, send budget, backoff
+examples/                 # 24 apps, each built with `gleam run -m brazier/build`
 test/                     # Unit, runtime, integration, build and cluster tests
 test_all_cdp.py           # Browser tests over the examples (see TESTING.md)
 ```

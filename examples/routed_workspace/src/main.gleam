@@ -7,15 +7,15 @@
 ///   browser with no server traffic.
 /// - Deploys, incidents, cards and the saved profile are in the Model: the
 ///   server validates every change.
-import beacon
-import beacon/attribute
-import beacon/effect.{type Effect}
-import beacon/element.{type Element}
-import beacon/event
-import beacon/html
-import beacon/local
-import beacon/log
-import beacon/router
+import brazier
+import brazier/attribute
+import brazier/effect.{type Effect}
+import brazier/element.{type Element}
+import brazier/event
+import brazier/html
+import brazier/local
+import brazier/log
+import brazier/router
 import gleam/int
 import gleam/list
 import gleam/string
@@ -117,8 +117,8 @@ pub fn href(route: Route) -> String {
 // --- Init and update (server) ---
 
 fn init(
-  _ctx: beacon.Context,
-) -> Result(#(Model, Effect(Msg)), beacon.InitError) {
+  _ctx: brazier.Context,
+) -> Result(#(Model, Effect(Msg)), brazier.InitError) {
   // `with_router` dispatches RouteChanged for the requested URL before the
   // first render, so this route is only a placeholder.
   Ok(#(
@@ -676,16 +676,16 @@ fn bool_text(value: Bool) -> String {
 
 pub fn main() {
   let assert Ok(Nil) =
-    beacon.full_application(
+    brazier.full_application(
       init:,
       update:,
       sync:,
       local: local.layer(init: init_local, update: update_local),
       view:,
     )
-    |> beacon.with_router(parse: parse_route, on_change: RouteChanged)
-    |> beacon.title(fn(_model) { "Beacon Routed Workspace" })
-    |> beacon.head_html(favicon)
-    |> beacon.start(8080)
-    as "beacon.start failed (it logs the error)"
+    |> brazier.with_router(parse: parse_route, on_change: RouteChanged)
+    |> brazier.title(fn(_model) { "Brazier Routed Workspace" })
+    |> brazier.head_html(favicon)
+    |> brazier.start(8080)
+    as "brazier.start failed (it logs the error)"
 }

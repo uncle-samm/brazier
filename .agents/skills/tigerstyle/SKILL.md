@@ -6,12 +6,12 @@ user_invocable: true
 
 # TigerStyle Compliance Audit
 
-Run a TigerStyle compliance audit on the Beacon codebase (or a specific file).
+Run a TigerStyle compliance audit on the Brazier codebase (or a specific file).
 
 ## Usage
 
 - `/tigerstyle` — audit the full codebase
-- `/tigerstyle src/beacon/runtime.gleam` — audit a specific file
+- `/tigerstyle src/brazier/runtime.gleam` — audit a specific file
 
 ## What to Check
 

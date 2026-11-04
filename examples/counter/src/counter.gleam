@@ -1,13 +1,13 @@
-/// Counter, the simplest Beacon app.
+/// Counter, the simplest Brazier app.
 ///
-/// Demonstrates `beacon.simple`: a pure `update` that the build also
+/// Demonstrates `brazier.simple`: a pure `update` that the build also
 /// compiles to JavaScript, so a click updates the page at once while the
 /// server runs the same `update` and stays authoritative.
-import beacon
-import beacon/attribute
-import beacon/element.{type Element}
-import beacon/event
-import beacon/html
+import brazier
+import brazier/attribute
+import brazier/element.{type Element}
+import brazier/event
+import brazier/html
 import gleam/int
 
 /// The tab icon, inline so the browser does not request `/favicon.ico`.
@@ -23,7 +23,7 @@ pub type Msg {
   Decrement
 }
 
-fn init(_ctx: beacon.Context) -> Result(Model, beacon.InitError) {
+fn init(_ctx: brazier.Context) -> Result(Model, brazier.InitError) {
   Ok(Model(count: 0))
 }
 
@@ -36,7 +36,7 @@ pub fn update(model: Model, msg: Msg) -> Model {
 
 pub fn view(model: Model) -> Element(Msg) {
   html.div([attribute.class("counter")], [
-    html.h1([], [html.text("Beacon Counter")]),
+    html.h1([], [html.text("Brazier Counter")]),
     html.p([], [html.text("Count: " <> int.to_string(model.count))]),
     html.button([event.on_click(Decrement)], [html.text("-")]),
     html.button([event.on_click(Increment)], [html.text("+")]),
@@ -45,9 +45,9 @@ pub fn view(model: Model) -> Element(Msg) {
 
 pub fn main() {
   let assert Ok(Nil) =
-    beacon.simple(init:, update:, view:)
-    |> beacon.title(fn(_model) { "Beacon Counter" })
-    |> beacon.head_html(favicon)
-    |> beacon.start(8080)
-    as "beacon.start failed (it logs the error)"
+    brazier.simple(init:, update:, view:)
+    |> brazier.title(fn(_model) { "Brazier Counter" })
+    |> brazier.head_html(favicon)
+    |> brazier.start(8080)
+    as "brazier.start failed (it logs the error)"
 }

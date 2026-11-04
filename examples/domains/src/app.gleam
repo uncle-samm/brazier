@@ -1,15 +1,15 @@
 /// Multi-file domains, demonstrating:
-/// - `beacon.simple` with a Model built from types in other modules
+/// - `brazier.simple` with a Model built from types in other modules
 ///   (`auth.User`, `List(items.Item)`);
 /// - the build following those modules: it generates the codec for their
 ///   types and compiles the functions `update` and `view` call from them
 ///   (`auth.parse_role`, `auth.role_label`) to JavaScript.
-import beacon
-import beacon/attribute
-import beacon/element.{type Element}
-import beacon/event
-import beacon/html
-import beacon/log
+import brazier
+import brazier/attribute
+import brazier/element.{type Element}
+import brazier/event
+import brazier/html
+import brazier/log
 import domains/auth
 import domains/items
 import gleam/int
@@ -34,7 +34,7 @@ pub type Msg {
 
 const max_item_length = 200
 
-fn init(_ctx: beacon.Context) -> Result(Model, beacon.InitError) {
+fn init(_ctx: brazier.Context) -> Result(Model, brazier.InitError) {
   Ok(Model(
     user: auth.User(
       name: "Alice",
@@ -195,9 +195,9 @@ fn view_item(item: items.Item) -> Element(Msg) {
 
 pub fn main() {
   let assert Ok(Nil) =
-    beacon.simple(init:, update:, view:)
-    |> beacon.title(fn(_model) { "Beacon Domains" })
-    |> beacon.head_html(favicon)
-    |> beacon.start(8080)
-    as "beacon.start failed (it logs the error)"
+    brazier.simple(init:, update:, view:)
+    |> brazier.title(fn(_model) { "Brazier Domains" })
+    |> brazier.head_html(favicon)
+    |> brazier.start(8080)
+    as "brazier.start failed (it logs the error)"
 }

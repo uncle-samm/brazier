@@ -1,21 +1,21 @@
 /// Todo App, demonstrating:
 /// - a draft and a filter kept in Local state (no server traffic while
 ///   typing or filtering);
-/// - a shared todo list for every session, kept in a `beacon/store` list as
+/// - a shared todo list for every session, kept in a `brazier/store` list as
 ///   an append-only change log, so concurrent sessions never overwrite each
 ///   other's changes;
 /// - a PubSub subscription that re-reads the log when another session
 ///   changes it;
 /// - derived values in the view ("items left" is not stored).
-import beacon
-import beacon/attribute
-import beacon/effect.{type Effect}
-import beacon/element.{type Element}
-import beacon/event
-import beacon/html
-import beacon/local
-import beacon/log
-import beacon/store.{type ListStore}
+import brazier
+import brazier/attribute
+import brazier/effect.{type Effect}
+import brazier/element.{type Element}
+import brazier/event
+import brazier/html
+import brazier/local
+import brazier/log
+import brazier/store.{type ListStore}
 import gleam/int
 import gleam/list
 import gleam/string
@@ -109,7 +109,7 @@ fn record(changes: ListStore(Change), change: Change) -> Effect(Msg) {
 
 fn init(
   changes: ListStore(Change),
-) -> Result(#(Model, Effect(Msg)), beacon.InitError) {
+) -> Result(#(Model, Effect(Msg)), brazier.InitError) {
   Ok(#(Model(todos: read_todos(changes)), effect.none()))
 }
 
@@ -424,17 +424,17 @@ fn filter_button(
 pub fn main() {
   let changes = store.new_list("todo_changes")
   let assert Ok(Nil) =
-    beacon.full_application(
+    brazier.full_application(
       init: fn(_ctx) { init(changes) },
       update: fn(model, msg) { update(changes, model, msg) },
       sync:,
       local: local.layer(init: init_local, update: update_local),
       view:,
     )
-    |> beacon.title(fn(_model) { "Todo App" })
-    |> beacon.subscriptions(fn(_model) { [store.list_topic(changes)] })
-    |> beacon.on_notify(fn(_topic) { TodosChanged })
-    |> beacon.head_html(favicon)
-    |> beacon.start(8080)
-    as "beacon.start failed (it logs the error)"
+    |> brazier.title(fn(_model) { "Todo App" })
+    |> brazier.subscriptions(fn(_model) { [store.list_topic(changes)] })
+    |> brazier.on_notify(fn(_topic) { TodosChanged })
+    |> brazier.head_html(favicon)
+    |> brazier.start(8080)
+    as "brazier.start failed (it logs the error)"
 }

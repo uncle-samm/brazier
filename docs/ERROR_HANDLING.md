@@ -1,6 +1,6 @@
 # Error Handling
 
-All framework errors use `BeaconError` from `src/beacon/error.gleam`.
+All framework errors use `BrazierError` from `src/brazier/error.gleam`.
 
 ## Error Variants
 
@@ -35,7 +35,7 @@ state instead), and reconnects with backoff on any other close, 4500 to 4599
 and 1011 included. See
 [WIRE_PROTOCOL.md](WIRE_PROTOCOL.md#client-connection-behaviour). A static error page (a refusal,
 an init crash, an unknown route, a missing bundle) opens no session, so it
-neither sets the `beacon_join_token` cookie nor replaces one that another tab
+neither sets the `brazier_join_token` cookie nor replaces one that another tab
 is still joining with. `auth.init_from_session` answers a
 session store outage with `error.unavailable`. See
 [GETTING_STARTED.md](GETTING_STARTED.md#refusing-in-init).
@@ -50,7 +50,7 @@ at debug, and the transport logs the close it answers with at info.
 
 A runtime that crashes after it started (in `update`, the view or the codec)
 dies with the crash's reason, and its connections close and reconnect to a
-new one. Before it dies it emits `[beacon, runtime, stop]` with reason `crash`
+new one. Before it dies it emits `[brazier, runtime, stop]` with reason `crash`
 and the reason as `error`; a runtime stopped by an exit signal (a linked
 process failing) emits it with reason `exit`. See
 [TELEMETRY.md](TELEMETRY.md).
@@ -113,7 +113,7 @@ Match on `Result` in `update`. For effects that can fail, send an error
 message back:
 
 <!-- docs-check: wrap
-import beacon/effect.{type Effect}
+import brazier/effect.{type Effect}
 import gleam/option.{type Option, Some}
 
 pub type Model {

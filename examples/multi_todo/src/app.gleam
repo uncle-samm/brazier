@@ -4,14 +4,14 @@
 /// - The todos are per session, held by the session's server process.
 /// - The draft and the filter are Local: typing and filtering never reach
 ///   the server.
-import beacon
-import beacon/attribute
-import beacon/effect.{type Effect}
-import beacon/element.{type Element}
-import beacon/event
-import beacon/html
-import beacon/local
-import beacon/log
+import brazier
+import brazier/attribute
+import brazier/effect.{type Effect}
+import brazier/element.{type Element}
+import brazier/event
+import brazier/html
+import brazier/local
+import brazier/log
 import domains/task
 import gleam/int
 import gleam/list
@@ -45,13 +45,13 @@ const max_todo_length = 200
 // --- Init and update (server) ---
 
 fn init(
-  _ctx: beacon.Context,
-) -> Result(#(Model, Effect(Msg)), beacon.InitError) {
+  _ctx: brazier.Context,
+) -> Result(#(Model, Effect(Msg)), brazier.InitError) {
   Ok(#(
     Model(
       todos: [
         task.TodoItem(id: 1, text: "Learn Gleam", completed: True),
-        task.TodoItem(id: 2, text: "Build with Beacon", completed: False),
+        task.TodoItem(id: 2, text: "Build with Brazier", completed: False),
         task.TodoItem(id: 3, text: "Ship it", completed: False),
       ],
       next_id: 4,
@@ -335,15 +335,15 @@ fn view_item(item: task.TodoItem) -> Element(Msg) {
 
 pub fn main() {
   let assert Ok(Nil) =
-    beacon.full_application(
+    brazier.full_application(
       init:,
       update:,
       sync:,
       local: local.layer(init: init_local, update: update_local),
       view:,
     )
-    |> beacon.title(fn(_model) { "Multi-File Todo" })
-    |> beacon.head_html(favicon)
-    |> beacon.start(8080)
-    as "beacon.start failed (it logs the error)"
+    |> brazier.title(fn(_model) { "Multi-File Todo" })
+    |> brazier.head_html(favicon)
+    |> brazier.start(8080)
+    as "brazier.start failed (it logs the error)"
 }

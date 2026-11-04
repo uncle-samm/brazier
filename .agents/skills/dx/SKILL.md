@@ -1,14 +1,14 @@
 ---
 name: dx
-description: Audit Beacon developer experience — API ergonomics, state-model clarity, routing/auth/API usability, diagnostics, examples, docs, and onboarding friction.
+description: Audit Brazier developer experience — API ergonomics, state-model clarity, routing/auth/API usability, diagnostics, examples, docs, and onboarding friction.
 user_invocable: true
 ---
 
 # Developer Experience Audit
 
-Run a DX audit on Beacon as a framework, not only on code style. The goal is to
+Run a DX audit on Brazier as a framework, not only on code style. The goal is to
 answer: "Can a competent Gleam developer build a real app without learning
-Beacon internals?"
+Brazier internals?"
 
 ## Usage
 
@@ -23,7 +23,7 @@ Beacon internals?"
 
 ## Philosophy
 
-Beacon should feel opinionated and easy:
+Brazier should feel opinionated and easy:
 
 - One conceptual app model: SSR first paint, then client-rendered UI from
   server-authoritative state updates.
@@ -61,8 +61,8 @@ Flag:
 
 ### 2. Public API Ergonomics
 
-Check `src/beacon.gleam`, `src/beacon/api.gleam`, `src/beacon/auth.gleam`,
-`src/beacon/route.gleam`, and examples.
+Check `src/brazier.gleam`, `src/brazier/api.gleam`, `src/brazier/auth.gleam`,
+`src/brazier/route.gleam`, and examples.
 
 - How many choices does a user face before writing a working app?
 - Do names describe concepts users already understand?
@@ -73,7 +73,7 @@ Check `src/beacon.gleam`, `src/beacon/api.gleam`, `src/beacon/auth.gleam`,
 - Are there multiple ways to do the same thing? If yes, is one clearly
   preferred and are older/advanced paths labeled?
 
-Beacon-specific checks:
+Brazier-specific checks:
 
 - `app`, `app_with_effects`, `app_with_local`, `app_with_server`: do these feel
   like type-specific doors into one app model, or like separate frameworks?
@@ -136,7 +136,7 @@ Look for boilerplate that could become framework API:
 
 ### 6. Auth And API DX
 
-Check `beacon/auth`, `beacon/api`, `examples/auth_workspace`, docs, and tests.
+Check `brazier/auth`, `brazier/api`, `examples/auth_workspace`, docs, and tests.
 
 - Can users implement login/logout/current user without hand-rolling cookies?
 - Is CSRF hard to forget?
@@ -154,7 +154,7 @@ Missing APIs to consider:
 - `auth.protected_page`
 - `auth.session_app` or builder helper wiring cookie + CSRF + `ws_auth` +
   request-aware server init
-- typed JSON body/query/response helpers in `beacon/api`
+- typed JSON body/query/response helpers in `brazier/api`
 
 ### 7. Diagnostics And Error Messages
 
@@ -171,7 +171,7 @@ errors, and docs.
 
 Flag:
 ```
-[DIAGNOSTIC] src/beacon/build.gleam:661 — Unsupported app shape message too generic
+[DIAGNOSTIC] src/brazier/build.gleam:661 — Unsupported app shape message too generic
   Problem: Says Model/Msg/update/view are required but not which one was missing.
   Fix: Include detected/missing symbols and module path in the error.
 ```
@@ -218,8 +218,8 @@ steps.
 Use this format for findings:
 ```
 [HIGH] API shape — Too many app entrypoints feel like separate modes
-  Evidence: src/beacon.gleam exposes app/app_with_effects/app_with_local/app_with_server.
-  User impact: Beginners must choose architecture before they understand Beacon's state model.
+  Evidence: src/brazier.gleam exposes app/app_with_effects/app_with_local/app_with_server.
+  User impact: Beginners must choose architecture before they understand Brazier's state model.
   Fix: Keep type-specific builders internally, but docs should present one conceptual app model and one recommended path.
 ```
 
@@ -250,7 +250,7 @@ DX Audit Results:
 
 - Do not turn DX audit into a generic code review. Use `/tigerstyle`,
   `/security`, and `/test-quality` for those concerns.
-- Do not recommend adding multiple competing APIs. Beacon should be opinionated.
+- Do not recommend adding multiple competing APIs. Brazier should be opinionated.
 - Do not propose fallback behavior to improve perceived ease. Fail loudly with
   better diagnostics instead.
 - Do not praise examples or docs without checking whether they teach the

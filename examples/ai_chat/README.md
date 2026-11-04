@@ -4,7 +4,7 @@ Real-time chat with a deterministic server-side streaming response.
 
 ## Features
 
-- `beacon.full_application` with a server-only `Session`: the per-session
+- `brazier.full_application` with a server-only `Session`: the per-session
   usage counters (prompts, characters streamed) are never synced. `sync`
   sends only the Model.
 - `effect.background` runs the stream in a process the session owns, so
@@ -23,7 +23,7 @@ Real-time chat with a deterministic server-side streaming response.
 
 ```bash
 cd examples/ai_chat
-gleam run -m beacon/build   # first, and after every change
+gleam run -m brazier/build   # first, and after every change
 gleam run -m ai_chat
 ```
 

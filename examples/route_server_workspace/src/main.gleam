@@ -5,13 +5,13 @@
 /// The root `Session` holds both pages' server records next to the Model;
 /// `sync` sends only the Model, and the build compiles only what `view`
 /// reaches, so the pages' signing keys never reach the browser.
-import beacon
-import beacon/attribute
-import beacon/effect.{type Effect}
-import beacon/element.{type Element}
-import beacon/html
-import beacon/local
-import beacon/router
+import brazier
+import brazier/attribute
+import brazier/effect.{type Effect}
+import brazier/element.{type Element}
+import brazier/html
+import brazier/local
+import brazier/router
 import gleam/int
 import gleam/uri.{type Uri}
 import route_server_workspace/pages/accounts
@@ -62,8 +62,8 @@ pub fn href(route: Route) -> String {
 }
 
 fn init(
-  _ctx: beacon.Context,
-) -> Result(#(Session, Effect(Msg)), beacon.InitError) {
+  _ctx: brazier.Context,
+) -> Result(#(Session, Effect(Msg)), brazier.InitError) {
   // `with_router` dispatches RouteChanged for the requested URL before the
   // first render, so this route is only a placeholder.
   Ok(#(
@@ -154,10 +154,10 @@ pub fn view(model: Model, _local: Nil) -> Element(Msg) {
 
 pub fn main() {
   let assert Ok(Nil) =
-    beacon.full_application(init:, update:, sync:, local: local.none(), view:)
-    |> beacon.with_router(parse: parse_route, on_change: RouteChanged)
-    |> beacon.title(fn(_model) { "Route Server Workspace" })
-    |> beacon.head_html(favicon)
-    |> beacon.start(8080)
-    as "beacon.start failed (it logs the error)"
+    brazier.full_application(init:, update:, sync:, local: local.none(), view:)
+    |> brazier.with_router(parse: parse_route, on_change: RouteChanged)
+    |> brazier.title(fn(_model) { "Route Server Workspace" })
+    |> brazier.head_html(favicon)
+    |> brazier.start(8080)
+    as "brazier.start failed (it logs the error)"
 }

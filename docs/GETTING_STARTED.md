@@ -1,6 +1,6 @@
-# Getting Started with Beacon
+# Getting Started with Brazier
 
-Beacon is a full-stack Gleam web framework on the BEAM. Each browser tab is
+Brazier is a full-stack Gleam web framework on the BEAM. Each browser tab is
 one server process running a Model-View-Update loop; the browser receives the
 model over a WebSocket and renders it with JavaScript compiled from your
 `view`.
@@ -14,25 +14,25 @@ gleam new my_app
 cd my_app
 ```
 
-### 2. Add Beacon as a dependency
+### 2. Add Brazier as a dependency
 
-Beacon is not published on Hex (the `beacon` package there is another
+Brazier is not published on Hex (the `brazier` package there is another
 project). Clone the repository and depend on the checkout by path in
 `gleam.toml`, as the apps in `examples/` do:
 
 ```toml
 [dependencies]
-beacon = { path = "../beacon" }
+brazier = { path = "../brazier" }
 ```
 
 ### 3. Write your app
 
 ```gleam
 // src/my_app.gleam
-import beacon
-import beacon/element.{type Element}
-import beacon/event
-import beacon/html
+import brazier
+import brazier/element.{type Element}
+import brazier/event
+import brazier/html
 import gleam/int
 
 pub type Model {
@@ -44,7 +44,7 @@ pub type Msg {
   Decrement
 }
 
-fn init(_ctx: beacon.Context) -> Result(Model, beacon.InitError) {
+fn init(_ctx: brazier.Context) -> Result(Model, brazier.InitError) {
   Ok(Model(count: 0))
 }
 
@@ -66,10 +66,10 @@ pub fn view(model: Model) -> Element(Msg) {
 
 pub fn main() {
   let assert Ok(Nil) =
-    beacon.simple(init:, update:, view:)
-    |> beacon.title(fn(_model) { "My Counter" })
-    |> beacon.start(8080)
-    as "beacon.start failed (it logs the error)"
+    brazier.simple(init:, update:, view:)
+    |> brazier.title(fn(_model) { "My Counter" })
+    |> brazier.start(8080)
+    as "brazier.start failed (it logs the error)"
 }
 ```
 
@@ -79,15 +79,15 @@ During development, run dev mode. It builds the app, starts it, and rebuilds
 whenever a `.gleam` file changes:
 
 ```bash
-gleam run -m beacon/dev
+gleam run -m brazier/dev
 ```
 
 To run without dev mode, build first and then run. Without the build's
-output, `beacon.start` logs and returns an error that names the missing
+output, `brazier.start` logs and returns an error that names the missing
 artifact, and `main` crashes on it, so `gleam run` exits with status 1:
 
 ```bash
-gleam run -m beacon/build
+gleam run -m brazier/build
 gleam run
 ```
 
@@ -100,9 +100,9 @@ arguments and return an `App` that the builder functions below configure.
 
 | Constructor | `init` | `update` | `view` | Use when |
 |---|---|---|---|---|
-| `beacon.simple(init:, update:, view:)` | `fn(Context) -> Result(model, InitError)` | `fn(model, msg) -> model` | `fn(model) -> Element(msg)` | The update is pure and safe to run in the browser |
-| `beacon.application(init:, update:, view:)` | `fn(Context) -> Result(#(model, Effect(msg)), InitError)` | `fn(model, msg) -> #(model, Effect(msg))` | `fn(model) -> Element(msg)` | The update needs effects or must stay on the server |
-| `beacon.full_application(init:, update:, sync:, local:, view:)` | `fn(Context) -> Result(#(state, Effect(msg)), InitError)` | `fn(state, msg) -> #(state, Effect(msg))` | `fn(model, local) -> Element(msg)` | The server keeps private state, or the browser keeps per-tab state |
+| `brazier.simple(init:, update:, view:)` | `fn(Context) -> Result(model, InitError)` | `fn(model, msg) -> model` | `fn(model) -> Element(msg)` | The update is pure and safe to run in the browser |
+| `brazier.application(init:, update:, view:)` | `fn(Context) -> Result(#(model, Effect(msg)), InitError)` | `fn(model, msg) -> #(model, Effect(msg))` | `fn(model) -> Element(msg)` | The update needs effects or must stay on the server |
+| `brazier.full_application(init:, update:, sync:, local:, view:)` | `fn(Context) -> Result(#(state, Effect(msg)), InitError)` | `fn(state, msg) -> #(state, Effect(msg))` | `fn(model, local) -> Element(msg)` | The server keeps private state, or the browser keeps per-tab state |
 
 Every `init` can refuse the request; see [Refusing in `init`](#refusing-in-init).
 
@@ -126,11 +126,11 @@ sees. `sync(state) -> model` chooses what is sent; everything else stays on
 the server. `local` adds client-only state per tab:
 
 <!-- docs-check: wrap
-import beacon
-import beacon/effect.{type Effect}
-import beacon/element.{type Element}
-import beacon/html
-import beacon/local
+import brazier
+import brazier/effect.{type Effect}
+import brazier/element.{type Element}
+import brazier/html
+import brazier/local
 
 pub type State {
   State(count: Int, audit_log: List(String))
@@ -147,7 +147,7 @@ pub type Msg {
   Decrement
 }
 
-fn init(_ctx: beacon.Context) -> Result(#(State, Effect(Msg)), beacon.InitError) {
+fn init(_ctx: brazier.Context) -> Result(#(State, Effect(Msg)), brazier.InitError) {
   Ok(#(State(count: 0, audit_log: []), effect.none()))
 }
 
@@ -188,14 +188,14 @@ pub fn update_local(_model: Model, local: Local, msg: Msg) -> local.Update(Local
 }
 
 pub fn main() {
-  beacon.full_application(
+  brazier.full_application(
     init:,
     update:,
     sync:,
     local: local.layer(init: init_local, update: update_local),
     view:,
   )
-  |> beacon.start(8080)
+  |> brazier.start(8080)
 }
 ```
 
@@ -211,13 +211,13 @@ pub fn main() {
 
 ### The `Context`
 
-`init` receives a `beacon.Context` describing the request:
+`init` receives a `brazier.Context` describing the request:
 
-- `beacon.uri(ctx)`: the requested URL.
-- `beacon.cookie(ctx, name)`: a request cookie, `Result(String, Nil)`.
-- `beacon.is_connected(ctx)`: `False` on the HTML render, `True` on the
+- `brazier.uri(ctx)`: the requested URL.
+- `brazier.cookie(ctx, name)`: a request cookie, `Result(String, Nil)`.
+- `brazier.is_connected(ctx)`: `False` on the HTML render, `True` on the
   WebSocket mount.
-- `beacon.session_id(ctx)`: the Beacon session id, `Result(String, Nil)`.
+- `brazier.session_id(ctx)`: the Brazier session id, `Result(String, Nil)`.
 
 `init` runs twice: once for the HTML render and once when the WebSocket
 connects. Effects returned from the HTML render are dropped, so a timer or a
@@ -226,7 +226,7 @@ subscription starts once, on the connected mount.
 ### Refusing in `init`
 
 `init` returns `Error(InitError)` when it cannot build the page, for example
-when a database it reads is down. Build the error with `beacon/error`:
+when a database it reads is down. Build the error with `brazier/error`:
 
 <!-- docs-check: wrap
 {{block}}
@@ -244,16 +244,16 @@ pub type LoadError {
   NotAMember
 }
 
-fn load_orders(_ctx: beacon.Context) -> Result(List(String), LoadError) {
+fn load_orders(_ctx: brazier.Context) -> Result(List(String), LoadError) {
   Error(DatabaseDown("connection refused"))
 }
 -->
 ```gleam
-import beacon
-import beacon/effect.{type Effect}
-import beacon/error
+import brazier
+import brazier/effect.{type Effect}
+import brazier/error
 
-pub fn init(ctx: beacon.Context) -> Result(#(Model, Effect(Msg)), beacon.InitError) {
+pub fn init(ctx: brazier.Context) -> Result(#(Model, Effect(Msg)), brazier.InitError) {
   case load_orders(ctx) {
     Ok(orders) -> Ok(#(Model(orders:), effect.none()))
     Error(DatabaseDown(reason)) -> Error(error.unavailable(reason))
@@ -279,13 +279,13 @@ WebSocket closes with 1011 `startup failure`.
 
 ### Events
 
-Event handlers live in `beacon/event`:
+Event handlers live in `brazier/event`:
 
 <!-- docs-check: wrap
-import beacon/attribute
-import beacon/element.{type Element}
-import beacon/event
-import beacon/html
+import brazier/attribute
+import brazier/element.{type Element}
+import brazier/event
+import brazier/html
 
 pub type Model {
   Model(title: String)
@@ -319,10 +319,10 @@ message is refused as a forged event.
 ## Routing
 
 <!-- docs-check: wrap
-import beacon
-import beacon/effect.{type Effect}
-import beacon/element.{type Element}
-import beacon/router
+import brazier
+import brazier/effect.{type Effect}
+import brazier/element.{type Element}
+import brazier/router
 import gleam/uri.{type Uri}
 
 pub type Route {
@@ -338,7 +338,7 @@ pub type Msg {
   RouteChanged(Route)
 }
 
-fn init(_ctx: beacon.Context) -> Result(#(Model, Effect(Msg)), beacon.InitError) {
+fn init(_ctx: brazier.Context) -> Result(#(Model, Effect(Msg)), brazier.InitError) {
   Ok(#(Model(route: HomePage), effect.none()))
 }
 
@@ -364,13 +364,13 @@ pub fn parse_route(uri: Uri) -> Result(Route, Nil) {
 }
 
 pub fn main() {
-  beacon.application(init:, update:, view:)
-  |> beacon.with_router(parse: parse_route, on_change: RouteChanged)
-  |> beacon.start(8080)
+  brazier.application(init:, update:, view:)
+  |> brazier.with_router(parse: parse_route, on_change: RouteChanged)
+  |> brazier.start(8080)
 }
 ```
 
-Beacon dispatches `on_change(route)` after `init` and on every client
+Brazier dispatches `on_change(route)` after `init` and on every client
 navigation, answers URLs `parse` rejects with 404, and intercepts same-origin
 links. `router.push`, `router.replace` and `router.redirect` navigate from
 `update`. See [ROUTING.md](ROUTING.md).
@@ -378,11 +378,11 @@ links. `router.push`, `router.replace` and `router.redirect` navigate from
 ## Shared State (Stores)
 
 Per-session state lives in the model. State that several sessions share
-lives in a `beacon/store`, and sessions subscribe to its topic. Write to
+lives in a `brazier/store`, and sessions subscribe to its topic. Write to
 the store from an effect, so the write runs on the server:
 
 <!-- docs-check: wrap
-import beacon/element.{type Element}
+import brazier/element.{type Element}
 
 {{block}}
 
@@ -395,7 +395,7 @@ pub type Msg {
   CounterChanged
 }
 
-fn init(_ctx: beacon.Context) -> Result(#(Model, Effect(Msg)), beacon.InitError) {
+fn init(_ctx: brazier.Context) -> Result(#(Model, Effect(Msg)), brazier.InitError) {
   Ok(#(Model(count: 0), effect.none()))
 }
 
@@ -404,20 +404,20 @@ pub fn view(_model: Model) -> Element(Msg) {
 }
 -->
 ```gleam
-import beacon
-import beacon/effect.{type Effect}
-import beacon/store.{type Store}
+import brazier
+import brazier/effect.{type Effect}
+import brazier/store.{type Store}
 
 pub fn main() {
   let shared = store.new("counter")
-  beacon.application(
+  brazier.application(
     init:,
     update: fn(model, msg) { update(shared, model, msg) },
     view:,
   )
-  |> beacon.subscriptions(fn(_model) { [store.topic(shared)] })
-  |> beacon.on_notify(fn(_topic) { CounterChanged })
-  |> beacon.start(8080)
+  |> brazier.subscriptions(fn(_model) { [store.topic(shared)] })
+  |> brazier.on_notify(fn(_topic) { CounterChanged })
+  |> brazier.start(8080)
 }
 
 pub fn update(
@@ -441,14 +441,14 @@ pub fn update(
 
 `subscriptions(fn(state) -> List(String))` is evaluated after each update, so
 a session can join and leave topics as its state changes.
-`beacon.broadcast(topic)` notifies subscribers without a store write. See
+`brazier.broadcast(topic)` notifies subscribers without a store write. See
 [STATE_MANAGEMENT.md](STATE_MANAGEMENT.md).
 
 ## API Routes
 
 <!-- docs-check: wrap
-import beacon/effect.{type Effect}
-import beacon/element.{type Element}
+import brazier/effect.{type Effect}
+import brazier/element.{type Element}
 
 {{block}}
 
@@ -464,7 +464,7 @@ pub type Msg {
   Increment
 }
 
-fn init(_ctx: beacon.Context) -> Result(#(Model, Effect(Msg)), beacon.InitError) {
+fn init(_ctx: brazier.Context) -> Result(#(Model, Effect(Msg)), brazier.InitError) {
   Ok(#(Model(count: 0), effect.none()))
 }
 
@@ -477,19 +477,19 @@ pub fn view(_model: Model) -> Element(Msg) {
 }
 -->
 ```gleam
-import beacon
-import beacon/api
+import brazier
+import brazier/api
 import gleam/json
 
 pub fn main() {
-  beacon.application(init:, update:, view:)
-  |> beacon.api_routes(api.routes([
+  brazier.application(init:, update:, view:)
+  |> brazier.api_routes(api.routes([
     api.get("/api/status", fn(_req) {
       api.json_value(200, json.object([#("ok", json.bool(True))]))
     }),
     api.post("/api/webhook", handle_webhook),
   ]))
-  |> beacon.start(8080)
+  |> brazier.start(8080)
 }
 ```
 
@@ -499,7 +499,7 @@ that no route matches falls through to normal page rendering.
 For request bodies, use the size-limited helpers:
 
 <!-- docs-check: wrap
-import beacon/api
+import brazier/api
 
 {{block}}
 -->
@@ -517,14 +517,14 @@ pub fn handle_greeting(req: api.Request) -> api.Response {
 ```
 
 Use `api.read_text(req, max_bytes)` for raw UTF-8 bodies. For custom matching,
-pass any `fn(api.Request) -> Option(api.Response)` to `beacon.api_routes`.
+pass any `fn(api.Request) -> Option(api.Response)` to `brazier.api_routes`.
 
 ## Custom Head HTML
 
 <!-- docs-check: wrap
-import beacon
-import beacon/effect.{type Effect}
-import beacon/element.{type Element}
+import brazier
+import brazier/effect.{type Effect}
+import brazier/element.{type Element}
 
 pub fn main() {
   {{block}}
@@ -538,7 +538,7 @@ pub type Msg {
   Increment
 }
 
-fn init(_ctx: beacon.Context) -> Result(#(Model, Effect(Msg)), beacon.InitError) {
+fn init(_ctx: brazier.Context) -> Result(#(Model, Effect(Msg)), brazier.InitError) {
   Ok(#(Model(count: 0), effect.none()))
 }
 
@@ -551,24 +551,24 @@ pub fn view(_model: Model) -> Element(Msg) {
 }
 -->
 ```gleam
-beacon.application(init:, update:, view:)
-|> beacon.head_html("<link rel='stylesheet' href='/static/styles.css'>")
-|> beacon.start(8080)
+brazier.application(init:, update:, view:)
+|> brazier.head_html("<link rel='stylesheet' href='/static/styles.css'>")
+|> brazier.start(8080)
 ```
 
-`beacon.head_html(html_string)` injects trusted content into the `<head>` of
+`brazier.head_html(html_string)` injects trusted content into the `<head>` of
 the HTML render. Use it for stylesheets, meta tags or fonts. Never pass user
-input to `head_html`. `beacon.static_dir(dir)` serves the files of `dir`
+input to `head_html`. `brazier.static_dir(dir)` serves the files of `dir`
 under `/static`, as the stylesheet above expects.
 
 ## Cookies
 
-In `init`, read a cookie with `beacon.cookie(ctx, name)`. In API handlers and
-middleware, use `beacon/cookie`:
+In `init`, read a cookie with `brazier.cookie(ctx, name)`. In API handlers and
+middleware, use `brazier/cookie`:
 
 ```gleam
-import beacon/api
-import beacon/cookie
+import brazier/api
+import brazier/cookie
 
 /// Read a cookie from a request.
 pub fn theme(req: api.Request) -> Result(String, Nil) {
@@ -602,20 +602,20 @@ character sets is refused and logged, never sent.
 
 ## Session Auth
 
-`beacon/auth` provides the standard session shape: an opaque HttpOnly
-`beacon_session` cookie, a server-side session store, a CSRF token returned
+`brazier/auth` provides the standard session shape: an opaque HttpOnly
+`brazier_session` cookie, a server-side session store, a CSRF token returned
 from login, and WebSocket auth that checks the same session.
 
 <!-- docs-check: wrap
-import beacon/effect.{type Effect}
-import beacon/element.{type Element}
+import brazier/effect.{type Effect}
+import brazier/element.{type Element}
 
 {{block}}
 
 fn init(
   store: session.SessionStore,
   config: auth.SessionConfig,
-) -> fn(beacon.Context) -> Result(#(Model, Effect(Msg)), beacon.InitError) {
+) -> fn(brazier.Context) -> Result(#(Model, Effect(Msg)), brazier.InitError) {
   auth.init_from_session(
     store,
     config,
@@ -644,19 +644,19 @@ pub fn view(_model: Model) -> Element(Msg) {
 }
 -->
 ```gleam
-import beacon
-import beacon/api
-import beacon/auth
-import beacon/session
+import brazier
+import brazier/api
+import brazier/auth
+import brazier/session
 
 pub fn main() {
   let store = session.new_store("my_app_sessions")
   let config = auth.default_session_config()
 
-  beacon.application(init: init(store, config), update:, view:)
-  |> beacon.api_routes(auth.session_routes(store, config, authenticate_login))
-  |> beacon.ws_auth(auth.allow_guests_ws(store, config))
-  |> beacon.start(8080)
+  brazier.application(init: init(store, config), update:, view:)
+  |> brazier.api_routes(auth.session_routes(store, config, authenticate_login))
+  |> brazier.ws_auth(auth.allow_guests_ws(store, config))
+  |> brazier.start(8080)
 }
 
 fn authenticate_login(req: api.Request) -> Result(String, String) {
@@ -689,11 +689,11 @@ When you write the handlers yourself:
 the HTML render is already signed in:
 
 <!-- docs-check: wrap
-import beacon
-import beacon/auth
-import beacon/effect.{type Effect}
-import beacon/element.{type Element}
-import beacon/session
+import brazier
+import brazier/auth
+import brazier/effect.{type Effect}
+import brazier/element.{type Element}
+import brazier/session
 
 {{block}}
 
@@ -726,7 +726,7 @@ pub fn view(_model: Model) -> Element(Msg) {
 pub fn init(
   store: session.SessionStore,
   config: auth.SessionConfig,
-) -> fn(beacon.Context) -> Result(#(Model, Effect(Msg)), beacon.InitError) {
+) -> fn(brazier.Context) -> Result(#(Model, Effect(Msg)), brazier.InitError) {
   auth.init_from_session(
     store,
     config,
@@ -738,7 +738,7 @@ pub fn init(
 }
 
 pub fn app(store: session.SessionStore, config: auth.SessionConfig) {
-  beacon.application(init: init(store, config), update:, view:)
+  brazier.application(init: init(store, config), update:, view:)
 }
 ```
 
@@ -754,7 +754,7 @@ pub fn app(store: session.SessionStore, config: auth.SessionConfig) {
 
 ### WebSocket auth
 
-`beacon.ws_auth(fn(api.Request) -> Result(Nil, String))` runs before the
+`brazier.ws_auth(fn(api.Request) -> Result(Nil, String))` runs before the
 WebSocket upgrade; `Error(reason)` rejects it with 401.
 `auth.protect_ws(store, config)` accepts only a live session and binds the
 socket to it: logout, session rotation or expiry closes the socket with code
@@ -765,23 +765,23 @@ connect, or the guest page's reconnects are refused forever. Use
 `auth.allow_guests_ws(store, config)` instead, next to `init_from_session`:
 
 <!-- docs-check: wrap
-import beacon
-import beacon/auth
-import beacon/effect.{type Effect}
-import beacon/element.{type Element}
-import beacon/session
+import brazier
+import brazier/auth
+import brazier/effect.{type Effect}
+import brazier/element.{type Element}
+import brazier/session
 
 pub fn app(
   store: session.SessionStore,
   config: auth.SessionConfig,
-) -> beacon.App(Model, Model, Nil, Msg) {
+) -> brazier.App(Model, Model, Nil, Msg) {
   {{block}}
 }
 
 fn init(
   store: session.SessionStore,
   config: auth.SessionConfig,
-) -> fn(beacon.Context) -> Result(#(Model, Effect(Msg)), beacon.InitError) {
+) -> fn(brazier.Context) -> Result(#(Model, Effect(Msg)), brazier.InitError) {
   auth.init_from_session(
     store,
     config,
@@ -810,8 +810,8 @@ pub fn view(_model: Model) -> Element(Msg) {
 }
 -->
 ```gleam
-beacon.application(init: init(store, config), update:, view:)
-|> beacon.ws_auth(auth.allow_guests_ws(store, config))
+brazier.application(init: init(store, config), update:, view:)
+|> brazier.ws_auth(auth.allow_guests_ws(store, config))
 ```
 
 It binds a signed-in socket to its session as `protect_ws` does, connects a
@@ -826,7 +826,7 @@ With `application` and `full_application`, `init` and `update` return
 effects:
 
 <!-- docs-check: wrap
-import beacon/effect.{type Effect}
+import brazier/effect.{type Effect}
 
 pub type Model {
   Model(draft: String, saving: Bool, result: Result(Nil, String))
@@ -867,8 +867,8 @@ See [EFFECTS.md](EFFECTS.md).
 ### Navigation
 
 <!-- docs-check: wrap
-import beacon/effect.{type Effect}
-import beacon/router
+import brazier/effect.{type Effect}
+import brazier/router
 
 pub type User {
   User(id: String)
@@ -903,20 +903,20 @@ All three take same-origin paths only.
 
 ### Configuration
 
-`beacon.start(app, port)` uses the port it is given, and signs tokens with
-the key from `beacon.secret_key(key)`. Without one it generates a random key
+`brazier.start(app, port)` uses the port it is given, and signs tokens with
+the key from `brazier.secret_key(key)`. Without one it generates a random key
 and logs a warning: tokens then stop working after a restart. Read both from
-the environment with `beacon/config`; each function logs and returns an
+the environment with `brazier/config`; each function logs and returns an
 `Error` for a bad value:
 
 | Function | Variable | Behaviour |
 |----------|----------|-----------|
 | `config.port()` | `PORT` | 8080 when unset; an error when not an integer in 0..65535 |
 | `config.secret_key()` | `SECRET_KEY` | An error when unset, shorter than the minimum, or the old built-in dev secret |
-| `config.is_production()` | `BEACON_ENV` | `True` for `production` or `prod` |
+| `config.is_production()` | `BRAZIER_ENV` | `True` for `production` or `prod` |
 
 [DEPLOYMENT.md](DEPLOYMENT.md#secret-key) has a `main` that reads both and
-stops loudly when either is wrong, and lists the other variables Beacon reads.
+stops loudly when either is wrong, and lists the other variables Brazier reads.
 
 ### Docker
 
@@ -925,41 +925,41 @@ yours; see [DEPLOYMENT.md](DEPLOYMENT.md#docker).
 
 ### Health Check
 
-Beacon answers `/health` with 200 and `{"status":"ok"}`. It is a liveness
+Brazier answers `/health` with 200 and `{"status":"ok"}`. It is a liveness
 check only; see [DEPLOYMENT.md](DEPLOYMENT.md#health-check).
 
 ## Build Tool
 
 ```bash
-gleam run -m beacon/build
+gleam run -m brazier/build
 ```
 
-The build finds the app module in `src/`, generates `src/beacon_codec.gleam`
-for the model, writes the event contract to `build/beacon_contract.json`, and
+The build finds the app module in `src/`, generates `src/brazier_codec.gleam`
+for the model, writes the event contract to `build/brazier_contract.json`, and
 compiles the client code to a content-hashed bundle like
-`priv/static/beacon_client_HASH.js`. When more than one module could be the
-app, name it: `gleam run -m beacon/build -- src/my_app.gleam`. It needs
+`priv/static/brazier_client_HASH.js`. When more than one module could be the
+app, name it: `gleam run -m brazier/build -- src/my_app.gleam`. It needs
 `node` and `npx`.
 
 Client code is what `view`, a Local layer and a `simple` app's `update`
 reach, and the types they use, `Msg` and the Model included. It may use any
-package that compiles to JavaScript, but only these Beacon modules:
-`beacon/attribute`, `beacon/element`, `beacon/event`, `beacon/html`,
-`beacon/local`, `beacon/log`, `beacon/notification`, `beacon/presence/sync`
-and `beacon/svg`. Anything else (a store, an effect, the tracker) is a build
+package that compiles to JavaScript, but only these Brazier modules:
+`brazier/attribute`, `brazier/element`, `brazier/event`, `brazier/html`,
+`brazier/local`, `brazier/log`, `brazier/notification`, `brazier/presence/sync`
+and `brazier/svg`. Anything else (a store, an effect, the tracker) is a build
 error that names the file and line.
 
 On any failure it prints the reason (file and location for parse errors, type
 and field for an unsupported model field) and exits with status 1. Run it
-before `gleam run` and in every deployment; `beacon.start` never builds.
+before `gleam run` and in every deployment; `brazier.start` never builds.
 
 ## Development Mode
 
 ```bash
-gleam run -m beacon/dev
+gleam run -m brazier/dev
 ```
 
-Dev mode is the only place Beacon builds automatically:
+Dev mode is the only place Brazier builds automatically:
 
 - It runs the build, then starts the app module's `main`. If the first build
   fails, dev mode exits with status 1.
@@ -978,8 +978,8 @@ reaches, plus `init_local` and `update_local` for a `local.layer`, plus
 secrets and the functions that use them, is never compiled to JavaScript.
 
 ```gleam
-import beacon/element.{type Element}
-import beacon/html
+import brazier/element.{type Element}
+import brazier/html
 
 // Reached only from server code: never in the bundle.
 const inventory_service = "http://10.0.0.5:9000/inventory"
@@ -998,5 +998,5 @@ pub fn view(_model: Nil) -> Element(msg) {
 
 With `full_application`, the browser receives only what `sync` returns, so
 private fields of the server state never leave the server. The build fails
-when browser code reaches a server-only module such as `beacon/store` or
-`beacon/effect`. See [SECURITY.md](SECURITY.md).
+when browser code reaches a server-only module such as `brazier/store` or
+`brazier/effect`. See [SECURITY.md](SECURITY.md).

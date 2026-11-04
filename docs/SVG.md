@@ -1,8 +1,8 @@
 # SVG
 
-Beacon provides SVG element and attribute helpers for rendering inline vector graphics in views. `svg.svg` adds the SVG namespace (`xmlns`) to the root element; the browser places it and every element inside it in the SVG namespace.
+Brazier provides SVG element and attribute helpers for rendering inline vector graphics in views. `svg.svg` adds the SVG namespace (`xmlns`) to the root element; the browser places it and every element inside it in the SVG namespace.
 
-Import with `import beacon/svg`. `beacon/svg` is a client module, so `view` may use it.
+Import with `import brazier/svg`. `brazier/svg` is a client module, so `view` may use it.
 
 ## Element Functions
 
@@ -74,16 +74,16 @@ Import with `import beacon/svg`. `beacon/svg` is a client module, so `view` may 
 | `clip_rule` | `clip-rule` |
 
 Other attributes, such as `class` or one with no helper, come from
-`beacon/attribute`; they work on SVG elements as on HTML ones.
+`brazier/attribute`; they work on SVG elements as on HTML ones.
 
 ## Example
 
 Render a simple triangle icon:
 
 ```gleam
-import beacon/attribute
-import beacon/element.{type Element}
-import beacon/svg
+import brazier/attribute
+import brazier/element.{type Element}
+import brazier/svg
 
 pub fn icon_triangle() -> Element(msg) {
   svg.svg([attribute.class("w-6 h-6"), svg.viewbox("0 0 24 24")], [

@@ -1,9 +1,9 @@
-name = "beacon_auth_workspace"
+name = "brazier_auth_workspace"
 version = "0.1.0"
 target = "erlang"
 
 [dependencies]
-beacon = { path = "../.." }
+brazier = { path = "../.." }
 gleam_stdlib = ">= 0.44.0 and < 2.0.0"
 gleam_erlang = ">= 1.3.0 and < 2.0.0"
 gleam_http = ">= 4.1.1 and < 5.0.0"

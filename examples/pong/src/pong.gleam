@@ -1,17 +1,17 @@
 /// Pong, demonstrating:
-/// - `beacon.application`: every message runs on the server, and the browser
+/// - `brazier.application`: every message runs on the server, and the browser
 ///   only renders;
 /// - a game loop of keyed `effect.after` timers. Each tick schedules the next
 ///   one while the game runs, so pausing stops the loop. The key makes the
 ///   timer single-flight: a Start inside a pending tick's window replaces
 ///   that tick instead of running a second loop.
-import beacon
-import beacon/attribute
-import beacon/effect.{type Effect}
-import beacon/element.{type Element}
-import beacon/event
-import beacon/html
-import beacon/log
+import brazier
+import brazier/attribute
+import brazier/effect.{type Effect}
+import brazier/element.{type Element}
+import brazier/event
+import brazier/html
+import brazier/log
 import gleam/int
 
 /// The tab icon, inline so the browser does not request `/favicon.ico`.
@@ -60,8 +60,8 @@ pub type Msg {
 }
 
 fn init(
-  _ctx: beacon.Context,
-) -> Result(#(Model, Effect(Msg)), beacon.InitError) {
+  _ctx: brazier.Context,
+) -> Result(#(Model, Effect(Msg)), brazier.InitError) {
   Ok(#(
     Model(
       left_y: height / 2,
@@ -212,7 +212,7 @@ pub fn view(model: Model) -> Element(Msg) {
       ]),
     ],
     [
-      html.h1([], [html.text("Beacon Pong")]),
+      html.h1([], [html.text("Brazier Pong")]),
       html.div(
         [
           attribute.class("pong-score"),
@@ -330,9 +330,9 @@ fn px(value: Int) -> String {
 
 pub fn main() {
   let assert Ok(Nil) =
-    beacon.application(init:, update:, view:)
-    |> beacon.title(fn(_model) { "Beacon Pong" })
-    |> beacon.head_html(favicon)
-    |> beacon.start(8080)
-    as "beacon.start failed (it logs the error)"
+    brazier.application(init:, update:, view:)
+    |> brazier.title(fn(_model) { "Brazier Pong" })
+    |> brazier.head_html(favicon)
+    |> brazier.start(8080)
+    as "brazier.start failed (it logs the error)"
 }

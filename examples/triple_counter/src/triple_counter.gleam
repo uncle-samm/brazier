@@ -1,20 +1,20 @@
 /// Triple Counter: three counters, one per state layer.
 ///
-/// 1. Shared: every session sees the same count, kept in a `beacon/store`
+/// 1. Shared: every session sees the same count, kept in a `brazier/store`
 ///    list and announced on the store's PubSub topic.
 /// 2. Server: per tab, held by the tab's server process.
 /// 3. Local: per tab, held in the browser; no server traffic.
 ///
 /// The shared counter needs effects (store writes), so this is a
 /// `full_application`, not a `simple` app.
-import beacon
-import beacon/attribute
-import beacon/effect.{type Effect}
-import beacon/element.{type Element}
-import beacon/event
-import beacon/html
-import beacon/local
-import beacon/store.{type ListStore}
+import brazier
+import brazier/attribute
+import brazier/effect.{type Effect}
+import brazier/element.{type Element}
+import brazier/event
+import brazier/html
+import brazier/local
+import brazier/store.{type ListStore}
 import gleam/int
 import gleam/list
 
@@ -68,7 +68,7 @@ fn add_shared(deltas: ListStore(Int), delta: Int) -> Effect(Msg) {
 
 fn init(
   deltas: ListStore(Int),
-) -> Result(#(Model, Effect(Msg)), beacon.InitError) {
+) -> Result(#(Model, Effect(Msg)), brazier.InitError) {
   Ok(#(Model(my_count: 0, shared_count: shared_count(deltas)), effect.none()))
 }
 
@@ -208,17 +208,17 @@ fn counter_panel(
 pub fn main() {
   let deltas = store.new_list("shared_counter")
   let assert Ok(Nil) =
-    beacon.full_application(
+    brazier.full_application(
       init: fn(_ctx) { init(deltas) },
       update: fn(model, msg) { update(deltas, model, msg) },
       sync:,
       local: local.layer(init: init_local, update: update_local),
       view:,
     )
-    |> beacon.title(fn(_model) { "Triple Counter" })
-    |> beacon.subscriptions(fn(_model) { [store.list_topic(deltas)] })
-    |> beacon.on_notify(fn(_topic) { SharedChanged })
-    |> beacon.head_html(favicon)
-    |> beacon.start(8080)
-    as "beacon.start failed (it logs the error)"
+    |> brazier.title(fn(_model) { "Triple Counter" })
+    |> brazier.subscriptions(fn(_model) { [store.list_topic(deltas)] })
+    |> brazier.on_notify(fn(_topic) { SharedChanged })
+    |> brazier.head_html(favicon)
+    |> brazier.start(8080)
+    as "brazier.start failed (it logs the error)"
 }

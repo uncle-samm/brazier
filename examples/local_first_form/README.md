@@ -1,7 +1,7 @@
 # Local First Form
 
-Focused example for Beacon's Model + Local split, built with
-`beacon.full_application` and `local.layer`.
+Focused example for Brazier's Model + Local split, built with
+`brazier.full_application` and `local.layer`.
 
 It exercises:
 
@@ -15,7 +15,7 @@ It exercises:
 
 ```sh
 cd examples/local_first_form
-gleam run -m beacon/build   # first, and after every change
+gleam run -m brazier/build   # first, and after every change
 gleam run -m local_first_form
 ```
 

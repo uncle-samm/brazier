@@ -2,17 +2,18 @@
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-IMAGE="${BEACON_CDP_DOCKER_IMAGE:-beacon-cdp:local}"
-TOTAL="${BEACON_CDP_TOTAL_SHARDS:-23}"
-VIEWPORTS="${BEACON_CDP_VIEWPORTS:-desktop}"
-LOG_DIR="${BEACON_CDP_DOCKER_LOG_DIR:-$ROOT/.tmp/cdp-shards}"
-REQUESTED_SHARDS="${BEACON_CDP_SHARDS:-}"
-SKIP_DOCKER_BUILD="${BEACON_CDP_SKIP_DOCKER_BUILD:-0}"
-PREBUILD_EXAMPLES="${BEACON_CDP_PREBUILD_EXAMPLES:-0}"
-SERVER_TIMEOUT="${BEACON_CDP_SERVER_TIMEOUT:-90}"
+. "$ROOT/scripts/refuse_renamed_env.sh"
+IMAGE="${BRAZIER_CDP_DOCKER_IMAGE:-brazier-cdp:local}"
+TOTAL="${BRAZIER_CDP_TOTAL_SHARDS:-23}"
+VIEWPORTS="${BRAZIER_CDP_VIEWPORTS:-desktop}"
+LOG_DIR="${BRAZIER_CDP_DOCKER_LOG_DIR:-$ROOT/.tmp/cdp-shards}"
+REQUESTED_SHARDS="${BRAZIER_CDP_SHARDS:-}"
+SKIP_DOCKER_BUILD="${BRAZIER_CDP_SKIP_DOCKER_BUILD:-0}"
+PREBUILD_EXAMPLES="${BRAZIER_CDP_PREBUILD_EXAMPLES:-0}"
+SERVER_TIMEOUT="${BRAZIER_CDP_SERVER_TIMEOUT:-90}"
 
 # Prints the host CPU count, or exits non-zero when it cannot be read. There
-# is no guessed default: set BEACON_CDP_PARALLEL on a host without nproc or
+# is no guessed default: set BRAZIER_CDP_PARALLEL on a host without nproc or
 # sysctl hw.ncpu.
 cpu_count() {
   if command -v nproc >/dev/null 2>&1; then
@@ -20,7 +21,7 @@ cpu_count() {
   elif command -v sysctl >/dev/null 2>&1; then
     sysctl -n hw.ncpu
   else
-    echo "cannot read the CPU count (no nproc or sysctl); set BEACON_CDP_PARALLEL" >&2
+    echo "cannot read the CPU count (no nproc or sysctl); set BRAZIER_CDP_PARALLEL" >&2
     exit 1
   fi
 }
@@ -29,7 +30,7 @@ default_parallel() {
   cpu="$(cpu_count)"
   case "$cpu" in
     ''|*[!0-9]*)
-      echo "CPU count '$cpu' is not an integer; set BEACON_CDP_PARALLEL" >&2
+      echo "CPU count '$cpu' is not an integer; set BRAZIER_CDP_PARALLEL" >&2
       exit 1
       ;;
   esac
@@ -41,13 +42,13 @@ default_parallel() {
 
 case "$TOTAL" in
   ''|*[!0-9]*)
-    echo "BEACON_CDP_TOTAL_SHARDS must be an integer" >&2
+    echo "BRAZIER_CDP_TOTAL_SHARDS must be an integer" >&2
     exit 1
     ;;
 esac
 
 if [ "$TOTAL" -lt 1 ]; then
-  echo "BEACON_CDP_TOTAL_SHARDS must be >= 1" >&2
+  echo "BRAZIER_CDP_TOTAL_SHARDS must be >= 1" >&2
   exit 1
 fi
 
@@ -61,13 +62,13 @@ SHARD_COUNT=0
 for shard in $SHARD_LIST; do
   case "$shard" in
     ''|*[!0-9]*)
-      echo "BEACON_CDP_SHARDS entries must be integers" >&2
+      echo "BRAZIER_CDP_SHARDS entries must be integers" >&2
       exit 1
       ;;
   esac
 
   if [ "$shard" -lt 1 ] || [ "$shard" -gt "$TOTAL" ]; then
-    echo "BEACON_CDP_SHARDS entry $shard is outside 1..$TOTAL" >&2
+    echo "BRAZIER_CDP_SHARDS entry $shard is outside 1..$TOTAL" >&2
     exit 1
   fi
 
@@ -81,21 +82,21 @@ fi
 
 # Assign in two steps: a plain assignment from $(...) carries the
 # substitution's exit status, so set -e stops here if default_parallel fails.
-if [ -n "${BEACON_CDP_PARALLEL:-}" ]; then
-  PARALLEL="$BEACON_CDP_PARALLEL"
+if [ -n "${BRAZIER_CDP_PARALLEL:-}" ]; then
+  PARALLEL="$BRAZIER_CDP_PARALLEL"
 else
   PARALLEL="$(default_parallel)"
 fi
 
 case "$PARALLEL" in
   ''|*[!0-9]*)
-    echo "BEACON_CDP_PARALLEL must be an integer" >&2
+    echo "BRAZIER_CDP_PARALLEL must be an integer" >&2
     exit 1
     ;;
 esac
 
 if [ "$PARALLEL" -lt 1 ]; then
-  echo "BEACON_CDP_PARALLEL must be >= 1" >&2
+  echo "BRAZIER_CDP_PARALLEL must be >= 1" >&2
   exit 1
 fi
 
@@ -111,7 +112,7 @@ fi
 case "$SKIP_DOCKER_BUILD" in
   0|1) ;;
   *)
-    echo "BEACON_CDP_SKIP_DOCKER_BUILD must be 0 or 1" >&2
+    echo "BRAZIER_CDP_SKIP_DOCKER_BUILD must be 0 or 1" >&2
     exit 1
     ;;
 esac
@@ -119,20 +120,20 @@ esac
 case "$PREBUILD_EXAMPLES" in
   0|1) ;;
   *)
-    echo "BEACON_CDP_PREBUILD_EXAMPLES must be 0 or 1" >&2
+    echo "BRAZIER_CDP_PREBUILD_EXAMPLES must be 0 or 1" >&2
     exit 1
     ;;
 esac
 
 case "$SERVER_TIMEOUT" in
   ''|*[!0-9]*)
-    echo "BEACON_CDP_SERVER_TIMEOUT must be an integer number of seconds" >&2
+    echo "BRAZIER_CDP_SERVER_TIMEOUT must be an integer number of seconds" >&2
     exit 1
     ;;
 esac
 
 if [ "$SERVER_TIMEOUT" -lt 1 ]; then
-  echo "BEACON_CDP_SERVER_TIMEOUT must be >= 1" >&2
+  echo "BRAZIER_CDP_SERVER_TIMEOUT must be >= 1" >&2
   exit 1
 fi
 
@@ -141,14 +142,14 @@ rm -f "$LOG_DIR"/shard-*.log "$LOG_DIR"/summary.txt
 
 if [ "$SKIP_DOCKER_BUILD" = "1" ]; then
   if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
-    echo "Docker image $IMAGE does not exist; unset BEACON_CDP_SKIP_DOCKER_BUILD or build it first" >&2
+    echo "Docker image $IMAGE does not exist; unset BRAZIER_CDP_SKIP_DOCKER_BUILD or build it first" >&2
     exit 1
   fi
   echo "Using existing Docker image $IMAGE"
 else
   echo "Building $IMAGE from Dockerfile.ci"
   docker build \
-    --build-arg BEACON_CDP_PREBUILD_EXAMPLES="$PREBUILD_EXAMPLES" \
+    --build-arg BRAZIER_CDP_PREBUILD_EXAMPLES="$PREBUILD_EXAMPLES" \
     -f "$ROOT/Dockerfile.ci" \
     -t "$IMAGE" \
     "$ROOT"
@@ -163,14 +164,14 @@ remaining_shards="$SHARD_LIST"
 run_shard() {
   shard="$1"
   log_file="$LOG_DIR/shard-$shard.log"
-  name="beacon-cdp-shard-$shard-$$"
+  name="brazier-cdp-shard-$shard-$$"
   (
     docker run --rm \
       --name "$name" \
       --shm-size=1g \
-      -e BEACON_CDP_VIEWPORTS="$VIEWPORTS" \
-      -e BEACON_CDP_SHARD="$shard/$TOTAL" \
-      -e BEACON_CDP_SERVER_TIMEOUT="$SERVER_TIMEOUT" \
+      -e BRAZIER_CDP_VIEWPORTS="$VIEWPORTS" \
+      -e BRAZIER_CDP_SHARD="$shard/$TOTAL" \
+      -e BRAZIER_CDP_SERVER_TIMEOUT="$SERVER_TIMEOUT" \
       "$IMAGE" \
       sh scripts/run_all_cdp.sh --shard "$shard/$TOTAL"
   ) >"$log_file" 2>&1 &

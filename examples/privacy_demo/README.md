@@ -1,6 +1,6 @@
 # Privacy Demo
 
-Shows how `beacon.full_application` keeps secrets on the server.
+Shows how `brazier.full_application` keeps secrets on the server.
 
 ## Features
 
@@ -20,10 +20,10 @@ Shows how `beacon.full_application` keeps secrets on the server.
 
 ```bash
 cd examples/privacy_demo
-gleam run -m beacon/build   # first, and after every change
+gleam run -m brazier/build   # first, and after every change
 gleam run -m privacy_demo
 ```
 
 Open http://localhost:8080. Add and clear items to see the totals change.
-Search the `beacon_client_*.js` bundle for `sk_live` or `postgres:` to
+Search the `brazier_client_*.js` bundle for `sk_live` or `postgres:` to
 check that the secrets are absent.

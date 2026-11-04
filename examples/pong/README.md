@@ -1,6 +1,6 @@
 # Pong
 
-Two-player Pong built with `beacon.application`. All game logic runs on the
+Two-player Pong built with `brazier.application`. All game logic runs on the
 server, and the browser only renders.
 
 ## Features
@@ -19,7 +19,7 @@ server, and the browser only renders.
 
 ```bash
 cd examples/pong
-gleam run -m beacon/build   # first, and after every change
+gleam run -m brazier/build   # first, and after every change
 gleam run
 ```
 

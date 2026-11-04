@@ -3,18 +3,18 @@
 ///   browser only renders;
 /// - keyboard input filtered in Local state: arrow keys reach the server,
 ///   other keys and the name draft never leave the browser;
-/// - a high-score table shared by every session, kept in a `beacon/store`
+/// - a high-score table shared by every session, kept in a `brazier/store`
 ///   list and re-read when any session records a score.
-import beacon
-import beacon/attribute
-import beacon/effect.{type Effect}
-import beacon/element.{type Element}
-import beacon/event
-import beacon/html
-import beacon/local
-import beacon/log
-import beacon/store.{type ListStore}
-import beacon/svg
+import brazier
+import brazier/attribute
+import brazier/effect.{type Effect}
+import brazier/element.{type Element}
+import brazier/event
+import brazier/html
+import brazier/local
+import brazier/log
+import brazier/store.{type ListStore}
+import brazier/svg
 import gleam/int
 import gleam/list
 import gleam/order
@@ -109,7 +109,7 @@ fn read_high_scores(scores: ListStore(HighScore)) -> List(HighScore) {
 
 fn init(
   scores: ListStore(HighScore),
-) -> Result(#(Model, Effect(Msg)), beacon.InitError) {
+) -> Result(#(Model, Effect(Msg)), brazier.InitError) {
   let snake = start_snake()
   Ok(#(
     Model(
@@ -509,17 +509,17 @@ fn view_high_scores(high_scores: List(HighScore)) -> Element(Msg) {
 pub fn main() {
   let scores = store.new_list("snake_scores")
   let assert Ok(Nil) =
-    beacon.full_application(
+    brazier.full_application(
       init: fn(_ctx) { init(scores) },
       update: fn(model, msg) { update(scores, model, msg) },
       sync:,
       local: local.layer(init: init_local, update: update_local),
       view:,
     )
-    |> beacon.title(fn(_model) { "Snake" })
-    |> beacon.subscriptions(fn(_model) { [store.list_topic(scores)] })
-    |> beacon.on_notify(fn(_topic) { ScoresChanged })
-    |> beacon.head_html(favicon)
-    |> beacon.start(8080)
-    as "beacon.start failed (it logs the error)"
+    |> brazier.title(fn(_model) { "Snake" })
+    |> brazier.subscriptions(fn(_model) { [store.list_topic(scores)] })
+    |> brazier.on_notify(fn(_topic) { ScoresChanged })
+    |> brazier.head_html(favicon)
+    |> brazier.start(8080)
+    as "brazier.start failed (it logs the error)"
 }

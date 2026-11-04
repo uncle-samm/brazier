@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to Beacon are recorded here. The format follows
+All notable changes to Brazier (named Beacon until 2026-11-04) are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/).
 
@@ -11,11 +11,10 @@ take. An earlier copy of this file had `0.1.0` and `0.2.0` entries from
 longer describe the code. They have been removed, and the history before
 Milestone 117 is summarised at the end of this file.
 
-The package will be renamed from `beacon` to `brazier` before it is first
-published, because the `beacon` name is taken on Hex. That rename has not
-happened yet. When it does, it will cover the package, the modules, the FFI
-modules, the client package, the DOM attributes, the cookie names and the
-docs, and the old names will stop working. There will be no aliases.
+The package was renamed from `beacon` to `brazier` on 2026-11-04, before it
+was first published, because the `beacon` name is taken on Hex. The first
+`### Breaking` entry under `[Unreleased]` lists what changed. The entries
+below it were written before the rename and keep the old names.
 
 `scripts/publish.sh` refuses to publish unless the `gleam.toml` version has a
 `## [X.Y.Z]` heading here. `make publish-dry-run` runs the whole release gate
@@ -29,6 +28,46 @@ with its own changelog, so they are not listed here.
 
 ### Breaking
 
+- The package is renamed from `beacon` to `brazier`. There are no aliases or
+  compatibility re-exports: every old name below stops existing.
+  - Package and modules: `gleam.toml` `name = "brazier"`; depend on
+    `brazier`, and import `brazier` and `brazier/...` (`beacon/element`
+    becomes `brazier/element`, and so on). The error type `BeaconError` is
+    `BrazierError`.
+  - CLIs: `gleam run -m brazier/build`, `gleam run -m brazier/lint` and
+    `gleam run -m brazier/build/runtime_bundle`.
+  - Generated files: `src/brazier_codec.gleam`, `build/brazier_contract.json`,
+    `priv/static/brazier_client.manifest` and
+    `priv/static/brazier_client_<hash>.js`. Delete the old `beacon_codec.gleam`
+    and `beacon_client*` files and rebuild.
+  - Erlang FFI modules: `beacon_*.erl` are `brazier_*.erl`, and the Erlang
+    module atoms of Gleam modules are `brazier@...`.
+  - The client runtime package is `brazier_client/` (`brazier_client_ffi.mjs`,
+    `brazier_client/patch.mjs`); the Hex tarball carries it as
+    `priv/brazier_client_src`.
+  - DOM and client hooks: `data-brazier-*` attributes (`data-brazier-on-*`,
+    `data-brazier-key`, `data-brazier-hook`, `data-brazier-prevent-*`, ...),
+    the `#brazier-app` root, `window.__brazier*` hooks and
+    `window.__BRAZIER_ENABLE_TEST_HOOKS`. Pages rendered by an old server do
+    not hydrate with the new client, and the reverse.
+  - Cookies: the default session cookie is `brazier_session`, and the join
+    token cookie `brazier_join_token`. Existing browser sessions are not
+    carried over.
+  - Telemetry: every event starts with `brazier` (`telemetry.prefix`), so
+    handlers attach to `[brazier, ...]`.
+  - Logs: module names are `brazier.*` (`"brazier.runtime"`, ...), and the
+    Erlang logger domain is `[brazier]`.
+  - Node-wide names: pg scopes, ETS tables, persistent_term keys,
+    registered processes and PubSub topics (`brazier:dev:reload`, ...) use
+    `brazier`. The cluster peer check signs `brazier-cluster-v1`, so a
+    renamed node does not join a cluster of old nodes.
+  - Environment variables: `BRAZIER_ENV`, `BRAZIER_SHUTDOWN_TIMEOUT`, and the
+    repository's `BRAZIER_CDP_*`, `BRAZIER_PORT` and `BRAZIER_BENCH_RUNS`.
+    An old `BEACON_*` name is refused, never read: `brazier.start` and
+    `cluster.start` fail with an error naming the variable to set instead,
+    and the CDP scripts and the bench exit non-zero. The old published dev
+    secret `beacon-dev-secret-change-in-production` is still refused as a
+    weak key.
 - (WS7) The application API was redesigned; see `docs/design/API_REDESIGN.md`.
   - There are three constructors: `beacon.simple`, `beacon.application` and
     `beacon.full_application`. They take a `Context` and the router, and

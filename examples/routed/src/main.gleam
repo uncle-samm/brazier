@@ -1,16 +1,16 @@
-/// Routed: one `Route` type, one `parse`, and `beacon.with_router`.
+/// Routed: one `Route` type, one `parse`, and `brazier.with_router`.
 ///
 /// The pages are plain view modules imported explicitly; the home page is
 /// a nested component whose messages are mapped with `element.map(Home)`.
-/// Beacon runs `update(model, RouteChanged(route))` after `init` and on
+/// Brazier runs `update(model, RouteChanged(route))` after `init` and on
 /// every client navigation, and answers paths `parse` rejects with 404.
-import beacon
-import beacon/attribute
-import beacon/effect.{type Effect}
-import beacon/element.{type Element}
-import beacon/html
-import beacon/log
-import beacon/router
+import brazier
+import brazier/attribute
+import brazier/effect.{type Effect}
+import brazier/element.{type Element}
+import brazier/html
+import brazier/log
+import brazier/router
 import gleam/int
 import gleam/string
 import gleam/uri.{type Uri}
@@ -63,8 +63,8 @@ pub fn href(route: Route) -> String {
 }
 
 fn init(
-  _ctx: beacon.Context,
-) -> Result(#(Model, Effect(Msg)), beacon.InitError) {
+  _ctx: brazier.Context,
+) -> Result(#(Model, Effect(Msg)), brazier.InitError) {
   // `with_router` dispatches RouteChanged for the requested URL before the
   // first render, so this route is only a placeholder.
   Ok(#(
@@ -139,10 +139,10 @@ pub fn view(model: Model) -> Element(Msg) {
 
 pub fn main() {
   let assert Ok(Nil) =
-    beacon.application(init:, update:, view:)
-    |> beacon.with_router(parse: parse_route, on_change: RouteChanged)
-    |> beacon.title(fn(_model) { "Beacon Routed" })
-    |> beacon.head_html(favicon)
-    |> beacon.start(8080)
-    as "beacon.start failed (it logs the error)"
+    brazier.application(init:, update:, view:)
+    |> brazier.with_router(parse: parse_route, on_change: RouteChanged)
+    |> brazier.title(fn(_model) { "Brazier Routed" })
+    |> brazier.head_html(favicon)
+    |> brazier.start(8080)
+    as "brazier.start failed (it logs the error)"
 }

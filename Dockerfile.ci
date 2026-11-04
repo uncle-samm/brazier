@@ -1,4 +1,4 @@
-# Beacon CI image for unit, lint, and browser/CDP shard jobs.
+# Brazier CI image for unit, lint, and browser/CDP shard jobs.
 #
 # The browser harness needs Gleam/Erlang, Node/npm for esbuild, Python for CDP,
 # and Chromium. Keep this image test-focused; the production Dockerfile remains
@@ -54,17 +54,17 @@ RUN set -eu; \
       (cd "$example_dir" && gleam deps download); \
     done
 
-ARG BEACON_CDP_PREBUILD_EXAMPLES=0
+ARG BRAZIER_CDP_PREBUILD_EXAMPLES=0
 
 RUN set -eu; \
-    if [ "$BEACON_CDP_PREBUILD_EXAMPLES" = "1" ]; then \
+    if [ "$BRAZIER_CDP_PREBUILD_EXAMPLES" = "1" ]; then \
       gleam build; \
       for gleam_toml in examples/*/gleam.toml; do \
         example_dir="$(dirname "$gleam_toml")"; \
         (cd "$example_dir" && gleam build); \
       done; \
-    elif [ "$BEACON_CDP_PREBUILD_EXAMPLES" != "0" ]; then \
-      echo "BEACON_CDP_PREBUILD_EXAMPLES must be 0 or 1" >&2; \
+    elif [ "$BRAZIER_CDP_PREBUILD_EXAMPLES" != "0" ]; then \
+      echo "BRAZIER_CDP_PREBUILD_EXAMPLES must be 0 or 1" >&2; \
       exit 1; \
     fi
 
@@ -75,4 +75,4 @@ RUN set -eu; \
 # non-zero exit. The build must be warning-free (CLAUDE.md, Definition of
 # Done), so warnings fail it. The docs check runs last: it compiles every
 # Gleam sample in the docs against the API the steps before it checked.
-CMD ["sh", "-lc", "gleam format --check src test && node --version && make test-client && gleam build --warnings-as-errors && gleam test && gleam run -m beacon/lint && scripts/check_docs.sh"]
+CMD ["sh", "-lc", "gleam format --check src test && node --version && make test-client && gleam build --warnings-as-errors && gleam test && gleam run -m brazier/lint && scripts/check_docs.sh"]

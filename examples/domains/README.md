@@ -1,6 +1,6 @@
 # Multi-File Domains
 
-A `beacon.simple` app whose Model is built from types in other modules.
+A `brazier.simple` app whose Model is built from types in other modules.
 
 ## Features
 
@@ -21,7 +21,7 @@ A `beacon.simple` app whose Model is built from types in other modules.
 
 ```bash
 cd examples/domains
-gleam run -m beacon/build   # first, and after every change
+gleam run -m brazier/build   # first, and after every change
 gleam run -m app
 ```
 

@@ -1,14 +1,14 @@
 # Triple Counter
 
-Three counters, one per Beacon state layer, built with
-`beacon.full_application`.
+Three counters, one per Brazier state layer, built with
+`brazier.full_application`.
 
 ## Features
 
 - Shared counter: every session sees the same value. Clicks append +1/-1
-  to a `beacon/store` list, so concurrent clicks are never lost; the store
+  to a `brazier/store` list, so concurrent clicks are never lost; the store
   broadcasts on its topic and every session re-reads it
-  (`beacon.subscriptions` and `beacon.on_notify`)
+  (`brazier.subscriptions` and `brazier.on_notify`)
 - Server counter: per tab, held by the tab's server process
 - Local counter: per tab, in the browser's Local layer, with no server
   traffic
@@ -19,7 +19,7 @@ Three counters, one per Beacon state layer, built with
 
 ```bash
 cd examples/triple_counter
-gleam run -m beacon/build   # first, and after every change
+gleam run -m brazier/build   # first, and after every change
 gleam run
 ```
 
