@@ -329,6 +329,22 @@
       - CHANGELOG WS10b bullets still use old names (`__beaconOutboundPendingForTest`, `beacon_http_conns`, `data-beacon-auto`), and the lint does not scan CHANGELOG;
       - `stop_server` in `test_all_cdp.py` only logs when the page doesn't reach `about:blank`;
       - a lint rule requiring an `as` message on every `let assert` (TS-12, for the wave-4 sweep).
+  - [x] fix-client-patch (TS-3, SEC-5, SEC-14, PERF-8, PERF-15, PERF-1 client side), merged as 3b6baa5.
+    - SEC-14: neither diff writes a patch path through `__proto__`, `constructor` or `prototype`; the object holding such a key is replaced whole. `patch.unsafe_keys()` is the one list, and a test checks the client's copy equals it.
+    - PERF-8: each array is copied once per patch, not once per op (copy-on-write in JS, a zipper in Erlang). An equivalence test runs the new engine against the old on 2450 applied and 550 refused patches. Speed-ups at n=4000: Erlang 4.6–9.4×, JS 3.0–8.6×.
+    - SEC-5: navigation targets follow Phoenix's `validate_local_url` (no leading `//` or `/\`, no `\`, no `/%09`) and also refuse control characters, on the server (`router.check_local_path`) and the client (`localPathRefusal`, plus a same-origin check with `new URL`). A parity test runs 27 paths through both.
+    - TS-3: a missing or invalid `ack_clock` or event clock is no longer read as 0. A `model_sync` fails, a patch drops the cache and asks for a full sync, and a queued event without a clock throws.
+    - PERF-15: the trace flag is read once and checked before trace details are built. PERF-1 client side: an identical render reuses the parsed fragment, and hooks are synced only for elements the morph touched (the morphdom / LiveView DOMPatch pattern), up to 2× faster. A keyed or vdom morph is the remaining cost.
+    - Coordinator verify on the merge of 1af7b17 into the branch (84e106f): clean build with zero warnings, format and lint clean, 1603 tests passing in each of 3 runs, docs check OK, test-client with 45 harness scenarios, 9 patch-safety checks and the apply-equivalence check.
+    - Decisions:
+      - kept: a hook `unmount` that removes an element the same morph changed now fails the render loudly and the client resyncs. Before, nothing was reported and the hook entry leaked;
+      - accepted the agent's edits outside its files: `runtime_versioning_test.gleam` (harness count, `as` messages) and the `Makefile` `test-client` target.
+    - Follow-ups:
+      - link-click interception compares only the hostname, not the origin;
+      - `runtime.gleam` (around 1400 and 2460) has its own weaker local-path checks, which should use `router.check_local_path`, and `hard_navigate` (around 1523) echoes a client-supplied path. Both go to wave 2;
+      - removing `data-brazier-hook` does not unmount the hook (already the case before);
+      - a keyed morph; whole-array replaces when about n/4 of the items change;
+      - a patch-apply bench metric (for PERF-9).
 - [ ] Final verification: build (zero warnings), tests, all examples, CDP browser suite, perf baselines
 
 **Decisions (Milestone 117, coordinator):**
