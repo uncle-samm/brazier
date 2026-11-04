@@ -296,6 +296,22 @@
     - Follow-ups:
       - `brazier_store_replica.erl` does not validate the shape of incoming peer deltas;
       - `compact` sorts the whole cloud on every join.
+  - [x] fix-render (SEC-1, SEC-6, SEC-12, SEC-13, PERF-1 server side, PERF-4, PERF-5), merged as 14631d6.
+    - SEC-1: `internal/url` reads the scheme the way the WHATWG URL parser does, one code point at a time (scheme start state, then scheme state). A combining mark after `:` no longer hides `javascript:`.
+    - New XSS found and fixed: on Erlang, `string.replace` works on graphemes and skipped a `"` that a combining mark followed, so an attribute value could break out. Escaping is now a single byte pass in `src/brazier_render_ffi.erl` and `.mjs`, following Phoenix.HTML's `html_escape`.
+    - SEC-12/13: render checks tag, attribute and event names again with an ASCII byte scan; `srcdoc` needs the `UnsafeSrcdoc` variant. The default CSP is now `script-src 'self'` and `connect-src 'self'`.
+    - PERF-4: `element.memo` (a documented no-op) is removed, along with its mentions in the docs, ARCHITECTURE included.
+    - PERF-1 server side and PERF-5: render is 2.3× faster and escaping 8× faster.
+    - `client_bundle.framework_ffi_files` copies the JS FFI files and errors when one is missing; `reach.resolve_ffi_path` is now public.
+    - Coordinator verify on the merge of 9c48e5e into the branch (c0f88e5): clean build with zero warnings, format and lint clean, 1564 tests passing in each of 3 runs, docs check with 72 samples, test-client with 39 scenarios and 5 patch-safety checks.
+    - Decisions:
+      - render re-checks attribute names on every call rather than trusting construction;
+      - `srcdoc` is opt-in through `UnsafeSrcdoc`;
+      - Safari 15 and older may need an explicit `wss://` host in `connect-src`. This is documented and not verified.
+    - Follow-ups:
+      - a render bench scenario (for the PERF-9 owner);
+      - constant tag names are re-checked on every render;
+      - CDP on an idle machine, during final verification.
 - [ ] Final verification: build (zero warnings), tests, all examples, CDP browser suite, perf baselines
 
 **Decisions (Milestone 117, coordinator):**
