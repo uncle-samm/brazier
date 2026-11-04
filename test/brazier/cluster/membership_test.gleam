@@ -60,11 +60,11 @@ pub fn pubsub_exchanges_nothing_with_an_unverified_node_test_() -> peer.Timeout 
   list.each([a, b, c], fn(p) { peer.on(p, pubsub.start) })
   // pg lists every connected node's worker, b's included; membership, not
   // pg, decides where forwards go.
-  assert peer.eventually(
-    fn() {
-      peer.on(a, fn() { remote_worker_nodes(0) })
-      == list.sort([peer.node(b), peer.node(c)], by: node_order)
-    },
+  let others = list.sort([peer.node(b), peer.node(c)], by: node_order)
+  assert peer.until(
+    a,
+    peer.pg_changes("brazier_pubsub_pg", #(atom.create("brazier_pubsub"), 0)),
+    fn() { remote_worker_nodes(0) == others },
     wait_ms,
   )
   let topic = "members-only"
@@ -79,10 +79,7 @@ pub fn pubsub_exchanges_nothing_with_an_unverified_node_test_() -> peer.Timeout 
   let assert Ok(Nil) =
     peer.on(a, fn() { pubsub.try_broadcast(topic, "from-a") })
     as "a broadcast on a running PubSub succeeds"
-  assert peer.eventually(
-    fn() { peer.on(c, fn() { recorded(on_c) }) == ["from-a"] },
-    wait_ms,
-  )
+  assert recorded_on(c, on_c, 1) == Ok(["from-a"])
   let b_node = peer.node(b)
   assert peer.on(a, fn() { pubsub.direct_broadcast(b_node, topic, "direct") })
     == Error(pubsub.NodeNotVerified(node: node_name(b)))
@@ -110,12 +107,9 @@ pub fn pubsub_exchanges_nothing_with_an_unverified_node_test_() -> peer.Timeout 
   // A last broadcast from a, after everything above, reaches c.
   let assert Ok(Nil) = peer.on(a, fn() { pubsub.try_broadcast(topic, "last") })
     as "a broadcast on a running PubSub succeeds"
-  assert peer.eventually(
-    fn() { peer.on(c, fn() { recorded(on_c) }) == ["from-a", "last"] },
-    wait_ms,
-  )
-  assert peer.on(a, fn() { recorded(on_a) }) == ["from-a", "last"]
-  assert peer.on(b, fn() { recorded(on_b) }) == ["from-b"]
+  assert recorded_on(c, on_c, 2) == Ok(["from-a", "last"])
+  assert recorded_on(a, on_a, 2) == Ok(["from-a", "last"])
+  assert recorded_on(b, on_b, 1) == Ok(["from-b"])
 }
 
 // --- Replicated store -------------------------------------------------------
@@ -131,10 +125,10 @@ pub fn store_exchanges_nothing_with_an_unverified_node_test_() -> peer.Timeout {
 
   put_on(a, kv, "from-a", "1")
   put_on(b, kv, "from-b", "2")
-  assert peer.eventually(fn() { get_on(c, kv, "from-a") == Ok("1") }, wait_ms)
+  assert await_value(c, kv, "from-a", "1")
   // Anti-entropy (every 100ms) has had its chance to fill any gap too.
   put_on(c, kv, "from-c", "3")
-  assert peer.eventually(fn() { get_on(a, kv, "from-c") == Ok("3") }, wait_ms)
+  assert await_value(a, kv, "from-c", "3")
   assert get_on(b, kv, "from-a") == Error(Nil)
   assert get_on(b, kv, "from-c") == Error(Nil)
   assert get_on(a, kv, "from-b") == Error(Nil)
@@ -175,14 +169,23 @@ pub fn presence_exchanges_nothing_with_an_unverified_node_test_() -> peer.Timeou
 
   track_on(a, tracker, "alice")
   track_on(b, tracker, "bob")
-  assert peer.eventually(fn() { keys(c, tracker) == ["alice"] }, wait_ms)
-  // a and c hear each other's heartbeats; b hears and is heard by no one.
-  assert peer.eventually(
-    fn() { replicas(a, tracker) == [node_name(c)] },
+  assert peer.until(
+    c,
+    room_diffs(tracker),
+    fn() { local_keys(tracker) == ["alice"] },
     wait_ms,
   )
-  assert peer.eventually(
-    fn() { replicas(c, tracker) == [node_name(a)] },
+  // a and c hear each other's heartbeats; b hears and is heard by no one.
+  assert peer.until(
+    a,
+    replica_changes(),
+    fn() { local_replicas(tracker) == [node_name(c)] },
+    wait_ms,
+  )
+  assert peer.until(
+    c,
+    replica_changes(),
+    fn() { local_replicas(tracker) == [node_name(a)] },
     wait_ms,
   )
   assert replicas(b, tracker) == []
@@ -224,7 +227,7 @@ pub fn revocation_reaches_no_unverified_node_test_() -> peer.Timeout {
   // A logout on a reaches c's socket and skips b's.
   let s = peer.on(a, fn() { session.create(store_a) })
   let _ = bind_on(b, store_b, s.id)
-  let _ = bind_on(c, store_c, s.id)
+  let bound_c = bind_on(c, store_c, s.id)
   assert bound_seen_from(a, name, s.id, 2)
   let #(Nil, lines) =
     peer.on(a, fn() {
@@ -234,10 +237,11 @@ pub fn revocation_reaches_no_unverified_node_test_() -> peer.Timeout {
     "Revocation skipped 1 bound process(es)",
     node_name(b),
   ])
-  assert peer.eventually(
-    fn() { list.contains(peer.on(c, revocations), #(s.id, "deleted")) },
-    wait_ms,
-  )
+  let id = s.id
+  assert peer.on_within(c, wait_ms + 5000, fn() {
+      await_revocation(bound_c, id, "deleted", wait_ms)
+    })
+    == Ok(Nil)
   assert !list.contains(peer.on(b, revocations), #(s.id, "deleted"))
 
   // A logout on b reaches no other node.
@@ -492,6 +496,22 @@ fn get_on(
   peer.on(p, fn() { store.get(kv, key) })
 }
 
+/// Wait on `p` until `key` holds `value` there. The replica writes a
+/// remote change to its table and then announces it on the store topic.
+fn await_value(
+  p: Peer,
+  kv: store.Store(String),
+  key: String,
+  value: String,
+) -> Bool {
+  peer.until(
+    p,
+    peer.broadcasts(store.topic(kv)),
+    fn() { store.get(kv, key) == Ok(value) },
+    wait_ms,
+  )
+}
+
 fn start_presence(
   p: Peer,
   config: presence.PresenceConfig(String),
@@ -515,20 +535,51 @@ fn track_on(p: Peer, tracker: presence.Presence(String), key: String) -> Nil {
 }
 
 fn keys(p: Peer, tracker: presence.Presence(String)) -> List(String) {
-  peer.on(p, fn() {
-    let assert Ok(entries) = presence.list(tracker, "room")
-      as "the tracker started in the test is running"
-    list.map(entries, fn(entry) { entry.key })
-  })
+  peer.on(p, fn() { local_keys(tracker) })
+}
+
+/// The keys tracked in "room", read on the node this runs on.
+fn local_keys(tracker: presence.Presence(String)) -> List(String) {
+  let assert Ok(entries) = presence.list(tracker, "room")
+    as "the tracker started in the test is running"
+  list.map(entries, fn(entry) { entry.key })
 }
 
 /// The nodes whose replica `p`'s shard for "room" hears from.
 fn replicas(p: Peer, tracker: presence.Presence(String)) -> List(String) {
-  peer.on(p, fn() {
-    let assert Ok(replicas) = presence.replicas(tracker, "room")
+  peer.on(p, fn() { local_replicas(tracker) })
+}
+
+/// `replicas` on the node this runs on. A call to the shard, so it is
+/// answered after the shard has handled whatever it was handling.
+fn local_replicas(tracker: presence.Presence(String)) -> List(String) {
+  let assert Ok(replicas) = presence.replicas(tracker, "room")
+    as "the tracker started in the test is running"
+  list.map(replicas, fn(r) { r.0 })
+}
+
+/// Wake on each diff of "room": the shard writes every change to ETS,
+/// where presence.list reads it, and then broadcasts the diff.
+fn room_diffs(tracker: presence.Presence(String)) -> peer.Wake {
+  fn() {
+    let assert Ok(Nil) = presence.subscribe(tracker, "room")
       as "the tracker started in the test is running"
-    list.map(replicas, fn(r) { r.0 })
-  })
+    fn() {
+      let assert Ok(Nil) = presence.unsubscribe(tracker, "room")
+        as "the tracker started in the test is running"
+      Nil
+    }
+  }
+}
+
+/// Wake on each change of a shard's replicas (each is emitted while the
+/// shard handles it, before it answers `presence.replicas`).
+fn replica_changes() -> peer.Wake {
+  peer.events([
+    ["brazier", "presence", "replica", "up"],
+    ["brazier", "presence", "replica", "down"],
+    ["brazier", "presence", "replica", "permdown"],
+  ])
 }
 
 // --- Session helpers --------------------------------------------------------
@@ -552,11 +603,18 @@ fn bind_on(p: Peer, store: SessionStore, id: String) -> Pid {
   })
 }
 
+/// Wait on `p` until `expected` processes are bound to session `id`,
+/// waking on each join and leave of the session's pg group.
 fn bound_seen_from(p: Peer, name: String, id: String, expected: Int) -> Bool {
-  peer.eventually(
-    fn() {
-      peer.on(p, fn() { bound_everywhere("external:" <> name, id) }) == expected
-    },
+  let namespace = "external:" <> name
+  peer.until(
+    p,
+    peer.pg_changes("brazier_session_pg", #(
+      atom.create("brazier_session"),
+      namespace,
+      id,
+    )),
+    fn() { bound_everywhere(namespace, id) == expected },
     wait_ms,
   )
 }
@@ -614,8 +672,22 @@ fn remote_worker_nodes(shard: Int) -> List(Node)
 @external(erlang, "brazier_cluster_test_ffi", "spawn_recorders")
 fn spawn_recorders(topic: String, count: Int) -> List(Pid)
 
-@external(erlang, "brazier_cluster_test_ffi", "recorded")
-fn recorded(pid: Pid) -> List(String)
+@external(erlang, "brazier_cluster_test_ffi", "await_recorded")
+fn await_recorded(
+  pid: Pid,
+  count: Int,
+  timeout_ms: Int,
+) -> Result(List(String), List(String))
+
+/// What the recorder `pid` on `p` has received, once it has received at
+/// least `count` broadcasts; an error holds what it had at the deadline.
+fn recorded_on(
+  p: Peer,
+  pid: Pid,
+  count: Int,
+) -> Result(List(String), List(String)) {
+  peer.on_within(p, wait_ms + 5000, fn() { await_recorded(pid, count, wait_ms) })
+}
 
 @external(erlang, "brazier_cluster_test_ffi", "forge_forward")
 fn forge_forward(node: Node, topic: String, message: String) -> Nil
@@ -646,6 +718,14 @@ fn spawn_bound(bind: fn() -> Nil) -> Pid
 
 @external(erlang, "brazier_session_test_ffi", "revocations")
 fn revocations() -> List(#(String, String))
+
+@external(erlang, "brazier_session_test_ffi", "await_revocation")
+fn await_revocation(
+  pid: Pid,
+  id: String,
+  reason: String,
+  timeout_ms: Int,
+) -> Result(Nil, List(#(String, String)))
 
 @external(erlang, "brazier_session_test_ffi", "bound_everywhere")
 fn bound_everywhere(namespace: String, id: String) -> Int
