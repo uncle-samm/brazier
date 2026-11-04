@@ -501,6 +501,23 @@
     - Follow-ups:
       - with `no_discovery`, a member lost to a real netsplit is never reconnected;
       - global can still drop members on a genuine netsplit, which `session_cluster_test` simulates deliberately.
+  - [x] w4-server-sweep, merged as a87186f.
+    - TS-12: a lint rule requires `as` on every `let assert` in `src`, and all violations are fixed (c72487f).
+    - SEC-11 remainder: raw client paths in ssr, static, http, upload and client logs go through `log_path` (b81b997).
+    - `trusted_proxies` is parsed once at listener start. The scheme comes only from the configured forwarding header (`Forwarded` `proto=` or `X-Forwarded-Proto`), and the other header from a trusted proxy is warned about. Follows Plug.RewriteOn, Rails RemoteIp and RFC 7239 (dc0909e).
+    - The asset cache revalidates size, mtime, ctime, inode and device, and applies git's racy-clean rule: an entry is trusted only 2 s after the file's last change (440ffc3).
+    - The CDP harness `stop_server` reports failures, and `start_example` stops on one. Only syntax-checked so far; it gets exercised in final verification (74bcb0c).
+    - `brazier_store_replica:check_payload/2` validates every field of a peer delta or full state before counting, sizing or joining it. A malformed payload is refused and logged with the failing field, and the replica keeps its state. 27 malformed variants are tested, in unit tests and on a 2-node cluster (5b8ae13).
+    - CRDT `union_context` no longer sorts the cloud: its cost follows the delta, checked against the old sort kept as a test oracle. A one-dot delta into a 10,000-dot cloud went from about 1.33M reductions to about the cost on a 10-dot cloud (75513e5).
+    - Coordinator verify on the merge of f802343 into the branch (dc899d1): clean build with zero warnings, format and lint clean, 1731 tests passing in each of 3 runs, docs check OK (73 modules), and test-client OK (47 scenarios, 9 patch-safety checks, 2450/550 apply equivalence).
+    - Decision: a refused replica payload is reported through the existing `[brazier, store, sync]` span with `entries` 0, not a new event. That keeps the telemetry catalogue that the client-tests agent's files assert unchanged; a dedicated event is a follow-up.
+    - Follow-ups:
+      - a `[brazier, store, sync, refused]` event, or a `result` key;
+      - `crdt.fingerprint` sorts the whole state on every anti-entropy tick;
+      - the warning for a malformed proxy hop can be logged twice on a WebSocket upgrade;
+      - `start_listener` may log "Invalid security limits" twice;
+      - `brazier_build_ffi` `absolute_path` never returns an error;
+      - for up to 2 s after a bundle write, the asset cache rebuilds its entry on every load.
 - [ ] Final verification: build (zero warnings), tests, all examples, CDP browser suite, perf baselines
 
 **Decisions (Milestone 117, coordinator):**
