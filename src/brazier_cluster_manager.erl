@@ -26,7 +26,8 @@
 %% to {brazier_cluster, Node}, where Mac = HMAC-SHA256(secret_key,
 %% "brazier-cluster-v1"). A manager that accepts a hello answers with
 %%   {brazier_cluster_hello_ack, FromNode, ?PROTOCOL_VERSION, Mac}
-%% which is checked the same way but not answered. The ack covers a hello
+%% which is checked the same way, and answered only when it is what
+%% verified its sender (see "Acks" below). The ack covers a hello
 %% sent before the other side's manager was running (it is dropped), and a
 %% manager restarted while its peers stayed connected (they see no nodeup).
 %% A peer whose Mac or version differs, or that sends neither a hello nor
@@ -52,13 +53,29 @@
 %% has handled the nodeup of (current_peer/3). A rejected node's later
 %% hello or ack is checked again too (its manager may have started late).
 %%
-%% Processes that sync with a peer when it joins (store replicas, session
-%% maintenance) call brazier_cluster_ffi:await_verified/1 on nodeup and get
-%% {brazier_cluster_peer_verified, Node} once the node passes the check,
-%% instead of syncing on nodeup (Phoenix.Tracker replicates only with
-%% replicas it has heard from). The interest is one-shot, kept while the
-%% node stays connected (a rejected node may still pass later) and dropped
-%% when it goes down: a node that never passes is never synced with.
+%% Processes waiting for a node to pass the check
+%% (brazier_cluster_ffi:await_verified/1) get
+%% {brazier_cluster_peer_verified, Node} once it does. The wait is
+%% one-shot, kept while the node stays connected (a rejected node may still
+%% pass later) and dropped when it goes down. Processes that sync with a
+%% peer when it joins (store replicas, session maintenance) subscribe
+%% instead (brazier_cluster_ffi:subscribe_mutual/1) and get
+%% {brazier_cluster_peer_mutual, Node} when this node has verified Node and
+%% Node has acknowledged this node's hello, so both directions of cluster
+%% traffic flow: once per connection, and once more each time Node's
+%% manager restarts on it (its new hello means it verifies this node
+%% again) (Phoenix.Tracker likewise replicates
+%% only with replicas it has heard from). Waits and subscriptions live in
+%% the table brazier_cluster_waiters, outside this process, so a restarted
+%% manager loses none of them (see brazier_cluster_ffi).
+%%
+%% Acks. A manager answers every hello it accepts with an ack, and answers
+%% an ack only when that ack is what verified the node (the node was not
+%% verified before it): the peer verified this node without a hello from
+%% it (its hello was dropped, or the peer's manager restarted), so without
+%% the answer it would never learn that this node verified it. The answer
+%% is sent at most once per transition to verified, so two managers never
+%% ack each other in a loop.
 %%
 %% Why a rejected peer stays connected. Under OTP's default
 %% kernel prevent_overlapping_partitions=true, global treats every lost
@@ -93,6 +110,7 @@
 
 -define(NAME, brazier_cluster).
 -define(MEMBERS, brazier_cluster_members).
+-define(WAITERS, brazier_cluster_waiters).
 -define(PROTOCOL_VERSION, 1).
 %% Exponent cap, so 2^attempt stays small; max_ms bounds the delay anyway.
 -define(MAX_EXPONENT, 30).
@@ -119,8 +137,16 @@ backoff_window(Attempt, InitialMs, MaxMs) ->
 
 %% --- gen_server ---
 
-init(Config = #{discovery := Discovery}) ->
+init(Config) ->
     process_flag(trap_exit, true),
+    %% The waits and subscriptions this manager serves; without the table
+    %% it could tell no one, so it does not start.
+    case brazier_cluster_ffi:waiters() of
+        {ok, ?WAITERS} -> init_manager(Config);
+        {error, Reason} -> {stop, Reason}
+    end.
+
+init_manager(Config = #{discovery := Discovery}) ->
     ?MEMBERS = ets:new(?MEMBERS, [set, protected, named_table, {read_concurrency, true}]),
     ok = net_kernel:monitor_nodes(true, #{connection_id => true, nodedown_reason => true}),
     State0 = Config#{
@@ -136,12 +162,10 @@ init(Config = #{discovery := Discovery}) ->
         connections => #{},
         %% MonitorRef => {connect, Node} | {resolve, Pid, TimeoutRef}
         jobs => #{},
-        %% Node => [Pid]: live local processes told when Node passes the
-        %% check. Only connected nodes have interests; they are dropped
-        %% when the node is verified or goes down, and dead waiters are
-        %% pruned on every new wait, so a node that stays rejected holds at
-        %% most one entry per live process.
-        interests => #{},
+        %% Node => ConnectionId: the connections on which Node
+        %% acknowledged this node's hello, and the subscribers were told
+        %% (removed on nodedown). Only connected nodes.
+        mutual => #{},
         dns_atoms => dns_atom_counter()
     },
     brazier_log_ffi:info(<<"brazier.cluster">>, "Cluster manager started on ~p (~ts)",
@@ -151,6 +175,7 @@ init(Config = #{discovery := Discovery}) ->
     Connected =/= [] andalso
         brazier_log_ffi:info(<<"brazier.cluster">>, "Checking ~b already-connected nodes: ~p",
                             [length(Connected), Connected]),
+    ok = prune_waits(),
     Ids = connection_ids(),
     State1 = lists:foldl(fun(Node, S) ->
                                  case maps:find(Node, Ids) of
@@ -167,12 +192,6 @@ handle_call(Request, From, State) ->
     brazier_log_ffi:warning(<<"brazier.cluster">>, "Unexpected call ~p from ~p", [Request, From]),
     {reply, {error, unknown_call}, State}.
 
-%% Waiters are local (brazier_cluster_ffi:await_verified/1 sends self()):
-%% pruning them uses is_process_alive/1, which takes local pids only, so a
-%% remote one falls through to the unexpected-cast warning.
-handle_cast({await_verified, Node, Pid}, State) when is_atom(Node), is_pid(Pid),
-                                                     node(Pid) =:= node() ->
-    {noreply, await_verified(Node, Pid, State)};
 handle_cast(Request, State) ->
     brazier_log_ffi:warning(<<"brazier.cluster">>, "Unexpected cast ~0P", [Request, 10]),
     {noreply, State}.
@@ -181,15 +200,20 @@ handle_info({nodeup, Node, #{connection_id := Id}}, State) ->
     brazier_log_ffi:info(<<"brazier.cluster">>, "Node up: ~p", [Node]),
     ok = brazier_telemetry_ffi:cluster_node(node_up, atom_to_binary(Node), <<"connected">>),
     {noreply, peer_up(Node, Id, State)};
-handle_info({nodedown, Node, Info}, State) when is_map(Info) ->
+handle_info({nodedown, Node, Info = #{connection_id := Id}}, State) ->
     Reason = format(maps:get(nodedown_reason, Info, unknown)),
     brazier_log_ffi:warning(<<"brazier.cluster">>, "Node down: ~p (~ts)", [Node, Reason]),
     ok = brazier_telemetry_ffi:cluster_node(node_down, atom_to_binary(Node), Reason),
-    {noreply, retry_target(Node, peer_down(Node, State))};
-handle_info({brazier_cluster_hello, Node, Version, Mac}, State)
+    {noreply, retry_target(Node, peer_down(Node, Id, State))};
+handle_info({brazier_cluster_hello, Node, Version, Mac}, State0)
         when is_atom(Node), is_integer(Version), is_binary(Mac) ->
-    case current_peer(brazier_cluster_hello, Node, State) of
+    case current_peer(brazier_cluster_hello, Node, State0) of
         {ok, Id} ->
+            %% A manager sends its hello only when it has not verified this
+            %% node on the connection (nodeup, or its own start): whatever
+            %% the two sides knew of each other before, Node has to learn
+            %% again, and its answer to the ack below is the next mutual.
+            State = forget_mutual(Node, State0),
             case check(Node, Id, Version, Mac, State) of
                 {verified, State1 = #{mac := Own}} ->
                     {?NAME, Node} ! {brazier_cluster_hello_ack, node(), ?PROTOCOL_VERSION, Own},
@@ -198,14 +222,29 @@ handle_info({brazier_cluster_hello, Node, Version, Mac}, State)
                     {noreply, State1}
             end;
         drop ->
-            {noreply, State}
+            {noreply, State0}
     end;
 handle_info({brazier_cluster_hello_ack, Node, Version, Mac}, State)
         when is_atom(Node), is_integer(Version), is_binary(Mac) ->
     case current_peer(brazier_cluster_hello_ack, Node, State) of
         {ok, Id} ->
-            {_, State1} = check(Node, Id, Version, Mac, State),
-            {noreply, State1};
+            Before = maps:get(Node, maps:get(peers, State), none),
+            case check(Node, Id, Version, Mac, State) of
+                {verified, State1 = #{mac := Own}} ->
+                    Before =:= verified orelse
+                        begin
+                            %% This ack verified Node: it has verified this
+                            %% node without a hello from it, so it learns
+                            %% that this node verified it only from this
+                            %% answer (see "Acks" above).
+                            brazier_log_ffi:debug(<<"brazier.cluster">>, "Answering the ack that verified ~p",
+                                                 [Node]),
+                            {?NAME, Node} ! {brazier_cluster_hello_ack, node(), ?PROTOCOL_VERSION, Own}
+                        end,
+                    {noreply, mutual(Node, Id, State1)};
+                {rejected, State1} ->
+                    {noreply, State1}
+            end;
         drop ->
             {noreply, State}
     end;
@@ -331,9 +370,9 @@ peer_up(Node, Id, State0 = #{connections := Connections}) ->
             State#{peers := Peers#{Node => {pending, TRef}}}
     end.
 
-peer_down(Node, State0 = #{peers := Peers, connections := Connections}) ->
-    State = State0#{connections := maps:remove(Node, Connections)},
-    State1 = drop_interests(Node, State),
+peer_down(Node, Id, State0 = #{peers := Peers, connections := Connections, mutual := Mutual}) ->
+    State1 = State0#{connections := maps:remove(Node, Connections), mutual := maps:remove(Node, Mutual)},
+    ok = drop_waits(Node, Id),
     case maps:take(Node, Peers) of
         {{pending, TRef}, Rest} ->
             cancel(TRef),
@@ -390,54 +429,71 @@ connection_ids() ->
     maps:from_list([{Node, Id} || {Node, #{connection_id := Id}}
                                      <- erlang:nodes(visible, #{connection_id => true})]).
 
-%% --- Verified-peer interests ---
+%% --- Waiters and subscribers (brazier_cluster_ffi:waiters/0) ---
 
-await_verified(Node, Pid, State = #{peers := Peers, interests := Interests}) ->
-    case maps:get(Node, Peers, none) of
-        verified ->
-            Pid ! {brazier_cluster_peer_verified, Node},
+%% At init: delete the waits of processes that died and of connections
+%% that went down while no manager ran (no nodedown removed them). The
+%% connections are read after the rows, so a wait written meanwhile on a
+%% new connection (the name is registered before init runs) is kept.
+prune_waits() ->
+    Rows = ets:match_object(?WAITERS, {{await, '_', '_'}, '_'}),
+    Ids = connection_ids(),
+    Stale = [Key || {{await, Node, Pid} = Key, Id} <- Rows,
+                    maps:get(Node, Ids, none) =/= Id orelse not is_process_alive(Pid)],
+    lists:foreach(fun(Key) -> true = ets:delete(?WAITERS, Key) end, Stale),
+    brazier_log_ffi:info(<<"brazier.cluster">>, "Kept ~b waits from before this manager started, "
+                        "dropped ~b stale ones", [length(Rows) - length(Stale), length(Stale)]),
+    ok.
+
+%% Tell the processes waiting for Node on connection Id that it passed.
+%% Each row is taken, so a waiter that took its own row (it found Node
+%% verified right after writing it) is not told twice.
+notify_verified(Node, Id) ->
+    Keys = [Key || {Key, _} <- ets:match_object(?WAITERS, {{await, Node, '_'}, Id})],
+    Told = lists:foldl(fun(Key = {await, _, Pid}, N) ->
+                               case ets:take(?WAITERS, Key) of
+                                   [_] -> Pid ! {brazier_cluster_peer_verified, Node}, N + 1;
+                                   [] -> N
+                               end
+                       end, 0, Keys),
+    Told > 0 andalso
+        brazier_log_ffi:debug(<<"brazier.cluster">>, "Told ~b processes that ~p is verified", [Told, Node]),
+    ok.
+
+%% Node's connection Id went down: its waits can no longer be told.
+drop_waits(Node, Id) ->
+    case ets:select_delete(?WAITERS, [{{{await, Node, '_'}, Id}, [], [true]}]) of
+        0 -> ok;
+        Dropped ->
+            brazier_log_ffi:debug(<<"brazier.cluster">>, "Dropping ~b waits for ~p: it went down "
+                                 "unverified", [Dropped, Node]),
+            ok
+    end.
+
+%% A valid ack from Node on connection Id: Node verified this node, and
+%% this node has verified Node. The subscribers are told once per
+%% connection.
+mutual(Node, Id, State = #{mutual := Mutual}) ->
+    case maps:get(Node, Mutual, none) of
+        Id ->
             State;
         _ ->
-            case lists:member(Node, nodes()) of
-                true ->
-                    %% Pending, rejected (it may still pass on a later
-                    %% hello), or connected and its nodeup not yet handled
-                    %% here (the caller saw its own nodeup first). A
-                    %% rejected node can stay connected indefinitely, so
-                    %% waiters that died meanwhile are pruned here.
-                    Live = [P || P <- maps:get(Node, Interests, []), is_process_alive(P)],
-                    Waiting = case lists:member(Pid, Live) of
-                                  true -> Live;
-                                  false -> [Pid | Live]
-                              end,
-                    brazier_log_ffi:debug(<<"brazier.cluster">>, "~p waits for ~p to be verified (~p, ~b "
-                                         "waiting)", [Pid, Node, peer_status(maps:get(Node, Peers, none)),
-                                                      length(Waiting)]),
-                    State#{interests := Interests#{Node => Waiting}};
-                false ->
-                    brazier_log_ffi:debug(<<"brazier.cluster">>, "Not waiting for ~p for ~p: it is not "
-                                         "connected", [Node, Pid]),
-                    State
-            end
+            Subscribers = brazier_cluster_ffi:live_subscribers(),
+            [Pid ! {brazier_cluster_peer_mutual, Node} || Pid <- Subscribers],
+            brazier_log_ffi:info(<<"brazier.cluster">>, "~p and ~p have verified each other; told ~b "
+                                "subscribers", [Node, node(), length(Subscribers)]),
+            State#{mutual := Mutual#{Node => Id}}
     end.
 
-notify_verified(Node, State = #{interests := Interests}) ->
-    case maps:take(Node, Interests) of
-        {Waiting, Rest} ->
-            [Pid ! {brazier_cluster_peer_verified, Node} || Pid <- Waiting],
-            brazier_log_ffi:debug(<<"brazier.cluster">>, "Told ~b processes that ~p is verified",
-                                 [length(Waiting), Node]),
-            State#{interests := Rest};
-        error ->
-            State
-    end.
-
-drop_interests(Node, State = #{interests := Interests}) ->
-    case maps:take(Node, Interests) of
-        {Waiting, Rest} ->
-            brazier_log_ffi:debug(<<"brazier.cluster">>, "Dropping ~b waits for ~p: it went down "
-                                 "unverified", [length(Waiting), Node]),
-            State#{interests := Rest};
+%% A hello from Node: it does not (or no longer) count this node verified,
+%% so the next valid ack from it is a new mutual (its manager restarted
+%% while the connection stayed up, so this side saw no nodedown).
+forget_mutual(Node, State = #{mutual := Mutual}) ->
+    case maps:take(Node, Mutual) of
+        {_Id, Rest} ->
+            brazier_log_ffi:info(<<"brazier.cluster">>, "~p sent a hello: it no longer counts ~p verified "
+                                "until it acknowledges it again", [Node, node()]),
+            State#{mutual := Rest};
         error ->
             State
     end.
@@ -457,7 +513,8 @@ check(Node, Id, ?PROTOCOL_VERSION, TheirMac, State = #{mac := Mac, peers := Peer
                                 [Node, peer_status(Previous)]),
             State1 = reset_attempts(Node, State#{peers := Peers#{Node => verified}}),
             ok = assert_membership(Node, State1),
-            {verified, notify_verified(Node, State1)};
+            ok = notify_verified(Node, Id),
+            {verified, State1};
         false ->
             {rejected, reject(Node, <<"secret key mismatch">>, State)}
     end;

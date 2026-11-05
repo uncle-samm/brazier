@@ -21,9 +21,12 @@
 %%             (brazier/store/crdt.digest, kept up to date by every join,
 %%             so a tick never walks the state)
 %%   sync_req  "send me your full state": broadcast when the replica starts,
-%%             sent directly once a connected node passes the cluster peer
-%%             check (brazier_cluster_ffi:await_verified/1) and when a
-%%             peer's digest differs
+%%             sent directly once a connected node and this node have
+%%             verified each other ({brazier_cluster_peer_mutual, Node},
+%%             brazier_cluster_ffi:subscribe_mutual/1: a request sent when
+%%             only this side had verified the peer would be dropped by the
+%%             peer as coming from a non-member) and when a peer's digest
+%%             differs
 %%   sync      the reply: the sender's full state
 %%
 %% Only cluster members replicate: PubSub forwards only to and from verified
@@ -249,27 +252,37 @@ init(Args) ->
                     end,
                     Table = ets:new(Table, [Type, protected, named_table,
                                             {read_concurrency, true}]),
-                    ok = net_kernel:monitor_nodes(true),
-                    NodeBin = atom_to_binary(node(), utf8),
-                    Replica = {replica, NodeBin, erlang:system_time(microsecond)},
-                    S = Args#{replica => Replica,
-                              node_bin => NodeBin,
-                              crdt => ?CRDT:new(),
-                              hlc => ?HLC:zero(NodeBin)},
-                    %% Up to one interval of initial jitter so replicas
-                    %% started together do not exchange digests in lockstep.
-                    schedule_sync(rand:uniform(max(1, Interval))),
-                    brazier_log_ffi:info(<<"brazier.store">>, "Replica ~ts started as ~ts",
-                                        [Name, ?CRDT:replica_to_string(Replica)]),
-                    %% Ask every running replica for its state.
-                    publish(S, {brazier_store, sync_req, node()}),
-                    {ok, S}
+                    case brazier_cluster_ffi:subscribe_mutual(self()) of
+                        {ok, nil} -> init_replica(Args, Name, Interval);
+                        {error, Reason} ->
+                            brazier_log_ffi:error(<<"brazier.store">>,
+                                                 "Replica ~ts cannot subscribe to cluster membership: ~p",
+                                                 [Name, Reason]),
+                            {stop, {membership_subscribe_failed, Reason}}
+                    end
             end;
         _ ->
             brazier_log_ffi:error(<<"brazier.store">>, "Replica ~ts cannot start: table ~p exists",
                                  [Name, Table]),
             {stop, {table_exists, Table}}
     end.
+
+init_replica(Args, Name, Interval) ->
+    ok = net_kernel:monitor_nodes(true),
+    NodeBin = atom_to_binary(node(), utf8),
+    Replica = {replica, NodeBin, erlang:system_time(microsecond)},
+    S = Args#{replica => Replica,
+              node_bin => NodeBin,
+              crdt => ?CRDT:new(),
+              hlc => ?HLC:zero(NodeBin)},
+    %% Up to one interval of initial jitter so replicas
+    %% started together do not exchange digests in lockstep.
+    schedule_sync(rand:uniform(max(1, Interval))),
+    brazier_log_ffi:info(<<"brazier.store">>, "Replica ~ts started as ~ts",
+                        [Name, ?CRDT:replica_to_string(Replica)]),
+    %% Ask every running replica for its state.
+    publish(S, {brazier_store, sync_req, node()}),
+    {ok, S}.
 
 handle_call({put, Key, Value}, _From, S = #{kind := key_value}) ->
     local_write(S, put, [Value], fun(Crdt, Replica, Hlc) ->
@@ -312,19 +325,20 @@ handle_info({brazier_pubsub, Topic, Message}, S = #{topic := Topic}) ->
     {noreply, peer_message(Message, S)};
 handle_info({nodeup, Node}, S) ->
     %% A connected node is not yet a cluster member: the state is requested
-    %% once the cluster manager has verified it (brazier_cluster_peer_verified).
-    case brazier_cluster_ffi:await_verified(Node) of
-        {ok, nil} ->
-            brazier_log_ffi:info(<<"brazier.store">>, "Replica ~ts: ~p connected, awaiting its peer check",
-                                [label(S), Node]);
-        {error, not_started} ->
+    %% once it and this node have verified each other
+    %% (brazier_cluster_peer_mutual).
+    case whereis(brazier_cluster) of
+        undefined ->
             brazier_log_ffi:warning(<<"brazier.store">>, "Replica ~ts: ~p connected, but no cluster manager "
-                                   "runs here, so it is not replicated to", [label(S), Node])
+                                   "runs here, so it is not replicated to", [label(S), Node]);
+        _Manager ->
+            brazier_log_ffi:info(<<"brazier.store">>, "Replica ~ts: ~p connected, awaiting the peer checks",
+                                [label(S), Node])
     end,
     {noreply, S};
-handle_info({brazier_cluster_peer_verified, Node}, S) ->
-    brazier_log_ffi:info(<<"brazier.store">>, "Replica ~ts: ~p is a verified cluster member, requesting "
-                        "its state", [label(S), Node]),
+handle_info({brazier_cluster_peer_mutual, Node}, S) ->
+    brazier_log_ffi:info(<<"brazier.store">>, "Replica ~ts: ~p and this node have verified each other, "
+                        "requesting its state", [label(S), Node]),
     send_direct(S, Node, {brazier_store, sync_req, node()}),
     {noreply, S};
 handle_info({nodedown, Node}, S) ->
@@ -344,6 +358,7 @@ handle_info(Message, S) ->
 
 terminate(Reason, S) ->
     brazier_log_ffi:info(<<"brazier.store">>, "Replica ~ts stopping: ~p", [label(S), Reason]),
+    nil = brazier_cluster_ffi:unsubscribe_mutual(self()),
     ok.
 
 %% --- Local writes ---

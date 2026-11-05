@@ -296,24 +296,49 @@ local_bound_sessions(Namespace) ->
 %% An unlinked process per store that
 %%   - runs SweepFun every IntervalMs (timer via send_after, so other
 %%     messages do not postpone the sweep), and
-%%   - runs RecheckFun(Node) when a connected node (net_kernel:monitor_nodes)
-%%     passes the cluster peer check (brazier_cluster_ffi:await_verified/1):
-%%     revocations travel only between members, so that is when the ones
-%%     missed while apart can be caught up. Verified events already queued
-%%     are coalesced into one re-check;
+%%   - runs RecheckFun(Node) when Node and this node have verified each
+%%     other ({brazier_cluster_peer_mutual, Node}, see
+%%     brazier_cluster_ffi:subscribe_mutual/1): a revocation goes only from
+%%     a node that has verified the bound process's node, so once each side
+%%     has verified the other no further one is skipped, and the ones
+%%     skipped before (while apart, or while only one side had verified the
+%%     other) are caught up by this re-check of the local bindings. Notices
+%%     already queued are coalesced into one re-check;
 %% and exits when Owner (the process that created the store) exits.
 %% Unlinked so a crash never kills the owner; monitored so it never outlives
 %% the store. A crash inside either fun is logged and the loop continues:
 %% the funs log their own failures, so a crash here is a bug worth an error
 %% line, but stopping expiry for the life of the store would be worse.
+%%
+%% The subscription is made here, in the owner, before this returns: it
+%% survives cluster manager restarts, and a failure to make it (the node's
+%% ETS table owner is gone, see brazier_ets_ffi LOST TABLES) crashes the
+%% owner loudly instead of running a store whose revocations are never
+%% caught up.
+%%
+%% Residual window: pg replicates the bindings of each node to the others
+%% on its own schedule (pg sync on nodeup), apart from the peer check. A
+%% revocation sent after the mutual notice but before the sender's pg has
+%% learnt of a remote binding misses that binding, and no re-check follows.
+%% The transport's periodic auth re-check of every socket bounds it.
 start_maintenance(Owner, IntervalMs, SweepFun, RecheckFun)
         when is_integer(IntervalMs), IntervalMs > 0 ->
-    spawn(fun() ->
+    Pid = spawn(fun() ->
         Ref = erlang:monitor(process, Owner),
         ok = net_kernel:monitor_nodes(true),
         erlang:send_after(IntervalMs, self(), brazier_session_sweep),
         maintenance_loop(Ref, IntervalMs, SweepFun, RecheckFun)
-    end).
+    end),
+    case brazier_cluster_ffi:subscribe_mutual(Pid) of
+        {ok, nil} ->
+            Pid;
+        {error, Reason} ->
+            true = exit(Pid, kill),
+            brazier_log_ffi:error(<<"brazier.session">>,
+                                 "Session maintenance cannot subscribe to cluster membership: ~p",
+                                 [Reason]),
+            erlang:error({brazier_session_maintenance_not_subscribed, Reason})
+    end.
 
 maintenance_loop(Ref, IntervalMs, SweepFun, RecheckFun) ->
     receive
@@ -321,16 +346,17 @@ maintenance_loop(Ref, IntervalMs, SweepFun, RecheckFun) ->
             brazier_log_ffi:debug(<<"brazier.session">>,
                                  "Session store owner exited (~p); stopping maintenance",
                                  [Reason]),
+            nil = brazier_cluster_ffi:unsubscribe_mutual(self()),
             ok;
         brazier_session_sweep ->
             run_guarded(sweep, fun() -> SweepFun() end),
             erlang:send_after(IntervalMs, self(), brazier_session_sweep),
             maintenance_loop(Ref, IntervalMs, SweepFun, RecheckFun);
         {nodeup, Node} ->
-            await_member(Node),
+            warn_unmanaged(Node),
             maintenance_loop(Ref, IntervalMs, SweepFun, RecheckFun);
-        {brazier_cluster_peer_verified, Node} ->
-            Last = drain_verified(Node),
+        {brazier_cluster_peer_mutual, Node} ->
+            Last = drain_mutual(Node),
             run_guarded(recheck, fun() -> RecheckFun(Last) end),
             maintenance_loop(Ref, IntervalMs, SweepFun, RecheckFun);
         {nodedown, _Node} ->
@@ -343,23 +369,26 @@ maintenance_loop(Ref, IntervalMs, SweepFun, RecheckFun) ->
             maintenance_loop(Ref, IntervalMs, SweepFun, RecheckFun)
     end.
 
-await_member(Node) ->
-    case brazier_cluster_ffi:await_verified(Node) of
-        {ok, nil} ->
-            brazier_log_ffi:debug(<<"brazier.session">>,
-                                 "~p connected; re-checking bound sessions once it is verified",
-                                 [Node]);
-        {error, not_started} ->
+%% A connected node is re-checked for once it and this node have verified
+%% each other; without a cluster manager that never happens.
+warn_unmanaged(Node) ->
+    case whereis(brazier_cluster) of
+        undefined ->
             brazier_log_ffi:warning(<<"brazier.session">>,
                                    "~p connected, but no cluster manager runs here: revocations "
-                                   "are not exchanged with it and no re-check runs", [Node])
+                                   "are not exchanged with it and no re-check runs until one does",
+                                   [Node]);
+        _Manager ->
+            brazier_log_ffi:debug(<<"brazier.session">>,
+                                 "~p connected; re-checking bound sessions once it and this node "
+                                 "have verified each other", [Node])
     end.
 
-%% Take the verified events already in the mailbox; one re-check covers
+%% Take the mutual notices already in the mailbox; one re-check covers
 %% them all.
-drain_verified(Node) ->
+drain_mutual(Node) ->
     receive
-        {brazier_cluster_peer_verified, Next} -> drain_verified(Next)
+        {brazier_cluster_peer_mutual, Next} -> drain_mutual(Next)
     after 0 -> Node
     end.
 
