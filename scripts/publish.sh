@@ -16,6 +16,7 @@
 #   - (real publish only) neither HEXPM_API_KEY nor .hex_api_key holds a key;
 #   - (--release-tag only) the tag is not v<gleam.toml version>, or HEAD is
 #     not the commit it names.
+# and fails after `gleam publish` when Hex does not serve the release.
 #
 # --dry-run runs every check and builds the tarball, then stops. It never
 # contacts Hex. `gleam publish` has no dry-run flag of its own, so the dry run
@@ -24,9 +25,12 @@
 #
 # --release-tag is the publish from a GitHub release
 # (.github/workflows/publish.yml): it checks the tag against the version and
-# HEAD, then answers Gleam's confirmation prompts with --yes, since nobody is
-# at a terminal. Approving the workflow's `hex` environment is the
-# confirmation.
+# HEAD, then answers Gleam's confirmation prompts (--yes, and the 0.x
+# versioning prompt on stdin), since nobody is at a terminal. Approving the
+# workflow's `hex` environment is the confirmation.
+#
+# After `gleam publish`, the script refuses unless Hex serves the release:
+# Gleam exits 0 when a prompt's answer stops the publish.
 set -euo pipefail
 
 ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
@@ -138,9 +142,15 @@ fi
 
 if [ -n "$release_tag" ]; then
   release_step "publishing $name $version to Hex from the release $release_tag"
-  gleam publish --yes
+  case "$version" in
+    # --yes does not answer the prompt Gleam asks before publishing a 0.x
+    # version, which reads one line from stdin, so it is answered here.
+    0.*) printf '%s\n' 'I am not using semantic versioning' | gleam publish --yes ;;
+    *) gleam publish --yes ;;
+  esac
 else
   release_step "publishing $name $version to Hex; answer Gleam's prompts to confirm"
   gleam publish
 fi
-release_step "published $name $version from $head"
+release_require_on_hex "$name" "$version"
+release_step "published $name $version from $head; Hex serves it"

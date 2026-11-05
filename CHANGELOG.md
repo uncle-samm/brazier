@@ -23,10 +23,25 @@ which publishes to Hex after the `hex` environment is approved.
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-11-06
+
+0.1.1 was tagged and released on GitHub but never reached Hex (see Fixed).
+0.1.2 holds every change listed under 0.1.1, and is the first release
+published through a GitHub release (`.github/workflows/publish.yml`).
+
+### Fixed
+
+- `scripts/publish.sh --release-tag` publishes a 0.x version. `gleam publish
+  --yes` does not answer the prompt Gleam asks before publishing a version
+  below 1.0.0; it read the end of stdin, printed "Not publishing." and exited
+  0, and the script reported the release as published. The script now answers
+  that prompt, and after `gleam publish` it refuses unless Hex serves the
+  release.
+
 ## [0.1.1] - 2026-11-06
 
-The first release published through a GitHub release
-(`.github/workflows/publish.yml`).
+Not published to Hex: the publish workflow stopped at Gleam's 0.x prompt
+(see 0.1.2). Its changes are in 0.1.2.
 
 ### Fixed
 

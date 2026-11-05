@@ -98,3 +98,44 @@ release_require_changelog_heading() {
     release_refuse "CHANGELOG.md has no '## [$version]' heading for the gleam.toml version; move the [Unreleased] entries under one first"
   fi
 }
+
+# Refuses unless Hex serves the release NAME VERSION. `gleam publish` exits 0
+# when it does not publish (a prompt answered with anything else prints "Not
+# publishing."), so its exit status does not show that the release is on Hex.
+# A 404 is retried for a minute, the time a new release can take to appear in
+# the API; any other answer, or no answer, refuses at once.
+release_require_on_hex() {
+  local name="$1" version="$2"
+  if ! python3 -I - "$name" "$version" <<'PY'
+import sys
+import time
+import urllib.error
+import urllib.request
+
+name, version = sys.argv[1], sys.argv[2]
+url = "https://hex.pm/api/packages/%s/releases/%s" % (name, version)
+request = urllib.request.Request(
+    url, headers={"User-Agent": "brazier-release", "Accept": "application/json"}
+)
+attempts = 10
+for attempt in range(1, attempts + 1):
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            status = response.status
+    except urllib.error.HTTPError as error:
+        status = error.code
+    except urllib.error.URLError as error:
+        sys.exit("could not reach %s: %s" % (url, error.reason))
+    if status == 200:
+        sys.exit(0)
+    if status != 404:
+        sys.exit("%s answered HTTP %d" % (url, status))
+    print("release: %s answered 404 (attempt %d of %d)" % (url, attempt, attempts))
+    if attempt < attempts:
+        time.sleep(6)
+sys.exit("%s still answers 404" % url)
+PY
+  then
+    release_refuse "Hex does not serve $name $version, so it was not published"
+  fi
+}

@@ -1,5 +1,5 @@
 name = "brazier"
-version = "0.1.1"
+version = "0.1.2"
 description = "A full-stack Gleam web framework combining LiveView-style server rendering with type-safe routing and VDOM diffing on the BEAM."
 licences = ["MIT"]
 repository = { type = "github", user = "uncle-samm", repo = "brazier" }
