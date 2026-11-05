@@ -208,6 +208,7 @@ pub fn event_before_join_is_rejected_and_not_applied_test() {
     as "the join after a refused event did not get a model_sync at revision 0, ack 0"
   let assert True = string.contains(json, "\"count\":0")
     as "the event sent before join was applied to the model"
+  stop(rt, [s])
 }
 
 pub fn batch_before_join_is_rejected_test() {
@@ -223,6 +224,7 @@ pub fn batch_before_join_is_rejected_test() {
   let assert transport.SendError(reason: "event batch received before join") =
     next(s)
     as "a batch before join was not refused with 'event batch received before join'"
+  stop(rt, [s])
 }
 
 pub fn navigation_before_join_is_rejected_test() {
@@ -236,6 +238,7 @@ pub fn navigation_before_join_is_rejected_test() {
   let assert transport.SendError(reason: "navigation received before join") =
     next(s)
     as "a navigation before join was not refused with 'navigation received before join'"
+  stop(rt, [s])
   let assert Error(Nil) = process.receive(proof, 0)
     as "a navigation before join still ran the route handler"
 }
@@ -247,6 +250,7 @@ pub fn sync_before_join_is_rejected_test() {
   let assert transport.SendError(reason: "sync request received before join") =
     barrier(rt, "c", s)
     as "a sync request before join was not refused with 'sync request received before join'"
+  stop(rt, [s])
 }
 
 pub fn join_from_unregistered_connection_does_not_join_test() {
@@ -257,6 +261,7 @@ pub fn join_from_unregistered_connection_does_not_join_test() {
   event(rt, "ghost", "inc", 1)
   let assert transport.SendError(reason: "event received before join") = next(s)
     as "a join sent before the connection registered left it joined"
+  stop(rt, [s])
 }
 
 pub fn reregistered_connection_must_join_again_test() {
@@ -270,7 +275,7 @@ pub fn reregistered_connection_must_join_again_test() {
   let assert transport.SendError(reason: "event received before join") =
     next(s2)
     as "a re-registered connection kept the old registration's join"
-  assert_nothing_pending(s1)
+  stop(rt, [s1, s2])
 }
 
 // --- rejoin ---
@@ -329,6 +334,7 @@ pub fn rejoin_is_full_resync_and_never_resets_state_test() {
   event(rt, "c", "inc", 3)
   let assert transport.SendPatch(version: 3, ack_clock: 3, ..) = next(s)
     as "an inc after the rejoin did not patch to revision 3, ack 3"
+  stop(rt, [s])
 }
 
 // --- versioning ---
@@ -365,6 +371,7 @@ pub fn unchanged_event_sends_ack_only_patch_test() {
     streams_json: "[]",
   ) = next(s)
     as "the noop after the inc was not an empty ack patch at revision 1, ack 3"
+  stop(rt, [s])
 }
 
 pub fn decode_failure_reports_error_then_acks_test() {
@@ -385,6 +392,7 @@ pub fn decode_failure_reports_error_then_acks_test() {
     streams_json: "[]",
   ) = next(s)
     as "the undecodable event was not acked with an empty patch at revision 0, ack 4"
+  stop(rt, [s])
 }
 
 pub fn non_monotonic_clock_never_lowers_ack_test() {
@@ -399,6 +407,7 @@ pub fn non_monotonic_clock_never_lowers_ack_test() {
   event(rt, "c", "inc", 3)
   let assert transport.SendPatch(version: 2, ack_clock: 5, ..) = next(s)
     as "the clock-3 inc lowered the ack below 5 or missed revision 2"
+  stop(rt, [s])
 }
 
 pub fn revision_is_shared_and_acks_are_per_connection_test() {
@@ -447,6 +456,7 @@ pub fn revision_is_shared_and_acks_are_per_connection_test() {
   let assert transport.SendModelSync(version: 2, ack_clock: 5, ..) =
     barrier(rt, "a", a)
     as "b's noop ack reached a, or a's barrier was not at revision 2, ack 5"
+  stop(rt, [a, b])
 }
 
 pub fn navigation_bumps_revision_only_when_model_changes_test() {
@@ -499,6 +509,9 @@ pub fn navigation_bumps_revision_only_when_model_changes_test() {
     as "the same-route navigation sent a a patch or moved the revision"
   let assert transport.SendModelSync(version: 1, ..) = barrier(rt, "b", b)
     as "the same-route navigation sent b a patch or moved the revision"
+  stop(rt, [a, b])
+  let assert Error(Nil) = process.receive(proof, 0)
+    as "a route handler ran that the test did not cause"
 }
 
 pub fn join_does_not_rerun_route_handlers_for_same_route_test() {
@@ -534,6 +547,9 @@ pub fn join_does_not_rerun_route_handlers_for_same_route_test() {
     as "c's join on /a did not patch a to revision 1"
   let assert transport.SendPatch(version: 1, ..) = next(b)
     as "c's join on /a did not patch b to revision 1"
+  stop(rt, [a, b, c])
+  let assert Error(Nil) = process.receive(proof, 0)
+    as "a route handler ran that the test did not cause"
 }
 
 // --- model size limit ---
@@ -588,6 +604,7 @@ pub fn model_over_limit_fails_loudly_and_resyncs_after_shrinking_test() {
     as "the resync after shrinking does not carry the empty blob"
   let assert transport.SendModelSync(version: 1, ack_clock: 0, ..) = next(late)
     as "shrinking the model did not resync the late joiner at revision 1, ack 0"
+  stop(rt, [s, late])
 }
 
 // --- batches ---
@@ -618,6 +635,7 @@ pub fn batch_with_failing_last_event_still_broadcasts_test() {
     as "the batch's good event was not broadcast at revision 1, ack 2"
   let assert True = string.contains(ops, "/count")
     as "the batch patch does not touch /count"
+  stop(rt, [s])
 }
 
 pub fn unchanged_batch_sends_ack_only_patch_test() {
@@ -640,6 +658,7 @@ pub fn unchanged_batch_sends_ack_only_patch_test() {
     streams_json: "[]",
   ) = next(s)
     as "an all-noop batch was not one empty ack patch at revision 0, ack 3"
+  stop(rt, [s])
 }
 
 pub fn empty_batch_sends_nothing_test() {
@@ -651,6 +670,7 @@ pub fn empty_batch_sends_nothing_test() {
   process.send(rt, runtime.ClientEventBatchReceived(conn_id: "c", events: []))
   let assert transport.SendModelSync(version: 0, ..) = barrier(rt, "c", s)
     as "an empty batch sent a frame before the barrier or moved the revision"
+  stop(rt, [s])
 }
 
 // --- disconnect ---
@@ -687,7 +707,7 @@ pub fn disconnect_removes_connection_from_broadcasts_test() {
     as "the joiner after everyone left did not get revision 1, ack 0"
   let assert True = string.contains(json, "\"count\":2")
     as "the update made while nobody was joined is missing from the model"
-  assert_nothing_pending(b)
+  stop(rt, [a, b, c])
 }
 
 // --- dynamic subscriptions ---
