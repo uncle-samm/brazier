@@ -77,11 +77,11 @@
     `test/brazier_dir_test_ffi.erl`,
     `docs/design/OTP_LIST_DIR_HANG.md`, `docs/design/OTP_SECURITY_REPORT.md`
   - **Attempted:** the upstream report (repro, observed vs expected, source
-    lines, and a one-line fix tested on 29.1.2) is drafted in
-    `docs/design/OTP_SECURITY_REPORT.md` as a private security report (a heap
-    use-after-free reachable from a file name). It is not sent: OTP takes
-    reports only from humans, so the maintainer reviews it and sends it to
-    erlang-security@erlang.org. When an OTP release has the fix, the
+    lines, and a one-line fix tested on 29.1.2) is in
+    `docs/design/OTP_SECURITY_REPORT.md`, a private security report (a heap
+    use-after-free reachable from a file name). OTP takes reports only from
+    humans, so the maintainer reviewed it and sent it to the OTP security
+    team on 2026-11-05; no answer yet. When an OTP release has the fix, the
     tripwires fail, and the find-based listing can be revisited for that
     release.
 

@@ -6,11 +6,12 @@ one never returns. The bug, its repro, cause and a tested one-line fix are
 in [OTP_SECURITY_REPORT.md](OTP_SECURITY_REPORT.md), the text to send to
 OTP. This file is what Brazier does while the bug stays open upstream.
 
-**Status:** the report is not sent. It is a heap use-after-free reachable
-from a file name, so it goes to the private channel in OTP's `SECURITY.md`,
-not a public issue. OTP accepts reports only from humans (AI may help write
-one, but the reporter must review it and send it), so Sam reviews and sends
-it. The open issue is tracked in [docs/TODO.md](../TODO.md#open-issues).
+**Status:** Sam sent the report to the OTP security team on 2026-11-05. It
+is a heap use-after-free reachable from a file name, so it went to the
+private channel in OTP's `SECURITY.md`, not a public issue. OTP accepts
+reports only from humans (AI may help write one, but the reporter must
+review it and send it), so Sam reviewed and sent it. No answer yet. The open
+issue is tracked in [docs/TODO.md](../TODO.md#open-issues).
 
 Checked on 2026-11-05 before drafting: no issue, pull request or advisory
 in erlang/otp mentions `cleanup_norm` or this hang; the last change to
