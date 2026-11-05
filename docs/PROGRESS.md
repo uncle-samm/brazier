@@ -826,6 +826,12 @@
     - [ ] Stream errors during init are only logged, since no connection exists yet; decide whether the first join must carry them.
     - [ ] `http_fuzz_test` flaked with MailboxResidue on its branch (it still uses `await.until_telemetry`; see the residue follow-up above).
   - Open from streams-client: a gleam test should run `stream_vectors.mjs` (today only `make test-client` does).
+- [ ] Phase B, second round (started 2026-11-05 at e747080, disjoint files):
+  - m118-backpressure: L453 runtime level, L605, L607, and the streams runtime follow-ups (later joiner's route, init stream errors, the `FrameTooLarge` test);
+  - m118-residue2: the `until_telemetry` residue and the last four `residue_pending` modules;
+  - m118-streams-build: the streams build/SSR follow-ups, the `stream_vectors.mjs` gleam test, the `[brazier, store, synced]` event and `store.synced`, the `log_path.describe` cap;
+  - m118-client: streams step 7 (`examples/timeline`, its CDP checks, benches, `docs/STREAMS.md`), L83, L606.
+  Left for after them: the perf items L637–643, then the re-baseline on an idle machine.
 - Decision, 2026-11-05: 4401 stays shared by an `init` 401 and a revoked or expired session. Both mean "authentication is no longer valid; reload" to the client. The server tells them apart by a distinct cause in the close's log line and telemetry metadata. m118-logs builds it.
 - Decision, 2026-11-05: m118-logs reproduced L453. Both problems are in the runtime's send paths:
   - `message_queue_len` returns an invented 1000000000 for a dead pid, so a dead connection is reported as slow on every broadcast;
