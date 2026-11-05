@@ -951,7 +951,9 @@ for the model, writes the event contract to `build/brazier_contract.json`, and
 compiles the client code to a content-hashed bundle like
 `priv/static/brazier_client_HASH.js`. When more than one module could be the
 app, name it: `gleam run -m brazier/build -- src/my_app.gleam`. It needs
-`node` and `npx`.
+`node` and `npx`. The client's packages are the versions your app's
+`manifest.toml` locks, never resolved again from Hex, so keep that file in
+version control.
 
 Client code is what `view`, a Local layer and a `simple` app's `update`
 reach, and the types they use, `Msg` and the Model included. It may use any

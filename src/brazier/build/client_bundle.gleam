@@ -16,7 +16,12 @@
 ///   `brazier_client/*.mjs` modules.
 /// - `src/brazier_app_entry.gleam`, the interface the runtime calls.
 /// - `gleam.toml`, pinning every package the sources import to the exact
-///   version in the app's `manifest.toml`.
+///   version in the app's `manifest.toml`, and a `manifest.toml` copied
+///   from the app's entries for those packages. With the lock in place,
+///   `gleam build` uses it as it is: it resolves nothing, so it never asks
+///   Hex for versions, and every build of one app uses the same packages.
+///   Packages it has not unpacked yet come from Gleam's package cache, where
+///   the app's own download put them, checked against the locked checksum.
 ///
 /// The project is compiled with `gleam build` and bundled with the pinned
 /// esbuild. Every step's failure stops the build; no bundle is written until
@@ -61,7 +66,7 @@ pub type Bundle {
 }
 
 /// One file of the client project: #(path relative to the project, contents).
-type ProjectFile =
+pub type ProjectFile =
   #(String, String)
 
 /// Build the client bundle of `app` in the app project at `project`, whose
@@ -86,9 +91,14 @@ pub fn build(
     runtime_dir,
     analysis,
   ))
-  use dependencies <- result.try(dependencies(project, project_files))
+  use packages <- result.try(pin_dependencies(project, project_files))
   let dir = files.join(project, client_dir)
-  use Nil <- result.try(write_project(dir, project_files, dependencies))
+  use Nil <- result.try(write_project(
+    dir,
+    project_files,
+    app_manifest(project),
+    packages,
+  ))
   use Nil <- result.try(program.gleam_build(dir))
   use Nil <- result.try(files.write(files.join(dir, "bundle_entry.mjs"), entry))
   use Nil <- result.try(program.esbuild_bundle(
@@ -292,13 +302,20 @@ fn unique_paths(project_files: List(ProjectFile)) -> Result(Nil, String) {
   }
 }
 
-/// The `[dependencies]` lines of the client project: every package that
-/// provides a module the project's Gleam sources import, and everything
-/// those packages need, pinned to the version in the app's manifest.
-fn dependencies(
+/// The packages the client project depends on: every package that provides
+/// a module the project's Gleam sources import, and everything those
+/// packages need, as the app's `manifest.toml` locks them. A local
+/// package's path is made relative to the client project.
+///
+/// The client project's lock is derived from the app's, never resolved on
+/// its own, so `gleam build` there never asks Hex for versions and two
+/// builds of one app use the same packages. A missing app manifest, or one
+/// that disagrees with the packages Gleam downloaded for the app, is an
+/// error; nothing is resolved afresh.
+pub fn pin_dependencies(
   project: String,
   project_files: List(ProjectFile),
-) -> Result(List(String), String) {
+) -> Result(List(LockedPackage), String) {
   let gleam_files =
     list.filter(project_files, fn(f) { string.ends_with(f.0, ".gleam") })
   let own_modules =
@@ -309,8 +326,8 @@ fn dependencies(
     |> set.from_list
   use imported <- result.try(imported_modules(gleam_files))
   let external = set.difference(imported, own_modules) |> set.to_list
-  let manifest_path = files.join(project, "manifest.toml")
-  use manifest <- result.try(project_toml.read_manifest(manifest_path))
+  let manifest_path = app_manifest(project)
+  use manifest <- result.try(read_app_manifest(manifest_path))
   use providers <- result.try(
     list.try_map(external, fn(module) { provider(project, manifest, module) }),
   )
@@ -318,11 +335,145 @@ fn dependencies(
     manifest,
     list.unique(providers),
   ))
-  list.try_map(packages, fn(package) {
-    project_toml.pinned_dependency_line(package, fn(path) {
-      program.absolute_path(files.join(project, path))
+  use Nil <- result.try(check_downloaded(project, packages))
+  use client <- result.try(
+    program.absolute_path(files.join(project, client_dir)),
+  )
+  use packages <- result.try(
+    list.try_map(packages, fn(package) { relocate(project, client, package) }),
+  )
+  log.debug(
+    "brazier.build.client_bundle",
+    "Pinning the client project to the lock in "
+      <> manifest_path
+      <> ", with no version resolution: "
+      <> string.join(list.map(packages, describe_pin), ", "),
+  )
+  Ok(packages)
+}
+
+/// The app's lock file.
+fn app_manifest(project: String) -> String {
+  files.join(project, "manifest.toml")
+}
+
+fn read_app_manifest(
+  path: String,
+) -> Result(Dict(String, LockedPackage), String) {
+  use exists <- result.try(files.is_file(path))
+  case exists {
+    True -> project_toml.read_manifest(path)
+    False -> {
+      log.error(
+        "brazier.build.client_bundle",
+        "No app lock file at " <> path <> "; refusing to resolve from Hex",
+      )
+      Error(
+        path
+        <> " does not exist. The client bundle's packages are pinned to the app's lock file, never resolved from Hex. Run `gleam build` in the app so Gleam writes it, then build again.",
+      )
+    }
+  }
+}
+
+/// Every Hex package in `packages` must be the version Gleam downloaded for
+/// the app (`build/packages/packages.toml`): the modules each package
+/// provides were read from those sources, and the client project pins the
+/// manifest's version. A difference means the lock and the downloads
+/// disagree.
+fn check_downloaded(
+  project: String,
+  packages: List(LockedPackage),
+) -> Result(Nil, String) {
+  let hex =
+    list.filter(packages, fn(package) {
+      case package.source {
+        project_toml.HexSource(..) -> True
+        project_toml.LocalSource(..) | project_toml.GitSource(..) -> False
+      }
     })
-  })
+  case hex {
+    [] -> Ok(Nil)
+    _ -> {
+      let path = files.join(project, "build/packages/packages.toml")
+      use exists <- result.try(files.is_file(path))
+      use downloaded <- result.try(case exists {
+        True -> project_toml.read_downloaded(path)
+        False -> {
+          log.error(
+            "brazier.build.client_bundle",
+            "No download record at " <> path <> "; cannot check the app lock",
+          )
+          Error(
+            path
+            <> " does not exist, so the app's packages were never downloaded. Run `gleam deps download` in the app, then build again.",
+          )
+        }
+      })
+      list.try_each(hex, fn(package) {
+        case dict.get(downloaded, package.name) {
+          Ok(version) if version == package.version -> Ok(Nil)
+          found -> {
+            let held = case found {
+              Ok(version) -> "holds " <> package.name <> " " <> version
+              Error(Nil) -> "does not hold " <> package.name
+            }
+            log.error(
+              "brazier.build.client_bundle",
+              "App lock and downloads disagree on " <> package.name,
+            )
+            Error(
+              app_manifest(project)
+              <> " locks "
+              <> package.name
+              <> " "
+              <> package.version
+              <> ", but "
+              <> files.join(project, "build/packages")
+              <> " "
+              <> held
+              <> " ("
+              <> path
+              <> "). Run `gleam deps download` in the app so the downloads match the lock, then build again.",
+            )
+          }
+        }
+      })
+    }
+  }
+}
+
+/// `package` with a local path made relative to the client project at the
+/// absolute path `client`, the form Gleam writes in a manifest.
+fn relocate(
+  project: String,
+  client: String,
+  package: LockedPackage,
+) -> Result(LockedPackage, String) {
+  case package.source {
+    project_toml.LocalSource(path:) -> {
+      use absolute <- result.try(
+        program.absolute_path(files.resolve(project, path)),
+      )
+      use relative <- result.map(files.relative_path(client, absolute))
+      project_toml.LockedPackage(
+        ..package,
+        source: project_toml.LocalSource(relative),
+      )
+    }
+    project_toml.HexSource(..) | project_toml.GitSource(..) -> Ok(package)
+  }
+}
+
+fn describe_pin(package: LockedPackage) -> String {
+  package.name
+  <> " "
+  <> package.version
+  <> case package.source {
+    project_toml.HexSource(..) -> " (hex)"
+    project_toml.LocalSource(path:) -> " (path " <> path <> ")"
+    project_toml.GitSource(repo:, ..) -> " (git " <> repo <> ")"
+  }
 }
 
 fn imported_modules(
@@ -383,19 +534,30 @@ fn provider(
 
 fn package_dir(project: String, package: LockedPackage) -> String {
   case package.source {
-    project_toml.LocalSource(path:) -> files.join(project, path)
-    project_toml.HexSource | project_toml.GitSource(..) ->
+    project_toml.LocalSource(path:) -> files.resolve(project, path)
+    project_toml.HexSource(..) | project_toml.GitSource(..) ->
       files.join(project, "build/packages/" <> package.name)
   }
 }
 
-/// Replace the project's sources and `gleam.toml`. The project's own
+/// Replace the client project at `dir`: its sources, its `gleam.toml`
+/// pinning `packages` (from `pin_dependencies`) and its `manifest.toml`
+/// locking them as the app's lock at `app_manifest` does. The project's own
 /// `build` directory is kept so unchanged packages are not recompiled.
-fn write_project(
+pub fn write_project(
   dir: String,
   project_files: List(ProjectFile),
-  dependencies: List(String),
+  app_manifest: String,
+  packages: List(LockedPackage),
 ) -> Result(Nil, String) {
+  use lines <- result.try(list.try_map(
+    packages,
+    project_toml.pinned_dependency_line,
+  ))
+  use manifest <- result.try(project_toml.client_manifest(
+    app_manifest,
+    packages,
+  ))
   use Nil <- result.try(files.delete_if_exists(files.join(dir, "src")))
   use Nil <- result.try(
     list.try_each(project_files, fn(file) {
@@ -404,9 +566,9 @@ fn write_project(
   )
   let toml =
     "name = \"brazier_client_app\"\nversion = \"0.1.0\"\ntarget = \"javascript\"\n\n[dependencies]\n"
-    <> string.join(dependencies, "\n")
-    <> "\n"
+    <> string.concat(list.map(lines, fn(line) { line <> "\n" }))
   use Nil <- result.try(files.write(files.join(dir, "gleam.toml"), toml))
+  use Nil <- result.try(files.write(files.join(dir, "manifest.toml"), manifest))
   log.info(
     "brazier.build.client_bundle",
     "Wrote client project "
@@ -414,8 +576,9 @@ fn write_project(
       <> " with "
       <> string.inspect(list.length(project_files))
       <> " files and "
-      <> string.inspect(list.length(dependencies))
-      <> " pinned dependencies",
+      <> string.inspect(list.length(packages))
+      <> " dependencies locked to "
+      <> app_manifest,
   )
   Ok(Nil)
 }

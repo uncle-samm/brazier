@@ -2,11 +2,14 @@
 ///
 /// The build needs three facts from these files: the project name, where the
 /// Brazier sources live, and the exact package versions the app is locked to so
-/// the generated client project uses the same ones. Every malformed or missing
-/// value is an error naming the file and key; nothing is guessed.
+/// the generated client project uses the same ones. It also renders that
+/// client project's `gleam.toml` pins and `manifest.toml` from the app's lock.
+/// Every malformed or missing value is an error naming the file and key;
+/// nothing is guessed.
 import brazier/log
 import gleam/dict.{type Dict}
 import gleam/list
+import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
 import simplifile
@@ -29,7 +32,10 @@ pub type ProjectConfig {
 
 /// Where a locked package came from.
 pub type PackageSource {
-  HexSource
+  /// A Hex package. `outer_checksum` is the SHA-256 of its tarball, which
+  /// Gleam checks when it unpacks the package.
+  HexSource(outer_checksum: String)
+  /// A path dependency, relative to the project that holds the manifest.
   LocalSource(path: String)
   GitSource(repo: String, commit: String)
 }
@@ -39,7 +45,10 @@ pub type LockedPackage {
   LockedPackage(
     name: String,
     version: String,
+    build_tools: List(String),
     requirements: List(String),
+    /// The OTP application name. Gleam writes it for Hex packages only.
+    otp_app: Option(String),
     source: PackageSource,
   )
 }
@@ -159,21 +168,38 @@ fn parse_package(
     tom.get_string(table, [key])
     |> result.map_error(fn(err) { context <> ": " <> describe_get_error(err) })
   }
+  let string_array_field = fn(key) {
+    case tom.get_array(table, [key]) {
+      Ok(items) ->
+        list.try_map(items, fn(item) {
+          case item {
+            tom.String(value) -> Ok(value)
+            _ -> Error(context <> ": " <> key <> " must be strings")
+          }
+        })
+      Error(err) -> Error(context <> ": " <> describe_get_error(err))
+    }
+  }
   use name <- result.try(string_field("name"))
   use version <- result.try(string_field("version"))
   use source_kind <- result.try(string_field("source"))
-  use requirements <- result.try(case tom.get_array(table, ["requirements"]) {
-    Ok(items) ->
-      list.try_map(items, fn(item) {
-        case item {
-          tom.String(requirement) -> Ok(requirement)
-          _ -> Error(context <> ": requirements must be strings")
-        }
-      })
+  use build_tools <- result.try(string_array_field("build_tools"))
+  use requirements <- result.try(string_array_field("requirements"))
+  use otp_app <- result.try(case tom.get_string(table, ["otp_app"]) {
+    Ok(otp_app) -> Ok(Some(otp_app))
+    Error(tom.NotFound(_)) -> Ok(None)
     Error(err) -> Error(context <> ": " <> describe_get_error(err))
   })
   use source <- result.try(case source_kind {
-    "hex" -> Ok(HexSource)
+    "hex" ->
+      string_field("outer_checksum")
+      |> result.map(HexSource)
+      |> result.map_error(fn(reason) {
+        reason
+        <> ". Gleam writes the checksum of every Hex package; without it the lock cannot be verified. Delete "
+        <> path
+        <> " and run `gleam deps download` to rewrite it."
+      })
     "local" -> result.map(string_field("path"), LocalSource)
     "git" -> {
       use repo <- result.try(string_field("repo"))
@@ -182,7 +208,45 @@ fn parse_package(
     }
     other -> Error(context <> ": unknown source " <> string.inspect(other))
   })
-  Ok(LockedPackage(name:, version:, requirements:, source:))
+  Ok(LockedPackage(
+    name:,
+    version:,
+    build_tools:,
+    requirements:,
+    otp_app:,
+    source:,
+  ))
+}
+
+/// Read Gleam's record of the packages it downloaded,
+/// `build/packages/packages.toml`: package name to version. Gleam writes it
+/// after every download, so it says which version of each Hex package the
+/// sources in `build/packages` are.
+pub fn read_downloaded(path: String) -> Result(Dict(String, String), String) {
+  use text <- result.try(read_file(path))
+  parse_downloaded(path, text)
+}
+
+/// Parse `build/packages/packages.toml` contents. `path` is used only in
+/// error messages.
+pub fn parse_downloaded(
+  path: String,
+  text: String,
+) -> Result(Dict(String, String), String) {
+  use doc <- result.try(parse_toml(path, text))
+  use table <- result.try(
+    tom.get_table(doc, ["packages"]) |> result.map_error(get_error(path, _)),
+  )
+  table
+  |> dict.to_list
+  |> list.try_map(fn(entry) {
+    case entry.1 {
+      tom.String(version) -> Ok(#(entry.0, version))
+      _ ->
+        Error(path <> ": packages." <> entry.0 <> " must be a version string")
+    }
+  })
+  |> result.map(dict.from_list)
 }
 
 /// Find the directory holding Brazier's own sources for the project whose
@@ -292,66 +356,150 @@ pub fn locked_closure(
   manifest: Dict(String, LockedPackage),
   names: List(String),
 ) -> Result(List(LockedPackage), String) {
-  use found <- result.try(walk_closure(manifest, names, dict.new()))
+  let pending = list.map(names, fn(name) { #(name, None) })
+  use found <- result.try(walk_closure(manifest, pending, dict.new()))
   found
   |> dict.values
   |> list.sort(fn(a, b) { string.compare(a.name, b.name) })
   |> Ok
 }
 
+/// `pending` holds each package still to visit and the locked package that
+/// requires it (`None` for a root).
 fn walk_closure(
   manifest: Dict(String, LockedPackage),
-  pending: List(String),
+  pending: List(#(String, Option(String))),
   found: Dict(String, LockedPackage),
 ) -> Result(Dict(String, LockedPackage), String) {
   case pending {
     [] -> Ok(found)
-    [name, ..rest] ->
+    [#(name, required_by), ..rest] ->
       case dict.has_key(found, name) {
         True -> walk_closure(manifest, rest, found)
         False ->
-          case dict.get(manifest, name) {
-            Ok(package) ->
+          case dict.get(manifest, name), required_by {
+            Ok(package), _ ->
               walk_closure(
                 manifest,
-                list.append(package.requirements, rest),
+                list.append(
+                  list.map(package.requirements, fn(requirement) {
+                    #(requirement, Some(name))
+                  }),
+                  rest,
+                ),
                 dict.insert(found, name, package),
               )
-            Error(Nil) ->
+            Error(Nil), None ->
               Error(
                 "Package `"
                 <> name
                 <> "` is needed by the client bundle but is not locked in manifest.toml. Add it to gleam.toml and run `gleam deps download`.",
+              )
+            Error(Nil), Some(parent) ->
+              Error(
+                "manifest.toml is inconsistent: the locked package `"
+                <> parent
+                <> "` requires `"
+                <> name
+                <> "`, which has no entry of its own. Delete manifest.toml and run `gleam deps download` to rewrite it.",
               )
           }
       }
   }
 }
 
-/// Render the `[dependencies]` entry that pins a locked package exactly.
-/// Local packages keep their path (made absolute by the caller); git
+/// Render the `[dependencies]` entry of the client project's `gleam.toml`
+/// that pins a locked package exactly. A local package's path is used as
+/// given, so the caller makes it relative to the client project first. Git
 /// packages are rejected because the client project cannot reproduce the
 /// lock for them.
 pub fn pinned_dependency_line(
   package: LockedPackage,
-  local_path: fn(String) -> Result(String, String),
 ) -> Result(String, String) {
+  use requirement <- result.map(pinned_requirement(package))
+  package.name <> " = " <> requirement
+}
+
+/// The requirement that pins `package`: `"== 1.2.3"` for Hex, an inline
+/// `{ path = ... }` table for a local package.
+fn pinned_requirement(package: LockedPackage) -> Result(String, String) {
   case package.source {
-    HexSource ->
-      Ok(package.name <> " = " <> toml_string("== " <> package.version))
-    LocalSource(path:) -> {
-      use resolved <- result.map(local_path(path))
-      package.name <> " = { path = " <> toml_string(resolved) <> " }"
-    }
-    GitSource(repo:, ..) ->
-      Error(
-        "Package `"
-        <> package.name
-        <> "` comes from git ("
-        <> repo
-        <> "). Client bundles support Hex and path dependencies only.",
-      )
+    HexSource(..) -> Ok(toml_string("== " <> package.version))
+    LocalSource(path:) -> Ok("{ path = " <> toml_string(path) <> " }")
+    GitSource(repo:, ..) -> git_unsupported(package.name, repo)
   }
+}
+
+fn git_unsupported(name: String, repo: String) -> Result(a, String) {
+  Error(
+    "Package `"
+    <> name
+    <> "` comes from git ("
+    <> repo
+    <> "). Client bundles support Hex and path dependencies only.",
+  )
+}
+
+/// Render the client project's `manifest.toml` from the locked `packages`
+/// the client's `gleam.toml` pins (see `pinned_dependency_line`), copied
+/// from the app's lock file at `source`. The `[requirements]` table states
+/// exactly what that `gleam.toml` declares, so Gleam finds the manifest up
+/// to date and uses it without resolving versions, which needs Hex. Local
+/// paths are used as given, relative to the client project.
+pub fn client_manifest(
+  source: String,
+  packages: List(LockedPackage),
+) -> Result(String, String) {
+  let packages =
+    list.sort(packages, fn(a, b) { string.compare(a.name, b.name) })
+  use entries <- result.try(list.try_map(packages, manifest_entry))
+  use requirements <- result.try(
+    list.try_map(packages, fn(package) {
+      use requirement <- result.map(pinned_requirement(package))
+      let requirement = case package.source {
+        HexSource(..) -> "{ version = " <> requirement <> " }"
+        LocalSource(..) | GitSource(..) -> requirement
+      }
+      package.name <> " = " <> requirement
+    }),
+  )
+  Ok(
+    "# Generated by the Brazier build from "
+    <> source
+    <> ".\n# Every build rewrites it. It pins the client project to the app's lock,\n# so `gleam build` here never resolves versions from Hex.\n\npackages = [\n"
+    <> string.concat(list.map(entries, fn(entry) { "  " <> entry <> ",\n" }))
+    <> "]\n\n[requirements]\n"
+    <> string.concat(list.map(requirements, fn(line) { line <> "\n" })),
+  )
+}
+
+/// One `packages` entry, in the order and format Gleam writes it.
+fn manifest_entry(package: LockedPackage) -> Result(String, String) {
+  let strings = fn(values) {
+    "[" <> string.join(list.map(values, toml_string), ", ") <> "]"
+  }
+  use source <- result.map(case package.source {
+    HexSource(outer_checksum:) ->
+      Ok("source = \"hex\", outer_checksum = " <> toml_string(outer_checksum))
+    LocalSource(path:) -> Ok("source = \"local\", path = " <> toml_string(path))
+    GitSource(repo:, ..) -> git_unsupported(package.name, repo)
+  })
+  let otp_app = case package.otp_app {
+    Some(otp_app) -> ", otp_app = " <> toml_string(otp_app)
+    None -> ""
+  }
+  "{ name = "
+  <> toml_string(package.name)
+  <> ", version = "
+  <> toml_string(package.version)
+  <> ", build_tools = "
+  <> strings(package.build_tools)
+  <> ", requirements = "
+  <> strings(package.requirements)
+  <> otp_app
+  <> ", "
+  <> source
+  <> " }"
 }
 
 /// Quote a value as a TOML basic string.

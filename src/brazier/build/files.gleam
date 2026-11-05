@@ -112,6 +112,61 @@ pub fn join(base: String, child: String) -> String {
   }
 }
 
+/// `path` resolved against `base`: an absolute `path` as it is, a relative
+/// one joined to `base`.
+pub fn resolve(base: String, path: String) -> String {
+  case string.starts_with(path, "/") {
+    True -> path
+    False -> join(base, path)
+  }
+}
+
+/// The relative path from the directory `from` to `to`, both absolute:
+/// `relative_path("/a/b/c", "/a/d")` is `../../d`. Both are normalised
+/// lexically first (`.` dropped, `..` removed with the segment before it),
+/// so the result is only as right as the paths are free of symlinked `..`.
+/// A path that is not absolute, or a `..` above `/`, is an `Error`.
+pub fn relative_path(from: String, to: String) -> Result(String, String) {
+  use from_segments <- result.try(absolute_segments(from))
+  use to_segments <- result.try(absolute_segments(to))
+  let #(up, down) = drop_common_prefix(from_segments, to_segments)
+  case list.append(list.map(up, fn(_) { ".." }), down) {
+    [] -> Ok(".")
+    segments -> Ok(string.join(segments, "/"))
+  }
+}
+
+fn absolute_segments(path: String) -> Result(List(String), String) {
+  case string.starts_with(path, "/") {
+    False ->
+      Error(
+        "Cannot compute a relative path from " <> path <> ": it is not absolute",
+      )
+    True ->
+      path
+      |> string.split("/")
+      |> list.try_fold([], fn(reversed, segment) {
+        case segment, reversed {
+          "", _ | ".", _ -> Ok(reversed)
+          "..", [_, ..rest] -> Ok(rest)
+          "..", [] -> Error("The path " <> path <> " climbs above /")
+          _, _ -> Ok([segment, ..reversed])
+        }
+      })
+      |> result.map(list.reverse)
+  }
+}
+
+fn drop_common_prefix(
+  a: List(String),
+  b: List(String),
+) -> #(List(String), List(String)) {
+  case a, b {
+    [x, ..a_rest], [y, ..b_rest] if x == y -> drop_common_prefix(a_rest, b_rest)
+    _, _ -> #(a, b)
+  }
+}
+
 fn ensure_parent(path: String) -> Result(Nil, String) {
   create_directory(parent(path))
 }
