@@ -439,6 +439,15 @@ open follow-ups), which is in progress.
 
 ### Changed
 
+- (M118 server-residue-2) The Origin check parses an origin by hand
+  instead of compiling a split pattern on every call: about 9 µs to about
+  1.5 µs per WebSocket upgrade.
+- (M118 server-residue-2) A listener removed from its parent with
+  `supervisor:terminate_child` and `delete_child` must be released with
+  `server.release`, as Ranch's `stop_listener` cleans up explicitly: the
+  parent may restart a terminated child, which rebinds its first port, and
+  a delete sends no signal. Until then its entries stay, until the parent
+  exits (docs/ARCHITECTURE.md).
 - (M118 client-decode) Generated codecs decode through
   `brazier/internal/wire_decode`, which stops at the first error and builds
   its path only on failure, on the server and in the browser. The browser
@@ -787,6 +796,13 @@ open follow-ups), which is in progress.
   has a keeper that monitors the processes able to restart or release it
   (as `ranch_server` monitors listener supervisors) and erases the entries,
   with a log line, when the last one exits.
+- (M118 server-residue-2) `server.start` on a taken or privileged port
+  returned gleam_otp's "shutdown" and killed a caller that did not trap
+  exits. The listener's supervisor (`brazier_http_listener_sup.erl`) now
+  starts empty and adds its children one by one, as Ranch's
+  `start_listener` does, so a failure returns its cause
+  (`cannot listen on port N: eaddrinuse (address already in use)`) and
+  kills no caller; `server.supervised` fails with `InitFailed` naming it.
 
 - (M118 backpressure) A dead connection read as 1000000000 queued
   messages, and a slow one was closed again, with another warning, on
@@ -1078,6 +1094,13 @@ open follow-ups), which is in progress.
 
 ### Security
 
+- (M118 server-residue-2) Protocol text (header names, `Connection` and
+  `Upgrade` tokens, schemes, cookie names, media types, digests, file
+  extensions) is compared with ASCII-only case folding
+  (`brazier/internal/ascii`). Unicode folding made the Kelvin sign U+212A
+  equal `k`, so `Upgrade: websocKet` passed the WebSocket check. An upload
+  part header name that is not a token is refused with a `ParseError`, as
+  the request parser already refused one.
 - (M118 server-residue) Host and Origin validation refuse a non-ASCII host,
   and control characters, space or DEL in an authority, by name.
 - (Final audit SEC-4) A client behind a trusted proxy could name its own

@@ -9,6 +9,7 @@
 import brazier/config as app_env
 import brazier/cookie
 import brazier/error
+import brazier/internal/ascii
 import brazier/internal/local_path
 import brazier/internal/log_path
 import brazier/internal/render
@@ -2723,13 +2724,17 @@ fn default_port(scheme: String) -> Result(Int, String) {
 /// Parse an Origin header value: `scheme://host[:port]`. A trailing path is
 /// tolerated (some legacy clients send one) but recorded. `null`, userinfo
 /// and anything outside http/https are rejected.
+///
+/// The value is split at bytes, not graphemes (`split_once_bytes`): a `://`
+/// or `/` followed by a combining mark is still a delimiter, as it is to a
+/// URL parser (WHATWG URL reads code points).
 fn parse_origin(value: String) -> Result(Origin, String) {
-  case string.split_once(string.trim(value), "://") {
+  case split_once_bytes(trim(value), "://") {
     Error(Nil) -> Error("origin has no scheme")
     Ok(#(raw_scheme, rest)) -> {
-      let scheme = ascii_lowercase(raw_scheme)
+      let scheme = ascii.lowercase(raw_scheme)
       use port <- result.try(default_port(scheme))
-      let #(authority, has_path) = case string.split_once(rest, "/") {
+      let #(authority, has_path) = case split_once_bytes(rest, "/") {
         Ok(#(authority, _path)) -> #(authority, True)
         Error(Nil) -> #(rest, False)
       }
@@ -2756,25 +2761,28 @@ fn parse_authority(
       case authority {
         "" -> Error("empty host")
         "[" <> ipv6_rest ->
-          case string.split_once(ipv6_rest, "]") {
+          case split_once_bytes(ipv6_rest, "]") {
             Ok(#("", _)) -> Error("empty IPv6 host")
             Ok(#(address, "")) ->
-              Ok(#("[" <> ascii_lowercase(address) <> "]", default))
+              Ok(#("[" <> ascii.lowercase(address) <> "]", default))
             Ok(#(address, ":" <> port_text)) -> {
               use port <- result.try(parse_port(port_text))
-              Ok(#("[" <> ascii_lowercase(address) <> "]", port))
+              Ok(#("[" <> ascii.lowercase(address) <> "]", port))
             }
             _ -> Error("malformed IPv6 host")
           }
         _ ->
-          case string.split(authority, ":") {
-            [""] | ["", _] -> Error("empty host")
-            [host] -> Ok(#(ascii_lowercase(host), default))
-            [host, port_text] -> {
-              use port <- result.try(parse_port(port_text))
-              Ok(#(ascii_lowercase(host), port))
-            }
-            _ -> Error("malformed host")
+          case split_once_bytes(authority, ":") {
+            Error(Nil) -> Ok(#(ascii.lowercase(authority), default))
+            Ok(#(host, port_text)) ->
+              case split_once_bytes(port_text, ":"), host {
+                Ok(_), _ -> Error("malformed host")
+                Error(Nil), "" -> Error("empty host")
+                Error(Nil), _ -> {
+                  use port <- result.try(parse_port(port_text))
+                  Ok(#(ascii.lowercase(host), port))
+                }
+              }
           }
       }
   }
@@ -2805,16 +2813,24 @@ fn authority_refusal(bytes: BitArray) -> Result(Nil, String) {
   }
 }
 
-/// `text` with `A-Z` lowercased and every other byte unchanged.
-///
-/// Schemes and hosts are compared case-insensitively in ASCII only
-/// (RFC 3986 §3.1 and §3.2.2, RFC 6454 §4). `string.lowercase` lowercases
-/// in Unicode, where the Kelvin sign U+212A becomes `k`; it is also slow,
-/// since OTP's `string:lowercase/1` raises and catches an exception
-/// internally for each string already in lowercase, and the Host check runs
-/// for every request. The render's FFI holds the byte scan.
-@external(erlang, "brazier_render_ffi", "ascii_lowercase")
-fn ascii_lowercase(text: String) -> String
+/// `text` split at the first `pattern`, compared byte by byte. The
+/// authority is ASCII once `authority_refusal` passed it, where bytes and
+/// graphemes are the same; unlike `string.split` and `string.split_once`
+/// it compiles no pattern per call, which was most of the cost of
+/// `origin_allowed`. `pattern` is ASCII, so both parts of a string are
+/// strings.
+@external(erlang, "brazier_transport_ffi", "split_once_bytes")
+fn split_once_bytes(
+  text: String,
+  pattern: String,
+) -> Result(#(String, String), Nil)
+
+/// `string.trim`, returning `text` without a pattern compile when neither
+/// end can start a whitespace grapheme, as in a header value the request
+/// parser already trimmed. `brazier/origin_parse_test` holds the FFI to
+/// `string.trim`.
+@external(erlang, "brazier_transport_ffi", "trim_whitespace")
+fn trim(text: String) -> String
 
 /// The errors of `parse_origin`, `parse_authority` and `parse_port` end up
 /// in log lines and quote any client text they repeat (SEC-11).
@@ -2970,7 +2986,7 @@ fn check_host_name(name: String) -> Result(String, String) {
       )
     False, False -> {
       use #(host, _port) <- result.try(parse_authority(name, 0))
-      case host == ascii_lowercase(name), string.ends_with(host, ".") {
+      case host == ascii.lowercase(name), string.ends_with(host, ".") {
         False, _ -> Error("a host name has no port")
         True, True -> Error("drop the trailing dot")
         True, False -> Ok(host)
@@ -3095,10 +3111,10 @@ pub fn origin_allowed(
     case list.contains(allowed_origins.origins, same) {
       True -> Ok(Nil)
       False -> {
-        let request_scheme = ascii_lowercase(request_scheme)
+        let request_scheme = ascii.lowercase(request_scheme)
         use port <- result.try(default_port(request_scheme))
         use #(host, port) <- result.try(
-          parse_authority(string.trim(request_host), port)
+          parse_authority(trim(request_host), port)
           |> result.map_error(fn(reason) { "invalid Host: " <> reason }),
         )
         let own =

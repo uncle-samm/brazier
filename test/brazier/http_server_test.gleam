@@ -494,6 +494,24 @@ pub fn http10_keep_alive_is_honoured_test() {
   server.stop(listener)
 }
 
+/// Connection options compare case-insensitively in ASCII only (RFC 9110
+/// §7.6.1): `KEEP-ALIVE` keeps an HTTP/1.0 connection open, and a Kelvin
+/// sign U+212A, which Unicode lowercases to `k`, does not.
+pub fn http10_keep_alive_compares_in_ascii_test() {
+  let listener = start_server(fast_limits())
+  let socket = open(listener)
+  send(socket, "GET /a HTTP/1.0\r\nConnection: KEEP-ALIVE\r\n\r\n")
+  let assert Ok(#(200, headers, _)) = raw_recv_response(socket, 2000, True)
+    as "HTTP/1.0 KEEP-ALIVE response"
+  let assert Ok("keep-alive") = header(headers, "connection")
+  send(socket, "GET /b HTTP/1.0\r\nConnection: \u{212A}eep-alive\r\n\r\n")
+  let assert Ok(#(200, headers, _)) = raw_recv_response(socket, 2000, True)
+    as "HTTP/1.0 Kelvin-sign keep-alive response"
+  let assert Ok("close") = header(headers, "connection")
+  assert_closed(socket)
+  server.stop(listener)
+}
+
 pub fn max_keepalive_requests_closes_test() {
   let listener =
     start_server(

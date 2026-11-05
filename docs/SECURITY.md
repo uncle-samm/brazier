@@ -183,7 +183,9 @@ and lists the codes in [Close Codes](WIRE_PROTOCOL.md#close-codes).
 Origin validation is the defence against cross-site WebSocket hijacking. On
 every upgrade the `Origin` header must equal the request's own origin, or an
 entry of `ws_allowed_origins`; scheme, host and port must all match, with the
-default port applied (80 for `http`, 443 for `https`):
+default port applied (80 for `http`, 443 for `https`), and scheme and host
+compared with ASCII letters case-folded only (`brazier/internal/ascii`), so a
+non-ASCII character such as the Kelvin sign never equals an ASCII `k`:
 
 - the request's host and port come from its `Host` header;
 - its scheme is `http`, or the scheme a trusted proxy sent in the configured
@@ -298,6 +300,7 @@ Brazier escapes text (`&`, `<`, `>`) and attribute values (also `"`) during SSR 
 - an inline event attribute such as `onclick`: use `brazier/event`;
 - `srcdoc`, whose value is a whole HTML document: use `attribute.unsafe_srcdoc` (see [Escape Hatches](#escape-hatches));
 - `attributeName` with a value containing `href`: an SVG `<animate>` or `<set>` targeting `href` or `xlink:href` would change a link after the URL policy checked it. DOMPurify refuses the same values. See [SVG.md](SVG.md#animation);
+- a name starting with `data-brazier-`, which the client reads and the render sets (`data-brazier-key`, `-stream`, `-on-<event>` and the rest). A forged `data-brazier-on-click` would send a handler id the view never rendered, a forged `data-brazier-stream` would make the client patch an element that is not a stream's container. Four names in the prefix are app API and allowed: `data-brazier-hook`, `-hook-watch`, `-preserve-children` and `-external` (see [HTML_ELEMENTS.md](HTML_ELEMENTS.md#attributes-brazierattribute)). The build refuses a reserved name it can know before the view runs;
 - a name with characters outside `a-z A-Z 0-9 - _ : .`.
 
 Names match case-insensitively. Attribute names come from application code, so such a name is a bug in the view. Event handler IDs are rendered as escaped attribute values.

@@ -330,6 +330,10 @@ pub fn cookie_prefixes_are_enforced_test() {
     )
   let assert Ok(_) = cookie.set_default(resp, "__Host-id", "v")
   let assert Ok(_) = cookie.set_default(resp, "__Secure-id", "v")
+  // A name is a token, so ASCII: a name holding a Kelvin sign U+212A is
+  // refused as a name before any prefix is matched.
+  let assert Error(cookie.InvalidName("__Host-\u{212A}ey")) =
+    cookie.set(resp, "__Host-\u{212A}ey", "v", insecure)
 }
 
 pub fn oversized_cookie_is_rejected_test() {

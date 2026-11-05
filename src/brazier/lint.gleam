@@ -25,6 +25,7 @@
 ///
 /// Reference: CLAUDE.md engineering principles, TigerBeetle approach.
 import brazier/build/source_location
+import brazier/internal/ascii
 import brazier/log
 import glance
 import gleam/int
@@ -224,7 +225,8 @@ pub fn lint_stale_names(file_path: String, source: String) -> List(Violation) {
   |> list.index_map(fn(line, index) { #(index + 1, line) })
   |> list.filter_map(fn(numbered) {
     let #(number, line) = numbered
-    let uses = occurrences(string.lowercase(line), old_name)
+    // The old name is ASCII, so ASCII lowercasing finds it in any case.
+    let uses = occurrences(ascii.lowercase(line), old_name)
     let allowed_uses =
       list.fold(allowed, 0, fn(sum, count_uses) { sum + count_uses(line) })
     case uses > allowed_uses {

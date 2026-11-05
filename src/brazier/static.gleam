@@ -12,6 +12,7 @@
 /// 304, and `X-Content-Type-Options: nosniff` on every response.
 ///
 /// Reference: Plug.Static, cowboy_static, Phoenix static serving.
+import brazier/internal/ascii
 import brazier/internal/log_path
 import brazier/log
 import brazier/transport/server.{type ResponseBody, Bytes, File}
@@ -459,7 +460,7 @@ pub fn etag_for(contents: BitArray) -> String {
 fn content_hash(contents: BitArray, length: Int) -> String {
   crypto.hash(crypto.Sha256, contents)
   |> bit_array.base16_encode
-  |> string.lowercase
+  |> ascii.lowercase
   |> string.slice(0, length)
 }
 
@@ -506,11 +507,14 @@ pub fn accepts_gzip(accept_encoding: String) -> Bool {
 }
 
 /// Parse one `coding;q=value` element. Malformed quality values make the
-/// element unacceptable (q=0) rather than silently accepted.
+/// element unacceptable (q=0) rather than silently accepted. Codings and
+/// parameter names are tokens, compared case-insensitively in ASCII
+/// (RFC 9110 §8.4.1, §5.6.6), so a name holding any other character never
+/// is `gzip` or `q`.
 fn parse_coding(element: String) -> Result(#(String, Float), Nil) {
   case string.split(element, ";") {
     [name, ..params] ->
-      case string.lowercase(string.trim(name)) {
+      case ascii.lowercase(string.trim(name)) {
         "" -> Error(Nil)
         coding -> Ok(#(coding, quality(params)))
       }
@@ -523,7 +527,7 @@ fn quality(params: List(String)) -> Float {
     list.find_map(params, fn(param) {
       case string.split_once(string.trim(param), "=") {
         Ok(#(key, value)) ->
-          case string.lowercase(string.trim(key)) {
+          case ascii.lowercase(string.trim(key)) {
             "q" -> Ok(parse_quality(string.trim(value)))
             _ -> Error(Nil)
           }
@@ -664,8 +668,9 @@ fn ffi_load_asset(
 
 /// Check if a path contains directory traversal sequences.
 /// Catches: "..", backslash, null bytes, and encoded traversal (%2e, %2f, %5c).
+/// A percent-escape is ASCII, so the path is lowercased in ASCII only.
 pub fn contains_traversal(path: String) -> Bool {
-  let lower = string.lowercase(path)
+  let lower = ascii.lowercase(path)
   string.contains(path, "..")
   || string.contains(path, "\\")
   || string.contains(path, "\u{0000}")
@@ -703,8 +708,11 @@ pub fn mime_type(path: String) -> String {
   }
 }
 
-/// Extract the lowercase file extension of the last path segment, or ""
-/// when the name has no extension ("Makefile", ".env", "dir/").
+/// Extract the file extension of the last path segment, lowercased in ASCII,
+/// or "" when the name has no extension ("Makefile", ".env", "dir/"). The
+/// extensions `mime_type` knows are ASCII; a character outside ASCII is
+/// kept as it is, so such an extension is unknown (and keeps its length
+/// for `fingerprint`).
 fn file_extension(path: String) -> String {
   let name = case list.last(string.split(path, "/")) {
     Ok(segment) -> segment
@@ -715,7 +723,7 @@ fn file_extension(path: String) -> String {
     [_] | ["", _] -> ""
     parts ->
       case list.last(parts) {
-        Ok(ext) -> string.lowercase(ext)
+        Ok(ext) -> ascii.lowercase(ext)
         Error(Nil) -> ""
       }
   }

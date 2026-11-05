@@ -58,7 +58,7 @@
 -behaviour(gen_server).
 
 -export([
-    new_name/0, is_name/1, owner_pid/1, start_link/7, start_link_gleam/7,
+    new_name/0, is_name/1, owner_pid/1, start_link/7,
     start_connection/2, release_self/0, release_pid/2,
     drain_requested/0, mark_draining/0, is_drain_message/1, owner/0, owner_if_any/0,
     count_self/0, count/1, count_for_ip/2, count_for_ip_text/2, children/1,
@@ -188,14 +188,6 @@ start_link({via, ?MODULE, Ref} = Name, Port, Handler, MaxConns, MaxPerIp, Truste
         when is_reference(Ref) ->
     gen_server:start_link(Name, ?MODULE,
                           {Ref, Port, Handler, MaxConns, MaxPerIp, TrustedCidrs, DrainMs}, []).
-
-%% Gleam supervision start shape: {ok, {started, Pid, Name}} | {error, StartError}.
-start_link_gleam(Name, Port, Handler, MaxConns, MaxPerIp, TrustedCidrs, DrainMs) ->
-    case start_link(Name, Port, Handler, MaxConns, MaxPerIp, TrustedCidrs, DrainMs) of
-        {ok, Pid} -> {ok, {started, Pid, Name}};
-        {error, Reason} -> {error, {init_failed, format(Reason)}};
-        ignore -> {error, {init_failed, <<"connection owner returned ignore">>}}
-    end.
 
 %% Called by an acceptor. Returns {ok, HandlerPid} | {error, Limit}.
 start_connection(Conns, Ip) ->
@@ -692,6 +684,3 @@ connection_init(Conns, Tid, Handler) ->
         brazier_log_ffi:error(<<"brazier.http_conns">>, "connection ~p never received its socket", [self()]),
         exit(socket_handoff_timeout)
     end.
-
-format(Reason) when is_binary(Reason) -> Reason;
-format(Reason) -> list_to_binary(io_lib:format("~p", [Reason])).

@@ -169,7 +169,7 @@ hash_file(Path) ->
             end,
             case Result of
                 {ok, Length, Digest} ->
-                    {ok, Length, string:lowercase(binary:encode_hex(Digest))};
+                    {ok, Length, binary:encode_hex(Digest, lowercase)};
                 {error, Reason} ->
                     {error, {read_failed, format(Reason)}}
             end;

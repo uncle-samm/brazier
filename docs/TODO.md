@@ -14,24 +14,36 @@
   - **Resolution:** how it was fixed (fill in when resolved)
 -->
 
-- **Issue:** `brazier/internal/url.is_url_attribute` lowercases every
-  attribute name with `string.lowercase`. On Erlang, OTP's
-  `string:lowercase/1` raises and catches an exception inside for a name
-  that is already lowercase, about 0.1 µs a name, and `attribute.attribute`
-  pays it once per attribute it builds (`url.check`). The render's name
-  policy had the same cost twice per attribute and now lowercases `A-Z`
-  itself (`brazier_render_ffi:ascii_lowercase`), which took 13% off a
-  1000-row render with the other fix of Milestone 118's SSR work.
-  - **Context:** Milestone 118, m118-perf-server, profiling `ssr.rows_1000`
-    (docs/PERFORMANCE.md, "Growth with size").
-  - **Files:** `src/brazier/internal/url.gleam`,
-    `src/brazier_render_ffi.erl`, `src/brazier_render_ffi.mjs`
-  - **Attempted:** nothing in url.gleam: it was outside that agent's files.
-    The names it lowercases come from `attribute.attribute`, which has
-    already passed them through the ASCII-only markup name check, so
-    `render.ascii_lowercase` (made public, or moved to a shared internal
-    module) gives the same result; `render_js_test` already compares the
-    two targets on `url.check`.
+- **Issue:** `application.start_supervised` starts its root as a
+  `static_supervisor` that lists its children at start, so a listener that
+  cannot bind (a taken or privileged port) still fails the root's own start:
+  the root exits `{shutdown, {failed_to_start_child, ...}}`, which kills a
+  caller that does not trap exits, and gleam_otp reports the start error as
+  `InitFailed("shutdown")`. The listener's own start now names the cause
+  (`server.supervised` returns `InitFailed("cannot listen on port N: ...")`)
+  and logs it as an error, so the cause is in the log, but `brazier.start`
+  does not return it.
+  - **Context:** Milestone 118, m118-server-residue, while making a failed
+    `server.start` return its cause (`brazier_http_listener_sup`).
+  - **Files:** `src/brazier/application.gleam`
+  - **Attempted:** nothing yet. The listener's fix (start the supervisor
+    empty, add each child with `supervisor:start_child`, return
+    `{error, Cause}`) applies to the root too, as Ranch adds a listener to
+    the running `ranch_sup`; gleam_otp's `static_supervisor` has no
+    start_child, so it means an Erlang root supervisor of the same shape.
+
+- **Issue:** the listener's `eacces` path is tested only where the OS
+  refuses a privileged port. macOS lets any user bind port 1 on the
+  wildcard address, so `a_privileged_port_matches_what_the_os_says_test`
+  checks there that the start succeeds; on Linux as non-root it checks the
+  `"cannot listen on port 1: eacces (permission denied)"` error. The
+  wording itself is covered on every OS by
+  `a_start_error_names_the_posix_cause_test`.
+  - **Context:** Milestone 118, m118-server-residue.
+  - **Files:** `test/brazier/listener_start_failure_test.gleam`
+  - **Attempted:** binding a specific address the user may not use gives
+    `eaddrnotavail`, whose text is OS-specific, and the listener has no
+    bind-address option to test it through.
 
 - **Issue:** `presence.list` grows faster than the room past about 10,000
   entries: 0.46 µs an entry at 3,000, 0.61 at 10,000 and 0.92 to 1.13 at
@@ -55,6 +67,53 @@
 ## Resolved Issues
 
 <!-- Move resolved issues here with full resolution details -->
+
+- **Issue:** `server.start` on a taken port killed a caller that did not
+  trap exits, and a caller that did got the error `"shutdown"`, the cause
+  lost. The listener supervisor listed its children in `init`, so a socket
+  owner that could not bind failed the supervisor's own start
+  (`{shutdown, {failed_to_start_child, listen_socket, ...}}`), an exit
+  signal to the linked caller.
+  - **Files:** `src/brazier_http_listener_sup.erl`,
+    `src/brazier/transport/server.gleam`
+  - **Resolution:** (Milestone 118, m118-server-residue) The listener
+    supervisor (`brazier_http_listener_sup`) starts empty and adds its
+    three children with `supervisor:start_child`, as Ranch's
+    `start_listener` adds a listener to `ranch_sup` and returns
+    `{error, eaddrinuse | eacces}`. A failed child is a returned error; the
+    partly started tree is stopped and the start returns
+    `"cannot listen on port N: eaddrinuse (address already in use)"`.
+    `server.supervised` returns it as `InitFailed` and logs it.
+    `test/brazier/listener_start_failure_test.gleam` checks the error, the
+    caller's links, trap flag and mailbox, the keepers left, and the
+    supervised path.
+
+- **Issue:** a supervised listener removed from its parent
+  (`supervisor:terminate_child`, then `delete_child`) kept its
+  `persistent_term` entries until the parent exited.
+  - **Files:** `src/brazier/transport/server.gleam`
+  - **Resolution:** (Milestone 118, m118-server-residue) Documented, not
+    erased on removal: the parent holds the entries because a terminated
+    child can still be restarted (`restart_child`) and must rebind the port
+    it bound first, and the supervisor tells nothing when a spec is
+    deleted. The parent that removes the listener releases it with
+    `server.release`, as Ranch's `stop_listener` cleans up its listener's
+    options itself between the terminate and the delete. `server.supervised`
+    says so; `listener_name_test` removes a listener, sees the entries kept,
+    releases it and sees them go.
+
+- **Issue:** `brazier/internal/url.is_url_attribute` lowercased every
+  attribute name with `string.lowercase`. On Erlang, OTP's
+  `string:lowercase/1` raises and catches an exception inside for a name
+  that is already lowercase, about 0.1 µs a name, and `attribute.attribute`
+  paid it once per attribute it builds (`url.check`).
+  - **Files:** `src/brazier/internal/url.gleam`,
+    `src/brazier/internal/ascii.gleam`
+  - **Resolution:** (Milestone 118, m118-server-residue) Every
+    `string.lowercase` outside render and build now uses
+    `brazier/internal/ascii.lowercase`, which lowercases `A-Z` only, url
+    among them. The render keeps `brazier_render_ffi:ascii_lowercase`, its
+    owner's to fold into the shared module.
 
 - **Issue:** every bench suite run after the first left 7 more atoms in
   the atom table. Listing the atoms each run creates (by index) showed all

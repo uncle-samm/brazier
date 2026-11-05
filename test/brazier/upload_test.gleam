@@ -542,6 +542,32 @@ pub fn parse_multipart_rejects_malformed_bodies_test() {
   let assert Error(upload.ParseError("missing closing boundary")) = parse(<<>>)
 }
 
+/// A part header name is a token: whitespace before the colon, a character
+/// outside ASCII (a Kelvin sign U+212A, which Unicode lowercases to `k`)
+/// or an empty name is refused by name, not read as another header.
+pub fn parse_multipart_refuses_a_part_header_name_that_is_not_a_token_test() {
+  let part = fn(header_name) {
+    <<
+      "--":utf8,
+      boundary:utf8,
+      "\r\n":utf8,
+      header_name:utf8,
+      ": form-data; name=\"a\"\r\n\r\nx\r\n":utf8,
+      close():bits,
+    >>
+  }
+  let assert Ok(upload.MultipartForm(fields: [#("a", "x")], ..)) =
+    parse(part("CONTENT-DISPOSITION"))
+  let assert Error(upload.ParseError(
+    "invalid part header name \"Content-Disposition \"",
+  )) = parse(part("Content-Disposition "))
+  let assert Error(upload.ParseError(
+    "invalid part header name \"Content-Dispo\u{212A}ition\"",
+  )) = parse(part("Content-Dispo\u{212A}ition"))
+  let assert Error(upload.ParseError("invalid part header name \"\"")) =
+    parse(part(""))
+}
+
 pub fn parse_multipart_accepts_a_quoted_boundary_test() {
   let body = <<
     file_part("file", "a.png", "image/png", png_bytes()):bits,
@@ -592,6 +618,9 @@ pub fn extension_test() {
   let assert Some("png") = upload.extension("photo.png")
   let assert Some("jpg") = upload.extension("my.photo.jpg")
   let assert None = upload.extension("noext")
+  // Lowercased in ASCII only: a Kelvin sign stays, so it never matches `k`.
+  let assert Some("png") = upload.extension("PHOTO.PNG")
+  let assert Some("\u{212A}b") = upload.extension("x.\u{212A}B")
 }
 
 pub fn format_size_test() {

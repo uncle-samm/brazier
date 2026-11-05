@@ -10,6 +10,7 @@
 /// suppressed, `Connection` handled by the server).
 ///
 /// Reference: RFC 9112 (HTTP/1.1), RFC 9110 (HTTP semantics), cowboy_http.
+import brazier/internal/ascii
 import brazier/internal/http_status
 import brazier/internal/log_path
 import brazier/log
@@ -330,7 +331,7 @@ fn check_expect(
   case header_values(req.headers, "expect"), version {
     [], _ -> Ok(False)
     [value], Http11 ->
-      case string.lowercase(string.trim(value)) {
+      case ascii.lowercase(string.trim(value)) {
         "100-continue" -> Ok(True)
         _ ->
           Error(FramingError(
@@ -340,7 +341,7 @@ fn check_expect(
       }
     // RFC 9110 10.1.1: a server MUST ignore 100-continue in HTTP/1.0.
     [value], Http10 ->
-      case string.lowercase(string.trim(value)) {
+      case ascii.lowercase(string.trim(value)) {
         "100-continue" -> Ok(False)
         _ ->
           Error(FramingError(
@@ -374,11 +375,15 @@ pub fn is_close_requested_by_response(
   list.contains(connection_tokens(resp.headers), "close")
 }
 
+/// The Connection options of `headers`, lowercased. Field names and
+/// connection options are tokens and compare case-insensitively in ASCII
+/// (RFC 9110 §5.1, §7.6.1): a Kelvin sign U+212A, which Unicode lowercases
+/// to `k`, does not make `keep-alive`.
 fn connection_tokens(headers: List(#(String, String))) -> List(String) {
   headers
-  |> list.filter(fn(h) { string.lowercase(h.0) == "connection" })
+  |> list.filter(fn(h) { ascii.lowercase(h.0) == "connection" })
   |> list.flat_map(fn(h) { string.split(h.1, ",") })
-  |> list.map(fn(token) { string.lowercase(string.trim(token)) })
+  |> list.map(fn(token) { ascii.lowercase(string.trim(token)) })
 }
 
 // --- Request body ---
@@ -882,7 +887,7 @@ pub fn write_framed_response(
       }
       let kept_headers =
         list.filter(resp.headers, fn(h) {
-          case string.lowercase(h.0) {
+          case ascii.lowercase(h.0) {
             "content-length" | "transfer-encoding" | "connection" -> False
             _ -> True
           }
@@ -1109,7 +1114,7 @@ fn header_values_ci(
   name: String,
 ) -> List(String) {
   list.filter_map(headers, fn(h) {
-    case string.lowercase(h.0) == name {
+    case ascii.lowercase(h.0) == name {
       True -> Ok(string.trim(h.1))
       False -> Error(Nil)
     }
@@ -1131,40 +1136,7 @@ fn validate_response_headers(
 }
 
 fn is_valid_header_name(name: String) -> Bool {
-  name != "" && token_bytes(<<name:utf8>>)
-}
-
-fn token_bytes(bits: BitArray) -> Bool {
-  case bits {
-    <<>> -> True
-    <<c, rest:bytes>> ->
-      case is_token_byte(c) {
-        True -> token_bytes(rest)
-        False -> False
-      }
-    _ -> False
-  }
-}
-
-fn is_token_byte(c: Int) -> Bool {
-  { c >= 97 && c <= 122 }
-  || { c >= 65 && c <= 90 }
-  || { c >= 48 && c <= 57 }
-  || c == 33
-  || c == 35
-  || c == 36
-  || c == 37
-  || c == 38
-  || c == 39
-  || c == 42
-  || c == 43
-  || c == 45
-  || c == 46
-  || c == 94
-  || c == 95
-  || c == 96
-  || c == 124
-  || c == 126
+  ascii.is_token(name)
 }
 
 fn is_valid_header_value(value: String) -> Bool {

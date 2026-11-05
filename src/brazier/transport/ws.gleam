@@ -9,6 +9,7 @@
 /// 1009 message too big.
 ///
 /// Reference: RFC 6455; cowlib cow_ws; cowboy_websocket.
+import brazier/internal/ascii
 import brazier/log
 import brazier/transport/server
 import gleam/bit_array
@@ -513,10 +514,12 @@ fn check_upgrade(req: Request(a)) -> Result(String, UpgradeError) {
 }
 
 /// Whether a comma-separated header value contains `token`
-/// (case-insensitive, RFC 7230 §3.2.6 token list).
+/// (case-insensitive in ASCII, RFC 9110 §5.6.1 token list; RFC 6455 §4.2.1
+/// compares `websocket` and `Upgrade` ASCII case-insensitively). A Kelvin
+/// sign U+212A, which Unicode lowercases to `k`, does not make `websocket`.
 fn has_token(value: String, token: String) -> Bool {
   string.split(value, ",")
-  |> list.any(fn(part) { string.lowercase(string.trim(part)) == token })
+  |> list.any(fn(part) { ascii.lowercase(string.trim(part)) == token })
 }
 
 /// Encode the 101 Switching Protocols response for a validated client key.

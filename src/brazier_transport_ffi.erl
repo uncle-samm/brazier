@@ -37,6 +37,9 @@
     ws_mailbox_len/0
 ]).
 
+%% Origin and Host parsing (brazier/transport.gleam).
+-export([split_once_bytes/2, trim_whitespace/1]).
+
 -define(ALLOWED_METHODS, [<<"GET">>, <<"HEAD">>, <<"POST">>, <<"PUT">>, <<"DELETE">>,
                           <<"OPTIONS">>, <<"PATCH">>]).
 
@@ -476,10 +479,62 @@ now_ms() ->
 monotonic_ms() ->
     now_ms().
 
+%% A field name lowercased in ASCII (RFC 9110 §5.1: field names are tokens
+%% and compare case-insensitively). decode_packet/3 returns a well-known
+%% name as an atom and any other as a binary; it answers http_error for a
+%% name with a byte outside tchar, and is_token/1 checks the result again.
+%% Not string:lowercase/1, which lowercases in Unicode and raises and
+%% catches an exception internally for each name already in lowercase, on
+%% every header of every request.
 normalize_header_name(Name) when is_atom(Name) ->
-    string:lowercase(atom_to_binary(Name, utf8));
+    brazier_render_ffi:ascii_lowercase(atom_to_binary(Name, utf8));
 normalize_header_name(Name) when is_binary(Name) ->
-    string:lowercase(Name).
+    brazier_render_ffi:ascii_lowercase(Name).
+
+%% Text split at the first occurrence of Pattern, compared byte by byte:
+%% {ok, {Before, After}}, or {error, nil} when Pattern does not occur.
+%%
+%% string:split/2 compares graphemes and compiles its pattern twice per call
+%% (binary:compile_pattern/1 allocates a resource each time); on the Origin
+%% check of every WebSocket upgrade that was most of its cost. binary:split/2
+%% takes a plain binary pattern without that allocation. Callers pass an
+%% ASCII pattern: an ASCII byte never occurs inside a multi-byte UTF-8
+%% sequence, so both parts of valid UTF-8 text are valid UTF-8.
+split_once_bytes(Text, Pattern)
+  when is_binary(Text), is_binary(Pattern), byte_size(Pattern) > 0 ->
+    case binary:split(Text, Pattern) of
+        [Before, After] -> {ok, {Before, After}};
+        [Text] -> {error, nil}
+    end.
+
+%% string:trim/2 at both ends, as gleam/string.trim (leading, then
+%% trailing), returning Text itself when neither end can start a whitespace
+%% grapheme.
+%%
+%% string:trim/2 builds and compiles a pattern for the 13 graphemes of
+%% unicode_util:whitespace() on every call, even when there is nothing to
+%% trim, as there is not in a header value the request parser already
+%% trimmed. A whitespace grapheme starts with a byte in ?WS_FIRST and ends
+%% with a byte in ?WS_LAST (the UTF-8 bytes of [CR LF], TAB, LF, VT, FF, CR,
+%% SP, U+0085, U+200E, U+200F, U+2028 and U+2029); when the first byte is
+%% not one of the first and the last byte not one of the last, the first
+%% and last graphemes are not whitespace and string:trim/2 returns its
+%% input unchanged. brazier/origin_parse_test checks this against
+%% gleam/string.trim for every code point up to U+2FFF at either end.
+-define(WS_FIRST(B), ((B >= 9 andalso B =< 13) orelse B =:= 32 orelse
+                      B =:= 16#C2 orelse B =:= 16#E2)).
+-define(WS_LAST(B), ((B >= 9 andalso B =< 13) orelse B =:= 32 orelse
+                     B =:= 16#85 orelse B =:= 16#8E orelse B =:= 16#8F orelse
+                     B =:= 16#A8 orelse B =:= 16#A9)).
+trim_whitespace(<<>>) ->
+    <<>>;
+trim_whitespace(Text) when is_binary(Text) ->
+    First = binary:first(Text),
+    Last = binary:last(Text),
+    case ?WS_FIRST(First) orelse ?WS_LAST(Last) of
+        false -> Text;
+        true -> string:trim(string:trim(Text, leading), trailing)
+    end.
 
 method_to_binary(Method) when is_atom(Method) -> atom_to_binary(Method, utf8);
 method_to_binary(Method) when is_binary(Method) -> Method.

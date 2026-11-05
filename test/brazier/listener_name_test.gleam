@@ -199,24 +199,59 @@ pub fn a_listener_that_fails_to_start_leaves_no_entry_test() {
   let listener = start_unlinked()
   let before = registry_entries()
   // The port is taken: the connection owner registers, the socket owner
-  // fails to bind, and the start returns an error. The failed supervisor
-  // exits with that reason through its link, so a process that traps exits
-  // starts it.
-  let result = process.new_subject()
-  process.spawn_unlinked(fn() {
-    process.trap_exits(True)
-    process.send(
-      result,
-      server.start(
-        server.default_listener_options(server.get_port(listener)),
-        ignore_socket,
-      ),
+  // fails to bind, and the start returns an error (listener_start_failure_test
+  // covers the error and the caller).
+  let assert Error(_refused) =
+    server.start(
+      server.default_listener_options(server.get_port(listener)),
+      ignore_socket,
     )
-  })
-  let assert Ok(Error(_refused)) = process.receive(result, 5000)
   let assert True = registry_entries() == before
     as "a listener that never ran leaves no entry"
   server.stop(listener)
+}
+
+/// A supervised listener removed from its parent for good
+/// (`supervisor:terminate_child` then `delete_child`) keeps its entries
+/// while the parent runs: the parent is its holder, and a terminated child
+/// can still be restarted (`restart_child`), which must rebind the port it
+/// bound first. Nothing tells the keeper that the spec was deleted, so the
+/// application that removes the listener releases it, as ranch's
+/// `stop_listener` cleans up its listener's options itself after the
+/// terminate and before the delete.
+pub fn a_supervised_listener_removed_from_its_parent_goes_when_released_test() {
+  let before = registry_entries()
+  let started = process.new_subject()
+  let assert Ok(spec) =
+    server.supervised(server.default_listener_options(0), ignore_socket)
+  let spec =
+    supervision.ChildSpecification(..spec, start: fn() {
+      case spec.start() {
+        Ok(child) -> {
+          process.send(started, child.data)
+          Ok(child)
+        }
+        Error(reason) -> Error(reason)
+      }
+    })
+  let assert Ok(parent) =
+    static_supervisor.new(static_supervisor.OneForOne)
+    |> static_supervisor.add(spec)
+    |> static_supervisor.start
+  process.unlink(parent.pid)
+  let assert Ok(listener) = process.receive(started, 5000)
+  let assert Ok(keeper) = server.get_keeper(listener)
+  delete_only_child(parent.pid)
+  let assert Error(Nil) = server.get_connection_owner(listener)
+    as "the removed listener's tree is gone"
+  let assert True = registry_entries() == before + 3
+    as "the parent still holds the removed listener's entries"
+  let assert True = server.release(listener)
+    as "the release forgets the removed listener's bound port"
+  await.expect_down(keeper, "the released listener's keeper")
+  let assert True = registry_entries() == before
+    as "a removed and released listener leaves no entry"
+  stop_supervisor(parent.pid)
 }
 
 /// A port-0 listener whose supervisor is not linked to this test, so the
@@ -273,6 +308,9 @@ fn forget(ref: Reference) -> Bool
 
 @external(erlang, "brazier_listener_name_test_ffi", "restart_only_child")
 fn restart_only_child(parent: Pid) -> Nil
+
+@external(erlang, "brazier_listener_name_test_ffi", "delete_only_child")
+fn delete_only_child(parent: Pid) -> Nil
 
 @external(erlang, "brazier_server_ffi", "stop_supervisor")
 fn stop_supervisor(pid: Pid) -> Nil
