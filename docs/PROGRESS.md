@@ -762,16 +762,20 @@
 - [ ] L410: await interests are lost when the cluster manager restarts (`brazier_cluster_manager.erl:128,349`). m118-cluster.
 - [ ] L411: a stale verified row survives between a disconnect and the nodedown (`brazier_cluster_ffi.erl:73`). m118-cluster.
 - [ ] L412: a revocation is lost while only one side has verified the other (`brazier_session_ffi.erl:154,330`). m118-cluster.
-- [ ] L452 (SEC-11): `upload.gleam:537` logs a raw client path. Phase B, with the transport-side log items.
+- [x] L452 (SEC-11), m118-logs 7c3adc8: three sites were still real. The `uri_check` query reason held the raw query, the 417 reason didn't quote `Expect`, and an overlong static name gave a 500. The other sites were already safe. `log_forging_paths_test` has 21 tests covering every site.
+  - Follow-up: `log_path.describe` has no length cap, so a long path is logged in full (quoted, so it can't forge a line).
 - [ ] L605: a navigation refused with an `error` frame gets no ack, so its pending scroll fires on a later ack (`runtime.gleam:1565`). After m118-lifecycle.
-- [ ] L453: a cascade of `CloseForBackpressure` closes was seen once; needs a reproduction. After m118-transport.
+- [ ] L453: the transport level is done (m118-logs 095daf6). `backpressure_isolation_test` shows that no close causes another: 6 sockets, 2 killed, 1 suspended under 1002 messages, which gets exactly one 1013. The runtime level is reproduced in `docs/design/backpressure_cascade_repro.gleam.txt`: a dead pid reads as 1000000000 queued, and a slow connection is closed again on every broadcast. Next, a dedicated agent after m118-streams-server merges builds it:
+  - `message_queue_len` returns a `Result`;
+  - the runtime forgets a connection after one close or once it is dead;
+  - the runtime monitors the owner pid, as Phoenix.Channel.Server does.
 - [ ] L515–516: with `NoDiscovery` a member lost to a netsplit never reconnects, and `global` can drop members on a netsplit. Neither is a recorded decision. m118-cluster (decide and document).
 - [ ] L716–719: replicated stores expose no "synced" signal; a refused merge has no retry backoff; the causal context gains a clock entry per replica restart and is never compacted; the CRDT was never checked against the `delta_crdt_ex` source. m118-cluster.
 - [x] L267 (m118-build): the client build writes no manifest, so every fresh build resolves dependencies from Hex (the cause of the rate-limit failures). m118-build.
 - [ ] L83: the client doesn't key the page root on navigation, so examples wrap each page in `element.keyed`. After m118-transport.
 - [ ] L606: a navigation without a hash doesn't scroll to the top (LiveView does). m118-transport if it fits item 8, otherwise after.
 - [ ] L607: the non-monotonic clock warning says "event clock" for navigations too. After m118-lifecycle.
-- [ ] L608–609: a bad proxy hop can be logged twice, and one refused limit makes two log lines. After m118-transport.
+- [x] L608–609, m118-logs ef5aa61, adfbc0e and d588536: the client is resolved once per WebSocket connection (`server.Connection.resolved` and `Admission.request`), and a refused setting logs one line.
 - [ ] L190: the owner-moved DOWN race in `create_via_owner` has no test. L414: the churn test survives some mutants. After m118-tests.
 - [x] L589 (m118-tests; the pending modules are a phase B follow-up): no check for messages a test leaves in the mailbox. m118-tests (partly).
 - [ ] Perf, before the re-baseline: L637 SSR at 1000 rows takes about 8 ms; L638 client decode and patch at 1000 rows; L639 `presence.list` copies the whole room; L640 a DOM morph bench (CDP); L642 6 atoms leak per suite run; L643 `ws.100x200` runs only 5 rounds.
@@ -780,7 +784,7 @@
 - [ ] Phase B running (started 2026-11-05, every worktree at 3047dd1):
   - m118-streams-server: STREAMS.md steps 2–5, with the `streams` field on `patch` and `model_sync`;
   - m118-streams-client: step 6;
-  - m118-logs: L452, L453, L608–609, and the 4401 TODO;
+  - m118-logs: L452, L453, L608–609, and the 4401 TODO. Done (095daf6, merged 2026-11-05): the close log lines carry the 4401 cause (6ed08e6, `close_cause_4401_test`). 2127 tests pass twice on its branch;
   - m118-residue: the residue-pending modules, L190 and L414.
   The two streams halves merge together before CDP runs, because each breaks the suite on its own.
 - Decision, 2026-11-05: 4401 stays shared by an `init` 401 and a revoked or expired session. Both mean "authentication is no longer valid; reload" to the client. The server tells them apart by a distinct cause in the close's log line and telemetry metadata. m118-logs builds it.

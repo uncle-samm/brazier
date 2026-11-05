@@ -51,6 +51,10 @@ open follow-ups), which is in progress.
   body read cut short by the request deadline is `RequestDeadlineExceeded`,
   and the error descriptions name `body_read_timeout_ms` and
   `request_timeout_ms`.
+- (M118 logs) `server.Connection` has a new `resolved` field: the client
+  address the WebSocket upgrade resolved once. The middleware gate and every
+  later join and navigation reuse it. Code that builds `Connection(socket:)`
+  by hand must set it.
 
 - The package is renamed from `beacon` to `brazier`. There are no aliases or
   compatibility re-exports: every old name below stops existing.
@@ -380,6 +384,17 @@ open follow-ups), which is in progress.
 - (M118 transport) `window.__brazierOutboundPendingForTest()` returns
   `{queued, scheduled, debounced}`, so a debounced send whose timer has not
   fired no longer looks drained.
+- (M118 logs) Every WebSocket close log line reads "with <code> (reason
+  <label>)", using the label the `[brazier, ws, close]` event reports. The
+  three 4401 closes are told apart: `init_refused`, `session_revoked` and
+  `authentication_expired`.
+- (M118 logs) A refused security setting logs one line with the detail; the
+  parsers (`parse_allowed_hosts`, `parse_allowed_origins`,
+  `validate_drain_timeout`, `ip.parse_trusted_proxies`) no longer log their
+  own refusal first.
+- (M118 logs) The `uri_check` reason for a bad query string no longer
+  contains the query, which can carry a token, and the 417 reason quotes the
+  client's `Expect` value.
 
 - (PERF-9) Every bench metric is gated:
   - A metric's tolerance is max(25%, spread), not max(25%, 2 × spread), so
@@ -626,6 +641,11 @@ open follow-ups), which is in progress.
   receive them.
 - (M118) The prebuilt runtime bundle in `priv/static` is rebuilt, so it
   carries the shifted-array diff.
+- (M118 logs) A static file name longer than the file system allows is a
+  404 logged at debug (as in Plug.Static), not a 500 with an error log.
+- (M118 logs) A malformed forwarding hop is logged once per WebSocket
+  connection. Before, the middleware gate, each join and each navigation
+  resolved the client again and logged it again.
 
 - (M117 transport follow-ups) A WebSocket upgrade logged a malformed
   forwarding hop (and a `Forwarded` request's unconfigured `X-Forwarded-*`
