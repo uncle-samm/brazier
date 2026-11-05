@@ -36,11 +36,9 @@ export const STREAM_FAULT_REASONS = Object.freeze([
   "insert_wrong_index",
   "insert_past_end",
   "over_limit",
-  // Client only: the item function or its decoder refused an item
-  // (render_item returned Error), or a container's keep or limit differs
-  // from its store's.
+  // Client only: the item's decoder or item function refused an item
+  // (render_item returned Error).
   "item_render_failed",
-  "container_mismatch",
 ]);
 
 function fault(stream, reason, detail) {
@@ -129,9 +127,9 @@ export function emptyStore(name, keep, limit) {
  *
  * Returns `{ok: true, store, steps}` with a new store, or
  * `{ok: false, fault}`. The input store is never changed, so a fault leaves
- * it exactly as it was. Each item of the store is `{item, handlers}`;
- * `handlers` is the item's handler table once it has been rendered, null
- * until then, and an updated item gets a fresh record.
+ * it exactly as it was. A store is `{name, keep, limit, keys, items}`:
+ * `keys` in order, `items` a Map from key to the item's parsed JSON value.
+ * What is rendered from it (nodes, handler tables) belongs to the DOM side.
  *
  * `steps` is what the DOM must do, in order, to follow the store:
  * - `{op: "reset"}`: remove every child;
@@ -176,7 +174,7 @@ export function applyEntry(store, entry, knownNames) {
       if (index !== at) {
         return fault(entry.name, "insert_wrong_index", `update of a held key at ${at}, the key is at ${index}`);
       }
-      items.set(key, { item, handlers: null });
+      items.set(key, item);
       steps.push({ op: "update", key, at });
     } else {
       if (at < 0 || at > keys.length) {
@@ -184,7 +182,7 @@ export function applyEntry(store, entry, knownNames) {
       }
       const before = at < keys.length ? keys[at] : null;
       keys.splice(at, 0, key);
-      items.set(key, { item, handlers: null });
+      items.set(key, item);
       steps.push({ op: "insert", key, at, before });
     }
   }

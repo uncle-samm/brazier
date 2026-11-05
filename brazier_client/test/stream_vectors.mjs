@@ -42,13 +42,13 @@ function storeOf(vector) {
   for (const { key, item } of vector.before) {
     assert.ok(!store.items.has(key), `${vector.name}: 'before' repeats key ${key}`);
     store.keys.push(key);
-    store.items.set(key, { item, handlers: null });
+    store.items.set(key, item);
   }
   return store;
 }
 
 function contents(store) {
-  return store.keys.map((key) => ({ key, item: store.items.get(key).item }));
+  return store.keys.map((key) => ({ key, item: store.items.get(key) }));
 }
 
 // Apply a frame's streams field (one entry here) as the runtime does: the
