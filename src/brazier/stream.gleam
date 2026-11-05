@@ -39,10 +39,13 @@
 //// Each op calls the stream's `key` and `encode` when it is called, so it
 //// holds the item's key and JSON text, never the item.
 ////
-//// Not wired yet: the ops are values of type `Ops`, which `emitted` reads.
-//// The next step of Milestone 118 makes each op function return an
-//// `Effect(msg)` holding the same ops, and adds `stream.render`.
+//// Each op function returns an `Effect(msg)`. Ops compose with
+//// `effect.batch`, in order, and `effect.map` passes them through, so a
+//// child module's ops reach its parent. `effect.keyed` and
+//// `effect.cancellable` do not key them: an op is applied when its update
+//// returns. `emitted` lists the ops an effect carries, for tests.
 
+import brazier/effect.{type Effect}
 import brazier/internal/stream_op
 import gleam/dict
 import gleam/dynamic/decode
@@ -76,12 +79,6 @@ pub type Limit {
 pub type Position {
   Append
   Prepend
-}
-
-/// Stream ops, in the order they are applied. The op functions return
-/// them; `emitted` lists them.
-pub opaque type Ops {
-  Ops(ops: List(stream_op.Op))
 }
 
 /// One stream op, for app unit tests: the stream's name, the item's key
@@ -144,8 +141,14 @@ pub fn key(stream: Stream(item), item: item) -> String {
 /// ```gleam
 /// stream.insert(log(), Line(id: "7", text: "done"), at: stream.Append)
 /// ```
-pub fn insert(stream: Stream(item), item: item, at position: Position) -> Ops {
-  Ops([insert_op(stream, stream.key(item), encode(stream, item), position)])
+pub fn insert(
+  stream: Stream(item),
+  item: item,
+  at position: Position,
+) -> Effect(msg) {
+  effect.from_stream_ops([
+    insert_op(stream, stream.key(item), encode(stream, item), position),
+  ])
 }
 
 /// Insert several items: `Append` keeps the list's order at the end,
@@ -161,7 +164,7 @@ pub fn insert_many(
   stream: Stream(item),
   items: List(item),
   at position: Position,
-) -> Ops {
+) -> Effect(msg) {
   let entries = unique_entries(stream, items)
   // Prepending one by one puts the last prepended first, so the list is
   // prepended from its end.
@@ -169,7 +172,7 @@ pub fn insert_many(
     Append -> entries
     Prepend -> list.reverse(entries)
   }
-  Ops(
+  effect.from_stream_ops(
     list.map(entries, fn(entry) {
       insert_op(stream, entry.0, entry.1, position)
     }),
@@ -178,13 +181,13 @@ pub fn insert_many(
 
 /// Delete the item with `item`'s key. A key not in the stream changes
 /// nothing; the runtime logs it at warning.
-pub fn delete(stream: Stream(item), item: item) -> Ops {
+pub fn delete(stream: Stream(item), item: item) -> Effect(msg) {
   delete_key(stream, stream.key(item))
 }
 
 /// Delete the item with `key` (LiveView `stream_delete_by_dom_id/3`).
-pub fn delete_key(stream: Stream(item), key: String) -> Ops {
-  Ops([
+pub fn delete_key(stream: Stream(item), key: String) -> Effect(msg) {
+  effect.from_stream_ops([
     stream_op.Op(
       name: stream.name,
       limit: to_op_limit(stream.limit),
@@ -196,8 +199,8 @@ pub fn delete_key(stream: Stream(item), key: String) -> Ops {
 /// Empty the stream, then insert `items` in order at the end.
 /// `reset(stream, [])` empties it. A key that appears twice is one item, as
 /// in `insert_many`.
-pub fn reset(stream: Stream(item), items: List(item)) -> Ops {
-  Ops([
+pub fn reset(stream: Stream(item), items: List(item)) -> Effect(msg) {
+  effect.from_stream_ops([
     stream_op.Op(
       name: stream.name,
       limit: to_op_limit(stream.limit),
@@ -206,15 +209,17 @@ pub fn reset(stream: Stream(item), items: List(item)) -> Ops {
   ])
 }
 
-/// The ops, in the order they are applied: an `insert_many` with `Prepend`
-/// lists its items from the last.
+/// The stream ops an effect carries, in the order they are applied: an
+/// `insert_many` with `Prepend` lists its items from the last. The
+/// effect's other callbacks are ignored.
 ///
 /// ```gleam
 /// stream.emitted(stream.delete_key(log(), "7"))
 /// // -> [stream.Deleted(stream: "log", key: "7")]
 /// ```
-pub fn emitted(ops: Ops) -> List(Emitted) {
-  list.map(ops.ops, fn(op) {
+pub fn emitted(effect: Effect(msg)) -> List(Emitted) {
+  let #(ops, _rest) = effect.take_stream_ops(effect)
+  list.map(ops, fn(op) {
     case op.action {
       stream_op.Insert(key, json, at) ->
         Inserted(stream: op.name, key: key, json: json, at: case at {
@@ -234,12 +239,6 @@ pub fn round_trip(stream: Stream(item), item: item) -> Result(item, String) {
     Ok(decoded) -> Ok(decoded)
     Error(error) -> Error(describe_json_error(error))
   }
-}
-
-/// The ops as data, for the runtime.
-@internal
-pub fn to_ops(ops: Ops) -> List(stream_op.Op) {
-  ops.ops
 }
 
 /// A public limit as the internal one.
