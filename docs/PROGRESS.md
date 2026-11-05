@@ -907,6 +907,10 @@
         - verified on the merged tree (all of phase C): build (zero warnings), format, lint, docs, `make test-client` pass; 2377 tests pass 3 runs in a row; CDP 1033/1033 desktop, whose 26 example builds log no app warning and are refused none;
         - [ ] follow-up: refusals in Brazier modules copied whole (`brazier/element`, …) name only the copy path (its line equals the source's); naming `brazier_root/src/<module>.gleam` too would be easy.
   - The unnamed flake: every run's log is kept; if it recurs it is named and fixed at its root.
+- [ ] Phase D (started 2026-11-05 at caba494, disjoint files), the open follow-ups of phase C:
+  - m118-client-decode: direct model decoders for `decode_model` (paths built only on failure; Modorra R3), `event_names` computed during the render, the render reserving the other `data-brazier-*` names. Owns codec_gen, client_entry, server_codec, analyzer, the render and its ffi, the attribute module, `brazier_client/`, `priv/static`, `client_bench`.
+  - m118-server-residue: `url.gleam` lowercasing, `transport.gleam`'s `string_tree.to_string`, `brazier/stress` joining with the build id, `persistent_term` entries outliving a crashed listener tree, refusals in whole-copied Brazier modules naming their source. Owns url, transport, stress, the listener files, client_bundle, reach, source_map.
+  - Then the perf re-baseline (patch_bench, the 15 stream metrics, the CDP morph decision), on an idle machine.
 - Decision, 2026-11-05: 4401 stays shared by an `init` 401 and a revoked or expired session. Both mean "authentication is no longer valid; reload" to the client. The server tells them apart by a distinct cause in the close's log line and telemetry metadata. m118-logs builds it.
 - Decision, 2026-11-05: m118-logs reproduced L453. Both problems are in the runtime's send paths:
   - `message_queue_len` returns an invented 1000000000 for a dead pid, so a dead connection is reported as slow on every broadcast;
