@@ -133,6 +133,21 @@ fn join(socket: RawSocket, observer: Subject(Observed)) -> Nil {
   Nil
 }
 
+/// Close the socket and wait until the server has run `on_close` for this
+/// connection, so the notice is received here and not left for the next
+/// test.
+fn close(
+  socket: RawSocket,
+  observer: Subject(Observed),
+  conn_id: String,
+) -> Nil {
+  raw_close(socket)
+  let assert Ok(ClosedConn(closed)) = process.receive(observer, 5000)
+    as "on_close must run"
+  let assert True = closed == conn_id
+  Nil
+}
+
 /// The next frame that is not a ping.
 fn next_frame(socket: RawSocket) -> #(Int, BitArray) {
   case raw_recv_frame(socket, 5000) {
@@ -200,11 +215,11 @@ pub fn outside_dev_mode_no_connection_subscribes_test() {
   pubsub.start()
   let assert False = live_reload_enabled()
   let #(listener, port, observer) = start_server()
-  let #(socket, _conn_id) = open(port, observer)
+  let #(socket, conn_id) = open(port, observer)
   join(socket, observer)
   let assert 0 = pubsub.local_subscriber_count(live_reload_topic())
   let assert Ok(0) = notify_browser_reload()
-  raw_close(socket)
+  close(socket, observer, conn_id)
   server.stop(listener)
 }
 

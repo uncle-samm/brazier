@@ -2,12 +2,16 @@
 /// request-line forms, message framing (smuggling), header limits,
 /// keep-alive, HEAD, slow clients, crash isolation and supervision.
 import brazier/await
+import brazier/monitored
+import brazier/telemetry
 import brazier/transport
 import brazier/transport/http as transport_http
 import brazier/transport/server.{type Connection, type Socket, Bytes}
 import gleam/bit_array
 import gleam/bytes_tree
-import gleam/erlang/process
+import gleam/dict
+import gleam/dynamic/decode
+import gleam/erlang/process.{type Subject}
 import gleam/http/request.{type Request}
 import gleam/http/response
 import gleam/int
@@ -702,35 +706,122 @@ pub fn per_ip_connection_cap_answers_503_test() {
     start_server(
       transport.SecurityLimits(..fast_limits(), max_connections_per_ip: 2),
     )
+  use events <- connection_events(listener)
   let a = open(listener)
   let b = open(listener)
-  await_count(listener, 2)
+  expect_connection_event(events, #("accepted", "ok"))
+  expect_connection_event(events, #("accepted", "ok"))
+  // The connection owner takes a slot before the acceptor emits accepted.
+  let assert 2 = server.get_connection_count(listener)
   let c = open(listener)
   let assert Ok(#(503, headers, _)) = raw_recv_response(c, 2000, True)
     as "connection over the per-IP cap must get 503"
   let assert Ok("close") = header(headers, "connection")
+  expect_connection_event(events, #("rejected", "max_connections_per_ip"))
   raw_close(c)
   raw_close(a)
   raw_close(b)
-  // Slots free up again once the clients go away.
-  await_count(listener, 0)
+  // Slots free up again once the clients go away: the owner releases a
+  // slot before it emits closed.
+  expect_connection_event(events, #("closed", "normal"))
+  expect_connection_event(events, #("closed", "normal"))
+  let assert 0 = server.get_connection_count(listener)
   let #(status, _, _) = exchange(listener, get("/"))
   let assert 200 = status
+  expect_connection_event(events, #("accepted", "ok"))
+  expect_connection_event(events, #("closed", "normal"))
   server.stop(listener)
 }
 
 pub fn global_connection_cap_answers_503_test() {
   let listener =
     start_server(transport.SecurityLimits(..fast_limits(), max_connections: 1))
+  use events <- connection_events(listener)
   let a = open(listener)
-  await_count(listener, 1)
+  expect_connection_event(events, #("accepted", "ok"))
+  let assert 1 = server.get_connection_count(listener)
   let b = open(listener)
   let assert Ok(#(503, _, _)) = raw_recv_response(b, 2000, True)
     as "connection over the global cap must get 503"
+  expect_connection_event(events, #("rejected", "max_connections"))
   raw_close(b)
   raw_close(a)
+  expect_connection_event(events, #("closed", "normal"))
+  let assert 0 = server.get_connection_count(listener)
   server.stop(listener)
 }
+
+/// Run `run` with `listener`'s `[brazier, http, connection, *]` events
+/// forwarded to the subject it gets, as `#(outcome, reason)`. The events
+/// are node-wide, and a listener an earlier test left running may still
+/// emit one; a telemetry handler runs in the process that emits, so this
+/// one forwards only what this listener's acceptors (accepted, rejected)
+/// and connection owner (closed) emit. The test receives every event it
+/// causes, so none is left once the handler is detached.
+fn connection_events(
+  listener: server.Listener,
+  run: fn(Subject(#(String, String))) -> a,
+) -> a {
+  let assert Ok(owner) = server.get_connection_owner(listener)
+    as "a started listener has a connection owner"
+  let acceptors = raw_acceptor_pids(server.get_supervisor(listener))
+  let assert True = acceptors != []
+  let emitters = [owner, ..acceptors]
+  let events = process.new_subject()
+  let id = "http_server_test_connections_" <> int.to_string(unique_integer())
+  use <- monitored.with_handler(
+    id,
+    [
+      ["brazier", "http", "connection", "accepted"],
+      ["brazier", "http", "connection", "rejected"],
+      ["brazier", "http", "connection", "closed"],
+    ],
+    fn(event: telemetry.Event) {
+      case list.contains(emitters, process.self()) {
+        True -> process.send(events, connection_event(event))
+        False -> Nil
+      }
+    },
+  )
+  run(events)
+}
+
+fn connection_event(event: telemetry.Event) -> #(String, String) {
+  let assert ["brazier", "http", "connection", outcome] = event.name
+  let assert Ok(reason) = dict.get(event.metadata, "reason")
+    as "a connection event carries a reason"
+  let assert Ok(reason) = decode.run(reason, decode.string)
+    as "a connection event's reason is a string"
+  #(outcome, reason)
+}
+
+/// The next connection event must be `expected`.
+fn expect_connection_event(
+  events: Subject(#(String, String)),
+  expected: #(String, String),
+) -> Nil {
+  case process.receive(events, await.deadline_ms) {
+    Ok(got) if got == expected -> Nil
+    Ok(got) ->
+      panic as {
+        "expected connection event "
+        <> string.inspect(expected)
+        <> ", got "
+        <> string.inspect(got)
+      }
+    Error(Nil) ->
+      panic as {
+        "expected connection event "
+        <> string.inspect(expected)
+        <> " within "
+        <> int.to_string(await.deadline_ms)
+        <> " ms"
+      }
+  }
+}
+
+@external(erlang, "erlang", "unique_integer")
+fn unique_integer() -> Int
 
 pub fn killed_acceptor_is_restarted_test() {
   let listener = start_server(fast_limits())
