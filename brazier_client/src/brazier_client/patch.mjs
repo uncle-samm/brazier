@@ -449,8 +449,10 @@ export const CLOSE_AUTH_REVOKED = 4401;
  * Close code for a join whose build id is not the client bundle the server
  * serves now: the app was rebuilt since the page loaded. It is in the reload
  * range, so the page reloads (behind the reload guard) and gets the new bundle.
+ * It is 4000 + 499, the one status an init refusal cannot use, so it never
+ * shares a code with an init refusal (4409 is an init 409).
  */
-export const CLOSE_STALE_BUILD = 4409;
+export const CLOSE_STALE_BUILD = 4499;
 /**
  * Close codes 4400 to 4499: the server refused this page's session. `init`
  * refused it with a client error (4000 + an HTTP 4xx status, 4401 also for a

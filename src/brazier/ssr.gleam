@@ -183,22 +183,23 @@ pub type RenderedPage {
 ///    `error.unavailable`); its reason is logged, never rendered. A crash
 ///    in `init` propagates, and the transport answers it with 500.
 /// 4. Apply the route message through `update` (effects dropped likewise).
-/// 5. Render `view` and wrap it in the HTML document with the client script
-///    named by the app's manifest (`client_assets_dir`). A missing or
-///    damaged manifest or bundle is a 500 static error page.
+/// 5. Render `view` and wrap it in the HTML document with the script of the
+///    client bundle the server loaded when it started (`client_bundle`); no
+///    file is read. A bundle that could not be loaded is a 500 static error
+///    page.
 pub fn render_page(
   config: SsrConfig(state, msg),
   req: Request(body),
 ) -> RenderedPage {
-  render_page_from(config, req, client_assets_dir())
+  render_page_with_bundle(config, req, client_bundle())
 }
 
-/// `render_page` with the client bundle read from `assets_dir` instead of
-/// the app's `priv/static`.
-pub fn render_page_from(
+/// `render_page` with the given client bundle, `Error` with the reason it
+/// could not be loaded, instead of the loaded one.
+pub fn render_page_with_bundle(
   config: SsrConfig(state, msg),
   req: Request(body),
-  assets_dir: String,
+  bundle: Result(String, String),
 ) -> RenderedPage {
   let page_uri = request.to_uri(req)
   let path = describe_uri(page_uri)
@@ -246,7 +247,7 @@ pub fn render_page_from(
                   routed
                 }
               }
-              render_state(config, state, path, assets_dir)
+              render_state(config, state, path, bundle)
             }
           }
         }
@@ -323,14 +324,14 @@ fn render_state(
   config: SsrConfig(state, msg),
   state: state,
   path: String,
-  assets_dir: String,
+  bundle: Result(String, String),
 ) -> RenderedPage {
   let view_html = element.to_string(config.view(state))
   let model_json = case config.recovery_encoder {
     Some(encode) -> Some(encode(state))
     None -> None
   }
-  case client_bundle_name(assets_dir) {
+  case bundle {
     Ok(bundle) -> {
       let html =
         build_html_document(
@@ -339,6 +340,7 @@ fn render_state(
           config.head_html,
           config.dev_mode,
           Some(bundle),
+          dev_build(),
         )
       log.debug("brazier.ssr", "Dead render complete for " <> path)
       RenderedPage(
@@ -350,8 +352,9 @@ fn render_state(
       )
     }
     // A page whose script cannot load is not interactive: serve a static
-    // 500 instead. `brazier.start` checks the bundle at startup, so this
-    // means it was removed or damaged while the server was running.
+    // 500 instead. A server start fails when the bundle cannot be loaded,
+    // so this is a `brazier/dev` rebuild whose bundle did not load, or a
+    // render without a started server.
     Error(reason) -> {
       log.error(
         "brazier.ssr",
@@ -386,6 +389,7 @@ fn render_error_page(
       element.to_string(page),
       config.head_html,
       config.dev_mode,
+      None,
       None,
     )
   RenderedPage(
@@ -725,13 +729,15 @@ fn try_or(
 }
 
 /// Build a full HTML document with the view and, for a live page, the
-/// script tag of the client bundle named `bundle`.
+/// script tag of the client bundle named `bundle` and the dev build
+/// (`new_dev_build`) its join reports.
 fn build_html_document(
   title: String,
   view_html: String,
   head_html: Option(String),
   dev_mode: Bool,
   bundle: Option(String),
+  dev_build: Option(String),
 ) -> String {
   let extra_head = case head_html {
     Some(html) -> html
@@ -739,6 +745,10 @@ fn build_html_document(
   }
   let client_script = case bundle {
     Some(name) -> "<script src=\"/" <> name <> "\"></script>"
+    None -> ""
+  }
+  let dev_build_attribute = case dev_build {
+    Some(id) -> " data-brazier-dev-build=\"" <> render.escape_html(id) <> "\""
     None -> ""
   }
   string.concat([
@@ -756,7 +766,9 @@ fn build_html_document(
       True -> "true"
       False -> "false"
     },
-    "\">",
+    "\"",
+    dev_build_attribute,
+    ">",
     view_html,
     "</div>",
     client_script,
@@ -772,51 +784,89 @@ pub fn client_assets_dir() -> String {
   "priv/static"
 }
 
-/// The bundle file named by `brazier_client.manifest` in `assets_dir`. The
-/// name must be exact build output (`static.is_client_bundle_name`), and
-/// the file must exist.
+/// Read the app's client bundle name from disk
+/// (`client_bundle_name(client_assets_dir())`) and store it as the bundle
+/// every page render and every join uses (`client_bundle`). The outcome is
+/// stored either way: after a failed load, pages answer 500 and joins with
+/// a build id close 1011 until a load succeeds, rather than serving a
+/// bundle the server can no longer vouch for.
 ///
-/// Every page render and every join asks for the name, so it is cached per
-/// manifest and validated against the manifest's stat on each call: a hit
-/// costs a stat of the manifest and one of the bundle, with no read. A
-/// rebuild (`brazier/dev` rebuilds into a running server) changes the stat
-/// and is seen on the next call; a manifest rewritten within the second it
-/// was read is never trusted (see `brazier_bundle_manifest_ffi`).
-pub fn client_bundle_name(assets_dir: String) -> Result(String, String) {
-  let manifest_path = assets_dir <> "/brazier_client.manifest"
-  case manifest_stamp(manifest_path) {
-    // The read reports why the manifest cannot be stat'ed.
-    Error(Nil) -> read_client_bundle_name(assets_dir, manifest_path)
-    Ok(stamp) ->
-      case cached_bundle_name(manifest_path, stamp) {
-        Ok(name) -> check_client_bundle_exists(assets_dir, manifest_path, name)
-        Error(Nil) -> {
-          use name <- result.map(read_client_bundle_name(
-            assets_dir,
-            manifest_path,
-          ))
-          remember_bundle_name(manifest_path, stamp, name)
-          name
-        }
-      }
+/// The server calls this when it starts (`brazier.start`, and each
+/// `transport.start_listener`), so a failure fails the start, and
+/// `brazier/dev` calls it again after each successful rebuild. Nothing else
+/// reads the manifest: a page render or a join touches no file.
+/// Reference: Phoenix's static manifest (`cache_static_manifest`), read
+/// once when the endpoint starts.
+pub fn load_client_bundle() -> Result(String, String) {
+  let loaded = client_bundle_name(client_assets_dir())
+  case store_bundle(loaded), loaded {
+    True, Ok(name) -> log.info("brazier.ssr", "Client bundle loaded: " <> name)
+    False, Ok(name) ->
+      log.debug("brazier.ssr", "Client bundle unchanged: " <> name)
+    _, Error(reason) ->
+      log.error("brazier.ssr", "Cannot load the client bundle: " <> reason)
+  }
+  loaded
+}
+
+/// The client bundle `load_client_bundle` loaded last, read from memory:
+/// the script every live page loads, and the build a join is checked
+/// against. An `Error` when that load failed, or when no load ran (code
+/// that renders without a started server).
+pub fn client_bundle() -> Result(String, String) {
+  case loaded_bundle() {
+    Ok(loaded) -> loaded
+    Error(Nil) ->
+      Error(
+        "no client bundle was loaded: the server loads it when it starts "
+        <> "(brazier.start, transport.start_listener)",
+      )
   }
 }
 
-/// Manifest paths whose bundle name is cached (at most 4).
-@external(erlang, "brazier_bundle_manifest_ffi", "cached_manifests")
-pub fn cached_bundle_manifests() -> List(String)
+/// The bundle file named by `brazier_client.manifest` in `assets_dir`, read
+/// from disk. The name must be exact build output
+/// (`static.is_client_bundle_name`), and the file must exist.
+/// `load_client_bundle` is the server's one caller; a render or a join uses
+/// the loaded name (`client_bundle`).
+pub fn client_bundle_name(assets_dir: String) -> Result(String, String) {
+  read_client_bundle_name(assets_dir, assets_dir <> "/brazier_client.manifest")
+}
 
-/// A manifest's size, mtime and inode, and the second they were read.
-type ManifestStamp
+/// Start a new dev build: a random id that every page rendered from now on
+/// carries (`data-brazier-dev-build`) and sends back with its join. A join
+/// with another id comes from a page rendered before the last rebuild, and
+/// the transport tells it to reload. That reaches a page that was between
+/// sockets when the rebuild's `reload` was broadcast.
+///
+/// Only `brazier/dev` calls this, when it starts and after each successful
+/// rebuild; a server outside dev mode has no dev build.
+/// Reference: Phoenix LiveView's `phx-track-static`, which compares the
+/// static assets a page loaded with the server's on every join.
+pub fn new_dev_build() -> String {
+  let id = bit_array.base16_encode(crypto.strong_random_bytes(8))
+  store_dev_build(id)
+  log.info("brazier.ssr", "Dev build is now " <> id)
+  id
+}
 
-@external(erlang, "brazier_bundle_manifest_ffi", "stamp")
-fn manifest_stamp(path: String) -> Result(ManifestStamp, Nil)
+/// The current dev build (`new_dev_build`); `None` outside dev mode.
+pub fn dev_build() -> Option(String) {
+  stored_dev_build()
+}
 
-@external(erlang, "brazier_bundle_manifest_ffi", "cached")
-fn cached_bundle_name(path: String, stamp: ManifestStamp) -> Result(String, Nil)
+/// Store a load's outcome; True when it differs from the stored one.
+@external(erlang, "brazier_bundle_manifest_ffi", "store_bundle")
+fn store_bundle(loaded: Result(String, String)) -> Bool
 
-@external(erlang, "brazier_bundle_manifest_ffi", "remember")
-fn remember_bundle_name(path: String, stamp: ManifestStamp, name: String) -> Nil
+@external(erlang, "brazier_bundle_manifest_ffi", "loaded_bundle")
+fn loaded_bundle() -> Result(Result(String, String), Nil)
+
+@external(erlang, "brazier_bundle_manifest_ffi", "store_dev_build")
+fn store_dev_build(id: String) -> Nil
+
+@external(erlang, "brazier_bundle_manifest_ffi", "dev_build")
+fn stored_dev_build() -> Option(String)
 
 fn client_bundle_hint() -> String {
   " Run `gleam run -m brazier/build`."

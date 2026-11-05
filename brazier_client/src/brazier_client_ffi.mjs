@@ -79,7 +79,7 @@ let started = false;
 // that is evaluating now (`/brazier_client_<hash>.js`). document.currentScript
 // is only set while a classic script runs, so it is read here, at evaluation.
 // The join carries it, and a server whose bundle is another one refuses the
-// join with CLOSE_STALE_BUILD (4409), which reloads the page. Null when the
+// join with CLOSE_STALE_BUILD (4499), which reloads the page. Null when the
 // page loaded the bundle from another URL, such as the stable
 // /brazier_client.js; the join then carries no build and is not checked.
 const BUILD_ID =
@@ -186,6 +186,14 @@ const throttled = new Map();
 // before building the detail; trace checks it again for the rest.
 let devMode = false;
 
+// The dev build this page was rendered under: data-brazier-dev-build on the
+// app root, which the server renders under `brazier/dev` (a new id after
+// every rebuild). Read once at boot, since it names this document, and sent
+// with every join. A page that was between sockets when a rebuild's `reload`
+// was broadcast is told to reload by its next join instead. Null outside
+// dev mode; the join then carries none.
+let pageDevBuild = null;
+
 function trace(kind, detail = {}) {
   if (!devMode) return;
   traceBuffer.push({ ts: Date.now(), kind, ...detail });
@@ -278,6 +286,7 @@ function boot() {
   ensureBrazierDebug();
   ensureHookRegistry();
   setAppRoot(root);
+  pageDevBuild = root.getAttribute("data-brazier-dev-build");
   // Until the first render there is no handler table: listen for the events
   // the server-rendered markup names, so they can be queued and replayed.
   listenFor(markupEventNames(root));
@@ -717,6 +726,7 @@ function sendJoin(socket) {
   }
   const join = { type: "join", token: "", path: location.pathname + location.search };
   if (BUILD_ID !== null) join.build = BUILD_ID;
+  if (pageDevBuild !== null) join.dev_build = pageDevBuild;
   if (!writeSocket(socket, join)) {
     console.error("[brazier] Join could not be written; closing the socket to reconnect");
     socket.close(4000, "join send failed");
@@ -895,11 +905,14 @@ if (typeof window !== "undefined") {
       return state;
     };
     // What the client still owes the server: the messages waiting in the
-    // paced queue, and whether a paced send is scheduled. A test waits for
-    // { queued: 0, scheduled: false } instead of a quiet period.
+    // paced queue, whether a paced send is scheduled, and the debounced
+    // messages whose timer has not fired (each is dispatched, and may be
+    // sent, when it does). A test waits for
+    // { queued: 0, scheduled: false, debounced: 0 } instead of a quiet period.
     window.__brazierOutboundPendingForTest = () => ({
       queued: outbound.length,
       scheduled: pumpTimer !== null,
+      debounced: debounced.size,
     });
   }
 }

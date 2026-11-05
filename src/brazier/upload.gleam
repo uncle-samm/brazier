@@ -291,7 +291,26 @@ pub fn read_multipart(
   use Nil <- result.try(check_declared_length(req, config.max_request_bytes))
   case transport_http.read_body(req, config.max_request_bytes) {
     Ok(body) -> parse_body(body, boundary, config)
-    Error(reason) -> {
+    // check_declared_length has already refused an over-limit length, so
+    // read_body reports BodyTooLarge here only if the two checks disagree.
+    // It is the same refusal either way, and keeps its 413.
+    Error(transport_http.BodyTooLarge(length:, limit:)) -> {
+      log.warning(
+        "brazier.upload",
+        "Multipart body of "
+          <> int.to_string(length)
+          <> " bytes exceeds the "
+          <> int.to_string(limit)
+          <> " byte limit on "
+          <> log_path.describe(req.path),
+      )
+      Error(RequestTooLarge(max: limit, actual: length))
+    }
+    Error(transport_http.MissingContentLength as error)
+    | Error(transport_http.InvalidContentLength as error)
+    | Error(transport_http.BodyAlreadyConsumed as error)
+    | Error(transport_http.BodyReadFailed(..) as error) -> {
+      let reason = transport_http.describe_read_body_error(error)
       log.warning(
         "brazier.upload",
         "Cannot read multipart body for "
@@ -534,7 +553,7 @@ fn check_declared_length(
               <> " bytes exceeds the "
               <> int.to_string(max)
               <> " byte limit on "
-              <> req.path,
+              <> log_path.describe(req.path),
           )
           Error(RequestTooLarge(max: max, actual: length))
         }

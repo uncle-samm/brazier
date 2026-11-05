@@ -27,8 +27,9 @@ waited for.
 
 A check that the browser sent NO model event (local-only messages) waits,
 after the local update is visible, for the client's outbound queue to be
-empty with no paced send scheduled (`window.__brazierOutboundPendingForTest`,
-installed by the test hooks), then takes a CDP barrier so every frame the
+empty with no paced send scheduled and no debounced message waiting
+(`window.__brazierOutboundPendingForTest`, installed by the test hooks),
+then takes a CDP barrier so every frame the
 page wrote has been recorded. Pong's "frozen while paused" check is the one
 deliberate time window: holding still for many ticks is the thing under
 test.
@@ -397,11 +398,14 @@ OUTBOUND_PENDING_JS = (
     'JSON.stringify(typeof window.__brazierOutboundPendingForTest === "function"'
     ' ? window.__brazierOutboundPendingForTest() : "missing")'
 )
-OUTBOUND_DRAINED = json.dumps({"queued": 0, "scheduled": False}, separators=(",", ":"))
+OUTBOUND_DRAINED = json.dumps(
+    {"queued": 0, "scheduled": False, "debounced": 0}, separators=(",", ":")
+)
 
 def wait_outbound_drained(msg):
     """Wait until the client owes the server nothing: its paced queue is
-    empty and no paced send is scheduled. Then take a barrier, so the CDP
+    empty, no paced send is scheduled and no debounced message waits for its
+    timer. Then take a barrier, so the CDP
     events for every frame the page wrote before that are recorded. Only for
     checks that something did NOT happen (no model event for a local
     message), and only after the local update is visible: a model event the
@@ -1902,6 +1906,68 @@ stop_server(); print()
 # == 20. Explicit Routed App ==
 ROUTED_COUNT_JS = 'document.querySelector("[data-testid=count]")?.textContent || ""'
 
+FRAGMENT_SCROLL_STATE_JS = (
+    "JSON.stringify({path: location.pathname, hash: location.hash, "
+    "scrollY: Math.round(window.scrollY), "
+    'rootTop: Math.round(document.getElementById("brazier-app").getBoundingClientRect().top), '
+    "marker: window.__brazierCdpFragmentNav || null})"
+)
+
+def check_fragment_scroll_after_live_navigation(path, fragment_text, other_path, other_text):
+    """A live navigation to another page's #fragment scrolls to it once that
+    page is rendered, and one to a fragment the page lacks scrolls to the
+    top. history.pushState never scrolls, so without the client's fragment
+    scroll the page would stay where it was. The examples have no fragment
+    links, so the check adds one outside #brazier-app (the morph never
+    touches it) and pads the body so the app root sits below the fold; the
+    target is #brazier-app, which every page has. A window marker proves
+    neither click loaded a new document."""
+    marker = json.dumps(f"fragment-{time.time_ns()}")
+    setup = evl(
+        "(function(){"
+        'var style = document.createElement("style"); style.id = "cdp-fragment-pad";'
+        'style.textContent = "body{padding-top:3000px;padding-bottom:3000px}";'
+        "document.head.appendChild(style);"
+        'var a = document.createElement("a"); a.id = "cdp-fragment-link"; a.textContent = "fragment";'
+        'a.style.position = "fixed"; a.style.top = "0"; a.style.left = "0";'
+        "document.body.appendChild(a);"
+        f"window.__brazierCdpFragmentNav = {marker}; window.scrollTo(0, 0);"
+        'return "ready";})()'
+    )
+    check(setup == "ready", f"Fragment scroll: test link and padding installed ({setup})")
+    check(count_js("Math.round(window.scrollY)") == 0, "Fragment scroll: starts at the top")
+
+    clear_cdp_events()
+    evl(f'document.getElementById("cdp-fragment-link").setAttribute("href", {json.dumps(path + "#brazier-app")}); 0')
+    click("#cdp-fragment-link")
+    landed = wait_for_js(
+        f"location.pathname === {json.dumps(path)} && location.hash === \"#brazier-app\" && "
+        f'(document.getElementById("brazier-app")?.textContent || "").includes({json.dumps(fragment_text)}) && '
+        "window.scrollY > 2000 && "
+        'Math.abs(document.getElementById("brazier-app").getBoundingClientRect().top) <= 1'
+    )
+    check(landed, f"Fragment scroll: live navigation to {path}#brazier-app scrolls to the fragment ({evl(FRAGMENT_SCROLL_STATE_JS)})")
+    check(str(evl("window.__brazierCdpFragmentNav")) == json.loads(marker), "Fragment scroll: no page load")
+    sent = [p.get("path") for p in websocket_json_payloads("Sent") if p.get("type") == "navigate"]
+    check(sent == [path], f"Fragment scroll: the server is told the path without the fragment ({sent})")
+
+    clear_cdp_events()
+    evl(f'document.getElementById("cdp-fragment-link").setAttribute("href", {json.dumps(other_path + "#cdp-no-such-id")}); 0')
+    click("#cdp-fragment-link")
+    topped = wait_for_js(
+        f"location.pathname === {json.dumps(other_path)} && location.hash === \"#cdp-no-such-id\" && "
+        f'(document.getElementById("brazier-app")?.textContent || "").includes({json.dumps(other_text)}) && '
+        "window.scrollY === 0"
+    )
+    check(topped, f"Fragment scroll: a fragment the page lacks scrolls to the top ({evl(FRAGMENT_SCROLL_STATE_JS)})")
+    check(str(evl("window.__brazierCdpFragmentNav")) == json.loads(marker), "Fragment scroll: still no page load")
+
+    removed = evl(
+        '(function(){document.getElementById("cdp-fragment-pad").remove();'
+        'document.getElementById("cdp-fragment-link").remove(); return "removed";})()'
+    )
+    check(removed == "removed", f"Fragment scroll: test link and padding removed ({removed})")
+
 print("-- 20: Explicit Routing --")
 if start_example("routed", module="main"):
     install_dom_monitor()
@@ -1945,6 +2011,9 @@ if start_example("routed", module="main"):
     check_history_go(1, "/stats", "Stats", "Explicit routed app history forward to stats")
 
     check_dom_conformance("Explicit routed app")
+    # After the conformance check: the padding it installs is not the app's
+    # layout.
+    check_fragment_scroll_after_live_navigation("/about", "About", "/settings", "Settings")
     check(errors() == "0", f"Zero errors ({error_list()})")
 
     # The browser logs the 404 document load itself as a console error, so

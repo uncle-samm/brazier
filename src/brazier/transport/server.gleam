@@ -149,6 +149,46 @@ pub fn send_close_frame(socket: Socket) -> Result(Nil, String) {
 
 // --- HTTP Body Reading ---
 
+/// Why `read_body` returned no bytes. After any of these but
+/// `NoActiveRequest` and `ReadPastBody` the body is marked failed: the
+/// connection answers and closes, because the rest of the body can no
+/// longer be found in the stream.
+pub type BodyReadError {
+  /// No request body context: `read_body` was called outside an active
+  /// HTTP request. A programming error.
+  NoActiveRequest
+  /// An earlier read of this body failed.
+  BodyUnavailable
+  /// The read asked for a negative count or for more bytes than remain of
+  /// the declared Content-Length. A programming error.
+  ReadPastBody(requested: Int, remaining: Int)
+  /// No bytes arrived within `body_read_timeout_ms`.
+  BodyReadTimeout
+  /// The request ran past `request_timeout_ms` before the body arrived.
+  RequestDeadlineExceeded
+  /// The socket failed: the peer closed it or reset it.
+  SocketFailed(reason: String)
+}
+
+/// A one-line description of a `BodyReadError`, for logs and replies.
+pub fn describe_body_read_error(error: BodyReadError) -> String {
+  case error {
+    NoActiveRequest -> "read_body called outside an active HTTP request"
+    BodyUnavailable -> "request body unavailable after an earlier read failure"
+    ReadPastBody(requested:, remaining:) ->
+      "requested "
+      <> int.to_string(requested)
+      <> " body bytes with "
+      <> int.to_string(remaining)
+      <> " left of the declared Content-Length"
+    BodyReadTimeout ->
+      "body_read_timeout_ms passed before the request body arrived"
+    RequestDeadlineExceeded ->
+      "request_timeout_ms passed before the request body arrived"
+    SocketFailed(reason:) -> "request body read failed: " <> reason
+  }
+}
+
 /// Read exactly `length` bytes of the current request's body.
 ///
 /// Reads go through the per-request body context registered by the
@@ -157,7 +197,7 @@ pub fn send_close_frame(socket: Socket) -> Result(Nil, String) {
 /// deadline, and fails loudly when called outside an active request.
 /// Application code should normally use `brazier/transport/http.read_body`.
 @external(erlang, "brazier_transport_ffi", "http_body_read")
-pub fn read_body(socket: Socket, length: Int) -> Result(BitArray, String)
+pub fn read_body(socket: Socket, length: Int) -> Result(BitArray, BodyReadError)
 
 // --- TCP Message Classification ---
 

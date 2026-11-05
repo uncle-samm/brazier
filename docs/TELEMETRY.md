@@ -216,10 +216,10 @@ Notes on individual events:
   label: `peer_close`; `rate_limit_exceeded`, `too_many_invalid_messages`,
   `protocol_error`, `message_too_big`, `invalid_utf8`,
   `binary_messages_not_supported`, `pong_timeout`, `idle_timeout`,
-  `internal_error` (also a join whose server cannot read its client
-  manifest, and a dev-mode handler that cannot subscribe to reloads),
+  `internal_error` (also a join whose server has no loaded client
+  bundle, and a dev-mode handler that cannot subscribe to reloads),
   `authentication_expired`, `session_revoked`, `server_overloaded`,
-  `backpressure`, `server_shutting_down` or `stale_build` (4409, a join
+  `backpressure`, `server_shutting_down` or `stale_build` (4499, a join
   from a page of another build) or `middleware_refused` (4600, an upgrade
   the page's middleware refused; it has `frames_out` 1 and no runtime ran)
   for a close Brazier sent; `tcp_closed`,

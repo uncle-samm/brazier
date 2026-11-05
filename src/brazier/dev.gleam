@@ -17,8 +17,11 @@
 /// 3. Watches `src` for `.gleam` changes with `fswatch` (macOS) or
 ///    `inotifywait` (Linux, from inotify-tools). Each change reruns the
 ///    build; on success the changed modules are hot-reloaded into the running
-///    app and every connected browser is told to reload its page (the
-///    `reload` server message). A failed rebuild is logged and the app keeps
+///    app, the rebuilt client bundle is loaded, and every connected browser
+///    is told to reload its page (the `reload` server message). A page that
+///    was between sockets then is told on its next join: each page carries
+///    the dev build it was rendered under, and a rebuild starts a new one
+///    (`ssr.new_dev_build`). A failed rebuild is logged and the app keeps
 ///    running the last good build until the next change.
 ///
 /// Dev mode checks for the watcher before it builds, and exits with status 1
@@ -37,6 +40,7 @@ import brazier/build/program
 import brazier/build/project_toml
 import brazier/internal/dev_watch
 import brazier/log
+import brazier/ssr
 import gleam/int
 import gleam/list
 import gleam/string
@@ -74,7 +78,16 @@ fn start() -> Result(Nil, String) {
                 "Live reload on: each WebSocket subscribes to "
                   <> live_reload_topic(),
               )
-              log.info("brazier.dev", "Starting " <> app.module_path <> ".main")
+              // Every page the app renders carries the dev build, and a join
+              // from a page of an older one is told to reload.
+              let dev_build = ssr.new_dev_build()
+              log.info(
+                "brazier.dev",
+                "Starting "
+                  <> app.module_path
+                  <> ".main under dev build "
+                  <> dev_build,
+              )
               start_app(erlang_module(app.module_path))
             }
           }
@@ -147,26 +160,52 @@ fn on_change() -> Nil {
             "Rebuild failed; the app keeps running the last good build: "
               <> reason,
           )
-        Ok(_app) ->
-          case notify_browser_reload() {
-            Ok(connections) ->
-              log.info(
-                "brazier.dev",
-                "Rebuild complete; told "
-                  <> int.to_string(connections)
-                  <> " connected page(s) to reload",
-              )
-            // The app runs the new build either way. The pages open now are
-            // not reloaded; one whose client bundle changed reloads when its
-            // next join is refused with 4409 (stale build).
-            Error(reason) ->
-              log.error(
-                "brazier.dev",
-                "Rebuild complete, but telling the pages to reload failed: "
-                  <> reason,
-              )
-          }
+        Ok(_app) -> publish_rebuild()
       }
+  }
+}
+
+/// After a successful rebuild: load the rebuilt client bundle, start a new
+/// dev build, then tell every open page to reload. In that order, a page
+/// that is between sockets when the reload is broadcast joins after the
+/// new dev build, and is told to reload then (`ssr.new_dev_build`).
+fn publish_rebuild() -> Nil {
+  case ssr.load_client_bundle() {
+    // The pages are not told to reload: they would reload into a 500. A
+    // join from one closes 1011 and reconnects, and the next good rebuild
+    // reloads it.
+    Error(reason) ->
+      log.error(
+        "brazier.dev",
+        "Rebuild complete, but its client bundle cannot be loaded; pages "
+          <> "answer 500 until the next good rebuild: "
+          <> reason,
+      )
+    Ok(bundle) -> {
+      let dev_build = ssr.new_dev_build()
+      case notify_browser_reload() {
+        Ok(connections) ->
+          log.info(
+            "brazier.dev",
+            "Rebuild complete ("
+              <> bundle
+              <> ", dev build "
+              <> dev_build
+              <> "); told "
+              <> int.to_string(connections)
+              <> " connected page(s) to reload",
+          )
+        // The app runs the new build either way. A page open now is not
+        // reloaded until its next join, which the new dev build refuses
+        // with a `reload`.
+        Error(reason) ->
+          log.error(
+            "brazier.dev",
+            "Rebuild complete, but telling the pages to reload failed: "
+              <> reason,
+          )
+      }
+    }
   }
 }
 

@@ -69,15 +69,14 @@ import brazier/presence as brazier_presence
 import brazier/presence/sync as presence_sync
 import brazier/pubsub
 import brazier/runtime
+import brazier/ssr
 import brazier/transport
 import gleam/dynamic/decode
 import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
-import gleam/string
 import gleam/uri.{type Uri}
-import simplifile
 
 // ===== Context =====
 
@@ -670,51 +669,18 @@ fn require_secret_key(
   }
 }
 
-const client_manifest = "priv/static/brazier_client.manifest"
-
-const build_hint =
-  "Run `gleam run -m brazier/build` before starting the app, or `gleam run -m brazier/dev` while developing."
-
-/// Check that the client bundle built by `gleam run -m brazier/build` exists:
-/// `priv/static/brazier_client.manifest` must name a bundle in `priv/static`.
+/// Load the client bundle built by `gleam run -m brazier/build`
+/// (`ssr.load_client_bundle`): `priv/static/brazier_client.manifest` must
+/// name a bundle in `priv/static`. The server reads the manifest only here
+/// and when its listener starts; a page render or a join reads no file.
 fn require_client_bundle() -> Result(Nil, error.BrazierError) {
-  case simplifile.read(client_manifest) {
-    Error(err) ->
+  case ssr.load_client_bundle() {
+    Ok(_bundle) -> Ok(Nil)
+    Error(reason) ->
       Error(error.ConfigError(
-        reason: "No client bundle: cannot read "
-        <> client_manifest
-        <> " ("
-        <> simplifile.describe_error(err)
-        <> "). "
-        <> build_hint,
+        reason: "No client bundle: "
+        <> reason
+        <> " While developing, run `gleam run -m brazier/dev`.",
       ))
-    Ok(contents) -> {
-      let bundle = "priv/static/" <> string.trim(contents)
-      case string.trim(contents), simplifile.is_file(bundle) {
-        "", _ ->
-          Error(error.ConfigError(
-            reason: client_manifest <> " is empty. " <> build_hint,
-          ))
-        _, Ok(True) -> {
-          log.info("brazier", "Client bundle " <> bundle)
-          Ok(Nil)
-        }
-        _, Ok(False) ->
-          Error(error.ConfigError(
-            reason: client_manifest
-            <> " names "
-            <> bundle
-            <> ", which does not exist. "
-            <> build_hint,
-          ))
-        _, Error(err) ->
-          Error(error.ConfigError(
-            reason: "Cannot inspect "
-            <> bundle
-            <> ": "
-            <> simplifile.describe_error(err),
-          ))
-      }
-    }
   }
 }

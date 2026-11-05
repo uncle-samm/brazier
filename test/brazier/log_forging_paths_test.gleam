@@ -104,6 +104,29 @@ pub fn unreadable_multipart_body_quotes_the_path_test() {
   assert_not_forged(logs)
 }
 
+pub fn oversized_multipart_body_quotes_the_path_test() {
+  let req =
+    make_request(
+      <<"POST">>,
+      "/upload/" <> forged <> "?token=secret",
+      [
+        #("content-type", "multipart/form-data; boundary=XyZ"),
+        #("content-length", "999999999999"),
+      ],
+      dead_socket(),
+    )
+  let #(result, logs) =
+    log_capture.capture(fn() {
+      upload.read_multipart(req, upload.default_config())
+    })
+  let assert Error(upload.RequestTooLarge(..)) = result
+  assert log_capture.has(logs, level: "warning", containing: [
+    "Multipart body of 999999999999 bytes exceeds",
+    quoted,
+  ])
+  assert_not_forged(logs)
+}
+
 pub fn client_ip_resolution_quotes_the_path_test() {
   let req =
     make_request(

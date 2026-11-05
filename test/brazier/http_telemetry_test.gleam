@@ -37,7 +37,8 @@ fn handler(
       transport_http.tag_route("/items/:id")
       case transport_http.read_body(req, 1000) {
         Ok(body) -> Some(text(201, "got " <> bits_to_string(body)))
-        Error(reason) -> Some(text(400, reason))
+        Error(error) ->
+          Some(text(400, transport_http.describe_read_body_error(error)))
       }
     }
     "/explode/" <> _ -> {

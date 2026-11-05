@@ -1,9 +1,9 @@
 /// The build-id handshake: a `join` carries the build id of the client
 /// bundle its page loaded, and the server refuses a join from another build
-/// with close 4409 so the page reloads (see `transport.check_join_build`).
-/// Unhappy paths first: the check against a manifest in a scratch
-/// directory, then joins over a real listener and a raw TCP client, checked
-/// against the repository's `priv/static` bundle.
+/// with close 4499 so the page reloads (see `transport.check_join_build`).
+/// Unhappy paths first: the check against a given loaded bundle, then joins
+/// over a real listener and a raw TCP client, checked against the
+/// repository's `priv/static` bundle.
 import brazier/await
 import brazier/log_capture
 import brazier/ssr
@@ -14,7 +14,6 @@ import gleam/erlang/process.{type Pid, type Subject}
 import gleam/int
 import gleam/option.{type Option, None, Some}
 import gleam/string
-import simplifile
 
 // --- Harness ---
 
@@ -50,9 +49,6 @@ fn raw_upgrade_request(
 
 @external(erlang, "brazier_ws_test_ffi", "masked_frame")
 fn masked_frame(fin: Int, opcode: Int, payload: BitArray) -> BitArray
-
-@external(erlang, "brazier_test_ffi", "unique_ref")
-fn unique_ref() -> String
 
 const host = "127.0.0.1"
 
@@ -142,155 +138,77 @@ fn current_build() -> String {
   string.drop_end(rest, 3)
 }
 
-fn scratch_dir() -> String {
-  let dir = "/tmp/brazier_build_handshake_" <> unique_ref()
-  let assert Ok(Nil) = simplifile.create_directory_all(dir)
-    as "test directory must be creatable"
-  dir
-}
+const loaded = Ok("brazier_client_0123456789abcdef.js")
 
-fn write(path: String, contents: String) -> Nil {
-  let assert Ok(Nil) = simplifile.write(path, contents)
-    as "test file must be writable"
-  Nil
-}
+// --- check_join_build against a given loaded bundle ---
 
-fn cleanup(dir: String) -> Nil {
-  let assert Ok(Nil) = simplifile.delete(dir) as "test directory cleanup"
-  Nil
-}
-
-// --- check_join_build against a scratch manifest ---
-
-pub fn missing_manifest_refuses_with_1011_and_logs_an_error_test() {
-  let dir = scratch_dir()
+pub fn no_loaded_bundle_refuses_with_1011_and_logs_an_error_test() {
+  // The server could not load its bundle (a dev rebuild whose manifest is
+  // broken): a join is not let through unchecked.
   let #(verdict, logs) =
     log_capture.capture(fn() {
-      transport.check_join_build(dir, "conn-a", Some("0123456789abcdef"))
+      transport.check_join_build(
+        Error("Cannot read priv/static/brazier_client.manifest"),
+        "conn-a",
+        "0123456789abcdef",
+      )
     })
   let assert Error(#(1011, "internal error")) = verdict
   let assert True =
     log_capture.has(logs, level: "error", containing: [
-      "conn-a", "brazier_client.manifest",
+      "conn-a", "brazier_client.manifest", "1011",
     ])
-  cleanup(dir)
 }
 
-pub fn manifest_naming_a_missing_bundle_refuses_with_1011_test() {
-  let dir = scratch_dir()
-  write(
-    dir <> "/brazier_client.manifest",
-    "brazier_client_0123456789abcdef.js\n",
-  )
+pub fn another_build_refuses_with_4499_test() {
   let #(verdict, logs) =
     log_capture.capture(fn() {
-      transport.check_join_build(dir, "conn-b", Some("0123456789abcdef"))
+      transport.check_join_build(loaded, "conn-d", "fedcba9876543210")
     })
-  let assert Error(#(1011, "internal error")) = verdict
-  let assert True =
-    log_capture.has(logs, level: "error", containing: [
-      "conn-b", "does not exist",
-    ])
-  cleanup(dir)
-}
-
-pub fn invalid_manifest_refuses_with_1011_test() {
-  let dir = scratch_dir()
-  write(dir <> "/brazier_client.manifest", "../secret.js")
-  let assert Error(#(1011, "internal error")) =
-    transport.check_join_build(dir, "conn-c", Some("0123456789abcdef"))
-  cleanup(dir)
-}
-
-pub fn another_build_refuses_with_4409_test() {
-  let dir = scratch_dir()
-  write(dir <> "/brazier_client.manifest", "brazier_client_0123456789abcdef.js")
-  write(dir <> "/brazier_client_0123456789abcdef.js", "/* bundle */")
-  let #(verdict, logs) =
-    log_capture.capture(fn() {
-      transport.check_join_build(dir, "conn-d", Some("fedcba9876543210"))
-    })
-  let assert Error(#(4409, "stale build")) = verdict
+  let assert Error(#(4499, "stale build")) = verdict
   let assert True =
     log_capture.has(logs, level: "info", containing: [
       "conn-d", "\"fedcba9876543210\"", "brazier_client_0123456789abcdef.js",
-      "4409",
+      "4499",
     ])
   // A build id is matched exactly: no prefix, case or extension tricks.
-  let assert Error(#(4409, "stale build")) =
-    transport.check_join_build(dir, "conn-d", Some("0123456789ABCDEF"))
-  let assert Error(#(4409, "stale build")) =
-    transport.check_join_build(dir, "conn-d", Some("01234567"))
-  let assert Error(#(4409, "stale build")) =
-    transport.check_join_build(dir, "conn-d", Some(""))
-  cleanup(dir)
+  let assert Error(#(4499, "stale build")) =
+    transport.check_join_build(loaded, "conn-d", "0123456789ABCDEF")
+  let assert Error(#(4499, "stale build")) =
+    transport.check_join_build(loaded, "conn-d", "01234567")
+  let assert Error(#(4499, "stale build")) =
+    transport.check_join_build(loaded, "conn-d", "")
+  let assert Error(#(4499, "stale build")) =
+    transport.check_join_build(loaded, "conn-d", "0123456789abcdef.js")
 }
 
 pub fn an_overlong_build_id_is_logged_truncated_test() {
-  let dir = scratch_dir()
-  write(dir <> "/brazier_client.manifest", "brazier_client_0123456789abcdef.js")
-  write(dir <> "/brazier_client_0123456789abcdef.js", "/* bundle */")
   let long = string.repeat("a", 10_000)
   let #(verdict, logs) =
     log_capture.capture(fn() {
-      transport.check_join_build(dir, "conn-e", Some(long))
+      transport.check_join_build(loaded, "conn-e", long)
     })
-  let assert Error(#(4409, "stale build")) = verdict
+  let assert Error(#(4499, "stale build")) = verdict
   let assert True =
     log_capture.has(logs, level: "info", containing: [
       "\"" <> string.repeat("a", 64) <> "\"",
     ])
   let assert False =
     log_capture.has(logs, level: "info", containing: [string.repeat("a", 65)])
-  cleanup(dir)
-}
-
-pub fn a_join_without_a_build_is_let_through_with_a_warning_test() {
-  // Not even the manifest is read: an app without one is not refused here.
-  let dir = scratch_dir()
-  let #(verdict, logs) =
-    log_capture.capture(fn() { transport.check_join_build(dir, "conn-f", None) })
-  let assert Ok(Nil) = verdict
-  let assert True =
-    log_capture.has(logs, level: "warning", containing: [
-      "conn-f", "no build id",
-    ])
-  cleanup(dir)
 }
 
 pub fn the_current_build_is_accepted_test() {
-  let dir = scratch_dir()
-  write(dir <> "/brazier_client.manifest", "brazier_client_0123456789abcdef.js")
-  write(dir <> "/brazier_client_0123456789abcdef.js", "/* bundle */")
   let assert Ok(Nil) =
-    transport.check_join_build(dir, "conn-g", Some("0123456789abcdef"))
-  cleanup(dir)
-}
-
-pub fn a_rebuild_is_seen_by_the_next_join_test() {
-  // The manifest is read on every join: brazier/dev rebuilds into a running
-  // server.
-  let dir = scratch_dir()
-  write(dir <> "/brazier_client.manifest", "brazier_client_0123456789abcdef.js")
-  write(dir <> "/brazier_client_0123456789abcdef.js", "/* old */")
-  let assert Ok(Nil) =
-    transport.check_join_build(dir, "conn-h", Some("0123456789abcdef"))
-  write(dir <> "/brazier_client.manifest", "brazier_client_fedcba9876543210.js")
-  write(dir <> "/brazier_client_fedcba9876543210.js", "/* new */")
-  let assert Error(#(4409, "stale build")) =
-    transport.check_join_build(dir, "conn-h", Some("0123456789abcdef"))
-  let assert Ok(Nil) =
-    transport.check_join_build(dir, "conn-h", Some("fedcba9876543210"))
-  cleanup(dir)
+    transport.check_join_build(loaded, "conn-g", "0123456789abcdef")
 }
 
 // --- Joins over a real listener ---
 
-pub fn a_join_from_another_build_closes_4409_and_reaches_no_runtime_test() {
+pub fn a_join_from_another_build_closes_4499_and_reaches_no_runtime_test() {
   let #(listener, port, observer) = start_server()
   let #(socket, conn_id, handler) = open(port, observer)
   send_join(socket, Some("00000000deadbeef"))
-  let assert #(4409, "stale build") = expect_close_frame(socket)
+  let assert #(4499, "stale build") = expect_close_frame(socket)
   let assert Ok(ClosedConn(closed)) = process.receive(observer, 5000)
     as "the join must not be dispatched, and on_close must run"
   let assert True = closed == conn_id

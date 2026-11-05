@@ -81,9 +81,12 @@ below 50 is logged as a warning when the listener starts.
 
 A `join` carries the build id of the client bundle its page loaded. When the
 server serves another bundle (the app was redeployed or rebuilt since the
-page loaded), it closes with 4409 `stale build`, and the client reloads
-behind its reload guard to get the current bundle. A server that cannot
-read its client manifest closes the join with 1011 and logs an error.
+page loaded), it closes with 4499 `stale build`, and the client reloads
+behind its reload guard to get the current bundle. The server reads its
+client manifest when it starts, and one that cannot read it does not start;
+a join that finds no loaded bundle closes with 1011 and logs an error.
+`error.refuse(499, _)` is a programming error and crashes `init`, so no
+`init` refusal shares the stale-build close code.
 
 ## Join Tokens
 

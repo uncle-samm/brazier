@@ -67,6 +67,10 @@ follows the cowboy/ranch and Plug conventions:
   `pre_upgrade_timeout_ms` (otherwise 408), each body chunk within
   `body_read_timeout_ms` and the whole body within `request_timeout_ms`; an
   idle keep-alive connection is closed after `keepalive_idle_timeout_ms`.
+  A body read that runs out of time names the limit that ended it
+  (`server.BodyReadTimeout` or `server.RequestDeadlineExceeded`, inside
+  `transport_http.BodyReadFailed`), and the connection closes after the
+  answer.
 - **Keep-alive:** `Connection: close` from either side and HTTP/1.0 without
   `keep-alive` close the connection after the response, which then carries
   `Connection: close`. `HEAD` responses keep `Content-Length` with no body.
