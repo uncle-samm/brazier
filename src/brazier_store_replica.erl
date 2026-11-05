@@ -21,9 +21,12 @@
 %%             (brazier/store/crdt.digest, kept up to date by every join,
 %%             so a tick never walks the state)
 %%   sync_req  "send me your full state": broadcast when the replica starts,
-%%             sent directly once a connected node passes the cluster peer
-%%             check (brazier_cluster_ffi:await_verified/1) and when a
-%%             peer's digest differs
+%%             sent directly once a connected node and this node have
+%%             verified each other ({brazier_cluster_peer_mutual, Node},
+%%             brazier_cluster_ffi:subscribe_mutual/1: a request sent when
+%%             only this side had verified the peer would be dropped by the
+%%             peer as coming from a non-member) and when a peer's digest
+%%             differs
 %%   sync      the reply: the sender's full state
 %%
 %% Only cluster members replicate: PubSub forwards only to and from verified
@@ -42,7 +45,8 @@
 %% grow the replica past max_entries. The span's stop metadata says which:
 %% `result` is malformed, too_large, too_many_entries or ok, and `reason`
 %% the failing field or limit. A refused merge leaves the digests
-%% different, so the next exchange retries it, and logs again.
+%% different, so a later exchange retries it (after the backoff below),
+%% and logs again.
 %%
 %% A peer's payload is checked field by field before anything reads it:
 %% the CRDT functions assume the shapes brazier/store/crdt builds, so a
@@ -51,13 +55,48 @@
 %% convergence on every node it reaches. Phoenix.Tracker likewise matches
 %% the exact shape of every replica message before merging it.
 %%
+%% Peers and sync. Every replica joins the pg group
+%% {brazier_store_replica, Topic} of the brazier_pubsub_pg scope, so its
+%% peers are the members of that group on verified cluster members (a node
+%% that has not opened the store holds no replica and is not waited for).
+%% The last digest each peer sent is kept; the replica is *in sync* when
+%% every peer's last digest is its own (synced/1, true with no peer). A
+%% local write, a merge or a new peer ends that until the next digests
+%% agree. Like Phoenix.Tracker, which keeps each replica's last heard
+%% clock, this needs no extra message: the periodic digests are the
+%% acknowledgements.
+%%
+%% Backoff. A merge refused by a limit or a malformed payload leaves the
+%% digests different, and the next digest would pull the same state, be
+%% refused again, and transfer up to max_sync_bytes every interval. So each
+%% refusal from a peer delays the next state request to it: after attempt
+%% N (from 0) by a uniformly random delay in [D/2, D] with
+%% D = min(Cap, Interval * 2^N), Cap = max(Interval, 60s)
+%% (brazier_cluster_manager:backoff_window/3, the cluster's reconnect
+%% backoff), logged with the delay. A merge of its state, or equal
+%% digests, ends the backoff (logged). The backoff map holds at most one
+%% entry per member and is pruned on nodedown.
+%%
+%% Floors (brazier/store/crdt, "Floors"). A replica started on a node that
+%% ran an earlier incarnation of it raises its node's floor to its own
+%% incarnation once it is in sync with at least one peer and every peer it
+%% has: the clock entries and cloud dots of the earlier incarnations go,
+%% everywhere, so the context does not grow with every restart. The raise
+%% is a context-only delta, broadcast like a write. Incarnations only grow
+%% on a node (next_incarnation/1). A replica that merges a floor of its own
+%% node above its own incarnation (a later incarnation of its node exists:
+%% a clock that went back across a restart of the node) would have every
+%% write it makes covered, so dropped, everywhere: it logs an error and
+%% stops, and its restart takes an incarnation above that floor.
+%%
 %% Remote changes are announced to this node's watchers by local_broadcast
 %% of nil on the store topic, plus the extra topics of every added or
 %% removed entry and of the delta. Local writes are announced by the writer
 %% (brazier/store), as for a node-local store.
 
 -export([start/3, start_link/1, stop/1, call/2,
-         put/3, remove/3, append/4, config/1, digest/1, size/1,
+         put/3, remove/3, append/4, config/1, digest/1, size/1, synced/1,
+         context_size/1,
          read_get/2, read_get_all/2, read_count/1, names/2,
          check_payload/2, admit/4]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
@@ -71,6 +110,13 @@
 %% A remote timestamp this far ahead of the wall clock is logged: its writes
 %% win every LWW comparison until the local clocks catch up.
 -define(DRIFT_WARNING_MS, 60000).
+%% The pg scope (started by brazier_pubsub_sup, which a replica needs to
+%% subscribe) and group every replica of a store joins.
+-define(PEER_SCOPE, brazier_pubsub_pg).
+-define(PEER_GROUP(Topic), {brazier_store_replica, Topic}).
+%% The longest delay before a state request to a peer whose merges were
+%% refused, unless the sync interval is longer.
+-define(MAX_BACKOFF_MS, 60000).
 
 %% --- Names ---
 
@@ -169,6 +215,8 @@ append(Server, Key, Values, Topics) -> call(Server, {append, Key, Values, Topics
 config(Server) -> call(Server, config).
 digest(Server) -> call(Server, digest).
 size(Server) -> call(Server, size).
+synced(Server) -> call(Server, synced).
+context_size(Server) -> call(Server, context_size).
 
 call(Server, Request) ->
     try
@@ -249,27 +297,56 @@ init(Args) ->
                     end,
                     Table = ets:new(Table, [Type, protected, named_table,
                                             {read_concurrency, true}]),
-                    ok = net_kernel:monitor_nodes(true),
-                    NodeBin = atom_to_binary(node(), utf8),
-                    Replica = {replica, NodeBin, erlang:system_time(microsecond)},
-                    S = Args#{replica => Replica,
-                              node_bin => NodeBin,
-                              crdt => ?CRDT:new(),
-                              hlc => ?HLC:zero(NodeBin)},
-                    %% Up to one interval of initial jitter so replicas
-                    %% started together do not exchange digests in lockstep.
-                    schedule_sync(rand:uniform(max(1, Interval))),
-                    brazier_log_ffi:info(<<"brazier.store">>, "Replica ~ts started as ~ts",
-                                        [Name, ?CRDT:replica_to_string(Replica)]),
-                    %% Ask every running replica for its state.
-                    publish(S, {brazier_store, sync_req, node()}),
-                    {ok, S}
+                    case brazier_cluster_ffi:subscribe_mutual(self()) of
+                        {ok, nil} -> join_peers(Args, Name, Topic, Interval);
+                        {error, Reason} ->
+                            brazier_log_ffi:error(<<"brazier.store">>,
+                                                 "Replica ~ts cannot subscribe to cluster membership: ~p",
+                                                 [Name, Reason]),
+                            {stop, {membership_subscribe_failed, Reason}}
+                    end
             end;
         _ ->
             brazier_log_ffi:error(<<"brazier.store">>, "Replica ~ts cannot start: table ~p exists",
                                  [Name, Table]),
             {stop, {table_exists, Table}}
     end.
+
+%% Join the peer group, so the other replicas count this one among their
+%% peers. The scope runs under the PubSub supervisor this replica just
+%% subscribed through; a scope that is gone stops the start.
+join_peers(Args, Name, Topic, Interval) ->
+    try pg:join(?PEER_SCOPE, ?PEER_GROUP(Topic), self()) of
+        ok -> init_replica(Args, Name, Interval)
+    catch
+        exit:Reason ->
+            brazier_log_ffi:error(<<"brazier.store">>, "Replica ~ts cannot join its peer group: ~p",
+                                 [Name, Reason]),
+            {stop, {peer_group_join_failed, Reason}}
+    end.
+
+init_replica(Args = #{server := Server}, Name, Interval) ->
+    ok = net_kernel:monitor_nodes(true),
+    NodeBin = atom_to_binary(node(), utf8),
+    Replica = {replica, NodeBin, next_incarnation(Server)},
+    S = Args#{replica => Replica,
+              node_bin => NodeBin,
+              crdt => ?CRDT:new(),
+              hlc => ?HLC:zero(NodeBin),
+              %% Node => {Pid, Digest}: each peer's last digest.
+              peer_digests => #{},
+              %% Node => {Attempt, RetryAtMs (monotonic)}.
+              backoff => #{},
+              in_sync => false,
+              floor_raised => false},
+    %% Up to one interval of initial jitter so replicas
+    %% started together do not exchange digests in lockstep.
+    schedule_sync(rand:uniform(max(1, Interval))),
+    brazier_log_ffi:info(<<"brazier.store">>, "Replica ~ts started as ~ts",
+                        [Name, ?CRDT:replica_to_string(Replica)]),
+    %% Ask every running replica for its state.
+    publish(S, {brazier_store, sync_req, node()}),
+    {ok, S}.
 
 handle_call({put, Key, Value}, _From, S = #{kind := key_value}) ->
     local_write(S, put, [Value], fun(Crdt, Replica, Hlc) ->
@@ -294,6 +371,10 @@ handle_call(digest, _From, S) ->
     {reply, {ok, state_digest(S)}, S};
 handle_call(size, _From, S = #{crdt := Crdt}) ->
     {reply, {ok, ?CRDT:size(Crdt)}, S};
+handle_call(synced, _From, S) ->
+    {reply, {ok, synced_with(peers(S), S)}, S};
+handle_call(context_size, _From, S = #{crdt := Crdt}) ->
+    {reply, {ok, ?CRDT:context_size(Crdt)}, S};
 handle_call(Request, From, S) ->
     brazier_log_ffi:warning(<<"brazier.store">>, "Replica ~ts received unexpected call ~p from ~p",
                            [label(S), Request, From]),
@@ -309,27 +390,35 @@ handle_info(sync_tick, S = #{config := {config, Interval, _, _, _, _}}) ->
     schedule_sync(Interval),
     {noreply, S};
 handle_info({brazier_pubsub, Topic, Message}, S = #{topic := Topic}) ->
-    {noreply, peer_message(Message, S)};
+    S1 = peer_message(Message, S),
+    case stale_incarnation(S1) of
+        ok ->
+            {noreply, note_sync(S1)};
+        {stale, Floor} ->
+            {stop, {stale_incarnation, Floor}, S1}
+    end;
 handle_info({nodeup, Node}, S) ->
     %% A connected node is not yet a cluster member: the state is requested
-    %% once the cluster manager has verified it (brazier_cluster_peer_verified).
-    case brazier_cluster_ffi:await_verified(Node) of
-        {ok, nil} ->
-            brazier_log_ffi:info(<<"brazier.store">>, "Replica ~ts: ~p connected, awaiting its peer check",
-                                [label(S), Node]);
-        {error, not_started} ->
+    %% once it and this node have verified each other
+    %% (brazier_cluster_peer_mutual).
+    case whereis(brazier_cluster) of
+        undefined ->
             brazier_log_ffi:warning(<<"brazier.store">>, "Replica ~ts: ~p connected, but no cluster manager "
-                                   "runs here, so it is not replicated to", [label(S), Node])
+                                   "runs here, so it is not replicated to", [label(S), Node]);
+        _Manager ->
+            brazier_log_ffi:info(<<"brazier.store">>, "Replica ~ts: ~p connected, awaiting the peer checks",
+                                [label(S), Node])
     end,
     {noreply, S};
-handle_info({brazier_cluster_peer_verified, Node}, S) ->
-    brazier_log_ffi:info(<<"brazier.store">>, "Replica ~ts: ~p is a verified cluster member, requesting "
-                        "its state", [label(S), Node]),
+handle_info({brazier_cluster_peer_mutual, Node}, S) ->
+    brazier_log_ffi:info(<<"brazier.store">>, "Replica ~ts: ~p and this node have verified each other, "
+                        "requesting its state", [label(S), Node]),
     send_direct(S, Node, {brazier_store, sync_req, node()}),
-    {noreply, S};
-handle_info({nodedown, Node}, S) ->
+    {noreply, note_sync(S)};
+handle_info({nodedown, Node}, S = #{peer_digests := Digests, backoff := Backoff}) ->
     brazier_log_ffi:info(<<"brazier.store">>, "Replica ~ts: ~p disconnected", [label(S), Node]),
-    {noreply, S};
+    S1 = S#{peer_digests := maps:remove(Node, Digests), backoff := maps:remove(Node, Backoff)},
+    {noreply, note_sync(S1)};
 handle_info({'EXIT', Pid, Reason}, S) ->
     %% The only link besides the parent (handled by gen_server) is the
     %% PubSub partition this replica subscribed through. Without it the
@@ -344,6 +433,7 @@ handle_info(Message, S) ->
 
 terminate(Reason, S) ->
     brazier_log_ffi:info(<<"brazier.store">>, "Replica ~ts stopping: ~p", [label(S), Reason]),
+    nil = brazier_cluster_ffi:unsubscribe_mutual(self()),
     ok.
 
 %% --- Local writes ---
@@ -380,7 +470,7 @@ local_write(S, OpName, Values, Op) ->
                 true ->
                     mirror(S, Crdt1, Changes),
                     publish(S, Message),
-                    {reply, {ok, nil}, S#{crdt := Crdt1, hlc := Hlc1}}
+                    {reply, {ok, nil}, note_sync(S#{crdt := Crdt1, hlc := Hlc1})}
             end
     end.
 
@@ -419,21 +509,19 @@ peer_message(Message, S) ->
 %% one is refused there with an error and its sync span.
 member_message({brazier_store, delta, From, Delta}, S) when is_atom(From) ->
     #{config := {config, _, _, _, MaxDelta, _}} = S,
-    merge(S, From, delta, Delta, MaxDelta, fun ?CRDT:join/2);
+    {S1, Result} = merge(S, From, delta, Delta, MaxDelta, fun ?CRDT:join/2),
+    merged(S1, From, delta, Result);
 member_message({brazier_store, sync, From, Full}, S) when is_atom(From) ->
     #{config := {config, _, _, _, _, MaxSync}} = S,
     brazier_log_ffi:debug(<<"brazier.store">>, "Replica ~ts received the state of ~p", [label(S), From]),
-    merge(S, From, sync, Full, MaxSync, fun ?CRDT:join_full/2);
+    {S1, Result} = merge(S, From, sync, Full, MaxSync, fun ?CRDT:join_full/2),
+    merged(S1, From, sync, Result);
 member_message({brazier_store, digest, From, Digest}, S)
   when is_atom(From), is_binary(Digest) ->
-    case state_digest(S) of
-        Digest ->
-            S;
-        _Other ->
-            brazier_log_ffi:debug(<<"brazier.store">>, "Replica ~ts differs from ~p, requesting its state",
-                                 [label(S), From]),
-            send_direct(S, From, {brazier_store, sync_req, node()}),
-            S
+    S1 = record_digest(S, From, Digest),
+    case state_digest(S1) of
+        Digest -> end_backoff(S1, From, <<"its digest matches">>);
+        _Other -> request_state(S1, From)
     end;
 member_message({brazier_store, sync_req, From}, S) when is_atom(From) ->
     #{crdt := Crdt, config := {config, _, _, _, _, MaxSync}} = S,
@@ -460,6 +548,7 @@ unexpected_message(Message, S) ->
 %% too_large or too_many_entries, and `reason` names the malformed field
 %% (check_payload/2), the limit that refused it, or is none. A malformed
 %% payload is refused before anything reads it, so its entries are 0.
+%% Returns {State, Result}.
 merge(S = #{name := Name}, From, What, Payload, MaxBytes, Join) ->
     Peer = atom_to_binary(From, utf8),
     brazier_telemetry_ffi:store_sync_span(Name, Peer, fun() ->
@@ -468,14 +557,14 @@ merge(S = #{name := Name}, From, What, Payload, MaxBytes, Join) ->
             {refused, Entries, <<"malformed">> = Result, Reason} ->
                 brazier_log_ffi:error(<<"brazier.store">>, "Replica ~ts refused a malformed ~p of ~b "
                                      "bytes from ~p: ~ts", [label(S), What, Bytes, From, Reason]),
-                {S, Entries, Bytes, Result, Reason};
+                {{S, Result}, Entries, Bytes, Result, Reason};
             {refused, Entries, <<"too_large">> = Result, Limit} ->
                 brazier_log_ffi:error(<<"brazier.store">>, "Replica ~ts refused a ~p of ~b bytes from ~p: "
                                      "over ~ts ~b", [label(S), What, Bytes, From, Limit, MaxBytes]),
-                {S, Entries, Bytes, Result, Limit};
+                {{S, Result}, Entries, Bytes, Result, Limit};
             {admitted, Entries} ->
                 {S1, Result, Reason} = checked_merge(S, From, What, Payload, Join),
-                {S1, Entries, Bytes, Result, Reason}
+                {{S1, Result}, Entries, Bytes, Result, Reason}
         end
     end).
 
@@ -539,6 +628,164 @@ advance_clock(S = #{hlc := Hlc}, From, Payload) ->
             ?HLC:observe(Hlc, Remote, Now)
     end.
 
+%% --- Sync, backoff and floors ---
+
+%% After a merge from From: a merged full state ends a backoff on From, a
+%% refused merge (of either kind) starts or lengthens it.
+merged(S, From, sync, <<"ok">>) ->
+    end_backoff(S, From, <<"its state merged">>);
+merged(S, _From, delta, <<"ok">>) ->
+    S;
+merged(S, From, What, Result) ->
+    back_off(S, From, What, Result).
+
+back_off(S = #{backoff := Backoff, config := {config, Interval, _, _, _, _}}, From, What, Result) ->
+    Attempt = case maps:find(From, Backoff) of
+        {ok, {Previous, _RetryAt}} -> Previous + 1;
+        error -> 0
+    end,
+    {Low, High} = brazier_cluster_manager:backoff_window(Attempt, Interval,
+                                                         max(Interval, ?MAX_BACKOFF_MS)),
+    Delay = Low + rand:uniform(High - Low + 1) - 1,
+    brazier_log_ffi:warning(<<"brazier.store">>, "Replica ~ts: a ~p from ~p was refused (~ts, refusal ~b "
+                           "in a row); its state is requested again in ~bms at the earliest",
+                           [label(S), What, From, Result, Attempt + 1, Delay]),
+    S#{backoff := Backoff#{From => {Attempt, now_mono_ms() + Delay}}}.
+
+end_backoff(S = #{backoff := Backoff}, From, Why) ->
+    case maps:take(From, Backoff) of
+        {{Attempt, _RetryAt}, Rest} ->
+            brazier_log_ffi:info(<<"brazier.store">>, "Replica ~ts: ~ts after ~b refused merges from ~p; "
+                                "its state is requested on every differing digest again",
+                                [label(S), Why, Attempt + 1, From]),
+            S#{backoff := Rest};
+        error ->
+            S
+    end.
+
+%% A digest from From differs from this replica's: pull From's state,
+%% unless a refused merge put From in backoff and its delay has not passed.
+request_state(S = #{backoff := Backoff}, From) ->
+    case maps:find(From, Backoff) of
+        {ok, {Attempt, RetryAt}} ->
+            Now = now_mono_ms(),
+            case Now >= RetryAt of
+                true ->
+                    brazier_log_ffi:info(<<"brazier.store">>, "Replica ~ts differs from ~p, requesting its "
+                                        "state again after ~b refused merges",
+                                        [label(S), From, Attempt + 1]),
+                    send_direct(S, From, {brazier_store, sync_req, node()});
+                false ->
+                    brazier_log_ffi:debug(<<"brazier.store">>, "Replica ~ts differs from ~p, but holds its "
+                                         "state request back for ~bms after ~b refused merges",
+                                         [label(S), From, RetryAt - Now, Attempt + 1])
+            end;
+        error ->
+            brazier_log_ffi:debug(<<"brazier.store">>, "Replica ~ts differs from ~p, requesting its state",
+                                 [label(S), From]),
+            send_direct(S, From, {brazier_store, sync_req, node()})
+    end,
+    S.
+
+%% The replicas of this store on verified cluster members, not this one.
+peers(#{topic := Topic}) ->
+    [Pid || Pid <- pg:get_members(?PEER_SCOPE, ?PEER_GROUP(Topic)),
+            node(Pid) =/= node(),
+            brazier_cluster_ffi:verified(node(Pid))].
+
+%% Keep From's digest against the one replica From runs. While pg has not
+%% yet shown it (or still shows a stopped one beside it), the digest is not
+%% kept: the peer is not in sync until a later digest is.
+record_digest(S = #{topic := Topic, peer_digests := Digests}, From, Digest) ->
+    case [Pid || Pid <- pg:get_members(?PEER_SCOPE, ?PEER_GROUP(Topic)), node(Pid) =:= From] of
+        [Pid] ->
+            S#{peer_digests := Digests#{From => {Pid, Digest}}};
+        Pids ->
+            brazier_log_ffi:debug(<<"brazier.store">>, "Replica ~ts: ~p sent a digest while its peer group "
+                                 "shows ~b replicas there; not counted towards sync",
+                                 [label(S), From, length(Pids)]),
+            S#{peer_digests := maps:remove(From, Digests)}
+    end.
+
+%% Whether every peer's last digest is this replica's digest (true with no
+%% peer).
+synced_with(Peers, S = #{peer_digests := Digests}) ->
+    Digest = state_digest(S),
+    lists:all(fun(Pid) -> maps:get(node(Pid), Digests, none) =:= {Pid, Digest} end, Peers).
+
+%% Log a change of the in-sync state; on reaching it with at least one
+%% peer, raise this node's floor if an earlier incarnation needs it.
+note_sync(S = #{in_sync := Was}) ->
+    Peers = peers(S),
+    case {Was, synced_with(Peers, S)} of
+        {false, true} ->
+            brazier_log_ffi:debug(<<"brazier.store">>, "Replica ~ts is in sync with its ~b peers",
+                                 [label(S), length(Peers)]),
+            maybe_raise_floor(S#{in_sync := true}, length(Peers));
+        {true, false} ->
+            brazier_log_ffi:debug(<<"brazier.store">>, "Replica ~ts is no longer in sync with its ~b peers",
+                                 [label(S), length(Peers)]),
+            S#{in_sync := false};
+        {Same, Same} ->
+            S
+    end.
+
+maybe_raise_floor(S, 0) ->
+    S;
+maybe_raise_floor(S = #{floor_raised := true}, _Peers) ->
+    S;
+maybe_raise_floor(S = #{crdt := Crdt, replica := Replica}, Peers) ->
+    case ?CRDT:has_older_incarnation(Crdt, Replica) of
+        false ->
+            S;
+        true ->
+            %% INVARIANT: an older incarnation of this node outside the
+            %% floor means the floor is below it, so below this
+            %% incarnation, and raise_floor/2 raises it.
+            {ok, {Crdt1, Delta}} = ?CRDT:raise_floor(Crdt, Replica),
+            brazier_log_ffi:info(<<"brazier.store">>, "Replica ~ts is in sync with its ~b peers and raised "
+                                "the floor of its node to its incarnation: its causal context went from "
+                                "~b to ~b elements",
+                                [label(S), Peers, ?CRDT:context_size(Crdt), ?CRDT:context_size(Crdt1)]),
+            publish(S, {brazier_store, delta, node(), Delta}),
+            S#{crdt := Crdt1, floor_raised := true, in_sync := false}
+    end.
+
+%% ok, or {stale, Floor} when the state holds a floor of this node above
+%% this incarnation (see the module doc). The floor is recorded first, so
+%% the restart's incarnation is above it.
+stale_incarnation(S = #{crdt := Crdt, node_bin := NodeBin, server := Server,
+                        replica := {replica, _, Incarnation}}) ->
+    case ?CRDT:floor(Crdt, NodeBin) of
+        Floor when Floor > Incarnation ->
+            ok = persistent_term:put(incarnation_key(Server), Floor),
+            brazier_log_ffi:error(<<"brazier.store">>, "Replica ~ts merged a floor of its own node (~b) above "
+                                 "its incarnation ~b: a later incarnation of this node exists, so every "
+                                 "write of this one would be dropped; stopping to restart above it",
+                                 [label(S), Floor, Incarnation]),
+            {stale, Floor};
+        _AtOrBelow ->
+            ok
+    end.
+
+%% A new incarnation for Server: the wall clock in microseconds, or one
+%% above the last incarnation (or stale floor) of Server on this VM when
+%% the clock has not moved past it, so incarnations only grow on a node.
+%% persistent_term holds one integer per replicated store name; it is
+%% written once per replica start.
+next_incarnation(Server) ->
+    Key = incarnation_key(Server),
+    Last = persistent_term:get(Key, 0),
+    Incarnation = max(erlang:system_time(microsecond), Last + 1),
+    ok = persistent_term:put(Key, Incarnation),
+    Incarnation.
+
+incarnation_key(Server) ->
+    {?MODULE, incarnation, Server}.
+
+now_mono_ms() ->
+    erlang:monotonic_time(millisecond).
+
 %% --- Payload validation ---
 
 %% {ok, nil} when Payload has exactly the shape brazier/store/crdt gives a Delta
@@ -550,7 +797,8 @@ advance_clock(S = #{hlc := Hlc}, From, Payload) ->
 %%   Replica  {replica, Node, Incarnation}       Node non-empty, Incarnation >= 0
 %%   Entry    {entry, Value, Timestamp, [Topic]}
 %%   Timestamp {timestamp, WallMs, Logical, Node} both >= 0
-%%   Context  {context, #{Replica => Max}, Cloud} Max >= 1, Cloud a set of Dot
+%%   Context  {context, #{Replica => Max}, Cloud, #{Node => Floor}}
+%%            Max >= 1, Cloud a set of Dot, Node non-empty, Floor >= 1
 %%
 %% Keys, topics and node names are UTF-8 binaries (Gleam strings). Beyond
 %% the shapes, every live dot must be covered by the payload's own context
@@ -608,7 +856,19 @@ validate_timestamp({timestamp, Wall, Logical, Node})
 validate_timestamp(_) ->
     malformed(<<"a timestamp is not {timestamp, WallMs >= 0, Logical >= 0, Node}">>).
 
-validate_context({context, Clock, {set, Cloud}}) when is_map(Clock), is_map(Cloud) ->
+validate_context({context, Clock, {set, Cloud}, Floors})
+  when is_map(Clock), is_map(Cloud), is_map(Floors) ->
+    maps:foreach(fun(Node, Floor) ->
+        validate_string(Node, <<"a floor node">>),
+        case Node of
+            <<>> -> malformed(<<"a floor node is empty">>);
+            _NonEmpty -> ok
+        end,
+        case is_integer(Floor) andalso Floor >= 1 of
+            true -> ok;
+            false -> malformed(<<"a floor is not an integer >= 1">>)
+        end
+    end, Floors),
     maps:foreach(fun(Replica, Max) ->
         validate_replica(Replica, <<"a clock replica">>),
         case is_integer(Max) andalso Max >= 1 of
@@ -624,7 +884,7 @@ validate_context({context, Clock, {set, Cloud}}) when is_map(Clock), is_map(Clou
         end
     end, Cloud);
 validate_context(_) ->
-    malformed(<<"the context is not {context, Clock, Cloud}">>).
+    malformed(<<"the context is not {context, Clock, Cloud, Floors}">>).
 
 validate_dot({dot, Replica, Counter}, What) when is_integer(Counter), Counter >= 1 ->
     validate_replica(Replica, What);

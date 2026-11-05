@@ -522,6 +522,7 @@ fn arbitrary_delta(rng: Rng) -> #(Delta(Int), Rng) {
     Context(
       clock: dict.from_list(clock),
       cloud: set.from_list(list.append(cloud, dots)),
+      floors: dict.new(),
     )
   #(
     Delta(entries: dict.from_list([#(key, entries)]), context:, topics: []),
@@ -614,6 +615,7 @@ pub fn a_huge_delta_clock_scans_the_small_key_instead_test() {
       context: Context(
         clock: dict.from_list([#(ra, 1_000_000_000)]),
         cloud: set.new(),
+        floors: dict.new(),
       ),
       topics: [],
     )
@@ -638,6 +640,7 @@ pub fn an_uncompacted_context_removes_each_dot_once_test() {
       context: Context(
         clock: dict.from_list([#(ra, 5)]),
         cloud: set.from_list([Dot(ra, 3)]),
+        floors: dict.new(),
       ),
       topics: [],
     )
@@ -658,7 +661,12 @@ pub fn an_uncompacted_context_removes_each_dot_once_test() {
 /// on both paths of the join (a key smaller and larger than the context),
 /// or replicas holding different numbers of values would disagree.
 pub fn a_clock_never_covers_counters_below_one_test() {
-  let context = Context(clock: dict.from_list([#(rb, 5)]), cloud: set.new())
+  let context =
+    Context(
+      clock: dict.from_list([#(rb, 5)]),
+      cloud: set.new(),
+      floors: dict.new(),
+    )
   assert !crdt.covers(context, Dot(rb, 0))
   assert !crdt.covers(context, Dot(rb, -3))
   assert crdt.covers(context, Dot(rb, 1))
@@ -673,7 +681,11 @@ pub fn a_clock_never_covers_counters_below_one_test() {
           dict.from_list([#(zero, crdt.Entry(value: 0, ts: ts(0), topics: []))]),
         ),
       ]),
-      context: Context(clock: dict.new(), cloud: set.from_list([zero])),
+      context: Context(
+        clock: dict.new(),
+        cloud: set.from_list([zero]),
+        floors: dict.new(),
+      ),
       topics: [],
     )
   let removal =
@@ -708,7 +720,11 @@ fn context_delta(
 ) -> Delta(Int) {
   Delta(
     entries: dict.new(),
-    context: Context(clock: dict.from_list(clock), cloud: set.from_list(cloud)),
+    context: Context(
+      clock: dict.from_list(clock),
+      cloud: set.from_list(cloud),
+      floors: dict.new(),
+    ),
     topics: [],
   )
 }
@@ -731,7 +747,11 @@ fn gap_fill() -> Delta(Int) {
   let entry = crdt.Entry(value: 1, ts: ts(1), topics: [])
   Delta(
     entries: dict.from_list([#("k", dict.from_list([#(dot, entry)]))]),
-    context: Context(clock: dict.new(), cloud: set.from_list([dot])),
+    context: Context(
+      clock: dict.new(),
+      cloud: set.from_list([dot]),
+      floors: dict.new(),
+    ),
     topics: [],
   )
 }
@@ -1113,7 +1133,12 @@ fn oracle_covers(context: Context, dot: Dot) -> Bool {
 
 fn oracle_union_context(a: Context, b: Context) -> Context {
   let clock = dict.combine(a.clock, b.clock, fn(x, y) { int.max(x, y) })
-  oracle_compact(Context(clock: clock, cloud: set.union(a.cloud, b.cloud)))
+  // The histories never raise a floor (crdt_floor_test covers floors).
+  oracle_compact(Context(
+    clock: clock,
+    cloud: set.union(a.cloud, b.cloud),
+    floors: dict.new(),
+  ))
 }
 
 fn oracle_compact(context: Context) -> Context {
@@ -1131,5 +1156,5 @@ fn oracle_compact(context: Context) -> Context {
         False, False -> #(clock, set.insert(cloud, dot))
       }
     })
-  Context(clock: clock, cloud: cloud)
+  Context(clock: clock, cloud: cloud, floors: context.floors)
 }

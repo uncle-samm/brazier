@@ -295,6 +295,7 @@ pub fn start_store_with_clock(
   // when it dies, so its Pid does not need to be kept.
   start_maintenance(
     process.self(),
+    store.namespace,
     config.sweep_interval_ms,
     fn() { sweep_in_background(store) },
     fn(joined) { recheck_bound(store, joined) },
@@ -1321,6 +1322,7 @@ fn local_bound_sessions(namespace: String) -> List(String)
 @external(erlang, "brazier_session_ffi", "start_maintenance")
 fn start_maintenance(
   owner: Pid,
+  namespace: String,
   interval_ms: Int,
   sweep: fn() -> Nil,
   recheck: fn(Node) -> Nil,

@@ -6,7 +6,11 @@
 ////
 //// - discovers peers with `Static` (a fixed list, retried with exponential
 ////   backoff and jitter) or `Dns` (A/AAAA lookups every `poll_ms`), or
-////   only watches connections with `NoDiscovery`;
+////   only watches connections with `NoDiscovery`. After a netsplit
+////   `Static` retries and every `Dns` poll reconnects; with `NoDiscovery`
+////   nothing does, and OTP's `global`
+////   (`prevent_overlapping_partitions`, kept at its default) may have cut
+////   connections the network never lost (docs/CLUSTERING.md, "Netsplits");
 //// - logs node up/down and emits `[brazier, cluster, node, up | down]` and
 ////   `[brazier, cluster, connect, failed]`;
 //// - checks every connected peer: nodes exchange
@@ -61,7 +65,11 @@ pub type Discovery {
   /// leave the DNS answer are not disconnected: a node that is up stays
   /// connected until distribution reports it down.
   Dns(query: String, basename: String, poll_ms: Int)
-  /// Connect to nothing; only report and check nodes that connect.
+  /// Connect to nothing; only report and check nodes that connect. Nothing
+  /// is ever reconnected: a member lost to a netsplit, or dropped by OTP's
+  /// `global` to close a partial partition, stays apart until other code
+  /// connects it again (as libcluster's Epmd strategy without `timeout`).
+  /// Use `Static` or `Dns` unless something else forms the cluster.
   NoDiscovery
 }
 
