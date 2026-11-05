@@ -1,7 +1,8 @@
 -module(brazier_application_ffi).
--export([trap_exit/0, receive_wait_event/0, get_env_int/1,
+-export([trap_exit/0, receive_wait_event/1, get_env_int/1,
          fail_loudly/1, once_new/0, once_take/1, stop_supervisor/2,
-         remember_app/2, forget_app/1, remembered_apps/0, is_linked/1, await_exit/1,
+         remember_app/3, forget_app/1, remembered_apps/0, app_watcher/1,
+         is_remembered/1, is_linked/1, await_exit/1,
          drain_exclusively/1, take_pending_sigterm/0, pass_on_sigterm/0]).
 
 %% The persistent_term key of one running application, by supervisor pid.
@@ -13,41 +14,66 @@ trap_exit() ->
     nil.
 
 %% Block until SIGTERM (forwarded by brazier_signal_handler) or the exit of
-%% a linked process. Returns sigterm, shutdown_requested for a `normal`
-%% exit (application.stop on the root supervisor), and
-%% {linked_process_exited, ReasonBin} for any other exit. A supervisor that
-%% gives up after too many restarts exits with `shutdown`: that is a
-%% failure, not a request, so it is reported as an exit too. Because the
-%% caller traps exits, swallowing those would leave the application running
-%% with a dead tree. No timeout: nothing needs to happen until one arrives.
-receive_wait_event() ->
+%% a linked process. Waited holds the supervisors of the applications this
+%% process waits on (linked to it when the wait began). Returns:
+%%
+%% - sigterm;
+%% - shutdown_requested for a `normal` exit of a waited supervisor
+%%   (application.stop on it);
+%% - {other_link_exited_normally, FromBin} for a `normal` exit of any other
+%%   linked process: a helper that finished is not a request to stop, and
+%%   without trapping exits it would not have touched this process either,
+%%   so the caller logs it and waits again;
+%% - {linked_process_exited, ReasonBin} for any other exit, of whichever
+%%   linked process. A supervisor that gives up after too many restarts
+%%   exits with `shutdown`: that is a failure, not a request, so it is
+%%   reported as an exit too. Because the caller traps exits, swallowing
+%%   those would leave the application running with a dead tree.
+%%
+%% No timeout: nothing needs to happen until one arrives.
+receive_wait_event(Waited) when is_list(Waited) ->
     receive
         {brazier_signal, sigterm} -> sigterm;
-        {'EXIT', _From, normal} -> shutdown_requested;
+        {'EXIT', From, normal} ->
+            case lists:member(From, Waited) of
+                true -> shutdown_requested;
+                false -> {other_link_exited_normally, format("~p", [From])}
+            end;
         {'EXIT', From, Reason} ->
-            {linked_process_exited,
-             iolist_to_binary(io_lib:format("~p exited with ~p", [From, Reason]))}
+            {linked_process_exited, format("~p exited with ~p", [From, Reason])}
     end.
 
 %% The applications started on this node and not stopped, newest first,
 %% keyed by their supervisor pid. wait_forever stops them on SIGTERM, from
 %% whichever process it runs in, so the record is node-wide: one
-%% persistent_term per application, written when it starts and erased when
-%% it stops, as brazier_http_conns does for a listener's bound port. Starts
-%% and stops are rare, which is what persistent_term is for. A tree that
-%% died without `stop` keeps its entry until a `stop` or a SIGTERM finds it
-%% not running.
-remember_app(Pid, App) when is_pid(Pid) ->
-    persistent_term:put(?APP_KEY(Pid), {erlang:unique_integer([monotonic]), App}),
+%% persistent_term per application, as brazier_http_conns does for a
+%% listener's bound port. Starts and stops are rare, which is what
+%% persistent_term is for. Each entry is written by the application's
+%% watcher (application.gleam), which monitors the supervisor first and
+%% erases the entry when the tree goes, stopped or crashed, as OTP's
+%% application controller notices an application master's exit.
+remember_app(Pid, App, Watcher) when is_pid(Pid), is_pid(Watcher) ->
+    persistent_term:put(?APP_KEY(Pid),
+                        {erlang:unique_integer([monotonic]), App, Watcher}),
     nil.
 
+%% Whether there was an entry to erase.
 forget_app(Pid) when is_pid(Pid) ->
-    _ = persistent_term:erase(?APP_KEY(Pid)),
-    nil.
+    persistent_term:erase(?APP_KEY(Pid)).
 
 remembered_apps() ->
-    Started = [{Seq, App} || {?APP_KEY(_Pid), {Seq, App}} <- persistent_term:get()],
+    Started = [{Seq, App} || {?APP_KEY(_Pid), {Seq, App, _Watcher}} <- persistent_term:get()],
     [App || {_Seq, App} <- lists:reverse(lists:keysort(1, Started))].
+
+%% The watcher of a remembered application: {ok, Pid} | {error, nil}.
+app_watcher(Pid) when is_pid(Pid) ->
+    case persistent_term:get(?APP_KEY(Pid), undefined) of
+        {_Seq, _App, Watcher} -> {ok, Watcher};
+        undefined -> {error, nil}
+    end.
+
+is_remembered(Pid) when is_pid(Pid) ->
+    persistent_term:get(?APP_KEY(Pid), undefined) =/= undefined.
 
 is_linked(Pid) ->
     {links, Links} = process_info(self(), links),
@@ -62,8 +88,6 @@ await_exit(Pid) ->
             iolist_to_binary(io_lib:format("~p", [Reason]))
     end.
 
-%% Generate a cryptographically secure secret key using crypto:strong_rand_bytes/1.
-%% Returns a URL-safe base64-encoded string prefixed with "brazier_".
 %% Run Drain while holding the node's SIGTERM drain lock: every process in
 %% wait_forever is told about SIGTERM, and they drain one after the other,
 %% so an application is never stopped by two of them at once, and none

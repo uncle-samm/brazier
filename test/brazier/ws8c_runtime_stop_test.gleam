@@ -7,14 +7,23 @@
 //// to the helper and not to the test process. The tests synchronize on the
 //// telemetry event and the runtime's DOWN; nothing sleeps.
 ////
-//// A monitor is a signal from the test process. When the process it
-//// targets is then stopped by a signal from ANOTHER process (the helper's
-//// exit reaching the runtime through their link, or the runtime's crash
-//// reaching the helper), the two signals have no ordering guarantee: the
-//// target can exit before it handles the monitor, and the monitor then
-//// reports `noproc` instead of the real reason. Every such monitor is
-//// followed by a barrier (a synchronous request from the test process,
-//// handled after the monitor), and `await_down` fails loudly on `noproc`.
+//// A monitor is a signal from the test process, and `process.monitor`
+//// returns before the target has it: on a normal scheduler the VM parks
+//// the monitor signal in the scheduler's pending slot and only enqueues it
+//// when the test process is scheduled out, sends the same target another
+//// signal or message, or creates another monitor (OTP 28
+//// `erl_proc_sig_queue.c`, `erts_proc_sig_send_monitor`). When the target
+//// is then stopped by a signal from ANOTHER process (the helper's exit
+//// reaching the runtime through their link, or the runtime's crash
+//// reaching the helper), nothing orders the two: the target can handle
+//// the exit and leave before the parked monitor reaches it, and that
+//// monitor then reports `noproc` instead of the real reason. That was the
+//// atom DOWN of `failing_linked_process_reports_stop_with_exit_test`, while
+//// its stop event carried the helper's reason
+//// (`monitor_reaching_an_exited_runtime_reports_noproc_test` replays it).
+//// Every such monitor is followed by a barrier (a synchronous request from
+//// the test process to the same target, which enqueues the monitor first
+//// and is answered after it), and `await_down` fails loudly on `noproc`.
 
 import brazier/await
 import brazier/effect
@@ -200,7 +209,8 @@ pub fn failing_linked_process_reports_stop_with_exit_test() {
   use events <- listen()
   let monitor = process.monitor(started.runtime_pid)
   // The runtime dies from the helper's exit signal, not from one of ours,
-  // so make it handle the monitor first (the flake this test once had).
+  // so make it handle the monitor first: without this barrier the monitor
+  // can still be parked when the runtime leaves (see the module doc).
   await.barrier_pid(started.runtime_pid)
 
   // The helper is the runtime's link (as a connection handler is).
@@ -215,10 +225,47 @@ pub fn failing_linked_process_reports_stop_with_exit_test() {
   // The runtime left with the signal's reason, as an untrapped link would.
   let assert process.Abnormal(reason) = await_down(monitor)
   let assert Ok("ws8c linked owner fails") = decode.run(reason, decode.string)
-    as {
-      "the runtime must leave with the signal's reason, not "
-      <> string.inspect(reason)
-    }
+    as "the runtime leaves with the signal's reason"
+  let assert Error(Nil) = process.receive(events, 0)
+    as "an exit signal reports one stop"
+}
+
+/// The flake, replayed in a fixed order. A monitor the runtime has handled
+/// before the helper fails carries the helper's reason; a monitor that
+/// reaches the runtime after it left (as the parked monitor of the old
+/// test did) reports the atom `noproc`, which is the atom the flaky
+/// assertion found while the stop event named the helper's reason. So the
+/// runtime's exit path was right, and the DOWN reason is only evidence for
+/// a monitor the target handled before it was stopped.
+pub fn monitor_reaching_an_exited_runtime_reports_noproc_test() {
+  let started = start()
+  use events <- listen()
+  let established = process.monitor(started.runtime_pid)
+  await.barrier_pid(started.runtime_pid)
+
+  process.send_abnormal_exit(started.owner, "ws8c linked owner fails")
+
+  let stop = expect_stop(events)
+  let assert Ok(description) = telemetry.string(stop, "error")
+  let assert True = string.contains(description, "ws8c linked owner fails")
+  let assert process.Abnormal(reason) = await_down(established)
+  let assert Ok("ws8c linked owner fails") = decode.run(reason, decode.string)
+    as "the monitor handled before the exit carries the signal's reason"
+
+  // The runtime is gone: this monitor reaches it only after it left.
+  let late = process.monitor(started.runtime_pid)
+  let selector =
+    process.new_selector()
+    |> process.select_specific_monitor(late, fn(down) { down })
+  let assert Ok(process.ProcessDown(reason: late_reason, ..)) =
+    process.selector_receive(selector, await.deadline_ms)
+    as "a monitor of an exited process is answered at once"
+  let assert process.Abnormal(late_reason) = late_reason
+  let assert Ok(noproc) = decode.run(late_reason, atom.decoder())
+    as "the late monitor's reason is an atom, as in the flake"
+  let assert "noproc" = atom.to_string(noproc)
+  let assert Error(_) = decode.run(late_reason, decode.string)
+    as "the flaky assertion's decode fails on that atom"
   let assert Error(Nil) = process.receive(events, 0)
     as "an exit signal reports one stop"
 }

@@ -400,48 +400,83 @@ fn stop_app(app: App) -> Result(Nil, StopFailure) {
       <> int.to_string(app.drain_timeout_ms)
       <> "ms)",
   )
+  // Looked up before the stop: once the tree is gone its watcher forgets
+  // the record and exits.
+  let watcher = app_watcher(app.supervisor_pid)
   case
     stop_supervisor(app.supervisor_pid, app.drain_timeout_ms + stop_margin_ms)
   {
-    Ok(Nil) -> {
-      forget_app(app.supervisor_pid)
-      case server.release(app.listener) {
-        True -> Nil
-        False ->
-          log.warning(
+    Ok(Nil) ->
+      case await_forgotten(app, watcher) {
+        Ok(Nil) -> {
+          log.info(
             "brazier.application",
-            "The listener of the application on port "
+            "Brazier application stopped (port "
               <> int.to_string(app.port)
-              <> " had no remembered port",
+              <> ")",
           )
-      }
-      log.info(
-        "brazier.application",
-        "Brazier application stopped (port " <> int.to_string(app.port) <> ")",
-      )
-      Ok(Nil)
-    }
-    // Already stopped (a second `stop`), or the tree died on its own: an
-    // unexpected call, not a failed shutdown, so it is one warning. A tree
-    // that died without `stop` still held its port memory: it goes now.
-    Error(NotRunning(reason)) -> {
-      forget_app(app.supervisor_pid)
-      let message =
-        "The application on port "
-        <> int.to_string(app.port)
-        <> " was not stopped: "
-        <> reason
-        <> case server.release(app.listener) {
-          True -> " (it exited without stop; its port is forgotten now)"
-          False -> " (it was stopped already)"
+          Ok(Nil)
         }
-      log.warning("brazier.application", message)
-      Error(NotRunning(message))
-    }
-    Error(StopFailed(reason)) -> {
-      let message = "Application stop failed: " <> reason
-      log.error("brazier.application", message)
-      Error(StopFailed(message))
+        Error(reason) -> stop_failed(reason)
+      }
+    // Already stopped (a second `stop`), or the tree died on its own (its
+    // watcher logged that and forgot it): an unexpected call, not a failed
+    // shutdown, so it is one warning.
+    Error(NotRunning(reason)) ->
+      case await_forgotten(app, watcher) {
+        Ok(Nil) -> {
+          let message =
+            "The application on port "
+            <> int.to_string(app.port)
+            <> " was not stopped: "
+            <> reason
+            <> " (it was stopped already, or its tree exited)"
+          log.warning("brazier.application", message)
+          Error(NotRunning(message))
+        }
+        Error(reason) -> stop_failed(reason)
+      }
+    Error(StopFailed(reason)) -> stop_failed(reason)
+  }
+}
+
+fn stop_failed(reason: String) -> Result(Nil, StopFailure) {
+  let message = "Application stop failed: " <> reason
+  log.error("brazier.application", message)
+  Error(StopFailed(message))
+}
+
+/// Wait until the watcher of a tree that is gone has forgotten it, so that
+/// `stop` returns with the node-wide record and the bound port cleared.
+/// `watcher` was looked up while the record still named it, or is
+/// `Error(Nil)` when the record was gone already.
+fn await_forgotten(
+  app: App,
+  watcher: Result(process.Pid, Nil),
+) -> Result(Nil, String) {
+  case watcher {
+    Error(Nil) -> Ok(Nil)
+    Ok(watcher) -> {
+      let monitor = process.monitor(watcher)
+      // INVARIANT: a monitor always delivers its DOWN (`noproc` when the
+      // watcher exited before it), and the watcher exits once the tree,
+      // which is not running now, has gone; no timeout is needed.
+      let down =
+        process.new_selector()
+        |> process.select_specific_monitor(monitor, fn(down) { down })
+        |> process.selector_receive_forever
+      case is_remembered(app.supervisor_pid), down {
+        False, _ -> Ok(Nil)
+        True, process.ProcessDown(reason:, ..) ->
+          Error(
+            "the watcher of the application on port "
+            <> int.to_string(app.port)
+            <> " exited without forgetting it: "
+            <> string.inspect(reason),
+          )
+        True, process.PortDown(..) ->
+          Error("a process monitor reported a port going down")
+      }
     }
   }
 }
@@ -454,10 +489,104 @@ type StopFailure {
   StopFailed(reason: String)
 }
 
-/// Remember an app node-wide, for `wait_forever`.
+/// Remember an app node-wide, for `wait_forever`, until its tree goes.
+///
+/// A watcher process monitors the supervisor, then writes the record, and
+/// forgets it (with the listener's bound port) when the monitor fires,
+/// whether the tree was stopped or crashed. Monitoring first means a tree
+/// that dies at any point after its start is forgotten: before the monitor
+/// it is reported `noproc`. Returns once the record is written. The
+/// watcher is unlinked: it outlives the starter as long as the tree does.
+/// Reference: OTP's application controller, which links to each
+/// application master and drops the application when it exits.
 fn remember(app: App) -> App {
-  remember_app(app.supervisor_pid, app)
-  app
+  let recorded = process.new_subject()
+  let watcher = process.spawn_unlinked(fn() { watch(app, recorded) })
+  let watcher_monitor = process.monitor(watcher)
+  // INVARIANT: the watcher either sends `recorded` or exits, and its
+  // monitor reports the exit: one of the two always arrives.
+  let outcome =
+    process.new_selector()
+    |> process.select_map(recorded, fn(_) { Ok(Nil) })
+    |> process.select_specific_monitor(watcher_monitor, Error)
+    |> process.selector_receive_forever
+  case outcome {
+    Ok(Nil) -> {
+      process.demonitor_process(watcher_monitor)
+      app
+    }
+    Error(down) -> {
+      let reason =
+        "The watcher of the application on port "
+        <> int.to_string(app.port)
+        <> " exited before recording it: "
+        <> string.inspect(down)
+      log.error("brazier.application", reason)
+      fail_loudly(reason)
+    }
+  }
+}
+
+/// The watcher's body: record the app, then forget it when its tree goes.
+fn watch(app: App, recorded: process.Subject(Nil)) -> Nil {
+  let tree = process.monitor(app.supervisor_pid)
+  remember_app(app.supervisor_pid, app, process.self())
+  process.send(recorded, Nil)
+  // INVARIANT: a monitor always delivers its DOWN; nothing else is
+  // received, and the watcher waits as long as the tree runs.
+  let down =
+    process.new_selector()
+    |> process.select_specific_monitor(tree, fn(down) { down })
+    |> process.selector_receive_forever
+  let port = int.to_string(app.port)
+  let record = case forget_app(app.supervisor_pid) {
+    True -> "its node-wide record is forgotten"
+    False -> "it had no node-wide record"
+  }
+  let bound = case server.release(app.listener) {
+    True -> "its bound port too"
+    False -> "it had no remembered bound port"
+  }
+  let summary = record <> ", " <> bound
+  case down {
+    process.ProcessDown(reason: process.Normal, ..) ->
+      log.info(
+        "brazier.application",
+        "The application tree on port " <> port <> " stopped: " <> summary,
+      )
+    process.ProcessDown(reason:, ..) ->
+      log.error(
+        "brazier.application",
+        "The application tree on port "
+          <> port
+          <> " exited with "
+          <> string.inspect(reason)
+          <> ": "
+          <> summary,
+      )
+    process.PortDown(..) ->
+      log.error(
+        "brazier.application",
+        "The application watcher on port "
+          <> port
+          <> " got a port DOWN from a process monitor: "
+          <> summary,
+      )
+  }
+}
+
+/// The watcher of a running application, for tests that wait for it to
+/// forget a tree that went.
+@internal
+pub fn watcher(app: App) -> Result(process.Pid, Nil) {
+  app_watcher(app.supervisor_pid)
+}
+
+/// Whether the application is in the node-wide record `wait_forever` stops
+/// on SIGTERM.
+@internal
+pub fn is_recorded(app: App) -> Bool {
+  is_remembered(app.supervisor_pid)
 }
 
 /// `BRAZIER_SHUTDOWN_TIMEOUT` (milliseconds), when set, replaces the
@@ -686,17 +815,34 @@ fn transport_config(
 /// The calling process traps exits. The abnormal exit of any linked
 /// process (for example the root supervisor giving up after repeated
 /// crashes) is received here and re-raised: the application never keeps
-/// running with a dead tree. Nothing is polled and nothing sleeps.
+/// running with a dead tree. Only the normal exit of an application this
+/// process started (linked to it when the wait begins) ends the wait; any
+/// other linked process that exits normally is logged and the wait goes
+/// on, as it would without trapping exits. Nothing is polled and nothing
+/// sleeps.
 pub fn wait_forever() -> Nil {
   let waiter = process.self()
+  // Taken before trapping exits: an application stopped after this point
+  // sends its EXIT once exits are trapped, and is in the list. One stopped
+  // before trap_exit sends nothing this process could receive, trapped or
+  // not.
+  let waited =
+    remembered_apps()
+    |> list.map(fn(app) { app.supervisor_pid })
+    |> list.filter(is_linked)
   trap_exit()
   case install_signal_handler(waiter) {
     Ok(Nil) -> Nil
     Error(reason) -> fail_loudly("SIGTERM handling: " <> reason)
   }
-  log.info("brazier.application", "Application running. Press Ctrl+C to stop.")
-  case receive_wait_event() {
-    Sigterm -> {
+  log.info(
+    "brazier.application",
+    "Application running, waiting on "
+      <> int.to_string(list.length(waited))
+      <> " linked application(s) and SIGTERM. Press Ctrl+C to stop.",
+  )
+  case await_wait_event(waited) {
+    SigtermReceived -> {
       // The handler stays installed through the drain, so a second SIGTERM
       // reaches it (logged and ignored), not OTP's `init:stop()`.
       let failures = drain_exclusively(stop_on_sigterm)
@@ -711,7 +857,7 @@ pub fn wait_forever() -> Nil {
         }
       }
     }
-    ShutdownRequested -> {
+    ApplicationStopped -> {
       leave_signal_handler(waiter)
       pass_on_late_sigterm()
       log.info(
@@ -719,7 +865,7 @@ pub fn wait_forever() -> Nil {
         "The application was stopped, wait_forever returns",
       )
     }
-    LinkedProcessExited(reason) -> {
+    LinkedExited(reason) -> {
       leave_signal_handler(waiter)
       pass_on_late_sigterm()
       let message = "Linked application process exited: " <> reason
@@ -729,12 +875,41 @@ pub fn wait_forever() -> Nil {
   }
 }
 
+/// The next event that ends `wait_forever`'s wait. A linked process that
+/// is not a waited application and exits normally does not: it is logged
+/// and the wait goes on.
+fn await_wait_event(waited: List(process.Pid)) -> WaitEnd {
+  case receive_wait_event(waited) {
+    Sigterm -> SigtermReceived
+    ShutdownRequested -> ApplicationStopped
+    LinkedProcessExited(reason) -> LinkedExited(reason)
+    OtherLinkExitedNormally(from) -> {
+      log.info(
+        "brazier.application",
+        "Linked process "
+          <> from
+          <> " exited normally; it is not an application this process waits on, so the wait goes on",
+      )
+      await_wait_event(waited)
+    }
+  }
+}
+
 /// What ended `wait_forever`'s wait.
+type WaitEnd {
+  SigtermReceived
+  ApplicationStopped
+  LinkedExited(reason: String)
+}
+
+/// What `wait_forever`'s wait received (`receive_wait_event`).
 type WaitEvent {
   /// The OS sent SIGTERM.
   Sigterm
-  /// A linked process exited normally (the application was stopped).
+  /// A waited application's supervisor exited normally (it was stopped).
   ShutdownRequested
+  /// Another linked process exited normally (`from` is its pid, formatted).
+  OtherLinkExitedNormally(from: String)
   /// A linked process exited abnormally.
   LinkedProcessExited(reason: String)
 }
@@ -819,7 +994,7 @@ type EnvIntError {
 fn trap_exit() -> Nil
 
 @external(erlang, "brazier_application_ffi", "receive_wait_event")
-fn receive_wait_event() -> WaitEvent
+fn receive_wait_event(waited: List(process.Pid)) -> WaitEvent
 
 @external(erlang, "brazier_signal_handler", "install")
 fn install_signal_handler(waiter: process.Pid) -> Result(Nil, String)
@@ -828,13 +1003,20 @@ fn install_signal_handler(waiter: process.Pid) -> Result(Nil, String)
 fn uninstall_signal_handler(waiter: process.Pid) -> Result(Nil, String)
 
 @external(erlang, "brazier_application_ffi", "remember_app")
-fn remember_app(supervisor: process.Pid, app: App) -> Nil
+fn remember_app(supervisor: process.Pid, app: App, watcher: process.Pid) -> Nil
 
+/// Whether there was a record to forget.
 @external(erlang, "brazier_application_ffi", "forget_app")
-fn forget_app(supervisor: process.Pid) -> Nil
+fn forget_app(supervisor: process.Pid) -> Bool
 
 @external(erlang, "brazier_application_ffi", "remembered_apps")
 fn remembered_apps() -> List(App)
+
+@external(erlang, "brazier_application_ffi", "app_watcher")
+fn app_watcher(supervisor: process.Pid) -> Result(process.Pid, Nil)
+
+@external(erlang, "brazier_application_ffi", "is_remembered")
+fn is_remembered(supervisor: process.Pid) -> Bool
 
 @external(erlang, "brazier_application_ffi", "drain_exclusively")
 fn drain_exclusively(drain: fn() -> List(String)) -> List(String)

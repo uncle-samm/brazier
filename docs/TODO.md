@@ -37,13 +37,6 @@ Found while merging WS10b (Milestone 117, 2026-11-04).
 - **Issue:** an `init` refusing with 409 closes with 4409, the same code as
   a stale build, so the two cannot be told apart from the close code.
   - **Files:** `src/brazier/error.gleam`, `src/brazier/transport/ws.gleam`
-- **Issue:** `brazier_application_ffi:receive_wait_event` takes any
-  `{'EXIT', _, normal}` as a shutdown request, so a linked helper that exits
-  normally stops the wait.
-  - **Files:** `src/brazier_application_ffi.erl`
-- **Issue:** the node-wide app record keeps the `persistent_term` entry of a
-  tree that crashed until a `stop` or a SIGTERM finds it not running.
-  - **Files:** `src/brazier_application_ffi.erl`
 - **Issue:** a page that is reconnecting while dev mode rebuilds misses the
   `reload` (it is not subscribed between sockets); it then joins with a
   stale build and reloads through 4409 instead, behind the reload guard.
@@ -51,13 +44,89 @@ Found while merging WS10b (Milestone 117, 2026-11-04).
 - **Issue:** `window.__brazierOutboundPendingForTest()` does not count a
   debounced send whose timer has not fired (`brazier_client_ffi.mjs`).
   - **Files:** `brazier_client/src/brazier_client_ffi.mjs`, `test_all_cdp.py`
-- **Issue:** a title over `runtime.title_max_bytes` is reported with an
-  `error` frame and a log line after every update while it stays too large.
-  - **Files:** `src/brazier/runtime.gleam`
 
 ## Resolved Issues
 
 <!-- Move resolved issues here with full resolution details -->
+
+- **Issue:** `brazier_application_ffi:receive_wait_event` takes any
+  `{'EXIT', _, normal}` as a shutdown request, so a linked helper that exits
+  normally stops the wait.
+  - **Files:** `src/brazier_application_ffi.erl`,
+    `src/brazier/application.gleam`
+  - **Resolution:** (Milestone 118, m118-lifecycle) `wait_forever` traps
+    exits, so every linked process's exit reaches its receive, and the
+    receive matched `normal` from any sender. A helper that finished (a
+    `process.spawn` task) therefore ended the wait as if the application had
+    been stopped: `wait_forever` returned while the application was still
+    running. `wait_forever` now notes, before it traps exits, the supervisors
+    of the remembered applications linked to it, and `receive_wait_event`
+    takes that list: a `normal` exit of one of them is the stop; a `normal`
+    exit of any other linked process is logged (info) and the wait goes on,
+    as it would without trapping exits; any abnormal exit still ends the
+    wait loudly. An application stopped before the list is taken sends
+    nothing the waiter could receive, trapped or not, as before.
+    `app_lifecycle_test` covers a helper that exits normally (logged, the
+    waiter keeps waiting, then `stop` ends the wait) and one that crashes.
+- **Issue:** the node-wide app record keeps the `persistent_term` entry of a
+  tree that crashed until a `stop` or a SIGTERM finds it not running.
+  - **Files:** `src/brazier_application_ffi.erl`,
+    `src/brazier/application.gleam`
+  - **Resolution:** (Milestone 118, m118-lifecycle) The record was written
+    by `start` and erased by `stop` only, so nothing noticed a tree that died
+    on its own: the record (and the listener's remembered bound port) stayed
+    until a `stop` or a SIGTERM drain found the tree not running. Each
+    application now has a watcher, spawned unlinked by `start`, which
+    monitors the root supervisor before it writes the record (so a tree that
+    dies at any point after its start is reported, `noproc` at worst). When
+    the monitor fires, stopped or crashed, the watcher erases the record and
+    the bound port, logs it (info for a stop, error with the reason for a
+    crash) and exits, as OTP's application controller drops an application
+    whose master exits. `stop` returns once the watcher has forgotten the
+    tree, and fails if it exited without doing so. `app_lifecycle_test`
+    covers a killed tree (forgotten at once, the error logged, a later
+    `stop` one warning), a stop, and a SIGTERM after a crash (nothing to
+    drain, no warning).
+
+- **Issue:** a title over `runtime.title_max_bytes` is reported with an
+  `error` frame and a log line after every update while it stays too large.
+  - **Files:** `src/brazier/runtime.gleam`
+  - **Resolution:** (Milestone 118, m118-lifecycle) The runtime reported
+    from the size check alone, with no memory of having reported, so every
+    update re-sent the error. The runtime state now holds a `TitleSync`
+    (`TitleWithinLimit` / `TitleOverLimit`, each with the last title sent).
+    Going over the limit is logged as an error and reported to every
+    connection once; while it stays over, an update logs at debug and sends
+    nothing, and a connection that joins meanwhile is told once. Going back
+    within the limit is logged (info), sends the title if it differs from
+    the one last sent, and re-arms the report. `runtime_title_limit_test`
+    covers staying over, going over again after being within, and a join
+    while over, counting the log lines.
+- **Issue:** `ws8c_runtime_stop_test`
+  (`failing_linked_process_reports_stop_with_exit_test`) failed once: the
+  stop event carried the owner's reason, but the runtime's DOWN reason was
+  an atom.
+  - **Files:** `test/brazier/ws8c_runtime_stop_test.gleam`
+  - **Resolution:** (Milestone 118, m118-lifecycle) The test, not the
+    runtime. On OTP 28 `erlang:monitor` on a normal scheduler parks the
+    monitor signal in the scheduler's pending slot (`erl_proc_sig_queue.c`,
+    `erts_proc_sig_send_monitor`); it is enqueued only when the sender is
+    scheduled out, signals the same target again, or creates another
+    monitor. The helper's exit reached the runtime from another process,
+    so the runtime could leave first, and a monitor that reaches an exited
+    process reports `noproc`: the atom. Measured with the real runtime and
+    a forced spin while the monitor is parked: 1079 and 598 of 2000 runs
+    gave `noproc`; with a message to the runtime after the monitor, and
+    with `await.barrier_pid`, 0 of 2000 each. The flake was recorded
+    (fa127d4) before the barrier was added after the monitor (3bc6444),
+    which fixes it: the synchronous request goes to the same target, so it
+    enqueues the monitor first. The module doc now names the mechanism,
+    `monitor_reaching_an_exited_runtime_reports_noproc_test` replays the
+    symptom in a fixed order, and the diagnostic is removed. The parked
+    slot cannot be held from Erlang code (any schedule-out flushes it), so
+    no test can force the race; what stretched the window in that one run
+    (likely the OS descheduling a scheduler thread on a loaded clean build)
+    is not known.
 
 - **Issue:** several simulation tests allow leaked processes or failed
   connections (`sim_test.gleam:177`, `:247`, `:320`, `:377-379`), against

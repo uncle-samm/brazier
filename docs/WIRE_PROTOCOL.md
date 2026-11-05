@@ -218,7 +218,10 @@ change when the client-visible model does not). The client sets
 ignored. An app without `brazier.title` never sends it. A title over
 `runtime.title_max_bytes` (4096) is not sent: the server logs an error and
 sends `{"type":"error","reason":"Title too large: ..."}` instead, and the
-page keeps its last title.
+page keeps its last title. The error is sent once when the title goes over
+the limit (and to a connection that joins while it is over), not after each
+update while it stays over; the title going back within the limit is
+logged, and a later title over it is reported again.
 ```json
 {"type": "title", "title": "Inbox (3)"}
 ```
