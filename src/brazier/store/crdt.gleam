@@ -30,6 +30,50 @@
 ////
 //// Every state carries a `digest` of itself for anti-entropy, kept up to
 //// date by every join instead of recomputed (see `digest`).
+////
+//// ## Floors: a context bounded across restarts
+////
+//// A restarted store server is a new replica (a new incarnation of its
+//// node), so without more every restart would add a clock entry that no
+//// replica could ever drop. The context therefore also holds *floors*:
+//// `floors[node] = i` covers every dot of every incarnation of `node`
+//// below `i`, so the clock entries and cloud dots of those incarnations
+//// are dropped. Only an incarnation raises its own node's floor, to
+//// itself (`raise_floor`), and only once every replica it can reach holds
+//// the same state, so every dot of an earlier incarnation any of them
+//// holds is in its own state: a live one stays live (a floor covers a dot,
+//// it does not remove it), a removed one stays removed. The context then
+//// holds at most one incarnation per node name that is still compacting,
+//// plus the incarnations that started since a node's last raise.
+////
+//// The cost is a narrow loss: a dot of an earlier incarnation that only a
+//// replica out of reach held (partitioned, or a node whose replica had not
+//// yet joined), or that was still in flight, is covered without having
+//// been seen, so it is dropped wherever it arrives. The earlier
+//// incarnation itself is gone, and its writes are fire and forget, so such
+//// a write was already at risk; docs/CLUSTERING.md says when it happens.
+////
+//// ## Against delta_crdt_ex
+////
+//// The join of dot sets is delta_crdt_ex's `AWLWWMap.join_dot_sets/4`
+//// (the formula on `join_keys`); the differences are:
+////
+//// - The context is exact: delta_crdt_ex's `Dots.compress` folds a dot
+////   set into one counter per replica, which also covers counters below
+////   it that it never saw. Here a dot beyond a gap stays in the cloud
+////   until the gap fills, and only a contiguous run moves into the clock.
+//// - Values are ordered by a hybrid logical clock (`brazier/store/hlc`)
+////   and ties break on the dot, a total order, so every node reads the
+////   same value. delta_crdt_ex stamps a value with the writer's
+////   `System.monotonic_time`, which is not comparable across nodes, and
+////   reads the greatest with `Enum.max_by`, with no tie-break.
+//// - Floors (above): delta_crdt_ex never shrinks its context, and its node
+////   id is a fresh `:rand.uniform(1_000_000_000)` on every start, so its
+////   context grows with every restart (and two starts can draw one id).
+//// - Anti-entropy compares one incremental digest (see `digest`) and a
+////   mismatch pulls the whole state; delta_crdt_ex walks a Merkle tree
+////   down to the differing keys and sends only those, one sync in flight
+////   per neighbour until it is acknowledged.
 
 import brazier/store/hlc.{type Timestamp}
 import gleam/dict.{type Dict}
@@ -60,9 +104,12 @@ pub type Entry(value) {
 }
 
 /// Every dot observed: `clock` covers counters `1..n` of each replica,
-/// `cloud` holds the dots seen beyond a gap.
+/// `cloud` holds the dots seen beyond a gap, and `floors` covers every dot
+/// of each node's incarnations below its floor (node name -> incarnation,
+/// always at least 1; see the module doc). No clock entry or cloud dot of
+/// a state is under a floor: joins drop them.
 pub type Context {
-  Context(clock: Dict(Replica, Int), cloud: Set(Dot))
+  Context(clock: Dict(Replica, Int), cloud: Set(Dot), floors: Dict(String, Int))
 }
 
 /// The live dots of a key.
@@ -104,7 +151,7 @@ pub fn new() -> State(value) {
 }
 
 fn empty_context() -> Context {
-  Context(clock: dict.new(), cloud: set.new())
+  Context(clock: dict.new(), cloud: set.new(), floors: dict.new())
 }
 
 // --- Writes (each returns the new state, its delta and the changes) ---
@@ -286,14 +333,17 @@ fn join_keys(
 
 /// The dots of `mine` that `context` covers and `theirs` lacks (the ones
 /// the other side saw and then replaced or removed), each once, and how
-/// many there are. `observed` is `context_dot_count(context)`.
+/// many there are. `observed` is `context_dot_count(context)`. A context
+/// with floors covers dots no listing can name (every counter of an older
+/// incarnation), so it is always scanned; a write's delta has none, so its
+/// joins keep the listing path.
 fn removed_dots(
   mine: Dots(value),
   theirs: Dots(value),
   context: Context,
   observed: Int,
 ) -> #(List(#(Dot, Entry(value))), Int) {
-  case observed < dict.size(mine) {
+  case observed < dict.size(mine) && dict.is_empty(context.floors) {
     True -> {
       // Collected in a dict: an uncompacted context lists a dot twice.
       let removed =
@@ -379,12 +429,91 @@ fn dict_get_or_empty(
 /// counters `1..n` only: `next_dot` never makes a counter below 1, and a
 /// clock that covered one would cover dots `fold_context_dots` cannot list,
 /// so the two ways `join_keys` finds removed dots would disagree on a
-/// malformed delta from a peer.
+/// malformed delta from a peer. A floor covers every dot of the node's
+/// incarnations below it.
 pub fn covers(context: Context, dot: Dot) -> Bool {
-  case dict.get(context.clock, dot.replica) {
-    Ok(max) if dot.counter >= 1 && dot.counter <= max -> True
-    Ok(_) | Error(Nil) -> set.contains(context.cloud, dot)
+  case below_floor(context.floors, dot.replica) {
+    True -> True
+    False ->
+      case dict.get(context.clock, dot.replica) {
+        Ok(max) if dot.counter >= 1 && dot.counter <= max -> True
+        Ok(_) | Error(Nil) -> set.contains(context.cloud, dot)
+      }
   }
+}
+
+/// Whether `replica` is an incarnation below its node's floor.
+fn below_floor(floors: Dict(String, Int), replica: Replica) -> Bool {
+  case dict.get(floors, replica.node) {
+    Ok(floor) -> replica.incarnation < floor
+    Error(Nil) -> False
+  }
+}
+
+/// The floor of `node` in the state's context: 0 when it has none (an
+/// incarnation is never below 0).
+pub fn floor(state: State(value), node: String) -> Int {
+  floor_or_zero(state.context.floors, node)
+}
+
+fn floor_or_zero(floors: Dict(String, Int), node: String) -> Int {
+  case dict.get(floors, node) {
+    Ok(floor) -> floor
+    Error(Nil) -> 0
+  }
+}
+
+/// Whether the state's context holds a clock entry or cloud dot of an
+/// incarnation of `replica`'s node older than `replica`: what
+/// `raise_floor` would drop. O(clock entries + cloud dots); a replica asks
+/// once it is in sync with every peer, not on every join.
+pub fn has_older_incarnation(state: State(value), replica: Replica) -> Bool {
+  let older = fn(other: Replica) {
+    other.node == replica.node && other.incarnation < replica.incarnation
+  }
+  list.any(dict.keys(state.context.clock), older)
+  || set.fold(state.context.cloud, False, fn(found, dot) {
+    found || older(dot.replica)
+  })
+}
+
+/// Raise `replica`'s node's floor to `replica`'s incarnation, covering
+/// every dot of the node's older incarnations and dropping their clock
+/// entries and cloud dots. Their live dots stay live. Returns the new state
+/// and the delta to broadcast (a context with only the floor, so a join of
+/// it removes no live dot), or `Error(Nil)` when the floor is already
+/// there or higher (nothing to raise). Only the incarnation itself may
+/// raise its node's floor, and only once it holds every reachable
+/// replica's state (see the module doc).
+pub fn raise_floor(
+  state: State(value),
+  replica: Replica,
+) -> Result(#(State(value), Delta(value)), Nil) {
+  case replica.incarnation > floor(state, replica.node) {
+    False -> Error(Nil)
+    True -> {
+      let delta =
+        Delta(
+          entries: dict.new(),
+          context: Context(
+            clock: dict.new(),
+            cloud: set.new(),
+            floors: dict.from_list([#(replica.node, replica.incarnation)]),
+          ),
+          topics: [],
+        )
+      let #(next, _changes) = join(state, delta)
+      Ok(#(next, delta))
+    }
+  }
+}
+
+/// The number of elements the state's context holds: clock entries, cloud
+/// dots and floors. Floors keep it bounded across restarts.
+pub fn context_size(state: State(value)) -> Int {
+  dict.size(state.context.clock)
+  + set.size(state.context.cloud)
+  + dict.size(state.context.floors)
 }
 
 /// The next dot of `replica`. A replica's own dots are created in order and
@@ -405,7 +534,7 @@ fn context_of(dots: List(Dot)) -> Context {
   let #(context, _digest) =
     union_context(
       empty_context(),
-      Context(clock: dict.new(), cloud: set.from_list(dots)),
+      Context(clock: dict.new(), cloud: set.from_list(dots), floors: dict.new()),
       0,
       untracked,
     )
@@ -439,12 +568,21 @@ fn context_of(dots: List(Dot)) -> Context {
 /// of the context that is added or removed (`untracked` for a context with
 /// no digest), so the digest costs O(elements that change), as the rest of
 /// the union does.
+///
+/// Floors come first: each floor `b` raises drops the clock entries and
+/// cloud dots of `a` it now covers (one pass over `a`'s clock and cloud,
+/// only when a floor rises, which is once per restart of a node), and the
+/// clock entries and cloud dots of `b` under the joined floors are left
+/// out, so no state ever holds an element a floor covers. With no floor on
+/// either side this costs nothing.
 fn union_context(
   a: Context,
   b: Context,
   digest: Int,
   toggle: fn(Int, Element) -> Int,
 ) -> #(Context, Int) {
+  let #(a, digest) = raise_floors(a, b.floors, digest, toggle)
+  let b = above_floors(b, a.floors)
   let clock = dict.combine(a.clock, b.clock, fn(x, y) { int.max(x, y) })
   let #(cloud, digest) = drop_covered(a, b.clock, digest, toggle)
   // Every replica `b` names is a candidate for extension: its clock may
@@ -485,7 +623,73 @@ fn union_context(
           |> toggle_entry(new, replica, toggle)
       }
     })
-  #(Context(clock:, cloud:), digest)
+  #(Context(clock:, cloud:, floors: a.floors), digest)
+}
+
+/// `a` with every floor of `floors` that is higher than its own, and
+/// without the clock entries and cloud dots those floors now cover, with
+/// `digest` updated for every element that changed.
+fn raise_floors(
+  a: Context,
+  floors: Dict(String, Int),
+  digest: Int,
+  toggle: fn(Int, Element) -> Int,
+) -> #(Context, Int) {
+  let raised =
+    dict.fold(floors, dict.new(), fn(raised, node, floor) {
+      case floor > floor_or_zero(a.floors, node) {
+        True -> dict.insert(raised, node, floor)
+        False -> raised
+      }
+    })
+  case dict.is_empty(raised) {
+    True -> #(a, digest)
+    False -> {
+      let digest =
+        dict.fold(raised, digest, fn(digest, node, floor) {
+          let digest = case dict.get(a.floors, node) {
+            Ok(old) -> toggle(digest, FloorEntry(node:, incarnation: old))
+            Error(Nil) -> digest
+          }
+          toggle(digest, FloorEntry(node:, incarnation: floor))
+        })
+      let #(clock, digest) =
+        dict.fold(a.clock, #(a.clock, digest), fn(acc, replica, max) {
+          case below_floor(raised, replica) {
+            True -> #(
+              dict.delete(acc.0, replica),
+              toggle(acc.1, ClockEntry(replica:, max:)),
+            )
+            False -> acc
+          }
+        })
+      let #(cloud, digest) =
+        set.fold(a.cloud, #(a.cloud, digest), fn(acc, dot) {
+          case below_floor(raised, dot.replica) {
+            True -> #(set.delete(acc.0, dot), toggle(acc.1, CloudDot(dot)))
+            False -> acc
+          }
+        })
+      let floors = dict.merge(a.floors, raised)
+      #(Context(clock:, cloud:, floors:), digest)
+    }
+  }
+}
+
+/// `b` without the clock entries and cloud dots `floors` covers. `b` is
+/// not part of any digest, so nothing is folded.
+fn above_floors(b: Context, floors: Dict(String, Int)) -> Context {
+  case dict.is_empty(floors) {
+    True -> b
+    False ->
+      Context(
+        ..b,
+        clock: dict.filter(b.clock, fn(replica, _max) {
+          !below_floor(floors, replica)
+        }),
+        cloud: set.filter(b.cloud, fn(dot) { !below_floor(floors, dot.replica) }),
+      )
+  }
 }
 
 fn toggle_entry(
@@ -658,16 +862,18 @@ pub fn max_timestamp(delta: Delta(value)) -> Result(Timestamp, Nil) {
 // --- Digest ---
 
 /// One element of a state, as the digest hashes it: a live dot under its
-/// key, a clock entry, or a cloud dot. Values are left out: a dot names
-/// one value forever.
+/// key, a clock entry, a cloud dot or a floor. Values are left out: a dot
+/// names one value forever.
 type Element {
   LiveDot(key: String, dot: Dot)
   ClockEntry(replica: Replica, max: Int)
   CloudDot(dot: Dot)
+  FloorEntry(node: String, incarnation: Int)
 }
 
 /// The state's digest for anti-entropy: the XOR of the 256-bit hashes of
-/// its elements (every live `(key, dot)`, clock entry and cloud dot). Two
+/// its elements (every live `(key, dot)`, clock entry, cloud dot and
+/// floor). Two
 /// replicas hold the same digest exactly when they hold the same elements,
 /// up to a hash collision. Reading it costs nothing: every join folds in
 /// the elements it adds and removes (XOR is its own inverse, and the
@@ -699,8 +905,12 @@ pub fn recompute_digest(state: State(value)) -> Int {
     dict.fold(state.context.clock, digest, fn(digest, replica, max) {
       toggle(digest, ClockEntry(replica:, max:))
     })
-  set.fold(state.context.cloud, digest, fn(digest, dot) {
-    toggle(digest, CloudDot(dot))
+  let digest =
+    set.fold(state.context.cloud, digest, fn(digest, dot) {
+      toggle(digest, CloudDot(dot))
+    })
+  dict.fold(state.context.floors, digest, fn(digest, node, incarnation) {
+    toggle(digest, FloorEntry(node:, incarnation:))
   })
 }
 

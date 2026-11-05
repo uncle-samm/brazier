@@ -337,6 +337,26 @@ pub fn size(server: Server) -> Result(Int, WriteError) {
   size_ffi(server)
 }
 
+/// Whether the replica is in sync: every peer replica (the replicas of
+/// this store on verified cluster members) last sent a digest equal to
+/// this replica's digest. `Ok(True)` with no peer. A local write, a merge
+/// or a new peer makes it `Ok(False)` until the next digests (one
+/// `sync_interval_ms` apart) agree; a peer that has not yet sent a digest
+/// since it joined counts as not in sync. Every value written anywhere
+/// before the last digests were sent is then on this node.
+pub fn synced(server: Server) -> Result(Bool, WriteError) {
+  synced_ffi(server)
+}
+
+/// The number of elements of the replica's causal context (clock entries,
+/// out-of-order dots and floors). A replica restart adds one clock entry
+/// for its new incarnation; once it is in sync the node's floor drops the
+/// earlier incarnations' entries, so this stays bounded however often the
+/// replicas restart (see `brazier/store/crdt`, "Floors").
+pub fn context_size(server: Server) -> Result(Int, WriteError) {
+  context_size_ffi(server)
+}
+
 /// Stop this node's replica of a store and its supervisor. Its ETS mirror
 /// goes with it.
 pub fn stop(server: Server) -> Result(Nil, String) {
@@ -376,6 +396,12 @@ fn digest_ffi(server: Server) -> Result(BitArray, WriteError)
 
 @external(erlang, "brazier_store_replica", "size")
 fn size_ffi(server: Server) -> Result(Int, WriteError)
+
+@external(erlang, "brazier_store_replica", "synced")
+fn synced_ffi(server: Server) -> Result(Bool, WriteError)
+
+@external(erlang, "brazier_store_replica", "context_size")
+fn context_size_ffi(server: Server) -> Result(Int, WriteError)
 
 @external(erlang, "brazier_store_replica", "stop")
 fn stop_ffi(server: Server) -> Result(Nil, String)
