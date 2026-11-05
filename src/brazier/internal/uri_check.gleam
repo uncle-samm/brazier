@@ -30,7 +30,9 @@ pub fn check(uri: Uri) -> Result(Nil, String) {
   case uri.query {
     None -> Ok(Nil)
     Some(query) -> {
-      let failure = "invalid query string " <> string.inspect(query)
+      // The query is not quoted in the reason: it can carry a token, and
+      // the reason reaches log lines (see `brazier/internal/log_path`).
+      let failure = "invalid query string: it does not percent-decode to UTF-8"
       use Nil <- result.try(well_formed_escapes(query, failure))
       uri.parse_query(query)
       |> result.replace(Nil)

@@ -332,13 +332,21 @@ fn check_expect(
     [value], Http11 ->
       case string.lowercase(string.trim(value)) {
         "100-continue" -> Ok(True)
-        _ -> Error(FramingError(417, "unsupported expectation: " <> value))
+        _ ->
+          Error(FramingError(
+            417,
+            "unsupported expectation: " <> string.inspect(value),
+          ))
       }
     // RFC 9110 10.1.1: a server MUST ignore 100-continue in HTTP/1.0.
     [value], Http10 ->
       case string.lowercase(string.trim(value)) {
         "100-continue" -> Ok(False)
-        _ -> Error(FramingError(417, "unsupported expectation: " <> value))
+        _ ->
+          Error(FramingError(
+            417,
+            "unsupported expectation: " <> string.inspect(value),
+          ))
       }
     _, _ -> Error(FramingError(417, "multiple Expect headers"))
   }
