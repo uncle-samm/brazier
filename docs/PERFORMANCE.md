@@ -79,7 +79,7 @@ spread for 3 s more per suite run; 20 buy nothing more.
 | pubsub | Broadcasts to S subscribers, each timed until every subscriber has it: 20000 to 1, 2000 to 100, 1000 to 1000 | µs p50/p99, by round |
 | store | put/get/delete, timed in 50 blocks of 1000 operations | ns/op median and p99 of the block timings, by round |
 | crdt append | One value appended to a replicated list key holding 10, 1000 or 10000 values (`brazier/store/crdt`, the work the replica server and every receiving node do per write), in 50 blocks of 1000 | ns/op median and p99 of the block timings, by round |
-| presence | A `brazier/presence` tracker with a room of 10 entries and one of 10000 (100 holder processes × 100 keys), filled before anything is timed. `track`/`untrack`: 10000 of each, each timed until the subscriber has the diff naming exactly that key. `list`: the whole room, checked to hold every entry, 2000 times for 10 entries and 50 for 10000. | µs median and p99, by round |
+| presence | A `brazier/presence` tracker with a room of 10 entries and one of 10000 (100 holder processes × 100 keys), filled before anything is timed. `track`/`untrack`: 10000 of each, each timed until the subscriber has the diff naming exactly that key. `list`: the whole room, checked to hold every entry, 2000 times for 10 entries and 50 for 10000. Each list is timed in a fresh process, after one untimed list there, with a heap that holds both lists; a trace proves no garbage collection ran, and a sample in which one did fails the run. | µs median and p99, by round |
 | client | The browser client's work for a 100- and a 1000-row model, in node, with the client entry a real `build.build` produces. `render`: `render` and `event_names`, what `renderNow` does before the DOM morph (2000 and 400 calls). `patch`: `handlePatch` before the morph, that is `JSON.parse` of the ops, `applyOps`, `decode_model`, `render` and `event_names`, for a patch that changes every tenth label and the selection. The client's HTML must equal the server's before and after the patch. | µs median and p99, by round |
 | client stream | A second fixture app holding a full `KeepLast(300)` stream of 1 KB lines. Its generator applies the app's own ops with the server's stream windows (`stream_window.apply_update`) and writes the `streams` fields the runtime sends, and the server's HTML for each new item (`render.render_item`). Node fills a store with the 300-line frame, then times one frame applied to it: `JSON.parse`, `decodeStreams`, `applyEntry`, and `render_item` with `event_names` for each inserted or updated item, what `applyFrameStreams` does before the DOM work (500 warm-up and 2000 timed calls). `append`: one insert and one trim. `chunk`: the last line grown by 100 bytes. Every call's item HTML must equal the server's. | µs median and p99, by round |
 
@@ -363,7 +363,10 @@ of 4b274e8, interleaved on the same machine (above 1 is slower):
   compiles to the same code at both commits (`beam_lib:md5`). About 15%
   of these 4.8 µs lists start a minor GC of the caller, and the p99 lands
   on those pauses, about 9.5 or about 14.5 µs depending on the VM, on
-  either commit. The A/B drew the old commit from the low mode.
+  either commit. The A/B drew the old commit from the low mode. Since
+  M118 the bench times each list in a fresh process sized to hold it, so
+  this metric no longer depends on the bench's heap; see
+  "`presence.list`" below.
 - New metrics, first baselined here: `ssr.stream_300`, `runtime.stream.*`,
   `wire.stream_patch`, `patch.window_*` and `client.stream.*`.
 
@@ -427,41 +430,83 @@ Some notes on reading the numbers:
   at 1000 rows; `client.render.rows_1000` went from 1706 to 1439 µs and
   `client.patch.rows_1000` from 2091 to 1819 µs (2026-11-05, same
   machine, not a re-baseline).
-- **`presence.list.10000`** is about 5.9 ms, while `track` and `untrack`
-  stay flat at 4 to 6 µs. A list copies every row of the topic out of
-  the shard's ETS table into the caller and decodes each meta, which is
-  Phoenix's pattern too: `Phoenix.Tracker.list` is one `:ets.select` of
-  the topic and `Phoenix.Presence.list` groups the result by key. Phoenix
-  keeps metas as terms; Brazier keeps the JSON it replicates and decodes
-  it with the tracker's decoder on read, the type check on metas that
-  came from other nodes. A single-process profile (2026-11-05, load 6 to
-  9), median of 21 fresh processes, in µs per entry:
+- **`presence.list`** copies every row of the topic out of the shard's
+  ETS table into the caller, which is Phoenix's pattern too:
+  `Phoenix.Tracker.list` is one `:ets.select` of the topic and
+  `Phoenix.Presence.list` groups the result by key. Until M118 a row held
+  the JSON the tracker replicates, `{{Topic, Key, Pid, Tag}, NodeBin,
+  StoredMeta}`, and every list decoded every meta with the tracker's
+  decoder, then grouped the entries with `try_map`, `chunk` and `map`.
+  The work was flat, about 70 reductions an entry, but a list allocated
+  about 100 words an entry (the raw rows, the parsed JSON, the decoded
+  metas and the grouped lists, live at once), and collecting the caller's
+  heap as they landed on it grew faster than the room: 0.46 µs an entry
+  at 3,000 entries, 0.61 at 10,000 and 0.92 to 1.13 at 30,000 in a
+  profile of 2026-11-05 under a load of 6 to 9.
 
-  | Entries | `ets:select` | `json.parse` | `list` | `list`, heap that never collects |
+  Rows now hold the meta as a read returns it, `{{Topic, Key, Pid, Tag},
+  Meta}` with `Meta` the `brazier/presence/sync.Meta` record, as
+  `Phoenix.Tracker.State` keeps each meta term in its values table and
+  `Phoenix.Tracker.State.get_by_topic/2` returns them with a match spec
+  and no decoding. A local track brings the value its caller decoded when
+  it checked the meta (`encode_meta` always did); the shard decodes a
+  peer's meta once, when the entry becomes visible. A list is one
+  `ets:select` whose match spec builds the `Entry` records, and one walk
+  that checks for a repeated key or an undecodable meta and returns the
+  select's list as it is when there is neither: about 2 reductions and 34
+  words an entry, the result and nothing else.
+  `list_cost_per_entry_does_not_grow_with_the_room_test` counts the
+  reductions of a list of 1,000 and of 10,000 entries in a process whose
+  heap never collects.
+
+  Interleaved A/B, the old commit (859944f) and the new code alternately,
+  each in a fresh VM, five rounds after one warm-up, medians of the first
+  list of fresh processes (2026-11-05, load about 3), in µs an entry (the
+  10 row in µs a list, which a cold first list dominates):
+
+  | Entries | old `list` | new `list` | old, heap that never collects | new, heap that never collects |
   |---------|------|------|------|------|
-  | 3,000 | 0.21 | 0.16 | 0.46 | 0.35 |
-  | 10,000 | 0.42 to 0.53 | 0.17 | 0.61 to 0.63 | 0.38 to 0.40 |
-  | 30,000 | 0.38 | 0.19 | 0.92 to 1.13 | 0.45 to 0.51 |
+  | 10 | 21.6 | 14.9 | 7.5 | 5.8 |
+  | 3,000 | 0.538 | 0.256 | 0.300 | 0.164 |
+  | 10,000 | 0.505 | 0.315 | 0.298 | 0.166 |
+  | 30,000 | 0.650 | 0.225 | 0.301 | 0.140 |
 
-  With a heap big enough to never collect, every stage stays near flat
-  per entry, the select at 0.13 to 0.21 µs and the decode at 0.11 (OTP's
-  `json:decode` alone is 0.05; the rest is gleam_json's wrapper and the
-  decoder). What grows is the collection of the caller's heap as the
-  10,000 entries' 340,000 words land on it, about a third of the list at
-  10,000 entries and half of it at 30,000. Two changes measured no real
-  gain, so neither shipped. Grouping and decoding in one pass instead of
-  `try_map`, `chunk` and `map` gave no difference outside the noise.
-  Reading the topic in chunks of 256 rows (`ets:select/3`), decoding each
-  before reading the next so the raw rows of the whole room are never
-  live at once, cut a list's minor collections from 8 to 3. Yet in four
-  interleaved A/B runs against the old code it was 5.5 to 5.9 ms against
-  5.9 to 6.1, 4 to 6%, and the heap after a list was the same 196,650
-  words, as the result itself is most of it. A `brazier.presence`
+  A 30,000-entry list spent 10.8 of its 19.3 ms collecting and now
+  spends 2.75 of 6.8. The new list's default-heap cost is not monotone
+  (0.315 at 10,000, 0.225 at 30,000) because where the result lands
+  against the heap's growth steps decides how many collections run; with
+  a heap that never collects it is flat. In the bench, five interleaved
+  runs each: `presence.list.10000.median` went from 4460 to 5170 µs to
+  1400 to 1650, and `presence.list.10.median` from 3.33 to 3.42 µs to
+  2.50 to 2.63. `track` and `untrack` did not move.
+
+  The cost per list is still linear in the room. A `brazier.presence`
   watcher lists a topic once when its session starts following it and
   again to reconcile after a shard restart, and otherwise applies diffs,
   as a Phoenix channel pushes `presence_state` once on join and then
-  diffs. So the list cost is paid per join, not per change. The open
-  issue is in docs/TODO.md.
+  diffs, so it is paid per join, not per change.
+
+  **How the bench times a list.** It used to time each list in the bench
+  process, so a list paid for collecting whatever that heap held when its
+  result did not fit, and `presence.list.10.p99` sat at about 9.5 or about
+  14.5 µs from VM to VM as the collection did or did not land among a
+  round's slowest 1%. `brazier_bench_ffi:presence_list_sample` now spawns
+  a process with `min_heap_size` set to hold two lists (64 words an entry
+  each, about twice what a list allocates), lists once untimed, then
+  times the second list, and traces the process's garbage collection: a
+  sample in which one ran fails the run and names the words an entry it
+  allowed. The untimed list matters: the first list of a new process runs
+  on cold caches, which put the 10-entry median at about 8 µs and its p99
+  at about 35 µs. As `brazier_crdt_test_ffi:reductions/1` does for
+  reductions, every sample then does the same work, so a slower select,
+  walk or allocation moves every sample and the median, and a list that
+  allocates more than it may fails loudly. Run against the old code, the
+  method still tells them apart: the 10-entry median is 3.58 to 3.79 µs
+  against 2.46 to 2.54 for the new code, and every 10,000-entry sample
+  fails (4 collections in a heap of 1,282,000 words). In five interleaved
+  bench runs `presence.list.10.p99` was 6.13 to 6.58 µs in four and 16.5
+  in one run taken as the load rose, against 6.33 to 10.13 µs for the old
+  code with the old method.
 - **Repeated p50 values.** On Darwin, `erlang:monotonic_time` ticks at
   about 41.67 ns, so every timing is a whole number of ticks. A
   percentile taken over thousands of samples from a tight distribution

@@ -20,7 +20,13 @@
 ///   and removes its entries when it exits.
 /// - **Meta** is JSON from your encoder, at most `max_meta_bytes`, checked
 ///   against your decoder when tracked. Each track or update gets a fresh
-///   `ref`; an update keeps the previous one as `ref_prev`.
+///   `ref`; an update keeps the previous one as `ref_prev`. Nodes replicate
+///   the JSON; each shard keeps the decoded value for reads (Phoenix.Tracker
+///   keeps the meta term), decoding a peer's meta once when it arrives. A
+///   meta that does not decode fails every read that would return it with
+///   `MetaDecodeFailed`. So a handle must carry the decoder the tracker was
+///   started with: build it from the same config, or its reads, tracks,
+///   updates and `decode_diff` return `MetaDecodeFailed`.
 /// - **Diffs.** Every change is delivered as a diff to the processes that
 ///   `subscribe` to the topic on the node of the change, and on each node
 ///   that learns about it. They receive `{brazier_pubsub, DiffTopic, Diff}`;
@@ -34,7 +40,7 @@
 ///
 /// See docs/CLUSTERING.md.
 import brazier/log
-import brazier/presence/sync.{type Diff, type Entry, Diff, Entry, Meta}
+import brazier/presence/sync.{type Diff, type Entry, Diff}
 import brazier/pubsub
 import brazier/telemetry
 import gleam/bit_array
@@ -115,12 +121,16 @@ pub opaque type Presence(meta) {
     names: Names,
     encode: fn(meta) -> json.Json,
     decoder: decode.Decoder(meta),
+    /// Of `decoder` (brazier_presence_ffi:fingerprint/1). Shards refuse
+    /// requests and reads that carry another one.
+    fingerprint: Int,
     max_meta_bytes: Int,
   )
 }
 
 /// The meta as shards store and replicate it. brazier_presence_shard builds
-/// it on update, so its shape is part of the FFI contract.
+/// it on update, so its shape is part of the FFI contract, and it crosses
+/// nodes in the replication messages.
 type StoredMeta {
   StoredMeta(json: String, ref: String, ref_prev: Option(String))
 }
@@ -131,7 +141,7 @@ type StoredMeta {
 type Names
 
 /// What the shards are started with (see brazier_presence_ffi:config_map).
-type ShardConfig {
+type ShardConfig(meta) {
   ShardConfig(
     name: String,
     pool_size: Int,
@@ -144,13 +154,32 @@ type ShardConfig {
     max_topics_per_pid: Int,
     max_entries_per_shard: Int,
     max_transfer_entries: Int,
+    /// Decodes the metas of other nodes, once, when they arrive.
+    decoder: decode.Decoder(meta),
   )
 }
 
-/// Request messages of brazier_presence_shard.
-type Request {
-  Track(pid: Pid, topic: String, key: String, meta: StoredMeta)
-  Update(pid: Pid, topic: String, key: String, json: String, ref: String)
+/// Request messages of brazier_presence_shard. A track or update carries
+/// the meta both as JSON, which replicates, and decoded, which the shard's
+/// table keeps, with the fingerprint of the decoder that decoded it.
+type Request(meta) {
+  Track(
+    pid: Pid,
+    topic: String,
+    key: String,
+    meta: StoredMeta,
+    value: meta,
+    fingerprint: Int,
+  )
+  Update(
+    pid: Pid,
+    topic: String,
+    key: String,
+    json: String,
+    ref: String,
+    value: meta,
+    fingerprint: Int,
+  )
   Untrack(pid: Pid, topic: String, key: String)
   UntrackAll(pid: Pid)
   Replicas
@@ -477,11 +506,12 @@ fn make_handle(config: PresenceConfig(meta)) -> Presence(meta) {
     names: names_ffi(config.name, config.pool_size),
     encode: config.encode,
     decoder: config.decoder,
+    fingerprint: fingerprint_ffi(config.decoder),
     max_meta_bytes: config.max_meta_bytes,
   )
 }
 
-fn shard_config(config: PresenceConfig(meta)) -> ShardConfig {
+fn shard_config(config: PresenceConfig(meta)) -> ShardConfig(meta) {
   ShardConfig(
     name: config.name,
     pool_size: config.pool_size,
@@ -494,6 +524,7 @@ fn shard_config(config: PresenceConfig(meta)) -> ShardConfig {
     max_topics_per_pid: config.max_topics_per_pid,
     max_entries_per_shard: config.max_entries_per_shard,
     max_transfer_entries: config.max_transfer_entries,
+    decoder: config.decoder,
   )
 }
 
@@ -514,13 +545,13 @@ pub fn track(
 ) -> Result(String, PresenceError) {
   use _ <- result.try(validate_topic(presence, topic))
   use _ <- result.try(validate_key(key))
-  use encoded <- result.try(encode_meta(presence, topic, meta))
+  use #(encoded, value) <- result.try(encode_meta(presence, topic, meta))
   let ref = new_ref()
   let stored = StoredMeta(json: encoded, ref:, ref_prev: option.None)
   use Nil <- result.try(call_ffi(
     presence.names,
     topic,
-    Track(process.self(), topic, key, stored),
+    Track(process.self(), topic, key, stored, value, presence.fingerprint),
   ))
   Ok(ref)
 }
@@ -535,12 +566,20 @@ pub fn update(
 ) -> Result(String, PresenceError) {
   use _ <- result.try(validate_topic(presence, topic))
   use _ <- result.try(validate_key(key))
-  use encoded <- result.try(encode_meta(presence, topic, meta))
+  use #(encoded, value) <- result.try(encode_meta(presence, topic, meta))
   let ref = new_ref()
   use Nil <- result.try(call_ffi(
     presence.names,
     topic,
-    Update(process.self(), topic, key, encoded, ref),
+    Update(
+      process.self(),
+      topic,
+      key,
+      encoded,
+      ref,
+      value,
+      presence.fingerprint,
+    ),
   ))
   Ok(ref)
 }
@@ -561,11 +600,14 @@ pub fn untrack_all(presence: Presence(meta)) -> Result(Nil, PresenceError) {
   call_all_ffi(presence.names, UntrackAll(process.self()))
 }
 
+/// The meta as JSON, and that JSON decoded back: what this node's readers
+/// get. Readers on other nodes decode the same JSON, so the value they get
+/// is the decoded one, not `meta` itself.
 fn encode_meta(
   presence: Presence(meta),
   topic: String,
   meta: meta,
-) -> Result(String, PresenceError) {
+) -> Result(#(String, meta), PresenceError) {
   let encoded = json.to_string(presence.encode(meta))
   let bytes = byte_size(encoded)
   case bytes > presence.max_meta_bytes {
@@ -589,10 +631,11 @@ fn encode_meta(
       Error(MetaTooLarge(bytes))
     }
     False ->
-      // Every reader decodes the stored JSON, so a meta the decoder cannot
-      // read back is refused here instead of failing every read later.
+      // Every node's readers get the stored JSON decoded, so a meta the
+      // decoder cannot read back is refused here instead of failing every
+      // read later.
       case json.parse(encoded, presence.decoder) {
-        Ok(_) -> Ok(encoded)
+        Ok(value) -> Ok(#(encoded, value))
         Error(error) -> Error(MetaDecodeFailed(string.inspect(error)))
       }
   }
@@ -636,8 +679,7 @@ pub fn list(
   topic: String,
 ) -> Result(List(Entry(meta)), PresenceError) {
   use _ <- result.try(validate_topic(presence, topic))
-  use rows <- result.try(list_ffi(presence.names, topic))
-  entries(presence, rows)
+  list_ffi(presence.name, presence.names, presence.fingerprint, topic)
 }
 
 /// What is tracked under `key` on `topic`. `Error(NotTracked)` if nothing.
@@ -648,58 +690,13 @@ pub fn get_by_key(
 ) -> Result(Entry(meta), PresenceError) {
   use _ <- result.try(validate_topic(presence, topic))
   use _ <- result.try(validate_key(key))
-  use rows <- result.try(get_by_key_ffi(presence.names, topic, key))
-  use found <- result.try(entries(presence, rows))
-  case found {
-    [] -> Error(NotTracked)
-    _ -> {
-      // INVARIANT: the match spec selects rows of this one key only, so
-      // they group into a single entry.
-      let assert [entry] = found as "get_by_key rows all have the same key"
-      Ok(entry)
-    }
-  }
-}
-
-/// Group rows that are consecutive per key (ETS order, or sorted diffs).
-fn entries(
-  presence: Presence(meta),
-  rows: List(#(String, Pid, String, StoredMeta)),
-) -> Result(List(Entry(meta)), PresenceError) {
-  use decoded <- result.try(
-    list.try_map(rows, fn(row) {
-      let #(key, _pid, node, stored) = row
-      case json.parse(stored.json, presence.decoder) {
-        Ok(value) ->
-          Ok(#(
-            key,
-            Meta(value:, ref: stored.ref, ref_prev: stored.ref_prev, node:),
-          ))
-        Error(error) -> {
-          log.error(
-            "brazier.presence",
-            "Tracker "
-              <> presence.name
-              <> " cannot decode the meta of "
-              <> key
-              <> " from "
-              <> node
-              <> ": "
-              <> string.inspect(error),
-          )
-          Error(MetaDecodeFailed(string.inspect(error)))
-        }
-      }
-    }),
+  get_by_key_ffi(
+    presence.name,
+    presence.names,
+    presence.fingerprint,
+    topic,
+    key,
   )
-  decoded
-  |> list.chunk(fn(pair) { pair.0 })
-  |> list.map(fn(group) {
-    // INVARIANT: list.chunk never yields an empty group.
-    let assert [#(key, _), ..] = group as "list.chunk groups are non-empty"
-    Entry(key:, metas: list.map(group, fn(pair) { pair.1 }))
-  })
-  |> Ok
 }
 
 // --- Diffs ---
@@ -765,17 +762,10 @@ pub fn decode_diff(
 ) -> Result(Diff(meta), PresenceError) {
   use #(topic, joins, leaves) <- result.try(decode_diff_ffi(
     presence.name,
+    presence.fingerprint,
     message,
   ))
-  use joins <- result.try(entries(presence, sort_rows(joins)))
-  use leaves <- result.try(entries(presence, sort_rows(leaves)))
   Ok(Diff(topic:, joins:, leaves:))
-}
-
-fn sort_rows(
-  rows: List(#(String, Pid, String, StoredMeta)),
-) -> List(#(String, Pid, String, StoredMeta)) {
-  list.sort(rows, fn(a, b) { string.compare(a.0, b.0) })
 }
 
 // --- Introspection ---
@@ -828,14 +818,17 @@ pub fn describe(error: PresenceError) -> String {
 fn names_ffi(name: String, pool_size: Int) -> Names
 
 @external(erlang, "brazier_presence_ffi", "start")
-fn start_ffi(config: ShardConfig, names: Names) -> Result(Nil, PresenceError)
+fn start_ffi(
+  config: ShardConfig(meta),
+  names: Names,
+) -> Result(Nil, PresenceError)
 
 @external(erlang, "brazier_presence_ffi", "running")
 fn running_ffi(names: Names) -> Bool
 
 @external(erlang, "brazier_presence_ffi", "start_link")
 fn start_link_ffi(
-  config: ShardConfig,
+  config: ShardConfig(meta),
   names: Names,
 ) -> Result(Pid, PresenceError)
 
@@ -846,31 +839,41 @@ fn stop_ffi(names: Names) -> Result(Nil, PresenceError)
 fn call_ffi(
   names: Names,
   topic: String,
-  request: Request,
+  request: Request(meta),
 ) -> Result(Nil, PresenceError)
 
 @external(erlang, "brazier_presence_ffi", "call")
 fn replicas_ffi(
   names: Names,
   topic: String,
-  request: Request,
+  request: Request(meta),
 ) -> Result(List(#(String, ReplicaStatus)), PresenceError)
 
 @external(erlang, "brazier_presence_ffi", "call_all")
-fn call_all_ffi(names: Names, request: Request) -> Result(Nil, PresenceError)
+fn call_all_ffi(
+  names: Names,
+  request: Request(meta),
+) -> Result(Nil, PresenceError)
+
+@external(erlang, "brazier_presence_ffi", "fingerprint")
+fn fingerprint_ffi(decoder: decode.Decoder(meta)) -> Int
 
 @external(erlang, "brazier_presence_ffi", "list")
 fn list_ffi(
+  name: String,
   names: Names,
+  fingerprint: Int,
   topic: String,
-) -> Result(List(#(String, Pid, String, StoredMeta)), PresenceError)
+) -> Result(List(Entry(meta)), PresenceError)
 
 @external(erlang, "brazier_presence_ffi", "get_by_key")
 fn get_by_key_ffi(
+  name: String,
   names: Names,
+  fingerprint: Int,
   topic: String,
   key: String,
-) -> Result(List(#(String, Pid, String, StoredMeta)), PresenceError)
+) -> Result(Entry(meta), PresenceError)
 
 @external(erlang, "brazier_presence_ffi", "shard_pid")
 fn shard_pid_ffi(names: Names, topic: String) -> Result(Pid, PresenceError)
@@ -881,15 +884,9 @@ fn shard_index_ffi(names: Names, topic: String) -> Int
 @external(erlang, "brazier_presence_ffi", "decode_diff")
 fn decode_diff_ffi(
   name: String,
+  fingerprint: Int,
   message: Dynamic,
-) -> Result(
-  #(
-    String,
-    List(#(String, Pid, String, StoredMeta)),
-    List(#(String, Pid, String, StoredMeta)),
-  ),
-  PresenceError,
-)
+) -> Result(#(String, List(Entry(meta)), List(Entry(meta))), PresenceError)
 
 @external(erlang, "erlang", "byte_size")
 fn byte_size(string: String) -> Int

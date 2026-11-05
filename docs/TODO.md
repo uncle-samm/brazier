@@ -27,26 +27,7 @@
     `eaddrnotavail`, whose text is OS-specific, and the listener has no
     bind-address option to test it through.
 
-- **Issue:** `presence.list` grows faster than the room past about 10,000
-  entries: 0.46 µs an entry at 3,000, 0.61 at 10,000 and 0.92 to 1.13 at
-  30,000. Every `brazier.presence` session that starts following a topic
-  pays one list, so a join into a 30,000-entry room costs about 30 ms of
-  the watcher's time.
-  - **Context:** Milestone 118, m118-perf-server, `presence.list.10000`
-    at about 5.9 ms (docs/PERFORMANCE.md, "`presence.list.10000`").
-  - **Files:** `src/brazier/presence.gleam`,
-    `src/brazier_presence_ffi.erl`, `src/brazier_presence_shard.erl`
-  - **Attempted:** a profile shows the ETS copy and the JSON decode flat
-    per entry and the growth in collecting the caller's heap. Neither a
-    one-pass decode-and-group nor reading in 256-row chunks gained more
-    than 4 to 6%, so neither shipped. What is left changes what a list
-    returns or what the shards store, for the design to decide. One
-    option is metas kept as terms for this node's entries, decoded once
-    at track: no decode on read, but the shard row grows and remote
-    entries still decode. Another is a list that hands the caller one
-    chunk of entries at a time.
-
-- **Issue:** on macOS, OTP's `file:list_dir/1` never returns (100% CPU,
+- **Issue:** on macOS, OTP 28's `file:list_dir/1` never returns (100% CPU,
   and the node ignores SIGTERM) for a directory that holds a name starting
   with a combining mark, such as U+0301 + `b` (bytes `cc 81 62`). The same
   goes for `list_dir_all`, `prim_file:list_dir`, `file:del_dir_r/1`,
@@ -104,6 +85,57 @@
 ## Resolved Issues
 
 <!-- Move resolved issues here with full resolution details -->
+
+- **Issue:** `presence.list` grew faster than the room past about 10,000
+  entries: 0.46 µs an entry at 3,000, 0.61 at 10,000 and 0.92 to 1.13 at
+  30,000. Every `brazier.presence` session that starts following a topic
+  pays one list, so a join into a 30,000-entry room cost about 30 ms of
+  the watcher's time.
+  - **Context:** Milestone 118, m118-perf-server, `presence.list.10000`
+    at about 5.9 ms.
+  - **Files:** `src/brazier/presence.gleam`,
+    `src/brazier_presence_ffi.erl`, `src/brazier_presence_shard.erl`,
+    `test/brazier/presence_test.gleam`, `test/brazier_presence_test_ffi.erl`
+  - **Cause:** the work was flat, about 70 reductions an entry, but each
+    list decoded every row's JSON meta and allocated about 100 words an
+    entry, with the raw rows, the parsed JSON, the decoded metas and the
+    grouped lists live at once. The growth was collecting the caller's
+    heap as that landed on it. A one-pass decode-and-group and a read in
+    256-row chunks each gained only 4 to 6%, as the result is most of the
+    heap.
+  - **Resolution:** (Milestone 118, m118-presence-list) The shard's rows
+    hold the meta term readers return, `{{Topic, Key, Pid, Tag}, Meta}`,
+    as `Phoenix.Tracker.State` keeps meta terms in its values table. A
+    local track or update stores the value its caller decoded when it
+    checked the meta; the shard decodes a peer's meta once, when the entry
+    becomes visible, inside a `try` so a crashing decoder cannot take the
+    shard down. A meta that does not decode is stored as
+    `{undecodable, Node, Reason}`, logged, and fails every read that would
+    return it, as reads did when they decoded each row. A list is one
+    `ets:select` that builds the `Entry` records and a walk that returns
+    them as they are unless a key repeats: about 2 reductions and 34 words
+    an entry. The table holds the fingerprint of the decoder its values
+    were decoded with (`erlang:phash2` of it); a read, track, update or
+    `decode_diff` through a handle built with another decoder fails with
+    `MetaDecodeFailed` instead of returning values of another type. A
+    leave takes its row (`ets:take`), and a missing row crashes the shard
+    (`presence_table_out_of_sync`), which restarts empty and refills from
+    its peers. The CRDT and replication still carry the JSON
+    (`StoredMeta`), so nothing that crosses nodes changed; the local diff
+    message became `{brazier_presence_diff, Name, Fingerprint, Topic,
+    Joins, Leaves}` with entries `{Key, Pid, Meta}`. Interleaved A/B
+    against 859944f, medians of fresh processes, µs an entry: 0.538 to
+    0.256 at 3,000, 0.505 to 0.315 at 10,000, 0.650 to 0.225 at 30,000;
+    with a heap that never collects, 0.30 to about 0.15 at every size. The
+    bench's `presence.list.10000.median` went from 4460 to 5170 µs to
+    1400 to 1650. Tests: `list_groups_metas_by_key_test`,
+    `list_cost_per_entry_does_not_grow_with_the_room_test` (reductions of
+    a list of 1,000 and of 10,000 entries, in a heap proven not to
+    collect), `decode_diff_checks_the_message_without_the_tracker_test`,
+    `a_handle_with_another_decoder_is_refused_test` and
+    `remote_metas_that_do_not_decode_fail_their_reads_test_` (a peer's
+    meta that fails to decode, crashes the decoder, or is not a stored
+    meta). docs/PERFORMANCE.md, "`presence.list`", has the numbers.
 
 - **Issue:** `brazier_transport_ffi:normalize_header_name/1` called
   `brazier_render_ffi:ascii_lowercase/1`, kept as a forwarder to
@@ -271,7 +303,16 @@
   - **Resolution:** (Milestone 118, m118-perf-regress) No code change; the
     regression does not reproduce. `presence.list.10.p99` measures GC
     pauses more than the list, so a move between its two modes is not a
-    regression signal.
+    regression signal. Then (m118-presence-list) the bench stopped
+    timing lists in its own process: `brazier_bench_ffi:presence_list_sample`
+    times each list in a fresh process whose `min_heap_size` holds two
+    lists, after one untimed list there, and a trace proves no collection
+    ran (a sample in which one did fails the run). In five interleaved
+    runs the p99 was 6.13 to 6.58 µs in four and 16.5 in one taken as the
+    load rose, against 6.33 to 10.13 for the old code and method; run on
+    the old code, the method still separates it (median 3.58 to 3.79 µs
+    against 2.46 to 2.54) and fails its 10,000-entry samples, which
+    allocate past the heap.
 
 - **Issue:** `server.start` on a taken port killed a caller that did not
   trap exits, and a caller that did got the error `"shutdown"`, the cause

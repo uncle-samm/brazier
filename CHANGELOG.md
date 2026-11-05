@@ -450,6 +450,23 @@ open follow-ups), which is in progress.
   naming the directory and the name's bytes; lint reports it as
   `unreadable-path`. The build, `brazier/dev` and `brazier/lint` need
   `find` on the `PATH`; a running app never lists directories.
+- (M118 presence-list) Presence shards store each meta decoded, as
+  Phoenix.Tracker.State keeps meta terms: a local `track` or `update`
+  brings the value it checked, and a peer's meta is decoded once when its
+  entry becomes visible. `presence.list` no longer decodes, so its cost per
+  entry stays flat as the room grows: `presence.list.10000.median` went
+  from 4.5–5.2 ms to 1.4–1.65 ms, and 30,000 entries cost about 0.23 µs an
+  entry, against 0.65. What crosses nodes is unchanged.
+- (M118 presence-list) A presence handle must be built with the decoder
+  its tracker was started with. Each shard's table records a fingerprint
+  of that decoder, and `list`, `get_by_key`, `track`, `update` and
+  `decode_diff` through a handle with another decoder return
+  `MetaDecodeFailed` (docs/CLUSTERING.md). A peer's meta that does not
+  decode is logged once, when it arrives, and every read that would return
+  it fails, as before. A missing table row on a leave crashes the shard,
+  which restarts empty and refills from its peers. The local diff message
+  is now `{brazier_presence_diff, Name, Fingerprint, Topic, Joins,
+  Leaves}`.
 - (M118 residue-3) `application.start_supervised` starts an empty root
   supervisor (`brazier_app_sup.erl`) and adds its children one by one, as
   Ranch adds a listener to `ranch_sup`. Restart behaviour is unchanged
