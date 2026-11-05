@@ -346,6 +346,77 @@ pub fn render_text(text: String) -> Element(msg) {
   let assert [StreamDecl(name: "log", ..)] = analysis.streams
 }
 
+// --- the container's attribute -----------------------------------------------
+
+/// `app` with the view's `div` given `attributes`, `import_line` added.
+fn with_div_attributes(import_line: String, attributes: String) -> String {
+  app
+  |> string.replace("import gleam/json\n", "import gleam/json\n" <> import_line)
+  |> string.replace(
+    "  html.div([], [\n",
+    "  html.div([" <> attributes <> "], [\n",
+  )
+}
+
+pub fn the_stream_attribute_on_an_element_is_refused_test() {
+  let reason =
+    analyze_error([
+      #(
+        "app",
+        with_div_attributes(
+          "import brazier/attribute\n",
+          "attribute.attribute(\"data-brazier-stream\", \"log\")",
+        ),
+      ),
+    ])
+  assert_contains(reason, "app.gleam:")
+  assert_contains(
+    reason,
+    "`attribute.attribute(\"data-brazier-stream\", ..)` sets data-brazier-stream, which marks a stream's container",
+  )
+  assert_contains(reason, "Only `stream.render` sets it")
+}
+
+pub fn the_stream_attribute_through_data_in_any_case_is_refused_test() {
+  let reason =
+    analyze_error([
+      #(
+        "app",
+        with_div_attributes(
+          "import brazier/attribute.{data}\n",
+          "data(\"Brazier-Stream\", \"log\")",
+        ),
+      ),
+    ])
+  assert_contains(
+    reason,
+    "`attribute.data(\"Brazier-Stream\", ..)` sets data-brazier-stream",
+  )
+}
+
+pub fn the_stream_attribute_in_server_code_is_refused_test() {
+  // The scan covers every module of the app, not only client code.
+  let server =
+    "import brazier/attribute
+
+pub fn mark() -> attribute.Attribute(msg) {
+  \"data-brazier-stream\" |> attribute.attribute(\"log\")
+}
+"
+  let reason = analyze_error([#("app", app), #("server_only", server)])
+  assert_contains(reason, "server_only.gleam:")
+  assert_contains(reason, "sets data-brazier-stream")
+}
+
+pub fn other_data_attributes_are_accepted_test() {
+  let analysis =
+    analyze_app(with_div_attributes(
+      "import brazier/attribute\n",
+      "attribute.data(\"brazier-streams\", \"x\"), attribute.attribute(\"data-stream\", \"log\")",
+    ))
+  let assert [StreamDecl(name: "log", ..)] = analysis.streams
+}
+
 // --- generated exports -------------------------------------------------------
 
 pub fn server_codec_exports_stream_names_test() {

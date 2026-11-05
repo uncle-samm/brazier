@@ -19,6 +19,7 @@
 /// project.
 import brazier/build/field_type
 import brazier/build/source_location
+import brazier/internal/render
 import glance
 import gleam/bit_array
 import gleam/dict.{type Dict}
@@ -88,7 +89,8 @@ pub type Reach {
 }
 
 /// A use of `brazier/stream.new` or `brazier/stream.render` in a user
-/// module (docs/design/STREAMS.md 10). `at` is the place, as
+/// module, or of the attribute that marks a stream's container
+/// (docs/design/STREAMS.md 10). `at` is the place, as
 /// `path.gleam:line:column`.
 pub type StreamUse {
   /// A `stream.new` call: its name argument as the literal string, or what
@@ -105,6 +107,11 @@ pub type StreamUse {
   /// `stream.new` or `stream.render` used as a value instead of called, so
   /// its arguments cannot be checked.
   Referenced(at: String, function: String)
+  /// A `function(name, ..)` call (`attribute.attribute` or
+  /// `attribute.data`) whose literal `name` makes `data-brazier-stream`,
+  /// in any case: the attribute that marks a stream's container, which
+  /// only `stream.render` sets.
+  ContainerAttribute(at: String, function: String, name: String)
 }
 
 /// Why the item argument of a `stream.render` call is refused.
@@ -1185,20 +1192,23 @@ fn walk_pipe(
 
 // ----- Stream uses -----
 
+/// The Brazier module whose `attribute` and `data` calls are checked for
+/// the stream container's attribute.
+const attribute_module = "brazier/attribute"
+
+/// A Brazier function whose calls the build checks.
 type StreamFunction {
   StreamNew
   StreamRender
+  /// `brazier/attribute.attribute` (`prefix` `""`) or `.data` (`prefix`
+  /// `"data-"`): a literal name that makes `render.stream_attribute` is
+  /// refused.
+  AttributeName(function: String, prefix: String)
 }
 
-fn stream_function_name(function: StreamFunction) -> String {
-  case function {
-    StreamNew -> "new"
-    StreamRender -> "render"
-  }
-}
-
-/// `stream.new` or `stream.render` when `expr` names one of them in a user
-/// module, through an unshadowed import alias or an unqualified import.
+/// `stream.new`, `stream.render`, `attribute.attribute` or `attribute.data`
+/// when `expr` names one of them in a user module, through an unshadowed
+/// import alias or an unqualified import.
 fn stream_callee(
   ctx: Ctx,
   locals: Set(String),
@@ -1215,34 +1225,33 @@ fn stream_callee(
             || dict.has_key(ctx.info.constants, name)
           {
             True -> Error(Nil)
-            False ->
-              case dict.get(ctx.info.values, name) {
-                Ok(#(module, original)) if module == stream_module ->
-                  Ok(original)
-                _ -> Error(Nil)
-              }
+            False -> dict.get(ctx.info.values, name)
           }
         glance.FieldAccess(
           container: glance.Variable(name: qualifier, ..),
           label:,
           ..,
         ) ->
-          case module_alias(ctx, locals, qualifier) {
-            Ok(module) if module == stream_module -> Ok(label)
-            _ -> Error(Nil)
-          }
+          module_alias(ctx, locals, qualifier)
+          |> result.map(fn(module) { #(module, label) })
         _ -> Error(Nil)
       }
       case named {
-        Ok("new") -> Ok(StreamNew)
-        Ok("render") -> Ok(StreamRender)
+        Ok(#(module, "new")) if module == stream_module -> Ok(StreamNew)
+        Ok(#(module, "render")) if module == stream_module -> Ok(StreamRender)
+        Ok(#(module, "attribute")) if module == attribute_module ->
+          Ok(AttributeName(function: "attribute.attribute", prefix: ""))
+        Ok(#(module, "data")) if module == attribute_module ->
+          Ok(AttributeName(function: "attribute.data", prefix: "data-"))
         _ -> Error(Nil)
       }
     }
   }
 }
 
-/// `stream.new` or `stream.render` used as a value, not called.
+/// `stream.new` or `stream.render` used as a value, not called. An
+/// attribute function used as a value is not recorded: the render refuses
+/// the container's attribute on any element (`render.stream_attribute`).
 fn record_reference(
   st: State,
   ctx: Ctx,
@@ -1250,16 +1259,13 @@ fn record_reference(
   expr: glance.Expression,
   location: glance.Span,
 ) -> State {
+  let referenced = fn(function) {
+    add_stream_use(st, Referenced(at: at(ctx, location), function:))
+  }
   case stream_callee(ctx, locals, expr) {
-    Ok(function) ->
-      add_stream_use(
-        st,
-        Referenced(
-          at: at(ctx, location),
-          function: stream_function_name(function),
-        ),
-      )
-    Error(Nil) -> st
+    Ok(StreamNew) -> referenced("new")
+    Ok(StreamRender) -> referenced("render")
+    Ok(AttributeName(..)) | Error(Nil) -> st
   }
 }
 
@@ -1297,6 +1303,18 @@ fn record_call(
           ),
         ),
       )
+    // Only a literal name is read; any other name reaches the render's
+    // name policy, which refuses the container's attribute too.
+    AttributeName(function:, prefix:) ->
+      case list.first(arguments) {
+        Ok(Some(glance.String(value: name, ..))) ->
+          case string.lowercase(prefix <> name) == render.stream_attribute {
+            True ->
+              add_stream_use(st, ContainerAttribute(at:, function:, name:))
+            False -> st
+          }
+        Ok(Some(_)) | Ok(None) | Error(Nil) -> st
+      }
   }
 }
 

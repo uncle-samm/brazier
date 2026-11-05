@@ -34,6 +34,8 @@ pub fn from_attr(attr: render.Attr(msg)) -> Attribute(msg) {
 ///
 /// - an inline event attribute such as `onclick`: use `brazier/event`;
 /// - `srcdoc`: use `unsafe_srcdoc`;
+/// - `data-brazier-stream`: it marks a stream's container, which only
+///   `brazier/stream.render` sets;
 /// - `attributeName` with a value containing `href` (`href`,
 ///   `xlink:href`): an SVG `<animate>` or `<set>` targeting a link's URL
 ///   would change it after the URL policy has checked it;
@@ -50,7 +52,7 @@ pub fn attribute(name: String, value: String) -> Attribute(msg) {
   // could break out of the tag is a bug in the view, so it crashes rather
   // than rendering.
   let assert True = render.is_allowed_attribute(name, value)
-    as "brazier/attribute.attribute: attribute refused by the name policy (on*, srcdoc, attributeName=href, or characters outside a-z A-Z 0-9 - _ : .)"
+    as "brazier/attribute.attribute: attribute refused by the name policy (on*, srcdoc, data-brazier-stream, attributeName=href, or characters outside a-z A-Z 0-9 - _ : .)"
   case url.check(name, value) {
     Ok(value) -> Attribute(render.Attribute(name, value))
     Error(blocked) -> {

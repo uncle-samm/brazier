@@ -234,7 +234,9 @@ fn streams(
       case stream_use {
         reach.Declared(at:, module:, owner:, name:) ->
           Ok(#(at, module, owner, name))
-        reach.Rendered(..) | reach.Referenced(..) -> Error(Nil)
+        reach.Rendered(..)
+        | reach.Referenced(..)
+        | reach.ContainerAttribute(..) -> Error(Nil)
       }
     })
   let named =
@@ -335,6 +337,15 @@ fn stream_use_error(stream_use: reach.StreamUse) -> Result(String, Nil) {
         <> kind
         <> ". The browser renders an item only when it is inserted or updated, so an item cannot depend on the model or Local state; put state that changes every item on the container's attributes, or insert the items again.",
       )
+    reach.ContainerAttribute(at:, function:, name:) ->
+      Ok(
+        at
+        <> ": `"
+        <> function
+        <> "(\""
+        <> name
+        <> "\", ..)` sets data-brazier-stream, which marks a stream's container: the browser applies the stream's inserts and deletes to the element that carries it. Only `stream.render` sets it; render the stream with `stream.render(my_stream(), \"ol\", attributes, render_item)`.",
+      )
     reach.Referenced(at:, function:) ->
       Ok(
         at
@@ -386,7 +397,9 @@ fn simple_app_stream_errors(
               at
               <> ": a `brazier.simple` app renders a stream, but a simple app's `update` returns no effects, so nothing can fill it. Build the app with `brazier.application` and fill the stream from `update` with `stream.insert`.",
             )
-          reach.Declared(..) | reach.Referenced(..) -> Error(Nil)
+          reach.Declared(..)
+          | reach.Referenced(..)
+          | reach.ContainerAttribute(..) -> Error(Nil)
         }
       })
     app_call.Application | app_call.FullApplication -> []
