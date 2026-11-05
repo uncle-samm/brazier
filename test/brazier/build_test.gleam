@@ -139,6 +139,56 @@ pub fn program_run_nonzero_exit_is_an_error_test() {
   let assert True = string.contains(reason, "`sh -c")
 }
 
+pub fn program_warnings_reads_headlines_and_locations_test() {
+  let output =
+    "  Compiling app\n"
+    <> "warning: Unused value\n"
+    <> "    ┌─ /p/src/app.gleam:3:3\n"
+    <> "    │\n"
+    <> "3 │   f(x)\n"
+    <> "\n"
+    <> "warning: Deprecated value used\n"
+    <> "\n"
+    <> "   Compiled in 0.10s\n"
+    <> "warning: Unused variable"
+  let assert [
+    "Unused value at /p/src/app.gleam:3:3",
+    "Deprecated value used",
+    "Unused variable",
+  ] = program.warnings(output)
+}
+
+pub fn program_warnings_of_a_clean_build_is_empty_test() {
+  let assert [] =
+    program.warnings(
+      "  Compiling app\n   Compiled in 0.10s\nno warning: here\n",
+    )
+}
+
+/// The parser against the compiler's real output: a project with an unused
+/// private function builds, and its one warning is read with its location.
+pub fn program_warnings_reads_a_real_gleam_build_test() {
+  let dir = "build/brazier_test_program_warnings"
+  let assert Ok(Nil) = simplifile.delete_all([dir])
+  let assert Ok(Nil) = simplifile.create_directory_all(dir <> "/src")
+  let assert Ok(Nil) =
+    simplifile.write(
+      dir <> "/gleam.toml",
+      "name = \"warned\"\nversion = \"1.0.0\"\n",
+    )
+  let assert Ok(Nil) =
+    simplifile.write(
+      dir <> "/src/warned.gleam",
+      "pub fn main() { 1 }\n\nfn unused() { 2 }\n",
+    )
+  let assert Ok(output) = program.run(dir, "gleam", ["build"])
+  let assert [warning] = program.warnings(output)
+  let assert True = string.starts_with(warning, "Unused private function at ")
+  let assert True = string.ends_with(warning, "src/warned.gleam:3:1")
+  let assert Ok(Nil) = program.gleam_build(dir)
+  let assert Ok(Nil) = simplifile.delete(dir)
+}
+
 pub fn program_run_missing_executable_is_an_error_test() {
   let assert Error(reason) = program.run(".", "brazier-no-such-program", [])
   let assert True =
