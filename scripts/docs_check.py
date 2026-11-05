@@ -261,6 +261,31 @@ def write_project_files() -> None:
         'brazier = { path = "../.." }\n' + "\n".join(deps) + "\n"
     )
     (SCRATCH / "gleam.toml").write_text(toml, encoding="utf-8")
+    drop_stale_lock()
+
+
+def drop_stale_lock() -> None:
+    """The scratch project's manifest.toml locks Brazier, a path dependency,
+    at the version it had when the manifest was written. After a version bump
+    Gleam refuses that lock ("locked to X, which is incompatible"), so the
+    manifest is removed and Gleam resolves again. A manifest with no Brazier
+    entry, or more than one, is not one this script wrote: it fails."""
+    manifest = SCRATCH / "manifest.toml"
+    if not manifest.exists():
+        return
+    locked = re.findall(
+        r'^  \{ name = "brazier", version = "([^"]+)",',
+        manifest.read_text(encoding="utf-8"),
+        re.MULTILINE,
+    )
+    if len(locked) != 1:
+        raise CheckError(f"{manifest.relative_to(ROOT)} has {len(locked)} brazier entries, expected 1")
+    versions = re.findall(r'^version = "([^"]+)"$', (ROOT / "gleam.toml").read_text(encoding="utf-8"), re.MULTILINE)
+    if len(versions) != 1:
+        raise CheckError(f"gleam.toml has {len(versions)} top-level version lines, expected 1")
+    if locked[0] != versions[0]:
+        print(f"docs-check: {manifest.relative_to(ROOT)} locks brazier {locked[0]}, gleam.toml is {versions[0]}; removing it so Gleam resolves again")
+        manifest.unlink()
 
 
 def section(toml: str, name: str) -> list[str]:
