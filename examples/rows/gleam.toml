@@ -1,0 +1,8 @@
+name = "brazier_rows"
+version = "0.1.0"
+target = "erlang"
+
+[dependencies]
+gleam_stdlib = ">= 0.44.0 and < 2.0.0"
+brazier = { path = "../.." }
+gleam_json = ">= 3.1.0 and < 4.0.0"

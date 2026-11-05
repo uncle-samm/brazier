@@ -67,7 +67,7 @@ browser loads bundle ──► WS /ws?path=/path ──► middleware (GET /path
                                                           │ init(ctx) → route msg
                                                           │ ◄── join
                                                           │ ──► model_sync (full model JSON)
-click ──► decoder → Msg → update_local / simple update → re-render
+click ──► decoder → Msg → update_local / simple update → re-render if changed
       ──► event {data: encode_msg(msg), clock} ──► decode_event → update
                                                           │ ──► patch (JSON Patch of the model)
 ```

@@ -1253,12 +1253,16 @@ pub fn client_replay_of_server_frames_matches_final_sync_test() {
 /// streams: every stream fault closing with 4000, deltas under every model
 /// verdict, item node identity, item hooks, item handler ids, containers that
 /// appear or change item function, and the reconnect that refills the
-/// stores; the page a live navigation replaces and its scroll to the top)
-/// driven by a fake socket, clock and DOM. The harness exits non-zero
-/// on any failed scenario.
+/// stores; the page a live navigation replaces and its scroll to the top;
+/// the scroll Back and Forward restore once the page renders; links whose
+/// path starts with "//", left to the browser; the connect hold and frame
+/// delivery test seams; the bounded performance timeline; a dispatch that
+/// renders only when it changed the model or the local state) driven by a
+/// fake socket, clock and DOM. The harness exits non-zero on any failed
+/// scenario.
 pub fn client_runtime_behaviour_harness_test() {
   let assert Ok(output) = run_node("brazier_client/test/ffi_harness.mjs", "")
     as "the client FFI harness failed; run node brazier_client/test/ffi_harness.mjs"
-  let assert True = string.contains(output, "ffi harness ok: 79 scenarios")
-    as "the client FFI harness did not run all 79 scenarios"
+  let assert True = string.contains(output, "ffi harness ok: 88 scenarios")
+    as "the client FFI harness did not run all 88 scenarios"
 }

@@ -223,14 +223,25 @@ function mark(name) {
   }
 }
 
+// Measure from the start mark to the end mark, then take the three entries
+// out of the performance timeline. The browser keeps every mark and measure
+// for the life of the page, and a session renders on every frame for as
+// long as the tab is open, so leaving them would grow the timeline without
+// bound. A PerformanceObserver is handed each measure as it is made, and
+// DevTools records it, so clearing the buffer hides it from neither (the
+// browser bench observes brazier:morph and brazier:patch this way).
 function measure(name, start, end) {
-  if (typeof performance !== "undefined" && performance.measure) {
-    try {
-      performance.measure("brazier:" + name, "brazier:" + start, "brazier:" + end);
-    } catch (e) {
-      console.warn("[brazier] performance.measure(" + name + ") failed:", e && e.message);
-    }
+  if (typeof performance === "undefined" || !performance.measure) return;
+  try {
+    performance.measure("brazier:" + name, "brazier:" + start, "brazier:" + end);
+  } catch (e) {
+    console.warn("[brazier] performance.measure(" + name + ") failed:", e && e.message);
   }
+  if (performance.clearMarks) {
+    performance.clearMarks("brazier:" + start);
+    performance.clearMarks("brazier:" + end);
+  }
+  if (performance.clearMeasures) performance.clearMeasures("brazier:" + name);
 }
 
 function ensureBrazierDebug() {
@@ -368,7 +379,13 @@ function renderNow(server = false) {
   // Checked before the morph, so a view that renders a stream twice throws
   // before it changes the page.
   const containers = streamContainerTable(rendered[2]);
+  const eventNames = app.event_names(table).toArray();
   const t1 = performance.now();
+  // brazier:morph measures the DOM work of a render (the morph or the
+  // navigation's replace, the event listeners and the stream containers),
+  // without the view and its event names, which the node bench times; the
+  // browser bench reads it (test_all_cdp.py, rows).
+  mark("morph-start");
   if (server && navigationRenderDue()) {
     replaceRootChildren(appRoot, html);
     settleNavigations();
@@ -376,8 +393,10 @@ function renderNow(server = false) {
     morphInnerHTML(appRoot, html);
   }
   handlers = table;
-  listenFor(app.event_names(table).toArray());
+  listenFor(eventNames);
   renderStreamContainers(containers);
+  mark("morph-end");
+  measure("morph", "morph-start", "morph-end");
   const t2 = performance.now();
   const total = t2 - t0;
   if (total > 5) {
@@ -626,6 +645,8 @@ function dispatchMsg(name, id, msg) {
     return;
   }
   let forward;
+  const modelBefore = clientModel;
+  const localBefore = clientLocal;
   try {
     const result = app.update_local(clientModel, clientLocal, msg);
     clientLocal = result[0];
@@ -639,8 +660,19 @@ function dispatchMsg(name, id, msg) {
     console.error("[brazier] The app's client update crashed on a " + name + " event (element " + id + "); the client stops handling events. Reload the page.", e);
     return;
   }
-  // The entry point that dispatched this renders once it is done.
-  renderPending = true;
+  // The entry point that dispatched this renders once it is done, when the
+  // message changed the state the view renders. A message only the server
+  // updates on (an `application`'s, or one the Local layer forwards without
+  // a change) leaves the page as the last render left it, so rendering it
+  // again would redo the whole view and morph for nothing, on every click;
+  // the server's patch or ack renders the outcome, as LiveView's pushEvent
+  // waits for the server's diff. The handlers of the last render stay
+  // current: they close over this same state.
+  if (clientModel !== modelBefore || clientLocal !== localBefore) {
+    renderPending = true;
+  } else {
+    trace("event.unchanged", { name, id, forward });
+  }
   if (!forward) {
     trace("event.local", { name, id });
     return;
@@ -1260,7 +1292,7 @@ function connect() {
   const scroll = pendingNavigationScroll;
   if (scroll !== null && !queuedNavigate(scroll.clock)) {
     trace("reconnect.navigation_scroll_on_join", { hash: scroll.hash, clock: scroll.clock });
-    pendingNavigationScroll = { hash: scroll.hash, clock: 0 };
+    pendingNavigationScroll = { ...scroll, clock: 0 };
   }
   if (unrenderedNavigations.length > 0) {
     trace("reconnect.navigation_render_on_join", { navigations: unrenderedNavigations.length });
@@ -1850,18 +1882,98 @@ function currentPath() {
 // popstate; it is the same page, so no navigate is sent for it.
 let routePath = null;
 
-// The scroll of a live navigation (a link, or the server's router.push and
-// router.replace), waiting for the new page: { hash, clock }, clock being
-// the navigate's and hash the URL's fragment ("" for none). The browser does
-// not scroll for pushState, and the new page exists only once the server's
-// answer to the navigate is rendered, so the first applied frame whose
-// ack_clock covers the clock scrolls: to the top for a URL without a
-// fragment, else to the fragment, or to the top when the page has no such
-// element. LiveView's Browser.pushState does the same once the reply of a
-// live navigation is rendered (getHashTargetEl, then scrollIntoView, else
-// window.scroll(0, 0)). Back and forward schedule none (popstate): they keep
-// the browser's scroll restoration.
+// The scroll of a navigation, waiting for the new page: { hash, clock,
+// restore }, clock being the navigate's, hash the URL's fragment ("" for
+// none) and restore the { x, y } the history entry saved, or null. The
+// browser does not scroll for pushState, and the new page exists only once
+// the server's answer to the navigate is rendered, so the first applied
+// frame whose ack_clock covers the clock scrolls (scrollToEntry): to the
+// saved position, else to the fragment, else to the top. A link and the
+// server's router.push and router.replace never restore: the new entry has
+// no saved position. LiveView's Browser.pushState does the same once the
+// reply of a live navigation is rendered (getHashTargetEl, then
+// scrollIntoView, else window.scroll(0, 0)), and its popstate handler
+// restores the entry's saved scroll once the page is patched (maybeScroll).
 let pendingNavigationScroll = null;
+
+// Where the client keeps a history entry's scroll position, as { x, y },
+// in the entry's state. Back and forward land on an entry before its page is
+// rendered, so the browser's own restoration would scroll the old page; the
+// client turns it off (history.scrollRestoration = "manual", as LiveView's
+// bindNav does) and restores the saved position itself once the page is
+// rendered. The position is saved into the current entry just before a
+// navigation leaves it (saveScroll), and after the page stops scrolling
+// (SCROLL_SAVE_DEBOUNCE_MS, LiveView's 100 ms), so an entry the user left
+// with Back or Forward keeps where it was scrolled to, as of the last pause.
+const SCROLL_STATE_KEY = "brazierScroll";
+const SCROLL_SAVE_DEBOUNCE_MS = 100;
+let scrollSaveTimer = null;
+
+function cancelScrollSave() {
+  if (scrollSaveTimer === null) return;
+  clearTimeout(scrollSaveTimer);
+  scrollSaveTimer = null;
+}
+
+// Save the page's scroll position into the current history entry, keeping
+// the rest of its state. replaceState without a URL keeps the entry's URL.
+function saveScroll(reason) {
+  cancelScrollSave();
+  const scroll = { x: window.scrollX, y: window.scrollY };
+  const state = history.state !== null && typeof history.state === "object" ? history.state : {};
+  try {
+    history.replaceState({ ...state, [SCROLL_STATE_KEY]: scroll }, "");
+  } catch (e) {
+    // Safari throws past 100 replaceState calls in 30 seconds.
+    console.warn(
+      "[brazier] Could not save the scroll position in history (" + e.message + "); " +
+        "Back or Forward to this entry restores the position it saved before",
+    );
+    return;
+  }
+  trace("scroll.save", { reason, x: scroll.x, y: scroll.y });
+}
+
+// The scroll position a history entry's state saved, or null for an entry
+// without one (a page the client has not seen scrolled, or an entry the
+// browser made for an in-page fragment link).
+function savedScroll(state) {
+  if (state === null || typeof state !== "object" || !(SCROLL_STATE_KEY in state)) return null;
+  const scroll = state[SCROLL_STATE_KEY];
+  if (scroll === null || typeof scroll !== "object" || !Number.isFinite(scroll.x) || !Number.isFinite(scroll.y)) {
+    console.warn(
+      "[brazier] The history entry's " + SCROLL_STATE_KEY + " is not { x, y } numbers, so it is not restored:",
+      JSON.stringify(scroll),
+    );
+    return null;
+  }
+  return { x: scroll.x, y: scroll.y };
+}
+
+// Scroll the page for the history entry it now shows: to the position the
+// entry saved, else as a page load of its URL does, to the fragment's
+// element, else to the top.
+function scrollToEntry(restore, hash) {
+  if (restore !== null) {
+    window.scrollTo(restore.x, restore.y);
+    trace("navigate.scroll_restore", { x: restore.x, y: restore.y });
+    return;
+  }
+  if (hash === "") {
+    window.scrollTo(0, 0);
+    trace("navigate.scroll_top");
+    return;
+  }
+  const target = fragmentTarget(hash);
+  if (target) {
+    target.scrollIntoView();
+    trace("navigate.fragment_scroll", { hash });
+    return;
+  }
+  console.warn("[brazier] The page has no element for the fragment " + JSON.stringify(hash) + " (no id, no <a name>); scrolled to the top");
+  window.scrollTo(0, 0);
+  trace("navigate.fragment_missing", { hash });
+}
 
 // The clocks of the navigates whose page is not rendered yet, in order. The
 // first render whose ack_clock covers one replaces the app root's children
@@ -1876,10 +1988,10 @@ let unrenderedNavigations = [];
 
 // Tell the server about a route change. `path` is what the server routes on
 // (pathname and search) and `hash` the URL's fragment ("" for none).
-// `scroll` is false for back and forward. The navigate takes its clock from
-// the event counter, so the frame that shows the new page is the first one
-// acknowledging it.
-function sendNavigate(path, hash, scroll) {
+// `restore` is the { x, y } the history entry saved (Back and Forward), or
+// null. The navigate takes its clock from the event counter, so the frame
+// that shows the new page is the first one acknowledging it.
+function sendNavigate(path, hash, restore) {
   const clock = ++eventClock;
   const fragment = hash === "#" ? "" : hash;
   if (!send({ type: "navigate", path, clock })) {
@@ -1890,8 +2002,8 @@ function sendNavigate(path, hash, scroll) {
     return;
   }
   unrenderedNavigations.push(clock);
-  pendingNavigationScroll = scroll ? { hash: fragment, clock } : null;
-  trace("navigate.pending", { path, hash: fragment, clock, scroll });
+  pendingNavigationScroll = { hash: fragment, clock, restore };
+  trace("navigate.pending", { path, hash: fragment, clock, restore });
 }
 
 // The element a fragment names: the HTML indicated-part rules (an element
@@ -1942,20 +2054,7 @@ function resolveNavigations() {
     trace("navigate.scroll_superseded", { hash: pending.hash, now: location.hash });
     return;
   }
-  if (pending.hash === "") {
-    window.scrollTo(0, 0);
-    trace("navigate.scroll_top");
-    return;
-  }
-  const target = fragmentTarget(pending.hash);
-  if (target) {
-    target.scrollIntoView();
-    trace("navigate.fragment_scroll", { hash: pending.hash });
-    return;
-  }
-  console.warn("[brazier] The page has no element for the fragment " + JSON.stringify(pending.hash) + " (no id, no <a name>); scrolled to the top");
-  window.scrollTo(0, 0);
-  trace("navigate.fragment_missing", { hash: pending.hash });
+  scrollToEntry(pending.restore, pending.hash);
 }
 
 // Why the server's navigation target is not a same-origin path of this
@@ -1986,14 +2085,19 @@ function handleServerNavigate(path, replace) {
     return;
   }
   leaveRoute(path);
-  if (replace) history.replaceState(null, "", path);
-  else history.pushState(null, "", path);
+  if (replace) {
+    history.replaceState(null, "", path);
+  } else {
+    // The entry being left keeps its scroll, for Back to restore.
+    saveScroll("navigate");
+    history.pushState(null, "", path);
+  }
   routePath = currentPath();
   // As for a link, the server is told the path without the fragment (a URL's
   // first "#" starts it) and the client scrolls to the fragment once the
   // page is rendered.
   const hashAt = path.indexOf("#");
-  sendNavigate(hashAt < 0 ? path : path.slice(0, hashAt), hashAt < 0 ? "" : location.hash, true);
+  sendNavigate(hashAt < 0 ? path : path.slice(0, hashAt), hashAt < 0 ? "" : location.hash, null);
 }
 
 // Hard navigation: a full page load, e.g. to receive Set-Cookie headers.
@@ -2010,6 +2114,33 @@ function handleServerHardNavigate(path) {
 
 function setupNavigation() {
   routePath = currentPath();
+  // The client restores the scroll of Back and Forward itself, once the page
+  // is rendered (SCROLL_STATE_KEY).
+  if ("scrollRestoration" in history) {
+    history.scrollRestoration = "manual";
+    trace("scroll.restoration_manual");
+  } else {
+    console.warn("[brazier] This browser has no history.scrollRestoration; Back and Forward scroll as the browser does, before the page is rendered");
+  }
+  // A reload, or Back from another site to this page, loads the entry again:
+  // the browser does not restore a manual entry's scroll, so the client
+  // does, as LiveView's joinDeadView does with history.state.scroll.
+  const loaded = savedScroll(history.state);
+  if (loaded !== null) {
+    window.scrollTo(loaded.x, loaded.y);
+    trace("navigate.scroll_restore", { x: loaded.x, y: loaded.y, load: true });
+  }
+  window.addEventListener(
+    "scroll",
+    () => {
+      cancelScrollSave();
+      scrollSaveTimer = setTimeout(() => {
+        scrollSaveTimer = null;
+        saveScroll("scroll");
+      }, SCROLL_SAVE_DEBOUNCE_MS);
+    },
+    { passive: true },
+  );
   // Same-origin links navigate without a page load.
   document.addEventListener("click", (e) => {
     if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
@@ -2029,39 +2160,58 @@ function setupNavigation() {
     if (a.hasAttribute("data-brazier-external") || a.hasAttribute("download")) return;
     if (a.target && a.target !== "_self") return;
     const path = url.pathname + url.search;
+    // A path the server would refuse to navigate to (localPathRefusal: the
+    // same rule as src/brazier/internal/local_path.gleam), such as "//x"
+    // from href="/.//x", is not routed live: the browser loads it, as it
+    // loads a link to another origin.
+    const refusal = localPathRefusal(path, location.origin);
+    if (refusal !== null) {
+      console.warn("[brazier] Link not intercepted: its path is not a local path (" + refusal + "); the browser loads it:", JSON.stringify(path));
+      return;
+    }
     // An in-page fragment link (`#section`, `/this/page#section`, or a bare
     // `#`) stays the browser's: it scrolls and changes the hash, and the
     // page does not change. This is LiveView's DOM.isNewPageClick (the same
     // pathname and search with a hash, or an href ending in "#", is not a
     // new page) and Turbo's same-page anchor rule.
     if (path === currentPath() && (url.hash !== "" || url.href.endsWith("#"))) {
+      // The browser adds the fragment's entry after this click: the entry
+      // being left keeps its scroll, for Back to restore.
+      saveScroll("fragment_link");
       trace("navigate.fragment", { hash: url.hash });
       return;
     }
     e.preventDefault();
     if (path === currentPath()) return;
     leaveRoute(path);
+    saveScroll("navigate");
     // A link to another page's fragment keeps the fragment in the URL; the
     // server is told only the path, which is what it routes on.
     history.pushState(null, "", path + url.hash);
     routePath = path;
-    sendNavigate(path, url.hash, true);
+    sendNavigate(path, url.hash, null);
   });
   // Back and forward. Moving between fragments of the same page fires
   // popstate too, and is not a navigation: LiveView's popstate handler
   // returns when isNewLocation finds the pathname and search unchanged.
-  window.addEventListener("popstate", () => {
+  window.addEventListener("popstate", (event) => {
+    // A save still waiting belongs to the entry just left; written now, it
+    // would land on this one. That entry keeps the position it saved at
+    // its last pause instead.
+    cancelScrollSave();
+    const restore = savedScroll(event.state);
     const path = currentPath();
     if (path === routePath) {
+      // The same page, at another fragment: there is no page to wait for.
       trace("navigate.same_route_popstate", { path });
+      scrollToEntry(restore, location.hash === "#" ? "" : location.hash);
       return;
     }
     leaveRoute(path);
     routePath = path;
-    // Back and forward keep the browser's scroll restoration, so no scroll
-    // is scheduled (and a pending one is dropped). The page is still
-    // replaced when it renders.
-    sendNavigate(path, "", false);
+    // The page is replaced when it renders, and then scrolled to where the
+    // entry was (resolveNavigations).
+    sendNavigate(path, location.hash, restore);
   });
 }
 

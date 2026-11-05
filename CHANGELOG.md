@@ -266,6 +266,12 @@ open follow-ups), which is in progress.
 
 ### Added
 
+- (M118 perf-client) `examples/rows`, a 1000-row list, with a CDP morph and
+  patch bench (median and p99 over 5 rounds of 100 updates) written to
+  `build/bench/cdp_morph_<viewport>.json`; not gated yet.
+- (M118 perf-client) The CDP harness's page checks wait for the exact path
+  and the page's single `h1` (`expect_path_and_heading`), and print what
+  they saw on timeout. The ffi harness covers the client test seams.
 - (M118 followups) `[brazier, runtime, connection, forgotten]` telemetry
   when the runtime forgets a slow or gone connection, with `count` and
   `queue_len` measurements and `reason` (`slow` or `down`) and
@@ -421,6 +427,23 @@ open follow-ups), which is in progress.
 
 ### Changed
 
+- (M118 perf-client) The client renders after an event only when the event
+  changed the model or the local state. A Msg only the server handles waits
+  for the server's patch or ack instead of re-rendering and morphing an
+  unchanged page (as LiveView's `pushEvent`); a server-bound click went from
+  2 renders to 1.
+- (M118 perf-client) Back and Forward restore each history entry's scroll
+  position once its page has rendered, as LiveView does:
+  `history.scrollRestoration` is `"manual"` and the position is kept in
+  `history.state.brazierScroll`, saved when a navigation leaves the entry
+  and 100 ms after scrolling stops (a position reached less than 100 ms
+  before Back is not saved). Reloads restore it too.
+- (M118 perf-client) A link whose path normalises to `//…` (such as
+  `/.//x`) is not routed live: the client warns and the browser loads it,
+  so the transport no longer refuses a navigation the client sent.
+- (M118 perf-client) The client clears its User Timing marks and measures
+  after observers see them, so the performance timeline stays bounded, and
+  adds a `brazier:morph` measure of the DOM work alone.
 - (M118 followups) The build refuses `data-brazier-stream` outside
   `stream.render` whenever it can know the attribute name statically: a
   literal, a constant (local or imported) or a `<>` join of them, given

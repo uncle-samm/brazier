@@ -433,12 +433,13 @@ For Boxd-style VM fan-out:
    ```
 
 2. Fork the VM and run non-overlapping shard lists on each fork. Every fork
-   reads the shard total from the same image, so they agree on it; with 25
-   examples, five forks take `1,6,11,16,21` through `5,10,15,20,25`:
+   reads the shard total from the same image, so they agree on it; with 26
+   examples, five forks take `1,6,11,16,21,26`, then `2,7,12,17,22` through
+   `5,10,15,20,25`:
 
    ```sh
    BRAZIER_CDP_DOCKER_IMAGE=brazier-cdp:boxd BRAZIER_CDP_SKIP_DOCKER_BUILD=1 \
-     BRAZIER_CDP_SHARDS="1,6,11,16,21" \
+     BRAZIER_CDP_SHARDS="1,6,11,16,21,26" \
      BRAZIER_CDP_PARALLEL=2 sh scripts/run_cdp_shards_docker.sh
    ```
 
@@ -469,7 +470,14 @@ number:
 - a presence diff must name exactly the key that was tracked;
 - the client's HTML must equal the server's.
 
-The client bench does not time the DOM morph, which needs a browser.
+The client bench does not time the DOM morph, which needs a browser. The
+CDP harness's `rows` slice (`examples/rows`, a 1000-row list) does: it
+checks each update's page, then reads the client's `brazier:morph` and
+`brazier:patch` User Timing measures over 100 updates and prints
+`browser.morph.rows_1000` and `browser.patch.rows_1000` as median and p99,
+cut into 5 rounds like the benches. It writes them, in the bench report
+format, to `build/bench/cdp_morph_<viewport>.json`. They have no baseline
+and are not gated.
 
 Each scenario runs in a fresh process (`measure.isolated`), so it is not
 timed through the bench process's heap, which grows run over run. Every

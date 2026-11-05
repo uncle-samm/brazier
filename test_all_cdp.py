@@ -109,6 +109,7 @@ ALL_EXAMPLES = [
     "route_server_workspace",
     "auth_workspace",
     "timeline",
+    "rows",
 ]
 
 CDP_PORT = int(os.environ.get("CDP_PORT", "9223"))
@@ -516,6 +517,23 @@ def websocket_type_count(method_suffix, type_name):
         if payload.get("type") == type_name
     )
 
+def console_messages(level, fragment):
+    """Console messages of `level` ("log", "warning", "error", ...) holding
+    `fragment`, from the CDP events since clear_cdp_events. They outlive the
+    document that logged them, so a check can read what a page said before
+    the browser loaded another."""
+    found = []
+    for event in cdp_events:
+        if event.get("method") != "Runtime.consoleAPICalled":
+            continue
+        params = event.get("params", {})
+        if params.get("type") != level:
+            continue
+        message = " ".join(str(arg.get("value", arg.get("description", ""))) for arg in params.get("args", []))
+        if fragment in message:
+            found.append(message)
+    return found
+
 def sent_event_count():
     return websocket_type_count("Sent", "event") + websocket_type_count("Sent", "event_batch")
 
@@ -706,19 +724,51 @@ def error_list():
     all_errors = [e for e in [str(dom_list)] if e and e != "none"] + browser_errors
     return "; ".join(all_errors) if all_errors else "none"
 
-def check_history_go(delta, path, text_fragment, label):
+def page_at_js(path, heading):
+    """True once the URL path is `path` and the app shows that page: its one
+    h1 is exactly `heading`. A text fragment is not enough, since the nav of
+    every page names every page; the h1 is the page's own."""
+    return (
+        f"(location.pathname === {json.dumps(path)} && (function(){{"
+        'var h = document.querySelectorAll("#brazier-app h1");'
+        f"return h.length === 1 && h[0].textContent === {json.dumps(heading)};}})())"
+    )
+
+PAGE_STATE_JS = (
+    "JSON.stringify({path: location.pathname, "
+    'h1: Array.from(document.querySelectorAll("#brazier-app h1")).map(function(h){ return h.textContent; }), '
+    'text: (document.getElementById("brazier-app")?.textContent || "").slice(0, 120)})'
+)
+
+def expect_path_and_heading(path, heading, msg):
+    """Wait, up to WAIT_SECONDS, until the URL path is `path` and the app
+    renders the page whose one h1 is `heading` (page_at_js). On a timeout
+    the failure names what was awaited and what the page showed."""
+    ok = wait_for_js(page_at_js(path, heading))
+    check(
+        ok,
+        msg if ok else (
+            f"{msg} (waited {WAIT_SECONDS}s for path {path!r} with the one h1 {heading!r}; "
+            f"saw {evl(PAGE_STATE_JS)})"
+        ),
+    )
+    return ok
+
+def check_history_go(delta, path, heading, label):
     clear_cdp_events()
     before = str(evl("location.pathname"))
     check(before != path, f"{label}: starts away from {path} (at {before})")
     went = evl(f'history.go({delta}); "ok"')
     check(went == "ok", f"{label}: history.go({delta}) evaluated ({went})")
-    restored = wait_for_js(
-        f"location.pathname === {json.dumps(path)} && "
-        f'(document.getElementById("brazier-app")?.textContent || "").includes({json.dumps(text_fragment)})'
+    restored = wait_for_js(page_at_js(path, heading))
+    check(
+        restored,
+        f"{label}: URL and view restore {path}"
+        + ("" if restored else (
+            f" (from {before}; waited {WAIT_SECONDS}s for the one h1 {heading!r}; "
+            f"saw {evl(PAGE_STATE_JS)}, history.length {evl('history.length')})"
+        )),
     )
-    after = str(evl("location.pathname"))
-    length = str(evl("history.length"))
-    check(restored, f"{label}: URL and view restore {path} (from {before}, now {after}, history.length {length})")
     expect(lambda: websocket_type_count("Sent", "navigate") >= 1, f"{label}: popstate sends navigate")
     expect(
         lambda: websocket_type_count("Received", "mount") >= 1 or received_state_update_count() >= 1,
@@ -1810,13 +1860,6 @@ if start_example("private_session"):
 stop_server(); print()
 
 # == 19. Routed Workspace ==
-def expect_path_and_text(path, fragment, msg):
-    return expect_js(
-        f"location.pathname === {json.dumps(path)} && "
-        f'(document.getElementById("brazier-app")?.textContent || "").includes({json.dumps(fragment)})',
-        msg,
-    )
-
 # Page identity across renders (L83). Every element under #brazier-app gets
 # a JS property no markup can set, the root and the window get a marker, and
 # the elements are kept in a list, so a later check can tell a reused node
@@ -1906,7 +1949,7 @@ if start_example("routed_workspace", module="main"):
 
     clear_cdp_events()
     click('a[href="/pipeline"]')
-    expect_path_and_text("/pipeline", "Pipeline", "Client navigation: pipeline URL and view")
+    expect_path_and_heading("/pipeline", "Pipeline", "Client navigation: pipeline URL and view")
 
     clear_cdp_events()
     type_input('[data-testid="card-draft"]', "CDP route card")
@@ -1939,7 +1982,7 @@ if start_example("routed_workspace", module="main"):
         "/settings",
         '!!document.querySelector("[data-testid=draft-name]")',
     )
-    expect_path_and_text("/settings", "Settings", "Client navigation: settings URL and view")
+    expect_path_and_heading("/settings", "Settings", "Client navigation: settings URL and view")
     expect_text("Ada / owner / v1", "Settings renders saved profile")
 
     reset_dom_monitor()
@@ -2044,17 +2087,52 @@ ROUTED_ABOUT_JS = '(document.getElementById("brazier-app")?.textContent || "").i
 SCROLL_STATE_JS = (
     "JSON.stringify({path: location.pathname, hash: location.hash, "
     "scrollY: Math.round(window.scrollY), height: document.documentElement.scrollHeight, "
+    "saved: (history.state && history.state.brazierScroll) || null, "
+    "atPopstate: window.__cdpScrollAtPopstate === undefined ? null : window.__cdpScrollAtPopstate, "
     "marker: window.__brazierCdpScrollNav || null})"
 )
 
-def check_scroll_top_after_live_navigation(link_sel, path, page_js, back_path, back_page_js):
+def saved_scroll_js(y):
+    """True once the current history entry saved the scroll position y (the
+    client's history.state.brazierScroll)."""
+    return f"!!(history.state && history.state.brazierScroll && history.state.brazierScroll.y === {y})"
+
+def check_history_scroll_restore(go, path, page_js, expected_y, left_y, label):
+    """history.go(go) lands on `path`, whose entry saved expected_y: the
+    browser does not scroll (history.scrollRestoration is "manual"), so at
+    popstate the page left is still at left_y; the client scrolls to
+    expected_y once the entry's page is rendered, as LiveView restores
+    history.state.scroll after the patch."""
+    clear_cdp_events()
+    hooked = evl(
+        "(function(){ delete window.__cdpScrollAtPopstate;"
+        'window.addEventListener("popstate", function(){ window.__cdpScrollAtPopstate = Math.round(window.scrollY); }, {once: true});'
+        'return "hooked";})()'
+    )
+    check(hooked == "hooked", f"{label}: popstate scroll recorder installed ({hooked})")
+    went = evl(f'history.go({go}); "ok"')
+    check(went == "ok", f"{label}: history.go({go}) evaluated ({went})")
+    restored = wait_for_js(
+        f"location.pathname === {json.dumps(path)} && ({page_js}) && Math.round(window.scrollY) === {expected_y}"
+    )
+    check(restored, f"{label}: the client scrolls {path} to its saved {expected_y} once the page renders ({evl(SCROLL_STATE_JS)})")
+    at_popstate = evl("window.__cdpScrollAtPopstate === undefined ? null : window.__cdpScrollAtPopstate")
+    check(
+        at_popstate == left_y,
+        f"{label}: the browser does not restore the scroll before the page renders (scrollY {at_popstate} at popstate, the page left was at {left_y})",
+    )
+    expect(lambda: websocket_type_count("Sent", "navigate") == 1, f"{label}: one navigate")
+
+def check_navigation_scroll(link_sel, path, page_js, back_path, back_page_js):
     """A live navigation to a URL without a fragment scrolls to the top once
     the new page is rendered (L606), as a page load does and as LiveView's
     pushState does; history.pushState alone keeps the scroll, and the body
-    is padded so every page is tall enough to keep it. Back to the previous
-    entry keeps the browser's scroll restoration: the client does not scroll
-    after rendering that page. The current URL is back_path, the page the
-    link is on."""
+    is padded so every page is tall enough to keep it. The client owns the
+    scroll of Back and Forward (history.scrollRestoration "manual"): the
+    entry being left saves its position (on the link click, and after the
+    page stops scrolling), and the client scrolls back to it once that
+    entry's page is rendered (check_history_scroll_restore). The current URL
+    is back_path, the page the link is on; the check ends on `path`."""
     marker = json.dumps(f"scroll-{time.time_ns()}")
     setup = evl(
         "(function(){"
@@ -2064,33 +2142,70 @@ def check_scroll_top_after_live_navigation(link_sel, path, page_js, back_path, b
         f"window.__brazierCdpScrollNav = {marker}; window.scrollTo(0, 1500);"
         'return "ready";})()'
     )
-    check(setup == "ready", f"Scroll to top: padding installed ({setup})")
-    check(str(evl("location.pathname")) == back_path, f"Scroll to top: starts at {back_path} ({evl('location.pathname')})")
-    check(wait_for_js("Math.round(window.scrollY) === 1500"), f"Scroll to top: scrolled down first ({evl(SCROLL_STATE_JS)})")
+    check(setup == "ready", f"Navigation scroll: padding installed ({setup})")
+    check(
+        str(evl("history.scrollRestoration")) == "manual",
+        f"Navigation scroll: the client owns history scroll restoration ({evl('history.scrollRestoration')})",
+    )
+    check(str(evl("location.pathname")) == back_path, f"Navigation scroll: starts at {back_path} ({evl('location.pathname')})")
+    check(wait_for_js("Math.round(window.scrollY) === 1500"), f"Navigation scroll: scrolled down first ({evl(SCROLL_STATE_JS)})")
 
     clear_cdp_events()
     click(link_sel)
     topped = wait_for_js(
         f"location.pathname === {json.dumps(path)} && location.hash === \"\" && ({page_js}) && window.scrollY === 0"
     )
-    check(topped, f"Scroll to top: live navigation to {path} scrolls to the top once the page renders ({evl(SCROLL_STATE_JS)})")
-    check(str(evl("window.__brazierCdpScrollNav")) == json.loads(marker), "Scroll to top: no page load")
+    check(topped, f"Navigation scroll: live navigation to {path} scrolls to the top once the page renders ({evl(SCROLL_STATE_JS)})")
+    check(str(evl("window.__brazierCdpScrollNav")) == json.loads(marker), "Navigation scroll: no page load")
 
-    clear_cdp_events()
-    went = evl('history.back(); "ok"')
-    check(went == "ok", f"Scroll to top: history.back() evaluated ({went})")
-    # The browser restores the entry's scroll before popstate; the page
-    # renders when the navigate is answered, and the client must not scroll
-    # then, so the check waits for that page and reads the scroll after it.
-    restored = wait_for_js(
-        f"location.pathname === {json.dumps(back_path)} && ({back_page_js}) && Math.round(window.scrollY) === 1500"
-    )
-    check(restored, f"Scroll to top: back to {back_path} keeps the browser's scroll restoration ({evl(SCROLL_STATE_JS)})")
-    expect(lambda: websocket_type_count("Sent", "navigate") == 1, "Scroll to top: back sends one navigate")
-    check(str(evl("window.__brazierCdpScrollNav")) == json.loads(marker), "Scroll to top: still no page load")
+    # The page stops scrolling at 800: the client saves that into this entry
+    # after its debounce, which the check waits for.
+    evl("window.scrollTo(0, 800); 0")
+    saved = wait_for_js(f"Math.round(window.scrollY) === 800 && {saved_scroll_js(800)}")
+    check(saved, f"Navigation scroll: {path} saves its scroll position after the page stops scrolling ({evl(SCROLL_STATE_JS)})")
+
+    check_history_scroll_restore(-1, back_path, back_page_js, 1500, 800, f"Navigation scroll: back to {back_path}")
+    check(str(evl("window.__brazierCdpScrollNav")) == json.loads(marker), "Navigation scroll: still no page load after back")
+    check_history_scroll_restore(1, path, page_js, 800, 1500, f"Navigation scroll: forward to {path}")
+    check(str(evl("window.__brazierCdpScrollNav")) == json.loads(marker), "Navigation scroll: still no page load after forward")
 
     removed = evl('(function(){document.getElementById("cdp-scroll-pad").remove(); window.scrollTo(0, 0); return "removed";})()')
-    check(removed == "removed", f"Scroll to top: padding removed ({removed})")
+    check(removed == "removed", f"Navigation scroll: padding removed ({removed})")
+
+def check_double_slash_link_loads():
+    """A same-origin link whose URL normalises to a "//" pathname (href
+    "/.//about" is pathname "//about") is not routed live: the server
+    refuses such a path (local_path), and "//about" read as a URL is the
+    host "about". The client leaves the click to the browser and warns; the
+    browser loads the document. The link sits outside #brazier-app, so the
+    morph never touches it. A window marker tells the page load from a live
+    navigation."""
+    marker = json.dumps(f"double-slash-{time.time_ns()}")
+    setup = evl(
+        "(function(){"
+        'var a = document.createElement("a"); a.id = "cdp-double-slash-link"; a.textContent = "double slash";'
+        'a.setAttribute("href", "/.//about"); document.body.appendChild(a);'
+        f"window.__brazierCdpDoubleSlash = {marker};"
+        'return new URL(a.getAttribute("href"), location.href).pathname;})()'
+    )
+    check(setup == "//about", f"Double-slash link: installed, its URL's pathname is //about ({setup})")
+    clear_cdp_events()
+    click("#cdp-double-slash-link")
+    loaded = wait_for_js(
+        f'window.__brazierCdpDoubleSlash !== {marker} && document.readyState === "complete" && location.pathname === "//about"'
+    )
+    check(
+        loaded,
+        "Double-slash link: the browser loads //about as a document"
+        + ("" if loaded else f" ({evl('JSON.stringify({path: location.pathname, ready: document.readyState})')})"),
+    )
+    warned = console_messages("warning", "Link not intercepted: its path is not a local path")
+    check(
+        len(warned) == 1 and "//about" in warned[0],
+        f"Double-slash link: the client warns that it does not intercept it ({warned})",
+    )
+    sent = [p.get("path") for p in websocket_json_payloads("Sent") if p.get("type") == "navigate"]
+    check(sent == [], f"Double-slash link: no navigate is sent ({sent})")
 
 print("-- 20: Explicit Routing --")
 if start_example("routed", module="main"):
@@ -2118,12 +2233,12 @@ if start_example("routed", module="main"):
         "/about",
         ROUTED_ABOUT_JS,
     )
-    expect_path_and_text("/about", "About", "Client navigation: about URL and view")
+    expect_path_and_heading("/about", "About", "Client navigation: about URL and view")
     check("does not scan the filesystem" in str(text()), "Client navigation: no filesystem route scan copy")
 
     clear_cdp_events()
     click('a[href="/settings"]')
-    expect_path_and_text("/settings", "Settings", "Client navigation: settings URL and view")
+    expect_path_and_heading("/settings", "Settings", "Client navigation: settings URL and view")
 
     clear_cdp_events()
     type_input('[data-testid="name-input"]', "CDP Route")
@@ -2134,7 +2249,7 @@ if start_example("routed", module="main"):
     check_model_ws_update("Routed settings input")
 
     click('a[href="/stats"]')
-    expect_path_and_text("/stats", "Stats", "Client navigation: stats URL and view")
+    expect_path_and_heading("/stats", "Stats", "Client navigation: stats URL and view")
     check("Route changes observed:" in str(text()), "Route model tracks entered pages")
 
     reset_dom_monitor()
@@ -2147,11 +2262,16 @@ if start_example("routed", module="main"):
     # After the conformance check: the padding it installs is not the app's
     # layout.
     check_fragment_scroll_after_live_navigation("/about", "About", "/settings", "Settings")
-    check_scroll_top_after_live_navigation(
+    check_navigation_scroll(
         'a[href="/about"]', "/about", ROUTED_ABOUT_JS,
         "/settings", '!!document.querySelector("[data-testid=name-input]")',
     )
     check(errors() == "0", f"Zero errors ({error_list()})")
+
+    # After the zero-errors check: the browser loads the "//" link's
+    # document, which the server may answer with a 404, logged by the
+    # browser as an error.
+    check_double_slash_link_loads()
 
     # The browser logs the 404 document load itself as a console error, so
     # the zero-errors check runs before this deliberate unknown route.
@@ -2214,7 +2334,7 @@ if start_example("route_server_workspace", module="main"):
 
     clear_cdp_events()
     click('a[href="/settings"]')
-    expect_path_and_text("/settings", "Settings", "Client navigation: settings URL and view")
+    expect_path_and_heading("/settings", "Settings", "Client navigation: settings URL and view")
     type_input('[data-testid="settings-email"]', "route@example.test")
     click_by_text("Save settings")
     expect_text("Saved route@example.test", "Route-local settings server update saves model")
@@ -2372,20 +2492,6 @@ def timeline_click(key, cls, label):
 def timeline_wait_status(fragment, label):
     expect_js(f"({TIMELINE_STATUS_JS}).includes({json.dumps(fragment)})", f"{label}: status shows {fragment!r} ({timeline_status()})")
 
-def timeline_console(level, fragment):
-    """Console messages of `level` holding `fragment`, from the CDP events."""
-    found = []
-    for event in cdp_events:
-        if event.get("method") != "Runtime.consoleAPICalled":
-            continue
-        params = event.get("params", {})
-        if params.get("type") != level:
-            continue
-        message = " ".join(str(arg.get("value", arg.get("description", ""))) for arg in params.get("args", []))
-        if fragment in message:
-            found.append(message)
-    return found
-
 print("-- 22: Timeline --")
 if start_example("timeline", module="main"):
     install_dom_monitor()
@@ -2530,7 +2636,7 @@ if start_example("timeline", module="main"):
     delivered = evl(f"window.__brazierDeliverFrameForTest ? window.__brazierDeliverFrameForTest({json.dumps(forged)}) : 'missing'")
     check(str(delivered) != "missing", f"{label}: the frame test hook is available")
     expect(lambda: cdp_method_count("Network.webSocketClosed") > 0, f"{label}: the socket closes")
-    expect(lambda: len(timeline_console("warning", "WebSocket closed (code 4000")) == 1, f"{label}: the socket closes with 4000 ({timeline_console('warning', 'WebSocket closed')})")
+    expect(lambda: len(console_messages("warning", "WebSocket closed (code 4000")) == 1, f"{label}: the socket closes with 4000 ({console_messages('warning', 'WebSocket closed')})")
     reconnected = wait_for_js(f"{APP_READY_JS} && ({TIMELINE_STATUS_JS}).includes('Next: step 4.')", timeout=2 * WAIT_SECONDS)
     check(reconnected, f"{label}: the client reconnects")
     expect(lambda: websocket_type_count("Sent", "join") == 1, f"{label}: one new join")
@@ -2568,11 +2674,198 @@ if start_example("timeline", module="main"):
     check(str(released) == "0", f"{label}: the connect starts ({released})")
     expect_js(APP_READY_JS, f"{label}: the client joins")
     timeline_wait_status("Picked: step 2.", label)
-    expect(lambda: len(timeline_console("log", "Replayed 1 event(s) from before hydration")) == 1, f"{label}: the client replayed the click")
+    expect(lambda: len(console_messages("log", "Replayed 1 event(s) from before hydration")) == 1, f"{label}: the client replayed the click")
     check(all(timeline_same_node(key) for key in TIMELINE_SEED), f"{label}: the join kept the server-rendered steps' nodes")
     sent_events = [p for p in websocket_json_payloads("Sent") if p.get("type") in ("event", "event_batch")]
     check(len(sent_events) == 1, f"{label}: one event sent ({sent_events})")
     expect_js("window.timelineHooks.counts.mount === 3", f"{label}: the meters mount on the join ({timeline_hook_counts()})")
+    check(errors() == "0", f"Zero errors ({error_list()})")
+stop_server(); print()
+
+# == 23. Rows (browser bench of the DOM morph) ==
+# The client's DOM work for a 1000-row list, in Chrome: the half of the
+# client's patch path the node bench (client_bench.gleam) cannot time. Each
+# Relabel changes every tenth label and moves the selection, the node
+# bench's patch. A PerformanceObserver in the page collects the client's
+# User Timing measures:
+#   brazier:morph  the morph of the page, the event listeners and the
+#                  stream containers of one render, without the view
+#   brazier:patch  handlePatch, from the patch to the rendered page, without
+#                  the frame's JSON.parse
+# They are reported as the bench suite reports them (measure.gleam's
+# percentiles_by_round: the timed samples cut into 5 rounds, the median over
+# rounds of each round's median and nearest-rank p99), in µs, and written
+# in the bench report format to build/bench/cdp_morph_<viewport>.json. They
+# are not gated: there is no baseline for them yet. performance.now() in a
+# page that is not cross-origin isolated is coarsened to 100 µs, which is
+# small next to these timings.
+ROWS_COUNT = 1000
+ROWS_WARMUP = 10
+ROWS_TIMED = 100
+ROWS_BENCH_ROUNDS = 5
+ROWS_STATUS_JS = 'document.querySelector("[data-testid=status]")?.textContent || ""'
+ROWS_MEASURES_JS = "JSON.stringify(window.__cdpRowsMeasures ? {morph: window.__cdpRowsMeasures.morph.length, patch: window.__cdpRowsMeasures.patch.length, render: window.__cdpRowsMeasures.render.length} : null)"
+
+def rows_label(row_id):
+    return evl(f'document.querySelector("#rows > li[data-row=\\"{row_id}\\"] > .label")?.textContent || ""')
+
+def rows_selected_ids():
+    return evl('JSON.stringify(Array.from(document.querySelectorAll("#rows > li.selected")).map(function(li){ return li.getAttribute("data-row"); }))')
+
+def rows_relabel_round(expected_round, label):
+    """Click Relabel and wait for round `expected_round` to render and for
+    its measures to reach the observer (an observer is called in a later
+    task than the render)."""
+    selected = expected_round * 7 % ROWS_COUNT + 1
+    before = json.loads(evl(ROWS_MEASURES_JS))
+    if not click("#relabel"):
+        return False
+    rendered = wait_for_js(
+        f"({ROWS_STATUS_JS}) === {json.dumps(f'Round {expected_round}, selected {selected}')}"
+        f" && window.__cdpRowsMeasures.patch.length === {before['patch'] + 1}"
+        f" && window.__cdpRowsMeasures.morph.length >= {before['morph'] + 1}"
+    )
+    after = json.loads(evl(ROWS_MEASURES_JS))
+    check(rendered, f"{label}: round {expected_round} renders and is measured ({evl(ROWS_STATUS_JS)}, {before} -> {after})")
+    if not rendered:
+        return False
+    # One render per patch: no other render may share the morph samples.
+    one_each = all(after[k] == before[k] + 1 for k in ("morph", "patch", "render"))
+    check(one_each, f"{label}: round {expected_round} is one patch, one render and one morph ({before} -> {after})")
+    return one_each
+
+def bench_percentiles(name, samples):
+    """measure.gleam's percentiles_by_round, so the numbers mean what the
+    suite's do."""
+    count = len(samples)
+    check(count >= ROWS_BENCH_ROUNDS and count % ROWS_BENCH_ROUNDS == 0, f"{name}: {count} samples split into {ROWS_BENCH_ROUNDS} equal rounds")
+    size = count // ROWS_BENCH_ROUNDS
+    medians, p99s = [], []
+    for start in range(0, count, size):
+        sorted_round = sorted(samples[start:start + size])
+        n = len(sorted_round)
+        medians.append(sorted_round[(n - 1) // 2] if n % 2 == 1 else (sorted_round[n // 2 - 1] + sorted_round[n // 2]) / 2)
+        p99s.append(sorted_round[(99 * n + 99) // 100 - 1])
+    def median(values):
+        ordered = sorted(values)
+        n = len(ordered)
+        return ordered[(n - 1) // 2] if n % 2 == 1 else (ordered[n // 2 - 1] + ordered[n // 2]) / 2
+    return median(medians), median(p99s)
+
+def bench_cpu_model():
+    """The CPU model, as brazier_bench_ffi:machine/0 reads it."""
+    if sys.platform == "darwin":
+        out = subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"], stdout=subprocess.PIPE, text=True, check=False)
+        return out.stdout.strip() if out.returncode == 0 and out.stdout.strip() else "unknown"
+    if sys.platform.startswith("linux"):
+        try:
+            with open("/proc/cpuinfo", "r", encoding="utf-8") as fh:
+                for line in fh:
+                    key, _, value = line.partition(":")
+                    if key.strip() == "model name":
+                        return value.strip()
+        except OSError:
+            return "unknown"
+    return "unknown"
+
+def write_rows_bench_report(metrics):
+    version = cdp_checked("Browser.getVersion")
+    browser = version["result"]["product"] if version else "unknown"
+    machine = {
+        "browser": browser,
+        "cpu": bench_cpu_model(),
+        "logical_processors": str(os.cpu_count()),
+        "os": f"{sys.platform}/{os.uname().release}",
+        "viewport": VIEWPORT,
+    }
+    report = {
+        "machine": dict(sorted(machine.items())),
+        "metrics": [{"name": name, "unit": "us", "better": "lower", "value": value} for name, value in metrics],
+    }
+    path = os.path.join(ROOT, "build", "bench", f"cdp_morph_{VIEWPORT}.json")
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(report, fh)
+            fh.write("\n")
+    except OSError as exc:
+        check(False, f"Rows bench: report written to {path} ({exc})")
+        return
+    check(True, f"Rows bench: report written to {os.path.relpath(path, ROOT)}")
+
+print("-- 23: Rows --")
+if start_example("rows"):
+    install_dom_monitor()
+    navigate("/")
+    reset_dom_monitor()
+    check(count_js('document.querySelectorAll("#rows > li").length') == ROWS_COUNT, f"SSR: {ROWS_COUNT} rows render")
+    check(str(evl(ROWS_STATUS_JS)) == "Round 0, selected 0", f"SSR: round 0, nothing selected ({evl(ROWS_STATUS_JS)})")
+    check(rows_label(10) == "row label number 10", "SSR: row 10 has its first label")
+    installed = evl(
+        "(function(){"
+        "window.__cdpRowsMeasures = {morph: [], patch: [], render: []};"
+        "new PerformanceObserver(function(list){"
+        " list.getEntries().forEach(function(e){"
+        '  var kind = e.name.slice("brazier:".length);'
+        "  if (e.name.indexOf(\"brazier:\") === 0 && Object.prototype.hasOwnProperty.call(window.__cdpRowsMeasures, kind)) window.__cdpRowsMeasures[kind].push(e.duration * 1000);"
+        " });"
+        '}).observe({type: "measure"});'
+        'return "observing";})()'
+    )
+    check(installed == "observing", f"Rows: the measure observer is installed ({installed})")
+
+    # Correctness first: the morph keeps every row's node, changes every
+    # tenth label and moves the selection.
+    label = "Rows relabel"
+    marked = evl('(function(){ var rows = Array.from(document.querySelectorAll("#rows > li")); rows.forEach(function(li){ li.__cdpRow = true; }); window.__cdpRows = rows; return rows.length; })()')
+    check(marked == ROWS_COUNT, f"{label}: rows marked ({marked})")
+    clear_cdp_events()
+    rows_relabel_round(1, label)
+    check(rows_label(10) == "label 10 round 1", f"{label}: row 10 is relabelled ({rows_label(10)})")
+    check(rows_label(1000) == "label 1000 round 1", f"{label}: row 1000 is relabelled ({rows_label(1000)})")
+    check(rows_label(11) == "row label number 11", f"{label}: row 11 keeps its label ({rows_label(11)})")
+    check(rows_selected_ids() == '["8"]', f"{label}: row 8 alone is selected ({rows_selected_ids()})")
+    check(count_js('window.__cdpRows.filter(function(li){ return !li.isConnected; }).length') == 0, f"{label}: every row keeps its node")
+    check(count_js('document.querySelectorAll("#rows > li").length') == ROWS_COUNT, f"{label}: still {ROWS_COUNT} rows")
+    check_model_ws_update(label, events=1)
+    # Hydration and one relabel only: the bench below changes the page as
+    # fast as the client renders, which is not a page's layout.
+    check_dom_conformance("Rows", max_bucket=200)
+
+    label = "Rows select"
+    clear_cdp_events()
+    click('#rows > li[data-row="500"]')
+    expect(lambda: str(evl(ROWS_STATUS_JS)) == "Round 1, selected 500", f"{label}: row 500 is selected ({evl(ROWS_STATUS_JS)})")
+    check(rows_selected_ids() == '["500"]', f"{label}: row 500 alone has the class ({rows_selected_ids()})")
+    check_model_ws_update(label, events=1)
+
+    # The bench: warm-up rounds, then the timed ones. Round 1 above is the
+    # first; the select took one more patch, so the measures are counted
+    # from here.
+    label = "Rows bench"
+    ok = True
+    for n in range(2, 2 + ROWS_WARMUP):
+        ok = ok and rows_relabel_round(n, label)
+    start = json.loads(evl(ROWS_MEASURES_JS))
+    for n in range(2 + ROWS_WARMUP, 2 + ROWS_WARMUP + ROWS_TIMED):
+        ok = ok and rows_relabel_round(n, label)
+        if not ok:
+            break
+    if ok:
+        samples = json.loads(evl("JSON.stringify(window.__cdpRowsMeasures)"))
+        morph = samples["morph"][start["morph"]:]
+        patch = samples["patch"][start["patch"]:]
+        check(len(morph) == ROWS_TIMED and len(patch) == ROWS_TIMED, f"{label}: {ROWS_TIMED} timed samples of each ({len(morph)} morph, {len(patch)} patch)")
+        check(all(m > 0 and p >= m for m, p in zip(morph, patch)), f"{label}: every patch takes longer than its morph")
+        metrics = []
+        for name, values in (("browser.morph.rows_1000", morph), ("browser.patch.rows_1000", patch)):
+            median, p99 = bench_percentiles(name, values)
+            metrics.append((name + ".median", median))
+            metrics.append((name + ".p99", p99))
+            print(f"  {name}: median {median:.0f} us, p99 {p99:.0f} us ({VIEWPORT}, {ROWS_TIMED} updates after {ROWS_WARMUP} warm-up)")
+        write_rows_bench_report(metrics)
+    check(rows_label(10) == f"label 10 round {1 + ROWS_WARMUP + ROWS_TIMED}", f"{label}: the last round's labels are on the page ({rows_label(10)})")
+    check(count_js('window.__cdpRows.filter(function(li){ return !li.isConnected; }).length') == 0, f"{label}: every row kept its node through every round")
     check(errors() == "0", f"Zero errors ({error_list()})")
 stop_server(); print()
 

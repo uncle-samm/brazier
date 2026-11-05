@@ -76,7 +76,7 @@ BRAZIER_CDP_VIEWPORTS=desktop BRAZIER_CDP_PARALLEL=5 make browser-all-docker-sha
 ```
 
 By default the runner makes one shard per example: the total is the number
-of examples the harness selects (its `ALL_EXAMPLES`, 25 today), read from
+of examples the harness selects (its `ALL_EXAMPLES`, 26 today), read from
 the harness inside the image the shards run. `BRAZIER_CDP_TOTAL_SHARDS`
 sets a smaller total; a total above the example count is refused, since a
 shard past it would run no example and pass.
@@ -200,7 +200,12 @@ The permanent harness now asserts:
 - Model events receive `patch` or `model_sync` frames and do not receive post-update
   HTML `mount` frames.
 - Explicit route apps restore URL and view state through browser back/forward
-  and send `navigate` frames from `popstate`.
+  and send `navigate` frames from `popstate`. A page check waits for the
+  URL path and the page's own `h1`, not for text the nav shares.
+- Back and forward restore each entry's scroll position once its page is
+  rendered, not before (`history.scrollRestoration` is `"manual"`).
+- A link whose URL path starts with `//` (`href="/.//about"`) is not routed
+  live: the client warns, sends no `navigate`, and the browser loads it.
 - Reconnect tests force a real browser WebSocket close, wait for the reconnect
   `join`, then prove the app remains interactive without duplicate model events.
   The forced-close hook is only enabled when the CDP harness injects
