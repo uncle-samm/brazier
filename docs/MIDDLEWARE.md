@@ -132,6 +132,76 @@ Consequences for a middleware:
 | `body_parser(max_bytes)` | Applies the listener's framing rule with a tighter limit: 413 if `Content-Length` exceeds `max_bytes`, 400 if it is repeated or not a plain decimal integer, 501 for `Transfer-Encoding`, 400 for both. A request with neither header has no body and passes through |
 | `cors(config)` | Sets CORS headers; handles preflight OPTIONS with 204 |
 | `secure_headers_with_csp(csp)` | Like `secure_headers()` but applies a custom CSP policy string |
+| `csp_with_connect_src(policy, sources)` | Returns `policy` with `sources` added to its `connect-src`, for one route's `secure_headers_with_csp` (see below). Returns `Result` |
+
+`secure_headers()` sets each header only when the response does not carry it
+yet. A header the handler or an inner middleware set is the more specific one
+and is kept: `upload.serve` answers with `default-src 'none'; sandbox`, and a
+framework error page with `X-Frame-Options: DENY`.
+
+## Route-Specific CSP Connect Sources
+
+Keep the app-wide policy strict and widen `connect-src` only on the route that
+needs another connection target, such as a WebTransport gateway.
+`csp_with_connect_src` adds the sources to a policy; `at` gives that policy to
+the one route, inside the app-wide `secure_headers()`, which then keeps it:
+
+<!-- docs-check: wrap
+import brazier/effect.{type Effect}
+import brazier/element.{type Element}
+
+{{block}}
+
+pub type Model {
+  Model
+}
+
+pub type Msg {
+  Noop
+}
+
+fn init(_ctx: brazier.Context) -> Result(#(Model, Effect(Msg)), brazier.InitError) {
+  Ok(#(Model, effect.none()))
+}
+
+pub fn update(model: Model, _msg: Msg) -> #(Model, Effect(Msg)) {
+  #(model, effect.none())
+}
+
+pub fn view(_model: Model) -> Element(Msg) {
+  element.text("page")
+}
+-->
+```gleam
+import brazier
+import brazier/error.{type BrazierError}
+import brazier/middleware
+import gleam/result
+
+pub fn start() -> Result(Nil, BrazierError) {
+  use viewer_csp <- result.try(
+    middleware.csp_with_connect_src(middleware.default_csp, [
+      "https://localhost:4433",
+    ])
+    |> result.map_error(error.ConfigError),
+  )
+  brazier.application(init:, update:, view:)
+  |> brazier.with_middleware(middleware.at(
+    "/viewer",
+    middleware.secure_headers_with_csp(viewer_csp),
+  ))
+  |> brazier.start(8080)
+}
+```
+
+`/viewer` gets `connect-src 'self' https://localhost:4433`; every other path
+keeps `connect-src 'self'`. A policy without `connect-src` governs
+connections with `default-src`, so the new directive starts from the
+`default-src` sources. `csp_with_connect_src` returns an `Error`, and logs it,
+for an empty source list, a source that is not one CSP source expression
+(whitespace, `;`, `,`, a non-printable or non-ASCII character, `'none'`), a
+policy that repeats a directive or holds more than one policy, and a policy
+with neither `connect-src` nor `default-src`.
 
 ## Scoping
 

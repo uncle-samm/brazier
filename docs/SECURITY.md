@@ -360,6 +360,15 @@ The `middleware.secure_headers()` middleware (included by default in all apps) s
   - `style-src` keeps `'unsafe-inline'`, which `attribute.style` needs.
   - `frame-ancestors 'self'` is the CSP form of `X-Frame-Options: SAMEORIGIN`.
 
+Each header is set only when the response does not carry it yet, so a value
+the handler or an inner middleware set wins: an upload keeps `default-src
+'none'; sandbox` and a framework error page keeps `DENY` and `no-referrer`.
+A route that must connect to
+another origin (a WebTransport gateway) gets a policy from
+`middleware.csp_with_connect_src(middleware.default_csp, sources)` scoped with
+`middleware.at`, and every other route keeps `connect-src 'self'`; see
+[MIDDLEWARE.md](MIDDLEWARE.md#route-specific-csp-connect-sources).
+
 HSTS is opt-in because Brazier does not terminate TLS: add `middleware.hsts(31_536_000, True)` (it returns a `Result`; a negative max-age is an error) when the app is served over HTTPS behind a TLS proxy.
 
 ## Route Scoping

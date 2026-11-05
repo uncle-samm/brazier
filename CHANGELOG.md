@@ -283,6 +283,14 @@ open follow-ups), which is in progress.
 
 ### Added
 
+- (M118 csp-connect-src) `middleware.csp_with_connect_src(policy, sources)`
+  returns `policy` with `sources` added to its `connect-src`, starting from
+  `default-src` when the policy has no `connect-src`. Scoped with `at`
+  around `secure_headers_with_csp`, it widens one route's connections (a
+  WebTransport gateway) and leaves every other route at `connect-src 'self'`.
+  It is an `Error` for an empty source list, a source that is not one CSP
+  source expression, and a policy that repeats a directive, holds two
+  policies or restricts no connections.
 - (M118 perf-client) `examples/rows`, a 1000-row list, with a CDP morph and
   patch bench (median and p99 over 5 rounds of 100 updates) written to
   `build/bench/cdp_morph_<viewport>.json`; not gated yet.
@@ -1148,6 +1156,12 @@ open follow-ups), which is in progress.
 
 ### Security
 
+- (M118 csp-connect-src) `secure_headers()` and `secure_headers_with_csp`
+  set each header only when the response does not carry it yet. Before, the
+  app-wide middleware overwrote the handler's headers: an upload served from
+  an API route lost `Content-Security-Policy: default-src 'none'; sandbox`,
+  and a framework error page (the static 404) lost `X-Frame-Options: DENY`,
+  `Referrer-Policy: no-referrer` and its `default-src 'none'` policy.
 - (M118 otp-listdir) A file named with a leading combining mark in an
   app's static or source directory can no longer stall a build or dev
   server on macOS until it is killed with SIGKILL.

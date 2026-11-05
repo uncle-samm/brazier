@@ -6,6 +6,7 @@
 /// auth library. You plug in whatever auth you want.
 ///
 /// Reference: Wisp middleware, Phoenix plugs, Express middleware.
+import brazier/internal/ascii
 import brazier/internal/http_status
 import brazier/internal/log_path
 import brazier/ip
@@ -20,6 +21,7 @@ import gleam/http/request.{type Request}
 import gleam/http/response.{type Response}
 import gleam/int
 import gleam/list
+import gleam/result
 import gleam/string
 import gleam/uri
 
@@ -158,6 +160,13 @@ pub const default_csp =
 /// Use this when the default CSP is too strict (e.g., external stylesheets,
 /// fonts, or images from CDNs).
 ///
+/// A header the response already carries is kept: the handler or an inner
+/// middleware set it for this response, so it is the more specific value
+/// (an upload's `default-src 'none'; sandbox`, an error page's
+/// `X-Frame-Options: DENY`, a route's own policy from
+/// `csp_with_connect_src`). Phoenix gets the same precedence by running
+/// `put_secure_browser_headers` before the controller.
+///
 /// Example:
 /// ```gleam
 /// middleware.secure_headers_with_csp(
@@ -170,19 +179,227 @@ pub fn secure_headers_with_csp(csp: String) -> Middleware {
     next: fn(Request(Connection)) -> Response(ResponseBody),
   ) -> Response(ResponseBody) {
     let resp = next(req)
+    case response.get_header(resp, "content-security-policy") {
+      Ok(_) ->
+        log.debug(
+          "brazier.middleware",
+          "Keeping the response's own CSP for " <> log_path.describe(req.path),
+        )
+      Error(Nil) -> Nil
+    }
     resp
-    |> response.set_header("x-content-type-options", "nosniff")
-    |> response.set_header("x-frame-options", "SAMEORIGIN")
+    |> set_unless_present("x-content-type-options", "nosniff")
+    |> set_unless_present("x-frame-options", "SAMEORIGIN")
     // OWASP: the legacy XSS auditor is itself exploitable; disable it and
     // rely on CSP.
-    |> response.set_header("x-xss-protection", "0")
-    |> response.set_header("referrer-policy", "strict-origin-when-cross-origin")
-    |> response.set_header(
+    |> set_unless_present("x-xss-protection", "0")
+    |> set_unless_present("referrer-policy", "strict-origin-when-cross-origin")
+    |> set_unless_present(
       "permissions-policy",
       "camera=(), microphone=(), geolocation=()",
     )
-    |> response.set_header("content-security-policy", csp)
+    |> set_unless_present("content-security-policy", csp)
   }
+}
+
+fn set_unless_present(
+  resp: Response(ResponseBody),
+  name: String,
+  value: String,
+) -> Response(ResponseBody) {
+  case response.get_header(resp, name) {
+    Ok(_) -> resp
+    Error(Nil) -> response.set_header(resp, name, value)
+  }
+}
+
+/// `policy` with `sources` added to its `connect-src`, for a route that
+/// connects somewhere the app-wide policy does not allow (a WebTransport
+/// gateway, an EventSource host). Give that route the result with `at`,
+/// `only` or `methods` around `secure_headers_with_csp`; the app-wide
+/// `secure_headers()` keeps the policy the inner one set.
+///
+/// ```gleam
+/// middleware.csp_with_connect_src(middleware.default_csp, [
+///   "https://localhost:4433",
+/// ])
+/// // Ok("default-src 'self'; ...; connect-src 'self' https://localhost:4433; ...")
+/// ```
+///
+/// A policy without `connect-src` governs connections with `default-src`,
+/// so the new directive starts from the `default-src` sources rather than
+/// narrowing to `sources` alone. `'none'` is dropped from the starting
+/// sources: next to another source it means nothing. A source already
+/// present is not repeated, and every other directive is kept in its place.
+///
+/// Errors, with the reason logged, when `sources` is empty or one of them is
+/// not a single CSP source expression (empty, whitespace, `;`, `,`, a
+/// non-printable or non-ASCII character, or `'none'`); when `policy` holds a
+/// `,` (more than one policy), a non-printable or non-ASCII character, or
+/// the same directive twice (browsers enforce only the first); and when it
+/// has neither `connect-src` nor `default-src`, so connections are already
+/// unrestricted.
+///
+/// Reference: CSP Level 3, "Parse a serialized CSP", the
+/// `serialized-source-list` grammar, and "Get the effective directive for
+/// request" (`default-src` governs a missing `connect-src`).
+pub fn csp_with_connect_src(
+  policy: String,
+  sources: List(String),
+) -> Result(String, String) {
+  let built = {
+    use Nil <- result.try(check_csp_sources(sources))
+    use directives <- result.try(parse_csp_policy(policy))
+    use start <- result.try(connect_src_start(directives))
+    let values =
+      list.fold(sources, start, fn(values, source) {
+        case list.contains(values, source) {
+          True -> values
+          False -> list.append(values, [source])
+        }
+      })
+    Ok(render_csp(set_connect_src(directives, values)))
+  }
+  case built {
+    Ok(widened) -> {
+      log.info(
+        "brazier.middleware",
+        "CSP connect-src widened with " <> string.join(sources, " "),
+      )
+      Ok(widened)
+    }
+    Error(reason) -> {
+      log.error("brazier.middleware", "csp_with_connect_src: " <> reason)
+      Error(reason)
+    }
+  }
+}
+
+/// One directive of a parsed policy: its lowercased name and its tokens.
+type CspDirective {
+  CspDirective(name: String, values: List(String))
+}
+
+fn check_csp_sources(sources: List(String)) -> Result(Nil, String) {
+  case sources {
+    [] -> Error("no connect-src sources to add")
+    _ ->
+      list.try_each(sources, fn(source) {
+        case source != "" && is_source_expression(source) {
+          True ->
+            case ascii.lowercase(source) == "'none'" {
+              True -> Error("'none' cannot be added to connect-src")
+              False -> Ok(Nil)
+            }
+          False ->
+            Error(
+              "not a single CSP source expression: " <> string.inspect(source),
+            )
+        }
+      })
+  }
+}
+
+/// Printable ASCII without `;` (ends a directive) or `,` (ends a policy):
+/// `serialized-source-list` tokens are separated by ASCII whitespace.
+fn is_source_expression(source: String) -> Bool {
+  string.to_utf_codepoints(source)
+  |> list.all(fn(codepoint) {
+    let code = string.utf_codepoint_to_int(codepoint)
+    code > 0x20 && code < 0x7f && code != 0x3b && code != 0x2c
+  })
+}
+
+fn parse_csp_policy(policy: String) -> Result(List(CspDirective), String) {
+  use Nil <- result.try(check_csp_policy_characters(policy))
+  policy
+  |> string.split(";")
+  |> list.map(fn(directive) {
+    string.replace(directive, "\t", " ")
+    |> string.split(" ")
+    |> list.filter(fn(token) { token != "" })
+  })
+  |> list.try_fold([], fn(directives, tokens) {
+    case tokens {
+      [] -> Ok(directives)
+      [name, ..values] -> {
+        let name = ascii.lowercase(name)
+        case
+          list.any(directives, fn(seen: CspDirective) { seen.name == name })
+        {
+          True -> Error("the policy repeats the directive " <> name)
+          False -> Ok(list.append(directives, [CspDirective(name, values)]))
+        }
+      }
+    }
+  })
+}
+
+/// Printable ASCII and tab, with no `,`: a comma separates two policies in
+/// one header value, and a control character cannot be in a header.
+fn check_csp_policy_characters(policy: String) -> Result(Nil, String) {
+  let valid =
+    string.to_utf_codepoints(policy)
+    |> list.all(fn(codepoint) {
+      let code = string.utf_codepoint_to_int(codepoint)
+      { code == 0x09 || { code >= 0x20 && code < 0x7f } } && code != 0x2c
+    })
+  case valid {
+    True -> Ok(Nil)
+    False ->
+      Error(
+        "the policy is not one CSP policy of printable ASCII: "
+        <> string.inspect(policy),
+      )
+  }
+}
+
+fn connect_src_start(
+  directives: List(CspDirective),
+) -> Result(List(String), String) {
+  let find = fn(name) {
+    list.find(directives, fn(directive: CspDirective) { directive.name == name })
+  }
+  case find("connect-src"), find("default-src") {
+    Ok(directive), _ | Error(Nil), Ok(directive) ->
+      Ok(
+        list.filter(directive.values, fn(value) {
+          ascii.lowercase(value) != "'none'"
+        }),
+      )
+    Error(Nil), Error(Nil) ->
+      Error(
+        "the policy has neither connect-src nor default-src, so connections are already unrestricted",
+      )
+  }
+}
+
+fn set_connect_src(
+  directives: List(CspDirective),
+  values: List(String),
+) -> List(CspDirective) {
+  case
+    list.any(directives, fn(directive: CspDirective) {
+      directive.name == "connect-src"
+    })
+  {
+    True ->
+      list.map(directives, fn(directive) {
+        case directive.name == "connect-src" {
+          True -> CspDirective("connect-src", values)
+          False -> directive
+        }
+      })
+    False -> list.append(directives, [CspDirective("connect-src", values)])
+  }
+}
+
+fn render_csp(directives: List(CspDirective)) -> String {
+  directives
+  |> list.map(fn(directive) {
+    string.join([directive.name, ..directive.values], " ")
+  })
+  |> string.join("; ")
 }
 
 /// HTTP Strict Transport Security. Add this when the app is served over
