@@ -99,7 +99,7 @@ pub fn build(
     app_manifest(project),
     packages,
   ))
-  use Nil <- result.try(program.gleam_build(dir))
+  use Nil <- result.try(compile(dir, user_modules(analysis)))
   use Nil <- result.try(files.write(files.join(dir, "bundle_entry.mjs"), entry))
   use Nil <- result.try(program.esbuild_bundle(
     dir,
@@ -139,6 +139,69 @@ pub fn publish(static: String, contents: String) -> Result(Bundle, String) {
       <> files.join(static, manifest_file),
   )
   Ok(Bundle(filename:, path:))
+}
+
+/// Compile the client project at `dir` with `gleam build`.
+///
+/// `user_modules` are the module paths holding the app's own reached
+/// definitions, sliced unchanged from its sources. A warning in one of them
+/// is the app's, as the server's `gleam build` of the same source is: it is
+/// logged and does not fail the build, so an unused variable in a view does
+/// not stop a bundle that Gleam itself would build.
+///
+/// Every other file is one Brazier writes: the copied and sliced Brazier
+/// modules, the `brazier/log` shim, the generated entry and `gleam.toml`.
+/// These must compile on JavaScript without a warning, so a warning in one,
+/// or a warning naming no file, fails the build, naming each file and
+/// warning. `--warnings-as-errors` is not used because it would refuse the
+/// app's own warnings too.
+pub fn compile(dir: String, user_modules: List(String)) -> Result(Nil, String) {
+  use warnings <- result.try(program.gleam_build(dir))
+  case brazier_warnings(warnings, user_modules) {
+    [] -> Ok(Nil)
+    refused -> {
+      let reason =
+        "`gleam build` in "
+        <> dir
+        <> " warned in files Brazier writes, which must compile without warnings. This is a Brazier bug; the bundle was not written:\n"
+        <> string.join(
+          list.map(refused, fn(w) { "- " <> program.describe_warning(w) }),
+          "\n",
+        )
+      log.error("brazier.build.client_bundle", reason)
+      Error(reason)
+    }
+  }
+}
+
+/// The warnings that do not point into one of `user_modules` (module
+/// paths): those whose file does not end with `/src/<module>.gleam`, and
+/// those naming no file. The compiler prints absolute paths; matching the
+/// end does not depend on how the project's directory is spelled.
+pub fn brazier_warnings(
+  warnings: List(program.Warning),
+  user_modules: List(String),
+) -> List(program.Warning) {
+  list.filter(warnings, fn(warning) {
+    case program.warning_file(warning) {
+      option.Some(file) ->
+        !list.any(user_modules, fn(module) {
+          string.ends_with(file, "/" <> module_file(module))
+        })
+      option.None -> True
+    }
+  })
+}
+
+/// The module paths of the app modules in the client project: the emitted
+/// modules that are not Brazier's.
+fn user_modules(analysis: Analysis) -> List(String) {
+  list.filter_map(analysis.client, fn(emitted) {
+    case reach.is_framework_module(emitted.path) {
+      True -> Error(Nil)
+      False -> Ok(emitted.path)
+    }
+  })
 }
 
 /// The esbuild entry: starts the runtime with the generated entry module.

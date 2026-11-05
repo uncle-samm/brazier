@@ -5,6 +5,7 @@ import brazier/build/discovery
 import brazier/build/program
 import brazier/build/sources
 import gleam/list
+import gleam/option.{None, Some}
 import gleam/string
 import simplifile
 
@@ -152,10 +153,24 @@ pub fn program_warnings_reads_headlines_and_locations_test() {
     <> "   Compiled in 0.10s\n"
     <> "warning: Unused variable"
   let assert [
-    "Unused value at /p/src/app.gleam:3:3",
-    "Deprecated value used",
-    "Unused variable",
+    program.Warning("Unused value", Some("/p/src/app.gleam:3:3")) as located,
+    program.Warning("Deprecated value used", None) as unlocated,
+    program.Warning("Unused variable", None),
   ] = program.warnings(output)
+  let assert "Unused value at /p/src/app.gleam:3:3" =
+    program.describe_warning(located)
+  let assert "Deprecated value used" = program.describe_warning(unlocated)
+}
+
+pub fn program_warning_file_drops_line_and_column_test() {
+  let at = fn(location) { program.warning_file(program.Warning("w", location)) }
+  let assert Some("/p/src/app.gleam") = at(Some("/p/src/app.gleam:3:3"))
+  // A colon in a directory name is part of the file.
+  let assert Some("/p:q/src/app.gleam") = at(Some("/p:q/src/app.gleam:10:1"))
+  // A location without `:line:column` is all file.
+  let assert Some("/p/src/app.gleam") = at(Some("/p/src/app.gleam"))
+  let assert Some("/p/src/app.gleam:x:1") = at(Some("/p/src/app.gleam:x:1"))
+  let assert None = at(None)
 }
 
 pub fn program_warnings_of_a_clean_build_is_empty_test() {
@@ -182,10 +197,14 @@ pub fn program_warnings_reads_a_real_gleam_build_test() {
       "pub fn main() { 1 }\n\nfn unused() { 2 }\n",
     )
   let assert Ok(output) = program.run(dir, "gleam", ["build"])
-  let assert [warning] = program.warnings(output)
-  let assert True = string.starts_with(warning, "Unused private function at ")
-  let assert True = string.ends_with(warning, "src/warned.gleam:3:1")
-  let assert Ok(Nil) = program.gleam_build(dir)
+  let assert [program.Warning("Unused private function", Some(location))] =
+    program.warnings(output)
+  let assert True = string.ends_with(location, "src/warned.gleam:3:1")
+  // `gleam build` does not recompile an unchanged module, so it no longer
+  // warns; remove the build to see the warning again.
+  let assert Ok(Nil) = simplifile.delete(dir <> "/build")
+  let assert Ok([program.Warning("Unused private function", Some(_))]) =
+    program.gleam_build(dir)
   let assert Ok(Nil) = simplifile.delete(dir)
 }
 

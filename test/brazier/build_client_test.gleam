@@ -1,13 +1,15 @@
 /// Tests for the client-side build pieces: the generated `brazier/log` shim,
-/// app module discovery, bundle publishing, and the framework FFI files the
-/// client project gets.
+/// app module discovery, bundle publishing, the framework FFI files the
+/// client project gets, and the warnings its compile refuses.
 import brazier/build/client_bundle
 import brazier/build/client_shim
 import brazier/build/discovery
+import brazier/build/program
 import brazier/build/sources
 import glance
 import gleam/dict
 import gleam/list
+import gleam/option.{None, Some}
 import gleam/set
 import gleam/string
 import simplifile
@@ -321,4 +323,76 @@ pub fn framework_ffi_files_without_externals_is_empty_test() {
     client_bundle.framework_ffi_files(".", [
       #("brazier/plain", "pub fn id(x) { x }\n"),
     ])
+}
+
+// --- Client project warnings ---
+
+/// A JavaScript project like the client project: an app module whose view
+/// ignores an argument and a generated entry. With `brazier_warnings`, the
+/// entry has an unused private function and a Brazier module has an Int
+/// JavaScript cannot represent, a warning only the JavaScript target raises.
+fn warning_project(name: String, brazier_warnings: Bool) -> String {
+  let dir = fresh_dir(name)
+  write(
+    dir,
+    "gleam.toml",
+    "name = \"warned_client\"\nversion = \"1.0.0\"\ntarget = \"javascript\"\n",
+  )
+  write(dir, "src/app/view.gleam", "pub fn view(model) { 1 }\n")
+  case brazier_warnings {
+    True -> {
+      write(
+        dir,
+        "src/brazier_app_entry.gleam",
+        "pub fn main() { 1 }\n\nfn unused() { 2 }\n",
+      )
+      write(dir, "src/brazier/big.gleam", "pub fn big() { 9007199254740993 }\n")
+    }
+    False -> write(dir, "src/brazier_app_entry.gleam", "pub fn main() { 1 }\n")
+  }
+  dir
+}
+
+pub fn compile_leaves_an_app_modules_warning_to_the_app_test() {
+  let dir = warning_project("compile_app_warning", False)
+  let assert Ok(Nil) = client_bundle.compile(dir, ["app/view"])
+}
+
+pub fn compile_refuses_a_warning_in_a_file_brazier_writes_test() {
+  let dir = warning_project("compile_brazier_warning", True)
+  let assert Error(reason) = client_bundle.compile(dir, ["app/view"])
+  let assert True = string.contains(reason, "`gleam build` in " <> dir)
+  let assert True = string.contains(reason, "This is a Brazier bug")
+  let assert True =
+    string.contains(reason, "- Unused private function at /")
+    && string.contains(reason, "/src/brazier_app_entry.gleam:3:1")
+  let assert True =
+    string.contains(
+      reason,
+      "- Int is outside JavaScript's safe integer range at /",
+    )
+    && string.contains(reason, "/src/brazier/big.gleam:1:16")
+  // The app's own warning is not among the refused ones.
+  let assert False = string.contains(reason, "app/view.gleam")
+  let assert False = string.contains(reason, "Unused function argument")
+}
+
+pub fn brazier_warnings_keeps_only_warnings_outside_app_modules_test() {
+  let warning = fn(location) { program.Warning("w", location) }
+  let app = warning(Some("/p/build/brazier_client_app/src/app/view.gleam:1:10"))
+  let entry =
+    warning(Some("/p/build/brazier_client_app/src/brazier_app_entry.gleam:3:1"))
+  // A Brazier module whose file name matches an app module's.
+  let brazier_view =
+    warning(Some("/p/build/brazier_client_app/src/brazier/view.gleam:2:1"))
+  // A warning naming no file cannot be the app's.
+  let unlocated = warning(None)
+  let assert [] = client_bundle.brazier_warnings([app], ["app/view"])
+  let assert True =
+    client_bundle.brazier_warnings([app, entry, brazier_view, unlocated], [
+      "app/view", "view",
+    ])
+    == [entry, brazier_view, unlocated]
+  // With no app modules, every warning is Brazier's.
+  let assert [_] = client_bundle.brazier_warnings([app], [])
 }

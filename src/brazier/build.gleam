@@ -218,8 +218,9 @@ fn compile(
   project_name: String,
   codec_path: String,
 ) -> Result(Nil, String) {
+  // The app's own warnings never fail its build: `gleam_build` logged each.
   case program.gleam_build(project) {
-    Ok(Nil) -> Ok(Nil)
+    Ok(_warnings) -> Ok(Nil)
     Error(reason) -> {
       use Nil <- result.try(remove_codec(project, project_name, codec_path))
       Error(

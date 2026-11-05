@@ -231,7 +231,9 @@ app project:
    reached definitions (sliced out of their files, with imports regenerated),
    the Brazier client modules, a JavaScript `brazier/log`, the runtime and
    `brazier_app_entry.gleam`, with packages pinned to `manifest.toml`. Compile
-   it, bundle it with the pinned esbuild, and write
+   it: a warning in a file Brazier writes fails the build, naming the file
+   and the warning, while a warning in the app's own reached code is logged,
+   as the server compile logs it. Bundle it with the pinned esbuild, and write
    `priv/static/brazier_client_<hash>.js` and the manifest. A failure deletes
    the manifest, so `brazier.start` refuses stale artifacts. The `<hash>` is
    the build id the client sends in `join`, so a running server closes a
