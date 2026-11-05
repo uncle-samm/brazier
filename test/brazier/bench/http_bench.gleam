@@ -499,6 +499,7 @@ fn ssr_scenario(page: #(Int, Int)) -> Result(List(Metric), String) {
       dev_mode: False,
       recovery_encoder: None,
       stream_limits: stream_window.default_limits(),
+      stream_names: [],
     )
   let listener =
     transport.TransportConfig(

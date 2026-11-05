@@ -61,6 +61,7 @@ fn test_config() -> ssr.SsrConfig(TestModel, TestMsg) {
     dev_mode: False,
     recovery_encoder: option.None,
     stream_limits: stream_window.default_limits(),
+    stream_names: [],
   )
 }
 

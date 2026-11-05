@@ -18,6 +18,7 @@
 /// frees them after (`Phoenix.LiveView.stream/4`, `LiveStream`).
 import brazier/effect.{type Effect}
 import brazier/internal/render
+import brazier/internal/stream_op.{type Op}
 import brazier/internal/stream_window.{type Delta, type Limits, type Windows}
 import brazier/log
 import gleam/dict.{type Dict}
@@ -26,6 +27,7 @@ import gleam/int
 import gleam/json
 import gleam/list
 import gleam/result
+import gleam/set.{type Set}
 import gleam/string
 
 /// Windows for one dead render: they keep their items.
@@ -36,13 +38,21 @@ pub fn new() -> Windows {
 /// Take the stream ops out of `effect` and apply them to `windows` as one
 /// update. Returns the windows after it and the effect without its ops.
 ///
-/// A refused op is logged at error and not applied; an update over a
-/// per-update bound is logged at error and none of its ops is applied, as
-/// the runtime does. A delete of a key not in its window is logged at
-/// warning. `stage` and `path` name the update in the logs.
+/// An op on a name not in `names` (the build's declared streams) is refused
+/// with the runtime's reason, `unknown_stream`, and logged at error, one
+/// line per stream; the others go through the runtime's bounds. A refused
+/// op is logged at error and not applied; an update over a per-update bound
+/// is logged at error and none of its ops is applied, as the runtime does.
+/// A delete of a key not in its window is logged at warning. `stage` and
+/// `path` name the update in the logs.
+///
+/// No `[brazier, stream, refused]` event is emitted here: the connected
+/// mount runs the same `init` again and the runtime emits it then, so the
+/// dead render would count every refusal twice.
 pub fn apply(
   windows: Windows,
   effect: Effect(msg),
+  names: Set(String),
   limits: Limits,
   stage: String,
   path: String,
@@ -51,56 +61,97 @@ pub fn apply(
   case ops {
     [] -> #(windows, rest)
     _ -> {
-      let context = " (" <> stage <> ", dead render of " <> path <> ")"
-      case stream_window.apply_update(windows, ops, limits) {
-        Error(refusal) -> {
-          log.error(
-            "brazier.ssr",
-            "Refused every stream op"
-              <> context
-              <> ": "
-              <> stream_window.describe_update_refusal(refusal),
-          )
-          #(windows, rest)
-        }
-        Ok(applied) -> {
-          list.each(applied.refused, fn(refusal) {
-            log.error(
-              "brazier.ssr",
-              "Refused stream op "
-                <> int.to_string(refusal.index)
-                <> " on stream "
-                <> refusal.stream
-                <> context
-                <> ": "
-                <> stream_window.describe_op_reason(refusal.reason),
-            )
-          })
-          list.each(applied.unknown_deletes, fn(unknown) {
-            log.warning(
-              "brazier.ssr",
-              "Stream op "
-                <> int.to_string(unknown.index)
-                <> " deletes key "
-                <> unknown.key
-                <> ", which stream "
-                <> unknown.stream
-                <> " does not hold"
-                <> context,
-            )
-          })
-          log.debug(
-            "brazier.ssr",
-            "Applied "
-              <> int.to_string(list.length(ops) - list.length(applied.refused))
-              <> " of "
-              <> int.to_string(list.length(ops))
-              <> " stream op(s)"
-              <> context,
-          )
-          #(applied.windows, rest)
-        }
+      let update = stage <> ", dead render of " <> path
+      let #(known, unknown) =
+        list.partition(ops, fn(op) { set.contains(names, op.name) })
+      refuse_unknown(unknown, update)
+      case known {
+        [] -> #(windows, rest)
+        _ -> #(apply_known(windows, known, limits, " (" <> update <> ")"), rest)
       }
+    }
+  }
+}
+
+/// Log the ops on names the build did not declare, one line per stream, in
+/// the order of each stream's first op.
+fn refuse_unknown(unknown: List(Op), update: String) -> Nil {
+  let counts =
+    list.fold(unknown, [], fn(counts, op) {
+      case list.key_find(counts, op.name) {
+        Ok(count) -> list.key_set(counts, op.name, count + 1)
+        Error(Nil) -> list.append(counts, [#(op.name, 1)])
+      }
+    })
+  list.each(counts, fn(entry) {
+    let #(name, count) = entry
+    log.error(
+      "brazier.ssr",
+      "Refused "
+        <> int.to_string(count)
+        <> " stream op(s) on stream "
+        <> name
+        <> " (unknown_stream, "
+        <> update
+        <> "): the build declared no stream with this name",
+    )
+  })
+}
+
+/// Apply `ops`, all on declared streams, as one update.
+fn apply_known(
+  windows: Windows,
+  ops: List(Op),
+  limits: Limits,
+  context: String,
+) -> Windows {
+  case stream_window.apply_update(windows, ops, limits) {
+    Error(refusal) -> {
+      log.error(
+        "brazier.ssr",
+        "Refused every stream op"
+          <> context
+          <> ": "
+          <> stream_window.describe_update_refusal(refusal),
+      )
+      windows
+    }
+    Ok(applied) -> {
+      list.each(applied.refused, fn(refusal) {
+        log.error(
+          "brazier.ssr",
+          "Refused stream op "
+            <> int.to_string(refusal.index)
+            <> " on stream "
+            <> refusal.stream
+            <> context
+            <> ": "
+            <> stream_window.describe_op_reason(refusal.reason),
+        )
+      })
+      list.each(applied.unknown_deletes, fn(unknown) {
+        log.warning(
+          "brazier.ssr",
+          "Stream op "
+            <> int.to_string(unknown.index)
+            <> " deletes key "
+            <> unknown.key
+            <> ", which stream "
+            <> unknown.stream
+            <> " does not hold"
+            <> context,
+        )
+      })
+      log.debug(
+        "brazier.ssr",
+        "Applied "
+          <> int.to_string(list.length(ops) - list.length(applied.refused))
+          <> " of "
+          <> int.to_string(list.length(ops))
+          <> " stream op(s)"
+          <> context,
+      )
+      applied.windows
     }
   }
 }

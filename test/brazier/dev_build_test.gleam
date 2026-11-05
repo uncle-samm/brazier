@@ -163,6 +163,7 @@ fn ssr_config() -> ssr.SsrConfig(Model, Nil) {
     dev_mode: True,
     recovery_encoder: None,
     stream_limits: stream_window.default_limits(),
+    stream_names: [],
   )
 }
 

@@ -758,6 +758,7 @@ fn transport_config(
         None -> None
       },
       stream_limits: transport.stream_limits(config.security_limits),
+      stream_names: config.stream_names,
     )
   // Every page is rendered for its request: init reads the request's URL,
   // cookies and session through the Context.
