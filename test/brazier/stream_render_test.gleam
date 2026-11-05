@@ -170,15 +170,63 @@ pub fn a_void_container_crashes_test() {
   let assert Error(#("error", _)) = rescue(fn() { element.to_string(view) })
 }
 
-pub fn a_container_setting_data_brazier_stream_crashes_test() {
-  let view =
-    stream.render(
-      log(),
-      "ol",
-      [attribute.attribute("data-brazier-stream", "x")],
-      render_line,
+pub fn the_stream_attribute_is_refused_when_built_test() {
+  // Only the render of a stream sets the attribute that marks its
+  // container, so a view cannot build it, in any case.
+  let assert Error(#("error", _)) =
+    rescue(fn() { attribute.attribute("data-brazier-stream", "x") })
+  let assert Error(#("error", _)) =
+    rescue(fn() { attribute.attribute("Data-Brazier-Stream", "x") })
+  let assert Error(#("error", _)) =
+    rescue(fn() { attribute.data("brazier-stream", "x") })
+  let assert False = render.is_valid_attribute_name("DATA-BRAZIER-STREAM")
+  let assert True = render.is_valid_attribute_name("data-brazier-streams")
+  let assert True = render.is_valid_attribute_name("data-brazier-stream-x")
+}
+
+pub fn the_stream_attribute_on_a_plain_element_crashes_the_render_test() {
+  // A tree built with the internal constructors bypasses
+  // `attribute.attribute`; the render refuses the attribute again, so the
+  // client never patches an element that is not a stream's container.
+  let plain =
+    render.Element("div", [render.Attribute("data-brazier-stream", "log")], [])
+  let assert Error(#("error", _)) = rescue(fn() { render.render(plain) })
+  let shouting =
+    render.Element("div", [render.Attribute("DATA-BRAZIER-STREAM", "log")], [])
+  let assert Error(#("error", _)) = rescue(fn() { render.render(shouting) })
+}
+
+pub fn the_stream_attribute_on_a_container_crashes_the_render_test() {
+  let assert render.Stream(name:, limit:, tag:, item:, item_ref:, ..) =
+    element.to_node(stream.render(log(), "ol", [], render_line))
+  let doubled =
+    render.Stream(
+      name:,
+      limit:,
+      tag:,
+      attributes: [render.Attribute("data-brazier-stream", "other")],
+      item:,
+      item_ref:,
     )
-  let assert Error(#("error", _)) = rescue(fn() { element.to_string(view) })
+  let assert Error(#("error", _)) = rescue(fn() { render.render(doubled) })
+}
+
+pub fn the_stream_attribute_in_an_item_is_refused_test() {
+  let container = the_container(stream.render(log(), "ol", [], render_line))
+  let marked =
+    render.Container(..container, item: fn(_value) {
+      Ok(
+        render.Element("li", [], [
+          render.Element(
+            "ol",
+            [render.Attribute("data-brazier-stream", "log")],
+            [],
+          ),
+        ]),
+      )
+    })
+  let assert Error(#("error", _)) =
+    rescue(fn() { render.render_item(marked, "k", item(Line(1, "a"))) })
 }
 
 pub fn a_bad_container_tag_crashes_test() {

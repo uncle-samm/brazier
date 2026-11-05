@@ -382,7 +382,7 @@ fn walk(
       Walk(..acc, html: string_tree.append(acc.html, escape_html(content)))
     Keyed(key, child) -> walk(add_key(child, key), id, mode, acc)
     Element(tag, attributes, children) -> {
-      let acc = open_tag(acc, tag, attributes, id)
+      let acc = open_tag(acc, tag, [], attributes, id)
       case is_void_element(tag) {
         True -> acc
         False -> {
@@ -409,10 +409,8 @@ fn walk(
           // the container must be able to hold children.
           let assert False = is_void_element(tag)
             as "brazier/internal/render: a stream's container cannot be a void element"
-          // Invariant: the stream sets data-brazier-stream itself; the
-          // client finds the container by it.
-          let assert False = has_attribute(attributes, "data-brazier-stream")
-            as "brazier/internal/render: a stream's container sets data-brazier-stream itself"
+          // The stream sets `stream_attribute` itself; the name policy
+          // refuses it in `attributes` (`collect_attributes`).
           // Invariant: the client keeps one store per stream and patches its
           // one container (docs/design/STREAMS.md 5.3).
           let assert False =
@@ -421,12 +419,7 @@ fn walk(
           let container =
             Container(name: name, limit: limit, item: item, item_ref: item_ref)
           let acc =
-            open_tag(
-              acc,
-              tag,
-              [Attribute("data-brazier-stream", name), ..attributes],
-              id,
-            )
+            open_tag(acc, tag, [#(stream_attribute, name)], attributes, id)
           let acc = Walk(..acc, containers: [container, ..acc.containers])
           let acc = case fill(container) {
             Ok(inner) -> Walk(..acc, html: string_tree.append(acc.html, inner))
@@ -438,10 +431,14 @@ fn walk(
   }
 }
 
-/// Append `<tag attributes>` and record the element's handlers under `id`.
+/// Append `<tag own attributes>` and record the element's handlers under
+/// `id`. `own` are the attributes the renderer sets itself, which the name
+/// policy refuses in `attributes` (a stream container's
+/// `stream_attribute`).
 fn open_tag(
   acc: Walk(msg),
   tag: String,
+  own: List(#(String, String)),
   attributes: List(Attr(msg)),
   id: String,
 ) -> Walk(msg) {
@@ -461,6 +458,7 @@ fn open_tag(
     acc.html
     |> string_tree.append("<")
     |> string_tree.append(tag)
+    |> append_plain(own)
     |> append_plain(plain)
     |> append_events(events, id)
     |> string_tree.append(">")
@@ -539,7 +537,7 @@ fn collect_attributes(
           // built directly is checked again here: an inline event handler,
           // `srcdoc` or an animation of `href` is a bug in the view.
           let assert True = is_allowed_attribute(name, value)
-            as "brazier/internal/render: attribute refused by the name policy (on*, srcdoc, attributeName=href, or characters outside a-z A-Z 0-9 - _ : .)"
+            as "brazier/internal/render: attribute refused by the name policy (on*, srcdoc, data-brazier-stream, attributeName=href, or characters outside a-z A-Z 0-9 - _ : .)"
           case checked_value(name, value) {
             Error(Nil) -> acc
             Ok(value) -> #(merge_plain(plain, name, value), events)
@@ -659,12 +657,21 @@ fn append_events(
 ///   `brazier/event`;
 /// - `srcdoc`, whose value is a whole HTML document that runs with the
 ///   page's origin unless the iframe is sandboxed. Use
-///   `attribute.unsafe_srcdoc`.
+///   `attribute.unsafe_srcdoc`;
+/// - `stream_attribute` (`data-brazier-stream`), which only a stream's
+///   container carries.
 pub fn is_valid_attribute_name(name: String) -> Bool {
   is_markup_name(name) && !is_refused_name(string.lowercase(name))
 }
 
-/// Whether attribute `name` may carry `value`: the name is valid, and the
+/// The attribute that marks a stream's container. Only the render of a
+/// `Stream` node sets it: the client applies a stream's ops to the element
+/// that carries it, so the name policy refuses it, in any case, on every
+/// attribute a view builds (docs/design/STREAMS.md 7.5).
+pub const stream_attribute = "data-brazier-stream"
+
+/// Whether attribute `name` may carry `value`: the name is valid
+/// (`is_valid_attribute_name`), and the
 /// attribute is not an SVG animation target of `href` or `xlink:href`. An
 /// `<animate>` or `<set>` with `attributeName="href"` rewrites a link's URL
 /// in the browser after the URL policy has checked it, so any
@@ -686,7 +693,9 @@ pub fn is_allowed_attribute(name: String, value: String) -> Bool {
 
 /// `lower` is an ASCII-only lowercase name.
 fn is_refused_name(lower: String) -> Bool {
-  string.starts_with(lower, "on") || lower == "srcdoc"
+  string.starts_with(lower, "on")
+  || lower == "srcdoc"
+  || lower == stream_attribute
 }
 
 /// Whether `tag` is safe to render as a tag name: one or more of

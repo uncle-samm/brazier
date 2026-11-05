@@ -4,14 +4,16 @@
 //// The server render, static serving, the HTTP head and framing checks,
 //// multipart uploads and client resolution all log a path the client sent.
 //// Each must quote it (no raw newline or escape byte reaches the log) and
-//// drop its query, which can carry a token. A very long path is quoted in
-//// full: escaping covers the whole path, not a prefix of it, so a forged
-//// tail after thousands of bytes is quoted too.
+//// drop its query, which can carry a token. A very long path is cut to
+//// `log_path.max_bytes` and quoted, and the count of bytes left out
+//// follows the closing quote, so a forged tail after thousands of bytes
+//// never reaches the log, raw or quoted.
 
 import brazier/cluster/log_capture as node_log
 import brazier/effect
 import brazier/error
 import brazier/html
+import brazier/internal/log_path
 import brazier/internal/stream_window
 import brazier/ip
 import brazier/log_capture
@@ -45,6 +47,27 @@ fn long_segment() -> String {
 /// A long path that ends in the forged text, as the client sent it.
 fn long_forged_path(prefix: String) -> String {
   prefix <> long_segment() <> "/" <> forged
+}
+
+/// `path` as a log line names it: quoted, and past `log_path.max_bytes`
+/// cut there with the count of bytes left out. Written out here rather
+/// than through `log_path.describe`, so a site that quotes the whole path
+/// fails. The paths these tests cut are ASCII up to the cut, so a
+/// grapheme is a byte there.
+fn logged(path: String) -> String {
+  let size = string.byte_size(path)
+  case size > log_path.max_bytes {
+    False -> string.inspect(path)
+    True -> {
+      let kept = string.slice(path, 0, log_path.max_bytes)
+      assert string.byte_size(kept) == log_path.max_bytes
+      assert !string.contains(kept, "FORGED")
+      string.inspect(kept)
+      <> " ("
+      <> int.to_string(size - log_path.max_bytes)
+      <> " more bytes left out)"
+    }
+  }
 }
 
 pub fn static_refused_path_is_quoted_in_the_log_test() {
@@ -170,7 +193,7 @@ pub fn client_ip_resolution_quotes_the_path_test() {
 
 // --- Long paths at the sites above -------------------------------------------
 
-pub fn static_long_refused_path_is_quoted_in_full_test() {
+pub fn static_long_refused_path_is_cut_and_quoted_test() {
   let path = long_forged_path("/static/../")
   let #(result, logs) =
     log_capture.capture(fn() {
@@ -179,7 +202,7 @@ pub fn static_long_refused_path_is_quoted_in_full_test() {
   let assert Ok(resp) = result
   let assert 403 = resp.status
   assert log_capture.has(logs, level: "warning", containing: [
-    "Refused static path " <> string.inspect(path),
+    "Refused static path " <> logged(path),
   ])
   assert_not_forged(logs)
 }
@@ -192,7 +215,7 @@ pub fn static_directory_path_is_quoted_test() {
     log_capture.capture(fn() { static.serve(static_config(), path) })
   let assert Error(Nil) = result
   assert log_capture.has(logs, level: "debug", containing: [
-    "No file named by: " <> string.inspect(path),
+    "No file named by: " <> logged(path),
   ])
   assert_not_forged(logs)
 }
@@ -214,7 +237,7 @@ pub fn static_overlong_file_name_is_no_file_test() {
   assert_not_forged(logs)
 }
 
-pub fn long_body_length_refusal_quotes_the_path_in_full_test() {
+pub fn long_body_length_refusal_cuts_and_quotes_the_path_test() {
   let path = long_forged_path("/")
   let req =
     make_request(
@@ -227,7 +250,7 @@ pub fn long_body_length_refusal_quotes_the_path_in_full_test() {
     log_capture.capture(fn() { transport_http.declared_body_length(req, 100) })
   let assert Error(transport_http.FramingError(status: 400, ..)) = result
   assert log_capture.has(logs, level: "warning", containing: [
-    "Refused the declared body length on " <> string.inspect(path),
+    "Refused the declared body length on " <> logged(path),
   ])
   assert_not_forged(logs)
 }
@@ -252,7 +275,7 @@ pub fn unsupported_expectation_is_quoted_test() {
   assert_not_forged(logs)
 }
 
-pub fn long_oversized_multipart_path_is_quoted_in_full_test() {
+pub fn long_oversized_multipart_path_is_cut_and_quoted_test() {
   let path = long_forged_path("/upload/")
   let req =
     make_request(
@@ -270,12 +293,12 @@ pub fn long_oversized_multipart_path_is_quoted_in_full_test() {
     })
   let assert Error(upload.RequestTooLarge(..)) = result
   assert log_capture.has(logs, level: "warning", containing: [
-    "byte limit on " <> string.inspect(path),
+    "byte limit on " <> logged(path),
   ])
   assert_not_forged(logs)
 }
 
-pub fn long_client_ip_path_is_quoted_in_full_test() {
+pub fn long_client_ip_path_is_cut_and_quoted_test() {
   let path = long_forged_path("/")
   let req =
     make_request(<<"GET">>, path <> "?token=secret", [], loopback_socket())
@@ -283,7 +306,7 @@ pub fn long_client_ip_path_is_quoted_in_full_test() {
     log_capture.capture(fn() { client.ip(req, ip.no_trusted_proxies()) })
   let assert Ok("127.0.0.1") = result
   assert log_capture.has(logs, level: "debug", containing: [
-    "Resolving client IP for " <> string.inspect(path),
+    "Resolving client IP for " <> logged(path),
   ])
   assert_not_forged(logs)
 }
@@ -327,10 +350,10 @@ pub fn dead_render_of_an_unknown_route_quotes_the_path_test() {
     })
   assert page.status == 404
   assert log_capture.has(logs, level: "debug", containing: [
-    "Dead render for " <> string.inspect(path),
+    "Dead render for " <> logged(path),
   ])
   assert log_capture.has(logs, level: "warning", containing: [
-    "No route for " <> string.inspect(path) <> " (404)",
+    "No route for " <> logged(path) <> " (404)",
   ])
   assert_not_forged(logs)
 }
@@ -347,7 +370,7 @@ pub fn dead_render_of_a_bad_path_quotes_the_path_test() {
     })
   assert page.status == 400
   assert log_capture.has(logs, level: "warning", containing: [
-    "Refusing dead render for " <> string.inspect(path) <> " (400)",
+    "Refusing dead render for " <> logged(path) <> " (400)",
   ])
   assert_not_forged(logs)
 }
@@ -382,7 +405,7 @@ pub fn dead_render_without_a_bundle_quotes_the_path_test() {
     })
   assert page.status == 500
   assert log_capture.has(logs, level: "error", containing: [
-    "Refusing dead render for " <> string.inspect(path) <> " (500)",
+    "Refusing dead render for " <> logged(path) <> " (500)",
   ])
   assert_not_forged(logs)
 }
@@ -424,7 +447,7 @@ pub fn request_head_with_a_long_path_quotes_it_and_drops_the_query_test() {
   assert node_log.contains(
     logs,
     "debug",
-    "Read request head GET " <> string.inspect(path),
+    "Read request head GET " <> logged(path),
   )
   assert_node_not_forged(logs)
 }
@@ -470,6 +493,7 @@ fn ssr_config(
     dev_mode: False,
     recovery_encoder: None,
     stream_limits: stream_window.default_limits(),
+    stream_names: [],
   )
 }
 

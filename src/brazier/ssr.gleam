@@ -37,6 +37,7 @@ import gleam/int
 import gleam/json
 import gleam/option.{type Option, None, Some}
 import gleam/result
+import gleam/set
 import gleam/string
 import gleam/uri.{type Uri}
 import simplifile
@@ -73,6 +74,10 @@ pub type SsrConfig(state, msg) {
     /// The stream bounds the runtime applies, so the dead render keeps the
     /// same items the join will send (docs/design/STREAMS.md 7.6).
     stream_limits: stream_window.Limits,
+    /// The streams the build declared (`brazier_codec.stream_names`). An op
+    /// on any other name is refused with `unknown_stream`, as the runtime
+    /// refuses it.
+    stream_names: List(String),
   )
 }
 
@@ -190,7 +195,8 @@ pub type RenderedPage {
 /// 4. Apply the route message through `update` (effects dropped likewise).
 ///    The stream ops of `init` and of the route message are taken out of
 ///    their effects and applied, with the runtime's bounds, to windows that
-///    keep their items (docs/design/STREAMS.md 7.6).
+///    keep their items (docs/design/STREAMS.md 7.6). An op on a stream the
+///    build did not declare is refused (`unknown_stream`) and logged.
 /// 5. Render `view`, each stream container holding its items, and wrap it
 ///    in the HTML document with the script of the client bundle the server
 ///    loaded when it started (`client_bundle`); no file is read. A bundle
@@ -248,10 +254,12 @@ pub fn render_page_with_bundle(
           case config.init(ctx) {
             Error(init_error) -> render_init_error(config, init_error, path)
             Ok(#(state, init_effects)) -> {
+              let stream_names = set.from_list(config.stream_names)
               let #(windows, init_effects) =
                 stream_ssr.apply(
                   stream_ssr.new(),
                   init_effects,
+                  stream_names,
                   config.stream_limits,
                   "init",
                   path,
@@ -265,6 +273,7 @@ pub fn render_page_with_bundle(
                     stream_ssr.apply(
                       windows,
                       route_effects,
+                      stream_names,
                       config.stream_limits,
                       "route update",
                       path,

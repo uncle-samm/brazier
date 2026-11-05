@@ -155,6 +155,15 @@ pub fn bump(n: Int) -> Int {
   assert_contains(reason, "helpers.gleam:")
   assert_contains(reason, "`helpers.bump` uses `brazier/effect.")
   assert_contains(reason, "does not run in the browser")
+  // The message lists every module the check lets through: the client
+  // modules and the pruned `brazier/stream`, with its client definitions.
+  list.each(analyzer.client_modules, fn(module) {
+    assert_contains(reason, module)
+  })
+  assert_contains(
+    reason,
+    "brazier/stream (only Stream, Limit, KeepFirst, KeepLast, Position, Append, Prepend, new, name, limit, key, render)",
+  )
 }
 
 pub fn simple_update_may_use_client_modules_and_packages_test() {

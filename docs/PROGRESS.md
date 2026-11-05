@@ -761,7 +761,7 @@
     - L716–719 (16f2a52): `replicated.synced/1`; a refused merge backs off with jitter, capped at max(interval, 60 s); per-node floors keep the causal context bounded (at most 4 entries across 15 restarts); the delta_crdt_ex differences are documented.
     - L515 and L516 (c6a08fa): decided to keep OTP's behaviour and document it in the CLUSTERING.md "Netsplits" section.
   - On its branch, the cluster modules failed once in the first 10 runs (log not kept), then passed 34 runs in a row.
-  - Follow-up: the `[brazier, store, synced]` telemetry event and a `store.synced` wrapper (the agent didn't own telemetry or store.gleam).
+  - [x] Follow-up: the `[brazier, store, synced]` telemetry event and a `store.synced` wrapper (the agent didn't own telemetry or store.gleam). Done in m118-streams-build.
   - Accepted gap (documented): pg copies bindings on its own schedule, so a revocation sent before a binding arrives can miss it; the WebSocket auth re-check closes that socket later.
 - [x] m118-build (110089a, merged 2026-11-05): L267 below. All 24 examples build.
 - Decision, 2026-11-05: m118-transport's 4409 split keeps init refusals on 4000 + status, and moves the stale build to 4499. 4499 is in the reload band, so every client released since the bands existed still reloads on it. The 4600 refusal band would leave old clients reconnecting forever. `error.refuse(499, _)` becomes a programming error.
@@ -772,7 +772,7 @@
 - [x] L411: a stale verified row survives between a disconnect and the nodedown (`brazier_cluster_ffi.erl:73`). m118-cluster. Done in m118-cluster, see below.
 - [x] L412: a revocation is lost while only one side has verified the other (`brazier_session_ffi.erl:154,330`). m118-cluster. Done in m118-cluster, see below.
 - [x] L452 (SEC-11), m118-logs 7c3adc8: three sites were still real. The `uri_check` query reason held the raw query, the 417 reason didn't quote `Expect`, and an overlong static name gave a 500. The other sites were already safe. `log_forging_paths_test` has 21 tests covering every site.
-  - Follow-up: `log_path.describe` has no length cap, so a long path is logged in full (quoted, so it can't forge a line).
+  - [x] Follow-up: `log_path.describe` has no length cap, so a long path is logged in full (quoted, so it can't forge a line). Done in m118-streams-build.
 - [ ] L605: a navigation refused with an `error` frame gets no ack, so its pending scroll fires on a later ack (`runtime.gleam:1565`). After m118-lifecycle.
 - [ ] L453: the transport level is done (m118-logs 095daf6). `backpressure_isolation_test` shows that no close causes another: 6 sockets, 2 killed, 1 suspended under 1002 messages, which gets exactly one 1013. The runtime level is reproduced in `docs/design/backpressure_cascade_repro.gleam.txt`: a dead pid reads as 1000000000 queued, and a slow connection is closed again on every broadcast. Next, a dedicated agent after m118-streams-server merges builds it:
   - `message_queue_len` returns a `Result`;
@@ -815,17 +815,17 @@
   - At the merge the coordinator made the `sync_vectors.mjs` replay strict (every recorded server `patch` and `model_sync` must carry a valid `streams`), added `stream_limits` to `log_forging_paths_test`'s `SsrConfig` (that test arrived with m118-logs) and resolved one `ws_protocol_test` conflict. The rebuilt runtime bundle is unchanged (`brazier_client_f2ce9d5d8f498075.js`).
   - Verified on the merged tree: build (zero warnings), format, lint and docs pass; 2270 tests pass 3 runs in a row; `make test-client` passes (ffi harness 77 scenarios, stream vectors 42 checks). CDP passes 633 of 633 on desktop and 642 of 642 on mobile (the suite has no stream page yet; m118-client adds `examples/timeline`).
   - Follow-ups from streams-server, not fixed yet:
-    - [ ] SSR does not refuse an op on an unknown stream.
-    - [ ] A `data-brazier-stream` attribute on an element that is not a stream container is not refused.
-    - [ ] The JS-target build shows "Unused value" warnings.
-    - [ ] Item render functions from dependency modules are accepted without the named-function check.
-    - [ ] The `check_framework` message's allowlist text omits `brazier/stream`.
-    - [ ] `stream_item_type` gives `None` for an annotation it cannot resolve; it must fail loudly.
+    - [x] SSR does not refuse an op on an unknown stream. Done in m118-streams-build.
+    - [x] A `data-brazier-stream` attribute on an element that is not a stream container is not refused. Done in m118-streams-build.
+    - [x] The JS-target build shows "Unused value" warnings. Done in m118-streams-build.
+    - [x] Item render functions from dependency modules are accepted without the named-function check. Done in m118-streams-build.
+    - [x] The `check_framework` message's allowlist text omits `brazier/stream`. Done in m118-streams-build.
+    - [x] `stream_item_type` gives `None` for an annotation it cannot resolve; it must fail loudly. Done in m118-streams-build.
     - [ ] A route change on a join after the first is not sent to the joiner; check against STREAMS.md (nothing is replayed by design).
     - [ ] The connection-level `FrameTooLarge` path has no test.
     - [ ] Stream errors during init are only logged, since no connection exists yet; decide whether the first join must carry them.
     - [x] `http_fuzz_test` flaked with MailboxResidue on its branch (it still uses `await.until_telemetry`; see the residue follow-up above).
-  - Open from streams-client: a gleam test should run `stream_vectors.mjs` (today only `make test-client` does).
+  - [x] Open from streams-client: a gleam test should run `stream_vectors.mjs` (today only `make test-client` does). Done in m118-streams-build.
 - [ ] Phase B, second round (started 2026-11-05 at e747080, disjoint files):
   - m118-backpressure: L453 runtime level, L605, L607, and the streams runtime follow-ups (later joiner's route, init stream errors, the `FrameTooLarge` test);
   - m118-residue2: the `until_telemetry` residue and the last four `residue_pending` modules. Done (6bb3b1e, merged 2026-11-05):
@@ -834,7 +834,15 @@
     - `residue_pending/0` is deleted: no module is exempt;
     - 2275 tests pass 3 runs in a row and `make test-flake` passes 5 of 5 on its branch;
     - [ ] follow-up: many other `runtime_versioning_test` tests don't stop their runtimes; they pass the check, but each should stop and wait for the exit like the fixed ones.
-  - m118-streams-build: the streams build/SSR follow-ups, the `stream_vectors.mjs` gleam test, the `[brazier, store, synced]` event and `store.synced`, the `log_path.describe` cap;
+  - m118-streams-build: the streams build/SSR follow-ups, the `stream_vectors.mjs` gleam test, the `[brazier, store, synced]` event and `store.synced`, the `log_path.describe` cap. Done (5fed3d1..c97ac0d, merged 2026-11-05):
+    - SSR refuses an op on an undeclared stream (`unknown_stream`); `data-brazier-stream` is refused outside `stream.render`, in the build and the render;
+    - the build refuses item functions from dependency or Brazier modules, fails on an unresolvable item type, and its allowlist message lists `brazier/stream`;
+    - the JS "Unused value" warnings are all in dependencies (Erlang-only calls; the root package targets only Erlang), so they aren't Brazier's JS compile. Brazier's real JS compile, the generated client project, threw its warnings away; `program.gleam_build` now logs each one;
+    - a gleam test runs `stream_vectors.mjs`;
+    - `[brazier, store, synced]` fires on each out-of-sync → in-sync change (`peers` 0 when alone); `store.synced` and `store.list_synced` return `Result(Bool, SyncedError)`;
+    - `log_path.describe` keeps 256 bytes of the path, never splitting a character, and marks the cut after the closing quote;
+    - 2310 tests pass twice on its branch;
+    - [ ] follow-ups: an attribute name that isn't a literal is caught only at render, not by the build; docs/CLUSTERING.md could mention the synced event; decide whether the client project build runs with `--warnings-as-errors`; one early full run on its branch had 1 failure whose name was lost (not seen in 5 runs since; watched in the coordinator's runs).
   - m118-client: streams step 7 (`examples/timeline`, its CDP checks, benches, `docs/STREAMS.md`), L83, L606.
   Left for after them: the perf items L637–643, then the re-baseline on an idle machine.
 - Decision, 2026-11-05: 4401 stays shared by an `init` 401 and a revoked or expired session. Both mean "authentication is no longer valid; reload" to the client. The server tells them apart by a distinct cause in the close's log line and telemetry metadata. m118-logs builds it.

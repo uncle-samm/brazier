@@ -4,6 +4,7 @@
 /// commands. A non-zero exit status is an `Error` carrying the program's
 /// combined output.
 import brazier/log
+import gleam/list
 import gleam/string
 
 /// The esbuild release the client bundles are built with. Pinned so the same
@@ -35,10 +36,55 @@ pub fn run(
 }
 
 /// Run `gleam build` in `cwd`.
+///
+/// A warning does not fail the build, but it is never dropped: each one is
+/// logged at warning level, naming the project. The generated client project
+/// is the build's one JavaScript compile, so a warning only the JavaScript
+/// target raises is seen here or nowhere.
 pub fn gleam_build(cwd: String) -> Result(Nil, String) {
   case run(cwd, "gleam", ["build"]) {
-    Ok(_output) -> Ok(Nil)
+    Ok(output) -> {
+      list.each(warnings(output), fn(warning) {
+        log.warning(
+          "brazier.build.program",
+          "`gleam build` in " <> cwd <> " warned: " <> warning,
+        )
+      })
+      Ok(Nil)
+    }
     Error(reason) -> Error(reason)
+  }
+}
+
+/// The warnings in the output of `gleam build`, one entry each: the
+/// `warning: ` headline, then the source location on the line after it when
+/// the compiler gives one.
+pub fn warnings(output: String) -> List(String) {
+  collect_warnings(string.split(output, "\n"), [])
+}
+
+fn collect_warnings(lines: List(String), acc: List(String)) -> List(String) {
+  case lines {
+    [] -> list.reverse(acc)
+    [line, ..rest] ->
+      case string.starts_with(line, "warning: ") {
+        False -> collect_warnings(rest, acc)
+        True -> {
+          let headline = string.drop_start(line, string.length("warning: "))
+          case rest {
+            [next, ..after] ->
+              case string.trim_start(next) {
+                "┌─ " <> location ->
+                  collect_warnings(after, [
+                    headline <> " at " <> location,
+                    ..acc
+                  ])
+                _ -> collect_warnings(rest, [headline, ..acc])
+              }
+            [] -> collect_warnings(rest, [headline, ..acc])
+          }
+        }
+      }
   }
 }
 

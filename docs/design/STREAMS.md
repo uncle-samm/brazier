@@ -661,6 +661,13 @@ generated server codec (`brazier_codec`) and the client entry. At run time:
 - The first op on a stream fixes the window's limit. An op with another
   limit under the same name is refused with reason `limit_mismatch`.
 
+Correction (streams-build): the dead render refuses the same ops. `SsrConfig`
+carries `stream_names` (the build's list, set by `application.gleam`), and
+`stream_ssr.apply` refuses an op on a name not in it with reason
+`unknown_stream`, logged at error once per stream, before the other bounds.
+It emits no `[brazier, stream, refused]`: the connected mount runs `init`
+again and the runtime counts the refusal then.
+
 ### 7.6 SSR
 
 `ssr.gleam` runs `init` and the route message and drops their effects. It
@@ -703,6 +710,13 @@ the same element now renders its items with another function. Two
 `data-brazier-stream` like one with `data-brazier-preserve-children`
 (`attribute.ignore_updates`): it morphs the container's own attributes and
 does not descend. This is LiveView's `skipFromChildren`.
+
+Correction (streams-build): only `stream.render` sets `data-brazier-stream`.
+The attribute name policy (`render.is_refused_name`, which also refuses
+`on*` and `srcdoc`) refuses it everywhere else, in any case:
+`attribute.attribute` and `attribute.data` crash when they build it, and
+the render crashes on it, inside an item too. The build refuses it first
+when the name is a literal (section 10).
 
 After every render, and after every frame that changes a store, the
 stream applier visits each container in the table:
@@ -814,6 +828,29 @@ item types.
 - `server_codec` and `client_entry` emit the list of stream names (a new
   `stream_names` export) for the checks in 6.2 and 7.5.
 
+Correction (streams-build):
+
+- An item function from a module the build does not analyze (a
+  dependency, or a Brazier module) is a build error naming the place and
+  the function: the build cannot check that it renders one element without
+  a stream, so the app wraps it in a named function of its own.
+- The item type is resolved from the stream's annotation
+  (`brazier/build/stream_item`): `Stream(Item)` directly or through type
+  aliases in the app's modules; app types are written qualified by their
+  module, dependency and prelude types as the source names them
+  (`gleam/time/timestamp.Timestamp`). An annotation that is a `Stream`
+  whose item does not resolve (an unknown type, an unimported module, a
+  hole such as `Stream(_)`, a type variable, a wrong arity) is a build
+  error naming the stream and the annotation, not a stream without a type.
+- `attribute.attribute("data-brazier-stream", ..)` and
+  `attribute.data("brazier-stream", ..)` with a literal name (any case),
+  in any of the app's modules, server-only ones included, are a build
+  error naming the place. A name built at run time is refused by the
+  render (section 8.1).
+- `check_framework`'s list of allowed framework modules is written from
+  the same list the check uses, so it names `brazier/stream` and the names
+  the client may use from it.
+
 ## 11. Telemetry
 
 | Event | Measurements | Metadata | Emitted |
@@ -850,6 +887,10 @@ rejoin with non-empty windows, error for every refusal. The browser logs a
 | Item root that is not one element, or a stream inside an item | render | SSR crash; in the browser `render_item` returns an error, which is a stream fault (`item_render_failed`) |
 | Item that does not decode | SSR, browser | SSR crash (500); browser stream fault |
 | A malformed `streams` field | browser | Stream fault |
+| Op on an undeclared stream during the dead render (Correction (streams-build)) | SSR | Refused, `unknown_stream`, error log; the page renders without it |
+| An item function from a dependency or a Brazier module (Correction (streams-build)) | build | Build error naming the place |
+| A `Stream` annotation whose item type does not resolve (Correction (streams-build)) | build | Build error naming the stream and the annotation |
+| `data-brazier-stream` set by app code (Correction (streams-build)) | build (literal name), render (any name) | Build error naming the place; the render crashes (SSR 500) |
 
 ## 13. Testing
 

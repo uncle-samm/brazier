@@ -504,6 +504,15 @@ pub fn open_shared() -> Result(store.ListStore(String), store.OpenError) {
 - **Notifications.** Watchers on every node are notified on the store's
   topic when a change reaches their node, whether the write was local or
   remote. `append_notify` topics are announced on every node too.
+- **Knowing when it is in sync.** `store.synced(settings)`
+  (`store.list_synced` for a list store) is `Ok(True)` when every peer
+  replica last sent a digest equal to this node's, so every value written
+  anywhere before then is readable here, and `Ok(True)` with no peer. A
+  local store is `Error(store.NotReplicated(..))`, and a replica that does
+  not answer is `Error(store.ReplicaFailed(..))`. Each change into sync
+  emits `[brazier, store, synced]` (see [TELEMETRY.md](TELEMETRY.md)). The
+  rules are in
+  [CLUSTERING.md](CLUSTERING.md#knowing-when-a-replica-is-in-sync).
 
 Replication, anti-entropy, limits and failure behaviour are described in
 [CLUSTERING.md](CLUSTERING.md#replicated-stores).

@@ -120,6 +120,7 @@ fn config(
     dev_mode: False,
     recovery_encoder: None,
     stream_limits: stream_window.default_limits(),
+    stream_names: ["log"],
   )
 }
 
@@ -306,6 +307,64 @@ pub fn an_unknown_delete_is_logged_at_warning_test() {
   let assert True =
     log_capture.has(logs, level: "warning", containing: [
       "deletes key line-404, which stream log does not hold",
+    ])
+}
+
+// --- Undeclared streams ---------------------------------------------------
+
+/// A stream the build did not declare: `config` declares only `log`.
+fn ghost() -> Stream(Line) {
+  stream.new(
+    "ghost",
+    key: line_key,
+    encode: encode_line,
+    decoder: line_decoder(),
+    limit: KeepLast(2),
+  )
+}
+
+pub fn ops_on_an_undeclared_stream_are_refused_as_unknown_test() {
+  let init =
+    effect.batch([
+      stream.insert(ghost(), Line(7, "boo"), at: Append),
+      stream.insert(log(), Line(1, "one"), at: Append),
+      stream.delete_key(ghost(), "line-7"),
+    ])
+  let #(page, logs) =
+    log_capture.capture(fn() { render(config(init, no_route_effect)) })
+  // The declared stream's op still applies; the two ghost ops are one line.
+  let assert True = container_html(page) == li(1, "one")
+  let assert True =
+    log_capture.has(logs, level: "error", containing: [
+      "Refused 2 stream op(s) on stream ghost (unknown_stream, init, dead render of \"/feed\")",
+      "the build declared no stream with this name",
+    ])
+  let assert False = string.contains(page.html, "boo")
+}
+
+pub fn route_ops_on_an_undeclared_stream_are_refused_as_unknown_test() {
+  let route = fn(_page) { stream.insert(ghost(), Line(7, "boo"), at: Append) }
+  let #(page, logs) =
+    log_capture.capture(fn() { render(routed(effect.none(), route)) })
+  let assert 200 = page.status
+  let assert True =
+    log_capture.has(logs, level: "error", containing: [
+      "Refused 1 stream op(s) on stream ghost (unknown_stream, route update, dead render of \"/feed\")",
+    ])
+}
+
+pub fn a_build_without_the_stream_refuses_the_view_s_stream_test() {
+  // The view renders `log`, but the build declared no stream: its ops are
+  // refused, as the runtime refuses them, and the container stays empty.
+  let init = stream.insert(log(), Line(1, "one"), at: Append)
+  let #(page, logs) =
+    log_capture.capture(fn() {
+      render(ssr.SsrConfig(..config(init, no_route_effect), stream_names: []))
+    })
+  let assert "" = container_html(page)
+  let assert True =
+    log_capture.has(logs, level: "error", containing: [
+      "Refused 1 stream op(s) on stream log (unknown_stream, init, dead render of \"/feed\")",
     ])
 }
 

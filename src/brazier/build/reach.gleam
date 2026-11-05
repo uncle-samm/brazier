@@ -19,6 +19,7 @@
 /// project.
 import brazier/build/field_type
 import brazier/build/source_location
+import brazier/internal/render
 import glance
 import gleam/bit_array
 import gleam/dict.{type Dict}
@@ -88,7 +89,8 @@ pub type Reach {
 }
 
 /// A use of `brazier/stream.new` or `brazier/stream.render` in a user
-/// module (docs/design/STREAMS.md 10). `at` is the place, as
+/// module, or of the attribute that marks a stream's container
+/// (docs/design/STREAMS.md 10). `at` is the place, as
 /// `path.gleam:line:column`.
 pub type StreamUse {
   /// A `stream.new` call: its name argument as the literal string, or what
@@ -100,11 +102,26 @@ pub type StreamUse {
     name: Result(String, String),
   )
   /// A `stream.render` call: `Ok` when its item argument is a named
-  /// function, or what the argument is instead.
-  Rendered(at: String, item: Result(Nil, String))
+  /// function, or why it is refused.
+  Rendered(at: String, item: Result(Nil, ItemRefusal))
   /// `stream.new` or `stream.render` used as a value instead of called, so
   /// its arguments cannot be checked.
   Referenced(at: String, function: String)
+  /// A `function(name, ..)` call (`attribute.attribute` or
+  /// `attribute.data`) whose literal `name` makes `data-brazier-stream`,
+  /// in any case: the attribute that marks a stream's container, which
+  /// only `stream.render` sets.
+  ContainerAttribute(at: String, function: String, name: String)
+}
+
+/// Why the item argument of a `stream.render` call is refused.
+pub type ItemRefusal {
+  /// It is not a named top-level function: `kind` says what it is.
+  NotNamedFunction(kind: String)
+  /// `written` names a definition of `module`, which the analyzer does not
+  /// index (a dependency's, or a Brazier module's), so the build cannot
+  /// check that it is a top-level function.
+  UncheckedModule(written: String, module: String)
 }
 
 /// The Brazier module whose definitions reach the client one by one, as
@@ -132,8 +149,11 @@ pub fn is_framework_module(module_path: String) -> Bool {
 /// True for a Brazier module the analyzer indexes and the client gets
 /// pruned to the reached definitions, as a user module: `brazier/stream`.
 pub fn is_pruned_framework_module(module_path: String) -> Bool {
-  module_path == stream_module
+  list.contains(pruned_framework_modules, module_path)
 }
+
+/// Every pruned Brazier module (`is_pruned_framework_module`).
+pub const pruned_framework_modules = [stream_module]
 
 /// Index parsed modules, given as #(module path, source, AST).
 pub fn index(
@@ -705,14 +725,30 @@ fn check_framework(
               <> "`, but "
               <> module
               <> " does not run in the browser. Client code (what `view`, a `simple` app's `update` and a Local layer reach) may use only "
-              <> string.join(
-              set.to_list(ctx.allowed) |> list.sort(string.compare),
-              ", ",
-            )
+              <> describe_client_modules(ctx.allowed)
               <> " and non-Brazier packages.",
           )
       }
   }
+}
+
+/// The Brazier modules client code may use, for messages: the ones
+/// `check_framework` lets through, `allowed` and the pruned modules, from
+/// the same lists, so the text cannot drift from the check. A pruned module
+/// is listed with the definitions client code may use of it.
+fn describe_client_modules(allowed: Set(String)) -> String {
+  set.to_list(allowed)
+  |> list.append(pruned_framework_modules)
+  |> list.unique
+  |> list.sort(string.compare)
+  |> list.map(fn(module) {
+    case module == stream_module {
+      True ->
+        module <> " (only " <> string.join(stream_client_names, ", ") <> ")"
+      False -> module
+    }
+  })
+  |> string.join(", ")
 }
 
 /// `qualifier.name` where `qualifier` is an import alias.
@@ -1156,20 +1192,23 @@ fn walk_pipe(
 
 // ----- Stream uses -----
 
+/// The Brazier module whose `attribute` and `data` calls are checked for
+/// the stream container's attribute.
+const attribute_module = "brazier/attribute"
+
+/// A Brazier function whose calls the build checks.
 type StreamFunction {
   StreamNew
   StreamRender
+  /// `brazier/attribute.attribute` (`prefix` `""`) or `.data` (`prefix`
+  /// `"data-"`): a literal name that makes `render.stream_attribute` is
+  /// refused.
+  AttributeName(function: String, prefix: String)
 }
 
-fn stream_function_name(function: StreamFunction) -> String {
-  case function {
-    StreamNew -> "new"
-    StreamRender -> "render"
-  }
-}
-
-/// `stream.new` or `stream.render` when `expr` names one of them in a user
-/// module, through an unshadowed import alias or an unqualified import.
+/// `stream.new`, `stream.render`, `attribute.attribute` or `attribute.data`
+/// when `expr` names one of them in a user module, through an unshadowed
+/// import alias or an unqualified import.
 fn stream_callee(
   ctx: Ctx,
   locals: Set(String),
@@ -1186,34 +1225,33 @@ fn stream_callee(
             || dict.has_key(ctx.info.constants, name)
           {
             True -> Error(Nil)
-            False ->
-              case dict.get(ctx.info.values, name) {
-                Ok(#(module, original)) if module == stream_module ->
-                  Ok(original)
-                _ -> Error(Nil)
-              }
+            False -> dict.get(ctx.info.values, name)
           }
         glance.FieldAccess(
           container: glance.Variable(name: qualifier, ..),
           label:,
           ..,
         ) ->
-          case module_alias(ctx, locals, qualifier) {
-            Ok(module) if module == stream_module -> Ok(label)
-            _ -> Error(Nil)
-          }
+          module_alias(ctx, locals, qualifier)
+          |> result.map(fn(module) { #(module, label) })
         _ -> Error(Nil)
       }
       case named {
-        Ok("new") -> Ok(StreamNew)
-        Ok("render") -> Ok(StreamRender)
+        Ok(#(module, "new")) if module == stream_module -> Ok(StreamNew)
+        Ok(#(module, "render")) if module == stream_module -> Ok(StreamRender)
+        Ok(#(module, "attribute")) if module == attribute_module ->
+          Ok(AttributeName(function: "attribute.attribute", prefix: ""))
+        Ok(#(module, "data")) if module == attribute_module ->
+          Ok(AttributeName(function: "attribute.data", prefix: "data-"))
         _ -> Error(Nil)
       }
     }
   }
 }
 
-/// `stream.new` or `stream.render` used as a value, not called.
+/// `stream.new` or `stream.render` used as a value, not called. An
+/// attribute function used as a value is not recorded: the render refuses
+/// the container's attribute on any element (`render.stream_attribute`).
 fn record_reference(
   st: State,
   ctx: Ctx,
@@ -1221,16 +1259,13 @@ fn record_reference(
   expr: glance.Expression,
   location: glance.Span,
 ) -> State {
+  let referenced = fn(function) {
+    add_stream_use(st, Referenced(at: at(ctx, location), function:))
+  }
   case stream_callee(ctx, locals, expr) {
-    Ok(function) ->
-      add_stream_use(
-        st,
-        Referenced(
-          at: at(ctx, location),
-          function: stream_function_name(function),
-        ),
-      )
-    Error(Nil) -> st
+    Ok(StreamNew) -> referenced("new")
+    Ok(StreamRender) -> referenced("render")
+    Ok(AttributeName(..)) | Error(Nil) -> st
   }
 }
 
@@ -1268,6 +1303,18 @@ fn record_call(
           ),
         ),
       )
+    // Only a literal name is read; any other name reaches the render's
+    // name policy, which refuses the container's attribute too.
+    AttributeName(function:, prefix:) ->
+      case list.first(arguments) {
+        Ok(Some(glance.String(value: name, ..))) ->
+          case string.lowercase(prefix <> name) == render.stream_attribute {
+            True ->
+              add_stream_use(st, ContainerAttribute(at:, function:, name:))
+            False -> st
+          }
+        Ok(Some(_)) | Ok(None) | Error(Nil) -> st
+      }
   }
 }
 
@@ -1300,19 +1347,20 @@ fn stream_name_argument(
 }
 
 /// The item argument of `stream.render`: `Ok` when it names a top-level
-/// function, or what it is instead.
+/// function, or why it is refused.
 fn item_argument(
   ctx: Ctx,
   locals: Set(String),
   argument: Result(Option(glance.Expression), Nil),
-) -> Result(Nil, String) {
+) -> Result(Nil, ItemRefusal) {
+  let not_named = fn(kind) { Error(NotNamedFunction(kind)) }
   case argument {
-    Error(Nil) -> Error("missing")
-    Ok(None) -> Error("a capture hole")
+    Error(Nil) -> not_named("missing")
+    Ok(None) -> not_named("a capture hole")
     Ok(Some(glance.Variable(name:, ..))) ->
       case set.contains(locals, name), is_upper_name(name) {
-        True, _ -> Error("the local variable `" <> name <> "`")
-        False, True -> Error("the constructor `" <> name <> "`")
+        True, _ -> not_named("the local variable `" <> name <> "`")
+        False, True -> not_named("the constructor `" <> name <> "`")
         False, False ->
           case
             dict.has_key(ctx.info.functions, name),
@@ -1320,12 +1368,12 @@ fn item_argument(
             dict.get(ctx.info.values, name)
           {
             True, _, _ -> Ok(Nil)
-            False, True, _ -> Error("the constant `" <> name <> "`")
+            False, True, _ -> not_named("the constant `" <> name <> "`")
             False, False, Ok(#(module, original)) ->
               imported_item(ctx, module, original, name)
             // The compiler rejects a name that is not defined.
             False, False, Error(Nil) ->
-              Error("`" <> name <> "`, which is not defined")
+              not_named("`" <> name <> "`, which is not defined")
           }
       }
     Ok(Some(
@@ -1338,31 +1386,35 @@ fn item_argument(
       case module_alias(ctx, locals, qualifier) {
         Ok(module) ->
           imported_item(ctx, module, label, qualifier <> "." <> label)
-        Error(Nil) -> Error(describe_expression(expr))
+        Error(Nil) -> not_named(describe_expression(expr))
       }
-    Ok(Some(expr)) -> Error(describe_expression(expr))
+    Ok(Some(expr)) -> not_named(describe_expression(expr))
   }
 }
 
-/// `written` names `module.name`. A function of a module the analyzer does
-/// not index (a dependency's) is accepted: its source is not here.
+/// `written` names `module.name`. The definition is checked in `module`'s
+/// source; a module the analyzer does not index (a dependency's, or a
+/// Brazier module's) has no source here, so its definition is refused
+/// rather than accepted unchecked.
 fn imported_item(
   ctx: Ctx,
   module: String,
   name: String,
   written: String,
-) -> Result(Nil, String) {
+) -> Result(Nil, ItemRefusal) {
   case is_upper_name(name), dict.get(ctx.index, module) {
-    True, _ -> Error("the constructor `" <> written <> "`")
-    False, Error(Nil) -> Ok(Nil)
+    True, _ -> Error(NotNamedFunction("the constructor `" <> written <> "`"))
+    False, Error(Nil) -> Error(UncheckedModule(written:, module:))
     False, Ok(info) ->
       case
         dict.has_key(info.functions, name),
         dict.has_key(info.constants, name)
       {
         True, _ -> Ok(Nil)
-        False, True -> Error("the constant `" <> written <> "`")
-        False, False -> Error("`" <> written <> "`, which is not defined")
+        False, True ->
+          Error(NotNamedFunction("the constant `" <> written <> "`"))
+        False, False ->
+          Error(NotNamedFunction("`" <> written <> "`, which is not defined"))
       }
   }
 }

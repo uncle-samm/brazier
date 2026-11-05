@@ -290,6 +290,13 @@ open follow-ups), which is in progress.
 - (M118 streams) Telemetry events `[brazier, stream, delta]` and
   `[brazier, stream, refused]`, and a `stream_bytes` measurement on the
   render span's stop.
+- (M118 streams-build) `store.synced` and `store.list_synced` report
+  whether a replicated store's replica is in sync with every peer, as
+  `Result(Bool, SyncedError)`: `NotReplicated(topic)` for a local store,
+  `ReplicaFailed(WriteError)` when the replica can't answer. A
+  `[brazier, store, synced]` telemetry event (`peers`, `store`) fires each
+  time a replica comes into sync.
+- (M118 streams-build) `gleam test` runs the client stream vectors.
 - (M118 cluster) `replicated.synced/1` is true when every peer's last
   digest equals this replica's (and when there are no peers), and
   `replicated.context_size/1` reports the causal context's size.
@@ -699,6 +706,19 @@ open follow-ups), which is in progress.
   the test process was counted as the append's reductions. The cost is
   now measured in a fresh process with room for the work, and a trace
   session asserts no collection ran during it.
+- (M118 streams-build) The dead render refused nothing: an op on an
+  undeclared stream is now refused there with `unknown_stream`, as live.
+- (M118 streams-build) `data-brazier-stream` is refused outside
+  `stream.render`, by the build and by the render.
+- (M118 streams-build) The build refuses a stream item function from a
+  dependency or a Brazier module (it can't check it is named), and fails
+  when it can't resolve a stream's item type; before, it went on with no
+  type. The client allowlist message lists `brazier/stream`.
+- (M118 streams-build) The generated client project's build warnings were
+  thrown away; each is now logged at warning level with its location.
+- (M118 streams-build) A log line keeps at most 256 bytes of a page path
+  (never splitting a character) and says after the closing quote how many
+  bytes it left out.
 - (M118 residue2) `await.until_telemetry` (a test helper) left events in
   the mailbox: one that arrived after the condition held, or from an
   emitter that found the handler just before the detach. Its handler now
