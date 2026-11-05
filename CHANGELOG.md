@@ -641,6 +641,14 @@ open follow-ups), which is in progress.
   receive them.
 - (M118) The prebuilt runtime bundle in `priv/static` is rebuilt, so it
   carries the shifted-array diff.
+- (M118 residue) Creating a named ETS table crashed the caller when the
+  table owner the lookup found was gone before it was monitored (it had
+  just handed its tables over, or died). The creation now looks the owner
+  up again, within the same bounded number of attempts as a moved owner.
+- (M118 residue) `build_handshake_test`, `dev_reload_test`,
+  `ws_protocol_test` and `http_server_test` receive every message they
+  cause. Two `http_server_test` tests that flaked on a telemetry event
+  left in the mailbox now receive each event exactly.
 - (M118 logs) A static file name longer than the file system allows is a
   404 logged at debug (as in Plug.Static), not a 500 with an error log.
 - (M118 logs) A malformed forwarding hop is logged once per WebSocket

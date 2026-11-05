@@ -776,7 +776,9 @@
 - [ ] L606: a navigation without a hash doesn't scroll to the top (LiveView does). m118-transport if it fits item 8, otherwise after.
 - [ ] L607: the non-monotonic clock warning says "event clock" for navigations too. After m118-lifecycle.
 - [x] L608–609, m118-logs ef5aa61, adfbc0e and d588536: the client is resolved once per WebSocket connection (`server.Connection.resolved` and `Admission.request`), and a refused setting logs one line.
-- [ ] L190: the owner-moved DOWN race in `create_via_owner` has no test. L414: the churn test survives some mutants. After m118-tests.
+- [x] L190 and L414, m118-residue (merged 2026-11-05):
+  - L190 was a real defect: if a table's owner was gone before the monitor (`noproc`), `create_via_owner` crashed the caller. It now asks again within the bounded `Moves` (0119b7c), and `ets_owner_race_test` reproduces the race deterministically.
+  - L414: the churn test's subscribers don't trap exits, so it misses orphan rows. The new `cluster/pubsub_restart_race_test` pauses a subscriber at every point of `subscribe/1` while the partition is killed, in three modes. It kills M3–M9; M1 and M2 are equivalent mutants (6b7a6dc).
 - [x] L589 (m118-tests; the pending modules are a phase B follow-up): no check for messages a test leaves in the mailbox. m118-tests (partly).
 - [ ] Perf, before the re-baseline: L637 SSR at 1000 rows takes about 8 ms; L638 client decode and patch at 1000 rows; L639 `presence.list` copies the whole room; L640 a DOM morph bench (CDP); L642 6 atoms leak per suite run; L643 `ws.100x200` runs only 5 rounds.
 
@@ -785,7 +787,12 @@
   - m118-streams-server: STREAMS.md steps 2–5, with the `streams` field on `patch` and `model_sync`;
   - m118-streams-client: step 6;
   - m118-logs: L452, L453, L608–609, and the 4401 TODO. Done (095daf6, merged 2026-11-05): the close log lines carry the 4401 cause (6ed08e6, `close_cause_4401_test`). 2127 tests pass twice on its branch;
-  - m118-residue: the residue-pending modules, L190 and L414.
+  - m118-residue: the residue-pending modules, L190 and L414. Done (merged 2026-11-05):
+    - build_handshake, dev_reload, ws_protocol and http_server are off `residue_pending` (2987480);
+    - two http_server tests flaked 1 in 6 on residue `await.until_telemetry` left behind; they now receive each event exactly;
+    - 2095 tests pass on its branch, and `make test-flake` passes 5 of 5;
+    - still pending: runtime, runtime_telemetry, runtime_versioning and session_security;
+    - follow-up: `await.until_telemetry` can leave residue (an event emitted before it detaches), and session_security, runtime_versioning and http_fuzz still use it.
   The two streams halves merge together before CDP runs, because each breaks the suite on its own.
 - Decision, 2026-11-05: 4401 stays shared by an `init` 401 and a revoked or expired session. Both mean "authentication is no longer valid; reload" to the client. The server tells them apart by a distinct cause in the close's log line and telemetry metadata. m118-logs builds it.
 - Decision, 2026-11-05: m118-logs reproduced L453. Both problems are in the runtime's send paths:
