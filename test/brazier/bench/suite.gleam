@@ -266,6 +266,7 @@ fn runtime_config(
     secret_key: "bench-secret-key-that-is-long-enough-for-hmac",
     presence: option.None,
     title: option.None,
+    streams: runtime.no_streams(),
   )
 }
 
@@ -505,6 +506,7 @@ fn wire_scenario() -> Result(List(Metric), String) {
         ops_json: ops_json,
         version: 12_345,
         ack_clock: 12_345,
+        streams_json: "[]",
       ),
       string.byte_size(ops_json),
     ),
@@ -514,6 +516,7 @@ fn wire_scenario() -> Result(List(Metric), String) {
         model_json: model_json,
         version: 12_345,
         ack_clock: 12_345,
+        streams_json: "[]",
       ),
       string.byte_size(model_json),
     ),

@@ -118,6 +118,7 @@ fn session_config(
     secret_key: "",
     presence: Some(presence_watch.new(fast_config(), track, Online)),
     title: None,
+    streams: runtime.no_streams(),
   )
 }
 

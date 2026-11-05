@@ -39,12 +39,41 @@
 //// Each op calls the stream's `key` and `encode` when it is called, so it
 //// holds the item's key and JSON text, never the item.
 ////
-//// Not wired yet: the ops are values of type `Ops`, which `emitted` reads.
-//// The next step of Milestone 118 makes each op function return an
-//// `Effect(msg)` holding the same ops, and adds `stream.render`.
+//// Each op function returns an `Effect(msg)`. Ops compose with
+//// `effect.batch`, in order, and `effect.map` passes them through, so a
+//// child module's ops reach its parent. `effect.keyed` and
+//// `effect.cancellable` do not key them: an op is applied when its update
+//// returns. `emitted` lists the ops an effect carries, for tests.
+////
+//// `render` puts the stream in the view: a container element whose
+//// children are the stream's items, each rendered by a named top-level
+//// function of the item (docs/design/STREAMS.md 5.3):
+////
+//// ```gleam
+//// import brazier/element.{type Element}
+//// import brazier/html
+//// import brazier/stream.{type Stream}
+////
+//// pub type Line {
+////   Line(id: String, text: String)
+//// }
+////
+//// pub fn view(log: Stream(Line)) -> Element(msg) {
+////   html.main([], [stream.render(log, "ol", [], render_line)])
+//// }
+////
+//// pub fn render_line(line: Line) -> Element(msg) {
+////   html.li([], [html.text(line.text)])
+//// }
+//// ```
 
+import brazier/attribute.{type Attribute}
+import brazier/effect.{type Effect}
+import brazier/element.{type Element}
+import brazier/internal/render
 import brazier/internal/stream_op
 import gleam/dict
+import gleam/dynamic.{type Dynamic}
 import gleam/dynamic/decode
 import gleam/json
 import gleam/list
@@ -78,12 +107,6 @@ pub type Position {
   Prepend
 }
 
-/// Stream ops, in the order they are applied. The op functions return
-/// them; `emitted` lists them.
-pub opaque type Ops {
-  Ops(ops: List(stream_op.Op))
-}
-
 /// One stream op, for app unit tests: the stream's name, the item's key
 /// and its encoded JSON text.
 pub type Emitted {
@@ -97,8 +120,8 @@ pub type Emitted {
 /// Crashes, as `attribute.attribute` does for a bad name, when `name` is
 /// not 1 to 64 characters of `a-z`, `0-9` and `_` starting with a letter,
 /// or when the limit is below 1. The largest limit is a server bound
-/// (1000 by default): a stream over it has its ops refused and logged by
-/// the runtime.
+/// (`SecurityLimits.stream_max_limit`, 1000 by default): a stream over it
+/// has its ops refused and logged by the runtime.
 ///
 /// ```gleam
 /// stream.new(
@@ -144,8 +167,14 @@ pub fn key(stream: Stream(item), item: item) -> String {
 /// ```gleam
 /// stream.insert(log(), Line(id: "7", text: "done"), at: stream.Append)
 /// ```
-pub fn insert(stream: Stream(item), item: item, at position: Position) -> Ops {
-  Ops([insert_op(stream, stream.key(item), encode(stream, item), position)])
+pub fn insert(
+  stream: Stream(item),
+  item: item,
+  at position: Position,
+) -> Effect(msg) {
+  effect.from_stream_ops([
+    insert_op(stream, stream.key(item), encode(stream, item), position),
+  ])
 }
 
 /// Insert several items: `Append` keeps the list's order at the end,
@@ -161,7 +190,7 @@ pub fn insert_many(
   stream: Stream(item),
   items: List(item),
   at position: Position,
-) -> Ops {
+) -> Effect(msg) {
   let entries = unique_entries(stream, items)
   // Prepending one by one puts the last prepended first, so the list is
   // prepended from its end.
@@ -169,7 +198,7 @@ pub fn insert_many(
     Append -> entries
     Prepend -> list.reverse(entries)
   }
-  Ops(
+  effect.from_stream_ops(
     list.map(entries, fn(entry) {
       insert_op(stream, entry.0, entry.1, position)
     }),
@@ -178,13 +207,13 @@ pub fn insert_many(
 
 /// Delete the item with `item`'s key. A key not in the stream changes
 /// nothing; the runtime logs it at warning.
-pub fn delete(stream: Stream(item), item: item) -> Ops {
+pub fn delete(stream: Stream(item), item: item) -> Effect(msg) {
   delete_key(stream, stream.key(item))
 }
 
 /// Delete the item with `key` (LiveView `stream_delete_by_dom_id/3`).
-pub fn delete_key(stream: Stream(item), key: String) -> Ops {
-  Ops([
+pub fn delete_key(stream: Stream(item), key: String) -> Effect(msg) {
+  effect.from_stream_ops([
     stream_op.Op(
       name: stream.name,
       limit: to_op_limit(stream.limit),
@@ -196,8 +225,8 @@ pub fn delete_key(stream: Stream(item), key: String) -> Ops {
 /// Empty the stream, then insert `items` in order at the end.
 /// `reset(stream, [])` empties it. A key that appears twice is one item, as
 /// in `insert_many`.
-pub fn reset(stream: Stream(item), items: List(item)) -> Ops {
-  Ops([
+pub fn reset(stream: Stream(item), items: List(item)) -> Effect(msg) {
+  effect.from_stream_ops([
     stream_op.Op(
       name: stream.name,
       limit: to_op_limit(stream.limit),
@@ -206,15 +235,60 @@ pub fn reset(stream: Stream(item), items: List(item)) -> Ops {
   ])
 }
 
-/// The ops, in the order they are applied: an `insert_many` with `Prepend`
-/// lists its items from the last.
+/// The stream's container: a `tag` element holding the stream's items, in
+/// order, each rendered by `item` with its root keyed by the stream's key
+/// (LiveView's `phx-update="stream"` container).
+///
+/// `item` must be a named top-level function, not an anonymous `fn` or a
+/// capture: an item is rendered when it is inserted or updated, never
+/// again, so it can depend on the item only. Its root must be one element,
+/// not text, `element.none()`, `unsafe_raw_html` or `element.keyed`. A view
+/// renders a stream at most once and never inside another stream's item;
+/// a second render of the same stream crashes the render. The build checks
+/// the rest (docs/design/STREAMS.md 5.3).
+///
+/// ```gleam
+/// stream.render(log(), "ol", [attribute.class("log")], render_line)
+/// ```
+pub fn render(
+  stream: Stream(item),
+  tag: String,
+  attributes: List(Attribute(msg)),
+  item: fn(item) -> Element(msg),
+) -> Element(msg) {
+  let assert True = render.is_valid_tag_name(tag)
+    as "brazier/stream.render: tag names are a-z A-Z 0-9 - _ : ."
+  let decoder = stream.decoder
+  element.from_node(render.Stream(
+    name: stream.name,
+    limit: to_op_limit(stream.limit),
+    tag: tag,
+    attributes: list.map(attributes, attribute.to_attr),
+    item: fn(value: Dynamic) {
+      case decode.run(value, decoder) {
+        Ok(decoded) -> Ok(element.to_node(item(decoded)))
+        Error(errors) ->
+          Error(
+            "the stream's decoder refused the item: "
+            <> string.join(list.map(errors, describe_decode_error), "; "),
+          )
+      }
+    },
+    item_ref: render.item_ref(item),
+  ))
+}
+
+/// The stream ops an effect carries, in the order they are applied: an
+/// `insert_many` with `Prepend` lists its items from the last. The
+/// effect's other callbacks are ignored.
 ///
 /// ```gleam
 /// stream.emitted(stream.delete_key(log(), "7"))
 /// // -> [stream.Deleted(stream: "log", key: "7")]
 /// ```
-pub fn emitted(ops: Ops) -> List(Emitted) {
-  list.map(ops.ops, fn(op) {
+pub fn emitted(effect: Effect(msg)) -> List(Emitted) {
+  let #(ops, _rest) = effect.take_stream_ops(effect)
+  list.map(ops, fn(op) {
     case op.action {
       stream_op.Insert(key, json, at) ->
         Inserted(stream: op.name, key: key, json: json, at: case at {
@@ -234,12 +308,6 @@ pub fn round_trip(stream: Stream(item), item: item) -> Result(item, String) {
     Ok(decoded) -> Ok(decoded)
     Error(error) -> Error(describe_json_error(error))
   }
-}
-
-/// The ops as data, for the runtime.
-@internal
-pub fn to_ops(ops: Ops) -> List(stream_op.Op) {
-  ops.ops
 }
 
 /// A public limit as the internal one.
@@ -304,7 +372,10 @@ fn limit_count(limit: Limit) -> Int {
   }
 }
 
-fn is_valid_name(name: String) -> Bool {
+/// The rule `new` asserts, which the build checks too on every literal name
+/// (`brazier/build/analyzer`).
+@internal
+pub fn is_valid_name(name: String) -> Bool {
   case string.to_utf_codepoints(name) |> list.map(string.utf_codepoint_to_int) {
     [] -> False
     [first, ..rest] ->

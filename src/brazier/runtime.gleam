@@ -27,6 +27,27 @@
 /// app does not route (or whose encoding does not decode) is answered with
 /// a hard navigation, so the server's dead render produces the 404 or 400.
 ///
+/// ## Streams (LiveView `stream/4`, docs/design/STREAMS.md 7)
+///
+/// The stream ops an update's effects carry (`effect.take_stream_ops`) are
+/// applied to the session's windows (`brazier/internal/stream_session`)
+/// and sent in the `streams` array of that update's frame: on its patch
+/// when the model changed, otherwise on an empty patch at the current
+/// revision to every joined connection, which also acknowledges each one's
+/// events. A batch sends the ops of all its events, in order, in its one
+/// broadcast. Every patch and model_sync carries `streams`, `[]` when there
+/// is nothing.
+///
+/// Ops applied before the first join (`init`, the initial route, messages
+/// dispatched before it) are kept and sent to the first joiner as resets
+/// in its model_sync. Each connection has windows of its own, of the keys
+/// its client was sent: a later connection, and a rejoin, are sent no
+/// items (no replay), and each entry is relative to the receiving
+/// connection's window. A refused op (an undeclared stream, a limit, key or
+/// item over `SecurityLimits`) is logged at error, counted by
+/// `[brazier, stream, refused]` and sent to every joined connection as an
+/// `error` frame; the rest of the update is sent.
+///
 /// ## Presence
 ///
 /// With `presence` configured, the initialiser starts the session's
@@ -44,7 +65,9 @@
 /// event's `update` inside `[brazier, runtime, handle_event]`; a client
 /// navigation's (or a join's route change) inside `[brazier, runtime,
 /// navigate]`; every broadcast to joined connections inside `[brazier,
-/// runtime, render]`. `event` is the message's constructor name in
+/// runtime, render]`, which measures the patch's `patch_bytes` and the
+/// largest `streams` array it sent as `stream_bytes`; every stream entry
+/// sent emits `[brazier, stream, delta]`. `event` is the message's constructor name in
 /// snake_case (`SetCount(9)` is `"set_count"`), or
 /// `"unknown"` for an event or path the app does not handle, so the label
 /// set stays the app's finite set of constructors. `route` is
@@ -66,6 +89,9 @@ import brazier/internal/context.{type Context}
 import brazier/internal/local_path
 import brazier/internal/log_path
 import brazier/internal/presence_watch
+import brazier/internal/stream_op
+import brazier/internal/stream_session
+import brazier/internal/stream_window
 import brazier/internal/uri_check
 import brazier/log
 import brazier/notification.{type Notification, Notification}
@@ -241,6 +267,8 @@ pub type RuntimeState(model, msg) {
     title: Option(fn(model) -> String),
     /// What the joined connections were last told about the title.
     title_sync: TitleSync,
+    /// The stream windows of the session and of each joined connection.
+    streams: stream_session.Streams,
   )
 }
 
@@ -303,7 +331,30 @@ pub type RuntimeConfig(state, msg) {
     /// on every join and whenever an update changes it, so the browser's
     /// title follows live updates. `None` sends no title.
     title: Option(fn(state) -> String),
+    /// The streams the build declared and the bounds their ops are held to.
+    streams: StreamConfig,
   )
+}
+
+/// The streams a runtime accepts ops for (docs/design/STREAMS.md 7.4 and
+/// 7.5). An op on any other name is refused with `unknown_stream`.
+pub type StreamConfig {
+  StreamConfig(
+    /// The declared names: the generated `brazier_codec.stream_names()`.
+    names: List(String),
+    /// The bounds: `transport.stream_limits` of the app's `SecurityLimits`.
+    limits: stream_window.Limits,
+  )
+}
+
+/// The `StreamConfig` of an app that declares no stream: every stream op
+/// is refused, under the default bounds.
+pub fn no_streams() -> StreamConfig {
+  log.debug(
+    "brazier.runtime",
+    "Stream config: no declared stream, every stream op is refused",
+  )
+  StreamConfig(names: [], limits: stream_window.default_limits())
 }
 
 /// Start a runtime actor for the session described by `ctx`. Returns a
@@ -380,8 +431,16 @@ fn start_for(
 }
 
 /// The model a session starts from: `init`, then the initial route.
+/// `stream_ops` holds the stream ops taken out of `init`'s effects and of
+/// the route message's, one update each, as the dead render applies them
+/// (`brazier/internal/stream_ssr`); `effects` holds the rest.
 type Mounted(model, msg) {
-  Mounted(model: model, effects: Effect(msg), route_msg: Option(msg))
+  Mounted(
+    model: model,
+    effects: Effect(msg),
+    route_msg: Option(msg),
+    stream_ops: List(#(String, List(stream_op.Op))),
+  )
 }
 
 /// A runtime that does not start is logged once, here, where the cause is
@@ -493,9 +552,16 @@ fn init_and_route(
   page_uri: Uri,
 ) -> Result(Mounted(model, msg), error.InitError) {
   use #(initial_model, init_effects) <- result.map(config.init(ctx))
+  let #(init_ops, init_effects) = effect.take_stream_ops(init_effects)
+  let init_only =
+    Mounted(
+      model: initial_model,
+      effects: init_effects,
+      route_msg: None,
+      stream_ops: [#("init", init_ops)],
+    )
   case config.route {
-    None ->
-      Mounted(model: initial_model, effects: init_effects, route_msg: None)
+    None -> init_only
     Some(route) ->
       case route(page_uri) {
         Ok(msg) -> {
@@ -504,10 +570,13 @@ fn init_and_route(
             "Applying the initial route for " <> describe_uri(page_uri),
           )
           let #(routed, route_effects) = config.update(initial_model, msg)
+          let #(route_ops, route_effects) =
+            effect.take_stream_ops(route_effects)
           Mounted(
             model: routed,
             effects: effect.batch([init_effects, route_effects]),
             route_msg: Some(msg),
+            stream_ops: [#("init", init_ops), #(event_label(msg), route_ops)],
           )
         }
         Error(Nil) -> {
@@ -518,7 +587,7 @@ fn init_and_route(
             "brazier.runtime",
             "No route for the session URL " <> describe_uri(page_uri),
           )
-          Mounted(model: initial_model, effects: init_effects, route_msg: None)
+          init_only
         }
       }
   }
@@ -540,6 +609,7 @@ fn spawn_actor(
     model: initial_model,
     effects: initial_effects,
     route_msg: route_msg,
+    stream_ops: initial_stream_ops,
   ) = mounted
   let result =
     actor.new_with_initialiser(5000, fn(subject) {
@@ -551,6 +621,18 @@ fn spawn_actor(
         initial_model,
         connection_id,
       ))
+      // No connection has joined: the ops of `init` and the initial route
+      // fill the session's windows, which keep their items until the first
+      // join (docs/design/STREAMS.md 7.2).
+      let streams =
+        list.fold(
+          initial_stream_ops,
+          stream_session.new(config.streams.names, config.streams.limits),
+          fn(streams, update) {
+            let #(cause, ops) = update
+            stream_session.apply(streams, ops, [], cause).streams
+          },
+        )
       run_effects(initial_effects, subject)
       let state =
         RuntimeState(
@@ -577,6 +659,7 @@ fn spawn_actor(
           started_at: started_at,
           title: config.title,
           title_sync: TitleWithinLimit(last_sent: None),
+          streams: streams,
         )
       log.debug("brazier.runtime", "Runtime initialising")
       // Trap exits so a stop caused by a linked process still reports
@@ -1021,6 +1104,7 @@ fn forget_connection(
       True -> NoCache
       False -> state.cached_model
     },
+    streams: stream_session.forget(state.streams, conn_id),
   )
 }
 
@@ -1191,6 +1275,11 @@ fn accept_join(
     NoCache -> set.to_list(state.joined)
     _ -> []
   }
+  // The joiner's stream entries: on the runtime's first join, every window
+  // filled before it (docs/design/STREAMS.md 7.2). The others' stores are
+  // not part of a resync.
+  let #(streams, join_frame, stream_errors) =
+    stream_session.join(state.streams, conn_id)
   let state =
     RuntimeState(
       ..state,
@@ -1200,9 +1289,29 @@ fn accept_join(
         True -> state.client_acks
         False -> dict.insert(state.client_acks, conn_id, 0)
       },
+      streams: streams,
     )
-  let state =
-    send_model_sync_to(state, [conn_id, ..stale_others], "join_model_sync")
+  send_stream_errors(state, [conn_id], stream_errors)
+  let #(state, sent) =
+    send_model_sync_to(
+      state,
+      [conn_id, ..stale_others],
+      "join_model_sync",
+      fn(target) {
+        case target == conn_id {
+          True -> join_frame
+          False -> stream_session.empty_frame
+        }
+      },
+    )
+  let state = case sent {
+    True -> state
+    False ->
+      RuntimeState(
+        ..state,
+        streams: stream_session.client_holds_nothing(state.streams, conn_id),
+      )
+  }
   let state = send_title_on_join(state, conn_id)
   reconcile_subscriptions(state)
 }
@@ -1388,9 +1497,11 @@ fn handle_batch(
       state
     }
     _ -> {
-      let #(state, failures) =
-        list.index_fold(events, #(state, []), fn(acc, evt, idx) {
-          let #(acc_state, failures) = acc
+      // The stream ops of every event, in order, ride the batch's one
+      // broadcast (docs/design/STREAMS.md 7.1). Kept newest event first.
+      let #(state, failures, stream_ops) =
+        list.index_fold(events, #(state, [], []), fn(acc, evt, idx) {
+          let #(acc_state, failures, stream_ops) = acc
           let #(event_name, handler_id, event_data, target_path, clock, ops) =
             evt
           warn_client_ops(conn_id, ops)
@@ -1403,10 +1514,11 @@ fn handle_batch(
               target_path,
             )
           {
-            Ok(msg) -> #(
-              run_update_only(acc_state, msg, Some(conn_id)),
-              failures,
-            )
+            Ok(msg) -> {
+              let #(acc_state, ops) =
+                run_update_only(acc_state, msg, Some(conn_id))
+              #(acc_state, failures, [ops, ..stream_ops])
+            }
             Error(err) -> {
               let reason = error.to_string(err)
               // The rejection itself is the event's span: nothing ran.
@@ -1430,7 +1542,7 @@ fn handle_batch(
                   <> "): "
                   <> reason,
               )
-              #(acc_state, [reason, ..failures])
+              #(acc_state, [reason, ..failures], stream_ops)
             }
           }
         })
@@ -1449,7 +1561,13 @@ fn handle_batch(
             ),
           )
       }
-      let #(state, changed) = broadcast_model(state, "batch", Some(conn_id))
+      let #(state, changed) =
+        broadcast_model(
+          state,
+          "batch",
+          Some(conn_id),
+          list.flatten(list.reverse(stream_ops)),
+        )
       let state = reconcile_subscriptions(state)
       ack_if_unchanged(state, conn_id, changed)
     }
@@ -1514,6 +1632,7 @@ fn ack_if_unchanged(
           ops_json: "[]",
           version: state.revision,
           ack_clock: ack_for(state, conn_id),
+          streams_json: stream_session.empty_frame,
         ),
       )
   }
@@ -1785,8 +1904,16 @@ fn run_update_for(
         fn() { state.update(state.model, msg) },
       )
   }
+  // The stream ops ride the broadcast of this update; the other effects
+  // run after it (docs/design/STREAMS.md 7.1).
+  let #(stream_ops, effects) = effect.take_stream_ops(effects)
   let #(state, changed) =
-    broadcast_model(RuntimeState(..state, model: new_model), label, conn_id)
+    broadcast_model(
+      RuntimeState(..state, model: new_model),
+      label,
+      conn_id,
+      stream_ops,
+    )
   run_effects_with_context(effects, state.self, conn_id, state.connections)
   #(reconcile_subscriptions(state), changed)
 }
@@ -1857,12 +1984,12 @@ fn apply_subscription_diff(
 
 /// Run update WITHOUT broadcasting — for atomic batch processing.
 /// Only updates the model and executes effects. The broadcast happens once
-/// after the batch.
+/// after the batch, and carries the stream ops returned here.
 fn run_update_only(
   state: RuntimeState(model, msg),
   msg: msg,
   conn_id: Option(transport.ConnectionId),
-) -> RuntimeState(model, msg) {
+) -> #(RuntimeState(model, msg), List(stream_op.Op)) {
   let #(new_model, effects) =
     telemetry.runtime_span(
       telemetry.HandleEvent,
@@ -1871,8 +1998,9 @@ fn run_update_only(
       connection_label(conn_id),
       fn() { state.update(state.model, msg) },
     )
+  let #(stream_ops, effects) = effect.take_stream_ops(effects)
   run_effects_with_context(effects, state.self, conn_id, state.connections)
-  RuntimeState(..state, model: new_model)
+  #(RuntimeState(..state, model: new_model), stream_ops)
 }
 
 /// The generated server codec (`brazier_codec`, written by
@@ -1883,6 +2011,8 @@ pub type GeneratedCodec(model, msg) {
     decode_model: fn(String) -> Result(model, String),
     decode_event: fn(String, String, String, String) ->
       Result(msg, error.BrazierError),
+    /// The streams the app declares (`brazier_codec.stream_names`).
+    stream_names: List(String),
   )
 }
 
@@ -1915,19 +2045,32 @@ pub fn load_generated_codec() -> Result(
     try_load_codec_event_decoder()
     |> result.replace_error(missing("decode_event/4")),
   )
-  Ok(
-    GeneratedCodec(
-      encode_model: encode_model,
-      decode_model: decode_model,
-      decode_event: fn(name, handler_id, data, target_path) {
-        decode_event(name, handler_id, data, target_path)
-        |> result.map_error(fn(reason) {
-          error.CodecError(reason: reason, raw: data)
-        })
-      },
-    ),
+  use stream_names <- result.try(
+    try_load_codec_stream_names()
+    |> result.replace_error(missing("stream_names/0")),
   )
+  let stream_names = stream_names()
+  log.info(
+    "brazier.runtime",
+    "The generated codec declares "
+      <> int.to_string(list.length(stream_names))
+      <> " stream(s)",
+  )
+  Ok(GeneratedCodec(
+    encode_model: encode_model,
+    decode_model: decode_model,
+    decode_event: fn(name, handler_id, data, target_path) {
+      decode_event(name, handler_id, data, target_path)
+      |> result.map_error(fn(reason) {
+        error.CodecError(reason: reason, raw: data)
+      })
+    },
+    stream_names: stream_names,
+  ))
 }
+
+@external(erlang, "brazier_runtime_ffi", "try_load_codec_stream_names")
+fn try_load_codec_stream_names() -> Result(fn() -> List(String), Nil)
 
 @external(erlang, "brazier_runtime_ffi", "try_load_codec_encoder")
 fn try_load_codec_encoder() -> Result(fn(model) -> String, Nil)
@@ -2101,9 +2244,15 @@ fn model_not_sent(
   RuntimeState(..state, cached_model: NoCache)
 }
 
-/// Broadcast the current model to every joined connection: a patch when
-/// the cache can be diffed, a full model_sync otherwise, nothing when the
-/// client-visible JSON is unchanged. Returns whether anything was sent.
+/// Broadcast the current model and the update's `stream_ops` to every
+/// joined connection: a patch when the cache can be diffed, a full
+/// model_sync otherwise. The stream entries ride that frame; when the
+/// model is unchanged (or could not be sent) and a connection has stream
+/// entries, they ride an empty patch at the current revision
+/// (docs/design/STREAMS.md 7.1). Returns whether anything was sent.
+///
+/// The ops are applied to the session's windows even with no connection
+/// joined: they are the items a first join is sent (7.2).
 ///
 /// With joined connections, the broadcast is a `[brazier, runtime, render]`
 /// span for `event` (the message's label, or `"batch"`); with none,
@@ -2112,8 +2261,12 @@ fn broadcast_model(
   state: RuntimeState(model, msg),
   event: String,
   conn_id: Option(transport.ConnectionId),
+  stream_ops: List(stream_op.Op),
 ) -> #(RuntimeState(model, msg), Bool) {
   let targets = set.to_list(state.joined)
+  let update = stream_session.apply(state.streams, stream_ops, targets, event)
+  let state = RuntimeState(..state, streams: update.streams)
+  send_stream_errors(state, targets, update.errors)
   case targets {
     [] -> {
       log.debug(
@@ -2128,10 +2281,86 @@ fn broadcast_model(
         event,
         connection_label(conn_id),
         fn() {
-          let #(state, changed, sent_bytes) = broadcast_to(state, targets)
-          #(#(sync_title(state, targets), changed), sent_bytes)
+          let #(state, changed, sent_bytes) =
+            broadcast_to(state, targets, update)
+          #(
+            #(sync_title(state, targets), changed),
+            sent_bytes,
+            largest_frame_bytes(update, targets),
+          )
         },
       )
+  }
+}
+
+/// The size in bytes of the largest `streams` array `update` sends to one
+/// of `targets`; 0 when it sends none.
+fn largest_frame_bytes(
+  update: stream_session.Update,
+  targets: List(transport.ConnectionId),
+) -> Int {
+  case stream_session.has_entries(update) {
+    False -> 0
+    True ->
+      list.fold(targets, 0, fn(largest, conn_id) {
+        int.max(
+          largest,
+          string.byte_size(stream_session.frame(update, conn_id)),
+        )
+      })
+  }
+}
+
+/// Send one `error` frame per refused stream op group to each of
+/// `targets`. Each refusal was logged at error and counted by
+/// `[brazier, stream, refused]` when it was refused.
+fn send_stream_errors(
+  state: RuntimeState(model, msg),
+  targets: List(transport.ConnectionId),
+  errors: List(String),
+) -> Nil {
+  list.each(errors, fn(reason) {
+    list.each(targets, fn(conn_id) {
+      send_to_conn_id(state, conn_id, transport.SendError(reason: reason))
+    })
+  })
+}
+
+/// The model sent no frame, but `update` has stream entries: send them on
+/// an empty patch at the current revision, which also acknowledges each
+/// connection's events. Every target gets one so that no connection is
+/// acknowledged twice. Returns whether anything was sent.
+fn send_stream_only(
+  state: RuntimeState(model, msg),
+  targets: List(transport.ConnectionId),
+  update: stream_session.Update,
+) -> Bool {
+  case stream_session.has_entries(update) {
+    False -> False
+    True -> {
+      log.debug(
+        "brazier.runtime",
+        "Model frame not sent; sending the stream entries on an empty patch"
+          <> " at revision "
+          <> int.to_string(state.revision)
+          <> " to "
+          <> int.to_string(list.length(targets))
+          <> " connection(s)",
+      )
+      list.each(targets, fn(conn_id) {
+        send_to_conn_id(
+          state,
+          conn_id,
+          transport.SendPatch(
+            ops_json: "[]",
+            version: state.revision,
+            ack_clock: ack_for(state, conn_id),
+            streams_json: stream_session.frame(update, conn_id),
+          ),
+        )
+      })
+      True
+    }
   }
 }
 
@@ -2321,33 +2550,32 @@ fn sync_title(
 
 /// The broadcast to a non-empty `targets`. The `Int` is the size in bytes
 /// of what each connection was sent: the patch ops, the model on a
-/// resync, 0 when nothing was sent.
+/// resync, 0 when no model frame was sent. Each connection's stream
+/// entries in `update` ride the model frame, or an empty patch when there
+/// is none.
 fn broadcast_to(
   state: RuntimeState(model, msg),
   targets: List(transport.ConnectionId),
+  update: stream_session.Update,
 ) -> #(RuntimeState(model, msg), Bool, Int) {
   let model_json = state.model_encoder(state.model)
   let model_bytes = string.byte_size(model_json)
   case check_model_size(model_bytes, "broadcast") {
-    TooLarge(size) -> #(
-      model_too_large(state, targets, size, "broadcast"),
-      False,
-      0,
-    )
+    TooLarge(size) -> {
+      let state = model_too_large(state, targets, size, "broadcast")
+      #(state, send_stream_only(state, targets, update), 0)
+    }
     SizeOk ->
       case diff_snapshot(state.cached_model, model_json) {
-        InvalidJson(reason) -> #(
-          model_invalid(state, targets, reason, "broadcast"),
-          False,
-          0,
-        )
+        InvalidJson(reason) -> {
+          let state = model_invalid(state, targets, reason, "broadcast")
+          #(state, send_stream_only(state, targets, update), 0)
+        }
         Unchanged(snapshot) -> {
           log.debug("brazier.runtime", "Model unchanged, skipping broadcast")
-          #(
-            RuntimeState(..state, cached_model: FullModelCache(snapshot)),
-            False,
-            0,
-          )
+          let state =
+            RuntimeState(..state, cached_model: FullModelCache(snapshot))
+          #(state, send_stream_only(state, targets, update), 0)
         }
         Changed(ops_json, snapshot) -> {
           let revision = state.revision + 1
@@ -2369,6 +2597,7 @@ fn broadcast_to(
                 ops_json: ops_json,
                 version: revision,
                 ack_clock: ack_for(state, conn_id),
+                streams_json: stream_session.frame(update, conn_id),
               ),
             )
           })
@@ -2383,7 +2612,13 @@ fn broadcast_to(
           // rather than encoding it again.
           let state = RuntimeState(..state, revision: state.revision + 1)
           let state =
-            send_snapshot_to(state, targets, snapshot, "broadcast_resync")
+            send_snapshot_to(
+              state,
+              targets,
+              snapshot,
+              "broadcast_resync",
+              fn(conn_id) { stream_session.frame(update, conn_id) },
+            )
           #(state, True, model_bytes)
         }
       }
@@ -2391,7 +2626,10 @@ fn broadcast_to(
 }
 
 /// Encode the current model and send it as a model_sync (current
-/// revision, each connection's own ack), then cache its snapshot.
+/// revision, each connection's own ack, the `streams` array `frames`
+/// gives each connection), then cache its snapshot. The `Bool` is whether
+/// it was sent: a model over the size limit or not valid JSON is reported
+/// instead.
 ///
 /// Callers must include every joined connection in `targets` when the
 /// cache is `NoCache`, since the cache is about to describe all of them.
@@ -2399,14 +2637,21 @@ fn send_model_sync_to(
   state: RuntimeState(model, msg),
   targets: List(transport.ConnectionId),
   context: String,
-) -> RuntimeState(model, msg) {
+  frames: fn(transport.ConnectionId) -> String,
+) -> #(RuntimeState(model, msg), Bool) {
   let model_json = state.model_encoder(state.model)
   case check_model_size(string.byte_size(model_json), context) {
-    TooLarge(size) -> model_too_large(state, targets, size, context)
+    TooLarge(size) -> #(model_too_large(state, targets, size, context), False)
     SizeOk ->
       case snapshot_for(state.cached_model, model_json) {
-        Ok(snapshot) -> send_snapshot_to(state, targets, snapshot, context)
-        Error(reason) -> model_invalid(state, targets, reason, context)
+        Ok(snapshot) -> #(
+          send_snapshot_to(state, targets, snapshot, context, frames),
+          True,
+        )
+        Error(reason) -> #(
+          model_invalid(state, targets, reason, context),
+          False,
+        )
       }
   }
 }
@@ -2418,6 +2663,7 @@ fn send_snapshot_to(
   targets: List(transport.ConnectionId),
   snapshot: patch.Snapshot,
   context: String,
+  frames: fn(transport.ConnectionId) -> String,
 ) -> RuntimeState(model, msg) {
   let model_json = patch.snapshot_json(snapshot)
   list.each(targets, fn(conn_id) {
@@ -2428,6 +2674,7 @@ fn send_snapshot_to(
         model_json: model_json,
         version: state.revision,
         ack_clock: ack_for(state, conn_id),
+        streams_json: frames(conn_id),
       ),
     )
   })
@@ -2445,7 +2692,8 @@ fn send_snapshot_to(
 }
 
 /// Full resync for one connection (or all joined ones when the cache is
-/// unusable, since they may be stale too).
+/// unusable, since they may be stale too). A resync carries no stream
+/// entries: the clients keep the stream items they hold (STREAMS.md 6.1).
 fn resync(
   state: RuntimeState(model, msg),
   conn_id: transport.ConnectionId,
@@ -2455,7 +2703,13 @@ fn resync(
     NoCache -> set.to_list(set.insert(state.joined, conn_id))
     _ -> [conn_id]
   }
-  send_model_sync_to(state, targets, context)
+  let #(state, _sent) =
+    send_model_sync_to(state, targets, context, fn(_conn_id) {
+      stream_session.empty_frame
+    })
+  // A resync that was not sent was reported to `targets` by
+  // `send_model_sync_to`; no stream window changed.
+  state
 }
 
 /// Execute effects by providing a dispatch function that sends messages

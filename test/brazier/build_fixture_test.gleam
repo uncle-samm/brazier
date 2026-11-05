@@ -2,8 +2,9 @@
 ///
 /// The fixture app is a `full_application` with a local layer, server state
 /// holding a secret, a Model with Dict(String, _), Dict(Int, _), tuple,
-/// Option, List and nested-module union fields, and a Msg constructor only
-/// the server builds. It imports brazier under an alias and sits next to a
+/// Option, List and nested-module union fields, a Msg constructor only the
+/// server builds, and a stream its view renders and its update fills. It
+/// imports brazier under an alias and sits next to a
 /// decoy module whose `pub fn main` mentions `brazier.simple` without calling
 /// it. The test:
 ///
@@ -14,7 +15,8 @@
 ///    models; node decodes them with the client entry, renders the view,
 ///    runs its handlers and the local layer, and encodes a Msg. The server
 ///    checks node rendered the same HTML it renders, decodes the Msg, and
-///    rejects a server-only constructor.
+///    rejects a server-only constructor. Node also renders a stream item
+///    from its JSON, and the server checks it renders the same HTML.
 ///
 /// The fixture project lives in `build/brazier_fixture_app` and its sources
 /// are rewritten only when they change, so later runs compile incrementally.
@@ -67,6 +69,18 @@ pub fn fixture_app_builds_and_round_trips_test_() -> Timeout {
     let assert False = string.contains(app_js, "function update(")
     let assert False = string.contains(app_js, "function sync(")
     let assert True = string.contains(app_js, "function local_update(")
+    // The client gets brazier/stream's client half only: the stream ops
+    // are effects, which run on the server.
+    let assert Ok(stream_js) =
+      files.read(
+        fixture
+        <> "/"
+        <> client_bundle.client_dir
+        <> "/build/dev/javascript/brazier_client_app/brazier/stream.mjs",
+      )
+    let assert True = string.contains(stream_js, "function render(")
+    let assert False = string.contains(stream_js, "function insert(")
+    let assert False = string.contains(stream_js, "brazier/effect")
     let assert Ok(output) =
       program.run(fixture, "gleam", ["run", "-m", "fixture_roundtrip"])
     let assert True = string.contains(output, "ROUNDTRIP OK")
@@ -141,9 +155,12 @@ import brazier/element.{type Element}
 import brazier/event
 import brazier/html
 import brazier/local
+import brazier/stream.{type Stream}
 import fixture/kinds.{type Kind}
 import gleam/dict.{type Dict}
+import gleam/dynamic/decode
 import gleam/int
+import gleam/json
 import gleam/list
 import gleam/option.{type Option}
 
@@ -183,6 +200,39 @@ pub type Draft {
 
 const api_key = \"sk_fixture_secret\"
 
+/// A stream item: the server sends it once and does not keep it.
+pub type Line {
+  Line(id: String, text: String)
+}
+
+pub fn log() -> Stream(Line) {
+  stream.new(
+    \"log\",
+    key: line_key,
+    encode: encode_line,
+    decoder: line_decoder(),
+    limit: stream.KeepLast(50),
+  )
+}
+
+pub fn line_key(line: Line) -> String {
+  line.id
+}
+
+pub fn encode_line(line: Line) -> json.Json {
+  json.object([#(\"id\", json.string(line.id)), #(\"text\", json.string(line.text))])
+}
+
+pub fn line_decoder() -> decode.Decoder(Line) {
+  use id <- decode.field(\"id\", decode.string)
+  use text <- decode.field(\"text\", decode.string)
+  decode.success(Line(id:, text:))
+}
+
+pub fn render_line(line: Line) -> Element(Msg) {
+  html.li([event.on_click(Blurred)], [html.text(line.text)])
+}
+
 pub fn init(_ctx: b.Context) -> Result(#(State, effect.Effect(Msg)), b.InitError) {
   let model =
     Model(
@@ -207,7 +257,7 @@ pub fn update(state: State, msg: Msg) -> #(State, effect.Effect(Msg)) {
     )
     Blurred -> #(
       State(..state, model: Model(..model, focused: False)),
-      effect.none(),
+      stream.insert(log(), Line(id: int.to_string(model.count), text: \"blurred\"), at: stream.Append),
     )
     SetScore(name:, score:) -> #(
       State(
@@ -261,6 +311,7 @@ pub fn view(model: Model, draft: Draft) -> Element(Msg) {
     html.button([event.on_click(SetScore(model.pair.1, model.count + 4))], [
       html.text(int.to_string(dict.size(model.scores))),
     ]),
+    stream.render(log(), \"ol\", [], render_line),
   ])
 }
 
@@ -329,11 +380,14 @@ const roundtrip_source =
 import brazier/build/files
 import brazier/build/program
 import brazier/element
+import brazier/internal/render
 import brazier_codec
-import codec_fixture.{Draft, Model, SetScore}
+import codec_fixture.{Draft, Line, Model, SetScore}
 import fixture/kinds
 import gleam/dict
+import gleam/dynamic/decode
 import gleam/io
+import gleam/json
 import gleam/option
 import gleam/string
 
@@ -370,8 +424,22 @@ pub fn main() -> Nil {
   write(\"reordered.json\", brazier_codec.encode_model(reordered))
   write(\"other.json\", brazier_codec.encode_model(other))
   write(\"bad.json\", \"{\\\"count\\\": \\\"three\\\"}\")
+  let item_json =
+    json.to_string(codec_fixture.encode_line(Line(id: \"l1\", text: tricky)))
+  write(\"item.json\", item_json)
+  let assert [\"log\"] = brazier_codec.stream_names()
   let assert Ok(output) = program.run(\".\", \"node\", [\"roundtrip.mjs\", dir])
   let assert True = string.contains(output, \"NODE OK\")
+  // The browser rendered the stream item exactly as the server renders it.
+  let #(_html, _handlers, containers) =
+    render.render_containers(
+      element.to_node(codec_fixture.view(model, Draft(text: \"\"))),
+    )
+  let assert [container] = containers
+  let assert Ok(item) = json.parse(item_json, decode.dynamic)
+  let assert Ok(#(item_html, _item_handlers)) =
+    render.render_item(container, \"l1\", item)
+  let assert True = read(\"item.html\") == item_html
   // The browser rendered the decoded model exactly as the server renders
   // the original.
   let assert True =
@@ -451,8 +519,32 @@ if (entry.decode_model(read('bad.json')).isOk()) {
 if (entry.is_simple()) fail('is_simple is true for a full_application');
 
 const local = entry.init_local(model);
-const [html, handlers] = entry.render(model, local);
+const [html, handlers, containers] = entry.render(model, local);
 writeFileSync(dir + '/client.html', html);
+
+// The view's stream container, and one item rendered from its JSON.
+const streamNames = entry.stream_names().toArray();
+if (streamNames.join(',') !== 'log') fail('stream_names: ' + streamNames);
+const found = containers.toArray();
+if (found.length !== 1) fail('render found ' + found.length + ' stream containers');
+const [container] = found;
+if (entry.container_name(container) !== 'log') fail('container_name: ' + entry.container_name(container));
+if (entry.container_keep(container) !== 'last') fail('container_keep: ' + entry.container_keep(container));
+if (entry.container_limit(container) !== 50) fail('container_limit: ' + entry.container_limit(container));
+const again = entry.render(model, local)[2].toArray()[0];
+if (entry.container_item(container) !== entry.container_item(again)) {
+  fail('container_item differs between two renders of the same view');
+}
+const item = entry.render_item(container, 'l1', read('item.json'));
+if (!item.isOk()) fail('render_item: ' + item[0]);
+const [itemHtml, itemHandlers] = item[0];
+writeFileSync(dir + '/item.html', itemHtml);
+if (!entry.event_names(itemHandlers).toArray().includes('click')) {
+  fail('The item has no click handler: ' + itemHtml);
+}
+if (entry.render_item(container, 'l2', { id: 'l2' }).isOk()) {
+  fail('render_item accepted an item its decoder refuses');
+}
 const names = entry.event_names(handlers).toArray();
 for (const name of ['focus', 'blur', 'input', 'click']) {
   if (!names.includes(name)) fail('event_names lacks ' + name + ': ' + names);

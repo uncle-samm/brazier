@@ -51,6 +51,16 @@ pub fn report(source_path: String, analysis: Analysis) -> String {
       "client_modules",
       json.array(analysis.client, fn(emitted) { json.string(emitted.path) }),
     ),
+    #(
+      "streams",
+      json.array(analysis.streams, fn(decl) {
+        json.object([
+          #("name", json.string(decl.name)),
+          #("item_type", json.nullable(decl.item_type, json.string)),
+          #("at", json.string(decl.at)),
+        ])
+      }),
+    ),
   ])
   |> json.to_string
 }

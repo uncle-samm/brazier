@@ -8,6 +8,7 @@
 import brazier/build/analyzer
 import brazier/build/discovery
 import brazier/build/files
+import brazier/build/reach
 import brazier/log
 import gleam/list
 import gleam/result
@@ -33,9 +34,23 @@ pub fn app_externals(
   list.filter(imported, fn(s) { s.0 != app.module_path })
 }
 
+/// The sources of the Brazier modules the analyzer indexes with the user
+/// modules (`reach.is_pruned_framework_module`), from `brazier_root/src`.
+pub fn pruned_framework_sources(
+  brazier_root: String,
+) -> Result(List(Source), String) {
+  let path = module_file(files.join(brazier_root, "src"), reach.stream_module)
+  use text <- result.map(files.read(path))
+  log.debug("brazier.build.sources", "Pruned framework module " <> path)
+  [#(reach.stream_module, text)]
+}
+
 /// The Brazier framework modules (`brazier/*`) that `sources` import, followed
 /// transitively through Brazier's own sources in `brazier_root/src`. Shimmed
 /// modules are not followed: the client project gets generated versions.
+/// Pruned modules (`brazier/stream`) are not followed either: the analyzer
+/// emitted their reached definitions with the client modules, and those
+/// copies' imports are in `sources`.
 pub fn framework_closure(
   brazier_root: String,
   sources: List(String),
@@ -122,6 +137,7 @@ fn walk_framework(
       case
         set.contains(seen, module_path)
         || list.contains(shimmed_framework_modules, module_path)
+        || reach.is_pruned_framework_module(module_path)
       {
         True -> walk_framework(brazier_root, rest, seen, acc)
         False -> {

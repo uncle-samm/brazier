@@ -73,6 +73,7 @@ fn config() -> runtime.RuntimeConfig(Model, Msg) {
     secret_key: "runtime-title-test-secret-0123456789",
     presence: None,
     title: Some(title),
+    streams: runtime.no_streams(),
   )
 }
 

@@ -1,0 +1,490 @@
+/// Tests for the build's stream checks (docs/design/STREAMS.md 10): literal
+/// and unique names, named item functions, client code limited to the
+/// client half of `brazier/stream`, and the stream lists the build writes
+/// into the server codec, the client entry and the contract report.
+import brazier/build/analyzer.{type Analysis, StreamDecl}
+import brazier/build/client_entry
+import brazier/build/contract
+import brazier/build/files
+import brazier/build/server_codec
+import brazier/build/sources
+import gleam/list
+import gleam/option.{None, Some}
+import gleam/string
+
+// --- helpers -----------------------------------------------------------------
+
+/// The analyzer indexes `brazier/stream` with the user modules, as the build
+/// does (`sources.pruned_framework_sources`).
+fn stream_source() -> #(String, String) {
+  let assert Ok(text) = files.read("src/brazier/stream.gleam")
+  #("brazier/stream", text)
+}
+
+fn analyze(modules: List(#(String, String))) -> Result(Analysis, String) {
+  analyzer.analyze("app", [stream_source(), ..modules])
+}
+
+fn analyze_app(app: String) -> Analysis {
+  let assert Ok(analysis) = analyze([#("app", app)])
+  analysis
+}
+
+fn analyze_error(modules: List(#(String, String))) -> String {
+  let assert Error(reason) = analyze(modules)
+  reason
+}
+
+fn assert_contains(haystack: String, needle: String) -> Nil {
+  let assert True = string.contains(haystack, needle)
+    as { "expected to find " <> needle <> " in:\n" <> haystack }
+  Nil
+}
+
+fn client_source(analysis: Analysis, path: String) -> String {
+  let assert Ok(emitted) = list.find(analysis.client, fn(e) { e.path == path })
+    as { "no emitted client module " <> path }
+  emitted.source
+}
+
+/// An application with one stream, `log`, filled by `update` and rendered
+/// by `view` with the named item function `render_line`.
+const app =
+  "import brazier
+import brazier/effect.{type Effect}
+import brazier/element.{type Element}
+import brazier/event
+import brazier/html
+import brazier/stream.{type Stream}
+import gleam/dynamic/decode
+import gleam/json
+
+pub type Model {
+  Model(count: Int)
+}
+
+pub type Msg {
+  Add
+}
+
+pub type Line {
+  Line(id: String, text: String)
+}
+
+pub fn log() -> Stream(Line) {
+  stream.new(
+    \"log\",
+    key: line_key,
+    encode: encode_line,
+    decoder: line_decoder(),
+    limit: stream.KeepLast(300),
+  )
+}
+
+pub fn line_key(line: Line) -> String {
+  line.id
+}
+
+pub fn encode_line(line: Line) -> json.Json {
+  json.object([#(\"id\", json.string(line.id)), #(\"text\", json.string(line.text))])
+}
+
+pub fn line_decoder() -> decode.Decoder(Line) {
+  use id <- decode.field(\"id\", decode.string)
+  use text <- decode.field(\"text\", decode.string)
+  decode.success(Line(id:, text:))
+}
+
+pub fn init(_ctx: brazier.Context) -> #(Model, Effect(Msg)) {
+  #(Model(count: 0), effect.none())
+}
+
+pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
+  case msg {
+    Add -> #(
+      Model(count: model.count + 1),
+      stream.insert(log(), Line(id: \"1\", text: \"hi\"), at: stream.Append),
+    )
+  }
+}
+
+pub fn view(_model: Model) -> Element(Msg) {
+  html.div([], [
+    html.button([event.on_click(Add)], [html.text(\"add\")]),
+    stream.render(log(), \"ol\", [], render_line),
+  ])
+}
+
+pub fn render_line(line: Line) -> Element(Msg) {
+  html.li([], [html.text(line.text)])
+}
+
+pub fn main() {
+  brazier.application(init:, update:, view:) |> brazier.start(8080)
+}
+"
+
+const render_call = "stream.render(log(), \"ol\", [], render_line)"
+
+fn with_render(source: String, render: String) -> String {
+  string.replace(source, render_call, render)
+}
+
+// --- accepted apps -----------------------------------------------------------
+
+pub fn declared_stream_is_listed_test() {
+  let analysis = analyze_app(app)
+  let assert [StreamDecl(name: "log", at:, item_type: Some(item_type))] =
+    analysis.streams
+  assert_contains(at, "app.gleam:")
+  let assert "app.Line" = item_type
+}
+
+pub fn unannotated_stream_has_no_item_type_test() {
+  let analysis =
+    analyze_app(string.replace(
+      app,
+      "pub fn log() -> Stream(Line) {",
+      "pub fn log() {",
+    ))
+  let assert [StreamDecl(name: "log", item_type: None, ..)] = analysis.streams
+}
+
+pub fn app_without_streams_lists_none_test() {
+  let source =
+    "import brazier
+import brazier/element.{type Element}
+import brazier/event
+import brazier/html
+
+pub type Model {
+  Model(count: Int)
+}
+
+pub type Msg {
+  Add
+}
+
+pub fn init(_ctx: brazier.Context) -> Model {
+  Model(count: 0)
+}
+
+pub fn update(model: Model, msg: Msg) -> Model {
+  case msg {
+    Add -> Model(count: model.count + 1)
+  }
+}
+
+pub fn view(_model: Model) -> Element(Msg) {
+  html.button([event.on_click(Add)], [html.text(\"add\")])
+}
+
+pub fn main() {
+  brazier.simple(init:, update:, view:) |> brazier.start(8080)
+}
+"
+  let analysis = analyze_app(source)
+  let assert [] = analysis.streams
+  let assert Ok(codec) = server_codec.generate(analysis)
+  assert_contains(codec, "pub fn stream_names() -> List(String) {\n[]")
+  let assert False =
+    list.any(analysis.client, fn(e) { e.path == "brazier/stream" })
+}
+
+pub fn emitted_stream_module_holds_only_reached_definitions_test() {
+  let analysis = analyze_app(app)
+  let source = client_source(analysis, "brazier/stream")
+  assert_contains(source, "pub fn new(")
+  assert_contains(source, "pub fn render(")
+  // The ops run only on the server; the effect module is Erlang-only.
+  let assert False = string.contains(source, "fn insert(")
+  let assert False = string.contains(source, "fn reset(")
+  let assert False = string.contains(source, "brazier/effect")
+}
+
+pub fn piped_and_captured_render_is_accepted_test() {
+  let piped =
+    analyze_app(with_render(
+      app,
+      "log() |> stream.render(\"ol\", [], render_line)",
+    ))
+  let assert [StreamDecl(name: "log", ..)] = piped.streams
+  let captured =
+    analyze_app(with_render(
+      app,
+      "log() |> stream.render(_, \"ol\", [], render_line)",
+    ))
+  let assert [StreamDecl(name: "log", ..)] = captured.streams
+}
+
+pub fn qualified_item_from_a_user_module_is_accepted_test() {
+  let lines =
+    "import brazier/element.{type Element}
+import brazier/html
+
+pub fn render_text(text: String) -> Element(msg) {
+  html.li([], [html.text(text)])
+}
+"
+  let source =
+    app
+    |> string.replace(
+      "import gleam/json\n",
+      "import gleam/json\nimport lines\n",
+    )
+    |> with_render("stream.render(log(), \"ol\", [], line_item)")
+    |> string.append(
+      "\npub fn line_item(line: Line) -> Element(Msg) {\n  lines.render_text(line.text)\n}\n",
+    )
+  let assert Ok(analysis) = analyze([#("app", source), #("lines", lines)])
+  let assert [StreamDecl(name: "log", ..)] = analysis.streams
+}
+
+// --- generated exports -------------------------------------------------------
+
+pub fn server_codec_exports_stream_names_test() {
+  let assert Ok(codec) = server_codec.generate(analyze_app(app))
+  assert_contains(codec, "pub fn stream_names() -> List(String) {\n[\"log\"]")
+}
+
+pub fn stream_names_are_sorted_test() {
+  let source =
+    app
+    |> string.append(
+      "\npub fn alerts() -> Stream(Line) {\n  stream.new(\"alerts\", key: line_key, encode: encode_line, decoder: line_decoder(), limit: stream.KeepFirst(10))\n}\n",
+    )
+  let analysis = analyze_app(source)
+  let assert ["alerts", "log"] = server_codec.stream_names(analysis)
+}
+
+pub fn client_entry_exports_the_stream_functions_test() {
+  let assert Ok(entry) = client_entry.generate(analyze_app(app))
+  assert_contains(entry, "pub fn stream_names() -> List(String) {\n[\"log\"]")
+  assert_contains(entry, "render_containers(")
+  assert_contains(entry, "pub fn container_name(")
+  assert_contains(entry, "pub fn container_keep(")
+  assert_contains(entry, "pub fn container_limit(")
+  assert_contains(entry, "pub fn container_item(")
+  assert_contains(entry, "pub fn render_item(")
+}
+
+pub fn contract_lists_the_streams_test() {
+  let analysis = analyze_app(app)
+  let report = contract.report("src/app.gleam", analysis)
+  assert_contains(
+    report,
+    "\"streams\":[{\"name\":\"log\",\"item_type\":\"app.Line\",\"at\":\"",
+  )
+}
+
+// --- refused names -----------------------------------------------------------
+
+pub fn non_literal_name_is_refused_test() {
+  let source =
+    string.replace(app, "    \"log\",\n    key:", "    log_name(),\n    key:")
+    |> string.append("\nfn log_name() -> String {\n  \"log\"\n}\n")
+  let reason = analyze_error([#("app", source)])
+  assert_contains(reason, "app.gleam:")
+  assert_contains(
+    reason,
+    "the name of a stream must be a string literal in the `stream.new` call, not a function call",
+  )
+}
+
+pub fn invalid_literal_name_is_refused_test() {
+  let source = string.replace(app, "    \"log\",\n", "    \"Log-1\",\n")
+  let reason = analyze_error([#("app", source)])
+  assert_contains(reason, "the stream name \"Log-1\" is not valid")
+}
+
+pub fn duplicate_name_is_refused_test() {
+  let source =
+    app
+    |> string.append(
+      "\npub fn other_log() -> Stream(Line) {\n  stream.new(\"log\", key: line_key, encode: encode_line, decoder: line_decoder(), limit: stream.KeepLast(5))\n}\n",
+    )
+  let reason = analyze_error([#("app", source)])
+  assert_contains(reason, "The stream name \"log\" is declared more than once")
+}
+
+pub fn duplicate_name_across_modules_is_refused_test() {
+  let other =
+    "import brazier/stream.{type Stream}
+import gleam/dynamic/decode
+import gleam/json
+
+pub fn other() -> Stream(String) {
+  stream.new(
+    \"log\",
+    key: fn(s: String) { s },
+    encode: json.string,
+    decoder: decode.string,
+    limit: stream.KeepLast(5),
+  )
+}
+"
+  let source =
+    string.replace(
+      app,
+      "import gleam/json\n",
+      "import gleam/json\nimport other\n",
+    )
+    |> string.append(
+      "\npub fn other_log() -> Stream(String) {\n  other.other()\n}\n",
+    )
+  let reason = analyze_error([#("app", source), #("other", other)])
+  assert_contains(reason, "is declared more than once")
+  assert_contains(reason, "app.gleam:")
+  assert_contains(reason, "other.gleam:")
+}
+
+// --- refused item functions --------------------------------------------------
+
+pub fn anonymous_item_function_is_refused_test() {
+  let reason =
+    analyze_error([
+      #(
+        "app",
+        with_render(
+          app,
+          "stream.render(log(), \"ol\", [], fn(line) { render_line(line) })",
+        ),
+      ),
+    ])
+  assert_contains(
+    reason,
+    "the item function of `stream.render` must be a named top-level function",
+  )
+  assert_contains(reason, "not an anonymous function")
+}
+
+pub fn captured_item_function_is_refused_test() {
+  let source =
+    with_render(
+      app,
+      "stream.render(log(), \"ol\", [], render_tagged(_, \"x\"))",
+    )
+    |> string.append(
+      "\npub fn render_tagged(line: Line, tag: String) -> Element(Msg) {\n  html.li([], [html.text(tag <> line.text)])\n}\n",
+    )
+  let reason = analyze_error([#("app", source)])
+  assert_contains(reason, "not a function capture")
+}
+
+pub fn local_variable_item_is_refused_test() {
+  let source =
+    string.replace(
+      app,
+      "pub fn view(_model: Model) -> Element(Msg) {\n",
+      "pub fn view(_model: Model) -> Element(Msg) {\n  let item = render_line\n",
+    )
+    |> with_render("stream.render(log(), \"ol\", [], item)")
+  let reason = analyze_error([#("app", source)])
+  assert_contains(reason, "not the local variable `item`")
+}
+
+pub fn constant_item_is_refused_test() {
+  let source =
+    with_render(app, "stream.render(log(), \"ol\", [], renderer)")
+    |> string.append("\nconst renderer = render_line\n")
+  let reason = analyze_error([#("app", source)])
+  assert_contains(reason, "not the constant `renderer`")
+}
+
+pub fn piped_anonymous_item_is_refused_test() {
+  let reason =
+    analyze_error([
+      #(
+        "app",
+        with_render(
+          app,
+          "log() |> stream.render(\"ol\", [], fn(l) { render_line(l) })",
+        ),
+      ),
+    ])
+  assert_contains(reason, "not an anonymous function")
+}
+
+pub fn every_refusal_is_reported_together_test() {
+  let source =
+    string.replace(app, "    \"log\",\n", "    \"Bad\",\n")
+    |> with_render("stream.render(log(), \"ol\", [], fn(l) { render_line(l) })")
+  let reason = analyze_error([#("app", source)])
+  assert_contains(reason, "the stream name \"Bad\" is not valid")
+  assert_contains(reason, "not an anonymous function")
+}
+
+// --- client code -------------------------------------------------------------
+
+pub fn stream_op_in_client_code_is_refused_test() {
+  let source =
+    string.replace(
+      app,
+      "pub fn view(_model: Model) -> Element(Msg) {\n",
+      "pub fn view(_model: Model) -> Element(Msg) {\n  let _op = stream.delete_key(log(), \"1\")\n",
+    )
+  let reason = analyze_error([#("app", source)])
+  assert_contains(
+    reason,
+    "`brazier/stream.delete_key`, which runs only on the server",
+  )
+}
+
+pub fn stream_used_as_a_value_is_refused_test() {
+  let source =
+    app
+    |> string.append(
+      "\npub fn renderer() -> fn(Stream(Line), String, List(a), fn(Line) -> Element(Msg)) -> Element(Msg) {\n  stream.render\n}\n",
+    )
+  let reason = analyze_error([#("app", source)])
+  assert_contains(reason, "`stream.render` is used as a value")
+}
+
+pub fn simple_app_rendering_a_stream_is_refused_test() {
+  let source =
+    app
+    |> string.replace(
+      "pub fn init(_ctx: brazier.Context) -> #(Model, Effect(Msg)) {\n  #(Model(count: 0), effect.none())\n}",
+      "pub fn init(_ctx: brazier.Context) -> Model {\n  Model(count: 0)\n}",
+    )
+    |> string.replace(
+      "pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {\n  case msg {\n    Add -> #(\n      Model(count: model.count + 1),\n      stream.insert(log(), Line(id: \"1\", text: \"hi\"), at: stream.Append),\n    )\n  }\n}",
+      "pub fn update(model: Model, msg: Msg) -> Model {\n  case msg {\n    Add -> Model(count: model.count + 1)\n  }\n}",
+    )
+    |> string.replace("import brazier/effect.{type Effect}\n", "")
+    |> string.replace("brazier.application(", "brazier.simple(")
+  let reason = analyze_error([#("app", source)])
+  assert_contains(reason, "a `brazier.simple` app renders a stream")
+}
+
+// --- framework modules -------------------------------------------------------
+
+pub fn other_framework_module_is_refused_test() {
+  let reason =
+    analyze_error([
+      #("app", app),
+      #("brazier/effect", "pub fn none() { Nil }\n"),
+    ])
+  assert_contains(
+    reason,
+    "Invariant violated: the Brazier module brazier/effect",
+  )
+}
+
+pub fn framework_closure_skips_the_pruned_stream_module_test() {
+  let assert Ok(closure) =
+    sources.framework_closure(".", [
+      "import brazier/stream\nimport brazier/internal/stream_op\n",
+    ])
+  let paths = list.map(closure, fn(source) { source.0 })
+  let assert True = list.contains(paths, "brazier/internal/stream_op")
+  let assert False = list.contains(paths, "brazier/stream")
+  // brazier/stream's own imports (brazier/effect) are not followed either.
+  let assert False = list.contains(paths, "brazier/effect")
+}
+
+pub fn pruned_framework_sources_reads_the_stream_module_test() {
+  let assert Ok([#("brazier/stream", text)]) =
+    sources.pruned_framework_sources(".")
+  assert_contains(text, "pub fn render(")
+}

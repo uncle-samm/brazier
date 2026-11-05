@@ -27,10 +27,11 @@ pub fn encode_model_sync_message_test() {
       model_json: "{\"count\":1}",
       version: 1,
       ack_clock: 1,
+      streams_json: "[]",
     )
   let encoded = transport.encode_server_message(msg)
   // The model JSON is embedded raw: an object, not a string to parse again.
-  let assert "{\"type\":\"model_sync\",\"model\":{\"count\":1},\"version\":1,\"ack_clock\":1}" =
+  let assert "{\"type\":\"model_sync\",\"model\":{\"count\":1},\"version\":1,\"ack_clock\":1,\"streams\":[]}" =
     encoded
   let assert Ok(1) =
     json.parse(encoded, decode.at(["model", "count"], decode.int))
@@ -40,28 +41,40 @@ pub fn encode_model_sync_embeds_large_model_unescaped_test() {
   // Quotes, backslashes and unicode inside the model stay as the encoder
   // wrote them; they are not escaped a second time.
   let model_json = "{\"text\":\"say \\\"hi\\\" \\\\ \\u00e9\",\"n\":[1,2,3]}"
+  // The streams array is embedded raw too.
+  let streams_json =
+    "[{\"name\":\"rows\",\"keep\":-1,\"limit\":null,\"reset\":false,\"deletes\":[],\"inserts\":[{\"key\":\"a\",\"at\":-1,\"item\":{\"t\":\"\\u00e9\"}}]}]"
   let encoded =
     transport.encode_server_message(transport.ServerModelSync(
       model_json:,
       version: 3,
       ack_clock: 2,
+      streams_json:,
     ))
   let assert True =
     encoded
     == "{\"type\":\"model_sync\",\"model\":"
     <> model_json
-    <> ",\"version\":3,\"ack_clock\":2}"
+    <> ",\"version\":3,\"ack_clock\":2,\"streams\":"
+    <> streams_json
+    <> "}"
   let assert Ok("say \"hi\" \\ é") =
     json.parse(encoded, decode.at(["model", "text"], decode.string))
 }
 
 pub fn encode_server_message_tree_matches_string_encoding_test() {
   let messages = [
-    transport.ServerModelSync(model_json: "{\"a\":1}", version: 1, ack_clock: 0),
+    transport.ServerModelSync(
+      model_json: "{\"a\":1}",
+      version: 1,
+      ack_clock: 0,
+      streams_json: "[]",
+    ),
     transport.ServerPatch(
       ops_json: "[{\"op\":\"remove\",\"path\":\"/a\"}]",
       version: 2,
       ack_clock: 1,
+      streams_json: "[]",
     ),
     transport.ServerError(reason: "x"),
     transport.ServerTitle(title: "T"),
@@ -214,12 +227,13 @@ pub fn encode_patch_message_test() {
       ops_json: "[{\"op\":\"replace\",\"path\":\"/count\",\"value\":1}]",
       version: 2,
       ack_clock: 2,
+      streams_json: "[]",
     )
   let encoded = transport.encode_server_message(msg)
   let assert Ok("patch") =
     json.parse(encoded, decode.at(["type"], decode.string))
   // The ops JSON is embedded raw: an array, not a string to parse again.
-  let assert "{\"type\":\"patch\",\"ops\":[{\"op\":\"replace\",\"path\":\"/count\",\"value\":1}],\"version\":2,\"ack_clock\":2}" =
+  let assert "{\"type\":\"patch\",\"ops\":[{\"op\":\"replace\",\"path\":\"/count\",\"value\":1}],\"version\":2,\"ack_clock\":2,\"streams\":[]}" =
     encoded
   let assert Ok([1]) =
     json.parse(
@@ -364,8 +378,18 @@ pub fn encode_decode_roundtrip_consistency_test() {
   // Verify that encoding produces valid JSON by parsing every message
   let messages = [
     transport.ServerMount(payload: "test"),
-    transport.ServerModelSync(model_json: "{}", version: 0, ack_clock: 0),
-    transport.ServerPatch(ops_json: "[]", version: 0, ack_clock: 0),
+    transport.ServerModelSync(
+      model_json: "{}",
+      version: 0,
+      ack_clock: 0,
+      streams_json: "[]",
+    ),
+    transport.ServerPatch(
+      ops_json: "[]",
+      version: 0,
+      ack_clock: 0,
+      streams_json: "[]",
+    ),
     transport.ServerHeartbeatAck,
     transport.ServerError(reason: "test error"),
     transport.ServerNavigate(path: "/foo"),

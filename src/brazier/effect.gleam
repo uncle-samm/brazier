@@ -47,6 +47,17 @@
 ///   per-runtime pending-timer cap.
 /// - `[brazier, effect, background, rejected]` with `limit` when
 ///   `background` hits the per-runtime worker cap.
+///
+/// ## Stream ops
+///
+/// The op functions of `brazier/stream` return effects that carry stream
+/// ops (docs/design/STREAMS.md 7.1). An op is not a callback: the runtime
+/// takes the ops out with `take_stream_ops` when `update` returns and sends
+/// them in the same frame as the model change. `batch` keeps them in
+/// order, `map` passes them through unchanged, and `keyed` and
+/// `cancellable` leave them unkeyed, because an op is applied when its
+/// update returns and so is never late or cancelled.
+import brazier/internal/stream_op
 import brazier/log
 import brazier/telemetry
 import gleam/dynamic
@@ -71,6 +82,9 @@ type Callback(msg) {
   OwnedCallback(run: fn(fn(msg) -> Nil) -> Option(Owned))
   KeyedOwnedCallback(key: String, run: fn(fn(msg) -> Nil) -> Option(Owned))
   CancelKeyCallback(key: String)
+  /// A stream op: data for the runtime, never run. `take_stream_ops`
+  /// takes it out before `perform`.
+  StreamCallback(op: stream_op.Op)
 }
 
 /// What an owned effect started: a process (`background`, `every`) or a
@@ -123,6 +137,9 @@ pub fn from(callback: fn(fn(msg) -> Nil) -> Nil) -> Effect(msg) {
 }
 
 /// Associate an effect with a stable key so stale async completions can be dropped.
+///
+/// Stream ops in `inner` are not keyed: they are applied when the update
+/// returns, so there is no late completion to drop.
 pub fn keyed(key: String, inner: Effect(msg)) -> Effect(msg) {
   Effect(
     callbacks: list.map(inner.callbacks, fn(callback) {
@@ -132,6 +149,7 @@ pub fn keyed(key: String, inner: Effect(msg)) -> Effect(msg) {
         OwnedCallback(run) -> KeyedOwnedCallback(key: key, run: run)
         KeyedOwnedCallback(_, run) -> KeyedOwnedCallback(key: key, run: run)
         CancelKeyCallback(cancel_key) -> CancelKeyCallback(key: cancel_key)
+        StreamCallback(op) -> StreamCallback(op: op)
       }
     }),
   )
@@ -179,14 +197,41 @@ pub fn map(effect: Effect(a), f: fn(a) -> b) -> Effect(b) {
             run(fn(a) { dispatch(f(a)) })
           })
         CancelKeyCallback(key) -> CancelKeyCallback(key: key)
+        StreamCallback(op) -> StreamCallback(op: op)
       }
     })
   Effect(callbacks: mapped_callbacks)
 }
 
+/// An effect carrying stream ops, in order. `brazier/stream`'s op
+/// functions build it.
+@internal
+pub fn from_stream_ops(ops: List(stream_op.Op)) -> Effect(msg) {
+  Effect(callbacks: list.map(ops, StreamCallback))
+}
+
+/// Split an effect into its stream ops, in the order `update` built them,
+/// and the effect without them (docs/design/STREAMS.md 7.1). The runtime
+/// and SSR call it before `perform`, which crashes on a stream op.
+@internal
+pub fn take_stream_ops(
+  effect: Effect(msg),
+) -> #(List(stream_op.Op), Effect(msg)) {
+  let #(ops, callbacks) =
+    list.fold(effect.callbacks, #([], []), fn(acc, callback) {
+      let #(ops, callbacks) = acc
+      case callback {
+        StreamCallback(op) -> #([op, ..ops], callbacks)
+        _ -> #(ops, [callback, ..callbacks])
+      }
+    })
+  #(list.reverse(ops), Effect(callbacks: list.reverse(callbacks)))
+}
+
 /// Execute all callbacks in the effect with the given dispatch function.
 /// Called by the runtime — not by user code. Started processes and timers
-/// are owned by (and die with) the calling process.
+/// are owned by (and die with) the calling process. Crashes on a stream
+/// op: take them out with `take_stream_ops` first.
 pub fn perform(
   effect: Effect(msg),
   dispatch: fn(msg) -> Nil,
@@ -210,6 +255,8 @@ pub fn perform_tracked(
   dispatch: fn(msg) -> Nil,
   dispatch_keyed: fn(String, Int, msg) -> Nil,
 ) -> List(process.Pid) {
+  let #(ops, effect) = take_stream_ops(effect)
+  assert_no_stream_ops(ops)
   list.fold(effect.callbacks, [], fn(pids, callback) {
     case callback {
       SimpleCallback(run) -> {
@@ -242,8 +289,31 @@ pub fn perform_tracked(
         stop_keyed(key, "cancelled")
         pids
       }
+      // Unreachable: `take_stream_ops` above took every stream op out,
+      // and `assert_no_stream_ops` crashed if there was one.
+      StreamCallback(_) -> pids
     }
   })
+}
+
+/// A stream op reached `perform`: its caller skipped `take_stream_ops`, so
+/// the op would never be sent. That is a framework bug; crash loudly.
+fn assert_no_stream_ops(ops: List(stream_op.Op)) -> Nil {
+  case ops {
+    [] -> Nil
+    [op, ..] ->
+      log.error(
+        "brazier.effect",
+        "perform reached "
+          <> int.to_string(list.length(ops))
+          <> " stream op(s), the first for stream "
+          <> op.name
+          <> "; stream ops must be taken out with take_stream_ops first",
+      )
+  }
+  let assert [] = ops
+    as "brazier/effect.perform: stream ops must be taken out with take_stream_ops before perform"
+  Nil
 }
 
 fn with_process(
@@ -531,7 +601,8 @@ pub fn pending_after_timers() -> Int {
   pending_after_count()
 }
 
-/// Check if an effect has any callbacks to execute.
+/// Check if an effect has any callbacks to execute. An effect that carries
+/// stream ops is not none.
 pub fn is_none(effect: Effect(msg)) -> Bool {
   list.is_empty(effect.callbacks)
 }

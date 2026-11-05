@@ -146,6 +146,7 @@ fn start_parent(seen: Subject(Msg)) -> Subject(runtime.RuntimeMessage(Msg)) {
       secret_key: "",
       presence: option.None,
       title: option.None,
+      streams: runtime.no_streams(),
     )
   let assert Ok(subject) = runtime.start(config, test_context())
   subject
@@ -232,8 +233,12 @@ pub fn runtime_child_message_without_effect_sends_nothing_more_test() {
   // an empty patch at the joined revision. The runtime sends the ack after
   // the update and its effects have run, so by then anything more would
   // already be in the mailbox.
-  let assert Ok(transport.SendPatch(ops_json: "[]", version: 0, ack_clock: 1)) =
-    process.receive(transport_subject, 500)
+  let assert Ok(transport.SendPatch(
+    ops_json: "[]",
+    version: 0,
+    ack_clock: 1,
+    streams_json: "[]",
+  )) = process.receive(transport_subject, 500)
   let assert Error(Nil) = process.receive(transport_subject, 0)
   let assert Error(Nil) = process.receive(seen, 0)
   process.send(subject, runtime.Shutdown)
@@ -250,8 +255,12 @@ pub fn runtime_refuses_click_on_child_root_test() {
   let assert Ok(transport.SendError(
     reason: "RuntimeError: No click handler at 0.1",
   )) = process.receive(transport_subject, 500)
-  let assert Ok(transport.SendPatch(ops_json: "[]", version: 0, ack_clock: 1)) =
-    process.receive(transport_subject, 500)
+  let assert Ok(transport.SendPatch(
+    ops_json: "[]",
+    version: 0,
+    ack_clock: 1,
+    streams_json: "[]",
+  )) = process.receive(transport_subject, 500)
   let assert Error(Nil) = process.receive(transport_subject, 0)
   let assert Error(Nil) = process.receive(seen, 0)
   process.send(subject, runtime.Shutdown)

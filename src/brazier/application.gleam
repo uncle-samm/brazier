@@ -91,6 +91,9 @@ pub type AppConfig(state, msg) {
     /// `brazier_codec.decode_event`).
     decode_event: fn(String, String, String, String) ->
       Result(msg, error.BrazierError),
+    /// The streams the app declares (the generated
+    /// `brazier_codec.stream_names`); an op on any other name is refused.
+    stream_names: List(String),
     /// Rebuild a state from client-visible model JSON and the fresh state
     /// `init` built for the connection (state recovery). When set, the dead
     /// render embeds the model in the signed join token.
@@ -754,6 +757,7 @@ fn transport_config(
         Some(_) -> Some(config.encode_model)
         None -> None
       },
+      stream_limits: transport.stream_limits(config.security_limits),
     )
   // Every page is rendered for its request: init reads the request's URL,
   // cookies and session through the Context.
@@ -775,6 +779,10 @@ fn transport_config(
       secret_key: config.secret_key,
       presence: config.presence,
       title: Some(config.title),
+      streams: runtime.StreamConfig(
+        names: config.stream_names,
+        limits: transport.stream_limits(config.security_limits),
+      ),
     )
 
   let base_transport_config =

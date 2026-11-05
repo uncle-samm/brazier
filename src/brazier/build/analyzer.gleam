@@ -22,7 +22,9 @@ import brazier/build/field_type.{type FieldType, type TypeDef}
 import brazier/build/reach
 import brazier/build/source_location
 import brazier/log
+import brazier/stream
 import glance
+import gleam/bool
 import gleam/dict.{type Dict}
 import gleam/list
 import gleam/option.{None, Some}
@@ -52,6 +54,20 @@ pub type Analysis {
     codecs: Codecs,
     /// The client modules, sorted by path.
     client: List(reach.Emitted),
+    /// The streams the app's modules declare, sorted by name.
+    streams: List(StreamDecl),
+  )
+}
+
+/// A stream an app module declares: one `stream.new` call.
+pub type StreamDecl {
+  StreamDecl(
+    name: String,
+    /// The place of the `stream.new` call, as `path.gleam:line:column`.
+    at: String,
+    /// The item type, from the declaring function's `-> Stream(Item)`
+    /// annotation; `None` when the function has no such annotation.
+    item_type: option.Option(String),
   )
 }
 
@@ -76,7 +92,8 @@ pub fn defines_app(
 
 /// Analyze the app whose module path is `app_module`. `modules` lists every
 /// user module the app uses, the app module included, as #(module path,
-/// source).
+/// source), plus the source of `brazier/stream`, which the client gets
+/// pruned to what it reaches (`reach.is_pruned_framework_module`).
 pub fn analyze(
   app_module: String,
   modules: List(#(String, String)),
@@ -88,7 +105,11 @@ pub fn analyze(
       |> result.map(fn(ast) { #(path, source, ast) })
     }),
   )
-  use Nil <- result.try(check_aliases(list.map(modules, fn(m) { m.0 })))
+  use Nil <- result.try(check_framework_modules(modules))
+  use Nil <- result.try(check_aliases(
+    list.map(modules, fn(m) { m.0 })
+    |> list.filter(fn(path) { !reach.is_framework_module(path) }),
+  ))
   use index <- result.try(reach.index(parsed))
   use info <- result.try(
     dict.get(index, app_module)
@@ -130,6 +151,7 @@ pub fn analyze(
     Some(update) -> walk(index, [to_item(update), ..allow_roots])
     None -> Ok(allowed_reach)
   })
+  use streams <- result.try(streams(index, call, client_reach))
   // Client code builds other values too (a local layer's state, view
   // helpers' records); only the constructors of types a Msg carries are
   // messages the browser may send.
@@ -155,7 +177,224 @@ pub fn analyze(
     msg:,
     codecs: Codecs(type_defs:, sent:, allowed:),
     client:,
+    streams:,
   )
+}
+
+/// Only the pruned Brazier modules may be given with the user modules.
+fn check_framework_modules(
+  modules: List(#(String, String)),
+) -> Result(Nil, String) {
+  list.try_each(modules, fn(module) {
+    case
+      reach.is_framework_module(module.0)
+      && !reach.is_pruned_framework_module(module.0)
+    {
+      True ->
+        Error(
+          "Invariant violated: the Brazier module "
+          <> module.0
+          <> " was given to the analyzer; only "
+          <> reach.stream_module
+          <> " is analyzed with the user modules",
+        )
+      False -> Ok(Nil)
+    }
+  })
+}
+
+/// The user modules of `index`, without the pruned Brazier modules.
+fn user_paths(index: reach.Index) -> Set(String) {
+  dict.keys(index)
+  |> list.filter(fn(path) { !reach.is_framework_module(path) })
+  |> set.from_list
+}
+
+// ===== Streams =====
+
+/// Check every `stream.new` and `stream.render` of the app's modules
+/// (docs/design/STREAMS.md 10) and list the declared streams. All errors
+/// are reported together, each naming its place.
+fn streams(
+  index: reach.Index,
+  call: AppCall,
+  client_reach: reach.Reach,
+) -> Result(List(StreamDecl), String) {
+  let modules = user_paths(index) |> set.to_list |> list.sort(string.compare)
+  use uses <- result.try(
+    reach.scan(index, modules)
+    |> result.map_error(fn(errors) {
+      list.each(errors, log.error("brazier.build.analyzer", _))
+      string.join(errors, "\n")
+    }),
+  )
+  let declared =
+    list.filter_map(uses, fn(stream_use) {
+      case stream_use {
+        reach.Declared(at:, module:, owner:, name:) ->
+          Ok(#(at, module, owner, name))
+        reach.Rendered(..) | reach.Referenced(..) -> Error(Nil)
+      }
+    })
+  let named =
+    list.filter_map(declared, fn(d) {
+      case d.3 {
+        Ok(name) -> Ok(#(name, d))
+        Error(_) -> Error(Nil)
+      }
+    })
+  let errors =
+    list.flatten([
+      list.filter_map(uses, stream_use_error),
+      duplicate_stream_errors(named),
+      simple_app_stream_errors(call, client_reach.streams),
+    ])
+    |> list.unique
+    |> list.sort(string.compare)
+  case errors {
+    [] -> {
+      let decls =
+        list.map(named, fn(entry) {
+          let #(name, #(at, module, owner, _)) = entry
+          StreamDecl(
+            name:,
+            at:,
+            item_type: stream_item_type(index, module, owner),
+          )
+        })
+        |> list.sort(fn(a, b) { string.compare(a.name, b.name) })
+      list.each(decls, fn(decl) {
+        log.info(
+          "brazier.build.analyzer",
+          "Stream "
+            <> decl.name
+            <> " declared at "
+            <> decl.at
+            <> " (items: "
+            <> option.unwrap(decl.item_type, "type not annotated")
+            <> ")",
+        )
+      })
+      Ok(decls)
+    }
+    errors -> {
+      list.each(errors, log.error("brazier.build.analyzer", _))
+      Error(
+        "The app's streams break the build's rules (docs/design/STREAMS.md 10):\n"
+        <> string.join(list.map(errors, fn(e) { "  " <> e }), "\n"),
+      )
+    }
+  }
+}
+
+fn stream_use_error(stream_use: reach.StreamUse) -> Result(String, Nil) {
+  case stream_use {
+    reach.Declared(name: Ok(name), at:, ..) ->
+      case stream.is_valid_name(name) {
+        True -> Error(Nil)
+        False ->
+          Ok(
+            at
+            <> ": the stream name \""
+            <> name
+            <> "\" is not valid: a stream name is 1 to 64 characters of a-z, 0-9 and _, starting with a letter.",
+          )
+      }
+    reach.Declared(name: Error(kind), at:, ..) ->
+      Ok(
+        at
+        <> ": the name of a stream must be a string literal in the `stream.new` call, not "
+        <> kind
+        <> ". The build reads the names to check they are unique and to list them for the runtime and the client.",
+      )
+    reach.Rendered(item: Ok(Nil), ..) -> Error(Nil)
+    reach.Rendered(item: Error(kind), at:) ->
+      Ok(
+        at
+        <> ": the item function of `stream.render` must be a named top-level function (`render_line` or `module.render_line`), not "
+        <> kind
+        <> ". The browser renders an item only when it is inserted or updated, so an item cannot depend on the model or Local state; put state that changes every item on the container's attributes, or insert the items again.",
+      )
+    reach.Referenced(at:, function:) ->
+      Ok(
+        at
+        <> ": `stream."
+        <> function
+        <> "` is used as a value. Call it directly (`stream."
+        <> function
+        <> "(..)`) so the build can check its arguments.",
+      )
+  }
+}
+
+fn duplicate_stream_errors(
+  named: List(#(String, #(String, String, String, Result(String, String)))),
+) -> List(String) {
+  named
+  |> list.group(fn(entry) { entry.0 })
+  |> dict.to_list
+  |> list.filter_map(fn(group) {
+    let #(name, entries) = group
+    let places =
+      list.map(entries, fn(entry) { entry.1.0 })
+      |> list.unique
+      |> list.sort(string.compare)
+    case places {
+      [_, _, ..] ->
+        Ok(
+          "The stream name \""
+          <> name
+          <> "\" is declared more than once: at "
+          <> string.join(places, " and at ")
+          <> ". Stream names are global to the app; give each `stream.new` its own name.",
+        )
+      [] | [_] -> Error(Nil)
+    }
+  })
+}
+
+fn simple_app_stream_errors(
+  call: AppCall,
+  client_uses: List(reach.StreamUse),
+) -> List(String) {
+  case call.kind {
+    app_call.Simple ->
+      list.filter_map(client_uses, fn(stream_use) {
+        case stream_use {
+          reach.Rendered(at:, ..) ->
+            Ok(
+              at
+              <> ": a `brazier.simple` app renders a stream, but a simple app's `update` returns no effects, so nothing can fill it. Build the app with `brazier.application` and fill the stream from `update` with `stream.insert`.",
+            )
+          reach.Declared(..) | reach.Referenced(..) -> Error(Nil)
+        }
+      })
+    app_call.Application | app_call.FullApplication -> []
+  }
+}
+
+/// `Item` from `owner`'s `-> Stream(Item)` return annotation.
+fn stream_item_type(
+  index: reach.Index,
+  module: String,
+  owner: String,
+) -> option.Option(String) {
+  let found = {
+    use info <- result.try(dict.get(index, module))
+    use def <- result.try(dict.get(info.functions, owner))
+    case def.definition.return {
+      Some(glance.NamedType(name:, module: qualifier, parameters: [item], ..)) ->
+        case is_type(info, qualifier, name, reach.stream_module, "Stream") {
+          True -> {
+            let scope = field_type.scope(info.ast, info.path, user_paths(index))
+            Ok(field_type.describe(field_type.resolve(scope, item)))
+          }
+          False -> Error(Nil)
+        }
+      _ -> Error(Nil)
+    }
+  }
+  option.from_result(found)
 }
 
 fn describe_ref(ref: FunctionRef) -> String {
@@ -253,8 +492,7 @@ fn view_types(
   let assert Ok(def) = dict.get(info.functions, view.name)
     as "resolved view function is not defined"
   let function = def.definition
-  let scope =
-    field_type.scope(info.ast, info.path, set.from_list(dict.keys(index)))
+  let scope = field_type.scope(info.ast, info.path, user_paths(index))
   let where =
     info.path
     <> ".gleam:"
@@ -311,21 +549,35 @@ fn is_element(
   qualifier: option.Option(String),
   name: String,
 ) -> Bool {
+  is_type(info, qualifier, name, element_module, "Element")
+}
+
+/// True when `qualifier.name` (or `name` unqualified) written in `info`'s
+/// module names `module.type_name`.
+fn is_type(
+  info: reach.ModuleInfo,
+  qualifier: option.Option(String),
+  name: String,
+  module: String,
+  type_name: String,
+) -> Bool {
   case qualifier {
     Some(qualifier) ->
-      name == "Element"
-      && dict.get(info.aliases, qualifier) == Ok(element_module)
-    None -> dict.get(info.types, name) == Ok(#(element_module, "Element"))
+      name == type_name && dict.get(info.aliases, qualifier) == Ok(module)
+    None -> dict.get(info.types, name) == Ok(#(module, type_name))
   }
 }
 
-/// Every user type, with type aliases expanded inside the definitions.
+/// Every user type, with type aliases expanded inside the definitions. The
+/// pruned Brazier modules' types are not user types: no codec is generated
+/// for them.
 fn type_defs(
   index: reach.Index,
 ) -> Result(Dict(#(String, String), TypeDef), String) {
-  let known = set.from_list(dict.keys(index))
+  let known = user_paths(index)
   let raw =
     dict.fold(index, dict.new(), fn(acc, path, info) {
+      use <- bool.guard(!set.contains(known, path), acc)
       let scope = field_type.scope(info.ast, path, known)
       let acc =
         list.fold(info.ast.custom_types, acc, fn(acc, def) {

@@ -3,6 +3,7 @@
     store_navigation_targets/1, get_navigation_targets/0,
     try_load_codec_encoder/0, try_load_codec_decoder/0,
     try_load_codec_event_decoder/0,
+    try_load_codec_stream_names/0,
     message_queue_len/1,
     event_label/1,
     run_guarded/1,
@@ -110,6 +111,10 @@ try_load_codec_decoder() ->
 %% The generated brazier_codec:decode_event/4.
 try_load_codec_event_decoder() ->
     try_load(decode_event, 4).
+
+%% The generated brazier_codec:stream_names/0.
+try_load_codec_stream_names() ->
+    try_load(stream_names, 0).
 
 try_load(Name, Arity) ->
     case code:ensure_loaded(brazier_codec) of

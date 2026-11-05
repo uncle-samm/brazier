@@ -42,6 +42,7 @@ fn int_codec() -> runtime.GeneratedCodec(Int, Msg) {
         other -> Error(error.RuntimeError(reason: "unknown handler " <> other))
       }
     },
+    stream_names: [],
   )
 }
 

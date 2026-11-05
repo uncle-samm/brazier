@@ -102,7 +102,7 @@ event(Socket, Buffer, Clock, Deadline) ->
         ok ->
             case recv_text(Socket, Buffer, Deadline) of
                 {ok, Reply, Buffer1} ->
-                    Ack = <<"\"ack_clock\":", ClockBin/binary, "}">>,
+                    Ack = <<"\"ack_clock\":", ClockBin/binary, ",\"streams\":">>,
                     case {binary:match(Reply, <<"\"type\":\"patch\"">>),
                           binary:match(Reply, Ack)} of
                         {{_, _}, {_, _}} ->

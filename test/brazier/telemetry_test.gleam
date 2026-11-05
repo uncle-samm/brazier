@@ -344,10 +344,16 @@ fn documented() -> List(Documented) {
     Span(
       ["runtime", "render"],
       ["route", "event", "connection_id"],
-      ["patch_bytes"],
+      ["patch_bytes", "stream_bytes"],
       [],
     ),
     Plain(["runtime", "stop"], ["uptime"], ["reason"]),
+    Plain(
+      ["stream", "delta"],
+      ["inserts", "updates", "deletes", "trimmed", "bytes"],
+      ["stream", "reset", "connection_id"],
+    ),
+    Plain(["stream", "refused"], ["count", "bytes"], ["stream", "reason"]),
     Span(["effect", "run"], ["effect"], [], []),
     Plain(["effect", "timer", "rejected"], [], ["limit"]),
     Plain(["effect", "after", "rejected"], [], ["limit"]),
@@ -461,8 +467,10 @@ fn emit_everything() -> Nil {
   let render = fn(run) {
     telemetry.runtime_render_span("/", "increment", "c1", run)
   }
-  let assert 4 = render(fn() { #(4, 128) }) as "render returns 4"
+  let assert 4 = render(fn() { #(4, 128, 64) }) as "render returns 4"
   crash(fn() { render(fn() { panic as "render crashed" }) })
+  telemetry.stream_delta(1, 2, 3, 4, 100, "log", False, "c1")
+  telemetry.stream_refused(1, 70_000, "log", "item_too_large")
   telemetry.runtime_stop(1000, "normal")
   let effect = fn(run) { telemetry.effect_run_span("http", run) }
   let assert 5 = effect(fn() { 5 }) as "effect returns 5"

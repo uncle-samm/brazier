@@ -82,6 +82,7 @@ fn watching() -> presence_watch.Watch(Model, Msg) {
       decode_event: fn(_name, handler_id, _data, _path) {
         Error(error.RuntimeError(reason: "no client events: " <> handler_id))
       },
+      stream_names: [],
     )
   let assert Ok(config) =
     brazier.simple(
@@ -133,6 +134,7 @@ fn session_config(
     secret_key: "",
     presence: Some(watching()),
     title: None,
+    streams: runtime.no_streams(),
   )
 }
 

@@ -702,6 +702,49 @@ pub fn snapshot_of_windows_without_items_is_an_error_test() {
     stream_window.snapshot(seeded(last(3), ["a"]))
 }
 
+// --- Key count and emptied windows ------------------------------------------
+
+pub fn key_count_sums_every_window_test() {
+  let assert 0 = stream_window.key_count(stream_window.new(keep_items: False))
+  let windows =
+    apply(seeded(last(3), ["a", "b"]), [
+      Op(
+        name: "t",
+        limit: first(5),
+        action: stream_op.Insert("x", item("x"), Back),
+      ),
+    ]).windows
+  let assert 3 = stream_window.key_count(windows)
+}
+
+pub fn emptied_windows_keep_each_limit_and_no_item_test() {
+  let windows =
+    apply(stream_window.new(keep_items: True), [
+      insert(last(3), "a", Back),
+      insert(last(3), "b", Back),
+    ]).windows
+  let emptied = stream_window.emptied(windows)
+  let assert 0 = stream_window.key_count(emptied)
+  let assert Ok([]) = stream_window.keys(emptied, "s")
+  let assert Ok(limit) = stream_window.limit(emptied, "s")
+  let assert True = limit == last(3)
+  // No item is kept once emptied: nothing is sent again.
+  let assert Error(stream_window.ItemsNotKept) = stream_window.snapshot(emptied)
+  // The limit the stream was first used with still holds (design 7.5).
+  let assert Ok(stream_window.Applied(refused: [refusal], ..)) =
+    stream_window.apply_update(
+      emptied,
+      [insert(first(3), "c", Back)],
+      stream_window.default_limits(),
+    )
+  let assert stream_window.LimitMismatch(..) = refusal.reason
+  // An insert into the emptied window is placed as in a fresh one.
+  let applied = apply(emptied, [insert(last(3), "c", Back)])
+  let assert ["c"] = keys_of(applied.windows)
+  let assert [at_c] = one_delta(applied).inserts
+  let assert True = at_c == at("c", 0)
+}
+
 // --- Wire text --------------------------------------------------------------
 
 pub fn delta_wire_text_test() {
@@ -727,4 +770,37 @@ pub fn applied_streams_json_is_the_encoded_changes_test() {
     apply(seeded(last(3), ["a", "b", "c"]), [insert(last(3), "d", Back)])
   let assert Applied(streams_json:, changes: [Change(delta:, ..)], ..) = applied
   let assert True = streams_json == stream_window.encode_deltas([delta])
+}
+
+// --- Descriptions -----------------------------------------------------------
+
+pub fn describe_limit_uses_the_app_spelling_test() {
+  let assert "KeepLast(300)" = stream_window.describe_limit(last(300))
+  let assert "KeepFirst(1)" = stream_window.describe_limit(first(1))
+}
+
+pub fn describe_op_reason_names_the_sizes_test() {
+  let assert "the limit 2000 is outside 1 to 1000" =
+    stream_window.describe_op_reason(stream_window.LimitOutOfRange(2000, 1000))
+  let assert "the stream was first used with KeepLast(3), this op uses KeepFirst(3)" =
+    stream_window.describe_op_reason(stream_window.LimitMismatch(
+      last(3),
+      first(3),
+    ))
+  let assert "the key is empty" =
+    stream_window.describe_op_reason(stream_window.KeyEmpty)
+  let assert "the key is 300 bytes, over the limit of 256" =
+    stream_window.describe_op_reason(stream_window.KeyTooLarge(300, 256))
+  let assert "the item is 70000 bytes, over the limit of 65536" =
+    stream_window.describe_op_reason(stream_window.ItemTooLarge(70_000, 65_536))
+}
+
+pub fn describe_update_refusal_names_the_sizes_test() {
+  let assert "the update carries 1001 stream ops, over the limit of 1000" =
+    stream_window.describe_update_refusal(stream_window.TooManyOps(1001, 1000))
+  let assert "the update's stream entries are 2000000 bytes, over the frame limit of 1048576" =
+    stream_window.describe_update_refusal(stream_window.FrameTooLarge(
+      2_000_000,
+      1_048_576,
+    ))
 }

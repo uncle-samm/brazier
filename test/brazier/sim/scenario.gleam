@@ -175,7 +175,7 @@ pub fn corrupt() -> Scenario {
     SendEventWithClock("h0", "{}", final_corrupt_clock),
     ReceiveUntil(
       5000,
-      "\"ack_clock\":" <> int.to_string(final_corrupt_clock) <> "}",
+      "\"ack_clock\":" <> int.to_string(final_corrupt_clock) <> ",\"streams\":",
     ),
     Disconnect,
   ])

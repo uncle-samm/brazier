@@ -26,6 +26,7 @@ import brazier/effect
 import brazier/element.{type Element}
 import brazier/event
 import brazier/html
+import brazier/internal/stream_window
 import brazier/middleware
 import brazier/ssr
 import brazier/static
@@ -497,6 +498,7 @@ fn ssr_scenario(page: #(Int, Int)) -> Result(List(Metric), String) {
       head_html: None,
       dev_mode: False,
       recovery_encoder: None,
+      stream_limits: stream_window.default_limits(),
     )
   let listener =
     transport.TransportConfig(

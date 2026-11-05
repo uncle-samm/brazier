@@ -52,10 +52,10 @@ import gleam/list
 import gleam/set.{type Set}
 import gleam/string
 
-/// The stream bounds (decision D4). They will be `SecurityLimits` fields
-/// (`stream_max_limit`, `stream_item_max_bytes`,
-/// `stream_ops_max_per_update`, `stream_frame_max_bytes`,
-/// `stream_key_max_bytes`); until then the caller passes them.
+/// The stream bounds (decision D4): the `SecurityLimits` fields
+/// `stream_max_limit`, `stream_item_max_bytes`,
+/// `stream_ops_max_per_update`, `stream_frame_max_bytes` and
+/// `stream_key_max_bytes`, as `transport.stream_limits` reads them.
 pub type Limits {
   Limits(
     /// The largest limit a stream may have.
@@ -226,6 +226,23 @@ pub fn limit(windows: Windows, name: String) -> Result(Limit, Nil) {
   }
 }
 
+/// The number of keys in every window together.
+pub fn key_count(windows: Windows) -> Int {
+  dict.fold(windows.streams, 0, fn(total, _, window) { total + window.size })
+}
+
+/// The same streams with every window empty and no items kept: what a
+/// client that was sent nothing holds. Each stream keeps the limit it was
+/// first used with (design 7.5). The runtime uses it when the first
+/// join's stream entries could not be sent (design 7.4).
+pub fn emptied(windows: Windows) -> Windows {
+  let streams =
+    dict.map_values(windows.streams, fn(_, window) {
+      Window(..window, keys: [], size: 0, members: set.new(), items: NoItems)
+    })
+  Windows(streams: streams, keep_items: False)
+}
+
 /// Apply one update's ops, in order. `Error` when the update is over a
 /// per-update bound; the windows are then unchanged.
 pub fn apply_update(
@@ -367,6 +384,59 @@ pub fn update_refusal_name(refusal: UpdateRefusal) -> String {
   case refusal {
     TooManyOps(..) -> "too_many_ops"
     FrameTooLarge(..) -> "frame_too_large"
+  }
+}
+
+/// A limit as the app wrote it: `KeepFirst(300)` or `KeepLast(300)`.
+pub fn describe_limit(limit: Limit) -> String {
+  case limit.keep {
+    First -> "KeepFirst("
+    Last -> "KeepLast("
+  }
+  <> int.to_string(limit.count)
+  <> ")"
+}
+
+/// Why an op was refused, for log lines and `error` frames.
+pub fn describe_op_reason(reason: OpReason) -> String {
+  case reason {
+    LimitOutOfRange(count, max) ->
+      "the limit "
+      <> int.to_string(count)
+      <> " is outside 1 to "
+      <> int.to_string(max)
+    LimitMismatch(window, op) ->
+      "the stream was first used with "
+      <> describe_limit(window)
+      <> ", this op uses "
+      <> describe_limit(op)
+    KeyEmpty -> "the key is empty"
+    KeyTooLarge(bytes, max) ->
+      "the key is "
+      <> int.to_string(bytes)
+      <> " bytes, over the limit of "
+      <> int.to_string(max)
+    ItemTooLarge(bytes, max) ->
+      "the item is "
+      <> int.to_string(bytes)
+      <> " bytes, over the limit of "
+      <> int.to_string(max)
+  }
+}
+
+/// Why a whole update was refused, for log lines and `error` frames.
+pub fn describe_update_refusal(refusal: UpdateRefusal) -> String {
+  case refusal {
+    TooManyOps(count, max) ->
+      "the update carries "
+      <> int.to_string(count)
+      <> " stream ops, over the limit of "
+      <> int.to_string(max)
+    FrameTooLarge(bytes, max) ->
+      "the update's stream entries are "
+      <> int.to_string(bytes)
+      <> " bytes, over the frame limit of "
+      <> int.to_string(max)
   }
 }
 

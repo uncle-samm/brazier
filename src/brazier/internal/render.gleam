@@ -17,8 +17,18 @@
 /// client bundle and to Erlang for SSR. Name checks and escaping, which run
 /// for every node, are in `brazier_render_ffi` on each target.
 ///
+/// A stream (`brazier/stream.render`) renders as its container element,
+/// with `data-brazier-stream="<name>"`, and lists the container in the
+/// render's container table. Its items are rendered one by one with
+/// `render_item`, whose handler ids are relative to the item's root and
+/// start with `i` (`"i0"`, `"i0.2"`), so an item's HTML and handler table do
+/// not depend on where the item is in the stream (docs/design/STREAMS.md
+/// 8.2). SSR fills each container with its items (`render_filled`); the
+/// client renders it empty and lets the stream applier fill it.
+///
 /// Reference: Lustre's `vdom/vnode` and `vdom/vattr`, LiveView's
-/// `phx-click` bindings.
+/// `phx-click` bindings, LiveView's `phx-update="stream"` containers.
+import brazier/internal/stream_op
 import brazier/internal/url
 import brazier/log
 import gleam/dict.{type Dict}
@@ -26,6 +36,7 @@ import gleam/dynamic.{type Dynamic}
 import gleam/dynamic/decode
 import gleam/int
 import gleam/list
+import gleam/result
 import gleam/string
 import gleam/string_tree.{type StringTree}
 
@@ -42,7 +53,41 @@ pub type Node(msg) {
   Nothing
   /// HTML injected without escaping or URL checks.
   RawHtml(html: String)
+  /// A stream's container: a `tag` element holding the stream's items,
+  /// built by `brazier/stream.render`. `item` decodes one item's JSON and
+  /// renders it; `element.map` composes onto it. `item_ref` is the identity
+  /// of the app's item function, for comparison only (see `Container`).
+  Stream(
+    name: String,
+    limit: stream_op.Limit,
+    tag: String,
+    attributes: List(Attr(msg)),
+    item: fn(Dynamic) -> Result(Node(msg), String),
+    item_ref: Dynamic,
+  )
 }
+
+/// A stream container met by a render, in document order.
+///
+/// `item_ref` is the app's item function as it was passed to
+/// `stream.render`, never called: two renders of the same stream compare
+/// their `item_ref`s to tell whether the items must be rendered again.
+/// `element.map` does not change it, so the same item function under two
+/// different `element.map`s compares equal.
+pub type Container(msg) {
+  Container(
+    name: String,
+    limit: stream_op.Limit,
+    item: fn(Dynamic) -> Result(Node(msg), String),
+    item_ref: Dynamic,
+  )
+}
+
+/// `value` as a `Dynamic`, unchanged. `brazier/stream.render` uses it for a
+/// container's `item_ref`.
+@external(erlang, "brazier_render_ffi", "identity")
+@external(javascript, "../../brazier_render_ffi.mjs", "identity")
+pub fn item_ref(value: a) -> Dynamic
 
 /// An attribute of an element.
 pub type Attr(msg) {
@@ -154,6 +199,15 @@ pub fn map_node(node: Node(a), f: fn(a) -> b) -> Node(b) {
         list.map(attributes, map_attr(_, f)),
         list.map(children, map_node(_, f)),
       )
+    Stream(name, limit, tag, attributes, item, item_ref) ->
+      Stream(
+        name: name,
+        limit: limit,
+        tag: tag,
+        attributes: list.map(attributes, map_attr(_, f)),
+        item: fn(value) { result.map(item(value), map_node(_, f)) },
+        item_ref: item_ref,
+      )
   }
 }
 
@@ -173,10 +227,11 @@ pub fn map_attr(attr: Attr(a), f: fn(a) -> b) -> Attr(b) {
 
 // --- Rendering ---
 
-/// Render a tree to HTML and collect its handler table.
+/// Render a tree to HTML and collect its handler table. A stream renders
+/// as its empty container.
 pub fn render(node: Node(msg)) -> #(String, Handlers(msg)) {
-  let #(tree, handlers) = walk(node, "0", string_tree.new(), dict.new())
-  #(string_tree.to_string(tree), handlers)
+  let #(html, handlers, _containers) = render_containers(node)
+  #(html, handlers)
 }
 
 /// Render a tree to HTML without its handlers.
@@ -184,58 +239,242 @@ pub fn to_string(node: Node(msg)) -> String {
   render(node).0
 }
 
+/// Render a tree to HTML, with its handler table and its stream
+/// containers in document order. Each container is rendered empty.
+///
+/// Crashes when the tree renders the same stream twice: a stream is
+/// rendered at most once per view (docs/design/STREAMS.md 5.3).
+pub fn render_containers(
+  node: Node(msg),
+) -> #(String, Handlers(msg), List(Container(msg))) {
+  let done = walk(node, "0", View(fill: empty_fill), new_walk())
+  // Invariant: in a view, only `fill` records a fault, and `empty_fill`
+  // never fails.
+  let assert [] = done.faults
+    as "brazier/internal/render: an empty render recorded a fault"
+  #(
+    string_tree.to_string(done.html),
+    done.handlers,
+    list.reverse(done.containers),
+  )
+}
+
+/// Render a tree to HTML, each stream container holding the HTML `fill`
+/// gives it. `Error` with every reason `fill` gave, joined with `; `, when
+/// it failed for a container.
+///
+/// Crashes when the tree renders the same stream twice, as
+/// `render_containers` does.
+pub fn render_filled(
+  node: Node(msg),
+  fill: fn(Container(msg)) -> Result(String, String),
+) -> Result(String, String) {
+  let done = walk(node, "0", View(fill: fill), new_walk())
+  case done.faults {
+    [] -> Ok(string_tree.to_string(done.html))
+    faults -> Error(string.join(list.reverse(faults), "; "))
+  }
+}
+
+/// Render one item of `container`: decode `item` with the container's item
+/// function and render it with its root keyed `key`. Handler ids are
+/// relative to the item's root and start with `i` (`"i0"`, `"i0.2"`), and
+/// the handler table is the item's own (docs/design/STREAMS.md 8.2).
+///
+/// `Error` when the item does not decode, when its root is not one element
+/// (text, `none`, raw HTML, a keyed node or a stream), when the root sets
+/// its own `data-brazier-key`, or when the item renders a stream. The
+/// server renders SSR items and the client renders inserted items with this
+/// function, so the two give the same HTML.
+pub fn render_item(
+  container: Container(msg),
+  key: String,
+  item: Dynamic,
+) -> Result(#(String, Handlers(msg)), String) {
+  let prefix = "stream " <> container.name <> ", item " <> key <> ": "
+  use root <- result.try(
+    container.item(item)
+    |> result.map_error(fn(reason) { prefix <> "does not decode: " <> reason }),
+  )
+  case root {
+    Element(tag, attributes, children) ->
+      case has_attribute(attributes, "data-brazier-key") {
+        True ->
+          Error(
+            prefix
+            <> "the item's root sets data-brazier-key; the stream keys it",
+          )
+        False -> {
+          let keyed =
+            Element(
+              tag,
+              [Attribute("data-brazier-key", key), ..attributes],
+              children,
+            )
+          let done = walk(keyed, "i0", InItem, new_walk())
+          case done.faults {
+            [] -> Ok(#(string_tree.to_string(done.html), done.handlers))
+            faults -> Error(prefix <> string.join(list.reverse(faults), "; "))
+          }
+        }
+      }
+    Text(_) ->
+      Error(prefix <> "the item's root is text; it must be one element")
+    Nothing ->
+      Error(prefix <> "the item's root is element.none; it must be one element")
+    RawHtml(_) ->
+      Error(
+        prefix <> "the item's root is unsafe_raw_html; it must be one element",
+      )
+    Keyed(_, _) ->
+      Error(
+        prefix
+        <> "the item's root is element.keyed; the stream keys the root itself",
+      )
+    Stream(name, ..) ->
+      Error(prefix <> "the item's root is the stream " <> name)
+  }
+}
+
+/// Where a walk is.
+type Mode(msg) {
+  /// In a view: a stream renders as its container, holding what `fill`
+  /// gives it.
+  View(fill: fn(Container(msg)) -> Result(String, String))
+  /// In a stream's item: a stream is a fault.
+  InItem
+}
+
+/// What a walk has built so far. `containers` and `faults` are in reverse
+/// order.
+type Walk(msg) {
+  Walk(
+    html: StringTree,
+    handlers: Handlers(msg),
+    containers: List(Container(msg)),
+    faults: List(String),
+  )
+}
+
+fn new_walk() -> Walk(msg) {
+  Walk(
+    html: string_tree.new(),
+    handlers: dict.new(),
+    containers: [],
+    faults: [],
+  )
+}
+
+fn empty_fill(_container: Container(msg)) -> Result(String, String) {
+  Ok("")
+}
+
 fn walk(
   node: Node(msg),
   id: String,
-  html: StringTree,
-  handlers: Handlers(msg),
-) -> #(StringTree, Handlers(msg)) {
+  mode: Mode(msg),
+  acc: Walk(msg),
+) -> Walk(msg) {
   case node {
-    Nothing -> #(html, handlers)
-    RawHtml(raw) -> #(string_tree.append(html, raw), handlers)
-    Text(content) -> #(string_tree.append(html, escape_html(content)), handlers)
-    Keyed(key, child) -> walk(add_key(child, key), id, html, handlers)
+    Nothing -> acc
+    RawHtml(raw) -> Walk(..acc, html: string_tree.append(acc.html, raw))
+    Text(content) ->
+      Walk(..acc, html: string_tree.append(acc.html, escape_html(content)))
+    Keyed(key, child) -> walk(add_key(child, key), id, mode, acc)
     Element(tag, attributes, children) -> {
-      // Invariant: `brazier/element.element` (and the html/svg helpers that
-      // call it) asserts the same check. The constructors of this module are
-      // public, so a tree built directly is checked again here: a tag that
-      // could break out of the markup is a bug in the view.
-      let assert True = is_valid_tag_name(tag)
-        as "brazier/internal/render: tag names are a-z A-Z 0-9 - _ : ."
-      let #(plain, events) = collect_attributes(attributes)
-      let handlers =
-        list.fold(events, handlers, fn(acc, event) {
-          let #(name, handler) = event
-          dict.insert(acc, key(name, id), handler)
-        })
-      let html =
-        html
-        |> string_tree.append("<")
-        |> string_tree.append(tag)
-        |> append_plain(plain)
-        |> append_events(events, id)
-        |> string_tree.append(">")
+      let acc = open_tag(acc, tag, attributes, id)
       case is_void_element(tag) {
-        True -> #(html, handlers)
+        True -> acc
         False -> {
-          let #(html, handlers, _index) =
-            list.fold(children, #(html, handlers, 0), fn(acc, child) {
-              let #(html, handlers, index) = acc
-              let #(html, handlers) =
-                walk(child, id <> "." <> int.to_string(index), html, handlers)
-              #(html, handlers, index + 1)
+          let #(acc, _index) =
+            list.fold(children, #(acc, 0), fn(state, child) {
+              let #(acc, index) = state
+              let acc =
+                walk(child, id <> "." <> int.to_string(index), mode, acc)
+              #(acc, index + 1)
             })
-          #(
-            html
-              |> string_tree.append("</")
-              |> string_tree.append(tag)
-              |> string_tree.append(">"),
-            handlers,
-          )
+          close_tag(acc, tag)
         }
       }
     }
+    Stream(name, limit, tag, attributes, item, item_ref) ->
+      case mode {
+        InItem ->
+          Walk(..acc, faults: [
+            "the item renders the stream " <> name <> " inside it",
+            ..acc.faults
+          ])
+        View(fill) -> {
+          // Invariant: a stream's items are children of its container, so
+          // the container must be able to hold children.
+          let assert False = is_void_element(tag)
+            as "brazier/internal/render: a stream's container cannot be a void element"
+          // Invariant: the stream sets data-brazier-stream itself; the
+          // client finds the container by it.
+          let assert False = has_attribute(attributes, "data-brazier-stream")
+            as "brazier/internal/render: a stream's container sets data-brazier-stream itself"
+          // Invariant: the client keeps one store per stream and patches its
+          // one container (docs/design/STREAMS.md 5.3).
+          let assert False =
+            list.any(acc.containers, fn(container) { container.name == name })
+            as "brazier/internal/render: a stream is rendered at most once per view"
+          let container =
+            Container(name: name, limit: limit, item: item, item_ref: item_ref)
+          let acc =
+            open_tag(
+              acc,
+              tag,
+              [Attribute("data-brazier-stream", name), ..attributes],
+              id,
+            )
+          let acc = Walk(..acc, containers: [container, ..acc.containers])
+          let acc = case fill(container) {
+            Ok(inner) -> Walk(..acc, html: string_tree.append(acc.html, inner))
+            Error(reason) -> Walk(..acc, faults: [reason, ..acc.faults])
+          }
+          close_tag(acc, tag)
+        }
+      }
   }
+}
+
+/// Append `<tag attributes>` and record the element's handlers under `id`.
+fn open_tag(
+  acc: Walk(msg),
+  tag: String,
+  attributes: List(Attr(msg)),
+  id: String,
+) -> Walk(msg) {
+  // Invariant: `brazier/element.element` (and the html/svg helpers that
+  // call it) asserts the same check. The constructors of this module are
+  // public, so a tree built directly is checked again here: a tag that
+  // could break out of the markup is a bug in the view.
+  let assert True = is_valid_tag_name(tag)
+    as "brazier/internal/render: tag names are a-z A-Z 0-9 - _ : ."
+  let #(plain, events) = collect_attributes(attributes)
+  let handlers =
+    list.fold(events, acc.handlers, fn(handlers, event) {
+      let #(name, handler) = event
+      dict.insert(handlers, key(name, id), handler)
+    })
+  let html =
+    acc.html
+    |> string_tree.append("<")
+    |> string_tree.append(tag)
+    |> append_plain(plain)
+    |> append_events(events, id)
+    |> string_tree.append(">")
+  Walk(..acc, html: html, handlers: handlers)
+}
+
+fn close_tag(acc: Walk(msg), tag: String) -> Walk(msg) {
+  Walk(
+    ..acc,
+    html: acc.html
+      |> string_tree.append("</")
+      |> string_tree.append(tag)
+      |> string_tree.append(">"),
+  )
 }
 
 /// Put `data-brazier-key` on the element under a keyed wrapper. An explicit
@@ -250,6 +489,19 @@ fn add_key(node: Node(msg), key: String) -> Node(msg) {
             tag,
             [Attribute("data-brazier-key", key), ..attributes],
             children,
+          )
+      }
+    Stream(name, limit, tag, attributes, item, item_ref) ->
+      case has_attribute(attributes, "data-brazier-key") {
+        True -> node
+        False ->
+          Stream(
+            name: name,
+            limit: limit,
+            tag: tag,
+            attributes: [Attribute("data-brazier-key", key), ..attributes],
+            item: item,
+            item_ref: item_ref,
           )
       }
     Keyed(inner, child) -> Keyed(inner, child)

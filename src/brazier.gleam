@@ -625,6 +625,7 @@ pub fn to_config(
     title: fn(state) { app.title(sync(state)) },
     encode_model: encode_model,
     decode_event: codec.decode_event,
+    stream_names: codec.stream_names,
     restore_model: case app.restore {
       None -> None
       Some(restore) ->

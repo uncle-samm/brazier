@@ -1,4 +1,5 @@
-// Name checks and HTML escaping for brazier/internal/render on JavaScript.
+// Name checks, HTML escaping and the item_ref identity for
+// brazier/internal/render on JavaScript.
 //
 // These run once per element, attribute and text node of every render, so
 // they scan UTF-16 code units instead of splitting the string into
@@ -62,4 +63,10 @@ export function escape_html(text) {
 // Escape `&`, `"`, `<` and `>`.
 export function escape_attr(text) {
   return ATTR_TEST.test(text) ? text.replace(ATTR_ALL, replaceEntity) : text;
+}
+
+// `value` unchanged, typed as `Dynamic` on the Gleam side: a stream
+// container's `item_ref`, compared with `===` and never called.
+export function identity(value) {
+  return value;
 }

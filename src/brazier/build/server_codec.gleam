@@ -10,6 +10,7 @@
 ///   `{"__brazier_msg": ..}` envelope the client sends. Only the constructors
 ///   client code builds decode (see `brazier/build/codec_gen`); every other
 ///   tag is rejected.
+/// - `stream_names() -> List(String)`: the streams the app declares.
 import brazier/build/analyzer.{type Analysis}
 import brazier/build/codec_gen
 import brazier/build/field_type
@@ -87,6 +88,17 @@ pub fn generate(analysis: Analysis) -> Result(String, String) {
         )),
       ],
     ),
+    Function(
+      "stream_names",
+      True,
+      [
+        "The streams the app declares, sorted. The runtime refuses an op on",
+        "any other name (docs/design/STREAMS.md 7.5).",
+      ],
+      [],
+      gleam_code.TNamed(option.None, "List", [codec_gen.string_type()]),
+      [ExprStmt(ListExpr(list.map(stream_names(analysis), Str)))],
+    ),
     ..helpers
   ]
   let imports =
@@ -106,6 +118,14 @@ pub fn generate(analysis: Analysis) -> Result(String, String) {
     "Generated the server codec for " <> analysis.app_module,
   )
   source
+}
+
+/// The declared stream names, sorted, each once. The analyzer refuses a
+/// name declared twice, so `unique` only guards the generated list.
+pub fn stream_names(analysis: Analysis) -> List(String) {
+  list.map(analysis.streams, fn(decl) { decl.name })
+  |> list.unique
+  |> list.sort(string.compare)
 }
 
 /// `case brazier_json.parse(var, decoder) { Ok(v) -> Ok(v)  Error(e) ->

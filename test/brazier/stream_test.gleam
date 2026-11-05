@@ -1,8 +1,10 @@
 //// Tests for `brazier/stream`: the declaration, the op values and the test
 //// helpers.
 
+import brazier/effect.{type Effect}
 import brazier/internal/stream_op
 import brazier/internal/stream_window
+import brazier/log_capture
 import brazier/stream.{
   type Stream, Append, Deleted, Inserted, KeepFirst, KeepLast, Prepend,
 }
@@ -102,7 +104,7 @@ pub fn limit_over_the_maximum_is_declared_and_refused_by_the_window_test() {
   let assert Ok(applied) =
     stream_window.apply_update(
       stream_window.new(keep_items: False),
-      stream.to_ops(stream.insert(s, Line(1, "a"), at: Append)),
+      ops_of(stream.insert(s, Line(1, "a"), at: Append)),
       stream_window.default_limits(),
     )
   let assert [
@@ -137,7 +139,7 @@ pub fn insert_holds_key_and_json_test() {
 
 pub fn ops_carry_the_stream_limit_test() {
   let assert [stream_op.Op(name: "log", limit:, action: stream_op.Delete("k"))] =
-    stream.to_ops(stream.delete_key(log(), "k"))
+    ops_of(stream.delete_key(log(), "k"))
   let assert True = limit == stream_op.Limit(keep: stream_op.Last, count: 3)
 }
 
@@ -241,11 +243,94 @@ pub fn emitted_key_bound_is_checked_by_the_window_test() {
   let assert Ok(applied) =
     stream_window.apply_update(
       stream_window.new(keep_items: False),
-      stream.to_ops(stream.insert(s, Line(1, ""), at: Append)),
+      ops_of(stream.insert(s, Line(1, ""), at: Append)),
       stream_window.default_limits(),
     )
   let assert [stream_window.OpRefusal(reason: stream_window.KeyEmpty, ..)] =
     applied.refused
+}
+
+// --- Ops are effects --------------------------------------------------------
+
+pub fn an_op_is_not_a_none_effect_test() {
+  let assert False = effect.is_none(stream.delete_key(log(), "k"))
+  let assert True = effect.is_none(stream.insert_many(log(), [], at: Append))
+}
+
+pub fn batch_keeps_ops_in_order_with_other_callbacks_test() {
+  let eff =
+    effect.batch([
+      stream.insert(log(), Line(1, "a"), at: Append),
+      effect.from(fn(_dispatch) { Nil }),
+      stream.delete_key(log(), "line-9"),
+      effect.batch([
+        stream.insert(log(), Line(2, "b"), at: Prepend),
+        effect.none(),
+      ]),
+    ])
+  let assert True =
+    stream.emitted(eff)
+    == [
+      Inserted("log", "line-1", text(Line(1, "a")), Append),
+      Deleted("log", "line-9"),
+      Inserted("log", "line-2", text(Line(2, "b")), Prepend),
+    ]
+  // The rest keeps the one callback and no op.
+  let #(ops, rest) = effect.take_stream_ops(eff)
+  let assert 3 = list.length(ops)
+  let assert False = effect.is_none(rest)
+  let assert #([], again) = effect.take_stream_ops(rest)
+  let assert False = effect.is_none(again)
+}
+
+pub fn map_passes_ops_through_test() {
+  let eff: Effect(Int) =
+    effect.batch([
+      stream.insert(log(), Line(1, "a"), at: Append),
+      stream.reset(log(), [Line(2, "b")]),
+    ])
+  let mapped: Effect(String) = effect.map(eff, int.to_string)
+  let assert True = stream.emitted(mapped) == stream.emitted(eff)
+  let assert 2 = list.length(stream.emitted(mapped))
+}
+
+pub fn keyed_and_cancellable_leave_ops_unkeyed_test() {
+  let eff =
+    effect.batch([
+      stream.insert(log(), Line(1, "a"), at: Append),
+      stream.delete_key(log(), "line-1"),
+    ])
+  let assert True =
+    stream.emitted(effect.keyed("feed", eff)) == stream.emitted(eff)
+  let #(cancellable, _token) = effect.cancellable(eff)
+  let assert True = stream.emitted(cancellable) == stream.emitted(eff)
+  let #(ops, rest) = effect.take_stream_ops(effect.keyed("feed", eff))
+  let assert 2 = list.length(ops)
+  let assert True = effect.is_none(rest)
+}
+
+pub fn emitted_ignores_other_callbacks_test() {
+  let assert [] = stream.emitted(effect.from(fn(_dispatch) { Nil }))
+  let assert [] = stream.emitted(effect.none())
+}
+
+pub fn perform_crashes_on_a_stream_op_test() {
+  let #(result, logs) =
+    log_capture.capture(fn() {
+      rescue(fn() {
+        effect.perform(
+          stream.insert(log(), Line(1, "a"), at: Append),
+          fn(_msg) { Nil },
+          fn(_key, _generation, _msg) { Nil },
+        )
+      })
+    })
+  let assert Error(#("error", _)) = result
+  let assert True =
+    log_capture.has(logs, level: "error", containing: [
+      "1 stream op(s), the first for stream log",
+      "take_stream_ops",
+    ])
 }
 
 // --- round_trip -------------------------------------------------------------
@@ -298,11 +383,17 @@ fn emitted_key(emitted: stream.Emitted) -> String {
   }
 }
 
-fn apply(windows: stream_window.Windows, ops: stream.Ops) {
+fn ops_of(eff: Effect(msg)) -> List(stream_op.Op) {
+  let #(ops, rest) = effect.take_stream_ops(eff)
+  let assert True = effect.is_none(rest)
+  ops
+}
+
+fn apply(windows: stream_window.Windows, ops: Effect(msg)) {
   let assert Ok(applied) =
     stream_window.apply_update(
       windows,
-      stream.to_ops(ops),
+      ops_of(ops),
       stream_window.default_limits(),
     )
   applied.windows
