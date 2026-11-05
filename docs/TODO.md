@@ -14,6 +14,25 @@
   - **Resolution:** how it was fixed (fill in when resolved)
 -->
 
+- **Issue:** `brazier/internal/url.is_url_attribute` lowercases every
+  attribute name with `string.lowercase`. On Erlang, OTP's
+  `string:lowercase/1` raises and catches an exception inside for a name
+  that is already lowercase, about 0.1 µs a name, and `attribute.attribute`
+  pays it once per attribute it builds (`url.check`). The render's name
+  policy had the same cost twice per attribute and now lowercases `A-Z`
+  itself (`brazier_render_ffi:ascii_lowercase`), which took 13% off a
+  1000-row render with the other fix of Milestone 118's SSR work.
+  - **Context:** Milestone 118, m118-perf-server, profiling `ssr.rows_1000`
+    (docs/PERFORMANCE.md, "Growth with size").
+  - **Files:** `src/brazier/internal/url.gleam`,
+    `src/brazier_render_ffi.erl`, `src/brazier_render_ffi.mjs`
+  - **Attempted:** nothing in url.gleam: it was outside that agent's files.
+    The names it lowercases come from `attribute.attribute`, which has
+    already passed them through the ASCII-only markup name check, so
+    `render.ascii_lowercase` (made public, or moved to a shared internal
+    module) gives the same result; `render_js_test` already compares the
+    two targets on `url.check`.
+
 ## Resolved Issues
 
 <!-- Move resolved issues here with full resolution details -->

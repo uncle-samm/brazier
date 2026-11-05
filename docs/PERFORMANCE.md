@@ -286,9 +286,35 @@ Some notes on reading the numbers:
   both the old and the new frame, is not in the metric. The flat encoding
   these rows replaced measured 117 µs per 50 KB `model_sync` and about
   1 µs per patch.
-- **Growth with size.** SSR and the node client both scale linearly with
-  rows: `ssr.rows_1000` is about 8 ms a page against 1 ms at 100 rows,
-  and `client.patch.rows_1000` about 2.8 ms. `presence.list.10000` is
+- **Growth with size.** The table's `ssr.rows_1000` (about 8 ms a page
+  against 1 ms at 100 rows) was superlinear. A single-process profile of
+  the page (2026-11-05, a loaded machine) put the render at 0.3 ms for
+  100 rows, 4 ms for 1000 and 110 ms for 10,000: 14x, then 28x, for 10x
+  the rows, while every function's call count grew linearly. The growth
+  was `string_tree.to_string`, which is `unicode:characters_to_binary`:
+  on the deep left-nested iolist a render builds it costs 0.017 µs a
+  piece at 3,000 pieces, 0.028 at 30,000 and 0.121 at 300,000, where
+  `iolist_to_binary` stays at 0.011 to 0.015. A render's tree holds only
+  Gleam strings, which are UTF-8 already, so the walk now ends with
+  `iolist_to_binary` (`brazier_render_ffi:iodata_to_string`). The second
+  cost was OTP's `string:lowercase/1`, which raises and catches an
+  exception inside for a name that is already lowercase: about 0.1 µs a
+  name, 13% of the render, paid twice per attribute. The attribute name
+  policy now lowercases `A-Z` itself; `brazier/internal/url` still calls
+  `string.lowercase` once per attribute (a follow-up in docs/TODO.md).
+  After both, the same profile renders 100, 1000 and 10,000 rows in
+  0.25, 3.0 and 45 ms: 12x, then 15x, the rest being garbage collection
+  of the bigger heap. In `http_bench`, three runs each, interleaved on
+  the same loaded machine: `ssr.rows_1000` went from 913 to 929 req/s
+  (p50 8.2 to 8.4 ms) to 1146 to 1195 req/s (p50 6.5 to 6.7 ms), about
+  28% more pages; `ssr.rows_100` did not move outside its noise (8650 to
+  9890 req/s either way) and `ssr.stream_300` rose about 3% (826 to 838
+  req/s, then 850 to 866). `ssr.stream_300` is linear: of its 5.4 ms
+  single-process page, the 300 items cost about 1 to 2.5 µs per KB in
+  each of escaping, decoding the item JSON back (the check that the
+  stream's encoder and decoder agree) and its UTF-8 check in
+  `gleam/dynamic/decode`, and encoding the join's JSON.
+  `client.patch.rows_1000` is about 2.8 ms. `presence.list.10000` is
   about 5.9 ms, a full copy of 10,000 presences, while `track` and
   `untrack` stay flat at 4 to 6 µs.
 - **Repeated p50 values.** On Darwin, `erlang:monotonic_time` ticks at

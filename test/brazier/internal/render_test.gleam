@@ -62,6 +62,19 @@ fn oracle_event_name(name: String) -> Bool {
   })
 }
 
+/// The attribute name policy with OTP's Unicode lowercase, which the FFI
+/// ASCII lowercase replaced: only names the markup check passes, which are
+/// ASCII, reach the lowercase.
+fn oracle_attribute_name(name: String) -> Bool {
+  oracle_tag_name(name)
+  && {
+    let lower = string.lowercase(name)
+    !string.starts_with(lower, "on")
+    && lower != "srcdoc"
+    && lower != render.stream_attribute
+  }
+}
+
 fn oracle_name_grapheme(grapheme: String) -> Bool {
   case grapheme {
     "-" | "_" | ":" | "." -> True
@@ -94,6 +107,16 @@ pub const text_pieces = [
 pub const name_pieces = [
   "a", "z", "A", "Z", "0", "9", "-", "_", ":", ".", "/", "@", "[", "`", "{", " ",
   "\"", "=", "é", "\u{0301}", "\u{0E33}", "😀", "\t",
+]
+
+/// Attribute names around the refused names, in mixed case: random names
+/// almost never spell one. `render_js_test` checks them too.
+pub const attribute_names = [
+  "on", "On", "oN", "ON", "OnClick", "oNcLiCk", "ONLOAD", "onx", "o", "n",
+  "SRCDOC", "SrcDoc", "sRcDoC", "srcdocX", "XSrcDoc", "Data-Brazier-Stream",
+  "DATA-BRAZIER-STREAM", "data-brazier-Stream", "data-brazier-streams",
+  "attributeName", "ATTRIBUTENAME", "AttributeName", "class", "CLASS",
+  "aria-Label", "xlink:HREF", "Z", "a", "ÖnClick", "ońclick",
 ]
 
 /// MINSTD (Park and Miller). The product stays below 2^53, so the sequence
@@ -163,6 +186,40 @@ pub fn name_checks_match_oracle_on_random_names_test() {
       render.is_valid_event_name(name) == oracle_event_name(name)
       as { "is_valid_event_name differs on " <> string.inspect(name) }
   })
+}
+
+pub fn attribute_name_policy_matches_oracle_test() {
+  let names = list.append(attribute_names, samples(name_pieces, 8, 5000))
+  list.each(names, fn(name) {
+    let assert True =
+      render.is_valid_attribute_name(name) == oracle_attribute_name(name)
+      as { "is_valid_attribute_name differs on " <> string.inspect(name) }
+    let assert True =
+      render.is_allowed_attribute(name, "x") == oracle_attribute_name(name)
+      as { "is_allowed_attribute differs on " <> string.inspect(name) }
+  })
+  // Both outcomes occur among the fixed names.
+  let assert True = list.any(attribute_names, render.is_valid_attribute_name)
+  let assert True =
+    list.any(attribute_names, fn(name) { !render.is_valid_attribute_name(name) })
+}
+
+/// A render's HTML is the same bytes as its pieces joined, multibyte text
+/// included: the render turns its tree into a string without validating
+/// it again.
+pub fn render_keeps_multibyte_text_test() {
+  let node =
+    render.Element(
+      "div",
+      [render.Attribute("title", "日本 \"😀\""), render.Attribute("Lang", "é")],
+      [
+        render.Text("é<ü>"),
+        render.Element("span", [], [render.Text("\u{0E33}\u{0301}&")]),
+        render.RawHtml("<b>日本</b>"),
+      ],
+    )
+  let assert "<div title=\"日本 &quot;😀&quot;\" Lang=\"é\">é&lt;ü&gt;<span>\u{0E33}\u{0301}&amp;</span><b>日本</b></div>" =
+    render.to_string(node)
 }
 
 pub fn random_samples_cover_both_outcomes_test() {
