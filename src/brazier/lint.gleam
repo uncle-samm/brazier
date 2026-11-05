@@ -27,6 +27,7 @@
 /// and `as` messages is checked like any other.
 ///
 /// Reference: CLAUDE.md engineering principles, TigerBeetle approach.
+import brazier/build/files
 import brazier/build/source_location
 import brazier/internal/ascii
 import brazier/log
@@ -55,7 +56,7 @@ pub type Violation {
 /// Returns a list of violations found.
 pub fn lint_directory(dir: String) -> List(Violation) {
   log.info("brazier.lint", "Linting directory: " <> dir)
-  case simplifile.read_directory(dir) {
+  case files.list_directory(dir) {
     Ok(entries) -> {
       let violations =
         list.flat_map(entries, fn(entry) {
@@ -76,7 +77,7 @@ pub fn lint_directory(dir: String) -> List(Violation) {
         })
       violations
     }
-    Error(err) -> [io_violation(dir, "Cannot read directory " <> dir, err)]
+    Error(reason) -> [listing_violation(dir, reason)]
   }
 }
 
@@ -90,6 +91,18 @@ fn io_violation(
   Violation(file: path, location: "file", rule: "unreadable-path", message:)
 }
 
+/// A directory `files.list_directory` could not list. Its error already
+/// names the directory and the reason.
+fn listing_violation(dir: String, reason: String) -> Violation {
+  log.error("brazier.lint", reason)
+  Violation(
+    file: dir,
+    location: "file",
+    rule: "unreadable-path",
+    message: reason,
+  )
+}
+
 /// Lint Markdown documentation for stale public model language.
 /// Every file named `PROGRESS.md`, at any depth, is excluded: these are
 /// progress logs that record old names on purpose. The exclusion is by file
@@ -98,7 +111,7 @@ fn io_violation(
 /// linted like the rest of `docs/`.
 pub fn lint_docs_directory(dir: String) -> List(Violation) {
   log.info("brazier.lint", "Linting docs directory: " <> dir)
-  case simplifile.read_directory(dir) {
+  case files.list_directory(dir) {
     Ok(entries) ->
       list.flat_map(entries, fn(entry) {
         let path = dir <> "/" <> entry
@@ -116,9 +129,7 @@ pub fn lint_docs_directory(dir: String) -> List(Violation) {
           ]
         }
       })
-    Error(err) -> [
-      io_violation(dir, "Cannot read docs directory " <> dir, err),
-    ]
+    Error(reason) -> [listing_violation(dir, reason)]
   }
 }
 
@@ -181,7 +192,7 @@ const text_source_extensions = [
 /// `test` and `examples`.
 pub fn lint_names_directory(dir: String) -> List(Violation) {
   log.info("brazier.lint", "Linting names in directory: " <> dir)
-  case simplifile.read_directory(dir) {
+  case files.list_directory(dir) {
     Ok(entries) ->
       list.flat_map(entries, fn(entry) {
         let path = dir <> "/" <> entry
@@ -198,7 +209,7 @@ pub fn lint_names_directory(dir: String) -> List(Violation) {
           ]
         }
       })
-    Error(err) -> [io_violation(dir, "Cannot read directory " <> dir, err)]
+    Error(reason) -> [listing_violation(dir, reason)]
   }
 }
 

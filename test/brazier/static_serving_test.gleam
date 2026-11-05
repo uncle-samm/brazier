@@ -2,6 +2,8 @@
 /// strong ETags and If-None-Match, nosniff, method restriction, strict
 /// bundle names, gzip negotiation and the bundle cache. End-to-end tests
 /// go through a real listener over raw sockets.
+import brazier/build/files
+import brazier/child_vm
 import brazier/error
 import brazier/static
 import brazier/transport
@@ -33,18 +35,22 @@ fn write(path: String, contents: String) -> Nil {
 }
 
 fn cleanup(dir: String) -> Nil {
-  let assert Ok(Nil) = simplifile.delete(dir) as "test directory cleanup"
+  let assert Ok(Nil) = files.delete_if_exists(dir) as "test directory cleanup"
+  let assert Ok(False) = simplifile.is_directory(dir)
+    as "the test directory is gone"
   Nil
 }
 
-/// Deletes each file by name, without listing its directory. On macOS,
-/// OTP 28's `file:list_dir/1` never returns for a directory that holds a
-/// name starting with a combining mark, so `cleanup` (which lists) can only
-/// run once those files are gone.
-fn delete_files(paths: List(String)) -> Nil {
-  list.each(paths, fn(path) {
-    let assert Ok(Nil) = simplifile.delete_file(path) as "test file cleanup"
-  })
+/// `cleanup` for a directory holding a name that starts with a combining
+/// mark. OTP's own listing (`simplifile.delete` is `file:del_dir_r/1`) never
+/// returns on macOS for such a name; `files.delete_if_exists` lists with
+/// find(1) instead, and runs here in a child VM so that a regression fails
+/// the test by a timeout rather than hanging the suite.
+fn cleanup_marked(dir: String) -> Nil {
+  child_vm.delete_tree(dir)
+  let assert Ok(False) = simplifile.is_directory(dir)
+    as "the test directory is gone"
+  Nil
 }
 
 fn config_for(static_cfg: option.Option(static.StaticConfig)) {
@@ -223,8 +229,7 @@ pub fn combining_mark_does_not_smuggle_a_separator_test() {
     let assert True = resp.status == 403
       as "a separator before a combining mark is still refused"
   })
-  delete_files([dir <> "/a/\u{0301}b"])
-  cleanup(dir)
+  cleanup_marked(dir)
 }
 
 pub fn names_with_combining_marks_are_served_test() {
@@ -253,8 +258,7 @@ pub fn names_with_combining_marks_are_served_test() {
     let assert True = served == dir <> file
       as "the file served is the one named"
   })
-  delete_files([dir <> "/\u{0301}lead.txt", dir <> "/a/\u{0301}b.txt"])
-  cleanup(dir)
+  cleanup_marked(dir)
 }
 
 pub fn prefix_ending_in_a_prepend_character_is_cut_in_bytes_test() {

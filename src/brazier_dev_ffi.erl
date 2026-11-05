@@ -20,17 +20,20 @@
 
 %% Load every module in Ebin whose compiled code differs from the loaded
 %% version, or that is not loaded yet. Any module that cannot be reloaded
-%% makes the whole call an error naming it.
+%% makes the whole call an error naming it. Ebin is listed by
+%% brazier_dir_ffi, not file:list_dir/1, which never returns on macOS for a
+%% name that starts with a combining mark.
 reload_modules(Ebin) ->
     Dir = unicode:characters_to_list(Ebin),
-    case file:list_dir(Dir) of
-        {ok, Files} ->
+    case brazier_dir_ffi:list(Ebin) of
+        {ok, Names} ->
+            Files = [unicode:characters_to_list(Name) || Name <- Names],
             Modules = lists:sort(
                 [filename:rootname(F) || F <- Files, filename:extension(F) =:= ".beam"]
             ),
             reload_each(Dir, Modules, [], []);
         {error, Reason} ->
-            {error, format("Cannot list ~ts: ~tp", [Dir, Reason])}
+            {error, Reason}
     end.
 
 reload_each(_Dir, [], Reloaded, []) ->
