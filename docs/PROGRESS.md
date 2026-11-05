@@ -784,6 +784,10 @@
   - m118-residue: the residue-pending modules, L190 and L414.
   The two streams halves merge together before CDP runs, because each breaks the suite on its own.
 - Decision, 2026-11-05: 4401 stays shared by an `init` 401 and a revoked or expired session. Both mean "authentication is no longer valid; reload" to the client. The server tells them apart by a distinct cause in the close's log line and telemetry metadata. m118-logs builds it.
+- Decision, 2026-11-05: m118-logs reproduced L453. Both problems are in the runtime's send paths:
+  - `message_queue_len` returns an invented 1000000000 for a dead pid, so a dead connection is reported as slow on every broadcast;
+  - a slow connection gets another `CloseForBackpressure` and another warning on every broadcast.
+  It stays inside one connection. The fix touches about 20 send sites in `runtime.gleam`, which m118-streams-server is rewriting, so a dedicated agent builds it from m118-logs' spec once streams-server merges. That agent also decides whether to monitor connection owners, following the Phoenix pattern.
 - Decision, 2026-11-05: m118-streams-client checks the required `streams` field with synthetic frames only. Making the replay of recorded server frames (`sync_vectors.mjs`) strict waits for the merge with the server half, so neither branch carries a red test.
 - [ ] Follow-up: `crdt_test.gleam:597` (`append_cost_does_not_grow_with_the_values_under_the_key_test`) flaked once on m118-transport's branch (3427 vs 992 reductions). m118-cluster owns the CRDT; if it isn't fixed there, phase B.
 - [ ] Follow-up: `patch_bench` metrics need a baseline (the re-baseline item).
