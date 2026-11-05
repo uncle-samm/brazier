@@ -123,6 +123,17 @@ create_via_owner(Name, AtomName, Type, Moves) ->
                                          "Table owner moved while creating ~p, asking again",
                                          [AtomName]),
                     ensure_existing_or_create(Name, AtomName, Type, Moves - 1);
+                {'DOWN', MRef, process, _, noproc} when Moves > 0 ->
+                    %% The owner the lookup found was gone before the
+                    %% monitor was taken: it moved to the supervised owner
+                    %% (hand_over/2 gives up the name before it exits) or
+                    %% died. The request reached no one, so look the owner
+                    %% up again, as a call made a moment later would.
+                    brazier_log_ffi:info(<<"brazier.ets">>,
+                                        "Table owner ~p was gone before the creation of ~p "
+                                        "monitored it (it moved or died), asking again",
+                                        [Owner, AtomName]),
+                    ensure_existing_or_create(Name, AtomName, Type, Moves - 1);
                 {'DOWN', MRef, process, _, Reason} ->
                     {error, {table_owner_unavailable, Name, format_reason(Reason)}}
             after ?OWNER_TIMEOUT_MS ->
@@ -235,8 +246,9 @@ count_owned({supervised, Owned}) -> atomics:add(Owned, 1, 1).
 
 %% Runs in an owner on demand that the supervised owner New adopts: give up
 %% the name, finish the creations already queued here, give every table to
-%% New and exit. A creation sent here after that sees the owner moved and
-%% asks again (create_via_owner/4).
+%% New and exit. A creation sent here after that sees the owner moved, or
+%% gone (noproc) when it monitors after the exit, and asks again
+%% (create_via_owner/4).
 hand_over(New, Ref) ->
     true = unregister(?OWNER),
     drain_creates(),
