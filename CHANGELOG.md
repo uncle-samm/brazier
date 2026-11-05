@@ -427,6 +427,17 @@ open follow-ups), which is in progress.
 
 ### Changed
 
+- (M118 server-residue) URL attribute checks and Host/Origin validation
+  lowercase names, schemes and hosts as ASCII instead of with OTP
+  `string:lowercase` (`url.check(class, x)` about 155 to about 74 ns,
+  `host_allowed` about 1.9 to about 0.8 µs).
+- (M118 server-residue) `transport.encode_server_message` flattens through
+  an iolist: a 678 KB message went from about 470 µs to about 14 µs.
+- (M118 server-residue) `brazier/stress` joins with the page's build id, so
+  a stress run no longer logs "carries no build id" on every join.
+- (M118 server-residue) A refused client compile warning in a Brazier module
+  copied whole into the client project names its source file and line in
+  Brazier's sources, with the copy alongside, as pruned modules already did.
 - (M118 perf-server) Server-side rendering of large pages is faster: the
   render flattens its output with `iolist_to_binary` and lowercases
   attribute names without OTP `string:lowercase` (`ssr.rows_1000`: about
@@ -748,6 +759,12 @@ open follow-ups), which is in progress.
   Ref}`, as Ranch keys listeners), held in a `persistent_term` registry
   that is cleared when the listener stops. A node that starts and stops
   listeners no longer grows its atom table.
+- (M118 server-residue) A listener whose tree crashed, or was stopped by its
+  parent, without a release left its connection owner and bound port in
+  `persistent_term`, as did a start that failed to bind. Each listener now
+  has a keeper that monitors the processes able to restart or release it
+  (as `ranch_server` monitors listener supervisors) and erases the entries,
+  with a log line, when the last one exits.
 
 - (M118 backpressure) A dead connection read as 1000000000 queued
   messages, and a slow one was closed again, with another warning, on
@@ -1039,6 +1056,8 @@ open follow-ups), which is in progress.
 
 ### Security
 
+- (M118 server-residue) Host and Origin validation refuse a non-ASCII host,
+  and control characters, space or DEL in an authority, by name.
 - (Final audit SEC-4) A client behind a trusted proxy could name its own
   address: the resolver preferred `Forwarded` over `X-Forwarded-For`, and a
   proxy that sets only `X-Forwarded-For` passes a client's `Forwarded`

@@ -25,6 +25,25 @@ pub fn url_attributes_test() {
   let assert False = url.is_url_attribute("hrefx")
 }
 
+pub fn url_attribute_names_are_lowercased_in_ascii_only_test() {
+  // The HTML parser lowercases `A-Z` in an attribute name and nothing else.
+  // In Unicode the Kelvin sign U+212A lowercases to `k`, but the browser
+  // keeps `xlin\u{212A}:href` as it is, a name that is not `xlink:href`.
+  let assert False = url.is_url_attribute("xlin\u{212A}:href")
+  let assert False = url.is_url_attribute("XLIN\u{212A}:HREF")
+  let assert True = kept("xlin\u{212A}:href", "javascript:alert(1)")
+  // An uppercase URL attribute is still checked, and reported lowercased.
+  let assert Error(url.DisallowedScheme("javascript")) =
+    url.check("HREF", "javascript:alert(1)")
+  let assert Error(url.DisallowedData("xlink:href")) =
+    url.check("XLink:HREF", "data:image/png;base64,AA")
+  let assert Ok("data:image/png;base64,AA") =
+    url.check("SRC", "data:image/png;base64,AA")
+  // Non-ASCII around a URL attribute's name is another name.
+  let assert False = url.is_url_attribute("hr\u{00C9}f")
+  let assert False = url.is_url_attribute("href\u{0301}")
+}
+
 pub fn non_url_attribute_is_never_checked_test() {
   let assert True = kept("title", "javascript:alert(1)")
   let assert True = kept("data-url", "javascript:alert(1)")

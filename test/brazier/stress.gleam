@@ -8,13 +8,21 @@
 /// measurement is taken with all of them open at once. Then every client
 /// runs the close handshake. Nothing sleeps to let the server settle.
 ///
+/// Every join carries the page build (`StressConfig.build`), as a page
+/// that loaded the server's `brazier_client_<hash>.js` sends it, so the
+/// server checks each join's build as it does a browser's.
+///
 /// Usage: `gleam run -m brazier/stress` (with a server running on 8080).
 import brazier/await
 import brazier/debug
 import brazier/log
+import brazier/ssr
+import brazier/static
 import gleam/erlang/process.{type Subject}
 import gleam/int
 import gleam/list
+import gleam/option.{type Option, Some}
+import gleam/result
 import gleam/string
 
 /// Stress test configuration.
@@ -33,6 +41,10 @@ pub type StressConfig {
     /// Number of events to send on each connection after join; each one
     /// must be acknowledged by a patch.
     events_per_connection: Int,
+    /// The page build every join carries: the hash in the
+    /// `brazier_client_<hash>.js` the server's pages load (`page_build`
+    /// for a server in this VM, `served_build` for one in another).
+    build: String,
   )
 }
 
@@ -82,6 +94,9 @@ pub fn run(config: StressConfig) -> StressResult {
   let assert True = config.connections > 0
   let assert True = config.events_per_connection >= 0
   let assert True = config.hold_duration_ms >= 0
+  let assert True =
+    static.is_client_bundle_name("brazier_client_" <> config.build <> ".js")
+    as "brazier/stress: the build is a bundle hash (page_build, served_build)"
   log.info(
     "brazier.stress",
     "Starting stress run: "
@@ -91,7 +106,9 @@ pub fn run(config: StressConfig) -> StressResult {
       <> " events to "
       <> config.host
       <> ":"
-      <> int.to_string(config.port),
+      <> int.to_string(config.port)
+      <> " on build "
+      <> config.build,
   )
   let stats_before = debug.stats()
   let started_us = monotonic_us()
@@ -154,6 +171,7 @@ fn client(config: StressConfig, index: Int, reports: Subject(ClientReport)) {
       config.host,
       config.port,
       config.events_per_connection,
+      Some(config.build),
       await.deadline_ms,
     )
   {
@@ -280,13 +298,102 @@ fn log_result(result: StressResult) -> Nil {
   }
 }
 
+/// The page build of a server in this VM: the hash in the
+/// `brazier_client_<hash>.js` its listener loaded (`ssr.client_bundle`),
+/// which every page it renders loads and sends back with its join. An
+/// `Error` naming the cause when no bundle is loaded (no server started in
+/// this VM, or its last load failed).
+pub fn page_build() -> Result(String, String) {
+  use bundle <- result.try(
+    ssr.client_bundle()
+    |> result.map_error(fn(reason) {
+      "brazier/stress: no page build: " <> reason
+    }),
+  )
+  bundle_build(bundle)
+}
+
+/// The page build of the server at `host:port`, which may run in another
+/// VM: the client bundle named by the `<script>` of the page it serves at
+/// `/`, as a browser loads it. An `Error` naming the cause when the page
+/// cannot be fetched, is not a 200, or loads no client bundle.
+pub fn served_build(host: String, port: Int) -> Result(String, String) {
+  use #(status_line, body) <- result.try(
+    fetch_page(host, port, await.deadline_ms)
+    |> result.map_error(fn(reason) {
+      "brazier/stress: no page build from "
+      <> host
+      <> ":"
+      <> int.to_string(port)
+      <> ": GET / failed: "
+      <> reason
+    }),
+  )
+  page_build_in(status_line, body)
+  |> result.map_error(fn(reason) {
+    "brazier/stress: no page build from "
+    <> host
+    <> ":"
+    <> int.to_string(port)
+    <> ": "
+    <> reason
+  })
+}
+
+/// The build in a `GET /` answer: its status line must be a 200, and its
+/// body must load one client bundle, `<script src="/brazier_client_<hash>.js">`
+/// (the tag `ssr` renders for a live page).
+@internal
+pub fn page_build_in(
+  status_line: String,
+  body: String,
+) -> Result(String, String) {
+  use Nil <- result.try(case string.starts_with(status_line, "HTTP/1.1 200 ") {
+    True -> Ok(Nil)
+    False -> Error("GET / answered " <> string.inspect(status_line))
+  })
+  case string.split(body, "<script src=\"/brazier_client_") {
+    [_, rest] ->
+      case string.split_once(rest, "\"") {
+        Ok(#(name, _)) -> bundle_build("brazier_client_" <> name)
+        Error(Nil) -> Error("the page's client script tag is not closed")
+      }
+    [_] -> Error("the page loads no brazier_client_<hash>.js")
+    _ -> Error("the page loads more than one brazier_client_<hash>.js")
+  }
+}
+
+/// The hash in a bundle name, which must be exact build output
+/// (`static.is_client_bundle_name`).
+fn bundle_build(bundle: String) -> Result(String, String) {
+  case static.is_client_bundle_name(bundle), bundle {
+    True, "brazier_client_" <> rest -> Ok(string.drop_end(rest, 3))
+    _, _ ->
+      Error(
+        "bundle "
+        <> string.inspect(bundle)
+        <> " is not a brazier_client_<hash>.js name",
+      )
+  }
+}
+
 @external(erlang, "brazier_stress_ffi", "connect_and_join")
 fn connect_and_join(
   host: String,
   port: Int,
   events: Int,
+  build: Option(String),
   timeout_ms: Int,
 ) -> Result(#(Conn, Int), String)
+
+/// `GET /` with `Connection: close`: the status line and the body, which
+/// must have a Content-Length (the listener sends one for every page).
+@external(erlang, "brazier_stress_ffi", "fetch_page")
+fn fetch_page(
+  host: String,
+  port: Int,
+  timeout_ms: Int,
+) -> Result(#(String, String), String)
 
 @external(erlang, "brazier_stress_ffi", "close_handshake")
 fn close_handshake(conn: Conn, timeout_ms: Int) -> Result(Nil, String)
@@ -294,17 +401,34 @@ fn close_handshake(conn: Conn, timeout_ms: Int) -> Result(Nil, String)
 @external(erlang, "brazier_stress_ffi", "monotonic_us")
 fn monotonic_us() -> Int
 
-/// CLI entry point. Exits non-zero when any connection failed.
+/// CLI entry point. The server runs in another VM, so the build comes from
+/// the page it serves. Exits non-zero when there is no build or any
+/// connection failed.
 pub fn main() {
   log.configure()
-  let result =
-    run(StressConfig(
-      connections: 100,
-      host: "localhost",
-      port: 8080,
-      hold_duration_ms: 1000,
-      events_per_connection: 10,
-    ))
+  let host = "localhost"
+  let port = 8080
+  case served_build(host, port) {
+    Error(reason) -> {
+      log.error("brazier.stress", reason <> "; exiting 1")
+      halt(1)
+    }
+    Ok(build) -> {
+      let result =
+        run(StressConfig(
+          connections: 100,
+          host: host,
+          port: port,
+          hold_duration_ms: 1000,
+          events_per_connection: 10,
+          build: build,
+        ))
+      exit_on_failures(result)
+    }
+  }
+}
+
+fn exit_on_failures(result: StressResult) -> Nil {
   case result.failed {
     0 -> Nil
     failed -> {

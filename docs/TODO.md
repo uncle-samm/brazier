@@ -83,6 +83,32 @@
     entry, and covers the registry's refusals (a second live owner, a dead
     owner, a send with no owner, an unregister by another process).
 
+- **Issue:** a listener's `persistent_term` entries (its connection owner,
+  its bound port) went only with a release (`server.stop`, the app
+  watcher). A listener tree that crashed with nothing to release it left
+  both behind, and a start that failed to bind left an owner entry naming
+  a dead pid.
+  - **Files:** `src/brazier_http_conns.erl`,
+    `src/brazier/transport/server.gleam`, `src/brazier/application.gleam`
+  - **Resolution:** (Milestone 118, m118-server-residue) Each listener name
+    gets a keeper process, made with the name. The keeper monitors the
+    listener's holders: the process that made the name until a holder is
+    added, the starter of an unsupervised listener (`server.start`), the
+    parent that restarts a supervised one (`server.supervised`, held each
+    time its child spec starts), and any process that will release it
+    (`server.stop`, the app watcher, through `server.hold`). A release
+    erases the entries and ends the keeper; when the last holder exits
+    without one, the keeper erases them and logs it (info). This is the
+    shape of Ranch's cleanup: `ranch_server` monitors a listener's
+    supervisor and drops its options on a stop, while `stop_listener`
+    cleans explicitly; the holders cover the restarted tree, whose pid
+    changes, and keep the bound port for a parent's restart. A start that
+    fails erases what it registered and says whether a port was forgotten.
+    `test/brazier/listener_name_test.gleam` covers a crash with no release,
+    a held listener kept until its release, a holder that exits before
+    releasing, every holder exiting, a supervised listener kept across a
+    parent restart and erased when the parent stops, and a failed start.
+
 - **Issue:** an `init` refusing with 401 closes with 4401, the code of a
   revoked session or expired authentication, so the two are told apart only
   by the close reason and the server log. The client action is the same (a
@@ -224,9 +250,14 @@
     It now joins with the hash of the bundle the listener loaded
     (`ssr.client_bundle`), as a page rendered by that server does, so the
     server checks the build on each join and logs nothing. The bench fails
-    by name if no bundle is loaded. `brazier/stress` still joins without a
-    build: it may drive a server in another VM, whose bundle it cannot
-    know.
+    by name if no bundle is loaded. `brazier/stress` joins the same way
+    (`StressConfig.build`): `stress.page_build` takes the bundle a listener
+    in its own VM loaded and fails by name if none is, and the CLI, which
+    drives a server in another VM, reads the bundle from the `<script>` of
+    the page that server serves at `/` (`stress.served_build`), as a
+    browser does. `test/brazier/stress_test.gleam` asserts that a run logs
+    no join without a build and that a join from another build is closed
+    with 4499.
 
 - **Issue:** the client manifest had two readers (`ssr` for the page and
   `transport.check_join_build` for the join), and the join read it from

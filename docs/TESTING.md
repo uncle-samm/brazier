@@ -270,8 +270,12 @@ Scenarios:
 
 `stress.run` opens N joined connections. On each it sends M events and
 waits for the patch acknowledging each one. It holds all connections open
-at the same moment, then runs the close handshake on every one. The
-result reports:
+at the same moment, then runs the close handshake on every one. Each join
+carries the page build (`StressConfig.build`), as a browser's does:
+`stress.page_build()` for a server in the same VM (an error naming the
+cause when no bundle is loaded), `stress.served_build(host, port)` for one
+in another, read from the `<script>` of the page it serves. The result
+reports:
 
 - attempted, succeeded and failed connections, with a reason for each
   failure;

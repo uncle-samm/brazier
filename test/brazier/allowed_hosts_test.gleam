@@ -104,6 +104,52 @@ pub fn malformed_entries_are_refused_test() {
   assert string.contains(reason, "allowed_hosts")
 }
 
+pub fn hosts_are_lowercased_in_ascii_only_test() {
+  let allowed = parse(["kitchen.example"])
+  let assert Ok(Nil) = transport.host_allowed("KITCHEN.Example:8080", allowed)
+  // In Unicode the Kelvin sign U+212A lowercases to `k`; a Host naming it
+  // is not `kitchen.example`, and a name outside ASCII is refused with why.
+  let #(result, logs) =
+    log_capture.capture(fn() {
+      transport.host_allowed("\u{212A}itchen.example", allowed)
+    })
+  let assert Error(reason) = result
+  assert string.contains(reason, "non-ASCII characters in host")
+  assert string.contains(reason, "xn--")
+  let assert True =
+    log_capture.has(logs, level: "warning", containing: [
+      "Host rejected", "non-ASCII", "\"\u{212A}itchen.example\"",
+    ])
+  let assert Error(_) = transport.host_allowed("b\u{00FC}cher.example", allowed)
+  // Its ASCII form is a host like any other.
+  let idn = parse(["xn--bcher-kva.example"])
+  let assert Ok(Nil) = transport.host_allowed("XN--BCHER-KVA.example", idn)
+}
+
+pub fn control_characters_in_a_host_are_refused_test() {
+  let allowed = parse(["*"])
+  list.each(
+    [
+      "evil.example\nINFO forged", "a\u{0000}b", "a\tb", "a\rb", "a\u{007F}b",
+      "a b", "user@example.com", "a?b", "a#b", "a\\b",
+    ],
+    fn(host) {
+      let assert Error(reason) = transport.host_allowed(host, allowed)
+        as { "refused: " <> string.inspect(host) }
+      assert string.contains(reason, "invalid characters in host")
+    },
+  )
+  let assert Ok(Nil) = transport.host_allowed("a-b.example_1:80", allowed)
+}
+
+pub fn a_non_ascii_allowed_hosts_entry_is_refused_test() {
+  let assert Error(reason) =
+    transport.parse_allowed_hosts(["b\u{00FC}cher.example"], production: False)
+  assert string.contains(reason, "allowed_hosts entry")
+  assert string.contains(reason, "non-ASCII characters in host")
+  assert string.contains(reason, "xn--")
+}
+
 pub fn a_refused_host_is_logged_quoted_test() {
   let allowed = parse([])
   let #(_, logs) =

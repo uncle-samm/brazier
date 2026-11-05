@@ -2,7 +2,7 @@
 %% Helpers for listener_name_test: the atom table, the connection owner
 %% registry's persistent_term entries, and the via registry's callbacks.
 -export([atom_count/0, atoms_since/1, registry_entries/0, register/2, unregister/1,
-         whereis/1, send_raises_badarg/1, forget/1]).
+         whereis/1, send_raises_badarg/1, forget/1, restart_only_child/1]).
 
 atom_count() ->
     erlang:system_info(atom_count).
@@ -42,3 +42,13 @@ send_raises_badarg(Ref) ->
 
 forget(Ref) ->
     brazier_http_conns:forget_port({via, brazier_http_conns, Ref}).
+
+%% Stop the only child of Parent in order (supervisor:terminate_child/2
+%% waits for it to exit) and start it again from the same child spec: a
+%% restart by the parent, as when an earlier sibling restarts under
+%% rest_for_one. Anything else is a test failure.
+restart_only_child(Parent) ->
+    [{Id, _Pid, _Type, _Modules}] = supervisor:which_children(Parent),
+    ok = supervisor:terminate_child(Parent, Id),
+    {ok, _Restarted} = supervisor:restart_child(Parent, Id),
+    nil.

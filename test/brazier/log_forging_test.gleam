@@ -53,8 +53,12 @@ pub fn rejected_origin_log_quotes_client_text_test() {
           "localhost",
           none,
         )
-      let assert Error(_) =
+      // A control character in an authority is refused before its port is
+      // read; a quote reaches the port parser, which repeats it quoted.
+      let assert Error("invalid Origin: invalid characters in host") =
         transport.origin_allowed("http://h:1\nX", "http", "localhost", none)
+      let assert Error(_) =
+        transport.origin_allowed("http://h:1\"X", "http", "localhost", none)
       let assert Error(_) =
         transport.origin_allowed("ftp\nX://h", "http", "localhost", none)
       let assert Error(_) =
@@ -72,7 +76,11 @@ pub fn rejected_origin_log_quotes_client_text_test() {
     ])
   let assert True =
     log_capture.has(logs, level: "warning", containing: [
-      "invalid port \"1\\nX\"",
+      "invalid port \"1\\\"X\"",
+    ])
+  let assert True =
+    log_capture.has(logs, level: "warning", containing: [
+      "invalid characters in host", "origin=\"http://h:1\\nX\"",
     ])
   let assert True =
     log_capture.has(logs, level: "warning", containing: [
@@ -89,10 +97,18 @@ pub fn rejected_host_port_is_quoted_test() {
   let assert Ok(allowed) = transport.parse_allowed_hosts([], production: False)
     as "the development default parses"
   let #(_, logs) =
-    log_capture.capture(fn() { transport.host_allowed("h:1\nX", allowed) })
+    log_capture.capture(fn() {
+      let assert Error("invalid Host: invalid characters in host") =
+        transport.host_allowed("h:1\nX", allowed)
+      transport.host_allowed("h:1\"X", allowed)
+    })
   let assert True =
     log_capture.has(logs, level: "warning", containing: [
-      "invalid port \"1\\nX\"",
+      "invalid port \"1\\\"X\"",
+    ])
+  let assert True =
+    log_capture.has(logs, level: "warning", containing: [
+      "invalid characters in host", "host=\"h:1\\nX\"",
     ])
   let assert True = no_raw_newline(logs)
 }

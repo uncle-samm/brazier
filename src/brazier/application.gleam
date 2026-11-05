@@ -533,6 +533,18 @@ fn remember(app: App) -> App {
 /// The watcher's body: record the app, then forget it when its tree goes.
 fn watch(app: App, recorded: process.Subject(Nil)) -> Nil {
   let tree = process.monitor(app.supervisor_pid)
+  // The watcher releases the listener below, so it holds it: the release
+  // here, not the listener's own keeper, forgets the bound port.
+  case server.hold(app.listener) {
+    True -> Nil
+    False ->
+      log.warning(
+        "brazier.application",
+        "The listener on port "
+          <> int.to_string(app.port)
+          <> " was gone before its watcher started",
+      )
+  }
   remember_app(app.supervisor_pid, app, process.self())
   process.send(recorded, Nil)
   // INVARIANT: a monitor always delivers its DOWN; nothing else is

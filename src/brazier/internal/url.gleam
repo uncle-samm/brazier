@@ -45,20 +45,37 @@ const allowed_data_types = ["image/png", "image/gif", "image/jpeg", "image/webp"
 const log_value_limit = 64
 
 /// Whether the browser interprets attribute `name` as a URL. The match is
-/// case-insensitive, as HTML attribute names are.
+/// ASCII case-insensitive, as the HTML parser's is: it lowercases `A-Z` in
+/// an attribute name and leaves every other character as it is, so
+/// `XLink:Href` is `xlink:href` and a name holding a non-ASCII character
+/// never is a URL attribute.
 pub fn is_url_attribute(name: String) -> Bool {
-  list.contains(url_attributes, string.lowercase(name))
+  list.contains(url_attributes, ascii_lowercase_name(name))
 }
 
 /// Check `value` for attribute `name`. Attributes that are not URL
 /// attributes always pass. The value is returned unchanged on success: the
 /// normalised form is used only to decide.
 pub fn check(name: String, value: String) -> Result(String, Blocked) {
-  case is_url_attribute(name) {
+  let lower = ascii_lowercase_name(name)
+  case list.contains(url_attributes, lower) {
     False -> Ok(value)
-    True -> check_url(string.lowercase(name), value)
+    True -> check_url(lower, value)
   }
 }
+
+/// `name` with `A-Z` lowercased and every other byte (code unit on
+/// JavaScript) unchanged, the HTML parser's lowercasing of an attribute
+/// name (WHATWG HTML, "attribute name state").
+///
+/// Not `string.lowercase`: that lowercases in Unicode, where the Kelvin sign
+/// U+212A becomes `k`, a name the browser keeps as it is. On Erlang it is
+/// also slow on the render's path: OTP's `string:lowercase/1` raises and
+/// catches an exception internally for each name that is already lowercase,
+/// and `check` runs for every attribute of every render.
+@external(erlang, "brazier_render_ffi", "ascii_lowercase")
+@external(javascript, "../../brazier_render_ffi.mjs", "ascii_lowercase")
+fn ascii_lowercase_name(name: String) -> String
 
 /// A short, printable description of a refusal for log lines.
 pub fn describe(blocked: Blocked) -> String {
@@ -135,7 +152,7 @@ fn scheme(codes: List(Int)) -> Result(#(String, List(Int)), Nil) {
   case codes {
     [first, ..rest] ->
       case is_ascii_alpha(first) {
-        True -> scan_scheme(rest, [ascii_lowercase(first)])
+        True -> scan_scheme(rest, [ascii_lowercase_code(first)])
         False -> Error(Nil)
       }
     [] -> Error(Nil)
@@ -151,7 +168,7 @@ fn scan_scheme(
     [0x3a, ..body] -> Ok(#(ascii_to_string(list.reverse(acc)), body))
     [code, ..tail] ->
       case is_scheme_code(code) {
-        True -> scan_scheme(tail, [ascii_lowercase(code), ..acc])
+        True -> scan_scheme(tail, [ascii_lowercase_code(code), ..acc])
         False -> Error(Nil)
       }
   }
@@ -172,7 +189,7 @@ fn is_ascii_alpha(code: Int) -> Bool {
 /// Lowercase an ASCII letter. Every other code point is unchanged: the URL
 /// parser lowercases schemes in ASCII only, so no non-ASCII code point may
 /// turn into a letter here.
-fn ascii_lowercase(code: Int) -> Int {
+fn ascii_lowercase_code(code: Int) -> Int {
   case code >= 0x41 && code <= 0x5a {
     True -> code + 0x20
     False -> code
@@ -207,6 +224,6 @@ fn is_allowed_data(body: List(Int)) -> Bool {
 fn read_media_type(rest: List(Int), acc: List(Int)) -> List(Int) {
   case rest {
     [] | [0x3b, ..] | [0x2c, ..] -> list.reverse(acc)
-    [code, ..tail] -> read_media_type(tail, [ascii_lowercase(code), ..acc])
+    [code, ..tail] -> read_media_type(tail, [ascii_lowercase_code(code), ..acc])
   }
 }
