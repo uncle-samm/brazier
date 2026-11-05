@@ -27,9 +27,22 @@ ARG EXAMPLE=counter
 WORKDIR /src/examples/${EXAMPLE}
 RUN gleam run -m brazier/build
 RUN gleam export erlang-shipment
+RUN erl -noshell -eval 'io:format("~s~n", [erlang:system_info(otp_release)]), halt().' > /otp_release
 
-# Stage 2: run on a plain Erlang image of the same OTP release.
-FROM erlang:28-alpine
+# Stage 2: run on a plain Erlang image of the same OTP release. A BEAM file
+# compiled by a newer release may not load on an older one, so the build
+# fails when the two stages' releases differ.
+FROM erlang:29-alpine
+
+RUN --mount=type=bind,from=builder,source=/otp_release,target=/tmp/builder_otp_release \
+    set -eu; \
+    builder=$(cat /tmp/builder_otp_release); \
+    runtime=$(erl -noshell -eval 'io:format("~s~n", [erlang:system_info(otp_release)]), halt().'); \
+    if [ "$builder" != "$runtime" ]; then \
+      echo "the builder stage compiled with OTP $builder, but the runtime stage runs OTP $runtime" >&2; \
+      exit 1; \
+    fi; \
+    echo "builder and runtime both run OTP $runtime"
 
 ARG EXAMPLE=counter
 ARG APP_MODULE=counter

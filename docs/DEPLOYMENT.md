@@ -283,8 +283,10 @@ docker run --rm -p 8080:8080 brazier-counter
 whose `main/0` starts the app (the build logs it as the app module). The
 builder stage (`ghcr.io/gleam-lang/gleam:v1.19.2-erlang-alpine` plus Node)
 runs `gleam run -m brazier/build` and `gleam export erlang-shipment`; any
-failure fails the image build. The runtime stage (`erlang:28-alpine`, the same
-OTP release) copies the shipment and `priv/`, runs as a non-root user, and
+failure fails the image build. The runtime stage (`erlang:29-alpine`, the same
+OTP release; the build fails if the two stages' releases differ, since a BEAM
+file compiled by a newer release may not load on an older one) copies the
+shipment and `priv/`, runs as a non-root user, and
 starts `APP_MODULE:main()` through a small start script. The script exits with
 status 1 when `main` returns an error or crashes. It does not use the
 shipment's `entrypoint.sh`, which calls `<package>@@main:run` and so only works
