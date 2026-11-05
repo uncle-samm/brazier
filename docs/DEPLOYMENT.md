@@ -301,6 +301,19 @@ app's first page; `/health` (above) is the cheaper check. It requests
 `Host`, never `127.0.0.1`, so listing the loopback address keeps the
 protection.
 
+Resolving the dependencies queries the Hex API, which allows 100
+unauthenticated requests a minute per IP. On an IP you share, such as a CI
+runner, pass a read-only Hex key as a BuildKit secret; it stays out of the
+image:
+
+```sh
+docker build --secret id=hexpm_read_api_key,env=HEXPM_READ_API_KEY -t brazier-counter .
+```
+
+`scripts/check_production_image.sh [EXAMPLE APP_MODULE]` builds the image,
+starts it with a fresh `SECRET_KEY`, and fails unless the container reports
+healthy and answers `/health`. CI runs it on the counter example.
+
 ## Graceful Shutdown
 
 `application.wait_forever`, which `brazier.start` calls once the application

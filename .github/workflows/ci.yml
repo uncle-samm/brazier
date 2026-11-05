@@ -38,6 +38,26 @@ jobs:
           compression-level: 0
           if-no-files-found: error
 
+  # The production image (Dockerfile) for the counter example must build,
+  # including its check that both stages run the same OTP release, then start,
+  # report healthy and answer /health. No other job builds it. Its build
+  # resolves the counter's dependencies through the Hex API, so it
+  # authenticates with the same read-only key.
+  production-image:
+    name: Production image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build and run the counter image
+        env:
+          HEXPM_READ_API_KEY: ${{ secrets.HEXPM_READ_API_KEY }}
+        run: |
+          if [ -z "$HEXPM_READ_API_KEY" ]; then
+            echo "::error::The HEXPM_READ_API_KEY secret is not set. The production image build resolves dependencies through the Hex API. Add a read-only Hex key as that repository secret." >&2
+            exit 1
+          fi
+          scripts/check_production_image.sh
+
   gleam:
     name: Gleam format, build, test, lint, docs
     needs: image

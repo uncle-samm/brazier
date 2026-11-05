@@ -25,6 +25,21 @@ COPY . .
 
 ARG EXAMPLE=counter
 WORKDIR /src/examples/${EXAMPLE}
+# Resolving the dependencies looks each Hex package up through the Hex API,
+# which allows 100 unauthenticated requests a minute per IP. A build on an IP
+# it shares (a CI runner) can pass a read-only key as the BuildKit secret
+# hexpm_read_api_key (docker build --secret id=hexpm_read_api_key,env=...);
+# Gleam reads it as HEXPM_READ_API_KEY. It is in no layer of the image.
+RUN --mount=type=secret,id=hexpm_read_api_key,required=false \
+    set -eu; \
+    if [ -s /run/secrets/hexpm_read_api_key ]; then \
+      HEXPM_READ_API_KEY="$(cat /run/secrets/hexpm_read_api_key)"; \
+      export HEXPM_READ_API_KEY; \
+      echo "Hex requests are authenticated with HEXPM_READ_API_KEY"; \
+    else \
+      echo "No hexpm_read_api_key secret: Hex requests are unauthenticated"; \
+    fi; \
+    gleam deps download
 RUN gleam run -m brazier/build
 RUN gleam export erlang-shipment
 RUN erl -noshell -eval 'io:format("~s~n", [erlang:system_info(otp_release)]), halt().' > /otp_release

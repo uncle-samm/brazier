@@ -552,7 +552,7 @@ unprivileged user `brazier`, as the production image runs the app: as root,
 a file whose permissions forbid reading it is still read, so the tests of
 permission errors would fail. The image's Erlang is the Gleam image's (OTP
 29), the same line as the 29.1.2 that `mise.toml` pins for local runs. The
-two jobs:
+two jobs, and a third that does not use the image:
 
 - **Gleam build, test, lint.** These steps run in order and stop at the
   first failure:
@@ -566,6 +566,13 @@ two jobs:
 - **Browser all.** 23 shards at each viewport (desktop and mobile), each
   running `make browser-all-shard` with `BRAZIER_CDP_VIEWPORTS` set to the
   viewport.
+- **Production image.** `scripts/check_production_image.sh` builds the
+  production `Dockerfile` for the counter example, with the same Hex key as
+  a BuildKit secret, then starts it with a fresh `SECRET_KEY` and requires
+  the container to report healthy within 120 seconds and to answer `/health`
+  with `{"status":"ok"}`. The build fails when its two stages run different
+  OTP releases. `scripts/check_production_image.sh EXAMPLE APP_MODULE` checks
+  another example.
 
 ## Deliberate waits
 
