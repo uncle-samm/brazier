@@ -80,7 +80,9 @@ monitors each connection's handler, as `Phoenix.Channel.Server` monitors
 its transport, so a handler that crashes or is killed without a disconnect
 is forgotten when its DOWN arrives (logged at info). A disconnect for a
 connection already forgotten is logged at debug
-(`runtime_backpressure_test`).
+(`runtime_backpressure_test`). Each forgotten connection also emits
+`[brazier, runtime, connection, forgotten]` with `reason` `slow` or
+`down` (see [TELEMETRY.md](TELEMETRY.md)).
 
 ## Rate Limiting
 

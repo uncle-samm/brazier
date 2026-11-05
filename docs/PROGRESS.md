@@ -874,7 +874,12 @@
     - the Docker CDP shard total defaults to the number of examples in the image's harness (25), refuses a larger total; CONFORMANCE.md and TESTING.md no longer hard-code 23 (the timings keep a note that they were taken with 23);
     - 2355 tests pass twice on its branch;
     - verified on the merged tree: build (zero warnings), format, lint, docs, `make test-client` pass; 2355 tests pass 3 runs in a row; CDP 761/761 desktop and 771/771 mobile;
-    - [ ] follow-ups: ERROR_HANDLING.md could mention the forgotten event; docs/design/STREAMS.md §10 could mention the wider build check; the render doesn't reserve the other `data-brazier-*` names (`-key`, `-hook`, `-on-*`); the runtime's `NotLocal` navigation branch is reachable only by a client that bypasses the transport; a warning in an app module points at line numbers in the sliced copy, not the user's source; TESTING.md's multi-VM example describes the other forks' shard lists without showing them.
+    - [ ] follow-ups:
+      - [x] ERROR_HANDLING.md mentions the forgotten event; docs/design/STREAMS.md §10 and its fault table have a "Correction (followups)" for the wider build check (coordinator);
+      - [x] TESTING.md's multi-VM example: no change; "`1,6,11,16,21` through `5,10,15,20,25`" names every fork's list;
+      - [x] Decision: the runtime's `NotLocal` navigation branch stays though only a client that bypasses the transport reaches it. The runtime checks its own input rather than trusting the transport's gate (defense in depth, as the runtime re-checks every bound);
+      - [ ] the render doesn't reserve the other `data-brazier-*` names (`-key`, `-hook`, `-on-*`); after m118-perf-server merges (it owns the render);
+      - [ ] a warning in an app module points at line numbers in the sliced copy, not the user's source.
   - The unnamed flake: every run's log is kept; if it recurs it is named and fixed at its root.
 - Decision, 2026-11-05: 4401 stays shared by an `init` 401 and a revoked or expired session. Both mean "authentication is no longer valid; reload" to the client. The server tells them apart by a distinct cause in the close's log line and telemetry metadata. m118-logs builds it.
 - Decision, 2026-11-05: m118-logs reproduced L453. Both problems are in the runtime's send paths:

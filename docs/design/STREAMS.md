@@ -878,6 +878,12 @@ Correction (streams-build):
   in any of the app's modules, server-only ones included, are a build
   error naming the place. A name built at run time is refused by the
   render (section 8.1).
+  Correction (followups): the build reads every name it can know
+  statically, not only a literal: a constant (local, or imported
+  qualified or unqualified) and a `<>` join of literals and constants,
+  given through `attribute.attribute`, `attribute.data` or
+  `attribute.boolean`. Only a name computed at run time is left to the
+  attribute constructor and the render.
 - `check_framework`'s list of allowed framework modules is written from
   the same list the check uses, so it names `brazier/stream` and the names
   the client may use from it.
@@ -923,7 +929,7 @@ rejoin with non-empty windows, error for every refusal. The browser logs a
 | Op on an undeclared stream during the dead render (Correction (streams-build)) | SSR | Refused, `unknown_stream`, error log; the page renders without it |
 | An item function from a dependency or a Brazier module (Correction (streams-build)) | build | Build error naming the place |
 | A `Stream` annotation whose item type does not resolve (Correction (streams-build)) | build | Build error naming the stream and the annotation |
-| `data-brazier-stream` set by app code (Correction (streams-build)) | build (literal name), render (any name) | Build error naming the place; the render crashes (SSR 500) |
+| `data-brazier-stream` set by app code (Correction (streams-build)) | build (any statically known name, Correction (followups)), render (any name) | Build error naming the place; the render crashes (SSR 500) |
 
 ## 13. Testing
 
