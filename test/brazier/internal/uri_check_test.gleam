@@ -45,6 +45,8 @@ pub fn bad_query_encoding_is_rejected_test() {
   list.each(["a=%zz", "a=%", "a=%2", "q=%E0%A4", "%FF=1"], fn(query) {
     let assert Error(reason) = uri_check.check(at("/", Some(query)))
     let assert True = string.contains(reason, "invalid query string")
+    // The reason is logged, and a query can carry a token.
+    let assert False = string.contains(reason, query)
   })
 }
 

@@ -541,7 +541,7 @@ the echo.
 | 1013 | Try again later (backpressure or overload) |
 | 4400-4499 | The server refused this page's session. The client does not reconnect: it reloads the page, at most 3 times per tab within 60 seconds |
 | 4000 + status | `init` refused with that 4xx status (4404, 4403, 4409, ...). Never 4499: `error.refuse(499, _)` is a programming error and crashes `init` |
-| 4401 | Session revoked (`session revoked`) or authentication expired (`authentication expired`). The page reloads, so the server renders it for whoever the cookie now names, or the login page |
+| 4401 | Session revoked (`session revoked`), authentication expired (`authentication expired`), or `init` refused with 401 (`init refused`). The page reloads, so the server renders it for whoever the cookie now names, or the login page. The server's close log line and `[brazier, ws, close]` name the cause: `session_revoked`, `authentication_expired` or `init_refused` |
 | 4499 | Stale build (`stale build`): the join's `build` is not the bundle the server serves now. The page reloads and gets the current bundle |
 | 4500-4599 | `init` refused with a 5xx status (4503 for `error.unavailable`). The client reconnects with backoff |
 | 4600 | The app's middleware refused the page's live connection (`middleware refused <status>`), sent right after the handshake. The client does not reconnect: it loads the current URL behind the reload guard, so the browser shows the middleware's answer |
@@ -554,8 +554,14 @@ this release (see `CHANGELOG.md`); a page from before then reloads on
 either code, because both are in the reload band.
 
 An `init` refusal with 401 still closes with 4401, the code of a revoked
-session or expired authentication. The action is the same, a reload, and
-the close reason and the server log tell them apart.
+session or expired authentication. The code stays shared because the
+client's action is the same for all three, a reload, and the client needs
+no more. The server tells them apart: the close line it logs reads
+`Closing WebSocket <id> (peer <ip>) with 4401 (reason <label>)`, and the
+`[brazier, ws, close]` event's `reason` is the same label
+(`init_refused`, `session_revoked` or `authentication_expired`; see
+[TELEMETRY.md](TELEMETRY.md#event-catalogue)). Count revocations by that
+label, not by the code.
 
 **The 4xxx scheme.** RFC 6455 §7.4.2 leaves 4000-4999 to applications.
 Brazier splits it by what the client does, so the client decides from the

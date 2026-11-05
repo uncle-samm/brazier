@@ -265,6 +265,8 @@ The limiter (`brazier/rate_limit`) is a fixed-window counter in an ETS table own
 
 With the default empty list, no forwarding header is ever honoured. Use the same settings for `middleware.rate_limit_behind_proxies` via `ip.parse_trusted_proxies(entries, header)` (or `transport.trusted_proxies(limits)`).
 
+A WebSocket connection resolves its client once. The upgrade resolves the address and scheme for the per-IP cap and the Origin check, and keeps the result on the request (`server.Connection.resolved`, an `ip.Resolved` that records the proxies it honoured). The route middleware runs on that request at the upgrade and at every later join and navigation, and `client.ip` reuses the resolution when it is asked against the same trusted proxies. A malformed hop is therefore logged once per connection, not once per gate. Asked against different proxies, `client.ip` resolves again, because the answer may differ. A plain HTTP request starts with no resolution (`resolved: None`).
+
 ## Message Size Limits
 
 A WebSocket frame, or a message reassembled from fragments, over `max_message_bytes` (default 64KB) closes the connection with 1009 before it is decoded. The length is checked from the frame header, so a peer cannot slowly accumulate an oversized partial frame.

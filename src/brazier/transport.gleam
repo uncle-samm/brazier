@@ -330,19 +330,23 @@ pub fn default_security_limits() -> SecurityLimits {
 const max_timer_ms = 4_294_967_295
 
 /// A drain timeout is a receive timeout: 0 (kill at once) up to the largest
-/// timer.
+/// timer. A refusal is returned, not logged: each caller logs it once with
+/// its own context ("Invalid security limits: ...", or the application's
+/// "BRAZIER_SHUTDOWN_TIMEOUT: ..."), so one refusal makes one log line.
 pub fn validate_drain_timeout(ms: Int) -> Result(Nil, String) {
+  log.debug(
+    "brazier.transport",
+    "Validating a drain timeout of " <> int.to_string(ms) <> "ms",
+  )
   case ms >= 0 && ms <= max_timer_ms {
     True -> Ok(Nil)
-    False -> {
-      let reason =
+    False ->
+      Error(
         "drain_timeout_ms must be in 0.."
         <> int.to_string(max_timer_ms)
         <> "ms, got "
-        <> int.to_string(ms)
-      log.warning("brazier.transport", "Refusing drain timeout: " <> reason)
-      Error(reason)
-    }
+        <> int.to_string(ms),
+      )
   }
 }
 
@@ -2262,9 +2266,19 @@ fn stop_connection(
   action: CloseAction,
   reason: String,
 ) -> Nil {
+  // The label is the one `[brazier, ws, close]` reports, so the log line
+  // and the event name the same cause (4401 is shared by three).
+  let #(close_code, close_label) = close_summary(action)
   log.info(
     "brazier.transport",
-    "Closing WebSocket " <> ctx(state) <> ": " <> reason,
+    "Closing WebSocket "
+      <> ctx(state)
+      <> " with "
+      <> int.to_string(close_code)
+      <> " (reason "
+      <> close_label
+      <> "): "
+      <> reason,
   )
   let frame = case action {
     SendClose(code: code, reason: close_reason) ->
@@ -2291,7 +2305,6 @@ fn stop_connection(
     None -> state
   }
   server.close(state.socket)
-  let #(close_code, close_label) = close_summary(action)
   telemetry.ws_close(
     erlang_monotonic_time() - state.opened_at,
     state.frames_in,
@@ -2417,8 +2430,15 @@ fn dev_live_reload_topic() -> String
 /// Identity of an admitted connection, carried from admission to startup.
 type Admission {
   /// `page` is the page the upgrade mounts (`get_upgrade_page`), which passed
-  /// the middleware gate.
-  Admission(conn_id: ConnectionId, peer_ip: String, page: LivePage)
+  /// the middleware gate. `request` is the upgrade request carrying its one
+  /// client resolution (`server.Connection.resolved`): the connection's
+  /// later gates run on it.
+  Admission(
+    conn_id: ConnectionId,
+    peer_ip: String,
+    page: LivePage,
+    request: Request(Connection),
+  )
 }
 
 /// Start a WebSocket connection on an already-upgraded socket.
@@ -2427,9 +2447,11 @@ type Admission {
 fn start_ws_connection(
   socket: Socket,
   config: TransportConfig,
-  req: Request(Connection),
   admission: Admission,
 ) -> Nil {
+  // The upgrade request with its one client resolution: every later gate
+  // on this connection runs on it.
+  let req = admission.request
   let conn_id = admission.conn_id
   let opened_at = erlang_monotonic_time()
   log.info(
@@ -2528,7 +2550,9 @@ fn start_ws_connection(
         <> admission.peer_ip
         <> ") with "
         <> int.to_string(close_code)
-        <> " after the runtime did not start: "
+        <> " (reason "
+        <> close_label
+        <> ") after the runtime did not start: "
         <> startup_error_to_string(startup_error)
       // The cause (a crash with its stacktrace, a refusal at the level its
       // status calls for) was logged once where it happened, with this
@@ -2657,7 +2681,8 @@ pub opaque type AllowedOrigins {
 }
 
 /// Parse `ws_allowed_origins` entries; each must be a bare
-/// `scheme://host[:port]` origin (http or https, no path).
+/// `scheme://host[:port]` origin (http or https, no path). A refusal is
+/// returned for the caller to log once ("Invalid security limits: ...").
 pub fn parse_allowed_origins(
   entries: List(String),
 ) -> Result(AllowedOrigins, String) {
@@ -2689,13 +2714,7 @@ pub fn parse_allowed_origins(
       )
       Ok(AllowedOrigins(origins: origins))
     }
-    Error(reason) -> {
-      log.warning(
-        "brazier.transport",
-        "Refusing ws_allowed_origins: " <> reason,
-      )
-      Error(reason)
-    }
+    Error(reason) -> Error(reason)
   }
 }
 
@@ -2720,7 +2739,8 @@ pub const development_allowed_hosts = [".localhost", "127.0.0.1", "[::1]"]
 
 /// Parse `allowed_hosts`. An empty list is refused in production (the
 /// error names the setting) and means `development_allowed_hosts`
-/// otherwise.
+/// otherwise. A refusal is returned for the caller to log once ("Invalid
+/// security limits: ...").
 @internal
 pub fn parse_allowed_hosts(
   entries: List(String),
@@ -2763,10 +2783,7 @@ pub fn parse_allowed_hosts(
       }
       Ok(AllowedHosts(patterns: patterns))
     }
-    Error(reason) -> {
-      log.warning("brazier.transport", "Refusing allowed_hosts: " <> reason)
-      Error(reason)
-    }
+    Error(reason) -> Error(reason)
   }
 }
 
@@ -3034,15 +3051,30 @@ fn handle_ws_request(
       release_connection_slot("peer gone before upgrade")
       Refused("peer_gone")
     }
-    Ok(ip.Client(address: peer_ip, scheme:)) ->
+    Ok(ip.Client(address: peer_ip, scheme:) as resolved) -> {
+      // The middleware gate and every later join and navigation reuse this
+      // resolution (`client.ip`), so the header is parsed once per
+      // connection.
+      let req =
+        request.Request(
+          ..req,
+          body: server.Connection(
+            ..req.body,
+            resolved: Some(ip.Resolved(
+              trusted: guards.trusted,
+              client: resolved,
+            )),
+          ),
+        )
       admit_ws_request(
         socket,
         req,
         scheme,
         config,
         guards,
-        Admission(conn_id:, peer_ip:, page:),
+        Admission(conn_id:, peer_ip:, page:, request: req),
       )
+    }
   }
 }
 
@@ -3054,7 +3086,7 @@ fn admit_ws_request(
   guards: Guards,
   admission: Admission,
 ) -> UpgradeOutcome {
-  let Admission(conn_id:, peer_ip:, page: _) = admission
+  let Admission(conn_id:, peer_ip:, ..) = admission
   let limits = config.security_limits
   let current_count = connection_tracker_count()
   case current_count > limits.max_connections {
@@ -3087,7 +3119,7 @@ fn acquire_ws_slot(
   guards: Guards,
   admission: Admission,
 ) -> UpgradeOutcome {
-  let Admission(conn_id:, peer_ip:, page: _) = admission
+  let Admission(conn_id:, peer_ip:, ..) = admission
   let limits = config.security_limits
   case ws.acquire_ip_slot(peer_ip, limits.max_ws_connections_per_ip) {
     Error(count) ->
@@ -3235,7 +3267,7 @@ fn close_refused_upgrade(
   admission: Admission,
   status: Int,
 ) -> UpgradeOutcome {
-  let Admission(conn_id:, peer_ip:, page:) = admission
+  let Admission(conn_id:, peer_ip:, page:, ..) = admission
   let opened_at = erlang_monotonic_time()
   log.warning(
     "brazier.transport",
@@ -3655,7 +3687,7 @@ fn serve_ws_request(
       #(outcome, upgrade_outcome_label(outcome))
     })
   case outcome {
-    Upgraded(admission) -> start_ws_connection(socket, config, req, admission)
+    Upgraded(admission) -> start_ws_connection(socket, config, admission)
     Refused(label) ->
       log.debug("brazier.transport", "WebSocket upgrade refused: " <> label)
   }

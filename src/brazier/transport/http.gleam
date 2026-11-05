@@ -332,13 +332,21 @@ fn check_expect(
     [value], Http11 ->
       case string.lowercase(string.trim(value)) {
         "100-continue" -> Ok(True)
-        _ -> Error(FramingError(417, "unsupported expectation: " <> value))
+        _ ->
+          Error(FramingError(
+            417,
+            "unsupported expectation: " <> string.inspect(value),
+          ))
       }
     // RFC 9110 10.1.1: a server MUST ignore 100-continue in HTTP/1.0.
     [value], Http10 ->
       case string.lowercase(string.trim(value)) {
         "100-continue" -> Ok(False)
-        _ -> Error(FramingError(417, "unsupported expectation: " <> value))
+        _ ->
+          Error(FramingError(
+            417,
+            "unsupported expectation: " <> string.inspect(value),
+          ))
       }
     _, _ -> Error(FramingError(417, "multiple Expect headers"))
   }
@@ -566,7 +574,7 @@ pub fn read_body(
   req: Request(server.Connection),
   max_bytes: Int,
 ) -> Result(BitArray, ReadBodyError) {
-  let server.Connection(socket: socket) = req.body
+  let server.Connection(socket: socket, ..) = req.body
   case request.get_header(req, "content-length") {
     Error(Nil) -> {
       log.debug("brazier.http", "read_body: request has no Content-Length")
@@ -1180,7 +1188,8 @@ fn build_request(
   request.Request(
     method: method,
     headers: headers,
-    body: server.Connection(socket: socket),
+    // Nothing has resolved the client yet; a WebSocket upgrade sets it.
+    body: server.Connection(socket: socket, resolved: None),
     scheme: http.Http,
     host: host_name,
     port: port_opt,

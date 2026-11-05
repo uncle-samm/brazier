@@ -1,0 +1,220 @@
+//// FAILING REPRODUCTION, NOT COMPILED. Save as
+//// test/brazier/backpressure_cascade_test.gleam to run it. Both tests
+//// assert the intended behaviour and fail against the tree at 7c3adc8
+//// (m118 L453); the runtime fix that makes them pass is specified in the
+//// m118-logs report. Kept out of test/ so the gates stay green.
+////
+//// L453: a cascade of `CloseForBackpressure` lines was seen once, when many
+//// tests failed together. These tests reproduce it on one runtime with a
+//// slow reader, a connection whose handler is gone, and a healthy one.
+////
+//// Observed today:
+//// - dead handler: `message_queue_len` answers 1000000000 for a dead pid,
+////   so join and every broadcast log "Connection gone outbound mailbox
+////   exceeded 1000 messages (1000000000); closing slow client";
+//// - slow reader: every broadcast past the limit logs another warning
+////   (1002, 1003, 1004 queued) and queues another CloseForBackpressure;
+//// - the healthy connection gets every patch (no cross-connection effect).
+////
+//// The "forgetting it" info line in the first test is the log line the fix
+//// is expected to add; adjust the fragment to the wording the fix chooses.
+
+import brazier/await
+import brazier/cluster/log_capture as node_log
+import brazier/effect
+import brazier/error
+import brazier/internal/context
+import brazier/runtime
+import brazier/transport.{type InternalMessage}
+import gleam/erlang/process.{type Pid, type Subject}
+import gleam/int
+import gleam/list
+import gleam/option
+import gleam/string
+import gleam/uri
+
+/// Case 1: a connection whose handler exited is not a slow client. Today
+/// `message_queue_len` answers 1000000000 for a dead pid, and every
+/// broadcast logs "closing slow client" for it and sends it a
+/// CloseForBackpressure.
+pub fn dead_connection_is_forgotten_not_called_slow_test() {
+  let assert Ok(rt) = runtime.start(config(), page_context())
+  let fast = process.new_subject()
+  let gone = subject_in_dead_process()
+  let #(received, logs) =
+    node_log.capture(fn() {
+      connect(rt, "fast", fast)
+      connect(rt, "gone", gone)
+      let _ = await.settle(rt, fast)
+      click(rt, "fast", 1)
+      click(rt, "fast", 2)
+      click(rt, "fast", 3)
+      await.settle(rt, fast)
+    })
+  assert patches(received) == 3
+  let slow_lines =
+    lines_about(logs, "Connection gone outbound mailbox exceeded")
+  assert slow_lines == [] as string.inspect(slow_lines)
+  // Forgotten once, at info, naming the connection.
+  let forgotten = lines_about(logs, "gone")
+  assert list.any(forgotten, fn(line) {
+    line.level == "info" && string.contains(line.message, "forgetting it")
+  })
+    as string.inspect(forgotten)
+}
+
+/// Case 2: a slow connection is told to close once. Today every broadcast
+/// past the limit logs another warning and queues another
+/// CloseForBackpressure behind the backlog.
+pub fn slow_connection_is_closed_once_test() {
+  let assert Ok(rt) = runtime.start(config(), page_context())
+  let fast = process.new_subject()
+  let #(slow, slow_pid) = subject_in_live_process()
+  let #(received, logs) =
+    node_log.capture(fn() {
+      connect(rt, "fast", fast)
+      connect(rt, "slow", slow)
+      let _ = await.settle(rt, fast)
+      fill(slow, 1001)
+      click(rt, "fast", 1)
+      click(rt, "fast", 2)
+      click(rt, "fast", 3)
+      await.settle(rt, fast)
+    })
+  // The healthy connection gets every patch.
+  assert patches(received) == 3
+  let warnings = lines_about(logs, "Connection slow outbound mailbox exceeded")
+  assert list.length(warnings) == 1 as string.inspect(warnings)
+  process.kill(slow_pid)
+}
+
+fn patches(received: List(InternalMessage)) -> Int {
+  list.count(received, fn(message) {
+    case message {
+      transport.SendPatch(..) -> True
+      _ -> False
+    }
+  })
+}
+
+fn lines_about(
+  logs: List(node_log.Line),
+  fragment: String,
+) -> List(node_log.Line) {
+  list.filter(logs, fn(line) {
+    string.starts_with(line.message, "[brazier.runtime]")
+    && string.contains(line.message, fragment)
+  })
+}
+
+// --- Harness -----------------------------------------------------------------
+
+pub type Model {
+  Model(count: Int)
+}
+
+pub type Msg {
+  Increment
+}
+
+fn config() -> runtime.RuntimeConfig(Model, Msg) {
+  runtime.RuntimeConfig(
+    init: fn(_ctx) { Ok(#(Model(count: 0), effect.none())) },
+    update: fn(model: Model, _msg) {
+      #(Model(count: model.count + 1), effect.none())
+    },
+    encode_model: fn(model: Model) {
+      "{\"count\":" <> int.to_string(model.count) <> "}"
+    },
+    decode_event: fn(_name, handler_id, _data, _path) {
+      case handler_id {
+        "increment" -> Ok(Increment)
+        _ -> Error(error.RuntimeError(reason: "unknown handler " <> handler_id))
+      }
+    },
+    restore_model: option.None,
+    route: option.None,
+    dynamic_subscriptions: option.None,
+    on_notify: option.None,
+    on_notification: option.None,
+    secret_key: "",
+    presence: option.None,
+    title: option.None,
+  )
+}
+
+fn page_context() -> context.Context {
+  context.new(
+    uri: uri.Uri(
+      ..uri.empty,
+      scheme: option.Some("http"),
+      host: option.Some("localhost"),
+      path: "/",
+    ),
+    cookies: [],
+    is_connected: True,
+    session_id: Error(Nil),
+  )
+}
+
+fn connect(
+  rt: Subject(runtime.RuntimeMessage(Msg)),
+  conn_id: String,
+  subject: Subject(InternalMessage),
+) -> Nil {
+  process.send(rt, runtime.ClientConnected(conn_id: conn_id, subject: subject))
+  process.send(rt, runtime.ClientJoined(conn_id: conn_id, token: "", path: "/"))
+}
+
+fn click(
+  rt: Subject(runtime.RuntimeMessage(Msg)),
+  conn_id: String,
+  clock: Int,
+) -> Nil {
+  process.send(
+    rt,
+    runtime.ClientEventReceived(
+      conn_id: conn_id,
+      event_name: "click",
+      handler_id: "increment",
+      event_data: "{}",
+      target_path: "0",
+      clock: clock,
+      ops: [],
+    ),
+  )
+}
+
+/// A subject whose owner is alive and never reads it: a slow reader.
+fn subject_in_live_process() -> #(Subject(InternalMessage), Pid) {
+  let reply = process.new_subject()
+  let pid =
+    process.spawn_unlinked(fn() {
+      process.send(reply, process.new_subject())
+      process.receive_forever(process.new_subject())
+    })
+  let assert Ok(subject) = process.receive(reply, 1000)
+    as "the reader must hand over its subject"
+  #(subject, pid)
+}
+
+/// A subject whose owner has exited: a handler that is gone.
+fn subject_in_dead_process() -> Subject(InternalMessage) {
+  let reply = process.new_subject()
+  let pid =
+    process.spawn_unlinked(fn() { process.send(reply, process.new_subject()) })
+  let assert Ok(subject) = process.receive(reply, 1000)
+    as "the handler must hand over its subject"
+  await.expect_down(pid, "the handler")
+  subject
+}
+
+fn fill(subject: Subject(InternalMessage), remaining: Int) -> Nil {
+  case remaining <= 0 {
+    True -> Nil
+    False -> {
+      process.send(subject, transport.SendError(reason: "queued"))
+      fill(subject, remaining - 1)
+    }
+  }
+}

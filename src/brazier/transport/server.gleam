@@ -46,6 +46,7 @@ import gleam/bytes_tree.{type BytesTree}
 import gleam/dynamic.{type Dynamic}
 import gleam/erlang/process
 import gleam/int
+import gleam/option.{type Option}
 import gleam/otp/actor
 import gleam/otp/static_supervisor
 import gleam/otp/supervision
@@ -54,7 +55,16 @@ import gleam/string
 /// Connection type — used as the body parameter for gleam_http Request.
 /// Carries the socket reference so handlers can read the request body.
 pub type Connection {
-  Connection(socket: Socket)
+  Connection(
+    socket: Socket,
+    /// The upgrade's one resolution of the client (address and scheme
+    /// behind the trusted proxies). A WebSocket upgrade resolves its client
+    /// once, for the per-IP cap and the Origin check, and sets this before
+    /// the middleware gate runs; every gate on that request must reuse it
+    /// rather than parse the forwarding header again (`client.ip` does).
+    /// `None` on a plain HTTP request, which nothing has resolved yet.
+    resolved: Option(ip.Resolved),
+  )
 }
 
 /// Response body type.

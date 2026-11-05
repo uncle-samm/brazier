@@ -62,20 +62,22 @@ pub fn forwarding_header_to_string(header: ForwardingHeader) -> String {
 /// an error: a typo in a proxy list must never silently widen or narrow
 /// trust. A header with no proxies is an error too: it would never be read,
 /// and the operator plainly expected it to be.
+///
+/// A refusal is returned, not logged: the caller logs it once, with its own
+/// context ("Invalid security limits: trusted_proxies: ..." when the
+/// listener checks its limits), so one refusal makes one log line.
 pub fn parse_trusted_proxies(
   entries: List(String),
   header: ForwardingHeader,
 ) -> Result(TrustedProxies, String) {
   case parse_proxy_networks(entries), entries, header {
     Error(reason), _, _ -> Error(reason)
-    Ok(_), [], Forwarded | Ok(_), [], XForwardedFor -> {
-      let reason =
+    Ok(_), [], Forwarded | Ok(_), [], XForwardedFor ->
+      Error(
         "forwarding header "
         <> forwarding_header_to_string(header)
-        <> " is configured but no trusted proxies are listed, so it would never be read"
-      log.error("brazier.ip", "Invalid trusted proxy configuration: " <> reason)
-      Error(reason)
-    }
+        <> " is configured but no trusted proxies are listed, so it would never be read",
+      )
     Ok(networks), _, _ -> {
       let count = string.inspect(list.length(entries))
       case entries, header {
@@ -100,17 +102,12 @@ pub fn parse_trusted_proxies(
 }
 
 /// Parse trusted proxy networks without a header, for the listener's
-/// per-IP cap exemption. Any invalid entry is an error.
+/// per-IP cap exemption. Any invalid entry is an error, returned for the
+/// caller to log once (the listener logs "Invalid listener options").
 pub fn parse_proxy_networks(
   entries: List(String),
 ) -> Result(ProxyNetworks, String) {
-  case ffi_parse_cidrs(entries) {
-    Ok(parsed) -> Ok(parsed)
-    Error(reason) -> {
-      log.error("brazier.ip", "Invalid trusted proxy list: " <> reason)
-      Error(reason)
-    }
-  }
+  ffi_parse_cidrs(entries)
 }
 
 /// No trusted proxies: forwarding headers are never honoured.
@@ -240,6 +237,14 @@ pub fn client_scheme(
 /// header (see `client`).
 pub type Client {
   Client(address: String, scheme: Result(String, String))
+}
+
+/// What one request's peer and forwarding headers resolved to, and the
+/// trusted proxies that resolution honoured. A request that carries one
+/// (`server.Connection.resolved`) is never resolved again against the same
+/// proxies, so a problem in its forwarding header is logged once.
+pub type Resolved {
+  Resolved(trusted: TrustedProxies, client: Client)
 }
 
 /// `client_address` and `client_scheme` together, for a caller that needs

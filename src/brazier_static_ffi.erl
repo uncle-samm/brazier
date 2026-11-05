@@ -48,7 +48,8 @@
 %% Length is its byte length, and Source is `cached` or
 %% {hashed, not_cached | stat_changed | racily_clean} (the Gleam type
 %% brazier/static.DigestSource);
-%% {error, not_a_file} for a missing path or anything but a regular file;
+%% {error, not_a_file} for a missing path (a name too long included) or
+%% anything but a regular file;
 %% {error, {read_failed, Bin}} when the file exists but cannot be read;
 %% {error, {cache_unavailable, Bin}} when the digest table cannot be had.
 %% Now is the current POSIX time in seconds (injected so tests can place an
@@ -64,7 +65,11 @@ file_digest(Path, HexChars, Now, Capacity)
             end;
         {ok, #file_info{}} ->
             {error, not_a_file};
-        {error, Missing} when Missing =:= enoent; Missing =:= enotdir ->
+        %% enametoolong: the client sent a segment longer than the file
+        %% system allows. No file can have that name, so it is missing,
+        %% not a server failure (Plug.Static passes on any stat error).
+        {error, Missing} when Missing =:= enoent; Missing =:= enotdir;
+                              Missing =:= enametoolong ->
             {error, not_a_file};
         {error, Reason} ->
             {error, {read_failed, format(Reason)}}
