@@ -45,26 +45,6 @@
     `eaddrnotavail`, whose text is OS-specific, and the listener has no
     bind-address option to test it through.
 
-- **Issue:** `wire.patch` and `wire.model_sync_50kb` are 13% slower on
-  their medians than at 4b274e8 (the 2026-11-04 baseline's commit), with
-  under 2% noise between runs. Inside the gate's 25% floor, so
-  `bench-check` passes it.
-  - **Context:** Milestone 118 re-baseline, an A/B of 4b274e8 and 7bef17a
-    run alternately on one machine (docs/PERFORMANCE.md, "Changes since
-    the 2026-11-04 baseline").
-  - **Files:** `src/brazier/transport.gleam` (`encode_server_message`),
-    `test/brazier/bench/suite.gleam` (the wire scenario)
-  - **Attempted:** nothing yet. Bisect the commits between the two that
-    touch the frame encoding or the bench's wire scenario.
-
-- **Issue:** `presence.list.10.p99` is 1.56x what it was at 4b274e8 (about
-  13 µs), with under 5% noise between runs; its median and the 10,000-entry
-  metrics did not move.
-  - **Context:** the same A/B as the `wire` issue above.
-  - **Files:** `src/brazier/presence.gleam`, `src/brazier_presence_ffi.erl`,
-    `test/brazier/bench/presence_bench.gleam`
-  - **Attempted:** nothing yet.
-
 - **Issue:** `presence.list` grows faster than the room past about 10,000
   entries: 0.46 µs an entry at 3,000, 0.61 at 10,000 and 0.92 to 1.13 at
   30,000. Every `brazier.presence` session that starts following a topic
@@ -87,6 +67,72 @@
 ## Resolved Issues
 
 <!-- Move resolved issues here with full resolution details -->
+
+- **Issue:** `wire.patch` and `wire.model_sync_50kb` were 13% slower on
+  their medians than at 4b274e8 (the 2026-11-04 baseline's commit), with
+  under 2% noise between runs. Inside the gate's 25% floor, so
+  `bench-check` passed it.
+  - **Context:** Milestone 118 re-baseline, an A/B of 4b274e8 and 7bef17a
+    run alternately on one machine (docs/PERFORMANCE.md, "Changes since
+    the 2026-11-04 baseline").
+  - **Files:** `src/brazier/transport.gleam` (`encode_server_message_tree`),
+    `src/brazier_transport_ffi.erl`
+  - **Cause:** 42416b3 (streams step 5) gave every `model_sync` and
+    `patch` frame a fifth member, `streams`, as it meant to. The frame was
+    built with `json.object`, which escapes every key byte by byte (OTP's
+    `json:encode_binary`) on every frame. An eprof of 20,000 patch frames
+    counted exactly 13 more calls a frame at 7bef17a than at 4b274e8 (one
+    more key escaped: 8 more `json:escape_binary` calls, the
+    `encode_binary`, the object comprehension's step and the raw splice),
+    reductions a frame went from 98 to 116, and `json:escape_binary` alone
+    was 25 to 28% of the time. The bench and `ws.encode_text_tree` did not
+    change between the two commits, nor did the dependencies.
+  - **Resolution:** (Milestone 118, m118-perf-regress) `model_sync` and
+    `patch` frames are written from constant text: the keys and type are
+    spliced in already JSON, the payloads as before, the integers with
+    `int.to_string` (`integer_to_binary`, what `json.int` writes), as
+    Jason's derived encoders escape a struct's keys once at compile time.
+    The other frames still use `json.object`. A frame now costs 19
+    reductions. Interleaved in one session (focused loop of the suite's
+    wire block, 3 runs a side): patch 151.9/151.7/151.7 ns against
+    576.5/577.9/575.8 at 7bef17a and 499.6/498.3/497.7 at 4b274e8;
+    model_sync 155.2/155.8/155.2 against 619.8/622.3/623.5 and
+    522.3/513.1/510.0. In the full suite, run alternately:
+    `wire.patch.median` 133.5/135.0/134.8/134.6 ns against
+    517.9/518.9/533.9/517.4 at 7bef17a and 462.7/460.8 at 4b274e8;
+    `wire.model_sync_50kb.median` 138.5/137.9/140.1/138.5 against
+    525.3/530.6/522.5/520.6 and 455.5/448.5. No other metric moved beyond
+    its run-to-run spread; the runtime scenarios never encode a frame (the
+    bench's transport is a subject).
+    `encode_server_message_tree_matches_json_object_test` checks the bytes
+    equal what `json.object` writes, for escaped and
+    non-ASCII payloads and integers up to 10²¹, so the frame cannot drift
+    from the encoder it replaced.
+
+- **Issue:** `presence.list.10.p99` was 1.56x what it was at 4b274e8
+  (about 13 µs), with under 5% noise between runs; its median and the
+  10,000-entry metrics did not move.
+  - **Context:** the same A/B as the `wire` issue above.
+  - **Files:** `src/brazier/presence.gleam`, `src/brazier_presence_ffi.erl`,
+    `test/brazier/bench/presence_bench.gleam`
+  - **Cause:** not a change in the code. Every module a list runs compiles
+    to the same code at both commits (`beam_lib:md5` of `brazier@presence`,
+    `brazier_presence_ffi`, `brazier_presence_shard`, the presence bench,
+    `measure`, `stats`, `pubsub`, `log`, gleam_json, `gleam@list` and
+    `gleam@dynamic@decode` is equal; only `brazier_bench_ffi` differs, in
+    the ws scenario). The p99 of a 4.8 µs list is set by garbage
+    collection: about 15% of lists (299 of 2,000 in a probe) start a minor
+    GC of the calling process, and the p99 (the 4th slowest of 400 a
+    round) lands on those pauses. It is bimodal between VMs, about 9.5 or
+    about 14.5 µs, on either commit. Interleaved in one session: the full
+    suite gave 14.88, 11.79, 15.38, 15.92, 16.67, 9.38 at 7bef17a and
+    14.50, 15.29, 14.71, 9.33 at 4b274e8; the presence scenario alone in a fresh VM gave
+    9.83, 14.46, 14.08, 14.88, 13.58, 13.58 and 12.04, 13.25, 14.17, 9.83,
+    13.17, 13.71. The re-baseline's A/B drew 4b274e8 from the low mode.
+  - **Resolution:** (Milestone 118, m118-perf-regress) No code change; the
+    regression does not reproduce. `presence.list.10.p99` measures GC
+    pauses more than the list, so a move between its two modes is not a
+    regression signal.
 
 - **Issue:** `server.start` on a taken port killed a caller that did not
   trap exits, and a caller that did got the error `"shutdown"`, the cause

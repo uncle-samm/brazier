@@ -27,7 +27,6 @@
     ws_encode_frame/2,
     ws_encode_frame_iodata/2,
     ws_encode_close/2,
-    json_raw/1,
     ws_is_valid_utf8/1,
     ws_decode_key/1,
     ws_set_send_timeout/2,
@@ -842,16 +841,6 @@ ws_encode_frame_iodata(Opcode, Payload) when is_integer(Opcode) ->
             <<1:1, 0:3, Opcode:4, 0:1, 127:7, Len:64>>
     end,
     [Header, Payload].
-
-%% A JSON value whose text the caller already holds: gleam_json's Json is
-%% iodata, so the text is spliced into the enclosing document unchanged.
-%% The caller guarantees the binary is one complete JSON value; the
-%% transport only passes text the runtime decoded (patch.Snapshot) or
-%% encoded (patch.diff_snapshots) itself.
-%% Reference: Phoenix.Socket.V2.JSONSerializer embeds encoded payloads
-%% as iodata rather than re-encoding them.
-json_raw(Json) when is_binary(Json) ->
-    Json.
 
 %% Encode a close frame carrying a status code and reason (§5.5.1).
 %% The caller guarantees byte_size(Reason) =< 123 so the payload fits a
