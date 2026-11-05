@@ -232,8 +232,13 @@ app project:
    the Brazier client modules, a JavaScript `brazier/log`, the runtime and
    `brazier_app_entry.gleam`, with packages pinned to `manifest.toml`. Compile
    it: a warning in a file Brazier writes fails the build, naming the file
-   and the warning, while a warning in the app's own reached code is logged,
-   as the server compile logs it. Bundle it with the pinned esbuild, and write
+   and the warning, while a warning in the app's own reached code is logged
+   at the line and column of the app's file it came from. The slice copies
+   each definition verbatim, so `source_map` records one segment per copied
+   definition (where it starts in the copy and in the original) and maps the
+   copy's position back exactly. A position in a line the build wrote (a
+   regenerated import or an `@external` attribute) is logged at the copy's
+   path as not in the app's source, not at a guessed line. Bundle it with the pinned esbuild, and write
    `priv/static/brazier_client_<hash>.js` and the manifest. A failure deletes
    the manifest, so `brazier.start` refuses stale artifacts. The `<hash>` is
    the build id the client sends in `join`, so a running server closes a

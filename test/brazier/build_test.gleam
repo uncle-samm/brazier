@@ -173,6 +173,20 @@ pub fn program_warning_file_drops_line_and_column_test() {
   let assert None = at(None)
 }
 
+pub fn program_location_line_column_needs_a_positive_line_and_column_test() {
+  let assert Some(#(3, 7)) =
+    program.location_line_column("/p/src/app.gleam:3:7")
+  let assert Some(#(10, 1)) =
+    program.location_line_column("/p:q/src/app.gleam:10:1")
+  let assert None = program.location_line_column("/p/src/app.gleam")
+  let assert None = program.location_line_column("/p/src/app.gleam:x:1")
+  let assert None = program.location_line_column("/p/src/app.gleam:0:1")
+  let assert None = program.location_line_column("/p/src/app.gleam:1:0")
+  let assert None = program.location_line_column("/p/src/app.gleam:-1:2")
+  // A bare `line:column` names no file, so it is not a location.
+  let assert None = program.location_line_column("3:7")
+}
+
 pub fn program_warnings_of_a_clean_build_is_empty_test() {
   let assert [] =
     program.warnings(

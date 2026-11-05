@@ -34,9 +34,11 @@ import brazier/build/files
 import brazier/build/program
 import brazier/build/project_toml.{type LockedPackage}
 import brazier/build/reach
+import brazier/build/source_map
 import brazier/build/sources
 import brazier/log
 import gleam/dict.{type Dict}
+import gleam/int
 import gleam/list
 import gleam/option
 import gleam/result
@@ -99,7 +101,7 @@ pub fn build(
     app_manifest(project),
     packages,
   ))
-  use Nil <- result.try(compile(dir, user_modules(analysis)))
+  use Nil <- result.try(compile(dir, src_dir, app_modules(analysis)))
   use Nil <- result.try(files.write(files.join(dir, "bundle_entry.mjs"), entry))
   use Nil <- result.try(program.esbuild_bundle(
     dir,
@@ -143,11 +145,16 @@ pub fn publish(static: String, contents: String) -> Result(Bundle, String) {
 
 /// Compile the client project at `dir` with `gleam build`.
 ///
-/// `user_modules` are the module paths holding the app's own reached
-/// definitions, sliced unchanged from its sources. A warning in one of them
-/// is the app's, as the server's `gleam build` of the same source is: it is
-/// logged and does not fail the build, so an unused variable in a view does
-/// not stop a bundle that Gleam itself would build.
+/// `app_modules` are the emitted app modules, holding the app's own reached
+/// definitions sliced unchanged from its sources in `src_dir`. A warning in
+/// one of them is the app's, as the server's `gleam build` of the same
+/// source is: it is logged and does not fail the build, so an unused
+/// variable in a view does not stop a bundle that Gleam itself would build.
+/// The compiler names the copy in the client project, whose line numbers
+/// are not the source's, so the log names the place in the app's own file,
+/// mapped through the module's segments (`source_map`). A place the build
+/// generated (a regenerated import, an `@external` line) has no place in
+/// the app's file, and the log says so, naming the copy.
 ///
 /// Every other file is one Brazier writes: the copied and sliced Brazier
 /// modules, the `brazier/log` shim, the generated entry and `gleam.toml`.
@@ -155,8 +162,32 @@ pub fn publish(static: String, contents: String) -> Result(Bundle, String) {
 /// or a warning naming no file, fails the build, naming each file and
 /// warning. `--warnings-as-errors` is not used because it would refuse the
 /// app's own warnings too.
-pub fn compile(dir: String, user_modules: List(String)) -> Result(Nil, String) {
-  use warnings <- result.try(program.gleam_build(dir))
+pub fn compile(
+  dir: String,
+  src_dir: String,
+  app_modules: List(reach.Emitted),
+) -> Result(Nil, String) {
+  use warnings <- result.try(program.gleam_build_warnings(dir))
+  let user_modules = list.map(app_modules, fn(emitted) { emitted.path })
+  use Nil <- result.try(
+    list.try_each(warnings, fn(warning) {
+      case app_module_of(warning, app_modules) {
+        Ok(#(emitted, copy)) -> {
+          use file <- result.map(
+            program.absolute_path(files.join(src_dir, emitted.path <> ".gleam")),
+          )
+          log.warning(
+            "brazier.build.client_bundle",
+            "`gleam build` of the client project in "
+              <> dir
+              <> " warned in the app's code: "
+              <> describe_app_warning(warning.headline, copy, emitted, file),
+          )
+        }
+        Error(Nil) -> Ok(Nil)
+      }
+    }),
+  )
   case brazier_warnings(warnings, user_modules) {
     [] -> Ok(Nil)
     refused -> {
@@ -193,14 +224,69 @@ pub fn brazier_warnings(
   })
 }
 
-/// The module paths of the app modules in the client project: the emitted
-/// modules that are not Brazier's.
-fn user_modules(analysis: Analysis) -> List(String) {
-  list.filter_map(analysis.client, fn(emitted) {
-    case reach.is_framework_module(emitted.path) {
-      True -> Error(Nil)
-      False -> Ok(emitted.path)
-    }
+/// The app module whose copy `warning` points into, by the same rule as
+/// `brazier_warnings`, and the warning's location there.
+fn app_module_of(
+  warning: program.Warning,
+  app_modules: List(reach.Emitted),
+) -> Result(#(reach.Emitted, String), Nil) {
+  use location <- result.try(option.to_result(warning.location, Nil))
+  use file <- result.try(option.to_result(program.warning_file(warning), Nil))
+  list.find(app_modules, fn(emitted) {
+    string.ends_with(file, "/" <> module_file(emitted.path))
+  })
+  |> result.map(fn(emitted) { #(emitted, location) })
+}
+
+/// An app module's warning `headline`, at `copy` (the compiler's
+/// `file:line:column` in `emitted`'s copy), described at the place in the
+/// app's file `source_file` that it maps to, followed by the copy's
+/// location. When it maps to no place, the copy's location and why: the
+/// position is in a line the build generated, or the compiler gave no line
+/// and column. Never a guessed line.
+pub fn describe_app_warning(
+  headline: String,
+  copy: String,
+  emitted: reach.Emitted,
+  source_file: String,
+) -> String {
+  case program.location_line_column(copy) {
+    option.Some(#(line, column)) ->
+      case source_map.locate(emitted.segments, line, column) {
+        source_map.InSource(line:, column:) ->
+          headline
+          <> " at "
+          <> source_file
+          <> ":"
+          <> int.to_string(line)
+          <> ":"
+          <> int.to_string(column)
+          <> " (the client project's copy: "
+          <> copy
+          <> ")"
+        source_map.Generated ->
+          headline
+          <> " at "
+          <> copy
+          <> ", in a line the build generated for "
+          <> emitted.path
+          <> " (its imports or an @external attribute), not in your source "
+          <> source_file
+      }
+    option.None ->
+      headline
+      <> " at "
+      <> copy
+      <> ", which gives no line and column, so it cannot be mapped to a place in your source "
+      <> source_file
+  }
+}
+
+/// The emitted app modules in the client project: those that are not
+/// Brazier's.
+fn app_modules(analysis: Analysis) -> List(reach.Emitted) {
+  list.filter(analysis.client, fn(emitted) {
+    !reach.is_framework_module(emitted.path)
   })
 }
 

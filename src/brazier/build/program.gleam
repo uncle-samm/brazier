@@ -60,13 +60,28 @@ pub fn describe_warning(warning: Warning) -> String {
 /// `:line:column`. `None` for a warning without a location.
 pub fn warning_file(warning: Warning) -> Option(String) {
   use location <- option.map(warning.location)
+  split_location(location).0
+}
+
+/// The 1-based #(line, column) a warning's location points at. `None` when
+/// the location does not end with a positive `:line:column`.
+pub fn location_line_column(location: String) -> Option(#(Int, Int)) {
+  split_location(location).1
+}
+
+/// `file:line:column` as #(file, Some(#(line, column))), or #(location,
+/// None) when it does not end with a positive line and column.
+fn split_location(location: String) -> #(String, Option(#(Int, Int))) {
   case list.reverse(string.split(location, ":")) {
     [column, line, ..file] ->
       case int.parse(column), int.parse(line), file {
-        Ok(_), Ok(_), [_, ..] -> string.join(list.reverse(file), ":")
-        _, _, _ -> location
+        Ok(column), Ok(line), [_, ..] if line >= 1 && column >= 1 -> #(
+          string.join(list.reverse(file), ":"),
+          Some(#(line, column)),
+        )
+        _, _, _ -> #(location, None)
       }
-    _ -> location
+    _ -> #(location, None)
   }
 }
 
@@ -74,19 +89,40 @@ pub fn warning_file(warning: Warning) -> Option(String) {
 ///
 /// A warning does not fail this compile, but it is never dropped: each one is
 /// logged at warning level, naming the project, and returned so the caller
-/// can refuse the ones it must (see `client_bundle`). The generated client
-/// project is the build's one JavaScript compile, so a warning only the
-/// JavaScript target raises is seen there or nowhere.
+/// can refuse the ones it must. This is the app project's own compile, so
+/// each location names the app's file. The client project, whose files are
+/// copies, uses `gleam_build_warnings` and maps them (see `client_bundle`).
 pub fn gleam_build(cwd: String) -> Result(List(Warning), String) {
-  case run(cwd, "gleam", ["build"]) {
-    Ok(output) -> {
-      let found = warnings(output)
+  case gleam_build_warnings(cwd) {
+    Ok(found) -> {
       list.each(found, fn(warning) {
         log.warning(
           "brazier.build.program",
           "`gleam build` in " <> cwd <> " warned: " <> describe_warning(warning),
         )
       })
+      Ok(found)
+    }
+    Error(reason) -> Error(reason)
+  }
+}
+
+/// Run `gleam build` in `cwd` and return its warnings without logging them.
+/// The caller must log or refuse every one: `client_bundle.compile` logs an
+/// app module's warning at the place in the app's own file, which this
+/// module cannot know, and refuses the rest.
+pub fn gleam_build_warnings(cwd: String) -> Result(List(Warning), String) {
+  case run(cwd, "gleam", ["build"]) {
+    Ok(output) -> {
+      let found = warnings(output)
+      log.debug(
+        "brazier.build.program",
+        "`gleam build` in "
+          <> cwd
+          <> " gave "
+          <> int.to_string(list.length(found))
+          <> " warnings",
+      )
       Ok(found)
     }
     Error(reason) -> Error(reason)
