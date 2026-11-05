@@ -464,7 +464,14 @@ number:
 - a presence diff must name exactly the key that was tracked;
 - the client's HTML must equal the server's.
 
-The client bench does not time the DOM morph, which needs a browser.
+The client bench does not time the DOM morph, which needs a browser. The
+CDP harness's `rows` slice (`examples/rows`, a 1000-row list) does: it
+checks each update's page, then reads the client's `brazier:morph` and
+`brazier:patch` User Timing measures over 100 updates and prints
+`browser.morph.rows_1000` and `browser.patch.rows_1000` as median and p99,
+cut into 5 rounds like the benches. It writes them, in the bench report
+format, to `build/bench/cdp_morph_<viewport>.json`. They have no baseline
+and are not gated.
 
 Each scenario runs in a fresh process (`measure.isolated`), so it is not
 timed through the bench process's heap, which grows run over run. Every

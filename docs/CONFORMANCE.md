@@ -191,7 +191,12 @@ The permanent harness now asserts:
 - Model events receive `patch` or `model_sync` frames and do not receive post-update
   HTML `mount` frames.
 - Explicit route apps restore URL and view state through browser back/forward
-  and send `navigate` frames from `popstate`.
+  and send `navigate` frames from `popstate`. A page check waits for the
+  URL path and the page's own `h1`, not for text the nav shares.
+- Back and forward restore each entry's scroll position once its page is
+  rendered, not before (`history.scrollRestoration` is `"manual"`).
+- A link whose URL path starts with `//` (`href="/.//about"`) is not routed
+  live: the client warns, sends no `navigate`, and the browser loads it.
 - Reconnect tests force a real browser WebSocket close, wait for the reconnect
   `join`, then prove the app remains interactive without duplicate model events.
   The forced-close hook is only enabled when the CDP harness injects
