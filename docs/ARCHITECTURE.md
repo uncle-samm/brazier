@@ -336,6 +336,22 @@ socket in a process of its own as in Thousand Island:
 3. **The acceptors** (`brazier_http_acceptors_sup`, one-for-one), which accept
    on that socket.
 
+The tree's supervisor (`brazier_http_listener_sup`) starts with no children
+and adds the three with `supervisor:start_child`, one by one, as Ranch adds a
+listener to `ranch_sup`. A child that cannot start (a taken port, a
+privileged one) is then an error the start returns, not an exit of the
+supervisor's own start, which killed a linked caller that did not trap
+exits. The partly started tree is stopped and the start returns the cause:
+`"cannot listen on port 80: eacces (permission denied)"`. `server.start`
+returns it as its `Error`, and `server.supervised` as `InitFailed`.
+
+A supervised listener's entries are held by its parent, since a terminated
+child can still be restarted (`restart_child`) and must rebind the port it
+bound first. A parent that removes the listener for good
+(`terminate_child`, then `delete_child`) releases it with `server.release`,
+as Ranch's `stop_listener` cleans up its listener's options itself;
+otherwise the entries stay until the parent exits.
+
 Stopping a listener stops the acceptors first, then closes the listen
 socket, then drains: the connection owner sends each connection
 `{brazier_http_drain, Owner}` and waits up to `drain_timeout_ms` for them to

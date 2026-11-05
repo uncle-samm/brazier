@@ -10,23 +10,16 @@
 %% eaddrinuse. The socket belongs to the sibling brazier_http_listen_socket,
 %% which closes it in its terminate/2. This supervisor reads the socket
 %% from the connection owner (brazier_http_conns), where its owner publishes
-%% it. The listener tree is rest_for_one with the socket owner before this
+%% it. The listener tree (brazier_http_listener_sup) is rest_for_one with
+%% the socket owner before this
 %% supervisor, so a new socket always comes with new acceptors.
 -behaviour(supervisor).
 
--export([start_link/2, start_link_gleam/2]).
+-export([start_link/2]).
 -export([init/1]).
 
 start_link(ConnsName, NumAcceptors) ->
     supervisor:start_link(?MODULE, {ConnsName, NumAcceptors}).
-
-%% Gleam supervision start shape: {ok, {started, Pid, nil}} | {error, StartError}.
-start_link_gleam(ConnsName, NumAcceptors) ->
-    case start_link(ConnsName, NumAcceptors) of
-        {ok, Pid} -> {ok, {started, Pid, nil}};
-        {error, Reason} -> {error, {init_failed, format(Reason)}};
-        ignore -> {error, {init_failed, <<"acceptor supervisor returned ignore">>}}
-    end.
 
 init({ConnsName, NumAcceptors}) ->
     true = brazier_http_conns:is_name(ConnsName),
@@ -60,6 +53,3 @@ init({ConnsName, NumAcceptors}) ->
                                  [ConnsName]),
             erlang:error({no_listen_socket, ConnsName})
     end.
-
-format(Reason) when is_binary(Reason) -> Reason;
-format(Reason) -> list_to_binary(io_lib:format("~p", [Reason])).

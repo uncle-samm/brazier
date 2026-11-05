@@ -7,7 +7,7 @@
 /// A listener is a small OTP tree modelled on ranch's listener supervisor:
 ///
 /// ```text
-/// listener supervisor (rest_for_one)
+/// listener supervisor    brazier_http_listener_sup (rest_for_one)
 /// ├── connection owner   brazier_http_conns      (worker)
 /// │     links every connection handler process, enforces the global and
 /// │     per-IP connection caps, releases a slot when a handler exits
@@ -33,6 +33,15 @@
 /// down. Ranch keeps the socket in its acceptor supervisor and never closes
 /// it; Thousand Island gives it a dedicated listener process, as here.
 ///
+/// The supervisor starts with no children and adds the three in order, so a
+/// child that fails to start (a taken port, a port the OS refuses) is an
+/// `Error` naming the cause, `"cannot listen on port 80: eacces (permission
+/// denied)"`, and the partly started tree is stopped without an exit signal
+/// to the caller. A supervisor that lists its children in `init` exits
+/// through its link when one fails, which killed a caller that does not
+/// trap exits (ranch starts its listeners with `start_child` for the same
+/// reason; see `brazier_http_listener_sup`).
+///
 /// A crashing handler only takes itself down (its slot is released by the
 /// owner). A crashing acceptor is restarted and reported by its supervisor.
 /// If the connection owner itself dies, rest_for_one restarts the socket
@@ -57,9 +66,7 @@ import gleam/erlang/process
 import gleam/int
 import gleam/option.{type Option}
 import gleam/otp/actor
-import gleam/otp/static_supervisor
 import gleam/otp/supervision
-import gleam/string
 
 /// Connection type — used as the body parameter for gleam_http Request.
 /// Carries the socket reference so handlers can read the request body.
@@ -280,6 +287,11 @@ pub opaque type Listener {
 
 /// Start a supervised listener. The listener's supervisor is linked to the
 /// calling process.
+///
+/// A listener that cannot start is an `Error` naming the cause, such as
+/// `"cannot listen on port 4000: eaddrinuse (address already in use)"`;
+/// nothing of it is left running and the caller gets no exit signal, so a
+/// caller that does not trap exits survives it.
 pub fn start(
   options: ListenerOptions,
   handler: fn(Socket) -> Nil,
@@ -289,14 +301,14 @@ pub fn start(
       log.error("brazier.server", "Invalid listener options: " <> reason)
       Error(reason)
     }
-    Ok(#(name, builder)) ->
-      case static_supervisor.start(builder) {
-        Ok(started) -> {
+    Ok(#(name, start_tree)) ->
+      case start_tree() {
+        Ok(supervisor) -> {
           // Nothing restarts this tree: its supervisor is its only holder.
           // INVARIANT: the keeper holds this process, its name's maker,
           // until a holder is added, and this process is running, so the
           // keeper is still there; a false here is a keeper bug.
-          let assert True = ffi_conns_keep(name, started.pid)
+          let assert True = ffi_conns_keep(name, supervisor)
             as "a started listener's keeper holds its starter"
           let port = ffi_conns_get_port(name)
           log.info(
@@ -307,10 +319,9 @@ pub fn start(
               <> int.to_string(options.acceptors)
               <> " acceptors",
           )
-          Ok(Listener(supervisor: started.pid, conns: name, port: port))
+          Ok(Listener(supervisor: supervisor, conns: name, port: port))
         }
-        Error(err) -> {
-          let reason = describe_start_error(err)
+        Error(reason) -> {
           // A connection owner that started before the failure registered
           // itself: the listener never ran, so its entries go now.
           let forgot = ffi_conns_forget_port(name)
@@ -332,7 +343,18 @@ pub fn start(
 }
 
 /// A child specification for embedding a listener in another supervision
-/// tree (for example the application supervisor).
+/// tree (for example the application supervisor). A start that fails is
+/// `InitFailed` naming the cause, as `start`'s error does.
+///
+/// The parent supervisor holds the listener's remembered entries (its
+/// connection owner and bound port) for as long as the parent runs, so a
+/// terminated listener restarted with `supervisor:restart_child` rebinds
+/// its port. A listener removed from a running parent for good
+/// (`supervisor:terminate_child` then `supervisor:delete_child`) must be
+/// released with `release`, or its entries stay until the parent exits:
+/// nothing tells the listener its spec was deleted. Ranch's `stop_listener`
+/// likewise cleans up a listener's options itself between the terminate
+/// and the delete.
 pub fn supervised(
   options: ListenerOptions,
   handler: fn(Socket) -> Nil,
@@ -342,7 +364,7 @@ pub fn supervised(
       log.error("brazier.server", "Invalid listener options: " <> reason)
       Error(reason)
     }
-    Ok(#(name, builder)) -> {
+    Ok(#(name, start_tree)) -> {
       log.debug(
         "brazier.server",
         "Prepared supervised listener for port " <> int.to_string(options.port),
@@ -352,8 +374,8 @@ pub fn supervised(
           // This runs in the parent supervisor, which restarts the tree:
           // the listener's entries stay while it runs.
           use <- held_by_parent(name, options.port)
-          case static_supervisor.start(builder) {
-            Ok(started) -> {
+          case start_tree() {
+            Ok(supervisor) -> {
               let port = ffi_conns_get_port(name)
               // Same line as `start`: operators and the browser
               // conformance harness wait for "Listening on port".
@@ -366,17 +388,19 @@ pub fn supervised(
                   <> " acceptors (supervised)",
               )
               Ok(actor.Started(
-                pid: started.pid,
-                data: Listener(supervisor: started.pid, conns: name, port: port),
+                pid: supervisor,
+                data: Listener(supervisor: supervisor, conns: name, port: port),
               ))
             }
-            Error(err) -> {
+            Error(reason) -> {
               log.error(
                 "brazier.server",
-                "Supervised listener failed to start: "
-                  <> describe_start_error(err),
+                "Supervised listener failed to start on port "
+                  <> int.to_string(options.port)
+                  <> ": "
+                  <> reason,
               )
-              Error(err)
+              Error(actor.InitFailed(reason))
             }
           }
         }),
@@ -526,53 +550,33 @@ pub fn get_connection_owner(listener: Listener) -> Result(process.Pid, Nil) {
   ffi_whereis(listener.conns)
 }
 
+/// Validate the options and name the listener. The returned function starts
+/// its tree, linked to the process that calls it, and returns the tree's
+/// supervisor or the cause of a failed start (see
+/// `brazier_http_listener_sup`, which holds the tree's layout).
 fn build(
   options: ListenerOptions,
   handler: fn(Socket) -> Nil,
-) -> Result(#(ConnsName, static_supervisor.Builder), String) {
+) -> Result(#(ConnsName, fn() -> Result(process.Pid, String)), String) {
   use Nil <- result_try(validate_options(options))
   use trusted <- result_try(ip.parse_proxy_networks(options.trusted_proxies))
   let name = ffi_conns_new_name()
-  let conns =
-    supervision.worker(fn() {
-      ffi_conns_start_link(
-        name,
-        options.port,
-        handler,
-        options.max_connections,
-        options.max_connections_per_ip,
-        trusted,
-        options.drain_timeout_ms,
-      )
-    })
-    // The owner drains for up to drain_timeout_ms, then kills the
-    // stragglers and waits for their exits: the margin covers that.
-    |> supervision.timeout(ms: options.drain_timeout_ms + conns_stop_margin_ms)
-  let listen_socket =
-    supervision.worker(fn() {
-      ffi_listen_socket_start_link(
-        name,
-        options.backlog,
-        options.send_timeout_ms,
-      )
-    })
-  let acceptors =
-    supervision.supervisor(fn() {
-      ffi_acceptors_start_link(name, options.acceptors)
-    })
-  let builder =
-    static_supervisor.new(static_supervisor.RestForOne)
-    |> static_supervisor.restart_tolerance(intensity: 3, period: 10)
-    |> static_supervisor.add(conns)
-    |> static_supervisor.add(listen_socket)
-    |> static_supervisor.add(acceptors)
-  Ok(#(name, builder))
+  let start_tree = fn() {
+    ffi_listener_start_link(
+      name,
+      options.port,
+      handler,
+      options.max_connections,
+      options.max_connections_per_ip,
+      trusted,
+      options.drain_timeout_ms,
+      options.backlog,
+      options.send_timeout_ms,
+      options.acceptors,
+    )
+  }
+  Ok(#(name, start_tree))
 }
-
-/// Time the connection owner gets on top of its drain timeout to kill the
-/// remaining handlers and collect their exits before its supervisor kills
-/// it.
-const conns_stop_margin_ms = 5000
 
 /// Largest receive timeout (2^32 - 1 ms).
 const max_drain_timeout_ms = 4_294_967_295
@@ -616,20 +620,11 @@ fn result_try(
   }
 }
 
-fn describe_start_error(err: actor.StartError) -> String {
-  case err {
-    actor.InitFailed(reason) -> reason
-    actor.InitTimeout -> "listener start timed out"
-    actor.InitExited(reason) ->
-      "listener exited during start: " <> string.inspect(reason)
-  }
-}
-
 @external(erlang, "brazier_http_conns", "new_name")
 fn ffi_conns_new_name() -> ConnsName
 
-@external(erlang, "brazier_http_conns", "start_link_gleam")
-fn ffi_conns_start_link(
+@external(erlang, "brazier_http_listener_sup", "start_link")
+fn ffi_listener_start_link(
   name: ConnsName,
   port: Int,
   handler: fn(Socket) -> Nil,
@@ -637,20 +632,10 @@ fn ffi_conns_start_link(
   max_connections_per_ip: Int,
   trusted: ip.ProxyNetworks,
   drain_timeout_ms: Int,
-) -> Result(actor.Started(ConnsName), actor.StartError)
-
-@external(erlang, "brazier_http_listen_socket", "start_link_gleam")
-fn ffi_listen_socket_start_link(
-  name: ConnsName,
   backlog: Int,
   send_timeout_ms: Int,
-) -> Result(actor.Started(Nil), actor.StartError)
-
-@external(erlang, "brazier_http_acceptors_sup", "start_link_gleam")
-fn ffi_acceptors_start_link(
-  name: ConnsName,
   acceptors: Int,
-) -> Result(actor.Started(Nil), actor.StartError)
+) -> Result(process.Pid, String)
 
 @external(erlang, "brazier_http_conns", "get_port")
 fn ffi_conns_get_port(name: ConnsName) -> Int

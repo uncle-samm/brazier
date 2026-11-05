@@ -2,7 +2,8 @@
 %% Helpers for listener_name_test: the atom table, the connection owner
 %% registry's persistent_term entries, and the via registry's callbacks.
 -export([atom_count/0, atoms_since/1, registry_entries/0, register/2, unregister/1,
-         whereis/1, send_raises_badarg/1, forget/1, restart_only_child/1]).
+         whereis/1, send_raises_badarg/1, forget/1, restart_only_child/1,
+         delete_only_child/1]).
 
 atom_count() ->
     erlang:system_info(atom_count).
@@ -51,4 +52,14 @@ restart_only_child(Parent) ->
     [{Id, _Pid, _Type, _Modules}] = supervisor:which_children(Parent),
     ok = supervisor:terminate_child(Parent, Id),
     {ok, _Restarted} = supervisor:restart_child(Parent, Id),
+    nil.
+
+%% Remove the only child of Parent for good (supervisor:terminate_child/2
+%% waits for it to exit, supervisor:delete_child/2 drops its spec), as an
+%% application that drops its listener at run time does.
+delete_only_child(Parent) ->
+    [{Id, _Pid, _Type, _Modules}] = supervisor:which_children(Parent),
+    ok = supervisor:terminate_child(Parent, Id),
+    ok = supervisor:delete_child(Parent, Id),
+    [] = supervisor:which_children(Parent),
     nil.

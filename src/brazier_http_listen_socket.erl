@@ -22,7 +22,7 @@
 %% acceptor pool under a rest_for_one supervisor; that is the structure used
 %% here, with the explicit close in terminate/2 added.
 %%
-%% The listener tree (brazier/transport/server.gleam) is rest_for_one:
+%% The listener tree (brazier_http_listener_sup) is rest_for_one:
 %%   conns -> listen socket (this) -> acceptors
 %% Children stop in reverse order, so a stopping listener stops the
 %% acceptors first, then closes the listen socket, then drains the
@@ -35,19 +35,13 @@
 %% its port.
 -behaviour(gen_server).
 
--export([start_link/3, start_link_gleam/3]).
+-export([start_link/3]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
+%% {ok, Pid} | {error, {listen_failed, Port, Posix}} when the port cannot be
+%% bound: brazier_http_listener_sup names Posix in the start error.
 start_link(ConnsName, Backlog, SendTimeoutMs) ->
     gen_server:start_link(?MODULE, {ConnsName, Backlog, SendTimeoutMs}, []).
-
-%% Gleam supervision start shape: {ok, {started, Pid, nil}} | {error, StartError}.
-start_link_gleam(ConnsName, Backlog, SendTimeoutMs) ->
-    case start_link(ConnsName, Backlog, SendTimeoutMs) of
-        {ok, Pid} -> {ok, {started, Pid, nil}};
-        {error, Reason} -> {error, {init_failed, format(Reason)}};
-        ignore -> {error, {init_failed, <<"listen socket owner returned ignore">>}}
-    end.
 
 init({ConnsName, Backlog, SendTimeoutMs}) ->
     true = brazier_http_conns:is_name(ConnsName),
@@ -113,6 +107,3 @@ terminate(Reason, #{socket := Socket, port := Port}) ->
     ok = gen_tcp:close(Socket),
     brazier_log_ffi:info(<<"brazier.http_listen_socket">>, "closed listen socket on port ~p (~p)",
                         [Port, Reason]).
-
-format(Reason) when is_binary(Reason) -> Reason;
-format(Reason) -> list_to_binary(io_lib:format("~p", [Reason])).

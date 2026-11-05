@@ -183,7 +183,9 @@ and lists the codes in [Close Codes](WIRE_PROTOCOL.md#close-codes).
 Origin validation is the defence against cross-site WebSocket hijacking. On
 every upgrade the `Origin` header must equal the request's own origin, or an
 entry of `ws_allowed_origins`; scheme, host and port must all match, with the
-default port applied (80 for `http`, 443 for `https`):
+default port applied (80 for `http`, 443 for `https`), and scheme and host
+compared with ASCII letters case-folded only (`brazier/internal/ascii`), so a
+non-ASCII character such as the Kelvin sign never equals an ASCII `k`:
 
 - the request's host and port come from its `Host` header;
 - its scheme is `http`, or the scheme a trusted proxy sent in the configured
