@@ -44,9 +44,37 @@ globalThis.clearInterval = removeTimer;
 globalThis.requestAnimationFrame = () => {
   throw new Error("the client must not wait for an animation frame");
 };
+// The User Timing timeline, on the fake clock: entries stay until cleared,
+// as in a browser, and `measureObservers` stand in for a PerformanceObserver
+// (each is handed every measure as it is made).
+const timeline = [];
+const measureObservers = [];
+function clearEntries(type, name) {
+  for (let i = timeline.length - 1; i >= 0; i--) {
+    if (timeline[i].entryType === type && (name === undefined || timeline[i].name === name)) timeline.splice(i, 1);
+  }
+}
 Object.defineProperty(globalThis, "performance", {
   configurable: true,
-  value: { now: () => clock.now, mark() {}, measure() {} },
+  value: {
+    now: () => clock.now,
+    mark(name) {
+      timeline.push({ name, entryType: "mark", startTime: clock.now });
+    },
+    measure(name, start, end) {
+      const at = (mark) => {
+        const found = timeline.filter((e) => e.entryType === "mark" && e.name === mark).at(-1);
+        if (!found) throw new Error("The mark '" + mark + "' does not exist.");
+        return found.startTime;
+      };
+      const entry = { name, entryType: "measure", startTime: at(start), duration: at(end) - at(start) };
+      timeline.push(entry);
+      for (const observe of measureObservers) observe(entry);
+    },
+    clearMarks: (name) => clearEntries("mark", name),
+    clearMeasures: (name) => clearEntries("measure", name),
+    getEntries: () => timeline.slice(),
+  },
 });
 // The reload guard stores wall-clock times: follow the fake clock.
 Date.now = () => clock.now;
@@ -378,7 +406,9 @@ globalThis.CSS = { escape: (s) => String(s).replace(/(["\\])/g, "\\$1") };
 let root = null;
 let documentListeners = [];
 let windowListeners = [];
-const historyLog = { pushed: [], replaced: [] };
+// saves: { path, scroll } for each state-only replaceState (the client
+// saving its scroll into the current entry).
+const historyLog = { pushed: [], replaced: [], saves: [] };
 
 function setPath(path) {
   const h = path.indexOf("#");
@@ -389,11 +419,25 @@ function setPath(path) {
   location.search = q < 0 ? "" : rest.slice(q);
 }
 
-// Back or forward to `path`: the browser sets the URL, then fires popstate
-// on window.
-function popTo(path) {
+// Back or forward to `path`, an entry whose state is `state`: the browser
+// sets the URL and history.state, then fires popstate on window.
+function popTo(path, state = null) {
   setPath(path);
-  for (const l of windowListeners.filter((l) => l.name === "popstate")) l.fn({ type: "popstate", state: null });
+  globalThis.history.state = state;
+  for (const l of windowListeners.filter((l) => l.name === "popstate")) l.fn({ type: "popstate", state });
+}
+
+// The user scrolls the page to (x, y): the browser fires scroll on window.
+function scrollPage(x, y) {
+  globalThis.window.scrollX = x;
+  globalThis.window.scrollY = y;
+  for (const l of windowListeners.filter((l) => l.name === "scroll")) l.fn({ type: "scroll" });
+}
+
+// The scroll the client saved into the current history entry, or undefined.
+function entryScroll() {
+  const state = globalThis.history.state;
+  return state === null ? undefined : state.brazierScroll;
 }
 
 // Dispatch a DOM event the way the browser does for listeners on document:
@@ -510,6 +554,7 @@ function freshGlobals(options = {}) {
   windowListeners = [];
   historyLog.pushed = [];
   historyLog.replaced = [];
+  historyLog.saves = [];
   clock.now = options.now ?? 1_000_000;
   globalThis.sessionStorage = options.storage || new FakeStorage();
   root = new FakeElement("div");
@@ -530,12 +575,28 @@ function freshGlobals(options = {}) {
     },
   };
   setPath(options.path || "/");
+  // The state of the current entry; a structured clone in a browser, so a
+  // copy here too.
+  const clone = (state) => (state === null || state === undefined ? null : JSON.parse(JSON.stringify(state)));
   globalThis.history = {
-    pushState(_state, _title, path) {
+    state: clone(options.historyState),
+    scrollRestoration: "auto",
+    pushState(state, _title, path) {
       historyLog.pushed.push(path);
+      this.state = clone(state);
       setPath(path);
     },
-    replaceState(_state, _title, path) {
+    // replaceState without a URL changes only the entry's state (the client
+    // saving its scroll); it is not a URL replace.
+    replaceState(state, _title, path) {
+      if (options.replaceStateThrows && path === undefined) {
+        throw new Error("SecurityError: Attempt to use history.replaceState() more than 100 times per 30 seconds");
+      }
+      this.state = clone(state);
+      if (path === undefined) {
+        historyLog.saves.push({ path: location.pathname + location.search + location.hash, scroll: this.state.brazierScroll });
+        return;
+      }
       historyLog.replaced.push(path);
       setPath(path);
     },
@@ -558,12 +619,17 @@ function freshGlobals(options = {}) {
   globalThis.window = {
     location: globalThis.location,
     __BRAZIER_ENABLE_TEST_HOOKS: options.testHooks === true,
+    __BRAZIER_HOLD_CONNECT_FOR_TEST: options.holdConnect === true,
+    scrollX: 0,
+    scrollY: 0,
     addEventListener(name, fn) {
       windowListeners.push({ name, fn });
     },
     scrollTo(x, y) {
-      assert.deepEqual([x, y], [0, 0], "the client only scrolls to the top");
-      scrolls.push("top");
+      assert.ok(Number.isFinite(x) && Number.isFinite(y), "scrollTo(" + x + ", " + y + ")");
+      this.scrollX = x;
+      this.scrollY = y;
+      scrolls.push(x === 0 && y === 0 ? "top" : x + "," + y);
     },
   };
 }
@@ -664,6 +730,89 @@ scenario("the outbound test hook counts a debounced send until its timer fires",
   advance(1);
   assert.deepEqual(s.msgs(), [{ q: "a" }]);
   assert.deepEqual(pending(), { queued: 0, scheduled: false, debounced: 0 }, "drained once sent");
+});
+
+// The browser suite's slow-join seam (test_all_cdp.py): with test hooks on
+// and __BRAZIER_HOLD_CONNECT_FOR_TEST set, the page stays server-rendered,
+// with its events queued for replay, until the test releases the connect.
+scenario("the hold-connect test seam keeps the first connect until released, only when hooks are enabled", async () => {
+  const ssr = '<button data-brazier-on-click="0.0">0</button>';
+  // Without __BRAZIER_ENABLE_TEST_HOOKS the hold flag is ignored.
+  let runtime = await loadModule({ ssr, holdConnect: true });
+  runtime.start(makeApp({ view: counterView }));
+  assert.equal(sockets.length, 1, "connects at once without test hooks");
+  assert.equal(globalThis.window.__brazierReleaseConnectForTest, undefined, "no release hook without test hooks");
+  // With hooks enabled but no hold, it connects at once too.
+  runtime = await loadModule({ ssr, testHooks: true });
+  runtime.start(makeApp({ view: counterView }));
+  assert.equal(sockets.length, 1);
+  assert.equal(globalThis.window.__brazierReleaseConnectForTest, undefined, "no release hook without a hold");
+
+  runtime = await loadModule({ ssr, testHooks: true, holdConnect: true });
+  runtime.start(makeApp({ view: counterView }));
+  assert.equal(sockets.length, 0, "the first connect is held");
+  assert.equal(logsMatching("log", "first connect waits for __brazierReleaseConnectForTest()").length, 1);
+  assert.equal(globalThis.window.__brazierWsState(), -1, "no socket while held");
+  fire(el('[data-brazier-on-click="0.0"]'), "click");
+  advance(60000);
+  assert.equal(sockets.length, 0, "time alone does not release it");
+  assert.equal(globalThis.window.__brazierReleaseConnectForTest(), FakeWebSocket.CONNECTING, "release connects and reports the socket's state");
+  assert.equal(sockets.length, 1);
+  // Unhappy path: a second release is an invariant violation, not a second socket.
+  assert.throws(() => globalThis.window.__brazierReleaseConnectForTest(), /called after the client connected/);
+  assert.equal(sockets.length, 1);
+  const s = sockets[0];
+  s.open();
+  sync(s, 0, { count: 0 });
+  assert.deepEqual(s.msgs(), [{ inc: 1 }], "the click from the held page is replayed once synced");
+});
+
+scenario("the deliver-frame test seam hands text to the socket's handler, and refuses misuse", async () => {
+  await loadModule({ testHooks: true, holdConnect: true });
+  const deliverBeforeStart = globalThis.window.__brazierDeliverFrameForTest;
+  assert.equal(typeof deliverBeforeStart, "function");
+  assert.throws(() => deliverBeforeStart("{}"), /there is no socket to deliver the frame on/, "no socket before the connect");
+
+  await loadRuntime({ view: counterView, testHooks: true });
+  const deliver = globalThis.window.__brazierDeliverFrameForTest;
+  const s = sockets[0];
+  s.open();
+  sync(s, 0, { count: 0 });
+  assert.throws(() => deliver({ type: "patch" }), /takes the frame's text, got object/, "an object is not a frame");
+  assert.throws(() => deliver(undefined), /got undefined/);
+  // A forged frame takes the same path as one from the server.
+  assert.equal(deliver(JSON.stringify({ type: "patch", ops: [{ op: "replace", path: "/count", value: 7 }], version: 1, ack_clock: 0, streams: [] })), FakeWebSocket.OPEN);
+  assert.equal(el('[data-brazier-on-click="0.0"]').textContent, "7", "the delivered patch is rendered");
+  // Text that is not JSON is the protocol error a server frame would be.
+  deliver("{not json");
+  assert.equal(errorsMatching("Failed to parse server message").length, 1);
+  assert.equal(s.types().filter((t) => t === "request_sync").length, 1, "and resyncs");
+
+  await loadRuntime({ view: counterView });
+  assert.equal(globalThis.window.__brazierDeliverFrameForTest, undefined, "no hook without __BRAZIER_ENABLE_TEST_HOOKS");
+});
+
+// The timeline keeps every mark and measure for the life of the page: the
+// client clears its own once measured, so a long session does not grow it,
+// and a PerformanceObserver (the browser bench) still sees each measure.
+scenario("render, morph and patch timings reach an observer and leave the timeline bounded", async () => {
+  const brazierEntries = () => performance.getEntries().filter((e) => e.name.startsWith("brazier:") && e.name !== "brazier:boot" && e.name !== "brazier:ws-open");
+  const seen = [];
+  const observe = (entry) => seen.push(entry.name);
+  measureObservers.push(observe);
+  await loadRuntime({ view: counterView });
+  const s = sockets[0];
+  s.open();
+  sync(s, 0, { count: 0 });
+  for (let v = 1; v <= 50; v++) patch(s, v, [{ op: "replace", path: "/count", value: v }], 0);
+  measureObservers.splice(measureObservers.indexOf(observe), 1);
+  assert.deepEqual(brazierEntries().map((e) => e.name), [], "no brazier mark or measure stays in the timeline");
+  const count = (name) => seen.filter((n) => n === name).length;
+  assert.equal(count("brazier:model-sync"), 1);
+  assert.equal(count("brazier:patch"), 50);
+  assert.equal(count("brazier:render"), 51);
+  assert.equal(count("brazier:morph"), 51, "every render measures its DOM work");
+  assert.equal(logsMatching("warn", "performance.measure").length, 0);
 });
 
 scenario("a bundle without a complete generated app is reported and never connects", async () => {
@@ -1051,12 +1200,21 @@ const counterView = (model) => ({
 });
 
 scenario("a click runs its decoder and sends the encoded Msg with the position id", async () => {
-  await loadRuntime({ ssr: '<button data-brazier-on-click="0.0">0</button>', view: counterView });
+  // The Local layer counts the local Msgs it handles, so each one changes
+  // the local state.
+  await loadRuntime({
+    ssr: '<button data-brazier-on-click="0.0">0</button>',
+    view: counterView,
+    initLocal: () => ({ handled: 0 }),
+    updateLocal: (model, local, msg) => (msg.local === true ? [{ handled: local.handled + 1 }, false] : [local, true]),
+  });
   const s = sockets[0];
   s.open();
   sync(s, 0, { count: 0 });
   const button = el('[data-brazier-on-click="0.0"]');
+  const rendersBeforeSent = renders;
   fire(button, "click");
+  assert.equal(renders, rendersBeforeSent, "a Msg only the server updates on does not re-render the unchanged page");
   assert.deepEqual(s.events()[0], {
     type: "event",
     name: "click",
@@ -1356,6 +1514,55 @@ scenario("a simple app predicts its model and the server's model wins", async ()
   assert.equal(logsMatching("warn", "the server's model wins").length, 1);
 });
 
+scenario("a dispatch renders only when it changed the model or the local state", async () => {
+  // A simple app whose update ignores { inc: 0 } and the local Msgs (it
+  // returns the same model; a simple app runs update on every Msg) and a
+  // Local layer that keeps its state for { local: "same" }.
+  const update = (model, msg) => (msg.inc === undefined || msg.inc === 0 ? model : { count: model.count + msg.inc });
+  const view = (model) => ({
+    html:
+      `<button data-brazier-on-click="0.0">${model.count}</button>` +
+      '<i data-brazier-on-click="0.1">same</i><b data-brazier-on-click="0.2">noop</b><u data-brazier-on-click="0.3">local</u>',
+    handlers: [
+      { name: "click", id: "0.0", decode: () => ok({ inc: 1 }) },
+      { name: "click", id: "0.1", decode: () => ok({ local: "same" }) },
+      { name: "click", id: "0.2", decode: () => ok({ inc: 0 }) },
+      { name: "click", id: "0.3", decode: () => ok({ local: "count" }) },
+    ],
+  });
+  await loadRuntime({
+    simple: true,
+    update,
+    view,
+    initLocal: () => ({ n: 0 }),
+    updateLocal: (model, local, msg) => {
+      if (msg.local === "same") return [local, false];
+      if (msg.local === "count") return [{ n: local.n + 1 }, false];
+      return [local, true];
+    },
+  });
+  const s = sockets[0];
+  s.open();
+  sync(s, 0, { count: 0 });
+  const clickOn = (id) => {
+    const before = renders;
+    fire(el(`[data-brazier-on-click="${id}"]`), "click");
+    return renders - before;
+  };
+  assert.equal(clickOn("0.0"), 1, "a predicted model change renders before the event returns");
+  assert.equal(el('[data-brazier-on-click="0.0"]').textContent, "1");
+  assert.equal(clickOn("0.2"), 0, "an update that returns the same model does not render");
+  assert.equal(s.events().length, 2, "it is still sent: the server decides");
+  assert.equal(clickOn("0.1"), 0, "a local Msg that keeps the local state does not render");
+  assert.equal(clickOn("0.3"), 1, "a local Msg that changes the local state renders");
+  assert.equal(s.events().length, 2, "local Msgs are not sent");
+  // The ack of the ignored event renders the server's model.
+  const before = renders;
+  patch(s, 1, [{ op: "replace", path: "/count", value: 1 }], 2);
+  assert.equal(renders, before + 1, "the server's patch renders");
+  assert.equal(el('[data-brazier-on-click="0.0"]').textContent, "1");
+});
+
 scenario("patches held for a pending simple event still advance the cached model", async () => {
   const update = (model, msg) => ({ count: model.count + msg.inc });
   await loadRuntime({ simple: true, update, view: counterView });
@@ -1552,6 +1759,35 @@ scenario("link clicks are intercepted only for the page's own origin", async () 
     s.sent.filter((f) => f.msg.type === "navigate").map((f) => f.msg.path),
     ["/b?q=1", "/c", "/d"],
   );
+});
+
+// A same-origin href whose path the URL parser normalises to "//x" is a path
+// the server's router refuses (localPathRefusal, as router.check_local_path):
+// it is left to the browser, which loads it, as for another origin's link.
+scenario("a link whose path normalises to //x is not intercepted, and says so", async () => {
+  const links =
+    '<a id="dot" href="/.//x">x</a>' +
+    '<a id="up" href="/a/..//y?q=1">y</a>' +
+    '<a id="relative" href=".//z">z</a>' +
+    '<a id="ok" href="/.%2F/w">w</a>';
+  await loadRuntime({ path: "/a", ssr: links, view: () => ({ html: links, handlers: [] }) });
+  const s = sockets[0];
+  s.open();
+  sync(s, 0, {});
+  for (const [id, path] of [["dot", "//x"], ["up", "//y?q=1"], ["relative", "//z"]]) {
+    const event = fire(el("#" + id), "click");
+    assert.equal(event.defaultPrevented, false, id + ": the browser loads the link");
+    const warned = logsMatching("warn", "Link not intercepted: its path is not a local path (it starts with two slashes");
+    assert.ok(warned.some((line) => line.text.includes(JSON.stringify(path))), id + " names its path " + path);
+  }
+  assert.equal(logsMatching("warn", "Link not intercepted").length, 3, "each refused link warns once");
+  assert.deepEqual(historyLog.pushed, [], "no refused link is pushed");
+  assert.deepEqual(historyLog.saves, [], "and no scroll is saved for it: the browser leaves the page");
+  assert.equal(s.types().filter((t) => t === "navigate").length, 0, "nothing is sent for a refused link");
+  assert.equal(location.pathname, "/a");
+  // An encoded slash is not a "/": the path stays local.
+  assert.equal(fire(el("#ok"), "click").defaultPrevented, true);
+  assert.deepEqual(lastNavigate(s), { type: "navigate", path: "/.%2F/w", clock: 1 });
 });
 
 scenario("a model_sync or patch without a valid ack_clock is a protocol error that resyncs", async () => {
@@ -1914,13 +2150,14 @@ scenario("a fragment scroll waits for a held navigation, yields to newer URLs, a
   patch(s, 2, [], 3);
   assert.deepEqual(scrolls, ["#sec"], "a superseded fragment does not scroll");
 
-  // Back and forward keep the browser's scroll restoration: popstate drops
-  // a pending fragment scroll.
+  // Back and forward restore the scroll their entry saved: popstate drops
+  // the pending fragment scroll of the navigation it leaves.
   fire(el("#to-sec"), "click");
-  popTo("/a");
+  popTo("/a", { brazierScroll: { x: 0, y: 640 } });
   assert.deepEqual(lastNavigate(s), { type: "navigate", path: "/a", clock: 5 });
+  assert.deepEqual(scrolls, ["#sec"], "nothing scrolls before the page exists");
   patch(s, 3, [{ op: "replace", path: "/page", value: "a" }], 5);
-  assert.deepEqual(scrolls, ["#sec"], "a popstate navigation does not scroll");
+  assert.deepEqual(scrolls, ["#sec", "0,640"], "the popstate navigation's page scrolls to the entry's position, not #sec");
 
   // router.push with a fragment: the server is sent the path, and the
   // client scrolls once the page renders.
@@ -1928,7 +2165,7 @@ scenario("a fragment scroll waits for a held navigation, yields to newer URLs, a
   assert.deepEqual(historyLog.pushed.at(-1), "/c?x=1#old");
   assert.deepEqual(lastNavigate(s), { type: "navigate", path: "/c?x=1", clock: 6 });
   patch(s, 4, [{ op: "replace", path: "/page", value: "c" }], 6);
-  assert.deepEqual(scrolls, ["#sec", "#[name=old]"]);
+  assert.deepEqual(scrolls, ["#sec", "0,640", "#[name=old]"]);
 });
 
 scenario("a fragment navigation lost with the socket scrolls on the join; a queued one waits for its ack", async () => {
@@ -1969,6 +2206,120 @@ scenario("a fragment navigation lost with the socket scrolls on the join; a queu
   patch(s2, 1, [{ op: "add", path: "/n", value: 1 }], 2);
   assert.equal(replaced(), 2, "a later frame of the page morphs");
   assert.equal(el("#to-sec"), afterJoin);
+});
+
+// --- scroll restore on Back and Forward ---
+// LiveView's way: the client turns the browser's scroll restoration off,
+// saves each entry's scroll into its history state (before a navigation
+// leaves it, and 100 ms after the page stops scrolling), and on popstate
+// scrolls to the saved position once the entry's page is rendered.
+scenario("Back and Forward restore the scroll each entry saved, once its page renders", async () => {
+  await loadRuntime({ path: "/a", ssr: FRAGMENT_LINKS, view: fragmentView });
+  assert.equal(history.scrollRestoration, "manual", "the browser's restoration is off");
+  const s = sockets[0];
+  s.open();
+  sync(s, 0, { page: "a" });
+
+  // A pause in scrolling saves the position into the entry.
+  scrollPage(0, 1500);
+  advance(99);
+  assert.equal(entryScroll(), undefined, "not saved while the page may still be scrolling");
+  scrollPage(0, 1600);
+  advance(99);
+  assert.equal(entryScroll(), undefined, "a new scroll restarts the wait");
+  advance(1);
+  assert.deepEqual(entryScroll(), { x: 0, y: 1600 });
+
+  // A link saves the position at once into the entry it leaves, and a save
+  // still waiting is not written into the new entry.
+  scrollPage(0, 1700);
+  fire(el("#to-plain"), "click");
+  assert.deepEqual(historyLog.saves.at(-1), { path: "/a", scroll: { x: 0, y: 1700 } });
+  const stateOfA = { brazierScroll: { x: 0, y: 1700 } };
+  advance(500);
+  assert.equal(entryScroll(), undefined, "the new entry has no saved position");
+  patch(s, 1, [{ op: "replace", path: "/page", value: "f" }], 1);
+  assert.deepEqual(scrolls, ["top"], "a link's page starts at the top");
+  scrollPage(0, 300);
+  advance(100);
+  assert.deepEqual(entryScroll(), { x: 0, y: 300 });
+
+  // Back: nothing scrolls on the old page; the new page scrolls once it
+  // renders.
+  popTo("/a", stateOfA);
+  assert.deepEqual(lastNavigate(s), { type: "navigate", path: "/a", clock: 2 });
+  assert.deepEqual(scrolls, ["top"], "nothing scrolls before the page exists");
+  patch(s, 2, [{ op: "replace", path: "/page", value: "a" }], 2);
+  assert.deepEqual(scrolls, ["top", "0,1700"]);
+
+  // Forward right after a scroll: the save still waiting belongs to /a and
+  // is dropped, not written into /f's entry.
+  scrollPage(0, 50);
+  popTo("/f", { brazierScroll: { x: 0, y: 300 } });
+  advance(500);
+  assert.deepEqual(entryScroll(), { x: 0, y: 300 }, "the entry keeps its own position");
+  patch(s, 3, [{ op: "replace", path: "/page", value: "f" }], 3);
+  assert.deepEqual(scrolls, ["top", "0,1700", "0,300"]);
+  assert.equal(logsMatching("warn", "scroll").length, 0);
+});
+
+scenario("Back and Forward between fragments of one page restore at once, without a navigate", async () => {
+  await loadRuntime({ path: "/f", ssr: FRAGMENT_LINKS, view: fragmentView });
+  const s = sockets[0];
+  s.open();
+  sync(s, 0, { page: "f" });
+  // An in-page link stays the browser's, but the entry it leaves keeps its
+  // scroll first.
+  scrollPage(0, 400);
+  assert.equal(fire(el("#here"), "click").defaultPrevented, false);
+  assert.deepEqual(historyLog.saves.at(-1), { path: "/f", scroll: { x: 0, y: 400 } });
+  // Back to it, and forward to the fragment's entry, which the browser made
+  // without a saved position: the fragment's element, as a load scrolls.
+  popTo("/f", { brazierScroll: { x: 0, y: 400 } });
+  assert.deepEqual(scrolls, ["0,400"], "the same page restores at once");
+  popTo("/f#here", null);
+  assert.deepEqual(scrolls, ["0,400", "#here"]);
+  popTo("/f", null);
+  assert.deepEqual(scrolls, ["0,400", "#here", "top"], "an entry with no position and no fragment is the top");
+  assert.equal(s.types().filter((t) => t === "navigate").length, 0, "no navigate for the same page");
+});
+
+scenario("a reloaded entry's saved scroll is restored on boot; a bad one is reported", async () => {
+  await loadRuntime({ path: "/a", ssr: FRAGMENT_LINKS, view: fragmentView, historyState: { other: 1, brazierScroll: { x: 5, y: 900 } } });
+  assert.deepEqual(scrolls, ["5,900"], "the server-rendered page scrolls to the entry's position at boot");
+  sockets[0].open();
+  sync(sockets[0], 0, { page: "a" });
+  scrollPage(5, 950);
+  advance(100);
+  assert.deepEqual(history.state, { other: 1, brazierScroll: { x: 5, y: 950 } }, "a save keeps the rest of the state");
+
+  // Unhappy path: a saved position that is not { x, y } numbers is not used.
+  await loadRuntime({ path: "/a", ssr: FRAGMENT_LINKS, view: fragmentView, historyState: { brazierScroll: { x: 0, y: "9" } } });
+  assert.deepEqual(scrolls, [], "a bad saved position is not restored on boot");
+  assert.equal(logsMatching("warn", "brazierScroll is not { x, y } numbers").length, 1);
+  const s = sockets[0];
+  s.open();
+  sync(s, 0, { page: "a" });
+  fire(el("#to-sec"), "click");
+  patch(s, 1, [{ op: "replace", path: "/page", value: "b" }], 1);
+  popTo("/a", { brazierScroll: "oops" });
+  patch(s, 2, [{ op: "replace", path: "/page", value: "a" }], 2);
+  assert.deepEqual(scrolls, ["#sec", "top"], "the page scrolls as a load of its URL does");
+  assert.equal(logsMatching("warn", "brazierScroll is not { x, y } numbers").length, 2);
+});
+
+scenario("a scroll save the browser refuses is reported, and the navigation goes ahead", async () => {
+  await loadRuntime({ path: "/a", ssr: FRAGMENT_LINKS, view: fragmentView, replaceStateThrows: true });
+  const s = sockets[0];
+  s.open();
+  sync(s, 0, { page: "a" });
+  scrollPage(0, 10);
+  advance(100);
+  assert.equal(logsMatching("warn", "Could not save the scroll position in history (SecurityError").length, 1);
+  assert.equal(fire(el("#to-plain"), "click").defaultPrevented, true);
+  assert.equal(logsMatching("warn", "Could not save the scroll position").length, 2);
+  assert.deepEqual(historyLog.pushed, ["/f"], "the link still navigates");
+  assert.deepEqual(lastNavigate(s), { type: "navigate", path: "/f", clock: 1 });
 });
 
 // --- page replace on a live navigation (L83) ---
@@ -2036,7 +2387,8 @@ scenario("a live navigation replaces the page's nodes; a render on the same page
   assert.equal(document.activeElement, el("#af"), "the new page's autofocus element is focused");
   assert.deepEqual(calls.splice(0), ["unmount h", "mount h"]);
 
-  // Back: the page is replaced, and nothing scrolls (the browser restores).
+  // Back to an entry without a saved scroll: the page is replaced, then
+  // scrolled as a load of its URL is, to the top.
   const scrolled = scrolls.length;
   popTo("/c");
   assert.equal(lastNavigate(s).clock, 4);
@@ -2044,7 +2396,7 @@ scenario("a live navigation replaces the page's nodes; a render on the same page
   patch(s, 7, [{ op: "replace", path: "/page", value: "c" }], 4);
   assert.equal(replaced(), 3, "a popstate navigation replaces the page too");
   assert.notEqual(el("#t"), d);
-  assert.equal(scrolls.length, scrolled, "a popstate navigation does not scroll");
+  assert.deepEqual(scrolls.slice(scrolled), ["top"], "an entry with no saved position starts at the top");
 });
 
 scenario("a navigation's page refills a stream container from its store and remounts item hooks", async () => {
@@ -2878,6 +3230,9 @@ let failures = 0;
 for (const { name, fn } of scenarios) {
   try {
     await fn();
+    // Every measure the client makes has both its marks: a failed one is a
+    // mark the code path skipped.
+    assert.deepEqual(logsMatching("warn", "performance.measure(").map((l) => l.text), [], "no performance.measure fails");
   } catch (error) {
     failures++;
     realConsole.error(`ffi scenario "${name}" failed: ${error.stack || error.message}`);

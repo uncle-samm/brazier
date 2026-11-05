@@ -174,7 +174,10 @@ html.a([attribute.href("/users/7")], [html.text("Profile")])
 The browser pushes a history entry and sends the new path over the
 WebSocket. A link opens a normal page load instead when it has a modifier key
 held, a `target` other than `_self`, a `download` attribute, or a
-`data-brazier-external` attribute. Links to other hosts are not intercepted.
+`data-brazier-external` attribute. Links to other hosts are not intercepted,
+and neither is a link whose path is not one the server would route live,
+such as `href="/.//x"`, whose URL path is `//x` (the browser reads `//x` as
+the host `x`): the client logs a console warning and the browser loads it.
 
 A link to a fragment of the current page (`#section`, `/this/page#section`
 or a bare `#`: the same path and query) is left to the browser, which
@@ -187,8 +190,17 @@ scrolls to the element whose id is the fragment (else to the `<a>` with that
 neither; `router.push("/docs#install")` does the same. A navigation to a URL
 without a fragment scrolls to the top once its page is rendered. These are
 LiveView's rules (`DOM.isNewPageClick`, and `Browser.pushState` scrolling
-after the reply of a live navigation). Back and forward keep the browser's
-scroll restoration. The
+after the reply of a live navigation).
+
+Back and forward restore the scroll position the history entry had, once
+its page is rendered. The browser's own restoration would scroll the old
+page before the new one arrives, so the client sets
+`history.scrollRestoration` to `"manual"` and keeps each entry's position in
+its `history.state` (under `brazierScroll`): saved when a navigation leaves
+the entry and 100 ms after the page stops scrolling, and restored after the
+entry's page renders, or on a reload of the entry. This is LiveView's scroll
+handling (`bindNav`, `maybeScroll`). A position scrolled to less than 100 ms
+before Back is not saved, so that entry restores its previous one. The
 wire side, a `clock` on `navigate` that the server acknowledges, is in
 [WIRE_PROTOCOL.md](WIRE_PROTOCOL.md#client-messages-browser-to-server) and
 [Event Clocking](WIRE_PROTOCOL.md#event-clocking).
@@ -344,8 +356,8 @@ the two pages share markup, and the view needs no key for it.
 
 After that render the client scrolls as the browser does for a page load: to
 the element the URL's `#fragment` names, or to the top when the URL has no
-fragment (or names no element). Back and forward keep the browser's own
-scroll restoration.
+fragment (or names no element). Back and forward scroll to where the entry
+was instead ([Links](#links)).
 
 The examples show the pattern at three sizes:
 
