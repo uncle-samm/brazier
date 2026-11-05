@@ -66,9 +66,102 @@
     entries still decode. Another is a list that hands the caller one
     chunk of entries at a time.
 
+- **Issue:** on macOS, OTP 28's `file:list_dir/1` never returns (100% CPU,
+  and the node ignores SIGTERM) for a directory that holds a name starting
+  with a combining mark, such as U+0301 + `b` (bytes `cc 81 62`). Names
+  with a mark elsewhere list, NFC-normalized. `file:del_dir_r/1` lists, so
+  `simplifile.delete` hangs on such a directory. Brazier lists directories
+  too: the client bundle build lists the app's static directory
+  (`build/client_bundle.gleam`), so a static file named that way would hang
+  the build. `unicode:characters_to_nfc_list([769, 98])` returns at once.
+  - **Context:** Milestone 118, m118-residue-3, the combining-mark static
+    tests.
+  - **Files:** `test/brazier/static_serving_test.gleam` (`delete_files`),
+    `src/brazier/build/client_bundle.gleam`
+  - **Attempted:** the tests delete such names one by one with
+    `simplifile.delete_file` before `cleanup`. Not yet reduced to an OTP
+    bug report, nor checked on Linux or another OTP release.
+
+- **Issue:** `brazier_transport_ffi:normalize_header_name/1` calls
+  `brazier_render_ffi:ascii_lowercase/1`, kept as a forwarder to
+  `brazier_ascii_ffi:lowercase/1`; `brazier/internal/url` has its own
+  `ascii_lowercase_code` for a code point; and docs/PERFORMANCE.md (the
+  attribute-name paragraph) still says url calls `string.lowercase`.
+  - **Context:** Milestone 118, m118-residue-3; the transport and
+    PERFORMANCE.md belong to other owners.
+  - **Files:** `src/brazier_transport_ffi.erl`, `src/brazier_render_ffi.erl`,
+    `src/brazier/internal/url.gleam`, `docs/PERFORMANCE.md`
+  - **Attempted:** nothing yet. Point the transport at `brazier_ascii_ffi`,
+    then drop the forwarder.
+
 ## Resolved Issues
 
 <!-- Move resolved issues here with full resolution details -->
+
+- **Issue:** the static file checks read the request path as grapheme
+  clusters, the file system as bytes. `gleam/string`'s `contains` and
+  `split` go through OTP's `string:find/2` and `string:split/3`, and
+  `drop_start` counts graphemes. A combining mark after `.`, `/` or `\`
+  joins it into one grapheme with the character before, so
+  `contains_traversal` missed `..` + U+0301, `%2f` + U+0301 and `\` +
+  U+0301, a segment holding `/` + U+0301 was not split, and a prefix ending
+  in a Prepend character (U+0600) ate the `/` after it.
+  - **Files:** `src/brazier/static.gleam`, `src/brazier_static_ffi.erl`,
+    `test/brazier/static_serving_test.gleam`
+  - **Resolution:** (Milestone 118, m118-residue-3) `contains_traversal`,
+    `check_segment`, the segment split, the prefix cut, `file_extension`
+    and `fingerprint` work on bytes: `brazier_static_ffi:contains_bytes/2`
+    (`binary:match/2`), `split_bytes/2` (`binary:split/3` on an ASCII
+    separator, which never cuts a UTF-8 sequence) and `bit_array` slices.
+    `/static/a%2f` + U+0301 + `b` was served and is now refused. Tests
+    cover traversal behind a mark (`..́/`, `/́..`, encoded escapes), a
+    separator smuggled behind one with its target file present, names with
+    marks still served, the Prepend prefix and the fingerprint and MIME
+    splits.
+
+- **Issue:** `string.lowercase` was left in the render (attribute names
+  and the SVG `attributeName` value check) and in the build (`reach`,
+  `codec_gen`, `field_type`). It folds in Unicode: the Kelvin sign U+212A
+  lowercases to `k` and U+0130 to `i` plus a combining dot, so a
+  non-ASCII lookalike can pass a check against an ASCII name.
+  - **Files:** `src/brazier/internal/render.gleam`,
+    `src/brazier/build/reach.gleam`, `src/brazier/build/codec_gen.gleam`,
+    `src/brazier/build/field_type.gleam`
+  - **Resolution:** (Milestone 118, m118-residue-3) Every site folds text
+    that is ASCII by grammar, so each uses `brazier/internal/ascii.lowercase`.
+    The render's allow-list of attribute names is ASCII. SVG attribute names
+    match code point by code point, so only an ASCII-folded `href` names
+    href; no character outside ASCII lowercases to `h`, `r`, `e` or `f`, so
+    Unicode folding refused nothing more there, and an oracle test in
+    `render_test` pins that. DOMPurify (GHSA-c6gr-qvv4-5v3f) matches the
+    `attributeName` value case-sensitively; this check is stricter. The
+    build folds Gleam names, ASCII by glexer's grammar
+    (`build_case_folding_test`).
+
+- **Issue:** two ASCII foldings per target: `brazier/internal/ascii` and the
+  render's own `brazier_render_ffi:ascii_lowercase` (and its JS twin).
+  - **Files:** `src/brazier_ascii_ffi.erl`, `src/brazier_ascii_ffi.mjs`,
+    `src/brazier/internal/ascii.gleam`, `src/brazier_render_ffi.erl`,
+    `src/brazier_render_ffi.mjs`
+  - **Resolution:** (Milestone 118, m118-residue-3) `brazier_ascii_ffi` is
+    the one implementation per target and `ascii.lowercase` names it; the
+    render calls `ascii.lowercase`. The JS render export is gone. The Erlang
+    export stays as a one-line forwarder for
+    `brazier_transport_ffi:normalize_header_name/1` (an open issue above).
+    Same compiled code, so the cost did not move: Erlang 0.064 µs a call
+    before and after, a 1,000-element page of 10 attributes 11.0 against
+    11.1 ms, JavaScript 52 to 58 ns a call before and 58 after (noise).
+
+- **Issue:** nothing stopped `string.lowercase` or `string.uppercase`
+  coming back into protocol code.
+  - **Files:** `src/brazier/lint.gleam`, `test/brazier/lint_test.gleam`
+  - **Resolution:** (Milestone 118, m118-residue-3) Lint rule 10,
+    `unicode-case-folding`, flags `string.lowercase`, `string.uppercase` and
+    `string.capitalise` in `src/` wherever they appear (called, piped,
+    passed, captured, in a guard or a constant, through an `as` alias, or
+    imported unqualified). `case_folding_allowed` lists modules that may
+    fold in Unicode, each with its reason; one without a reason is itself a
+    violation. The list is empty.
 
 - **Issue:** `application.start_supervised` started its root as a
   `static_supervisor` that listed its children at start, so a listener that
@@ -137,8 +230,9 @@
   - **Resolution:** (Milestone 118, m118-server-residue) Every
     `string.lowercase` outside render and build now uses
     `brazier/internal/ascii.lowercase`, which lowercases `A-Z` only, url
-    among them. The render keeps `brazier_render_ffi:ascii_lowercase`, its
-    owner's to fold into the shared module.
+    among them. The render kept `brazier_render_ffi:ascii_lowercase`, its
+    owner's to fold into the shared module; m118-residue-3 folded it in
+    (the entry on one ASCII folding per target, above).
 
 - **Issue:** every bench suite run after the first left 7 more atoms in
   the atom table. Listing the atoms each run creates (by index) showed all
