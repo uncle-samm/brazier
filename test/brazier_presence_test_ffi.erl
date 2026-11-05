@@ -6,9 +6,10 @@
 %% drive replica up, down, permdown, restarts and the limits from one node
 %% (with_verified_peer runs them on a member naming the other member).
 
--export([fake_ref/2, heartbeat/2, transfer_ack/4, graceful_permdown/2,
+-export([fake_ref/2, heartbeat/2, transfer_ack/4, odd_transfer_ack/4, graceful_permdown/2,
          send_peer/3, receive_diff/1, parent/1, unique_positive/0, shard_has_delta/1,
-         malformed_messages/1, with_verified_peer/1]).
+         malformed_messages/1, malformed_diffs/1, with_fingerprint/2, fingerprint_of/1,
+         with_verified_peer/1]).
 
 -define(STATE, 'brazier@presence@state').
 %% How long a test body may run on the peer.
@@ -42,8 +43,24 @@ heartbeat(Ref, PoolSize) ->
 %% A transfer_ack from Ref holding Entries ([{Key, Json}]) on Topic, tracked
 %% by a pid of the calling node.
 transfer_ack(Ref, PoolSize, Topic, Entries) ->
-    State = lists:foldl(fun({Key, Json}, Acc) ->
-        Meta = {stored_meta, Json, <<"fake-", Key/binary>>, none},
+    raw_transfer_ack(Ref, PoolSize, Topic,
+                     [{Key, {stored_meta, Json, <<"fake-", Key/binary>>, none}}
+                      || {Key, Json} <- Entries]).
+
+%% transfer_ack/4 with three more entries whose metas a peer running this
+%% code never sends: odd_json (JSON that is not a binary), odd_prev (a
+%% previous ref that is not an Option(String)) and odd_shape (not a stored
+%% meta at all).
+odd_transfer_ack(Ref, PoolSize, Topic, Entries) ->
+    raw_transfer_ack(Ref, PoolSize, Topic,
+                     [{Key, {stored_meta, Json, <<"fake-", Key/binary>>, none}}
+                      || {Key, Json} <- Entries]
+                     ++ [{<<"odd_json">>, {stored_meta, 42, <<"fake-odd_json">>, none}},
+                         {<<"odd_prev">>, {stored_meta, <<"\"x\"">>, <<"fake-odd_prev">>, {some, 7}}},
+                         {<<"odd_shape">>, not_a_stored_meta}]).
+
+raw_transfer_ack(Ref, PoolSize, Topic, Entries) ->
+    State = lists:foldl(fun({Key, Meta}, Acc) ->
         {ok, {Next, _}} = ?STATE:join(Acc, self(), Topic, Key, Meta),
         Next
     end, ?STATE:new(Ref), Entries),
@@ -84,6 +101,32 @@ malformed_messages(NodeName) ->
      {brazier_presence, bogus, 1, Ref},
      {brazier_presence, heartbeat, 1, Ref, not_a_delta, nil},
      {brazier_presence, transfer_ack, 1, Ref, not_a_transfer}].
+
+%% Variants of a real diff message, {brazier_presence_diff, Name,
+%% Fingerprint, Topic, Joins, Leaves}, that decode_diff must refuse as not a
+%% diff: a meta of another shape, a key that is not a binary, a pid that is
+%% not a pid, an entry of another size, sides that are not lists, a topic
+%% that is not a binary and a tuple of another size.
+malformed_diffs({brazier_presence_diff, Name, Fp, Topic, [{Key, Pid, Meta} | _], _Leaves}) ->
+    Diff = fun(Joins) -> {brazier_presence_diff, Name, Fp, Topic, Joins, []} end,
+    [Diff([{Key, Pid, garbage}]),
+     Diff([{Key, Pid, setelement(3, Meta, 7)}]),
+     Diff([{Key, Pid, {undecodable, <<"n@h">>, 7}}]),
+     Diff([{binary_to_list(Key), Pid, Meta}]),
+     Diff([{Key, not_a_pid, Meta}]),
+     Diff([{Key, Pid}]),
+     Diff([{Key, Pid, Meta} | not_a_list]),
+     {brazier_presence_diff, Name, Fp, Topic, not_a_list, []},
+     {brazier_presence_diff, Name, Fp, binary_to_list(Topic), [{Key, Pid, Meta}], []},
+     {brazier_presence_diff, Name, Topic, [{Key, Pid, Meta}], []}].
+
+%% The diff message with another decoder fingerprint.
+with_fingerprint({brazier_presence_diff, Name, _Fp, Topic, Joins, Leaves}, Fingerprint) ->
+    {brazier_presence_diff, Name, Fingerprint, Topic, Joins, Leaves}.
+
+%% The decoder fingerprint a diff message carries.
+fingerprint_of({brazier_presence_diff, _Name, Fp, _Topic, _Joins, _Leaves}) ->
+    Fp.
 
 %% Whether Shard holds changes its next heartbeat will broadcast.
 shard_has_delta(Shard) ->

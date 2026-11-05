@@ -317,6 +317,111 @@ pub fn list_is_ordered_by_key_test() {
   let assert Ok(Nil) = presence.stop(p) as "presence.stop succeeds"
 }
 
+/// Each key's values, sorted: the order of a key's metas follows the pids
+/// that track it, which a test does not choose.
+fn grouped(entries: List(sync.Entry(String))) -> List(#(String, List(String))) {
+  list.map(entries, fn(entry) {
+    #(
+      entry.key,
+      list.sort(list.map(entry.metas, fn(meta) { meta.value }), string.compare),
+    )
+  })
+}
+
+/// A key tracked by several processes is one entry holding every meta, in
+/// key order, whatever order the tracks came in, and get_by_key returns the
+/// entry list does.
+pub fn list_groups_metas_by_key_test() {
+  let p = start_default()
+  use a <- holder.with_holder
+  use b <- holder.with_holder
+  use c <- holder.with_holder
+  let _ = track(p, c, "room", "dave", "dave-c")
+  let _ = track(p, a, "room", "carol", "carol-a")
+  let _ = track(p, b, "room", "alice", "alice-b")
+  let _ = track(p, a, "room", "alice", "alice-a")
+  let _ = track(p, b, "room", "bob", "bob-b")
+  let _ = track(p, c, "room", "carol", "carol-c")
+  let _ = track(p, c, "room", "alice", "alice-c")
+  let _ = track(p, c, "lobby", "alice", "lobby-c")
+  let assert Ok(entries) = presence.list(p, "room") as "presence.list succeeds"
+  assert grouped(entries)
+    == [
+      #("alice", ["alice-a", "alice-b", "alice-c"]),
+      #("bob", ["bob-b"]),
+      #("carol", ["carol-a", "carol-c"]),
+      #("dave", ["dave-c"]),
+    ]
+  assert list.all(entries, fn(entry) {
+    list.all(entry.metas, fn(meta) {
+      meta.node == this_node() && meta.ref_prev == None
+    })
+  })
+  list.each(entries, fn(entry) {
+    assert presence.get_by_key(p, "room", entry.key) == Ok(entry)
+  })
+  let assert Ok([Entry("alice", [lobby])]) = presence.list(p, "lobby")
+    as "presence.list succeeds"
+  assert lobby.value == "lobby-c"
+
+  let assert Ok(Nil) =
+    holder.run(b, fn() { presence.untrack(p, "room", "alice") })
+    as "holder.run succeeds"
+  holder.kill(c)
+  let assert Ok(entries) = presence.list(p, "room") as "presence.list succeeds"
+  assert grouped(entries)
+    == [#("alice", ["alice-a"]), #("bob", ["bob-b"]), #("carol", ["carol-a"])]
+  holder.kill(a)
+  holder.kill(b)
+  let assert Ok(Nil) = presence.stop(p) as "presence.stop succeeds"
+}
+
+/// The work of a list is the same for each entry of a room of 1,000 as of
+/// one of 10,000: the rows hold the metas readers return, so a list is one
+/// select and one walk, with nothing decoded. Reductions count that work
+/// whatever the machine's load, and brazier_crdt_test_ffi:reductions/1
+/// proves no garbage collection ran while it counted, so the bound holds the
+/// work itself: about 2 reductions an entry, where decoding each row on
+/// every list cost about 70. What a list costs in collections of the
+/// caller's heap is the presence.list bench's (docs/PERFORMANCE.md).
+pub fn list_cost_per_entry_does_not_grow_with_the_room_test() {
+  let p = start(config(unique_name()) |> presence.max_topics_per_pid(20_000))
+  use h <- holder.with_holder
+  let track_many = fn(topic, count) {
+    int.range(from: 0, to: count, with: Nil, run: fn(_, i) {
+      let assert Ok(_) =
+        presence.track(p, topic, "user" <> int.to_string(i), "online")
+        as "presence.track succeeds"
+      Nil
+    })
+  }
+  holder.run_within(h, 60_000, fn() {
+    track_many("small", 1000)
+    track_many("large", 10_000)
+  })
+  let small_cost = reductions(fn() { presence.list(p, "small") })
+  let large_cost = reductions(fn() { presence.list(p, "large") })
+  assert large_cost < small_cost * 12
+    as {
+      "listing 10,000 entries cost "
+      <> int.to_string(large_cost)
+      <> " reductions, listing 1,000 cost "
+      <> int.to_string(small_cost)
+    }
+  assert large_cost < 10_000 * 10
+    as {
+      "listing 10,000 entries cost "
+      <> int.to_string(large_cost)
+      <> " reductions: more than 10 an entry"
+    }
+  let assert Ok(small) = presence.list(p, "small") as "presence.list succeeds"
+  let assert Ok(large) = presence.list(p, "large") as "presence.list succeeds"
+  assert list.length(small) == 1000
+  assert list.length(large) == 10_000
+  holder.kill(h)
+  let assert Ok(Nil) = presence.stop(p) as "presence.stop succeeds"
+}
+
 pub fn update_replaces_meta_and_keeps_ref_prev_test() {
   let p = start_default()
   use h <- holder.with_holder
@@ -606,6 +711,109 @@ pub fn decode_diff_rejects_other_messages_test() {
     as "next_diff returns Diff('room', [], [Entry('alice', _)])"
   let assert Ok(Nil) = presence.stop(p) as "presence.stop succeeds"
   finish(other, "room")
+}
+
+/// A diff carries the metas as the shard stored them, so decode_diff reads
+/// it without the tracker, and refuses a message whose entries are not
+/// what a shard sends.
+pub fn decode_diff_checks_the_message_without_the_tracker_test() {
+  use <- monitored.isolated
+  let p = start_default()
+  subscribe(p, "room")
+  use h <- holder.with_holder
+  let ref = track(p, h, "room", "alice", "online")
+  let assert Ok(message) = receive_diff(wait_ms) as "receive_diff succeeds"
+  holder.kill(h)
+  let assert Diff("room", [], [Entry("alice", _)]) = next_diff(p)
+    as "next_diff returns Diff('room', [], [Entry('alice', _)])"
+  finish(p, "room")
+  assert presence.decode_diff(p, message)
+    == Ok(
+      Diff(
+        "room",
+        [Entry("alice", [Meta("online", ref, None, this_node())])],
+        [],
+      ),
+    )
+  let accepted =
+    list.index_map(malformed_diffs(message), fn(malformed, index) {
+      #(index, presence.decode_diff(p, malformed))
+    })
+    |> list.filter(fn(outcome) { outcome.1 != Error(InvalidMessage) })
+  assert accepted == []
+}
+
+/// The handle's error for a tracker started with another decoder.
+fn refused_for_its_decoder(
+  result: Result(a, presence.PresenceError),
+  name: String,
+) -> Bool {
+  case result {
+    Error(MetaDecodeFailed(reason)) ->
+      string.contains(reason, "not the decoder tracker " <> name)
+    _ -> False
+  }
+}
+
+/// A shard decodes a peer's metas with the decoder of the config it was
+/// started with, and its rows and diffs hold the values that decoder made.
+/// A handle built from a config with another decoder would read values of
+/// another type, so every read, track, update and decode_diff through it is
+/// refused, and logged, and leaves the tracker as it was.
+pub fn a_handle_with_another_decoder_is_refused_test() {
+  use <- monitored.isolated
+  let name = unique_name()
+  let p = start(config(name))
+  let assert Ok(same) = presence.handle(config(name))
+    as "presence.handle succeeds"
+  let assert Ok(other) =
+    presence.handle(presence.new(
+      name,
+      json.string,
+      decode.map(decode.string, string.uppercase),
+    ))
+    as "presence.handle succeeds"
+  subscribe(p, "room")
+  use h <- holder.with_holder
+  let ref = track(same, h, "room", "alice", "online")
+  let assert Ok(message) = receive_diff(wait_ms) as "receive_diff succeeds"
+  let #(refused, lines) =
+    log_capture.capture(fn() {
+      [
+        refused_for_its_decoder(presence.list(other, "room"), name),
+        refused_for_its_decoder(
+          presence.get_by_key(other, "room", "alice"),
+          name,
+        ),
+        refused_for_its_decoder(
+          holder.run(h, fn() { presence.track(other, "room", "bob", "x") }),
+          name,
+        ),
+        refused_for_its_decoder(
+          holder.run(h, fn() { presence.update(other, "room", "alice", "x") }),
+          name,
+        ),
+        refused_for_its_decoder(presence.decode_diff(other, message), name),
+        refused_for_its_decoder(
+          presence.decode_diff(
+            same,
+            with_fingerprint(message, fingerprint_of(message) + 1),
+          ),
+          name,
+        ),
+      ]
+    })
+  assert refused == [True, True, True, True, True, True]
+  assert log_capture.contains(lines, "error", "another decoder")
+  assert log_capture.contains(lines, "error", "refused a request from")
+  let alice = Entry("alice", [Meta("online", ref, None, this_node())])
+  assert presence.list(same, "room") == Ok([alice])
+  assert presence.decode_diff(same, message) == Ok(Diff("room", [alice], []))
+  // The refused track and update changed nothing: the next diff is the
+  // leave of the holder's one entry.
+  holder.kill(h)
+  assert next_diff(same) == Diff("room", [], [alice])
+  finish(p, "room")
 }
 
 // --- merge ------------------------------------------------------------------
@@ -961,6 +1169,102 @@ pub fn malformed_peer_messages_are_logged_test_() -> peer.Timeout {
   let assert Ok(Nil) = presence.stop(p) as "presence.stop succeeds"
 }
 
+/// A decoder that crashes on the string "boom", as application code can.
+fn crashing_decoder() -> decode.Decoder(String) {
+  use value <- decode.then(decode.string)
+  case value {
+    "boom" -> panic as "the test decoder crashes on boom"
+    _ -> decode.success(value)
+  }
+}
+
+/// A peer's metas are decoded once, when they reach the shard. One that does
+/// not decode (JSON of another type, a decoder that crashes, a stored meta
+/// of another shape) is logged there and stored as undecodable: the shard
+/// keeps running, every read or diff that would return it fails with
+/// MetaDecodeFailed, and the entries that did decode are still read.
+pub fn remote_metas_that_do_not_decode_fail_their_reads_test_() -> peer.Timeout {
+  use <- Timeout(60)
+  use ghost_node <- with_verified_peer
+  use <- monitored.isolated
+  let name = unique_name()
+  let p = start(presence.new(name, json.string, crashing_decoder()))
+  let shard = only_shard(p)
+  subscribe(p, "room")
+  let ref = fake_ref(ghost_node, 1)
+  let bad = ["boom", "number", "odd_json", "odd_prev", "odd_shape"]
+  let #(_, stored) =
+    log_capture.capture(fn() {
+      send_peer(
+        p,
+        odd_transfer_ack(ref, 1, "room", [
+          #("good", "\"hi\""),
+          #("number", "1"),
+          #("boom", "\"boom\""),
+        ]),
+      )
+    })
+  assert only_shard(p) == shard
+  assert replicas(p) == [#(ghost_node, Up)]
+  let not_decoded =
+    list.filter(stored, fn(line) {
+      line.level == "error"
+      && string.contains(line.message, "cannot decode the meta of")
+    })
+  assert list.length(not_decoded) == list.length(bad)
+  assert log_capture.contains(stored, "error", "the decoder crashed")
+  assert log_capture.contains(stored, "error", "is not a stored meta")
+  assert log_capture.contains(stored, "error", "is not an Option(String)")
+
+  let #(outcomes, read) =
+    log_capture.capture(fn() {
+      #(
+        failed(presence.list(p, "room")),
+        list.map(bad, fn(key) { failed(presence.get_by_key(p, "room", key)) }),
+        presence.get_by_key(p, "room", "good"),
+        failed(presence.decode_diff(p, receive_message())),
+      )
+    })
+  assert outcomes
+    == #(
+      True,
+      [True, True, True, True, True],
+      Ok(Entry("good", [Meta("hi", "fake-good", None, ghost_node)])),
+      True,
+    )
+  assert log_capture.contains(read, "error", "Tracker " <> name <> " cannot")
+
+  // The leaves report the metas their joins stored.
+  send_peer(p, graceful_permdown(ref, 1))
+  let #(left, _) =
+    log_capture.capture(fn() {
+      failed(presence.decode_diff(p, receive_message()))
+    })
+  assert left
+  assert presence.list(p, "room") == Ok([])
+  // Local tracks are decoded by their caller and are unaffected.
+  use h <- holder.with_holder
+  let _ = track(p, h, "room", "local", "fine")
+  let assert Diff("room", [Entry("local", _)], []) = next_diff(p)
+    as "next_diff returns Diff('room', [Entry('local', _)], [])"
+  holder.kill(h)
+  let assert Diff("room", [], [Entry("local", _)]) = next_diff(p)
+    as "next_diff returns Diff('room', [], [Entry('local', _)])"
+  finish(p, "room")
+}
+
+fn failed(result: Result(a, presence.PresenceError)) -> Bool {
+  case result {
+    Error(MetaDecodeFailed(_)) -> True
+    _ -> False
+  }
+}
+
+fn receive_message() -> Dynamic {
+  let assert Ok(message) = receive_diff(wait_ms) as "receive_diff succeeds"
+  message
+}
+
 // --- FFI --------------------------------------------------------------------
 
 @external(erlang, "brazier_presence_test_ffi", "fake_ref")
@@ -976,6 +1280,29 @@ fn transfer_ack(
   topic: String,
   entries: List(#(String, String)),
 ) -> Dynamic
+
+/// transfer_ack with three more entries whose metas no peer running this
+/// code sends: odd_json, odd_prev and odd_shape.
+@external(erlang, "brazier_presence_test_ffi", "odd_transfer_ack")
+fn odd_transfer_ack(
+  ref: Ref,
+  pool_size: Int,
+  topic: String,
+  entries: List(#(String, String)),
+) -> Dynamic
+
+/// Variants of a real diff message that are not diffs.
+@external(erlang, "brazier_presence_test_ffi", "malformed_diffs")
+fn malformed_diffs(message: Dynamic) -> List(Dynamic)
+
+@external(erlang, "brazier_presence_test_ffi", "with_fingerprint")
+fn with_fingerprint(message: Dynamic, fingerprint: Int) -> Dynamic
+
+@external(erlang, "brazier_presence_test_ffi", "fingerprint_of")
+fn fingerprint_of(message: Dynamic) -> Int
+
+@external(erlang, "brazier_crdt_test_ffi", "reductions")
+fn reductions(run: fn() -> a) -> Int
 
 @external(erlang, "brazier_presence_test_ffi", "graceful_permdown")
 fn graceful_permdown(ref: Ref, pool_size: Int) -> Dynamic

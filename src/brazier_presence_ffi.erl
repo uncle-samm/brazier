@@ -6,9 +6,18 @@
 %% A topic always maps to the shard erlang:phash2(Topic, PoolSize) + 1, so
 %% every node sends a topic's entries through the same shard index.
 %% Errors are returned as brazier/presence.PresenceError values.
+%%
+%% Shards hold metas decoded with the tracker's decoder, so every read and
+%% every track carries the fingerprint of the handle's decoder, and one that
+%% is not the tracker's is refused (see fingerprint/1).
 
--export([names/2, start/2, start_link/2, stop/1, running/1, call/3, call_all/2, list/2,
-         get_by_key/3, shard_pid/2, shard_index/2, decode_diff/2]).
+-export([names/2, start/2, start_link/2, stop/1, running/1, call/3, call_all/2, list/4,
+         get_by_key/5, shard_pid/2, shard_index/2, decode_diff/3, fingerprint/1]).
+
+%% Key of the one row of a shard's table that is not an entry:
+%% {{?FINGERPRINT_KEY, Fingerprint}}. Entry keys are 4-tuples, so no entry
+%% select matches it.
+-define(FINGERPRINT_KEY, brazier_presence_decoder).
 
 %% Bound on a shard call. A shard serves calls between heartbeats, so a
 %% call that takes longer than this means the shard is stuck.
@@ -109,26 +118,113 @@ call_shard(Shard, Request) ->
     end.
 
 %% --- Reads (ETS, no call) ---
+%%
+%% A shard's rows hold the meta as readers return it (see
+%% brazier_presence_shard), so a read is one select that builds the
+%% brazier/presence/sync.Entry records, {entry, Key, [Meta]}, and one walk
+%% over them that allocates nothing unless a key has several metas or a
+%% meta did not decode. Its cost per entry does not grow with the room.
 
-%% Entries on Topic as {Key, Pid, NodeBin, StoredMeta}, ordered by key.
-list(Names, Topic) ->
-    select(shard_name(Names, Topic),
-           [{{{Topic, '$1', '$2', '_'}, '$3', '$4'}, [], [{{'$1', '$2', '$3', '$4'}}]}]).
+%% The entries on Topic, ordered by key: {ok, [Entry]} | {error, PresenceError}.
+list(Name, Names, Fingerprint, Topic) ->
+    Table = shard_name(Names, Topic),
+    case select(Name, Table, Fingerprint,
+                [{{{Topic, '$1', '_', '_'}, '$2'}, [], [{{entry, '$1', ['$2']}}]}]) of
+        {ok, Rows} -> entries(Name, Rows);
+        {error, Reason} -> {error, Reason}
+    end.
 
-get_by_key(Names, Topic, Key) ->
-    select(shard_name(Names, Topic),
-           [{{{Topic, Key, '$1', '_'}, '$2', '$3'}, [], [{{{const, Key}, '$1', '$2', '$3'}}]}]).
+%% The entry of Key on Topic: {ok, Entry} | {error, PresenceError}.
+get_by_key(Name, Names, Fingerprint, Topic, Key) ->
+    Table = shard_name(Names, Topic),
+    case select(Name, Table, Fingerprint, [{{{Topic, Key, '_', '_'}, '$1'}, [], ['$1']}]) of
+        {ok, []} ->
+            {error, not_tracked};
+        {ok, Metas} ->
+            case undecodable(Metas) of
+                none -> {ok, {entry, Key, Metas}};
+                {Node, Reason} -> decode_failed(Name, Key, Node, Reason)
+            end;
+        {error, Reason} ->
+            {error, Reason}
+    end.
 
 %% The table dies with its shard; reads in that window see it missing.
-select(Table, Spec) ->
-    try
-        {ok, ets:select(Table, Spec)}
+%% The table's fingerprint row tells whether the caller's handle was built
+%% with the decoder the shard decodes with (see check_fingerprint/3).
+select(Name, Table, Fingerprint, Spec) ->
+    try ets:member(Table, {?FINGERPRINT_KEY, Fingerprint}) of
+        true -> {ok, ets:select(Table, Spec)};
+        false -> fingerprint_mismatch(Name)
     catch
         error:badarg ->
             brazier_log_ffi:warning(<<"brazier.presence">>, "Table ~p is missing: its shard is not running",
                                    [Table]),
             {error, tracker_down}
     end.
+
+%% Rows {entry, Key, [Meta]}, one per meta, consecutive per key. Returned
+%% as they are when every key is distinct and every meta decoded.
+entries(Name, Rows) ->
+    case scan(Rows, none, distinct) of
+        distinct -> {ok, Rows};
+        repeated -> {ok, regroup(Rows)};
+        {undecodable, Key, Node, Reason} -> decode_failed(Name, Key, Node, Reason)
+    end.
+
+%% Keys are binaries, so the first row never matches the atom `none`.
+scan([], _Previous, Seen) ->
+    Seen;
+scan([{entry, Key, [{undecodable, Node, Reason}]} | _], _Previous, _Seen) ->
+    {undecodable, Key, Node, Reason};
+scan([{entry, Key, [_Meta]} | Rest], Key, _Seen) ->
+    scan(Rest, Key, repeated);
+scan([{entry, Key, [_Meta]} | Rest], _Previous, Seen) ->
+    scan(Rest, Key, Seen).
+
+%% One entry per key, its metas in row order (pid, then tag).
+regroup([{entry, Key, [Meta]} | Rest]) ->
+    regroup(Rest, Key, [Meta], []).
+
+regroup([{entry, Key, [Meta]} | Rest], Key, Metas, Acc) ->
+    regroup(Rest, Key, [Meta | Metas], Acc);
+regroup([{entry, Next, [Meta]} | Rest], Key, Metas, Acc) ->
+    regroup(Rest, Next, [Meta], [{entry, Key, lists:reverse(Metas)} | Acc]);
+regroup([], Key, Metas, Acc) ->
+    lists:reverse([{entry, Key, lists:reverse(Metas)} | Acc]).
+
+undecodable([{undecodable, Node, Reason} | _]) -> {Node, Reason};
+undecodable([_ | Rest]) -> undecodable(Rest);
+undecodable([]) -> none.
+
+%% A meta the shard could not decode (it logged why when it stored it)
+%% fails every read that would return it.
+decode_failed(Name, Key, Node, Reason) ->
+    brazier_log_ffi:error(<<"brazier.presence">>, "Tracker ~ts cannot decode the meta of ~ts from ~ts: ~ts",
+                         [Name, Key, Node, Reason]),
+    {error, {meta_decode_failed, Reason}}.
+
+fingerprint_mismatch(Name) ->
+    brazier_log_ffi:error(<<"brazier.presence">>, "Tracker ~ts was started with another decoder than the "
+                         "one of this handle: build every handle from the config the tracker "
+                         "was started with", [Name]),
+    {error, {meta_decode_failed, <<"the handle's decoder is not the decoder tracker ",
+                                   Name/binary, " was started with">>}}.
+
+%% The fingerprint of a tracker's decoder. A handle and the shards each
+%% compute it from the decoder of their config, and the shards decode
+%% remote metas with theirs, so a read through a handle whose decoder
+%% differs would return values of another type: it is refused instead.
+%% 32 bits: it guards against a handle built from another config, not
+%% against an adversary, who cannot pick a handle's decoder.
+fingerprint(Decoder) ->
+    erlang:phash2(Decoder, 1 bsl 32).
+
+%% Whether a request's fingerprint is the shard's: ok | {error, PresenceError}.
+check_fingerprint(_Name, Fingerprint, Fingerprint) when is_integer(Fingerprint) ->
+    ok;
+check_fingerprint(Name, _Given, _Own) ->
+    fingerprint_mismatch(Name).
 
 %% The shard process for Topic. Tracked processes monitor it.
 shard_pid(Names, Topic) ->
@@ -145,22 +241,62 @@ shard_name(Names = {names, _Sup, Shards}, Topic) ->
 
 %% --- Diffs ---
 
-decode_diff(Name, {brazier_presence_diff, Name, Topic, Joins, Leaves})
+%% A diff of tracker Name: {brazier_presence_diff, Name, Fingerprint, Topic,
+%% Joins, Leaves} with entries {Key, Pid, Meta} (see brazier_presence_shard).
+%% Returns {ok, {Topic, [Entry], [Entry]}}, each side grouped by key in key
+%% order, or {error, PresenceError}.
+decode_diff(Name, Fingerprint, {brazier_presence_diff, Name, Own, Topic, Joins, Leaves})
   when is_binary(Topic), is_list(Joins), is_list(Leaves) ->
-    {ok, {Topic, Joins, Leaves}};
-decode_diff(_Name, _Message) ->
+    case check_fingerprint(Name, Fingerprint, Own) of
+        ok ->
+            case diff_entries(Name, Joins) of
+                {ok, JoinEntries} ->
+                    case diff_entries(Name, Leaves) of
+                        {ok, LeaveEntries} -> {ok, {Topic, JoinEntries, LeaveEntries}};
+                        {error, Reason} -> {error, Reason}
+                    end;
+                {error, Reason} ->
+                    {error, Reason}
+            end;
+        {error, Reason} ->
+            {error, Reason}
+    end;
+decode_diff(_Name, _Fingerprint, _Message) ->
     {error, invalid_message}.
+
+%% A shard reports a diff's entries in the order it changed them; group
+%% them by key (keysort is stable, so a key's metas keep that order).
+diff_entries(Name, Entries) ->
+    case diff_rows(Entries, []) of
+        {ok, Rows} -> entries(Name, lists:keysort(2, Rows));
+        error -> {error, invalid_message}
+    end.
+
+diff_rows([{Key, Pid, Meta} | Rest], Acc) when is_binary(Key), is_pid(Pid) ->
+    case Meta of
+        {meta, _Value, Ref, _RefPrev, Node} when is_binary(Ref), is_binary(Node) ->
+            diff_rows(Rest, [{entry, Key, [Meta]} | Acc]);
+        {undecodable, Node, Reason} when is_binary(Node), is_binary(Reason) ->
+            diff_rows(Rest, [{entry, Key, [Meta]} | Acc]);
+        _ ->
+            error
+    end;
+diff_rows([], Acc) ->
+    {ok, lists:reverse(Acc)};
+diff_rows(_Entries, _Acc) ->
+    error.
 
 %% --- Helpers ---
 
 %% The Gleam record brazier/presence.ShardConfig as the map shards use.
 config_map({shard_config, Name, PoolSize, BroadcastPeriod, MaxSilent, DownPeriod,
             PermdownPeriod, ClockSamples, MaxDeltaSizes, MaxTopicsPerPid,
-            MaxEntriesPerShard, MaxTransferEntries},
+            MaxEntriesPerShard, MaxTransferEntries, Decoder},
            {names, Sup, Shards}) ->
     Topics = list_to_tuple([<<"brazier_presence:", Name/binary, ":",
                               (integer_to_binary(I))/binary>>
                             || I <- lists:seq(1, PoolSize)]),
+    Fingerprint = fingerprint(Decoder),
     #{name => Name,
       pool_size => PoolSize,
       sup_name => Sup,
@@ -174,7 +310,10 @@ config_map({shard_config, Name, PoolSize, BroadcastPeriod, MaxSilent, DownPeriod
       max_delta_sizes => MaxDeltaSizes,
       max_topics_per_pid => MaxTopicsPerPid,
       max_entries_per_shard => MaxEntriesPerShard,
-      max_transfer_entries => MaxTransferEntries}.
+      max_transfer_entries => MaxTransferEntries,
+      decoder => Decoder,
+      fingerprint => Fingerprint,
+      fingerprint_row => {{?FINGERPRINT_KEY, Fingerprint}}}.
 
 format(Term) ->
     unicode:characters_to_binary(io_lib:format("~p", [Term])).

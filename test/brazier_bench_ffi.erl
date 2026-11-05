@@ -8,7 +8,7 @@
 -export([now_us/0, now_ns/0, machine/0, load_average/0, utc_now/0,
          getenv/1, halt/1,
          http_round/6, http_fetch/3, gunzip/1, ws_round/6, pubsub_fanout/5,
-         presence_fill/5, presence_release/2, presence_round/5,
+         presence_fill/5, presence_release/2, presence_round/5, presence_list_sample/4,
          gc/0, expect_empty_mailbox/1, isolated/2, vm_census/0]).
 
 now_us() -> erlang:monotonic_time(microsecond).
@@ -595,13 +595,106 @@ presence_round(Presence, Topic, DiffTopic, N, Ops, TimeoutMs, Tracks, Untracks) 
             {error, fmt("track ~ts: ~0p", [Key, Reason])}
     end.
 
+%% What one presence.list may allocate, in words: its result is about 34
+%% words an entry (the key, the meta and the list cells;
+%% brazier_presence_ffi builds nothing else), so 64 leaves room to spare. A
+%% sample's heap holds two lists (the warm-up and the timed one) and the
+%% base. A list that allocates past it fails the bench instead of being
+%% timed with a collection: the old list, which decoded every row on every
+%% read, needed about 100 words an entry, and its samples of the 10000 room
+%% fail here.
+-define(LIST_WORDS_PER_ENTRY, 64).
+-define(LIST_BASE_WORDS, 2000).
+
+%% Time one brazier/presence.list of Topic, checked to return Entries
+%% entries, in a fresh process whose heap holds everything the list
+%% allocates, and prove with a trace session that no garbage collection ran
+%% in it: {ok, Ns} | {error, Reason}.
+%%
+%% Timed in the bench process, a list pays for collecting whatever that
+%% heap holds when the list's result does not fit: presence.list.10.p99 sat
+%% at about 9.5 or 14.5 us from run to run, as the collection did or did not
+%% land among a round's slowest 1%. That measures the bench's heap, not the
+%% list. In a fresh, sized process every sample does the same work, so a
+%% slower select, walk or allocation moves every sample and the median,
+%% while a list that allocates more than its heap fails the run loudly.
+%% (brazier_crdt_test_ffi:reductions/1 measures the same way, with
+%% reductions in place of time.)
+%%
+%% The process lists once untimed before the timed list: the first list of
+%% a new process runs on cold caches (its own heap, the table's pages, the
+%% code, on whichever scheduler it landed), which put the 10-entry room's
+%% median at about 8 us and its p99 at about 35 us, against 2.5 and 6 us
+%% for the warm list. The warm list is what a session that lists repeatedly
+%% pays, and its cost is the code's.
+presence_list_sample(Presence, Topic, Entries, TimeoutMs) ->
+    Words = ?LIST_BASE_WORDS + 2 * Entries * ?LIST_WORDS_PER_ENTRY,
+    Parent = self(),
+    Ref = make_ref(),
+    {Pid, Monitor} = spawn_opt(fun() ->
+        receive {Ref, go} -> ok end,
+        Warm = 'brazier@presence':list(Presence, Topic),
+        T0 = now_ns(),
+        Listed = 'brazier@presence':list(Presence, Topic),
+        T1 = now_ns(),
+        Parent ! {Ref, listed, T1 - T0, listed_count(Warm), listed_count(Listed)}
+    end, [monitor, {min_heap_size, Words}, {min_bin_vheap_size, Words}]),
+    Session = trace:session_create(?MODULE, Parent, []),
+    1 = trace:process(Session, Pid, true, [garbage_collection]),
+    Pid ! {Ref, go},
+    Sampled =
+        receive
+            {Ref, listed, Ns, WarmCount, Count} ->
+                %% The process exits once it has sent its answer.
+                receive {'DOWN', Monitor, process, Pid, _} -> ok end,
+                case {WarmCount, Count} of
+                    {{ok, Entries}, {ok, Entries}} -> {ok, Ns};
+                    {{ok, Other}, _} -> {error, fmt("the warm-up list returned ~b entries, expected ~b", [Other, Entries])};
+                    {{error, Reason}, _} -> {error, fmt("the warm-up list: ~0p", [Reason])};
+                    {_, {ok, Other}} -> {error, fmt("list returned ~b entries, expected ~b", [Other, Entries])};
+                    {_, {error, Reason}} -> {error, fmt("list: ~0p", [Reason])}
+                end;
+            {'DOWN', Monitor, process, Pid, Why} ->
+                {error, fmt("the list's process died: ~0p", [Why])}
+        after TimeoutMs ->
+            true = exit(Pid, kill),
+            receive {'DOWN', Monitor, process, Pid, _} -> ok end,
+            {error, fmt("list did not answer within ~b ms", [TimeoutMs])}
+        end,
+    Delivered = erlang:trace_delivered(Pid),
+    receive {trace_delivered, Pid, Delivered} -> ok end,
+    true = trace:session_destroy(Session),
+    case {Sampled, collections(Pid, 0)} of
+        {{ok, _}, 0} ->
+            Sampled;
+        {{ok, _}, Collections} ->
+            {error, fmt("~b garbage collection event(s) ran during a list of ~b entries in a heap "
+                        "of ~b words: the list allocates more than ~b words an entry",
+                        [Collections, Entries, Words, ?LIST_WORDS_PER_ENTRY])};
+        {{error, _}, _} ->
+            Sampled
+    end.
+
+listed_count({ok, Listed}) -> {ok, length(Listed)};
+listed_count({error, Reason}) -> {error, Reason}.
+
+%% The trace events of Pid (its session traces garbage collection only),
+%% removed from the mailbox.
+collections(Pid, Count) ->
+    receive
+        {trace, Pid, _Event, _Info} ->
+            collections(Pid, Count + 1)
+    after 0 ->
+        Count
+    end.
+
 await_diff(DiffTopic, Topic, Key, Side, TimeoutMs) ->
     Self = self(),
     receive
-        {brazier_pubsub, DiffTopic, {brazier_presence_diff, _Name, Topic, Joins, Leaves}} ->
+        {brazier_pubsub, DiffTopic, {brazier_presence_diff, _Name, _Fingerprint, Topic, Joins, Leaves}} ->
             case {Side, Joins, Leaves} of
-                {join, [{Key, Self, _Node, _Meta}], []} -> ok;
-                {leave, [], [{Key, Self, _Node, _Meta}]} -> ok;
+                {join, [{Key, Self, _Meta}], []} -> ok;
+                {leave, [], [{Key, Self, _Meta}]} -> ok;
                 _ -> {error, fmt("expected the ~p of ~ts, got joins ~0p, leaves ~0p",
                                  [Side, Key, Joins, Leaves])}
             end

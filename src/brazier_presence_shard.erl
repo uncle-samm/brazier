@@ -7,7 +7,21 @@
 %% and mirrors the entries that are visible (their replica is up) into a
 %% protected ordered_set ETS table, so reads never call the shard:
 %%
-%%   {{Topic, Key, Pid, Tag}, NodeBin, StoredMeta}
+%%   {{Topic, Key, Pid, Tag}, Meta}
+%%
+%% Meta is the meta as readers return it, the Gleam record
+%% brazier/presence/sync.Meta {meta, Value, Ref, RefPrev, NodeBin}, as
+%% Phoenix.Tracker.State keeps the meta term in its values table. A local
+%% track brings its value, decoded by the caller when it checked the meta;
+%% an entry from a peer is decoded here once, when it becomes visible. A
+%% meta that does not decode is stored as {undecodable, NodeBin, Reason}
+%% (logged here) and fails every read that would return it. The table's
+%% one other row, {{brazier_presence_decoder, Fingerprint}}, tells readers
+%% which decoder made the values (brazier_presence_ffi:fingerprint/1).
+%%
+%% The CRDT and replication keep the meta as JSON
+%% (brazier/presence.StoredMeta {stored_meta, Json, Ref, RefPrev}), so what
+%% crosses nodes does not depend on how a node stores its values.
 %%
 %% Replication runs over Brazier PubSub on brazier_presence:<name>:<index>,
 %% between cluster members only: PubSub forwards only to and from nodes that
@@ -28,12 +42,10 @@
 %% marked down and permanently down at once.
 %%
 %% Every change is applied to ETS and reported as a diff
-%% {brazier_presence_diff, Name, Topic, Joins, Leaves} by local_broadcast on
-%% presence:<name>:<topic>, with entries {Key, Pid, NodeBin, StoredMeta}.
-%% The shard is the only sender, so each subscriber sees diffs in order.
-%%
-%% StoredMeta is the Gleam record brazier/presence.StoredMeta:
-%% {stored_meta, Json, Ref, RefPrev}.
+%% {brazier_presence_diff, Name, Fingerprint, Topic, Joins, Leaves} by
+%% local_broadcast on presence:<name>:<topic>, with entries {Key, Pid, Meta}
+%% holding the Meta of the entry's row. The shard is the only sender, so
+%% each subscriber sees diffs in order.
 %%
 %% Sync waiters. A shard that restarts starts empty and learns every other
 %% node's entries from that node (its heartbeat marks it up, the transfer
@@ -82,6 +94,7 @@ init({Index, Config}) ->
         {ok, nil} ->
             Table = ets:new(Table, [ordered_set, protected, named_table,
                                     {read_concurrency, true}]),
+            true = ets:insert(Table, maps:get(fingerprint_row, Config)),
             Vsn = {erlang:system_time(microsecond),
                    erlang:unique_integer([positive, monotonic])},
             Ref = {node(), Vsn},
@@ -92,6 +105,8 @@ init({Index, Config}) ->
             {ok, #{index => Index,
                    name => Name,
                    config => Config,
+                   %% Of the decoder the table's values are decoded with.
+                   fingerprint => maps:get(fingerprint, Config),
                    table => Table,
                    topic => Topic,
                    ref => Ref,
@@ -112,7 +127,10 @@ init({Index, Config}) ->
 
 %% --- Local tracking ---
 
-handle_call({track, Pid, Topic, Key, Meta}, _From, S) ->
+handle_call({track, _Pid, _Topic, _Key, _Stored, _Value, Fingerprint}, {Caller, _}, S = #{fingerprint := Own})
+  when Fingerprint =/= Own ->
+    {reply, fingerprint_mismatch(S, Caller), S};
+handle_call({track, Pid, Topic, Key, Stored, Value, _Fingerprint}, _From, S) ->
     #{pres := Pres, config := #{max_topics_per_pid := MaxPerPid,
                                 max_entries_per_shard := MaxEntries}} = S,
     case ?STATE:get_by_pid_key(Pres, Pid, Topic, Key) of
@@ -128,21 +146,27 @@ handle_call({track, Pid, Topic, Key, Meta}, _From, S) ->
                     {reply, limit(S, <<"max_entries_per_shard">>, Pid, Size), S};
                 true ->
                     %% Not tracked (checked above), so join succeeds.
-                    {ok, {Pres1, Element}} = ?STATE:join(Pres, Pid, Topic, Key, Meta),
-                    S1 = report(ensure_monitor(S#{pres := Pres1}, Pid), [Element], []),
+                    {ok, {Pres1, Element}} = ?STATE:join(Pres, Pid, Topic, Key, Stored),
+                    S1 = report(ensure_monitor(S#{pres := Pres1}, Pid),
+                                [{Element, local_meta(Stored, Value)}], []),
                     event(S1, track, 1),
                     {reply, {ok, nil}, S1}
             end
     end;
-handle_call({update, Pid, Topic, Key, Json, NewRef}, _From, S = #{pres := Pres}) ->
+handle_call({update, _Pid, _Topic, _Key, _Json, _NewRef, _Value, Fingerprint}, {Caller, _},
+            S = #{fingerprint := Own}) when Fingerprint =/= Own ->
+    {reply, fingerprint_mismatch(S, Caller), S};
+handle_call({update, Pid, Topic, Key, Json, NewRef, Value, _Fingerprint}, _From,
+            S = #{pres := Pres}) ->
     case ?STATE:get_by_pid_key(Pres, Pid, Topic, Key) of
         {error, nil} ->
             {reply, {error, not_tracked}, S};
         {ok, {element, _, {stored_meta, _, OldRef, _}, _}} ->
-            Meta = {stored_meta, Json, NewRef, {some, OldRef}},
+            Stored = {stored_meta, Json, NewRef, {some, OldRef}},
             %% Tracked (looked up above), so leave_join succeeds.
-            {ok, {Pres1, Previous, New}} = ?STATE:leave_join(Pres, Pid, Topic, Key, Meta),
-            {reply, {ok, nil}, report(S#{pres := Pres1}, [New], [Previous])}
+            {ok, {Pres1, Previous, New}} = ?STATE:leave_join(Pres, Pid, Topic, Key, Stored),
+            {reply, {ok, nil}, report(S#{pres := Pres1},
+                                      [{New, local_meta(Stored, Value)}], [Previous])}
     end;
 handle_call({untrack, Pid, Topic, Key}, _From, S = #{pres := Pres}) ->
     case ?STATE:leave(Pres, Pid, Topic, Key) of
@@ -436,7 +460,7 @@ up(S = #{pres := Pres, name := Name}, Ref) ->
     brazier_log_ffi:info(<<"brazier.presence">>, "Shard ~ts: replica ~p is up (~b entries)",
                         [label(S), Ref, length(Joins)]),
     brazier_telemetry_ffi:presence_replica(replica_up, ref_binary(Ref), Name),
-    report(S#{pres := Pres1}, Joins, Leaves).
+    report(S#{pres := Pres1}, decoded(S, Joins), Leaves).
 
 down(S = #{pres := Pres, name := Name, replicas := Replicas}, Node) ->
     #{Node := Replica = #{ref := Ref}} = Replicas,
@@ -445,7 +469,7 @@ down(S = #{pres := Pres, name := Name, replicas := Replicas}, Node) ->
                            [label(S), Ref, length(Leaves)]),
     brazier_telemetry_ffi:presence_replica(replica_down, ref_binary(Ref), Name),
     report(S#{pres := Pres1, replicas := Replicas#{Node := Replica#{status := down}}},
-           Joins, Leaves).
+           decoded(S, Joins), Leaves).
 
 %% Drop a replica's data. Its entries already left when it went down.
 permdown(S = #{pres := Pres, deltas := Deltas, name := Name, heard := Heard}, Ref) ->
@@ -463,7 +487,8 @@ merge(S = #{pres := Pres}, Transfer) ->
     Visible = fun({element, _, _, {tag, Ref, _}}) ->
         ?STATE:replica_status(Pres1, Ref) =:= {ok, up}
     end,
-    report(S#{pres := Pres1}, lists:filter(Visible, Joins), lists:filter(Visible, Leaves)).
+    report(S#{pres := Pres1}, decoded(S, lists:filter(Visible, Joins)),
+           lists:filter(Visible, Leaves)).
 
 %% --- Sync waiters (see the module doc) ---
 
@@ -589,16 +614,19 @@ limit(S, Limit, Pid, Value) ->
 
 %% --- ETS and diffs ---
 
+%% Joins are {Element, Meta}: the meta its row holds (local_meta/2 or
+%% decoded/2). Leaves are elements: their rows are taken, so a leave
+%% reports the meta its join stored.
 report(S, [], []) ->
     S;
-report(S = #{table := Table, name := Name}, Joins, Leaves) ->
-    [true = ets:delete(Table, row_key(E)) || E <- Leaves],
-    true = ets:insert(Table, [row(E) || E <- Joins]),
-    ByTopic = lists:foldl(fun(E, Acc) -> group(E, 2, Acc) end,
-                          lists:foldl(fun(E, Acc) -> group(E, 1, Acc) end, #{}, Joins),
-                          Leaves),
+report(S = #{table := Table, name := Name, fingerprint := Fingerprint}, Joins, Leaves) ->
+    Left = [take_row(S, E) || E <- Leaves],
+    true = ets:insert(Table, [{row_key(E), Meta} || {E, Meta} <- Joins]),
+    ByTopic = lists:foldl(fun(Row, Acc) -> group(Row, 2, Acc) end,
+                          lists:foldl(fun(Row, Acc) -> group(Row, 1, Acc) end, #{}, Joins),
+                          Left),
     maps:foreach(fun(Topic, {TopicJoins, TopicLeaves}) ->
-        Diff = {brazier_presence_diff, Name, Topic,
+        Diff = {brazier_presence_diff, Name, Fingerprint, Topic,
                 lists:reverse(TopicJoins), lists:reverse(TopicLeaves)},
         DiffTopic = <<"presence:", Name/binary, ":", Topic/binary>>,
         case brazier_pubsub_ffi:local_broadcast(DiffTopic, Diff) of
@@ -611,24 +639,99 @@ report(S = #{table := Table, name := Name}, Joins, Leaves) ->
     end, ByTopic),
     S.
 
-group(Element = {element, {key, Topic, _, _}, _, _}, Side, Acc) ->
+group({{element, {key, Topic, Pid, Key}, _, _}, Meta}, Side, Acc) ->
     {J, L} = maps:get(Topic, Acc, {[], []}),
-    Entry = diff_entry(Element),
+    Entry = {Key, Pid, Meta},
     case Side of
         1 -> Acc#{Topic => {[Entry | J], L}};
         2 -> Acc#{Topic => {J, [Entry | L]}}
     end.
 
+%% Remove the row of an element that leaves and return it with its meta.
+%% The table mirrors the visible entries of the CRDT, and the CRDT reports
+%% a leave only for an entry it reported joining, so the row is there. If it
+%% is not, the table no longer mirrors the CRDT: crash, and the supervisor
+%% restarts the shard with an empty table that peers fill again.
+take_row(S = #{table := Table}, Element = {element, {key, Topic, Pid, Key}, _, _}) ->
+    RowKey = row_key(Element),
+    case ets:take(Table, RowKey) of
+        [{RowKey, Meta}] ->
+            {Element, Meta};
+        Found ->
+            brazier_log_ffi:error(<<"brazier.presence">>, "Shard ~ts: the entry ~ts of ~p on ~ts "
+                                 "leaves but its table row is ~P", [label(S), Key, Pid, Topic, Found, 10]),
+            erlang:error({presence_table_out_of_sync, RowKey})
+    end.
+
 row_key({element, {key, Topic, Pid, Key}, _Meta, Tag}) ->
     {Topic, Key, Pid, Tag}.
 
-row(Element = {element, _, Meta, {tag, Ref, _}}) ->
-    {row_key(Element), ref_node(Ref), Meta}.
+%% The meta of a local track or update: the caller decoded its JSON with
+%% the tracker's decoder when it checked it (presence.encode_meta), and the
+%% request's fingerprint says it used this shard's decoder.
+local_meta({stored_meta, _Json, Ref, RefPrev}, Value) ->
+    {meta, Value, Ref, RefPrev, atom_to_binary(node(), utf8)}.
 
-diff_entry({element, {key, _Topic, Pid, Key}, Meta, {tag, Ref, _}}) ->
-    {Key, Pid, ref_node(Ref), Meta}.
+%% Entries that became visible from a peer, decoded once for their rows.
+decoded(S, Elements) ->
+    [{E, decode_meta(S, E)} || E <- Elements].
+
+decode_meta(S = #{config := #{decoder := Decoder}},
+            {element, {key, Topic, _Pid, Key}, Stored, {tag, Ref, _}}) ->
+    Node = ref_node(Ref),
+    case Stored of
+        {stored_meta, Json, MetaRef, RefPrev} when is_binary(Json), is_binary(MetaRef) ->
+            case valid_ref_prev(RefPrev) of
+                true ->
+                    parse_meta(S, Topic, Key, Node, Decoder, Json, MetaRef, RefPrev);
+                false ->
+                    undecodable(S, Topic, Key, Node,
+                                format("its previous ref ~P is not an Option(String)", [RefPrev, 10]))
+            end;
+        _ ->
+            undecodable(S, Topic, Key, Node, format("~P is not a stored meta", [Stored, 10]))
+    end.
+
+parse_meta(S, Topic, Key, Node, Decoder, Json, MetaRef, RefPrev) ->
+    try 'gleam@json':parse(Json, Decoder) of
+        {ok, Value} ->
+            {meta, Value, MetaRef, RefPrev, Node};
+        {error, Error} ->
+            undecodable(S, Topic, Key, Node, 'gleam@string':inspect(Error))
+    catch
+        Class:Reason:Stack ->
+            %% The decoder is the application's code; it must not take the
+            %% shard, and every entry on it, down with it.
+            brazier_log_ffi:error(<<"brazier.presence">>, "Shard ~ts: the decoder crashed on the meta "
+                                 "of ~ts from ~ts: ~p:~P ~P",
+                                 [label(S), Key, Node, Class, Reason, 20, Stack, 20]),
+            undecodable(S, Topic, Key, Node, format("the decoder crashed: ~p:~P", [Class, Reason, 20]))
+    end.
+
+valid_ref_prev(none) -> true;
+valid_ref_prev({some, Ref}) -> is_binary(Ref);
+valid_ref_prev(_) -> false.
+
+%% A peer's meta that this node's decoder cannot read. The row keeps the
+%% reason, and every read that would return the entry fails with it
+%% (brazier_presence_ffi), as the reads did when they decoded each row.
+undecodable(S, Topic, Key, Node, Reason) ->
+    brazier_log_ffi:error(<<"brazier.presence">>, "Shard ~ts cannot decode the meta of ~ts on ~ts "
+                         "from ~ts: ~ts", [label(S), Key, Topic, Node, Reason]),
+    {undecodable, Node, Reason}.
+
+%% A track or update from a handle built with another decoder: its value is
+%% not what this shard's readers expect.
+fingerprint_mismatch(S = #{name := Name}, Pid) ->
+    brazier_log_ffi:error(<<"brazier.presence">>, "Shard ~ts refused a request from ~p: its handle's "
+                         "decoder is not the decoder the tracker was started with", [label(S), Pid]),
+    {error, {meta_decode_failed, <<"the handle's decoder is not the decoder tracker ", Name/binary,
+                                   " was started with">>}}.
 
 ref_node({Node, _Vsn}) -> atom_to_binary(Node, utf8).
+
+format(Format, Args) ->
+    unicode:characters_to_binary(io_lib:format(Format, Args)).
 
 ref_binary(Ref) -> unicode:characters_to_binary(io_lib:format("~p", [Ref])).
 

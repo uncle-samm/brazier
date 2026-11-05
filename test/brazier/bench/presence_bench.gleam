@@ -9,8 +9,11 @@
 ////   Each wait is the full trip a subscriber sees: the shard call, the ETS
 ////   write and the PubSub delivery. Every diff is checked to name exactly
 ////   that key of this process.
-//// - presence.list.N: `presence.list` of the room, the ETS read and the
-////   meta decode of every entry, checked to return all N entries.
+//// - presence.list.N: `presence.list` of the room, the ETS read of every
+////   entry (the shard stored each meta decoded), checked to return all N
+////   entries. Each list runs in a fresh process whose heap holds all it
+////   allocates, after one untimed list in that process, proven free of
+////   garbage collection (list_samples).
 
 import brazier/bench/measure.{check}
 import brazier/bench/report.{type Metric}
@@ -55,6 +58,14 @@ fn presence_release(
   holders: List(#(Pid, process.Monitor)),
   timeout_ms: Int,
 ) -> Result(Nil, String)
+
+@external(erlang, "brazier_bench_ffi", "presence_list_sample")
+fn presence_list_sample(
+  presence: presence.Presence(String),
+  topic: String,
+  entries: Int,
+  timeout_ms: Int,
+) -> Result(Int, String)
 
 @external(erlang, "brazier_bench_ffi", "presence_round")
 fn presence_round(
@@ -165,29 +176,22 @@ fn measure_room(
 }
 
 /// Time `presence.list` of the room `lists` times (after `list_warmup`),
-/// in microseconds, each checked to return all `entries` entries.
+/// in microseconds, each checked to return all `entries` entries. Each
+/// list runs in a fresh process whose heap holds all it allocates, after
+/// one untimed list there that warms its caches, and a sample in which a
+/// garbage collection ran fails the run
+/// (brazier_bench_ffi:presence_list_sample), so the samples time the list,
+/// not the collection of whatever heap the caller had.
 fn list_samples(
   tracker: presence.Presence(String),
   entries: Int,
   lists: Int,
 ) -> Result(List(Float), String) {
   let once = fn() {
-    let t0 = measure.now_ns()
-    let listed = presence.list(tracker, topic)
-    let t1 = measure.now_ns()
-    use found <- result.try(
-      listed
-      |> result.map_error(fn(e) { "list: " <> presence.describe(e) }),
-    )
-    let count = list.length(found)
-    use <- check(
-      count == entries,
-      "list returned " <> int.to_string(count) <> " entries",
-    )
-    Ok(ns_to_us(t1 - t0))
+    presence_list_sample(tracker, topic, entries, measure.timeout_ms)
+    |> result.map(ns_to_us)
   }
   use _ <- result.try(measure.repeat(list_warmup, once))
-  measure.gc()
   measure.repeat(lists, once)
 }
 
