@@ -21,6 +21,7 @@ const WORK = mkdtempSync(join(tmpdir(), "brazier_ffi_harness_"));
 mkdirSync(join(WORK, "brazier_client"));
 copyFileSync(join(SRC, "brazier_client_ffi.mjs"), join(WORK, "brazier_client_ffi.mjs"));
 copyFileSync(join(SRC, "brazier_client", "patch.mjs"), join(WORK, "brazier_client", "patch.mjs"));
+copyFileSync(join(SRC, "brazier_client", "stream.mjs"), join(WORK, "brazier_client", "stream.mjs"));
 
 // --- fake clock and timers ---
 const clock = { now: 0 };
@@ -86,6 +87,7 @@ class FakeWebSocket {
     this.sent.push({ at: clock.now, msg: JSON.parse(data) });
   }
   close(code, reason) {
+    this.closed = { code, reason: reason || "" };
     this.readyState = FakeWebSocket.CLOSED;
     this.onclose({ code, reason: reason || "" });
   }
@@ -172,10 +174,11 @@ class FakeText extends FakeNode {
   }
 }
 
-// Supports "*", "#id", "[attr]", '[attr="value"]' and "tag[attr]".
+// Supports "*", "#id", "tag", "[attr]", '[attr="value"]' and "tag[attr]".
 function matcher(selector) {
   if (selector === "*") return () => true;
   if (selector.startsWith("#")) return (el) => el.id === selector.slice(1);
+  if (/^[a-z][a-z0-9]*$/.test(selector)) return (el) => el.tagName === selector.toUpperCase();
   const m = /^([a-z]*)\[([^\]="]+)(?:="((?:[^"\\]|\\.)*)")?\]$/.exec(selector);
   if (!m) throw new Error("fake DOM: unsupported selector " + selector);
   const tag = m[1].toUpperCase();
@@ -429,14 +432,19 @@ let reloads = 0;
 let scrolls = [];
 let decoded = [];
 let renders = 0;
+let itemRenders = 0;
 
-// spec.view(model, local) returns { html, handlers }, each handler being
-// { name, id, decode(event) -> Result, prevent, stop, debounce, throttle }.
-// spec.simple adds spec.update; spec.state.crash makes update_local throw.
-// spec.initLocal and spec.updateLocal(model, local, msg) -> [local, forward]
-// replace the default Local layer (null local, forward unless msg.local).
+// spec.view(model, local) returns { html, handlers, containers }, each
+// handler being { name, id, decode(event) -> Result, prevent, stop,
+// debounce, throttle }, and each container (in document order) a stream
+// container { name, keep, limit, item } (see container). spec.streams lists
+// the declared stream names. spec.simple adds spec.update; spec.state.crash
+// makes update_local throw. spec.initLocal and
+// spec.updateLocal(model, local, msg) -> [local, forward] replace the
+// default Local layer (null local, forward unless msg.local).
 function makeApp(spec = {}) {
   const view = spec.view || (() => ({ html: "", handlers: [] }));
+  const streamNames = spec.streams || [];
   const app = {
     // The runtime hands decode_model the parsed `model` value of the frame
     // (or the patched cached value), never text: a string here means the
@@ -452,7 +460,22 @@ function makeApp(spec = {}) {
     render(model, local) {
       renders++;
       const out = view(model, local);
-      return [out.html, new Map(out.handlers.map((h) => [h.name + ":" + h.id, h]))];
+      const containers = out.containers || [];
+      return [out.html, new Map(out.handlers.map((h) => [h.name + ":" + h.id, h])), { toArray: () => containers }];
+    },
+    stream_names: () => ({ toArray: () => streamNames }),
+    container_name: (c) => c.name,
+    container_keep: (c) => c.keep,
+    container_limit: (c) => c.limit,
+    container_item: (c) => c.item,
+    // The generated entry decodes the item and renders it with the item
+    // function; a container's `item(key, item)` returns { html, handlers }
+    // or { error } for an item it cannot decode.
+    render_item(c, key, item) {
+      itemRenders++;
+      const out = c.item(key, item);
+      if (out.error !== undefined) return err(out.error);
+      return ok([out.html, new Map(out.handlers.map((h) => [h.name + ":" + h.id, h]))]);
     },
     lookup_handler: (table, name, id) => (table.has(name + ":" + id) ? ok(table.get(name + ":" + id)) : err(undefined)),
     run_handler: (handler, event) => handler.decode(event),
@@ -482,6 +505,7 @@ function freshGlobals(options = {}) {
   scrolls = [];
   decoded = [];
   renders = 0;
+  itemRenders = 0;
   documentListeners = [];
   windowListeners = [];
   historyLog.pushed = [];
@@ -560,11 +584,17 @@ async function loadRuntime(options = {}) {
 }
 
 // The server embeds the model and the ops raw: `"model":{...}`, `"ops":[...]`.
-function sync(socket, version, model, ackClock = 0) {
-  socket.deliver({ type: "model_sync", model, version, ack_clock: ackClock });
+// Every frame carries the required `streams` field ([] unless given);
+// NO_STREAMS leaves it out.
+const NO_STREAMS = Symbol("no streams field");
+function frame(fields, streams) {
+  return streams === NO_STREAMS ? fields : { ...fields, streams };
 }
-function patch(socket, version, ops, ackClock = 0) {
-  socket.deliver({ type: "patch", ops, version, ack_clock: ackClock });
+function sync(socket, version, model, ackClock = 0, streams = []) {
+  socket.deliver(frame({ type: "model_sync", model, version, ack_clock: ackClock }, streams));
+}
+function patch(socket, version, ops, ackClock = 0, streams = []) {
+  socket.deliver(frame({ type: "patch", ops, version, ack_clock: ackClock }, streams));
 }
 function event(clockValue) {
   return { type: "event", name: "click", handler_id: "h", data: "{}", target_path: "0", clock: clockValue };
@@ -1529,7 +1559,7 @@ scenario("a model_sync or patch without a valid ack_clock is a protocol error th
   const s = sockets[0];
   s.open();
   const requests = () => s.types().filter((t) => t === "request_sync").length;
-  s.deliver({ type: "model_sync", model: { count: 1 }, version: 0 });
+  s.deliver({ type: "model_sync", model: { count: 1 }, version: 0, streams: [] });
   assert.equal(decoded.length, 0, "a model_sync without ack_clock is not applied");
   assert.equal(errorsMatching("invalid ack_clock undefined").length, 1);
   assert.equal(requests(), 1);
@@ -1537,12 +1567,12 @@ scenario("a model_sync or patch without a valid ack_clock is a protocol error th
   assert.deepEqual(decoded.at(-1), { count: 0 }, "a valid model_sync recovers");
   for (const [i, ackClock] of [undefined, "1", -1, 1.5, null].entries()) {
     sync(s, i, { count: i });
-    s.deliver({ type: "patch", ops: [{ op: "replace", path: "/count", value: 99 }], version: i + 1, ack_clock: ackClock });
+    s.deliver({ type: "patch", ops: [{ op: "replace", path: "/count", value: 99 }], version: i + 1, ack_clock: ackClock, streams: [] });
     assert.deepEqual(decoded.at(-1), { count: i }, `a patch with ack_clock ${JSON.stringify(ackClock)} is not applied`);
     assert.equal(s.types().at(-1), "request_sync", `a patch with ack_clock ${JSON.stringify(ackClock)} resyncs`);
   }
   assert.equal(errorsMatching("has invalid ack_clock").length, 5);
-  s.deliver({ type: "model_sync", model: { count: 7 }, version: 9, ack_clock: "9" });
+  s.deliver({ type: "model_sync", model: { count: 7 }, version: 9, ack_clock: "9", streams: [] });
   assert.notDeepEqual(decoded.at(-1), { count: 7 }, "a model_sync with a string ack_clock is not applied");
   assert.equal(errorsMatching('invalid ack_clock "9"').length, 1);
 });
@@ -1553,17 +1583,17 @@ scenario("a model or ops sent as JSON text instead of a raw value is refused and
   s.open();
   const requests = () => s.types().filter((t) => t === "request_sync").length;
   // The wire format before raw embedding: "model":"{...}" and "ops":"[...]".
-  s.deliver({ type: "model_sync", model: JSON.stringify({ count: 1 }), version: 0, ack_clock: 0 });
+  s.deliver({ type: "model_sync", model: JSON.stringify({ count: 1 }), version: 0, ack_clock: 0, streams: [] });
   assert.equal(decoded.length, 0, "a model sent as text is not adopted");
   assert.equal(errorsMatching("decode_model got JSON text").length, 1);
   assert.equal(requests(), 1);
-  s.deliver({ type: "model_sync", version: 0, ack_clock: 0 });
+  s.deliver({ type: "model_sync", version: 0, ack_clock: 0, streams: [] });
   assert.equal(decoded.length, 0, "a model_sync without a model is not adopted");
   assert.equal(errorsMatching("the frame has no model field").length, 1);
   assert.equal(requests(), 2);
   sync(s, 0, { count: 0 });
   assert.deepEqual(decoded.at(-1), { count: 0 }, "a raw model is adopted as parsed");
-  s.deliver({ type: "patch", ops: JSON.stringify([{ op: "replace", path: "/count", value: 5 }]), version: 1, ack_clock: 0 });
+  s.deliver({ type: "patch", ops: JSON.stringify([{ op: "replace", path: "/count", value: 5 }]), version: 1, ack_clock: 0, streams: [] });
   assert.deepEqual(decoded.at(-1), { count: 0 }, "ops sent as text are not applied");
   assert.equal(errorsMatching("Patch ops are not an array (got string)").length, 1);
   assert.equal(requests(), 3);
@@ -2233,6 +2263,489 @@ scenario("random morphs reproduce the markup, keep surviving keyed elements and 
       tree = rand() < 0.2 ? randomTree(rand, 3) : mutateTree(rand, tree, 3);
     }
     assert.equal(errorsMatching("").length, 0, `seed ${seed}: no render logged an error`);
+  }
+});
+
+// --- streams (docs/design/STREAMS.md 6.2, 8, 13) ---
+
+// The item function of stream "s": an item { t, v, hook, debounce } renders
+// as an <li> keyed by its key, with a button (click "i0.0") and an input
+// (input "i0.1") whose handler ids are relative to the item. Anything else
+// does not decode, as a generated decoder refuses it.
+function li(key, item, prefix = "") {
+  if (item === null || typeof item !== "object" || typeof item.t !== "string") {
+    return { error: "expected an Item, found " + (item === null ? "null" : typeof item) };
+  }
+  const hook = item.hook ? ` data-brazier-hook="${item.hook}" data-brazier-hook-watch="data-v"` : "";
+  return {
+    html:
+      `<li data-brazier-key="${key}"${hook} data-v="${item.v ?? 0}">` +
+      `<button data-brazier-on-click="i0.0">${prefix}${item.t}</button>` +
+      `<input name="${key}" data-brazier-on-input="i0.1"></li>`,
+    handlers: [
+      { name: "click", id: "i0.0", decode: () => ok({ clicked: key }) },
+      { name: "input", id: "i0.1", debounce: item.debounce || 0, decode: (e) => ok({ typed: key, value: e.target.value }) },
+    ],
+  };
+}
+// Another item function for the same stream, as a view that switches item
+// functions renders.
+function liUpper(key, item) {
+  return li(key, item, "UP:");
+}
+
+// An app with one declared stream "s" (keep last, limit 3 unless the model
+// says otherwise). The model: count (shown in <h1>), hide (no container),
+// plain (the <ul> without the container attribute, with a page <li>),
+// upper (the other item function), twice (two containers), stray (an item
+// handler id outside any item).
+function streamsApp(extra = {}) {
+  return {
+    streams: ["s"],
+    view: (model) => {
+      const head = `<h1>${model.count ?? 0}</h1>` + (model.stray ? '<p data-brazier-on-click="i0.0">stray</p>' : "");
+      if (model.hide) return { html: head, handlers: [] };
+      if (model.plain) return { html: head + '<ul><li data-brazier-key="ka">page</li></ul>', handlers: [] };
+      const c = { name: "s", keep: model.keep || "last", limit: model.limit || 3, item: model.upper ? liUpper : li };
+      return {
+        html: head + '<ul data-brazier-stream="s"></ul>' + (model.twice ? '<ol data-brazier-stream="s"></ol>' : ""),
+        handlers: [],
+        containers: model.twice ? [c, { ...c }] : [c],
+      };
+    },
+    ...extra,
+  };
+}
+function entry(fields = {}) {
+  return { name: "s", keep: "last", limit: 3, reset: false, deletes: [], inserts: [], ...fields };
+}
+function ins(key, at, item) {
+  return { key, at, item };
+}
+function item(t, more = {}) {
+  return { t, ...more };
+}
+function streamEl() {
+  return el('[data-brazier-stream="s"]');
+}
+function streamKeys() {
+  return streamEl().childNodes.map((c) => c.getAttribute("data-brazier-key"));
+}
+function streamNode(key) {
+  return streamEl().childNodes.find((c) => c.getAttribute("data-brazier-key") === key);
+}
+function streamTexts() {
+  return streamEl().childNodes.map((c) => c.childNodes[0].textContent);
+}
+// A browser's moveBefore on `container`: moves without taking the node out
+// of the document, so focus stays. Returns the moved nodes.
+function addMoveBefore(container) {
+  const moved = [];
+  container.moveBefore = function (node, ref) {
+    const from = this.childNodes.indexOf(node);
+    assert.ok(from >= 0, "moveBefore of a node that is not a child");
+    this.childNodes.splice(from, 1);
+    const to = ref === null ? this.childNodes.length : this.childNodes.indexOf(ref);
+    assert.ok(to >= 0, "moveBefore reference is not a child");
+    this.childNodes.splice(to, 0, node);
+    moved.push(node);
+  };
+  return moved;
+}
+// The socket closed with 4000 `stream fault` after one console.error naming
+// the stream and the reason, and the close reconnects with backoff.
+function assertStreamFault(s, reason, stream = "s") {
+  assert.deepEqual(s.closed, { code: 4000, reason: "stream fault" }, "a stream fault closes with 4000 stream fault");
+  const faults = errorsMatching("Stream fault");
+  assert.equal(faults.length, 1, "one console.error per fault");
+  assert.ok(faults[0].text.includes(`stream ${JSON.stringify(stream)}, ${reason}:`), faults[0].text);
+  assert.equal(logsMatching("warn", "WebSocket closed (code 4000, stream fault); reconnecting").length, 1);
+  const count = sockets.length;
+  advance(reconnectDelay());
+  assert.equal(sockets.length, count + 1, "the fault's close reconnects");
+}
+
+// A store holding ka, kb (keep last, limit 3); each case's patch must fault
+// before its model part or any store changes.
+const STREAM_FAULTS = [
+  { name: "a patch without a streams field", reason: "malformed", stream: null, streams: NO_STREAMS },
+  { name: "streams that is not an array", reason: "malformed", stream: null, streams: {} },
+  { name: "an entry with a field of the wrong type", reason: "malformed", streams: [entry({ limit: "3" })] },
+  { name: "an entry with a missing field", reason: "malformed", streams: [{ name: "s", keep: "last", limit: 3, reset: false, deletes: [] }] },
+  { name: "an entry for a stream the bundle does not declare", reason: "unknown_stream", stream: "t", streams: [entry({ name: "t" })] },
+  { name: "keep that differs from the store's", reason: "keep_mismatch", streams: [entry({ keep: "first" })] },
+  { name: "limit that differs from the store's", reason: "limit_mismatch", streams: [entry({ limit: 4 })] },
+  { name: "a delete of a key the store does not hold", reason: "delete_unknown_key", streams: [entry({ deletes: ["secret-key"] })] },
+  { name: "an update of a held key at another index", reason: "insert_wrong_index", streams: [entry({ inserts: [ins("ka", 1, item("A2"))] })] },
+  { name: "a new key past the end", reason: "insert_past_end", streams: [entry({ inserts: [ins("kz", 3, item("Z"))] })] },
+  { name: "more items than the limit", reason: "over_limit", streams: [entry({ inserts: [ins("kc", 2, item("C")), ins("kd", 3, item("D"))] })] },
+  { name: "an item the item function cannot decode", reason: "item_render_failed", streams: [entry({ inserts: [ins("kc", 2, "not an item")] })] },
+  { name: "a valid entry before a faulting one", reason: "delete_unknown_key", streams: [entry({ inserts: [ins("kc", 2, item("C"))] }), entry({ deletes: ["kz"] })] },
+];
+
+scenario("every stream fault closes the socket with 4000 stream fault, applies nothing and reconnects", async () => {
+  for (const c of STREAM_FAULTS) {
+    await loadRuntime(streamsApp());
+    const s = sockets[0];
+    s.open();
+    sync(s, 0, { count: 0 }, 0, [entry({ reset: true, inserts: [ins("ka", 0, item("A")), ins("kb", 1, item("B"))] })]);
+    assert.deepEqual(streamKeys(), ["ka", "kb"], c.name);
+    const models = decoded.length;
+    try {
+      patch(s, 1, [{ op: "replace", path: "/count", value: 1 }], 0, c.streams);
+      assert.equal(decoded.length, models, "the model part of a faulting frame is not applied");
+      assert.equal(el("h1").textContent, "0");
+      assert.deepEqual(streamKeys(), ["ka", "kb"], "a fault changes no container");
+      assert.deepEqual(streamTexts(), ["A", "B"]);
+      assert.equal(s.types().filter((t) => t === "request_sync").length, 0, "a resync cannot repair a store");
+      assert.equal(logs.filter((l) => l.text.includes("secret-key")).length, 0, "keys are never logged");
+      assertStreamFault(s, c.reason, c.stream === undefined ? "s" : c.stream);
+    } catch (error) {
+      error.message = c.name + ": " + error.message;
+      throw error;
+    }
+  }
+});
+
+scenario("a join model_sync without a streams field, or with a faulting entry, is a stream fault", async () => {
+  for (const streams of [NO_STREAMS, [entry({ deletes: ["ka"] })]]) {
+    await loadRuntime(streamsApp());
+    const s = sockets[0];
+    s.open();
+    sync(s, 0, { count: 0 }, 0, streams);
+    assert.equal(decoded.length, 0, "the model is not adopted");
+    assert.equal(logsMatching("log", "Client ready").length, 0);
+    assertStreamFault(s, streams === NO_STREAMS ? "malformed" : "delete_unknown_key", streams === NO_STREAMS ? null : "s");
+  }
+});
+
+scenario("keep or limit that differs from the rendered container's is a stream fault", async () => {
+  // An entry for a stream without a store yet, against its container.
+  for (const [fields, reason] of [[{ limit: 5 }, "limit_mismatch"], [{ keep: "first" }, "keep_mismatch"]]) {
+    await loadRuntime(streamsApp());
+    const s = sockets[0];
+    s.open();
+    sync(s, 0, { count: 0 });
+    patch(s, 1, [], 0, [entry({ ...fields, inserts: [ins("ka", 0, item("A"))] })]);
+    assert.deepEqual(streamKeys(), [], "the entry is not applied");
+    assertStreamFault(s, reason);
+    assert.ok(errorsMatching("container " + (reason === "keep_mismatch" ? "keep last" : "limit 3")).length === 1);
+  }
+  // A store filled while the container was not rendered, against the
+  // container that appears.
+  await loadRuntime(streamsApp());
+  const s = sockets[0];
+  s.open();
+  sync(s, 0, { count: 0, hide: true }, 0, [entry({ limit: 5, inserts: [ins("ka", 0, item("A"))] })]);
+  patch(s, 1, [{ op: "replace", path: "/hide", value: false }]);
+  assert.deepEqual(streamKeys(), [], "a container that does not match its store is not filled");
+  assertStreamFault(s, "limit_mismatch");
+  assert.equal(errorsMatching("store limit 5, container limit 3").length, 1);
+});
+
+scenario("frames on a socket a stream fault closed are ignored", async () => {
+  await loadRuntime(streamsApp());
+  const s = sockets[0];
+  s.open();
+  sync(s, 0, { count: 0 }, 0, [entry({ inserts: [ins("ka", 0, item("A"))] })]);
+  patch(s, 1, [], 0, [entry({ deletes: ["kz"] })]);
+  assert.deepEqual(s.closed, { code: 4000, reason: "stream fault" });
+  // A browser drops frames once the socket is closing; the runtime does not
+  // rely on it.
+  patch(s, 1, [{ op: "replace", path: "/count", value: 9 }], 0, [entry({ inserts: [ins("kb", 1, item("B"))] })]);
+  assert.equal(el("h1").textContent, "0");
+  assert.deepEqual(streamKeys(), ["ka"]);
+  assert.equal(logsMatching("warn", "after a stream fault and is ignored").length, 1);
+  assert.equal(errorsMatching("Stream fault").length, 1, "an ignored frame is not a second fault");
+});
+
+scenario("a stream delta is applied under every model verdict, a held frame and an invalid ack_clock", async () => {
+  await loadRuntime(streamsApp());
+  const s = sockets[0];
+  s.open();
+  sync(s, 0, { count: 0 }, 0, [entry({ inserts: [ins("ka", 0, item("A"))] })]);
+  // apply
+  patch(s, 1, [{ op: "replace", path: "/count", value: 1 }], 0, [entry({ inserts: [ins("kb", 1, item("B"))] })]);
+  assert.deepEqual([el("h1").textContent, ...streamKeys()], ["1", "ka", "kb"], "apply");
+  // ack: the revision does not move
+  patch(s, 1, [], 0, [entry({ inserts: [ins("kc", 2, item("C"))] })]);
+  assert.deepEqual(streamKeys(), ["ka", "kb", "kc"], "ack");
+  // stale
+  patch(s, 1, [{ op: "replace", path: "/count", value: 7 }], 0, [entry({ deletes: ["ka"] })]);
+  assert.deepEqual([el("h1").textContent, ...streamKeys()], ["1", "kb", "kc"], "stale: the model is not applied, the delta is");
+  // a stale model_sync (an older revision while synced)
+  sync(s, 0, { count: 0 }, 0, [entry({ inserts: [ins("kd", 2, item("D"))] })]);
+  assert.deepEqual([el("h1").textContent, ...streamKeys()], ["1", "kb", "kc", "kd"], "stale model_sync");
+  // gap
+  patch(s, 5, [{ op: "replace", path: "/count", value: 7 }], 0, [entry({ deletes: ["kb"] })]);
+  assert.deepEqual([el("h1").textContent, ...streamKeys()], ["1", "kc", "kd"], "gap");
+  assert.equal(s.types().at(-1), "request_sync", "a gap still resyncs the model");
+  // invalid ack_clock: the model part is refused, the delta is applied
+  patch(s, 2, [], "x", [entry({ inserts: [ins("kc", 0, item("C2"))] })]);
+  assert.deepEqual(streamTexts(), ["C2", "D"], "invalid ack_clock");
+  // Entries for one name in one frame apply in order.
+  patch(s, 1, [], 0, [entry({ inserts: [ins("ke", 2, item("E"))] }), entry({ deletes: ["ke"] })]);
+  assert.deepEqual(streamKeys(), ["kc", "kd"], "entries apply in order");
+  assert.equal(errorsMatching("Stream fault").length, 0);
+
+  // held: a `simple` app's pending prediction holds the model, not the delta.
+  const view = streamsApp().view;
+  await loadRuntime({
+    ...streamsApp(),
+    simple: true,
+    update: (model) => ({ ...model, count: model.count + 1 }),
+    view: (model) => {
+      const out = view(model);
+      return { ...out, html: '<button data-brazier-on-click="0.0">+</button>' + out.html, handlers: [{ name: "click", id: "0.0", decode: () => ok({ inc: true }) }] };
+    },
+  });
+  const h = sockets[0];
+  h.open();
+  sync(h, 0, { count: 0 });
+  fire(el("button"), "click");
+  assert.equal(el("h1").textContent, "1", "predicted");
+  patch(h, 1, [{ op: "replace", path: "/count", value: 5 }], 0, [entry({ inserts: [ins("ka", 0, item("A"))] })]);
+  assert.deepEqual([el("h1").textContent, ...streamKeys()], ["1", "ka"], "held: the prediction stays, the item is shown");
+});
+
+scenario("an update in place keeps the item's node, and a move restores it with focus", async () => {
+  await loadRuntime(streamsApp());
+  const s = sockets[0];
+  s.open();
+  sync(s, 0, { count: 0 }, 0, [entry({ inserts: [ins("ka", 0, item("A")), ins("kb", 1, item("B")), ins("kc", 2, item("C"))] })]);
+  const nodes = new Map(["ka", "kb", "kc"].map((k) => [k, streamNode(k)]));
+  const renderedItems = itemRenders;
+  patch(s, 0, [], 0, [entry({ inserts: [ins("kb", 1, item("B2"))] })]);
+  assert.equal(streamNode("kb"), nodes.get("kb"), "an update in place keeps the node");
+  assert.deepEqual(streamTexts(), ["A", "B2", "C"]);
+  assert.equal(itemRenders, renderedItems + 1, "only the updated item renders");
+  // A move without moveBefore: the node leaves the document for a moment,
+  // and focus is given back.
+  const button = nodes.get("kb").childNodes[0];
+  button.focus();
+  patch(s, 0, [], 0, [entry({ deletes: ["kb"], inserts: [ins("kb", 2, item("B3"))] })]);
+  assert.deepEqual(streamKeys(), ["ka", "kc", "kb"]);
+  assert.equal(streamNode("kb"), nodes.get("kb"), "a moved item keeps its node");
+  assert.equal(streamNode("kb").childNodes[0], button);
+  assert.equal(document.activeElement, button, "focus comes back after the move");
+  assert.deepEqual(streamTexts(), ["A", "C", "B3"]);
+  // With moveBefore, the node moves without leaving the document.
+  const moved = addMoveBefore(streamEl());
+  patch(s, 0, [], 0, [entry({ deletes: ["ka"], inserts: [ins("ka", 2, item("A"))] })]);
+  assert.deepEqual(moved, [nodes.get("ka")]);
+  assert.deepEqual(streamKeys(), ["kc", "kb", "ka"]);
+  assert.equal(document.activeElement, button);
+  for (const [key, node] of nodes) assert.equal(streamNode(key), node, key + " keeps its node");
+});
+
+scenario("item hooks mount on insert, update on a watched change and unmount on delete, trim and reset", async () => {
+  await loadRuntime(streamsApp());
+  const s = sockets[0];
+  s.open();
+  const calls = [];
+  window.brazierClient.registerHook("Item", {
+    mount: (node) => calls.push("mount " + node.getAttribute("data-brazier-key")),
+    update: (node) => calls.push("update " + node.getAttribute("data-brazier-key")),
+    unmount: (node) => calls.push("unmount " + node.getAttribute("data-brazier-key")),
+  });
+  const hooked = (t, v = 0) => item(t, { hook: "Item", v });
+  sync(s, 0, { count: 0 }, 0, [entry({ inserts: [ins("ka", 0, hooked("A")), ins("kb", 1, hooked("B"))] })]);
+  assert.deepEqual(calls.splice(0), ["mount ka", "mount kb"], "insert mounts");
+  patch(s, 0, [], 0, [entry({ inserts: [ins("kb", 1, hooked("B", 1))] })]);
+  assert.deepEqual(calls.splice(0), ["update kb"], "a watched change updates");
+  patch(s, 0, [], 0, [entry({ inserts: [ins("kb", 1, hooked("B2", 1))] })]);
+  assert.deepEqual(calls.splice(0), [], "an unwatched change does not");
+  patch(s, 0, [], 0, [entry({ deletes: ["ka"] })]);
+  assert.deepEqual(calls.splice(0), ["unmount ka"], "delete unmounts");
+  // A trim is a delete the server computed: limit 3, keep last.
+  patch(s, 0, [], 0, [entry({ inserts: [ins("kc", 1, hooked("C")), ins("kd", 2, hooked("D"))] })]);
+  assert.deepEqual(calls.splice(0), ["mount kc", "mount kd"]);
+  patch(s, 0, [], 0, [entry({ deletes: ["kb"], inserts: [ins("ke", 2, hooked("E"))] })]);
+  // Removals unmount at once; mounts run after the patch, in syncHooks.
+  assert.deepEqual(calls.splice(0), ["unmount kb", "mount ke"], "a trim unmounts");
+  // A reset unmounts every item it does not insert again; one it inserts
+  // again keeps its node and its hook.
+  const kd = streamNode("kd");
+  patch(s, 0, [], 0, [entry({ reset: true, inserts: [ins("kd", 0, hooked("D")), ins("kf", 1, hooked("F"))] })]);
+  assert.deepEqual(calls.splice(0).sort(), ["mount kf", "unmount kc", "unmount ke"]);
+  assert.equal(streamNode("kd"), kd);
+  assert.deepEqual(streamKeys(), ["kd", "kf"]);
+});
+
+scenario("a container that appears later is filled, a new item function re-renders it, and one rendered twice throws", async () => {
+  await loadRuntime(streamsApp());
+  const s = sockets[0];
+  s.open();
+  sync(s, 0, { count: 0, hide: true }, 0, [entry({ inserts: [ins("ka", 0, item("A")), ins("kb", 1, item("B"))] })]);
+  assert.equal(root.querySelector('[data-brazier-stream="s"]'), null);
+  // Ops for a stream that is not rendered are kept in its store.
+  patch(s, 0, [], 0, [entry({ inserts: [ins("kc", 2, item("C"))] })]);
+  patch(s, 1, [{ op: "replace", path: "/hide", value: false }]);
+  assert.deepEqual(streamKeys(), ["ka", "kb", "kc"], "the container is filled from the store");
+  const nodes = streamEl().childNodes.slice();
+  // The same container with another item function: every item renders again
+  // and keeps its node.
+  patch(s, 2, [{ op: "add", path: "/upper", value: true }]);
+  assert.deepEqual(streamTexts(), ["UP:A", "UP:B", "UP:C"]);
+  assert.deepEqual(streamEl().childNodes, nodes);
+  // Hidden again: the view goes, the store stays.
+  patch(s, 3, [{ op: "replace", path: "/hide", value: true }]);
+  assert.equal(logsMatching("log", "Stream s is no longer rendered").length, 1);
+  patch(s, 3, [], 0, [entry({ deletes: ["ka"] })]);
+  patch(s, 4, [{ op: "replace", path: "/hide", value: false }]);
+  assert.deepEqual(streamKeys(), ["kb", "kc"]);
+  // Two containers of one stream: the render throws before the page morph.
+  const before = root.childNodes.slice();
+  patch(s, 5, [{ op: "add", path: "/twice", value: true }]);
+  assert.equal(errorsMatching("renders stream s twice").length, 1);
+  assert.deepEqual(root.childNodes, before, "the page is not changed");
+  assert.equal(root.querySelector('[data-brazier-stream="s"]').tagName, "UL");
+  assert.equal(s.types().at(-1), "request_sync", "the render failure path resyncs");
+  assert.equal(errorsMatching("Stream fault").length, 0);
+  // A stream the bundle does not declare.
+  await loadRuntime({ ...streamsApp(), streams: [] });
+  sockets[0].open();
+  sync(sockets[0], 0, { count: 0 });
+  assert.equal(errorsMatching("which the bundle does not declare").length, 1);
+  assert.equal(root.querySelector("h1"), null, "nothing is rendered");
+});
+
+scenario("a reconnect empties the stores, keeps the old items until the join, and the join reconciles them", async () => {
+  await loadRuntime(streamsApp());
+  const calls = [];
+  window.brazierClient.registerHook("Item", {
+    mount: (node) => calls.push("mount " + node.getAttribute("data-brazier-key")),
+    unmount: (node) => calls.push("unmount " + node.getAttribute("data-brazier-key")),
+  });
+  const hooked = (t) => item(t, { hook: "Item" });
+  const s = sockets[0];
+  s.open();
+  sync(s, 0, { count: 0 }, 0, [entry({ inserts: [ins("ka", 0, hooked("A")), ins("kb", 1, hooked("B")), ins("kc", 2, hooked("C"))] })]);
+  const nodes = new Map(["ka", "kb", "kc"].map((k) => [k, streamNode(k)]));
+  calls.length = 0;
+  s.serverClose(1006);
+  advance(reconnectDelay());
+  assert.equal(logsMatching("log", "emptied 1 stream store(s)").length, 1);
+  assert.deepEqual(streamKeys(), ["ka", "kb", "kc"], "the old items stay until the join");
+  // The old items stay clickable meanwhile; the click waits in the queue.
+  fire(nodes.get("ka").childNodes[0], "click");
+  assert.equal(errorsMatching("").length, 0);
+  const s2 = sockets[1];
+  s2.open();
+  sync(s2, 0, { count: 0 }, 0, [entry({ reset: true, inserts: [ins("kb", 0, hooked("B")), ins("kc", 1, hooked("C2")), ins("kd", 2, hooked("D"))] })]);
+  assert.deepEqual(streamKeys(), ["kb", "kc", "kd"]);
+  assert.equal(streamNode("kb"), nodes.get("kb"), "an item the join sends again keeps its node");
+  assert.equal(streamNode("kc"), nodes.get("kc"));
+  assert.deepEqual(streamTexts(), ["B", "C2", "D"]);
+  assert.deepEqual(calls.sort(), ["mount kd", "unmount ka"], "kept items keep their hooks");
+  assert.deepEqual(s2.msgs(), [{ clicked: "ka" }], "the queued click is sent on the new socket");
+  assert.equal(logsMatching("log", "First frame of the connection: reconciling 1").length, 1);
+
+  // The new connection's stores start empty: a join entry that builds on the
+  // old store faults.
+  s2.serverClose(1006);
+  advance(reconnectDelay());
+  const s3 = sockets[2];
+  s3.open();
+  sync(s3, 0, { count: 0 }, 0, [entry({ deletes: ["kb"] })]);
+  assertStreamFault(s3, "delete_unknown_key");
+});
+
+scenario("the first render keeps the SSR items the join sends and drops the rest", async () => {
+  const ssrItem = (key, t) => li(key, item(t)).html;
+  await loadRuntime({
+    ...streamsApp(),
+    ssr: '<h1>0</h1><ul data-brazier-stream="s">' + ssrItem("ka", "A") + "stray" + ssrItem("kb", "B") + "</ul>",
+  });
+  const ka = streamNode("ka");
+  const s = sockets[0];
+  s.open();
+  sync(s, 0, { count: 0 }, 0, [entry({ reset: true, inserts: [ins("kc", 0, item("C")), ins("ka", 1, item("A2"))] })]);
+  assert.deepEqual(streamKeys(), ["kc", "ka"], "the unkeyed text and kb are gone");
+  assert.equal(streamNode("ka"), ka, "the SSR node is the live node");
+  assert.deepEqual(streamTexts(), ["C", "A2"]);
+});
+
+scenario("item handlers dispatch by key and id, and debounce per item", async () => {
+  await loadRuntime(streamsApp());
+  const s = sockets[0];
+  s.open();
+  sync(s, 0, { count: 0 }, 0, [entry({ inserts: [ins("ka", 0, item("A", { debounce: 100 })), ins("kb", 1, item("B", { debounce: 100 }))] })]);
+  fire(streamNode("kb").childNodes[0], "click");
+  assert.deepEqual(s.msgs(), [{ clicked: "kb" }]);
+  assert.equal(s.events()[0].handler_id, "i0.0", "the id sent is the item-relative one");
+  // The same handler id in two items is two debounces.
+  const a = streamNode("ka").childNodes[1];
+  const b = streamNode("kb").childNodes[1];
+  a.value = "x";
+  fire(a, "input");
+  b.value = "y";
+  fire(b, "input");
+  advance(100);
+  assert.deepEqual(s.msgs().slice(1), [{ typed: "ka", value: "x" }, { typed: "kb", value: "y" }]);
+  // An item-relative id outside any item is an error, not a page lookup.
+  patch(s, 1, [{ op: "add", path: "/stray", value: true }]);
+  fire(el("p"), "click");
+  assert.equal(errorsMatching("is relative to a stream item, but its element is not inside one").length, 1);
+  assert.equal(s.msgs().length, 3);
+});
+
+scenario("pre-hydration events on SSR items replay on the item the join keeps, and drop with a warning when it removes it", async () => {
+  const ssrItem = (key, t) => li(key, item(t)).html;
+  await loadRuntime({
+    ...streamsApp(),
+    ssr: '<h1>0</h1><ul data-brazier-stream="s">' + ssrItem("ka", "A") + ssrItem("kb", "B") + "</ul>",
+  });
+  const s = sockets[0];
+  fire(streamNode("ka").childNodes[0], "click");
+  fire(streamNode("kb").childNodes[0], "click");
+  s.open();
+  sync(s, 0, { count: 0 }, 0, [entry({ reset: true, inserts: [ins("ka", 0, item("A"))] })]);
+  assert.deepEqual(s.msgs(), [{ clicked: "ka" }]);
+  assert.equal(logsMatching("warn", "from before hydration dropped: the join removed the item").length, 1);
+  assert.equal(errorsMatching("").length, 0);
+});
+
+scenario("an element the page morph turns into a container loses its page children before the stream fills it", async () => {
+  await loadRuntime(streamsApp());
+  const s = sockets[0];
+  s.open();
+  sync(s, 0, { count: 0, plain: true }, 0, [entry({ inserts: [ins("ka", 0, item("A"))] })]);
+  const ul = el("ul");
+  const page = ul.childNodes[0];
+  assert.equal(page.textContent, "page");
+  patch(s, 1, [{ op: "replace", path: "/plain", value: false }]);
+  assert.equal(streamEl(), ul, "the page morph keeps the element");
+  assert.notEqual(streamNode("ka"), page, "a page child is never adopted as an item, even with an item's key");
+  assert.deepEqual(streamTexts(), ["A"]);
+});
+
+scenario("an event on an element in a container that its view does not hold is dropped with an error", async () => {
+  await loadRuntime(streamsApp());
+  const s = sockets[0];
+  s.open();
+  sync(s, 0, { count: 0 }, 0, [entry({ inserts: [ins("ka", 0, item("A"))] })]);
+  // Code outside the runtime puts elements into the container: one with a
+  // key the store does not hold, one with a key it holds.
+  const template = document.createElement("template");
+  template.innerHTML = li("kz", item("Z")).html + li("ka", item("A")).html;
+  const [foreign, copy] = template.content.childNodes.slice();
+  streamEl().appendChild(foreign);
+  streamEl().appendChild(copy);
+  fire(foreign.childNodes[0], "click");
+  assert.equal(errorsMatching("that its view does not hold; the page and the stream store disagree").length, 1);
+  fire(copy.childNodes[0], "click");
+  assert.equal(errorsMatching("that is not the item node its view holds").length, 1);
+  assert.deepEqual(s.msgs(), [], "neither event is sent");
+  fire(streamNode("ka").childNodes[0], "click");
+  assert.deepEqual(s.msgs(), [{ clicked: "ka" }]);
+});
+
+scenario("stream_names with a name repeated, empty or not a string throws at start, before any connection", async () => {
+  for (const [streams, message] of [[["s", "s"], /lists the stream s twice/], [[""], /not a stream name/], [[7], /not a stream name/]]) {
+    const runtime = await loadModule();
+    assert.throws(() => runtime.start(makeApp(streamsApp({ streams }))), message);
+    assert.equal(sockets.length, 0, "no connection");
   }
 });
 

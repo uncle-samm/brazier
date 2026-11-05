@@ -29,6 +29,13 @@
 // client's model. A `simple` app predicts the model by running its update in
 // the browser; when the server's model differs, the server's wins and the
 // mismatch is logged.
+//
+// Streams (docs/design/STREAMS.md, the "=== Streams ===" section below):
+// every patch and model_sync carries a required `streams` array, applied to
+// the stream stores before the frame's model part. A stream's items are not
+// in the model; each rendered container follows its store, item by item,
+// and a frame that does not fit a store closes the socket with 4000
+// `stream fault` to reconnect and refill the stores.
 
 import {
   applyOps,
@@ -52,11 +59,15 @@ import {
   RELOAD_HISTORY_KEY,
   RELOAD_WINDOW_MS,
 } from "./brazier_client/patch.mjs";
+import { applyEntry, decodeStreams, stepCounts } from "./brazier_client/stream.mjs";
 
 // === Generated entry ===
 
 // Every export of the generated entry the runtime calls. A `simple` app also
-// exports `update`.
+// exports `update`. `render` returns #(html, handlers, containers); the
+// container_* exports read a stream container of that list, render_item
+// renders one item of it, and stream_names lists the declared streams
+// (docs/design/STREAMS.md 8).
 const REQUIRED_EXPORTS = [
   "decode_model",
   "init_local",
@@ -69,6 +80,12 @@ const REQUIRED_EXPORTS = [
   "encode_msg",
   "same_model",
   "is_simple",
+  "stream_names",
+  "container_name",
+  "container_keep",
+  "container_limit",
+  "container_item",
+  "render_item",
 ];
 
 let app = null;
@@ -169,14 +186,14 @@ let predicted = false;
 // does not acknowledge it is held back so the prediction is not undone.
 let pendingModelEventClock = 0;
 
-// Pre-hydration events: { name, ids, snapshot }.
+// Pre-hydration events: { name, targets, snapshot }.
 const MAX_PENDING_EARLY_EVENTS = 50;
 let pendingEarlyEvents = [];
 
-// Debounced messages by "name:id": { name, id, msg, seq, timer }.
+// Debounced messages by handlerKey: { name, id, msg, seq, timer }.
 const debounced = new Map();
 let debounceSeq = 0;
-// Time of the last dispatched throttled event by "name:id".
+// Time of the last dispatched throttled event by handlerKey.
 const throttled = new Map();
 
 // Whether the app root carries data-brazier-dev="true". The server renders
@@ -253,6 +270,7 @@ export function start(entry) {
   started = true;
   app = entry;
   simple = app.is_simple() === true;
+  declaredStreams = declaredStreamNames(app.stream_names());
   if (BUILD_ID === null) {
     console.warn(
       "[brazier] This page did not load the client from /brazier_client_<hash>.js, so its join carries no build id " +
@@ -329,10 +347,14 @@ function renderNow() {
   const rendered = app.render(clientModel, clientLocal);
   const html = rendered[0];
   const table = rendered[1];
+  // Checked before the morph, so a view that renders a stream twice throws
+  // before it changes the page.
+  const containers = streamContainerTable(rendered[2]);
   const t1 = performance.now();
   morphInnerHTML(appRoot, html);
   handlers = table;
   listenFor(app.event_names(table).toArray());
+  renderStreamContainers(containers);
   const t2 = performance.now();
   const total = t2 - t0;
   if (total > 5) {
@@ -377,20 +399,87 @@ function listenFor(names) {
 }
 
 // The elements from the event target outwards that have a handler for
-// `name`, innermost first, as { el, id }. An event that does not bubble only
-// reaches its own target.
+// `name`, innermost first, as handler targets (see handlerTarget). An event
+// that does not bubble only reaches its own target.
 function handlerTargets(name, target, bubbles) {
   const attr = "data-brazier-on-" + name;
   const found = [];
   let node = target && target.nodeType !== 1 ? target.parentNode : target;
   while (node && node !== appRoot) {
     if (node.nodeType === 1 && node.hasAttribute(attr)) {
-      found.push({ el: node, id: node.getAttribute(attr) });
+      found.push(handlerTarget(node, node.getAttribute(attr)));
     }
     if (!bubbles) break;
     node = node.parentNode;
   }
   return found;
+}
+
+// The handler id of an element inside a stream item: `i` and the element's
+// path from the item's root, such as `i0` or `i0.2`. Page ids are paths
+// without the `i`.
+const ITEM_HANDLER_ID = /^i[0-9]+(\.[0-9]+)*$/;
+
+// A handler id inside a stream item is relative to the item's root
+// (docs/design/STREAMS.md 8.2, ITEM_HANDLER_ID): it is looked up in the
+// item's own handler table, found by the stream and key of the closest
+// element with data-brazier-key whose parent is a stream container. Any
+// other id is looked up in the page's table. Returns
+// { el, id, stream, key, item }, with stream, key and item null outside an
+// item.
+function handlerTarget(el, id) {
+  if (ITEM_HANDLER_ID.test(id)) {
+    for (let node = el; node && node !== appRoot; node = node.parentNode) {
+      if (node.nodeType !== 1 || !node.hasAttribute("data-brazier-key")) continue;
+      const parent = node.parentNode;
+      if (parent && parent.nodeType === 1 && parent.hasAttribute("data-brazier-stream")) {
+        return {
+          el,
+          id,
+          stream: parent.getAttribute("data-brazier-stream"),
+          key: node.getAttribute("data-brazier-key"),
+          item: node,
+        };
+      }
+    }
+  }
+  return { el, id, stream: null, key: null, item: null };
+}
+
+// The handler table `target`'s id is looked up in, or null when there is
+// none (logged here). A live event on an item must come from the node the
+// stream's view holds for its key; a replayed one finds its item by stream
+// and key, as the join may have kept the SSR node or removed the item.
+function handlerTableFor(name, target, replay) {
+  if (target.stream === null) {
+    if (ITEM_HANDLER_ID.test(target.id)) {
+      console.error("[brazier] " + name + " handler id " + target.id + " is relative to a stream item, but its element is not inside one; the event is dropped");
+      return null;
+    }
+    return handlers;
+  }
+  const view = streamViews.get(target.stream);
+  const table = view === undefined ? undefined : view.handlers.get(target.key);
+  if (table === undefined) {
+    if (replay) {
+      console.warn("[brazier] " + name + " event on an item of stream " + target.stream + " from before hydration dropped: the join removed the item");
+    } else {
+      console.error("[brazier] " + name + " event on an item of stream " + target.stream + " that its view does not hold; the page and the stream store disagree");
+    }
+    return null;
+  }
+  if (!replay && view.nodes.get(target.key) !== target.item) {
+    console.error("[brazier] " + name + " event on an element of stream " + target.stream + " that is not the item node its view holds; the event is dropped");
+    return null;
+  }
+  return table;
+}
+
+// The throttle and debounce key of a handler: the event name and the id,
+// plus the stream and key for an item, whose ids repeat across items.
+function handlerKey(name, target) {
+  if (target.stream === null) return name + ":" + target.id;
+  return name + ":" + JSON.stringify([target.stream, target.key, target.id]);
 }
 
 function onDomEvent(event) {
@@ -404,25 +493,30 @@ function onDomEvent(event) {
     return;
   }
   assertRendered("a " + name + " event");
-  runHandlers(name, event, found.map((f) => f.id), event, false);
+  runHandlers(name, event, found, event, false);
   renderIfDispatched();
 }
 
-// Run the handlers for `ids` (innermost first) against `payload`: the DOM
-// event, or a snapshot of it when `replay` is true. `domEvent` is the live
-// event prevent-default applies to, or null on replay.
-function runHandlers(name, payload, ids, domEvent, replay) {
+// Run the handlers of `targets` (innermost first, see handlerTarget) against
+// `payload`: the DOM event, or a snapshot of it when `replay` is true.
+// `domEvent` is the live event prevent-default applies to, or null on
+// replay.
+function runHandlers(name, payload, targets, domEvent, replay) {
   if (clientFailed) {
     console.error("[brazier] " + name + " event dropped: the client stopped after an earlier crash. Reload the page.");
     return;
   }
-  for (const id of ids) {
-    const looked = app.lookup_handler(handlers, name, id);
+  for (const target of targets) {
+    const id = target.id;
+    const table = handlerTableFor(name, target, replay);
+    if (table === null) continue;
+    const where = target.stream === null ? "the last render" : "the item's render of stream " + target.stream;
+    const looked = app.lookup_handler(table, name, id);
     if (!looked.isOk()) {
       if (replay) {
-        console.warn("[brazier] " + name + " event on element " + id + " from before hydration dropped: the rendered page has no such handler");
+        console.warn("[brazier] " + name + " event on element " + id + " from before hydration dropped: " + where + " has no such handler");
       } else {
-        console.error("[brazier] No " + name + " handler for element " + id + " in the last render; the page and its handler table disagree");
+        console.error("[brazier] No " + name + " handler for element " + id + " in " + where + "; the page and its handler table disagree");
       }
       continue;
     }
@@ -434,7 +528,7 @@ function runHandlers(name, payload, ids, domEvent, replay) {
     const throttleMs = options[3];
     if (preventDefault && domEvent) domEvent.preventDefault();
     if (name === "submit" && domEvent) attachFormData(domEvent);
-    const key = name + ":" + id;
+    const key = handlerKey(name, target);
     if (throttleMs > 0) {
       const now = performance.now();
       const last = throttled.get(key);
@@ -450,7 +544,7 @@ function runHandlers(name, payload, ids, domEvent, replay) {
     } else {
       if (throttleMs > 0) throttled.set(key, performance.now());
       if (debounceMs > 0) {
-        scheduleDebounced(name, id, decoded[0], debounceMs);
+        scheduleDebounced(name, id, key, decoded[0], debounceMs);
       } else {
         flushDebounced();
         dispatchMsg(name, id, decoded[0]);
@@ -473,8 +567,9 @@ function attachFormData(event) {
   }
 }
 
-function scheduleDebounced(name, id, msg, ms) {
-  const key = name + ":" + id;
+// `key` is the handler's handlerKey, so a debounce is per item inside a
+// stream.
+function scheduleDebounced(name, id, key, msg, ms) {
   const existing = debounced.get(key);
   if (existing) clearTimeout(existing.timer);
   const entry = { name, id, msg, seq: ++debounceSeq, timer: null };
@@ -550,7 +645,10 @@ function enqueueEarlyEvent(name, event, found) {
     trace("early_event.full", { name });
     return;
   }
-  pendingEarlyEvents.push({ name, ids: found.map((f) => f.id), snapshot: snapshotEvent(event) });
+  // An item's handler is replayed by (stream, key, id): the join may keep
+  // the SSR node or remove the item, so the node itself is not kept.
+  const targets = found.map((f) => ({ el: null, id: f.id, stream: f.stream, key: f.key, item: null }));
+  pendingEarlyEvents.push({ name, targets, snapshot: snapshotEvent(event) });
   trace("early_event.enqueue", { name, size: pendingEarlyEvents.length });
 }
 
@@ -576,7 +674,7 @@ function flushPendingEarlyEvents() {
   const queued = pendingEarlyEvents;
   pendingEarlyEvents = [];
   for (const entry of queued) {
-    runHandlers(entry.name, entry.snapshot, entry.ids, null, true);
+    runHandlers(entry.name, entry.snapshot, entry.targets, null, true);
     // The next replayed event runs the handlers of the state this one left.
     renderIfDispatched();
   }
@@ -659,6 +757,455 @@ function adoptAuthoritativeModel(modelValue) {
   return null;
 }
 
+// === Streams ===
+//
+// docs/design/STREAMS.md 6.2 and 8. Every patch and model_sync carries a
+// required `streams` array; each entry is applied to its stream's store
+// (brazier_client/stream.mjs) before the model part of the frame, and the
+// rendered container of the stream follows the store. A stream's items are
+// not in the model: the view renders an empty container
+// (`data-brazier-stream="<name>"`) and lists it next to the handler table,
+// and the items are rendered one by one with render_item.
+//
+// Adapted from Phoenix LiveView, assets/js/phoenix_live_view/dom_patch.ts
+// (commit 882655c): the container is skipped by the page morph
+// (skipFromChildren); a connection's first frame reconciles every container
+// against the store, keeping the node of every key it holds (the join path
+// of `perform`, where children whose key is not in the stream are removed);
+// later frames apply their entry only, and a key deleted and inserted again
+// in one entry is restored from a stash (removeStreamChildElement and
+// streamComponentRestore). Unlike LiveView, the wire entry carries each
+// insert's final index and every trim as a delete, so the client computes
+// no position and no trim (D6); and nothing is repaired: a frame that does
+// not fit the store is a stream fault, which closes the socket with 4000
+// `stream fault` to reconnect (D3).
+
+// The stream names the bundle declares (stream_names), set by start.
+let declaredStreams = new Set();
+// Stream name -> store (stream.mjs). Emptied by connect(); the join's
+// model_sync refills every stream `init` touched.
+const streamStores = new Map();
+// Stream name -> the stream's rendered container:
+// { name, el, container, nodes: Map key -> item element,
+//   handlers: Map key -> item handler table }.
+// The handler tables live here, not in the store, so the items a reconnect
+// keeps on the page stay clickable until the join reconciles them.
+const streamViews = new Map();
+// Container element -> the stream whose items it holds.
+const containerOwners = new WeakMap();
+// The next frame with a streams field is the connection's first: it
+// reconciles every container in full. Set by connect().
+let streamsNeedReconcile = true;
+// The socket a stream fault closed; its later frames are ignored.
+let faultedSocket = null;
+
+// The names of stream_names, checked: strings, unique and not empty.
+function declaredStreamNames(list) {
+  const names = new Set();
+  for (const name of list.toArray()) {
+    if (typeof name !== "string" || name === "") {
+      throw new Error("[brazier] invariant violated: stream_names holds " + JSON.stringify(name) + ", not a stream name");
+    }
+    if (names.has(name)) {
+      throw new Error("[brazier] invariant violated: stream_names lists the stream " + name + " twice");
+    }
+    names.add(name);
+  }
+  return names;
+}
+
+function resetStreamStores() {
+  if (streamStores.size > 0) {
+    console.log("[brazier] Reconnecting: emptied " + streamStores.size + " stream store(s); the join refills them and reconciles the page");
+  }
+  streamStores.clear();
+  streamsNeedReconcile = true;
+  trace("stream.reset_stores", { views: streamViews.size });
+}
+
+// A stream fault (docs/design/STREAMS.md 6.2): the store can no longer be
+// trusted and request_sync cannot repair it, so the socket is closed with
+// 4000 `stream fault`, which reconnects with backoff (as sendJoin does when
+// the join cannot be written). Logged with the stream and the reason; never
+// a key or an item, which can identify a user.
+function streamFault(socket, fault, where) {
+  if (socket === null) throw new Error("[brazier] invariant violated: a stream fault without a socket");
+  console.error(
+    "[brazier] Stream fault (" + where + "): stream " + JSON.stringify(fault.stream) + ", " + fault.reason + ": " +
+      fault.detail + ". The stream store cannot be trusted; closing the socket with 4000 to reconnect and refill it.",
+  );
+  trace("stream.fault", { stream: fault.stream, reason: fault.reason, where });
+  if (socket === faultedSocket) return;
+  faultedSocket = socket;
+  if (socket.readyState === WebSocket.CLOSING || socket.readyState === WebSocket.CLOSED) {
+    console.warn("[brazier] The socket of the stream fault is already closing; its close reconnects");
+    return;
+  }
+  socket.close(4000, "stream fault");
+}
+
+// Apply a frame's `streams` field. Returns false after a stream fault (the
+// socket is then closing and the frame's model part must not be applied).
+// Every entry is checked before any store changes, so a fault leaves the
+// stores as they were; entries for one name apply in order.
+function applyFrameStreams(socket, value, kind) {
+  const decoded = decodeStreams(value);
+  if (!decoded.ok) {
+    streamFault(socket, decoded.fault, kind);
+    return false;
+  }
+  const working = new Map();
+  const applied = [];
+  for (const entry of decoded.entries) {
+    const current = working.has(entry.name) ? working.get(entry.name) : streamStores.get(entry.name);
+    const result = applyEntry(current === undefined ? null : current, entry, declaredStreams);
+    if (!result.ok) {
+      streamFault(socket, result.fault, kind);
+      return false;
+    }
+    const view = streamViews.get(entry.name);
+    if (view !== undefined) {
+      const mismatch = containerMismatch(entry.name, view.container, entry.keep, entry.limit, "entry");
+      if (mismatch !== null) {
+        streamFault(socket, mismatch, kind);
+        return false;
+      }
+    }
+    working.set(entry.name, result.store);
+    applied.push({ name: entry.name, store: result.store, steps: result.steps });
+  }
+  for (const { name, store, steps } of applied) {
+    if (!streamStores.has(name)) {
+      console.log("[brazier] Stream " + name + " started (keep " + store.keep + ", limit " + store.limit + ")");
+    }
+    streamStores.set(name, store);
+    if (devMode) trace("stream.delta", { stream: name, kind, items: store.keys.length, ...stepCounts(steps) });
+  }
+  const first = streamsNeedReconcile;
+  streamsNeedReconcile = false;
+  if (first) {
+    if (streamViews.size === 0) return true;
+    console.log("[brazier] First frame of the connection: reconciling " + streamViews.size + " stream container(s)");
+    return withStreamMorph(() => {
+      for (const view of streamViews.values()) {
+        if (!reconcileView(socket, view)) return false;
+      }
+      return true;
+    });
+  }
+  const shown = applied.filter(({ name }) => streamViews.has(name));
+  if (shown.length === 0) return true;
+  return withStreamMorph(() => {
+    for (const { name, store, steps } of shown) {
+      if (!patchView(socket, streamViews.get(name), store, steps)) return false;
+    }
+    return true;
+  });
+}
+
+// A fault when `keep` or `limit` (of an entry or a store, `what`) differs
+// from the rendered container's, else null.
+function containerMismatch(name, container, keep, limit, what) {
+  const containerKeep = app.container_keep(container);
+  const containerLimit = app.container_limit(container);
+  if (keep !== containerKeep) {
+    return { stream: name, reason: "keep_mismatch", detail: what + " keep " + keep + ", container keep " + containerKeep };
+  }
+  if (limit !== containerLimit) {
+    return { stream: name, reason: "limit_mismatch", detail: what + " limit " + limit + ", container limit " + containerLimit };
+  }
+  return null;
+}
+
+// Run DOM work on stream containers as a morph: focus and selection are kept
+// across moves, autofocus is honoured, and the hooks of what it touched sync
+// once it is done (morphInnerHTML does the same for the page).
+function withStreamMorph(fn) {
+  const focused = document.activeElement;
+  const focusedTag = focused ? focused.tagName : undefined;
+  const focusedName = focused && focused.getAttribute ? focused.getAttribute("name") : null;
+  const selStart = focused ? focused.selectionStart : undefined;
+  const selEnd = focused ? focused.selectionEnd : undefined;
+  const focusedValue = focused ? focused.value : undefined;
+  const locked = inputLocked();
+  autofocusQueue = [];
+  hookTouched = [];
+  morphFocused = focused;
+  let result;
+  try {
+    result = fn();
+  } finally {
+    morphFocused = null;
+  }
+  syncHooks(appRoot);
+  restoreReplacedFocus(appRoot, focused, focusedTag, focusedName, focusedValue, selStart, selEnd, locked);
+  focusAutofocused(appRoot);
+  return result;
+}
+
+// Render one item of `view`'s stream: { root, table }, or null after a
+// stream fault (the item's decoder or item function refused it). The root
+// is a new element, keyed by `key`.
+function renderStreamItem(socket, view, key, item) {
+  const result = app.render_item(view.container, key, item);
+  if (!result.isOk()) {
+    streamFault(socket, { stream: view.name, reason: "item_render_failed", detail: String(result[0]) }, "item render");
+    return null;
+  }
+  const html = result[0][0];
+  const table = result[0][1];
+  const template = document.createElement("template");
+  template.innerHTML = html;
+  const root = template.content.firstChild;
+  // render_item refuses an item whose root is not one element (an Error
+  // above), and sets the root's data-brazier-key to the key.
+  if (!root || root.nodeType !== 1 || root.nextSibling !== null || root.getAttribute("data-brazier-key") !== key) {
+    throw new Error("[brazier] invariant violated: render_item for stream " + view.name + " did not give one element keyed by the item's key");
+  }
+  listenFor(app.event_names(table).toArray());
+  return { root, table };
+}
+
+// Remove an item element and unmount its hooks. One frame can remove an
+// element it touched earlier (an entry inserts a key, a later entry for the
+// same stream deletes it), so what the removed subtree holds leaves the
+// morph's touched list here; syncHooks still throws for anything else that
+// leaves the root.
+function removeStreamChild(el, node) {
+  if (hookTouched.length > 0) hookTouched = hookTouched.filter((touched) => !node.contains(touched.node));
+  unmountSubtree(node);
+  el.removeChild(node);
+}
+
+function removeAllStreamChildren(el) {
+  while (el.firstChild) removeStreamChild(el, el.firstChild);
+}
+
+// Move an item element before `ref` (null: to the end). moveBefore keeps
+// focus, selection and an iframe's state through the move; without it the
+// element leaves the document for a moment, and withStreamMorph gives focus
+// back.
+function placeStreamChild(el, node, ref) {
+  if (typeof el.moveBefore === "function") el.moveBefore(node, ref);
+  else el.insertBefore(node, ref);
+}
+
+// Morph an item element into a new render of its item. An element of
+// another tag is replaced. Returns the element that holds the item.
+function morphStreamChild(el, node, root) {
+  if (node.tagName !== root.tagName) {
+    el.insertBefore(root, node);
+    removeStreamChild(el, node);
+    inserted(root);
+    return root;
+  }
+  morphNode(node, root);
+  return node;
+}
+
+// Full reconcile of a container with its store: on the connection's first
+// frame and for a container new in the DOM. Every child that is not an
+// element keyed by a key of the store (or repeats one) is removed and its
+// hooks unmounted; every key is placed in order, and a child that already
+// has it is kept and morphed, so it keeps its identity, focus and hook
+// state. Works from the children on the page, not from view.nodes, so it
+// also repairs a view that a fault left half patched. Returns false after a
+// stream fault.
+function reconcileView(socket, view) {
+  const el = view.el;
+  const store = streamStores.get(view.name);
+  const keys = store === undefined ? [] : store.keys;
+  const owner = containerOwners.get(el);
+  if (owner !== undefined && owner !== view.name) {
+    if (devMode) trace("stream.container_reowned", { from: owner, to: view.name });
+    removeAllStreamChildren(el);
+  }
+  containerOwners.set(el, view.name);
+  const wanted = new Set(keys);
+  const kept = new Map();
+  for (let child = el.firstChild; child !== null; ) {
+    const next = child.nextSibling;
+    const key = child.nodeType === 1 ? child.getAttribute("data-brazier-key") : null;
+    if (key === null || !wanted.has(key) || kept.has(key)) removeStreamChild(el, child);
+    else kept.set(key, child);
+    child = next;
+  }
+  const nodes = new Map();
+  const tables = new Map();
+  let cursor = el.firstChild;
+  for (const key of keys) {
+    const rendered = renderStreamItem(socket, view, key, store.items.get(key));
+    if (rendered === null) return false;
+    const old = kept.get(key);
+    let node;
+    if (old === undefined) {
+      node = el.insertBefore(rendered.root, cursor);
+      inserted(node);
+    } else {
+      if (old === cursor) cursor = cursor.nextSibling;
+      else placeStreamChild(el, old, cursor);
+      node = morphStreamChild(el, old, rendered.root);
+    }
+    nodes.set(key, node);
+    tables.set(key, rendered.table);
+  }
+  view.nodes = nodes;
+  view.handlers = tables;
+  verifyStreamView(view, keys);
+  if (devMode) trace("stream.reconcile", { stream: view.name, items: keys.length, kept: kept.size });
+  return true;
+}
+
+// Apply one entry's steps (stream.mjs applyEntry) to a container that
+// already follows the store before the entry. A deleted or reset child is
+// stashed, and an insert of its key in the same entry restores it (a move);
+// what is still stashed at the end is removed and its hooks unmounted.
+// `store` is the store after the entry. Returns false after a stream fault.
+function patchView(socket, view, store, steps) {
+  const el = view.el;
+  const leaving = new Map();
+  const stash = (key) => {
+    const node = view.nodes.get(key);
+    if (node === undefined) {
+      throw new Error("[brazier] invariant violated: the view of stream " + view.name + " has no element for a key its store held");
+    }
+    view.nodes.delete(key);
+    view.handlers.delete(key);
+    leaving.set(key, node);
+  };
+  for (const step of steps) {
+    if (step.op === "reset") {
+      for (const key of [...view.nodes.keys()]) stash(key);
+    } else if (step.op === "delete") {
+      stash(step.key);
+    } else if (step.op === "insert") {
+      const rendered = renderStreamItem(socket, view, step.key, store.items.get(step.key));
+      if (rendered === null) return false;
+      const ref = step.before === null ? null : view.nodes.get(step.before);
+      if (ref === undefined) {
+        throw new Error("[brazier] invariant violated: an insert into stream " + view.name + " goes before a key its view does not hold");
+      }
+      const back = leaving.get(step.key);
+      let node;
+      if (back === undefined) {
+        node = el.insertBefore(rendered.root, ref);
+        inserted(node);
+      } else {
+        leaving.delete(step.key);
+        placeStreamChild(el, back, ref);
+        node = morphStreamChild(el, back, rendered.root);
+      }
+      view.nodes.set(step.key, node);
+      view.handlers.set(step.key, rendered.table);
+    } else if (step.op === "update") {
+      const node = view.nodes.get(step.key);
+      if (node === undefined) {
+        throw new Error("[brazier] invariant violated: an update in stream " + view.name + " of a key its view does not hold");
+      }
+      const rendered = renderStreamItem(socket, view, step.key, store.items.get(step.key));
+      if (rendered === null) return false;
+      view.nodes.set(step.key, morphStreamChild(el, node, rendered.root));
+      view.handlers.set(step.key, rendered.table);
+    } else {
+      throw new Error("[brazier] invariant violated: unknown stream step " + step.op);
+    }
+  }
+  for (const node of leaving.values()) removeStreamChild(el, node);
+  verifyStreamView(view, store.keys);
+  return true;
+}
+
+// Invariant: a container's children are exactly the elements of its view,
+// one per key, in the store's order, and every key has a handler table.
+function verifyStreamView(view, keys) {
+  const el = view.el;
+  if (view.nodes.size !== keys.length || view.handlers.size !== keys.length || el.childNodes.length !== keys.length) {
+    throw new Error(
+      "[brazier] invariant violated: stream " + view.name + " holds " + keys.length + " items, its view " + view.nodes.size +
+        " elements and " + view.handlers.size + " handler tables, its container " + el.childNodes.length + " children",
+    );
+  }
+  let child = el.firstChild;
+  for (const key of keys) {
+    if (child !== view.nodes.get(key)) {
+      throw new Error("[brazier] invariant violated: the container of stream " + view.name + " is not in the store's order");
+    }
+    child = child.nextSibling;
+  }
+}
+
+// The containers a render lists, by name, checked before the page morph: a
+// stream the bundle does not declare, or one rendered twice, throws
+// (docs/design/STREAMS.md 12), which takes the render-failure path.
+function streamContainerTable(list) {
+  const table = new Map();
+  for (const container of list.toArray()) {
+    const name = app.container_name(container);
+    if (!declaredStreams.has(name)) {
+      throw new Error("[brazier] invariant violated: the view renders stream " + JSON.stringify(name) + ", which the bundle does not declare");
+    }
+    if (table.has(name)) {
+      throw new Error("[brazier] The view renders stream " + name + " twice; a stream has one container");
+    }
+    table.set(name, container);
+  }
+  return table;
+}
+
+// After the page morph: match the listed containers to the elements on the
+// page, check each store against its container, and fill every container
+// that is new in the DOM (or whose item function changed) with a full
+// reconcile. A container the render no longer lists loses its view; the
+// store stays, and fills the container when it appears again.
+function renderStreamContainers(table) {
+  const elements = new Map();
+  for (const el of appRoot.querySelectorAll("[data-brazier-stream]")) {
+    const name = el.getAttribute("data-brazier-stream");
+    if (!table.has(name) || elements.has(name)) {
+      throw new Error("[brazier] invariant violated: the page holds a container of stream " + JSON.stringify(name) + " that the render did not list once");
+    }
+    elements.set(name, el);
+  }
+  if (elements.size !== table.size) {
+    throw new Error("[brazier] invariant violated: the render lists " + table.size + " stream container(s), the page holds " + elements.size);
+  }
+  for (const name of [...streamViews.keys()]) {
+    if (table.has(name)) continue;
+    streamViews.delete(name);
+    console.log("[brazier] Stream " + name + " is no longer rendered; its store is kept");
+  }
+  for (const [name, container] of table) {
+    const store = streamStores.get(name);
+    if (store === undefined) continue;
+    const mismatch = containerMismatch(name, container, store.keep, store.limit, "store");
+    if (mismatch !== null) {
+      streamFault(ws, mismatch, "render");
+      return;
+    }
+  }
+  const fresh = [];
+  for (const [name, container] of table) {
+    const el = elements.get(name);
+    const view = streamViews.get(name);
+    // The item function is compared by reference only, never called: the
+    // same element under a new item function renders its items anew.
+    if (view !== undefined && view.el === el && app.container_item(view.container) === app.container_item(container)) {
+      view.container = container;
+      continue;
+    }
+    const next = { name, el, container, nodes: new Map(), handlers: new Map() };
+    streamViews.set(name, next);
+    fresh.push(next);
+    console.log("[brazier] Stream " + name + (view === undefined ? " rendered" : " rendered into a new container or with a new item function") + "; filling it from its store");
+  }
+  if (fresh.length === 0) return;
+  withStreamMorph(() => {
+    for (const view of fresh) {
+      if (!reconcileView(ws, view)) return;
+    }
+  });
+}
+
 // === WebSocket ===
 
 function socketUrl() {
@@ -703,6 +1250,7 @@ function connect() {
   outbound.setBudget(new SendBudget(CLIENT_SEND_BUDGET, CLIENT_SEND_WINDOW_MS));
   const purged = outbound.removeWhere((msg) => msg.type === "request_sync");
   if (purged > 0) trace("send_queue.purge_request_sync", { purged });
+  resetStreamStores();
   const socket = new WebSocket(socketUrl());
   ws = socket;
   socketOpened = false;
@@ -713,7 +1261,7 @@ function connect() {
     startHeartbeat(socket);
     sendJoin(socket);
   };
-  socket.onmessage = (e) => handleMessage(e.data);
+  socket.onmessage = (e) => handleMessage(socket, e.data);
   socket.onclose = (e) => handleClose(socket, e);
   socket.onerror = (e) => console.error("[brazier] WS error:", e);
 }
@@ -974,7 +1522,7 @@ export function ws_send(data) {
 
 // === Server messages ===
 
-function handleMessage(raw) {
+function handleMessage(socket, raw) {
   let msg;
   // A frame that is not JSON cannot be processed. It may have been a patch,
   // so the cached model can no longer be trusted: log it and resync.
@@ -985,9 +1533,23 @@ function handleMessage(raw) {
     requestFullSync("unparseable_server_message");
     return;
   }
+  // A socket closed for a stream fault applies nothing more: its stores
+  // cannot be trusted, and the next connection's join refills them.
+  if (socket === faultedSocket) {
+    console.warn("[brazier] A " + msg.type + " frame arrived after a stream fault and is ignored; the socket is closing to reconnect");
+    trace("stream.frame_after_fault", { type: msg.type });
+    return;
+  }
+  // The streams field is applied before the model part, under every model
+  // verdict (docs/design/STREAMS.md 6.2). A stream fault closes the socket,
+  // and the model part is not applied.
   switch (msg.type) {
-    case "model_sync": handleModelSync(msg.model, msg.version, msg.ack_clock); break;
-    case "patch": handlePatch(msg.ops, msg.version, msg.ack_clock); break;
+    case "model_sync":
+      if (applyFrameStreams(socket, msg.streams, "model_sync")) handleModelSync(msg.model, msg.version, msg.ack_clock);
+      break;
+    case "patch":
+      if (applyFrameStreams(socket, msg.streams, "patch")) handlePatch(msg.ops, msg.version, msg.ack_clock);
+      break;
     case "navigate": handleServerNavigate(msg.path, msg.replace === true); break;
     case "hard_navigate": handleServerHardNavigate(msg.path); break;
     case "reload": console.log("[brazier] Hot reload: refreshing"); location.reload(); break;
@@ -1670,7 +2232,16 @@ function morphNode(o, n) {
     if (devMode) trace("morph.hook_removed", { node: describeNode(o), hook: mounted.hookName });
     unmountHookNode(o);
   }
+  const wasContainer = o.hasAttribute("data-brazier-stream");
   if (morphAttributes(o, n) && o.hasAttribute("data-brazier-hook")) hookTouched.push({ node: o, subtree: false });
+  if (o.hasAttribute("data-brazier-stream")) {
+    // A stream container: its children are the stream's items, which the
+    // stream applier places after the render (renderStreamContainers). This
+    // is LiveView's skipFromChildren for phx-update="stream". An element
+    // that just became a container drops what it held before.
+    if (!wasContainer) removeAllStreamChildren(o);
+    return;
+  }
   if (o.hasAttribute("data-brazier-preserve-children")) {
     // Other code owns these children, and may have added hook elements.
     hookTouched.push({ node: o, subtree: true });
@@ -1806,8 +2377,10 @@ function syncHooks(root) {
   };
   for (const { node, subtree } of touched) {
     // A touched element always stays in the root: the morph only removes
-    // siblings it has not reached yet. Only other code can take one out
-    // mid-morph (a hook's unmount removing an element outside its own).
+    // siblings it has not reached yet, and a stream patch that removes an
+    // item it touched drops it from the list (removeStreamChild). Only other
+    // code can take one out mid-morph (a hook's unmount removing an element
+    // outside its own).
     if (!root.contains(node)) {
       throw new Error(
         "[brazier] invariant violated: an element the morph touched (" + describeNode(node) +
