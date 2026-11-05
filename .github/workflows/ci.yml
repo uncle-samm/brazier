@@ -8,16 +8,25 @@ on:
 
 jobs:
   # The image is built once and handed to every other job as an artifact.
-  # Building it in each of the 47 jobs ran 47 `gleam deps download`s for the
-  # root and every example at once, and Hex answered "The rate limit for the
-  # Hex API has been exceeded" (every run from 2026-11-04 failed so).
+  # Building it resolves every example's dependencies, about 400 Hex API
+  # requests, past the unauthenticated limit of 100 a minute per IP: Hex
+  # answered "The rate limit for the Hex API has been exceeded". The build
+  # authenticates with the read-only key in the HEXPM_READ_API_KEY secret and
+  # does it once, not in each of the 47 jobs.
   image:
     name: Build CI image
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Build CI image
-        run: docker build -f Dockerfile.ci -t brazier-ci .
+        env:
+          HEXPM_READ_API_KEY: ${{ secrets.HEXPM_READ_API_KEY }}
+        run: |
+          if [ -z "$HEXPM_READ_API_KEY" ]; then
+            echo "::error::The HEXPM_READ_API_KEY secret is not set. Unauthenticated, the image build exceeds the Hex API rate limit. Add a read-only Hex key as that repository secret." >&2
+            exit 1
+          fi
+          docker build --secret id=hexpm_read_api_key,env=HEXPM_READ_API_KEY -f Dockerfile.ci -t brazier-ci .
       - name: Save CI image
         run: docker save brazier-ci | gzip -1 > brazier-ci.tar.gz
       - uses: actions/upload-artifact@v4

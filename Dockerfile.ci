@@ -47,7 +47,22 @@ ENV CHROME_BIN=/usr/bin/chromium
 ENV CHROME_EXTRA_ARGS="--no-sandbox --disable-dev-shm-usage"
 ENV PYTHON_BIN=/app/.venv/bin/python
 
-RUN set -eu; \
+# A fresh image has no build/ directory, so Gleam resolves every example's
+# path dependency on the root again and looks each Hex package up through the
+# Hex API: about 400 requests, past the unauthenticated limit of 100 a minute
+# per IP that GitHub runners share. A read-only key (HEXPM_READ_API_KEY, which
+# Gleam reads) raises that to the account's own limit. It is a BuildKit
+# secret, so it is in no layer of the image; ci.yml requires it, a local build
+# may leave it out.
+RUN --mount=type=secret,id=hexpm_read_api_key,required=false \
+    set -eu; \
+    if [ -s /run/secrets/hexpm_read_api_key ]; then \
+      HEXPM_READ_API_KEY="$(cat /run/secrets/hexpm_read_api_key)"; \
+      export HEXPM_READ_API_KEY; \
+      echo "Hex requests are authenticated with HEXPM_READ_API_KEY"; \
+    else \
+      echo "No hexpm_read_api_key secret: Hex requests are unauthenticated"; \
+    fi; \
     gleam deps download; \
     for gleam_toml in examples/*/gleam.toml; do \
       example_dir="$(dirname "$gleam_toml")"; \

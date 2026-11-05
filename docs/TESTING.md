@@ -541,7 +541,12 @@ how to make one.
 
 ## CI
 
-`.github/workflows/ci.yml` builds `Dockerfile.ci` and runs two jobs:
+`.github/workflows/ci.yml` builds `Dockerfile.ci` once and hands the image to
+two jobs. Building it downloads the dependencies of the root and every
+example, about 400 Hex API requests, so the build needs the repository secret
+`HEXPM_READ_API_KEY`: a read-only Hex key (unauthenticated, GitHub runners
+share the limit of 100 requests a minute per IP). The image job fails if the
+secret is missing. A local `docker build` may leave it out. The two jobs:
 
 - **Gleam build, test, lint.** These steps run in order and stop at the
   first failure:
