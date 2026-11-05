@@ -2,6 +2,7 @@ import brazier/static
 import gleam/http/response
 import gleam/int
 import gleam/list
+import gleam/string
 import simplifile
 
 // --- MIME type tests ---
@@ -37,6 +38,24 @@ pub fn mime_unknown_test() {
 
 pub fn mime_json_test() {
   let assert "application/json; charset=utf-8" = static.mime_type("data.json")
+}
+
+/// Extensions compare case-insensitively in ASCII only: `.PNG` is a PNG,
+/// and an extension holding a Kelvin sign U+212A (which Unicode lowercases
+/// to `k`) or a dotted capital I U+0130 is unknown.
+pub fn mime_extension_compares_in_ascii_test() {
+  let assert "image/png" = static.mime_type("LOGO.PNG")
+  let assert "text/html; charset=utf-8" = static.mime_type("dir/Index.HTM")
+  let assert "application/octet-stream" = static.mime_type("x.\u{212A}ml")
+  let assert "application/octet-stream" = static.mime_type("x.\u{0130}co")
+}
+
+/// An ETag is lowercase hex of the SHA-256 of the body.
+pub fn etag_is_lowercase_hex_test() {
+  let etag = static.etag_for(<<"abc":utf8>>)
+  assert string.starts_with(etag, "\"ba7816bf8f01cfea")
+  assert string.ends_with(etag, "\"")
+  assert string.lowercase(etag) == etag
 }
 
 // --- Traversal prevention tests ---

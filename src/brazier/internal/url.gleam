@@ -21,6 +21,7 @@
 ///   an SVG document can run script.
 ///
 /// Remaining hole, by design: `element.unsafe_raw_html` bypasses this check.
+import brazier/internal/ascii
 import gleam/list
 import gleam/string
 
@@ -46,36 +47,24 @@ const log_value_limit = 64
 
 /// Whether the browser interprets attribute `name` as a URL. The match is
 /// ASCII case-insensitive, as the HTML parser's is: it lowercases `A-Z` in
-/// an attribute name and leaves every other character as it is, so
-/// `XLink:Href` is `xlink:href` and a name holding a non-ASCII character
-/// never is a URL attribute.
+/// an attribute name and leaves every other character as it is (WHATWG
+/// HTML, "attribute name state"), so `XLink:Href` is `xlink:href` and a
+/// name holding a non-ASCII character, such as the Kelvin sign U+212A that
+/// Unicode lowercases to `k`, never is a URL attribute.
 pub fn is_url_attribute(name: String) -> Bool {
-  list.contains(url_attributes, ascii_lowercase_name(name))
+  list.contains(url_attributes, ascii.lowercase(name))
 }
 
 /// Check `value` for attribute `name`. Attributes that are not URL
 /// attributes always pass. The value is returned unchanged on success: the
 /// normalised form is used only to decide.
 pub fn check(name: String, value: String) -> Result(String, Blocked) {
-  let lower = ascii_lowercase_name(name)
+  let lower = ascii.lowercase(name)
   case list.contains(url_attributes, lower) {
     False -> Ok(value)
     True -> check_url(lower, value)
   }
 }
-
-/// `name` with `A-Z` lowercased and every other byte (code unit on
-/// JavaScript) unchanged, the HTML parser's lowercasing of an attribute
-/// name (WHATWG HTML, "attribute name state").
-///
-/// Not `string.lowercase`: that lowercases in Unicode, where the Kelvin sign
-/// U+212A becomes `k`, a name the browser keeps as it is. On Erlang it is
-/// also slow on the render's path: OTP's `string:lowercase/1` raises and
-/// catches an exception internally for each name that is already lowercase,
-/// and `check` runs for every attribute of every render.
-@external(erlang, "brazier_render_ffi", "ascii_lowercase")
-@external(javascript, "../../brazier_render_ffi.mjs", "ascii_lowercase")
-fn ascii_lowercase_name(name: String) -> String
 
 /// A short, printable description of a refusal for log lines.
 pub fn describe(blocked: Blocked) -> String {

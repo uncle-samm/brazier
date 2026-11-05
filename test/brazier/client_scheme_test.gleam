@@ -196,6 +196,45 @@ pub fn forwarded_proto_comes_from_the_client_element_test() {
     )
 }
 
+/// Schemes (RFC 3986 §3.1) and Forwarded parameter names (RFC 7239 §4)
+/// are ASCII and compare case-insensitively in ASCII: upper case is read,
+/// a scheme holding a character outside ASCII is an error, and a parameter
+/// name holding one is no `proto` (skipped, as an extension parameter is).
+pub fn schemes_and_parameter_names_compare_in_ascii_test() {
+  let x_forwarded_for = trusting(ip.XForwardedFor)
+  let assert Ok("https") =
+    ip.client_scheme(
+      "10.0.0.1",
+      [#("x-forwarded-proto", " HTTPS ")],
+      x_forwarded_for,
+    )
+  let #(result, logs) =
+    log_capture.capture(fn() {
+      ip.client_scheme(
+        "10.0.0.1",
+        [#("x-forwarded-proto", "\u{FF48}ttps")],
+        x_forwarded_for,
+      )
+    })
+  let assert Error("invalid X-Forwarded-Proto \"\u{FF48}ttps\"") = result
+  assert log_capture.has(logs, level: "warning", containing: [
+    "invalid X-Forwarded-Proto",
+  ])
+  let forwarded = trusting(ip.Forwarded)
+  let assert Ok("https") =
+    ip.client_scheme(
+      "10.0.0.1",
+      [#("forwarded", "FOR=203.0.113.7;PROTO=https")],
+      forwarded,
+    )
+  let assert Ok("http") =
+    ip.client_scheme(
+      "10.0.0.1",
+      [#("forwarded", "for=203.0.113.7;pr\u{00D3}to=https")],
+      forwarded,
+    )
+}
+
 pub fn forwarded_without_proto_is_http_test() {
   let trusted = trusting(ip.Forwarded)
   let assert Ok("http") = ip.client_scheme("10.0.0.1", [], trusted)

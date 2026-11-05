@@ -22,6 +22,7 @@
 /// Patterns follow Plug.Upload (random names, exclusive create, an empty
 /// filename means no file was chosen) and Phoenix `send_download`
 /// (RFC 6266 attachment headers).
+import brazier/internal/ascii
 import brazier/internal/log_path
 import brazier/log
 import brazier/transport/http as transport_http
@@ -515,13 +516,16 @@ pub fn error_to_string(error: UploadError) -> String {
   }
 }
 
-/// Get the file extension from a filename.
+/// Get the file extension from a filename, lowercased in ASCII. File
+/// extensions in type tables are ASCII; a character outside ASCII is kept
+/// as it is (`"x.\u{212A}B"` gives `"\u{212A}b"`, not `"kb"`), so such an
+/// extension never equals an ASCII one.
 pub fn extension(filename: String) -> Option(String) {
   case string.split(filename, ".") {
     [_] -> None
     parts ->
       case list.last(parts) {
-        Ok(ext) -> Some(string.lowercase(ext))
+        Ok(ext) -> Some(ascii.lowercase(ext))
         Error(Nil) -> None
       }
   }
@@ -731,7 +735,7 @@ fn parse_part(part: BitArray) -> Result(Part, UploadError) {
     }),
   )
   use name <- result.try(
-    case string.lowercase(kind), list.key_find(params, "name") {
+    case ascii.lowercase(kind), list.key_find(params, "name") {
       "form-data", Ok(name) -> Ok(name)
       "form-data", Error(Nil) -> Error(ParseError("part has no name"))
       _, _ -> Error(ParseError("part disposition is not form-data"))
@@ -764,8 +768,12 @@ fn parse_part(part: BitArray) -> Result(Part, UploadError) {
   }
 }
 
-/// Parse "Name: value" lines into lower-cased names. Duplicates of the
-/// headers that decide how a part is read are ambiguous and refused.
+/// Parse "Name: value" lines into names lowercased in ASCII. A name must be
+/// a token (RFC 7578 §4.8 part headers are MIME fields; RFC 9112 §5.1
+/// refuses whitespace before the colon, as the request parser does), so a
+/// name with a space, a control character or a character outside ASCII is
+/// refused by name. Duplicates of the headers that decide how a part is
+/// read are ambiguous and refused.
 fn parse_part_headers(
   text: String,
 ) -> Result(List(#(String, String)), UploadError) {
@@ -776,7 +784,14 @@ fn parse_part_headers(
   use headers <- result.try(
     list.try_map(lines, fn(line) {
       case string.split_once(line, ":") {
-        Ok(#(name, value)) -> Ok(#(string.lowercase(name), string.trim(value)))
+        Ok(#(name, value)) ->
+          case ascii.is_token(name) {
+            True -> Ok(#(ascii.lowercase(name), string.trim(value)))
+            False ->
+              Error(ParseError(
+                "invalid part header name " <> string.inspect(name),
+              ))
+          }
         Error(Nil) ->
           Error(ParseError("malformed part header " <> string.inspect(line)))
       }
@@ -792,10 +807,10 @@ fn parse_part_headers(
   }
 }
 
-/// Parse `value; key=token; key="quoted"` into the value and lower-cased
-/// parameter names. Quoted values end at the next quote: browsers
-/// percent-encode quotes in filenames (HTML form submission) and send
-/// backslashes literally.
+/// Parse `value; key=token; key="quoted"` into the value and parameter
+/// names lowercased in ASCII (they are tokens, RFC 9110 §5.6.6). Quoted
+/// values end at the next quote: browsers percent-encode quotes in
+/// filenames (HTML form submission) and send backslashes literally.
 fn parse_header_params(
   header: String,
 ) -> Result(#(String, List(#(String, String))), String) {
@@ -817,7 +832,7 @@ fn parse_params(
       case string.split_once(trimmed, "=") {
         Error(Nil) -> Error("malformed parameter " <> string.inspect(trimmed))
         Ok(#(key, after)) -> {
-          let key = string.lowercase(string.trim(key))
+          let key = ascii.lowercase(string.trim(key))
           case string.trim_start(after) {
             "\"" <> quoted ->
               case string.split_once(quoted, "\"") {
@@ -846,14 +861,15 @@ fn parse_params(
   }
 }
 
-/// The media type of a Content-Type value, lower-cased, without parameters.
+/// The media type of a Content-Type value, lowercased in ASCII (a media
+/// type is two tokens, RFC 9110 §8.3.1), without parameters.
 fn media_type(content_type: String) -> String {
   case string.split_once(content_type, ";") {
     Ok(#(media, _)) -> media
     Error(Nil) -> content_type
   }
   |> string.trim
-  |> string.lowercase
+  |> ascii.lowercase
 }
 
 // --- Names ---

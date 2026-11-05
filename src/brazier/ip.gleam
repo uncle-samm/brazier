@@ -21,6 +21,7 @@
 /// no header means plain `http`. Plug.RewriteOn rewrites the scheme only
 /// from the headers it is told to believe, and Django's
 /// `SECURE_PROXY_SSL_HEADER` names the one header that carries it.
+import brazier/internal/ascii
 import brazier/log
 import gleam/list
 import gleam/option.{type Option, None, Some}
@@ -379,10 +380,11 @@ fn x_forwarded_proto_scheme(
   }
 }
 
-/// `http` or `https`, case-insensitive; anything else is an error. The
-/// value is client-reachable text, so it is quoted (SEC-11).
+/// `http` or `https`, case-insensitive in ASCII (a URI scheme is ASCII,
+/// RFC 3986 §3.1); anything else, a non-ASCII character included, is an
+/// error. The value is client-reachable text, so it is quoted (SEC-11).
 fn parse_scheme(raw: String, source: String) -> Result(String, String) {
-  let scheme = string.lowercase(string.trim(raw))
+  let scheme = ascii.lowercase(string.trim(raw))
   case scheme {
     "http" | "https" -> Ok(scheme)
     _ -> {
@@ -505,6 +507,9 @@ fn forwarded_for_hops(values: List(String)) -> List(#(Hop, Nil)) {
 
 /// RFC 7239: `Forwarded: for=192.0.2.60;proto=http, for="[2001:db8::1]:4711"`.
 /// Each element is its `for=` hop, tagged with its `proto=` values.
+/// Parameter names are tokens, compared case-insensitively in ASCII
+/// (RFC 7239 §4); a name holding any other character is no `for` or
+/// `proto`, and is skipped like an extension parameter.
 fn forwarded_elements(values: List(String)) -> List(#(Hop, List(String))) {
   values
   |> list.flat_map(fn(value) { string.split(value, ",") })
@@ -513,7 +518,7 @@ fn forwarded_elements(values: List(String)) -> List(#(Hop, List(String))) {
       list.filter_map(string.split(element, ";"), fn(pair) {
         case string.split_once(string.trim(pair), "=") {
           Ok(#(key, value)) ->
-            Ok(#(string.lowercase(string.trim(key)), string.trim(value)))
+            Ok(#(ascii.lowercase(string.trim(key)), string.trim(value)))
           Error(Nil) -> Error(Nil)
         }
       })

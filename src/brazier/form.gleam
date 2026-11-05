@@ -5,6 +5,7 @@
 import brazier/attribute.{type Attribute}
 import brazier/element.{type Element}
 import brazier/html
+import brazier/internal/ascii
 import brazier/log
 import gleam/bit_array
 import gleam/crypto
@@ -265,7 +266,7 @@ pub fn select(
 fn generate_csrf_token() -> String {
   crypto.strong_random_bytes(32)
   |> bit_array.base16_encode
-  |> string.lowercase
+  |> ascii.lowercase
 }
 
 // NOTE: A stateless `verify_csrf(token)` cannot provide real CSRF protection —

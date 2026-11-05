@@ -11,6 +11,7 @@
 /// attribute injection (`value; Domain=evil.example`) by construction.
 ///
 /// Reference: Plug.Conn.Cookies (encoding, one Set-Cookie per name).
+import brazier/internal/ascii
 import brazier/log
 import gleam/http/request.{type Request}
 import gleam/http/response.{type Response, Response}
@@ -291,10 +292,11 @@ fn check(
 }
 
 /// RFC 6265bis section 4.1.3: `__Secure-` needs Secure; `__Host-` needs
-/// Secure and Path=/ (Brazier never sets Domain). Matched case-insensitively,
-/// as browsers do.
+/// Secure and Path=/ (Brazier never sets Domain). Matched case-insensitively
+/// in ASCII, as browsers do. `validate_options` refuses a name that is not
+/// a token (`InvalidName`) before this runs, so the name is ASCII.
 fn check_prefix(name: String, opts: CookieOptions) -> Result(Nil, CookieError) {
-  let lower = string.lowercase(name)
+  let lower = ascii.lowercase(name)
   case
     string.starts_with(lower, "__secure-"),
     string.starts_with(lower, "__host-")

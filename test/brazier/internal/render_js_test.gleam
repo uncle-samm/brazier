@@ -8,8 +8,8 @@
 ////
 //// The test writes a small JavaScript-target project in
 //// `build/brazier_render_js_check` with copies of `render.gleam` (and the
-//// `stream_op.gleam` it imports), `url.gleam`, `brazier_render_ffi.mjs` and
-//// the client `brazier/log` shim,
+//// `stream_op.gleam` it imports), `url.gleam` (and the `ascii.gleam` it
+//// imports), `brazier_render_ffi.mjs` and the client `brazier/log` shim,
 //// as the client build copies them. It writes the inputs (the pseudo-random
 //// strings of `render_test` plus URL payloads), runs the project under node,
 //// and compares every result with the Erlang one. It needs `node`, like the
@@ -18,6 +18,7 @@
 import brazier/build/client_shim
 import brazier/build/files
 import brazier/build/program
+import brazier/internal/ascii
 import brazier/internal/render
 import brazier/internal/render_test
 import brazier/internal/url
@@ -99,7 +100,9 @@ pub fn javascript_ffi_matches_erlang_test_() -> Timeout {
       })
     let assert True =
       list.any(url_payloads, fn(payload) {
-        string.ends_with(check(payload), ";true;error")
+        // The fields `is_url_attribute` and `check(input, "javascript:...")`.
+        list.take(list.drop(string.split(check(payload), ";"), 9), 2)
+        == ["true", "error"]
       })
     Nil
   })
@@ -120,6 +123,8 @@ pub fn check(input: String) -> String {
     url_result(url.check("src", input)),
     bool(url.is_url_attribute(input)),
     url_result(url.check(input, "javascript:alert(1)")),
+    encode(ascii.lowercase(input)),
+    bool(ascii.is_token(input)),
   ]
   |> string.join(";")
 }
@@ -163,6 +168,10 @@ fn write_project(inputs: List(String)) -> Nil {
     ),
     #("src/brazier/internal/url.gleam", copy("src/brazier/internal/url.gleam")),
     #(
+      "src/brazier/internal/ascii.gleam",
+      copy("src/brazier/internal/ascii.gleam"),
+    ),
+    #(
       "src/brazier/internal/stream_op.gleam",
       copy("src/brazier/internal/stream_op.gleam"),
     ),
@@ -197,7 +206,8 @@ export function read_inputs() {
 "
 
 const check_source =
-  "import brazier/internal/render
+  "import brazier/internal/ascii
+import brazier/internal/render
 import brazier/internal/url
 import gleam/int
 import gleam/io
@@ -227,6 +237,8 @@ fn check(input: String) -> String {
     url_result(url.check(\"src\", input)),
     bool(url.is_url_attribute(input)),
     url_result(url.check(input, \"javascript:alert(1)\")),
+    encode(ascii.lowercase(input)),
+    bool(ascii.is_token(input)),
   ]
   |> string.join(\";\")
 }

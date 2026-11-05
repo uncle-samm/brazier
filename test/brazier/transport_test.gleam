@@ -3,6 +3,7 @@ import brazier/transport/ws
 import gleam/bit_array
 import gleam/bytes_tree
 import gleam/dynamic/decode
+import gleam/http/request
 import gleam/json
 import gleam/list
 import gleam/option
@@ -457,6 +458,23 @@ pub fn ws_decode_invalid_utf8_text_is_1007_test() {
       65_536,
     )
   let assert 1007 = ws.get_protocol_close_code(error)
+}
+
+/// `websocket` and `upgrade` compare case-insensitively in ASCII only
+/// (RFC 6455 §4.2.1): `WebSocket` and `UPGRADE` pass, and a Kelvin sign
+/// U+212A, which Unicode lowercases to `k`, does not make `websocket`.
+pub fn ws_upgrade_tokens_compare_in_ascii_test() {
+  let upgrade = fn(upgrade_value, connection_value) {
+    request.new()
+    |> request.set_header("upgrade", upgrade_value)
+    |> request.set_header("connection", connection_value)
+    |> request.set_header("sec-websocket-version", "13")
+    |> request.set_header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+  }
+  let assert Ok("dGhlIHNhbXBsZSBub25jZQ==") =
+    ws.validate_upgrade(upgrade("WebSocket", "keep-alive, UPGRADE"))
+  let assert Error(ws.InvalidUpgradeHeader("websoc\u{212A}et")) =
+    ws.validate_upgrade(upgrade("websoc\u{212A}et", "Upgrade"))
 }
 
 @external(erlang, "brazier_test_ffi", "masked_ws_frame")
