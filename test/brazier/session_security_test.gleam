@@ -459,12 +459,17 @@ pub fn allow_guests_ws_refuses_a_bound_socket_whose_session_expired_test() {
   let req = cookie_request("GET", "/ws", config.cookie_name, sess.id)
   should.equal(auth_fn(req), Ok(Nil))
   should.be_true(session.is_current_process_bound(store, sess.id))
-  // No sweep runs, so no revocation is sent: only the recheck sees expiry.
+  // No sweep runs, so the recheck is the first to see the expiry. Its
+  // lookup deletes the expired row and so revokes the processes bound to
+  // it: this test process, until now the socket.
   advance(clock, 40)
   let #(outcome, logs) = log_capture.capture(fn() { auth_fn(req) })
   should.equal(outcome, Error("invalid session"))
   let assert True =
     log_capture.has(logs, level: "warning", containing: ["no longer valid"])
+  let assert Ok(#(revoked, "expired")) = receive_revoked(await.deadline_ms)
+    as "the recheck's lookup revokes the bound socket for expiry"
+  assert revoked == sess.id
   should.equal(auth_in_new_process(auth_fn, req), Ok(Nil))
 }
 

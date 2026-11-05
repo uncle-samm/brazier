@@ -2379,6 +2379,27 @@ pub fn on_update_effect_is_invoked_test() {
       panic as "on_update_effect was not invoked by the runtime"
     }
   }
+  // The join's sync and the event's patch, the frames the connection was
+  // sent; nothing after them once the runtime has stopped.
+  let assert Ok(transport.SendModelSync(model_json: "{\"count\":0}", ..)) =
+    process.receive(transport_subject, await.deadline_ms)
+    as "the join got the initial model"
+  let assert Ok(transport.SendPatch(version: 1, ack_clock: 1, ..)) =
+    process.receive(transport_subject, await.deadline_ms)
+    as "the increment was patched to revision 1, acking clock 1"
+  stop_runtime(subject)
+  let assert [] = await.drain(transport_subject)
+    as "the runtime sent nothing else"
+  Nil
+}
+
+/// Shut a runtime down and return once it has exited, so nothing it sends
+/// can reach a later test.
+fn stop_runtime(subject: process.Subject(runtime.RuntimeMessage(msg))) -> Nil {
+  let assert Ok(pid) = process.subject_owner(subject)
+    as "a started runtime has an owner process"
+  process.send(subject, runtime.Shutdown)
+  await.expect_down(pid, "the runtime after Shutdown")
 }
 
 /// An init that seeds the count from the `user_id` cookie, -1 without one.

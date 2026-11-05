@@ -175,6 +175,20 @@ fn assert_nothing_pending(subject: Subject(transport.InternalMessage)) -> Nil {
   Nil
 }
 
+/// Shut the runtime down and return once it has exited, so nothing it
+/// sends can reach a later test; then no connection in `connections` was
+/// sent a frame the test did not receive.
+fn stop(
+  rt: Subject(runtime.RuntimeMessage(Msg)),
+  connections: List(Subject(transport.InternalMessage)),
+) -> Nil {
+  let assert Ok(pid) = process.subject_owner(rt)
+    as "a started runtime has an owner process"
+  process.send(rt, runtime.Shutdown)
+  await.expect_down(pid, "the runtime after Shutdown")
+  list.each(connections, assert_nothing_pending)
+}
+
 // --- messages before join (unhappy paths) ---
 
 pub fn event_before_join_is_rejected_and_not_applied_test() {
@@ -722,7 +736,10 @@ pub fn join_reconciles_dynamic_subscriptions_test() {
     "the listener to leave rv_join_topic_0",
     fn() { pubsub.subscriber_count("rv_join_topic_0") == 0 },
   )
-  process.send(rt, runtime.Shutdown)
+  stop(rt, [s])
+  let assert Error(Nil) = process.receive(computed, 0)
+    as "the subscriptions were computed again after the join"
+  Nil
 }
 
 fn wait_for_topics(computed: Subject(List(String)), expected: List(String)) {
@@ -941,7 +958,11 @@ pub fn invalid_model_json_fails_loudly_and_resyncs_after_fix_test() {
     as "the resync after the encoder recovered does not carry count 2"
   let assert transport.SendModelSync(version: 1, ack_clock: 0, ..) = next(late)
     as "valid encoder output again did not resync the late joiner at revision 1, ack 0"
-  process.send(rt, runtime.Shutdown)
+  // c's join, its count-1 event, the late join while broken (one encode
+  // for both connections' error) and the count-2 event.
+  let assert [0, 1, 1, 2] = encodes_so_far(encodes, [])
+    as "the model was not encoded once per join and per event"
+  stop(rt, [s, late])
 }
 
 /// PERF-2: a broadcast that falls back to a full model_sync sends the model
@@ -967,7 +988,7 @@ pub fn broadcast_resync_encodes_the_model_once_test() {
     as "the count-2 event did not resync at revision 1, ack 2"
   let assert [2] = encodes_so_far(encodes, [])
     as "the resync broadcast encoded the model more than once"
-  process.send(rt, runtime.Shutdown)
+  stop(rt, [s])
 }
 
 // --- client replay of server frames (server and client versioning agree) ---
@@ -1114,6 +1135,18 @@ fn record_session() -> #(List(String), String, Int) {
   let assert transport.SendModelSync(model_json: final_json, version: 5, ..) =
     barrier(rt, "a", a)
     as "a's final barrier got no model_sync at revision 5"
+  // The barrier was answered after the join and the batch were broadcast,
+  // so b's and c's frames for them are already here.
+  // b's ack stays at its one event's clock.
+  let assert transport.SendPatch(version: 4, ack_clock: 1, ..) = next(b)
+    as "c's route change did not patch b to revision 4, ack 1"
+  let assert transport.SendPatch(version: 5, ack_clock: 1, ..) = next(b)
+    as "a's batch did not patch b to revision 5, ack 1"
+  let assert transport.SendPatch(version: 5, ack_clock: 0, ..) = next(c)
+    as "a's batch did not patch c to revision 5"
+  stop(rt, [a, b, c])
+  let assert Error(Nil) = process.receive(proof, 0)
+    as "a route handler ran that the recorded session did not expect"
   let frames = list.map([f0, f1, f2, f3, f4, f4b, f5, f6, f7, f8], wire)
   #(frames, final_json, 5)
 }
