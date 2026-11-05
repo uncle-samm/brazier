@@ -1,0 +1,269 @@
+{
+  "format": "Stream delta vectors (docs/design/STREAMS.md 6.1, 6.2, 7.3), shared by the server and the client. Each 'deltas' vector: a stream with 'keep' and 'limit' holds 'before' (a list of {key, item}); the server applies 'ops' in one update ({op: insert, key, at: append|prepend, item}, {op: delete, key}, {op: reset, items: [{key, item}]}); 'entry' is the wire entry it sends, or null when it sends none; a client store holding 'before' that applies 'entry' holds 'after'. Each 'faults' vector: a client store for stream 'stream' with 'keep' and 'limit' holds 'before'; applying 'entry' is a stream fault with 'reason': malformed, unknown_stream, keep_mismatch, limit_mismatch, delete_unknown_key, insert_wrong_index, insert_past_end or over_limit. Items are JSON values; compare them as values, not text.",
+  "deltas": [
+    {
+      "name": "append to an empty stream",
+      "stream": "s", "keep": "last", "limit": 3,
+      "before": [],
+      "ops": [{"op": "insert", "key": "a", "at": "append", "item": {"v": 1}}],
+      "entry": {"name": "s", "keep": "last", "limit": 3, "reset": false, "deletes": [],
+                "inserts": [{"key": "a", "at": 0, "item": {"v": 1}}]},
+      "after": [{"key": "a", "item": {"v": 1}}]
+    },
+    {
+      "name": "prepend puts the new key first",
+      "stream": "s", "keep": "last", "limit": 3,
+      "before": [{"key": "a", "item": {"v": 1}}, {"key": "b", "item": {"v": 2}}],
+      "ops": [{"op": "insert", "key": "z", "at": "prepend", "item": {"v": 26}}],
+      "entry": {"name": "s", "keep": "last", "limit": 3, "reset": false, "deletes": [],
+                "inserts": [{"key": "z", "at": 0, "item": {"v": 26}}]},
+      "after": [{"key": "z", "item": {"v": 26}}, {"key": "a", "item": {"v": 1}}, {"key": "b", "item": {"v": 2}}]
+    },
+    {
+      "name": "append into a full keep-last stream trims the front",
+      "stream": "s", "keep": "last", "limit": 3,
+      "before": [{"key": "a", "item": {"v": 1}}, {"key": "b", "item": {"v": 2}}, {"key": "c", "item": {"v": 3}}],
+      "ops": [{"op": "insert", "key": "d", "at": "append", "item": {"v": 4}}],
+      "entry": {"name": "s", "keep": "last", "limit": 3, "reset": false, "deletes": ["a"],
+                "inserts": [{"key": "d", "at": 2, "item": {"v": 4}}]},
+      "after": [{"key": "b", "item": {"v": 2}}, {"key": "c", "item": {"v": 3}}, {"key": "d", "item": {"v": 4}}]
+    },
+    {
+      "name": "prepend into a full keep-first stream trims the back",
+      "stream": "s", "keep": "first", "limit": 3,
+      "before": [{"key": "a", "item": {"v": 1}}, {"key": "b", "item": {"v": 2}}, {"key": "c", "item": {"v": 3}}],
+      "ops": [{"op": "insert", "key": "z", "at": "prepend", "item": {"v": 26}}],
+      "entry": {"name": "s", "keep": "first", "limit": 3, "reset": false, "deletes": ["c"],
+                "inserts": [{"key": "z", "at": 0, "item": {"v": 26}}]},
+      "after": [{"key": "z", "item": {"v": 26}}, {"key": "a", "item": {"v": 1}}, {"key": "b", "item": {"v": 2}}]
+    },
+    {
+      "name": "prepend into a full keep-last stream trims the new item",
+      "stream": "s", "keep": "last", "limit": 2,
+      "before": [{"key": "a", "item": {"v": 1}}, {"key": "b", "item": {"v": 2}}],
+      "ops": [{"op": "insert", "key": "z", "at": "prepend", "item": {"v": 26}}],
+      "entry": null,
+      "after": [{"key": "a", "item": {"v": 1}}, {"key": "b", "item": {"v": 2}}]
+    },
+    {
+      "name": "append into a full keep-first stream trims the new item",
+      "stream": "s", "keep": "first", "limit": 2,
+      "before": [{"key": "a", "item": {"v": 1}}, {"key": "b", "item": {"v": 2}}],
+      "ops": [{"op": "insert", "key": "c", "at": "append", "item": {"v": 3}}],
+      "entry": null,
+      "after": [{"key": "a", "item": {"v": 1}}, {"key": "b", "item": {"v": 2}}]
+    },
+    {
+      "name": "insert of a held key updates it in place",
+      "stream": "s", "keep": "last", "limit": 3,
+      "before": [{"key": "a", "item": {"v": 1}}, {"key": "b", "item": {"v": 2}}, {"key": "c", "item": {"v": 3}}],
+      "ops": [{"op": "insert", "key": "b", "at": "prepend", "item": {"v": 20}}],
+      "entry": {"name": "s", "keep": "last", "limit": 3, "reset": false, "deletes": [],
+                "inserts": [{"key": "b", "at": 1, "item": {"v": 20}}]},
+      "after": [{"key": "a", "item": {"v": 1}}, {"key": "b", "item": {"v": 20}}, {"key": "c", "item": {"v": 3}}]
+    },
+    {
+      "name": "delete",
+      "stream": "s", "keep": "last", "limit": 3,
+      "before": [{"key": "a", "item": {"v": 1}}, {"key": "b", "item": {"v": 2}}, {"key": "c", "item": {"v": 3}}],
+      "ops": [{"op": "delete", "key": "b"}],
+      "entry": {"name": "s", "keep": "last", "limit": 3, "reset": false, "deletes": ["b"], "inserts": []},
+      "after": [{"key": "a", "item": {"v": 1}}, {"key": "c", "item": {"v": 3}}]
+    },
+    {
+      "name": "delete of a key the stream does not hold sends nothing",
+      "stream": "s", "keep": "last", "limit": 3,
+      "before": [{"key": "a", "item": {"v": 1}}],
+      "ops": [{"op": "delete", "key": "zz"}],
+      "entry": null,
+      "after": [{"key": "a", "item": {"v": 1}}]
+    },
+    {
+      "name": "delete then insert moves the key",
+      "stream": "s", "keep": "last", "limit": 3,
+      "before": [{"key": "a", "item": {"v": 1}}, {"key": "b", "item": {"v": 2}}, {"key": "c", "item": {"v": 3}}],
+      "ops": [{"op": "delete", "key": "a"}, {"op": "insert", "key": "a", "at": "append", "item": {"v": 10}}],
+      "entry": {"name": "s", "keep": "last", "limit": 3, "reset": false, "deletes": ["a"],
+                "inserts": [{"key": "a", "at": 2, "item": {"v": 10}}]},
+      "after": [{"key": "b", "item": {"v": 2}}, {"key": "c", "item": {"v": 3}}, {"key": "a", "item": {"v": 10}}]
+    },
+    {
+      "name": "reset",
+      "stream": "s", "keep": "last", "limit": 3,
+      "before": [{"key": "a", "item": {"v": 1}}, {"key": "b", "item": {"v": 2}}],
+      "ops": [{"op": "reset", "items": [{"key": "c", "item": {"v": 3}}, {"key": "d", "item": {"v": 4}}]}],
+      "entry": {"name": "s", "keep": "last", "limit": 3, "reset": true, "deletes": [],
+                "inserts": [{"key": "c", "at": 0, "item": {"v": 3}}, {"key": "d", "at": 1, "item": {"v": 4}}]},
+      "after": [{"key": "c", "item": {"v": 3}}, {"key": "d", "item": {"v": 4}}]
+    },
+    {
+      "name": "reset to empty",
+      "stream": "s", "keep": "first", "limit": 3,
+      "before": [{"key": "a", "item": {"v": 1}}],
+      "ops": [{"op": "reset", "items": []}],
+      "entry": {"name": "s", "keep": "first", "limit": 3, "reset": true, "deletes": [], "inserts": []},
+      "after": []
+    },
+    {
+      "name": "reset over the limit trims",
+      "stream": "s", "keep": "last", "limit": 2,
+      "before": [],
+      "ops": [{"op": "reset", "items": [{"key": "a", "item": {"v": 1}}, {"key": "b", "item": {"v": 2}}, {"key": "c", "item": {"v": 3}}]}],
+      "entry": {"name": "s", "keep": "last", "limit": 2, "reset": true, "deletes": [],
+                "inserts": [{"key": "b", "at": 0, "item": {"v": 2}}, {"key": "c", "at": 1, "item": {"v": 3}}]},
+      "after": [{"key": "b", "item": {"v": 2}}, {"key": "c", "item": {"v": 3}}]
+    },
+    {
+      "name": "a new item trimmed in the same update is not sent",
+      "stream": "s", "keep": "last", "limit": 2,
+      "before": [],
+      "ops": [{"op": "insert", "key": "x", "at": "append", "item": {"v": 24}},
+              {"op": "insert", "key": "y", "at": "append", "item": {"v": 25}},
+              {"op": "insert", "key": "z", "at": "append", "item": {"v": 26}}],
+      "entry": {"name": "s", "keep": "last", "limit": 2, "reset": false, "deletes": [],
+                "inserts": [{"key": "y", "at": 0, "item": {"v": 25}}, {"key": "z", "at": 1, "item": {"v": 26}}]},
+      "after": [{"key": "y", "item": {"v": 25}}, {"key": "z", "item": {"v": 26}}]
+    },
+    {
+      "name": "update, delete, prepend and append in one update",
+      "stream": "s", "keep": "last", "limit": 4,
+      "before": [{"key": "a", "item": {"v": 1}}, {"key": "b", "item": {"v": 2}}, {"key": "c", "item": {"v": 3}}, {"key": "d", "item": {"v": 4}}],
+      "ops": [{"op": "insert", "key": "b", "at": "append", "item": {"v": 21}},
+              {"op": "delete", "key": "c"},
+              {"op": "insert", "key": "e", "at": "prepend", "item": {"v": 5}},
+              {"op": "insert", "key": "f", "at": "append", "item": {"v": 6}}],
+      "entry": {"name": "s", "keep": "last", "limit": 4, "reset": false, "deletes": ["c"],
+                "inserts": [{"key": "b", "at": 1, "item": {"v": 21}}, {"key": "f", "at": 3, "item": {"v": 6}}]},
+      "after": [{"key": "a", "item": {"v": 1}}, {"key": "b", "item": {"v": 21}}, {"key": "d", "item": {"v": 4}}, {"key": "f", "item": {"v": 6}}]
+    },
+    {
+      "name": "two prepends into a full keep-first stream",
+      "stream": "s", "keep": "first", "limit": 3,
+      "before": [{"key": "a", "item": {"v": 1}}, {"key": "b", "item": {"v": 2}}, {"key": "c", "item": {"v": 3}}],
+      "ops": [{"op": "insert", "key": "x", "at": "prepend", "item": {"v": 24}},
+              {"op": "insert", "key": "y", "at": "prepend", "item": {"v": 25}}],
+      "entry": {"name": "s", "keep": "first", "limit": 3, "reset": false, "deletes": ["b", "c"],
+                "inserts": [{"key": "y", "at": 0, "item": {"v": 25}}, {"key": "x", "at": 1, "item": {"v": 24}}]},
+      "after": [{"key": "y", "item": {"v": 25}}, {"key": "x", "item": {"v": 24}}, {"key": "a", "item": {"v": 1}}]
+    },
+    {
+      "name": "insert then delete of a new key sends nothing",
+      "stream": "s", "keep": "last", "limit": 3,
+      "before": [{"key": "a", "item": {"v": 1}}],
+      "ops": [{"op": "insert", "key": "b", "at": "append", "item": {"v": 2}}, {"op": "delete", "key": "b"}],
+      "entry": null,
+      "after": [{"key": "a", "item": {"v": 1}}]
+    },
+    {
+      "name": "item JSON of every type is embedded as it is",
+      "stream": "log_2", "keep": "first", "limit": 5,
+      "before": [],
+      "ops": [{"op": "insert", "key": "agent-1:12", "at": "append",
+               "item": {"text": "quote \" é", "seq": 12, "done": false, "score": 1.5, "tags": ["a", "b"], "parent": null}}],
+      "entry": {"name": "log_2", "keep": "first", "limit": 5, "reset": false, "deletes": [],
+                "inserts": [{"key": "agent-1:12", "at": 0,
+                             "item": {"text": "quote \" é", "seq": 12, "done": false, "score": 1.5, "tags": ["a", "b"], "parent": null}}]},
+      "after": [{"key": "agent-1:12", "item": {"text": "quote \" é", "seq": 12, "done": false, "score": 1.5, "tags": ["a", "b"], "parent": null}}]
+    }
+  ],
+  "faults": [
+    {
+      "name": "keep differs from the store's",
+      "stream": "s", "keep": "last", "limit": 3, "before": [{"key": "a", "item": {"v": 1}}],
+      "entry": {"name": "s", "keep": "first", "limit": 3, "reset": false, "deletes": [], "inserts": []},
+      "reason": "keep_mismatch"
+    },
+    {
+      "name": "limit differs from the store's",
+      "stream": "s", "keep": "last", "limit": 3, "before": [],
+      "entry": {"name": "s", "keep": "last", "limit": 4, "reset": false, "deletes": [], "inserts": []},
+      "reason": "limit_mismatch"
+    },
+    {
+      "name": "unknown stream name",
+      "stream": "s", "keep": "last", "limit": 3, "before": [],
+      "entry": {"name": "t", "keep": "last", "limit": 3, "reset": false, "deletes": [], "inserts": []},
+      "reason": "unknown_stream"
+    },
+    {
+      "name": "delete of a key the store does not hold",
+      "stream": "s", "keep": "last", "limit": 3, "before": [{"key": "a", "item": {"v": 1}}],
+      "entry": {"name": "s", "keep": "last", "limit": 3, "reset": false, "deletes": ["zz"], "inserts": []},
+      "reason": "delete_unknown_key"
+    },
+    {
+      "name": "delete after a reset of a key the reset removed",
+      "stream": "s", "keep": "last", "limit": 3, "before": [{"key": "a", "item": {"v": 1}}],
+      "entry": {"name": "s", "keep": "last", "limit": 3, "reset": true, "deletes": ["a"], "inserts": []},
+      "reason": "delete_unknown_key"
+    },
+    {
+      "name": "update of a held key at another index",
+      "stream": "s", "keep": "last", "limit": 3,
+      "before": [{"key": "a", "item": {"v": 1}}, {"key": "b", "item": {"v": 2}}],
+      "entry": {"name": "s", "keep": "last", "limit": 3, "reset": false, "deletes": [],
+                "inserts": [{"key": "a", "at": 1, "item": {"v": 10}}]},
+      "reason": "insert_wrong_index"
+    },
+    {
+      "name": "new key past the end",
+      "stream": "s", "keep": "last", "limit": 3, "before": [{"key": "a", "item": {"v": 1}}],
+      "entry": {"name": "s", "keep": "last", "limit": 3, "reset": false, "deletes": [],
+                "inserts": [{"key": "b", "at": 2, "item": {"v": 2}}]},
+      "reason": "insert_past_end"
+    },
+    {
+      "name": "new key at a negative index",
+      "stream": "s", "keep": "last", "limit": 3, "before": [],
+      "entry": {"name": "s", "keep": "last", "limit": 3, "reset": false, "deletes": [],
+                "inserts": [{"key": "b", "at": -1, "item": {"v": 2}}]},
+      "reason": "insert_past_end"
+    },
+    {
+      "name": "store over the limit after the entry",
+      "stream": "s", "keep": "last", "limit": 2,
+      "before": [{"key": "a", "item": {"v": 1}}, {"key": "b", "item": {"v": 2}}],
+      "entry": {"name": "s", "keep": "last", "limit": 2, "reset": false, "deletes": [],
+                "inserts": [{"key": "c", "at": 2, "item": {"v": 3}}]},
+      "reason": "over_limit"
+    },
+    {
+      "name": "missing field",
+      "stream": "s", "keep": "last", "limit": 3, "before": [],
+      "entry": {"name": "s", "keep": "last", "limit": 3, "reset": false, "inserts": []},
+      "reason": "malformed"
+    },
+    {
+      "name": "keep that is neither first nor last",
+      "stream": "s", "keep": "last", "limit": 3, "before": [],
+      "entry": {"name": "s", "keep": "middle", "limit": 3, "reset": false, "deletes": [], "inserts": []},
+      "reason": "malformed"
+    },
+    {
+      "name": "limit below 1",
+      "stream": "s", "keep": "last", "limit": 3, "before": [],
+      "entry": {"name": "s", "keep": "last", "limit": 0, "reset": false, "deletes": [], "inserts": []},
+      "reason": "malformed"
+    },
+    {
+      "name": "limit above 1000",
+      "stream": "s", "keep": "last", "limit": 3, "before": [],
+      "entry": {"name": "s", "keep": "last", "limit": 1001, "reset": false, "deletes": [], "inserts": []},
+      "reason": "malformed"
+    },
+    {
+      "name": "index that is not an integer",
+      "stream": "s", "keep": "last", "limit": 3, "before": [],
+      "entry": {"name": "s", "keep": "last", "limit": 3, "reset": false, "deletes": [],
+                "inserts": [{"key": "a", "at": "0", "item": {"v": 1}}]},
+      "reason": "malformed"
+    },
+    {
+      "name": "insert without an item",
+      "stream": "s", "keep": "last", "limit": 3, "before": [],
+      "entry": {"name": "s", "keep": "last", "limit": 3, "reset": false, "deletes": [],
+                "inserts": [{"key": "a", "at": 0}]},
+      "reason": "malformed"
+    }
+  ]
+}
