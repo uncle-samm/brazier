@@ -141,7 +141,7 @@ fn scheme(codes: List(Int)) -> Result(#(String, List(Int)), Nil) {
   case codes {
     [first, ..rest] ->
       case is_ascii_alpha(first) {
-        True -> scan_scheme(rest, [ascii_lowercase_code(first)])
+        True -> scan_scheme(rest, [ascii.lowercase_code(first)])
         False -> Error(Nil)
       }
     [] -> Error(Nil)
@@ -157,7 +157,7 @@ fn scan_scheme(
     [0x3a, ..body] -> Ok(#(ascii_to_string(list.reverse(acc)), body))
     [code, ..tail] ->
       case is_scheme_code(code) {
-        True -> scan_scheme(tail, [ascii_lowercase_code(code), ..acc])
+        True -> scan_scheme(tail, [ascii.lowercase_code(code), ..acc])
         False -> Error(Nil)
       }
   }
@@ -173,16 +173,6 @@ fn is_scheme_code(code: Int) -> Bool {
 
 fn is_ascii_alpha(code: Int) -> Bool {
   { code >= 0x41 && code <= 0x5a } || { code >= 0x61 && code <= 0x7a }
-}
-
-/// Lowercase an ASCII letter. Every other code point is unchanged: the URL
-/// parser lowercases schemes in ASCII only, so no non-ASCII code point may
-/// turn into a letter here.
-fn ascii_lowercase_code(code: Int) -> Int {
-  case code >= 0x41 && code <= 0x5a {
-    True -> code + 0x20
-    False -> code
-  }
 }
 
 fn ascii_to_string(codes: List(Int)) -> String {
@@ -213,6 +203,6 @@ fn is_allowed_data(body: List(Int)) -> Bool {
 fn read_media_type(rest: List(Int), acc: List(Int)) -> List(Int) {
   case rest {
     [] | [0x3b, ..] | [0x2c, ..] -> list.reverse(acc)
-    [code, ..tail] -> read_media_type(tail, [ascii_lowercase_code(code), ..acc])
+    [code, ..tail] -> read_media_type(tail, [ascii.lowercase_code(code), ..acc])
   }
 }

@@ -62,21 +62,23 @@
     `simplifile.delete_file` before `cleanup`. Not yet reduced to an OTP
     bug report, nor checked on Linux or another OTP release.
 
-- **Issue:** `brazier_transport_ffi:normalize_header_name/1` calls
-  `brazier_render_ffi:ascii_lowercase/1`, kept as a forwarder to
-  `brazier_ascii_ffi:lowercase/1`; `brazier/internal/url` has its own
-  `ascii_lowercase_code` for a code point; and docs/PERFORMANCE.md (the
-  attribute-name paragraph) still says url calls `string.lowercase`.
-  - **Context:** Milestone 118, m118-residue-3; the transport and
-    PERFORMANCE.md belong to other owners.
-  - **Files:** `src/brazier_transport_ffi.erl`, `src/brazier_render_ffi.erl`,
-    `src/brazier/internal/url.gleam`, `docs/PERFORMANCE.md`
-  - **Attempted:** nothing yet. Point the transport at `brazier_ascii_ffi`,
-    then drop the forwarder.
-
 ## Resolved Issues
 
 <!-- Move resolved issues here with full resolution details -->
+
+- **Issue:** `brazier_transport_ffi:normalize_header_name/1` called
+  `brazier_render_ffi:ascii_lowercase/1`, kept as a forwarder to
+  `brazier_ascii_ffi:lowercase/1`; `brazier/internal/url` had its own
+  `ascii_lowercase_code` for a code point; and docs/PERFORMANCE.md (the
+  attribute-name paragraph) still said url calls `string.lowercase`.
+  - **Files:** `src/brazier_transport_ffi.erl`, `src/brazier_render_ffi.erl`,
+    `src/brazier/internal/url.gleam`, `src/brazier/internal/ascii.gleam`,
+    `docs/PERFORMANCE.md`
+  - **Resolution:** (Milestone 118, coordinator) The transport calls
+    `brazier_ascii_ffi:lowercase/1` and the forwarder is gone; url folds
+    scheme and media type code points with `ascii.lowercase_code`, which
+    `ascii_test` checks against `ascii.lowercase` on every code point up to
+    U+2FFF. PERFORMANCE.md was corrected by the perf-regress merge.
 
 - **Issue:** the static file checks read the request path as grapheme
   clusters, the file system as bytes. `gleam/string`'s `contains` and

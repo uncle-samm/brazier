@@ -13,7 +13,7 @@
 %% that a combining mark follows.
 -module(brazier_render_ffi).
 
--export([is_markup_name/1, is_event_name/1, ascii_lowercase/1, escape_html/1, escape_attr/1,
+-export([is_markup_name/1, is_event_name/1, escape_html/1, escape_attr/1,
          identity/1, iodata_to_string/1]).
 
 -define(IS_ALNUM(C),
@@ -47,14 +47,6 @@ event_bytes(<<C, Rest/binary>>) when ?IS_ALNUM(C) orelse C =:= $- orelse C =:= $
     event_bytes(Rest);
 event_bytes(_) ->
     false.
-
-%% The ASCII folding moved to brazier_ascii_ffi:lowercase/1 (the one
-%% implementation, behind brazier/internal/ascii.lowercase); this export
-%% only forwards to it for brazier_transport_ffi:normalize_header_name/1,
-%% which still calls it here. Remove it once that caller names
-%% brazier_ascii_ffi (docs/TODO.md).
--spec ascii_lowercase(binary()) -> binary().
-ascii_lowercase(Name) -> brazier_ascii_ffi:lowercase(Name).
 
 %% Escape `&`, `<` and `>`.
 -spec escape_html(binary()) -> binary().

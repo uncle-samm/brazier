@@ -349,10 +349,21 @@ of 4b274e8, interleaved on the same machine (above 1 is slower):
   O(1) instead of a sorted hash of the whole state (about 1.2M reductions
   at 10,000 keys) on every sync tick.
 - **`wire.patch` and `wire.model_sync_50kb`: 1.13x** on the medians, with
-  under 2% noise between runs. Within the gate's floor, not yet
-  explained; a follow-up in docs/TODO.md.
+  under 2% noise between runs. The `streams` member every `patch` and
+  `model_sync` frame gained (42416b3) was one more key for `json.object`
+  to escape byte by byte on every frame. After the baseline (8a14257)
+  these two frames splice their keys in as constant JSON text, as Jason's
+  derived encoders escape a struct's keys once: 116 reductions a frame
+  became 19, and `wire.patch.median` went from about 518 to 135 ns
+  (`wire.model_sync_50kb` 525 to 139, `wire.stream_patch` 517 to 140),
+  interleaved in one session. The table above still holds the slower
+  numbers until the next re-baseline; the gate only fails a slowdown.
 - **`presence.list.10.p99`: 1.56x** (13 µs), with under 5% noise; the
-  median did not move. A follow-up in docs/TODO.md.
+  median did not move. Not a code change: every module a list runs
+  compiles to the same code at both commits (`beam_lib:md5`). About 15%
+  of these 4.8 µs lists start a minor GC of the caller, and the p99 lands
+  on those pauses, about 9.5 or about 14.5 µs depending on the VM, on
+  either commit. The A/B drew the old commit from the low mode.
 - New metrics, first baselined here: `ssr.stream_300`, `runtime.stream.*`,
   `wire.stream_patch`, `patch.window_*` and `client.stream.*`.
 

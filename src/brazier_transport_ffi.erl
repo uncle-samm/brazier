@@ -486,9 +486,9 @@ monotonic_ms() ->
 %% catches an exception internally for each name already in lowercase, on
 %% every header of every request.
 normalize_header_name(Name) when is_atom(Name) ->
-    brazier_render_ffi:ascii_lowercase(atom_to_binary(Name, utf8));
+    brazier_ascii_ffi:lowercase(atom_to_binary(Name, utf8));
 normalize_header_name(Name) when is_binary(Name) ->
-    brazier_render_ffi:ascii_lowercase(Name).
+    brazier_ascii_ffi:lowercase(Name).
 
 %% Text split at the first occurrence of Pattern, compared byte by byte:
 %% {ok, {Before, After}}, or {error, nil} when Pattern does not occur.

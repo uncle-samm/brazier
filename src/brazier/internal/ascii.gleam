@@ -26,6 +26,17 @@
 @external(javascript, "../../brazier_ascii_ffi.mjs", "lowercase")
 pub fn lowercase(text: String) -> String
 
+/// `code` lowercased if it is `A-Z`, and unchanged otherwise: the same
+/// folding as `lowercase`, for a parser that reads code points one at a
+/// time (the URL scheme and `data:` media type in `brazier/internal/url`).
+/// No code point outside ASCII turns into a letter.
+pub fn lowercase_code(code: Int) -> Int {
+  case code >= 0x41 && code <= 0x5a {
+    True -> code + 0x20
+    False -> code
+  }
+}
+
 /// Whether `text` is an RFC 9110 token (§5.6.2): one or more of the
 /// visible ASCII characters other than the delimiters `"(),/:;<=>?@[\]{}`.
 /// Field names are tokens, so a name holding a space, a control character

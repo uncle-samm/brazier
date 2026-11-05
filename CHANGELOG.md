@@ -451,6 +451,13 @@ open follow-ups), which is in progress.
 - (M118 residue-3) One ASCII case folding per target
   (`brazier_ascii_ffi.erl`, `.mjs`); the render and the build fold
   attribute names and Gleam names with it. Render time is unchanged.
+- (M118 perf-regress) `patch` and `model_sync` frames are written with
+  their keys and type as constant JSON text, as Jason's derived encoders
+  escape a struct's keys once, instead of through `json.object`, which
+  escapes every key byte by byte on every frame. The bytes are unchanged
+  (a test compares them with `json.object`'s). 116 reductions a frame
+  became 19; `wire.patch.median` went from about 518 to about 135 ns. This
+  fixes the 1.13x `wire` slowdown the `streams` member brought.
 - (M118 server-residue-2) The Origin check parses an origin by hand
   instead of compiling a split pattern on every call: about 9 µs to about
   1.5 µs per WebSocket upgrade.

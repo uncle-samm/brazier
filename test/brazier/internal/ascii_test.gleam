@@ -1,4 +1,5 @@
 import brazier/internal/ascii
+import gleam/int
 import gleam/list
 import gleam/string
 
@@ -18,6 +19,37 @@ pub fn lowercase_keeps_characters_outside_ascii_test() {
   assert ascii.lowercase("\u{00C0}B") == "\u{00C0}b"
   assert ascii.lowercase("\u{212A}eep-alive") != "keep-alive"
   assert string.lowercase("\u{212A}eep-alive") == "keep-alive"
+}
+
+pub fn lowercase_code_folds_ascii_letters_only_test() {
+  assert ascii.lowercase_code(0x41) == 0x61
+  assert ascii.lowercase_code(0x5a) == 0x7a
+  assert ascii.lowercase_code(0x40) == 0x40
+  assert ascii.lowercase_code(0x5b) == 0x5b
+  assert ascii.lowercase_code(0x61) == 0x61
+  assert ascii.lowercase_code(0x212a) == 0x212a
+  assert ascii.lowercase_code(0x130) == 0x130
+}
+
+/// The code point folding and the string folding agree on every code point
+/// up to U+2FFF (ASCII, Latin, and the Kelvin sign's block), so the URL
+/// parser and the rest of the server fold the same way.
+pub fn lowercase_code_agrees_with_lowercase_test() {
+  int.range(from: 1, to: 0x3000, with: Nil, run: fn(_, code) {
+    case string.utf_codepoint(code) {
+      Ok(codepoint) -> {
+        let text = string.from_utf_codepoints([codepoint])
+        let assert Ok(folded) = string.utf_codepoint(ascii.lowercase_code(code))
+          as "ascii_test: a folded code point is a code point"
+        let assert True =
+          ascii.lowercase(text) == string.from_utf_codepoints([folded])
+          as { "ascii_test: code point " <> string.inspect(code) }
+        Nil
+      }
+      // Surrogates are not code points a string can hold.
+      Error(Nil) -> Nil
+    }
+  })
 }
 
 pub fn is_token_accepts_tchars_test() {
