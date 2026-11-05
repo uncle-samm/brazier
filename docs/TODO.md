@@ -14,24 +14,6 @@
   - **Resolution:** how it was fixed (fill in when resolved)
 -->
 
-- **Issue:** `application.start_supervised` starts its root as a
-  `static_supervisor` that lists its children at start, so a listener that
-  cannot bind (a taken or privileged port) still fails the root's own start:
-  the root exits `{shutdown, {failed_to_start_child, ...}}`, which kills a
-  caller that does not trap exits, and gleam_otp reports the start error as
-  `InitFailed("shutdown")`. The listener's own start now names the cause
-  (`server.supervised` returns `InitFailed("cannot listen on port N: ...")`)
-  and logs it as an error, so the cause is in the log, but `brazier.start`
-  does not return it.
-  - **Context:** Milestone 118, m118-server-residue, while making a failed
-    `server.start` return its cause (`brazier_http_listener_sup`).
-  - **Files:** `src/brazier/application.gleam`
-  - **Attempted:** nothing yet. The listener's fix (start the supervisor
-    empty, add each child with `supervisor:start_child`, return
-    `{error, Cause}`) applies to the root too, as Ranch adds a listener to
-    the running `ranch_sup`; gleam_otp's `static_supervisor` has no
-    start_child, so it means an Erlang root supervisor of the same shape.
-
 - **Issue:** the listener's `eacces` path is tested only where the OS
   refuses a privileged port. macOS lets any user bind port 1 on the
   wildcard address, so `a_privileged_port_matches_what_the_os_says_test`
@@ -87,6 +69,29 @@
 ## Resolved Issues
 
 <!-- Move resolved issues here with full resolution details -->
+
+- **Issue:** `application.start_supervised` started its root as a
+  `static_supervisor` that listed its children at start, so a listener that
+  could not bind (a taken or privileged port) failed the root's own start:
+  the root exited `{shutdown, {failed_to_start_child, ...}}`, which killed a
+  caller of `brazier.start` that did not trap exits, and gleam_otp reported
+  the start error as `InitFailed("shutdown")`, the cause only in the log.
+  - **Files:** `src/brazier/application.gleam`, `src/brazier_app_sup.erl`
+  - **Resolution:** (Milestone 118, m118-residue-3) The root is
+    `brazier_app_sup`, an Erlang supervisor that starts with no children and
+    adds each one with `supervisor:start_child`, as Ranch adds a listener to
+    the running `ranch_sup` and `brazier_http_listener_sup` adds its own
+    children. A child that cannot start stops the partly started tree,
+    unlinked from the caller first, and its own start error is returned:
+    `"Supervision tree failed to start: cannot listen on port N: eaddrinuse
+    (address already in use)"`. The restart semantics are those of the
+    static_supervisor it replaces: `rest_for_one`, 2 restarts in 5 seconds,
+    child N with the id N, and each gleam_otp child spec turned into the
+    same OTP child map. `test/brazier/cluster/app_tree_start_failure_test.gleam`
+    covers a taken port with a caller that does not trap exits (links,
+    leftovers, the logged cause, a start and stop afterwards), one that
+    does (no `EXIT` message), and the child specs, which it also checked
+    against the old root.
 
 - **Issue:** `server.start` on a taken port killed a caller that did not
   trap exits, and a caller that did got the error `"shutdown"`, the cause

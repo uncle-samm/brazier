@@ -23,8 +23,9 @@
 /// runtimes were linked to PubSub partitions anyway); a listener restart
 /// touches nothing before it. A single presence shard that crashes is
 /// restarted by the tracker's own supervisor, and every session tracks its
-/// entries on it again. Past the restart tolerance the supervisor gives up and exits, which
-/// `wait_forever` turns into a crash of the main process.
+/// entries on it again. Past the restart tolerance (2 restarts in 5
+/// seconds) the supervisor gives up and exits, which `wait_forever` turns
+/// into a crash of the main process.
 ///
 /// `start` is the unsupervised form for embedding and tests: it makes sure
 /// PubSub, the session scope and the presence tracker run on the node
@@ -63,7 +64,6 @@ import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
-import gleam/otp/static_supervisor as supervisor
 import gleam/otp/supervision
 import gleam/result
 import gleam/string
@@ -245,6 +245,14 @@ pub fn start(config: AppConfig(state, msg)) -> Result(App, error.BrazierError) {
 /// The root supervisor is linked to the caller. This is the production
 /// entry point; stop it with `stop`.
 ///
+/// The root starts empty and adds its children one by one
+/// (`brazier_app_sup`, as Ranch adds a listener to the running `ranch_sup`),
+/// so a child that cannot start is a returned error naming its cause, such
+/// as `"Supervision tree failed to start: cannot listen on port 4000:
+/// eaddrinuse (address already in use)"`. The children already started are
+/// stopped, and the caller's links are as they were: it is not killed, and
+/// one that traps exits gets no `EXIT` message.
+///
 /// Refuses to start when PubSub, the cluster manager, the session scope or
 /// the presence tracker already run on this node outside a tree: the tree must own them, or a
 /// crash of theirs would go unnoticed.
@@ -317,26 +325,20 @@ pub fn start_supervised(
       }
     })
 
-  let builder =
-    supervisor.new(supervisor.RestForOne)
-    |> supervisor.add(state_manager.table_owner_supervised())
-    |> supervisor.add(pubsub_child)
-  let builder = case cluster_child {
-    Some(child) -> supervisor.add(builder, child)
-    None -> builder
-  }
-  let builder =
-    builder
-    |> supervisor.add(session.registry_supervised())
-  let builder = case presence_child {
-    Some(child) -> supervisor.add(builder, child)
-    None -> builder
-  }
-  let builder = supervisor.add(builder, listener_child)
+  // Every child in start order, as `brazier_app_sup` adds them.
+  let children =
+    option.values([
+      Some(supervision.map_data(state_manager.table_owner_supervised(), ignore)),
+      Some(supervision.map_data(pubsub_child, ignore)),
+      option.map(cluster_child, supervision.map_data(_, ignore)),
+      Some(supervision.map_data(session.registry_supervised(), ignore)),
+      option.map(presence_child, supervision.map_data(_, ignore)),
+      Some(supervision.map_data(listener_child, ignore)),
+    ])
 
-  case supervisor.start(builder) {
-    Ok(started) ->
-      // INVARIANT: supervisor.start returns only after every child started,
+  case start_root(children) {
+    Ok(root) ->
+      // INVARIANT: start_root returns only after every child started,
       // and the listener child sent its Listener before returning.
       case process.receive(first_start, 0) {
         Ok(listener) -> {
@@ -348,7 +350,7 @@ pub fn start_supervised(
           )
           Ok(
             remember(App(
-              supervisor_pid: started.pid,
+              supervisor_pid: root,
               port: port,
               listener: listener,
               drain_timeout_ms: config.security_limits.drain_timeout_ms,
@@ -1070,6 +1072,20 @@ fn once_new() -> Once
 
 @external(erlang, "brazier_application_ffi", "once_take")
 fn once_take(once: Once) -> Bool
+
+/// Start the root supervisor empty and add `children` in order with
+/// `supervisor:start_child` (`brazier_app_sup`): `RestForOne`, 2 restarts in
+/// 5 seconds, child N with the id N. A child that fails to start stops the
+/// partly started tree, unlinked first, and its own start error is
+/// returned: the caller gets no exit signal.
+@external(erlang, "brazier_app_sup", "start_link")
+fn start_root(
+  children: List(supervision.ChildSpecification(Nil)),
+) -> Result(process.Pid, actor.StartError)
+
+fn ignore(_data: a) -> Nil {
+  Nil
+}
 
 /// Stop a supervisor with reason `normal`, waiting up to `timeout` ms.
 @external(erlang, "brazier_application_ffi", "stop_supervisor")

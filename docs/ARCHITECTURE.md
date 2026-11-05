@@ -389,6 +389,17 @@ it and never one before it. The children, in start order:
 5. **The presence tracker**, when configured (`presence.supervised`).
 6. **The HTTP/WebSocket listener** (`transport.supervised`).
 
+The root (`brazier_app_sup`) restarts at most 2 times in 5 seconds and gives
+each child the id of its place in this order. Like the listener's own
+supervisor, it starts with no children and adds them with
+`supervisor:start_child`, one by one, as Ranch adds a listener to the running
+`ranch_sup`. A child that cannot start is then an error `start_supervised`
+returns (`"Supervision tree failed to start: cannot listen on port 4000:
+eaddrinuse (address already in use)"`), not an exit of the root's own start,
+which killed a caller that did not trap exits. The children already started
+are stopped, unlinked from the caller first, so the caller gets no exit
+signal.
+
 `application.start` (tests, embedding) starts the shared infrastructure
 unsupervised, and the table owner on demand runs until the node stops.
 
