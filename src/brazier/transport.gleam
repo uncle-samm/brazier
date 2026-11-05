@@ -832,64 +832,102 @@ fn json_tree_to_string(tree: StringTree) -> String
 /// iodata with the already-encoded payload spliced in; LiveView sends its
 /// rendered diff as a JSON object inside the reply, never as a string.
 pub fn encode_server_message_tree(msg: ServerMessage) -> StringTree {
-  let document = case msg {
+  case msg {
+    ServerModelSync(model_json, version, ack_clock, streams_json) ->
+      versioned_frame(
+        model_sync_head,
+        model_json,
+        version,
+        ack_clock,
+        streams_json,
+      )
+    ServerPatch(ops_json, version, ack_clock, streams_json) ->
+      versioned_frame(patch_head, ops_json, version, ack_clock, streams_json)
     ServerMount(payload) ->
       json.object([
         #("type", json.string("mount")),
         #("payload", json.string(payload)),
       ])
-    ServerHeartbeatAck -> json.object([#("type", json.string("heartbeat_ack"))])
+      |> json.to_string_tree
+    ServerHeartbeatAck ->
+      json.object([#("type", json.string("heartbeat_ack"))])
+      |> json.to_string_tree
     ServerError(reason) ->
       json.object([
         #("type", json.string("error")),
         #("reason", json.string(reason)),
       ])
-    ServerModelSync(model_json, version, ack_clock, streams_json) ->
-      json.object([
-        #("type", json.string("model_sync")),
-        #("model", json_raw(model_json)),
-        #("version", json.int(version)),
-        #("ack_clock", json.int(ack_clock)),
-        #("streams", json_raw(streams_json)),
-      ])
-    ServerPatch(ops_json, version, ack_clock, streams_json) ->
-      json.object([
-        #("type", json.string("patch")),
-        #("ops", json_raw(ops_json)),
-        #("version", json.int(version)),
-        #("ack_clock", json.int(ack_clock)),
-        #("streams", json_raw(streams_json)),
-      ])
+      |> json.to_string_tree
     ServerNavigate(path) ->
       json.object([
         #("type", json.string("navigate")),
         #("path", json.string(path)),
       ])
+      |> json.to_string_tree
     ServerReplaceNavigate(path) ->
       json.object([
         #("type", json.string("navigate")),
         #("path", json.string(path)),
         #("replace", json.bool(True)),
       ])
+      |> json.to_string_tree
     ServerHardNavigate(path) ->
       json.object([
         #("type", json.string("hard_navigate")),
         #("path", json.string(path)),
       ])
-    ServerReload -> json.object([#("type", json.string("reload"))])
+      |> json.to_string_tree
+    ServerReload ->
+      json.object([#("type", json.string("reload"))]) |> json.to_string_tree
     ServerTitle(title) ->
       json.object([
         #("type", json.string("title")),
         #("title", json.string(title)),
       ])
+      |> json.to_string_tree
   }
-  json.to_string_tree(document)
 }
 
-/// Splice text that is already one complete JSON value into a document
-/// unchanged (gleam_json's `Json` is iodata on Erlang).
-@external(erlang, "brazier_transport_ffi", "json_raw")
-fn json_raw(json_text: String) -> json.Json
+/// The text of a `model_sync` frame up to its model: `{"type":
+/// "model_sync","model":`, every key and the type already JSON.
+const model_sync_head = "{\"type\":\"model_sync\",\"model\":"
+
+/// The text of a `patch` frame up to its ops.
+const patch_head = "{\"type\":\"patch\",\"ops\":"
+
+/// A `model_sync` or `patch` frame: `head`, the payload JSON, then the
+/// version, ack clock and `streams` members, as `json.object` writes them
+/// (`encode_server_message_tree_matches_json_object_test` checks the bytes
+/// are the same). These two are the frames of every event and resync.
+///
+/// Their keys and type are constants, so they are spliced in as JSON text
+/// and not encoded on every frame. `json.object` escapes each key and the
+/// type byte by byte (OTP's `json:encode_binary`) on every call: encoding
+/// and framing a patch cost 116 reductions that way and costs 19 spliced,
+/// and the fifth member a frame gained for streams (`streams`) alone made
+/// a frame about 1.15x slower. Jason's derived encoders do the same, escaping the
+/// keys of a struct once at compile time (`Jason.Encoder` `@derive`). The
+/// integers are what `json.int` writes, `integer_to_binary` (OTP's
+/// `json:encode_integer`).
+fn versioned_frame(
+  head: String,
+  payload_json: String,
+  version: Int,
+  ack_clock: Int,
+  streams_json: String,
+) -> StringTree {
+  string_tree.from_strings([
+    head,
+    payload_json,
+    ",\"version\":",
+    int.to_string(version),
+    ",\"ack_clock\":",
+    int.to_string(ack_clock),
+    ",\"streams\":",
+    streams_json,
+    "}",
+  ])
+}
 
 /// A decoded client message and, for a `join`, the builds its page reports
 /// (`no_page_build` for every other message). Only the transport reads

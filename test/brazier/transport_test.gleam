@@ -87,6 +87,75 @@ pub fn encode_server_message_tree_matches_string_encoding_test() {
   })
 }
 
+/// Text that is already JSON as a gleam_json value: `Json` is iodata on
+/// Erlang, so this splices the text in unchanged, as the transport did
+/// before it wrote these frames' keys as constant text.
+@external(erlang, "gleam_stdlib", "identity")
+fn raw_json(text: String) -> json.Json
+
+pub fn encode_server_message_tree_matches_json_object_test() {
+  // The model_sync and patch frames splice their keys in as constant text;
+  // the bytes are the ones json.object writes for the same members, for
+  // every integer form and for payloads holding escapes and non-ASCII.
+  let payloads = [
+    #("{}", "[]"),
+    #("[{\"op\":\"replace\",\"path\":\"/count\",\"value\":12345}]", "[]"),
+    #(
+      "{\"text\":\"say \\\"hi\\\" \\\\ \\u00e9 é 😀\",\"n\":[1,2.5,-3e7]}",
+      "[{\"name\":\"rows\",\"keep\":-1,\"limit\":null,\"reset\":false,\"deletes\":[\"k\"],\"inserts\":[]}]",
+    ),
+  ]
+  let integers = [
+    0,
+    1,
+    9,
+    10,
+    12_345,
+    -1,
+    9_007_199_254_740_993,
+    1_000_000_000_000_000_000_000,
+  ]
+  list.each(payloads, fn(payload) {
+    let #(payload_json, streams_json) = payload
+    list.each(integers, fn(version) {
+      list.each(integers, fn(ack_clock) {
+        let members = fn(type_name, payload_key) {
+          json.object([
+            #("type", json.string(type_name)),
+            #(payload_key, raw_json(payload_json)),
+            #("version", json.int(version)),
+            #("ack_clock", json.int(ack_clock)),
+            #("streams", raw_json(streams_json)),
+          ])
+          |> json.to_string
+        }
+        let model_sync =
+          transport.ServerModelSync(
+            model_json: payload_json,
+            version:,
+            ack_clock:,
+            streams_json:,
+          )
+        let patch =
+          transport.ServerPatch(
+            ops_json: payload_json,
+            version:,
+            ack_clock:,
+            streams_json:,
+          )
+        let assert True =
+          transport.encode_server_message(model_sync)
+          == members("model_sync", "model")
+        let assert True =
+          transport.encode_server_message(patch) == members("patch", "ops")
+        let assert True =
+          string_tree.to_string(transport.encode_server_message_tree(patch))
+          == members("patch", "ops")
+      })
+    })
+  })
+}
+
 pub fn encode_text_tree_frame_matches_flat_frame_test() {
   // The iodata frame the transport writes is byte-identical to the flat
   // frame, at each of the three payload length encodings (7, 16, 64 bit).
