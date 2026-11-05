@@ -1,9 +1,11 @@
 //// The shard's sync waiters (brazier_presence_shard, "Sync waiters"),
-//// driven on one node by fake peers (see brazier_presence_test_ffi): a
+//// driven by fake peer messages (see brazier_presence_test_ffi): a
 //// process asks when the shard has caught up with some nodes and gets one
 //// answer per node, after the diffs of what the shard learnt before. A
 //// shard takes replication messages only from verified cluster members, so
-//// the tests that hear from the ghost count it as one (with_verified).
+//// the tests that hear from the ghost run on a member of a two-node
+//// cluster and name the other member, which runs no presence of the
+//// test's name, as the ghost (with_verified_peer).
 ////
 //// Every presence is stopped after its test even when the test fails
 //// (with_presence), and nothing polls: a test waits for the shard's own
@@ -11,6 +13,7 @@
 
 import brazier/await
 import brazier/cluster/log_capture
+import brazier/cluster/peer.{Timeout}
 import brazier/monitored
 import brazier/presence.{type Presence, Down}
 import brazier/pubsub
@@ -82,18 +85,19 @@ fn answer(shard: Pid) -> Result(#(String, String), Nil) {
 /// The ghost node says it issued one event; the shard holds none of them.
 /// The answer only comes once the transfer brought its entry, and after
 /// the diff of that entry.
-pub fn synced_comes_after_the_entries_it_waited_for_test() {
+pub fn synced_comes_after_the_entries_it_waited_for_test_() -> peer.Timeout {
+  use <- Timeout(60)
+  use ghost_node <- with_verified_peer
+  use <- monitored.isolated
   // Isolated: it subscribes the test process, whose mailbox then gets the
   // diffs. In eunit's shared process a failure here would leave that
   // subscription, and its diffs, to the next tests.
-  use <- monitored.isolated
-  use <- with_verified(["ghost@host"])
   use p <- with_presence(5000)
   let assert Ok(Nil) = presence.subscribe(p, "room")
     as "presence.subscribe succeeds"
-  let ghost = fake_ref("ghost@host", 1)
+  let ghost = fake_ref(ghost_node, 1)
   send_peer(p, heartbeat_at(ghost, 1, 1))
-  await_sync(shard(p), ["ghost@host"])
+  await_sync(shard(p), [ghost_node])
   let assert Ok(_) = presence.replicas(p, "room")
     as "presence.replicas succeeds"
   // A call answered after the request: nothing was sent yet.
@@ -102,24 +106,23 @@ pub fn synced_comes_after_the_entries_it_waited_for_test() {
 
   send_peer(p, transfer_ack(ghost, 1, "room", [#("remote", "\"hi\"")]))
   let assert Ok("diff") = receive_any(wait_ms) as "receive_any succeeds"
-  let assert Ok(#("ghost@host", "synced")) = answer(shard(p))
-    as "answer succeeds"
+  assert answer(shard(p)) == Ok(#(ghost_node, "synced"))
   let assert Ok(Nil) = presence.unsubscribe(p, "room")
     as "presence.unsubscribe succeeds"
 }
 
 /// A node the shard knows and holds everything of is answered at once.
-pub fn synced_at_once_when_already_caught_up_test() {
-  use <- with_verified(["ghost@host"])
+pub fn synced_at_once_when_already_caught_up_test_() -> peer.Timeout {
+  use <- Timeout(60)
+  use ghost_node <- with_verified_peer
   use p <- with_presence(5000)
-  let ghost = fake_ref("ghost@host", 1)
+  let ghost = fake_ref(ghost_node, 1)
   send_peer(p, transfer_ack(ghost, 1, "room", [#("remote", "\"hi\"")]))
   send_peer(p, heartbeat_at(ghost, 1, 1))
-  await_sync(shard(p), ["ghost@host"])
+  await_sync(shard(p), [ghost_node])
   let assert Ok(_) = presence.replicas(p, "room")
     as "presence.replicas succeeds"
-  let assert Ok(#("ghost@host", "synced")) = receive_synced(shard(p), 0)
-    as "receive_synced succeeds"
+  assert receive_synced(shard(p), 0) == Ok(#(ghost_node, "synced"))
 }
 
 /// A node never heard from is absent once down_period has passed since the
@@ -133,41 +136,47 @@ pub fn absent_for_a_node_never_heard_from_test() {
 
 /// A node whose replica is down is answered at once: its entries are
 /// hidden, so a watcher holding them reports them gone.
-pub fn down_for_a_node_that_is_down_test() {
-  use <- with_verified(["ghost@host"])
+pub fn down_for_a_node_that_is_down_test_() -> peer.Timeout {
+  use <- Timeout(60)
+  use ghost_node <- with_verified_peer
   use p <- with_presence(100)
   use tick <- await.with_watch_info(shard(p), "heartbeat")
-  let ghost = fake_ref("ghost@host", 1)
+  let ghost = fake_ref(ghost_node, 1)
   send_peer(p, transfer_ack(ghost, 1, "room", [#("remote", "\"hi\"")]))
   // The shard marks a silent replica down on a heartbeat tick, once
   // down_period has passed: check after each tick.
   await.until_info(
     tick,
     shard(p),
-    fn() { presence.replicas(p, "room") == Ok([#("ghost@host", Down)]) },
+    fn() { presence.replicas(p, "room") == Ok([#(ghost_node, Down)]) },
     max_ticks,
     "the ghost's replica marked down",
   )
-  await_sync(shard(p), ["ghost@host"])
-  let assert Ok(#("ghost@host", "down")) = answer(shard(p)) as "answer succeeds"
+  await_sync(shard(p), [ghost_node])
+  assert answer(shard(p)) == Ok(#(ghost_node, "down"))
 }
 
 /// The ghost keeps heartbeating a clock the shard never catches up with
 /// (it answers no transfer request): the waiter is told `timeout` after
 /// down_period, and the shard logs it.
-pub fn timeout_when_the_node_never_catches_up_test() {
-  use <- with_verified(["ghost@host"])
+pub fn timeout_when_the_node_never_catches_up_test_() -> peer.Timeout {
+  use <- Timeout(60)
+  use ghost_node <- with_verified_peer
   use p <- with_presence(300)
   use tick <- await.with_watch_info(shard(p), "heartbeat")
-  let ghost = fake_ref("ghost@host", 1)
+  let ghost = fake_ref(ghost_node, 1)
   send_peer(p, heartbeat_at(ghost, 1, 5))
   let #(answered, lines) =
     log_capture.capture(fn() {
-      await_sync(shard(p), ["ghost@host"])
+      await_sync(shard(p), [ghost_node])
       keep_alive_until_answered(p, tick, ghost, max_ticks)
     })
-  let assert Ok(#("ghost@host", "timeout")) = answered as "answered is Ok"
-  assert log_capture.contains(lines, "warning", "did not sync with ghost@host")
+  assert answered == Ok(#(ghost_node, "timeout"))
+  assert log_capture.contains(
+    lines,
+    "warning",
+    "did not sync with " <> ghost_node,
+  )
 }
 
 /// Heartbeat as the ghost once per shard heartbeat tick, so the shard never
@@ -244,8 +253,8 @@ fn transfer_ack(
 @external(erlang, "brazier_presence_test_ffi", "send_peer")
 fn send_peer_ffi(shard: Pid, topic: String, message: Dynamic) -> Nil
 
-@external(erlang, "brazier_presence_test_ffi", "with_verified")
-fn with_verified(nodes: List(String), run: fn() -> a) -> a
+@external(erlang, "brazier_presence_test_ffi", "with_verified_peer")
+fn with_verified_peer(run: fn(String) -> a) -> Nil
 
 @external(erlang, "brazier_presence_test_ffi", "unique_positive")
 fn unique_integer() -> Int

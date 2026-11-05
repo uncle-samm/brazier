@@ -2,56 +2,34 @@
 
 %% Helpers for the presence tests: fake replication messages from a peer
 %% that does not exist, built with the real CRDT, and delivery straight to a
-%% shard. The shard cannot tell them from PubSub deliveries, so single-node
-%% tests can drive replica up, down, permdown, restarts and the limits.
+%% shard. The shard cannot tell them from PubSub deliveries, so tests can
+%% drive replica up, down, permdown, restarts and the limits from one node
+%% (with_verified_peer runs them on a member naming the other member).
 
 -export([fake_ref/2, heartbeat/2, transfer_ack/4, graceful_permdown/2,
          send_peer/3, receive_diff/1, parent/1, unique_positive/0, shard_has_delta/1,
-         malformed_messages/0, with_verified/2]).
+         malformed_messages/1, with_verified_peer/1]).
 
 -define(STATE, 'brazier@presence@state').
-%% The cluster manager's table of verified peers (brazier_cluster_ffi).
--define(MEMBERS, brazier_cluster_members).
+%% How long a test body may run on the peer.
+-define(PEER_CALL_MS, 30000).
 
-%% Run Fun with the nodes NodeNames counted as verified cluster members, as
-%% the cluster manager counts a peer that passed its check: a shard only
-%% takes replication messages from members. No manager may be running (it
-%% owns the real table). The table goes away before this returns, also
-%% when Fun crashes, so no later test sees these members.
-with_verified(NodeNames, Fun) ->
-    undefined = whereis(brazier_cluster),
-    undefined = ets:info(?MEMBERS),
-    Parent = self(),
-    Ref = make_ref(),
-    {Owner, Monitor} = spawn_monitor(fun() ->
-        %% If the test process is killed (an eunit timeout) the after
-        %% clause below never runs: the owner then exits with it, taking the
-        %% table along, instead of leaving it to fail every later test.
-        ParentMonitor = erlang:monitor(process, Parent),
-        ?MEMBERS = ets:new(?MEMBERS, [set, protected, named_table, {read_concurrency, true}]),
-        true = ets:insert(?MEMBERS, [{binary_to_atom(N, utf8), 0} || N <- NodeNames]),
-        Parent ! {Ref, ready},
-        receive
-            {Ref, stop} -> true = ets:delete(?MEMBERS);
-            {'DOWN', ParentMonitor, process, Parent, _} -> exit(test_process_gone)
+%% Run Fun(Ghost) on a cluster member, where Ghost is the name of the
+%% other member of a two-node cluster: a shard only takes replication
+%% messages from verified members, and a member is verified only while it
+%% is connected over the connection its peer check passed on
+%% (brazier_cluster_ffi:verified/1), so the fake peer messages a test sends
+%% must name a real, connected, verified node. Ghost runs no presence of
+%% the test's name, so only the messages the test sends come from it. The
+%% peers stop before this returns, also when Fun crashes.
+with_verified_peer(Fun) ->
+    brazier_peer_ffi:with_members(2, <<"presence">>, fun([Member, Other]) ->
+        Ghost = atom_to_binary(brazier_peer_ffi:node_of(Other)),
+        case brazier_peer_ffi:rpc(Member, fun() -> Fun(Ghost) end, ?PEER_CALL_MS) of
+            {ok, _Result} -> nil;
+            {error, Reason} -> erlang:error({test_failed_on_peer, Reason})
         end
-    end),
-    receive
-        {Ref, ready} -> ok;
-        {'DOWN', Monitor, process, Owner, Failed} -> erlang:error({members_table_failed, Failed})
-    after 5000 ->
-        erlang:error(members_table_not_ready)
-    end,
-    try
-        Fun()
-    after
-        Owner ! {Ref, stop},
-        receive
-            {'DOWN', Monitor, process, Owner, Exit} -> normal = Exit
-        after 5000 ->
-            erlang:error(members_table_not_removed)
-        end
-    end.
+    end).
 
 %% A replica ref {Node, Vsn} for a node that need not exist.
 fake_ref(NodeName, Vsn) ->
@@ -97,9 +75,10 @@ unique_positive() ->
     erlang:unique_integer([positive]).
 
 %% Replication messages a shard must log and ignore: not a tuple, a tuple
-%% without a replica ref, an unknown kind, and known kinds with bad shapes.
-malformed_messages() ->
-    Ref = fake_ref(<<"fake@host">>, 1),
+%% without a replica ref, an unknown kind, and known kinds with bad shapes,
+%% from a replica of NodeName.
+malformed_messages(NodeName) ->
+    Ref = fake_ref(NodeName, 1),
     [garbage,
      {brazier_presence, heartbeat, 1, not_a_ref, none, nil},
      {brazier_presence, bogus, 1, Ref},

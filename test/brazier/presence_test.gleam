@@ -12,6 +12,7 @@
 
 import brazier/await
 import brazier/cluster/log_capture
+import brazier/cluster/peer.{Timeout}
 import brazier/monitored
 import brazier/presence.{
   type Presence, AlreadyTracked, Down, InvalidConfig, InvalidKey, InvalidMessage,
@@ -762,33 +763,31 @@ pub fn supervised_tracker_test() {
 
 // --- Replicas (fake peers) --------------------------------------------------
 //
-// A shard takes replication messages only from verified cluster members, so
-// each of these tests counts the fake node as one (with_verified).
+// A shard takes replication messages only from verified cluster members,
+// and a member must be connected, so each of these tests runs on a member
+// of a two-node cluster and sends the fake messages as the other member
+// (with_verified_peer), which runs no presence of the test's name.
 
-pub fn remote_entries_join_go_down_and_permdown_test() {
+pub fn remote_entries_join_go_down_and_permdown_test_() -> peer.Timeout {
+  use <- Timeout(60)
+  use ghost_node <- with_verified_peer
   use <- monitored.isolated
-  use <- with_verified(["fake@host"])
   let p = start_fast(unique_name())
   {
     use tick <- await.with_watch_info(only_shard(p), "heartbeat")
     subscribe(p, "room")
-    let ref = fake_ref("fake@host", 1)
+    let ref = fake_ref(ghost_node, 1)
     send_peer(p, transfer_ack(ref, 1, "room", [#("remote", "\"hi\"")]))
-    assert replicas(p) == [#("fake@host", Up)]
+    assert replicas(p) == [#(ghost_node, Up)]
     let assert Ok([Entry("remote", [meta])]) = presence.list(p, "room")
       as "presence.list succeeds"
     assert meta
-      == Meta(
-        value: "hi",
-        ref: "fake-remote",
-        ref_prev: None,
-        node: "fake@host",
-      )
+      == Meta(value: "hi", ref: "fake-remote", ref_prev: None, node: ghost_node)
     let assert Diff("room", [Entry("remote", _)], []) = next_diff(p)
       as "next_diff returns Diff('room', [Entry('remote', _)], [])"
 
     // No heartbeats: down after 100ms (entries leave), forgotten after 300ms.
-    await_replicas(p, tick, [#("fake@host", Down)], "the fake replica down")
+    await_replicas(p, tick, [#(ghost_node, Down)], "the fake replica down")
     let assert Ok([]) = presence.list(p, "room") as "presence.list succeeds"
     let assert Diff("room", [], [Entry("remote", _)]) = next_diff(p)
       as "next_diff returns Diff('room', [], [Entry('remote', _)])"
@@ -797,9 +796,10 @@ pub fn remote_entries_join_go_down_and_permdown_test() {
   finish(p, "room")
 }
 
-pub fn heartbeat_brings_a_down_replica_back_test() {
+pub fn heartbeat_brings_a_down_replica_back_test_() -> peer.Timeout {
+  use <- Timeout(60)
+  use ghost_node <- with_verified_peer
   use <- monitored.isolated
-  use <- with_verified(["fake@host"])
   let p =
     start(
       config(unique_name())
@@ -808,54 +808,56 @@ pub fn heartbeat_brings_a_down_replica_back_test() {
       |> presence.down_period(100)
       |> presence.permdown_period(60_000),
     )
-  let ref = fake_ref("fake@host", 1)
+  let ref = fake_ref(ghost_node, 1)
   {
     use tick <- await.with_watch_info(only_shard(p), "heartbeat")
     send_peer(p, transfer_ack(ref, 1, "room", [#("remote", "\"hi\"")]))
-    await_replicas(p, tick, [#("fake@host", Down)], "the fake replica down")
+    await_replicas(p, tick, [#(ghost_node, Down)], "the fake replica down")
   }
   let assert Ok([]) = presence.list(p, "room") as "presence.list succeeds"
   send_peer(p, heartbeat(ref, 1))
-  assert replicas(p) == [#("fake@host", Up)]
+  assert replicas(p) == [#(ghost_node, Up)]
   assert keys(p, "room") == ["remote"]
   let assert Ok(Nil) = presence.stop(p) as "presence.stop succeeds"
 }
 
-pub fn graceful_permdown_drops_entries_at_once_test() {
-  use <- with_verified(["fake@host"])
+pub fn graceful_permdown_drops_entries_at_once_test_() -> peer.Timeout {
+  use <- Timeout(60)
+  use ghost_node <- with_verified_peer
   let p = start(config(unique_name()))
-  let ref = fake_ref("fake@host", 1)
+  let ref = fake_ref(ghost_node, 1)
   send_peer(p, transfer_ack(ref, 1, "room", [#("remote", "\"hi\"")]))
   assert keys(p, "room") == ["remote"]
   // A graceful_permdown from another version is ignored.
-  send_peer(p, graceful_permdown(fake_ref("fake@host", 2), 1))
-  assert replicas(p) == [#("fake@host", Up)]
+  send_peer(p, graceful_permdown(fake_ref(ghost_node, 2), 1))
+  assert replicas(p) == [#(ghost_node, Up)]
   send_peer(p, graceful_permdown(ref, 1))
   assert replicas(p) == []
   let assert Ok([]) = presence.list(p, "room") as "presence.list succeeds"
   let assert Ok(Nil) = presence.stop(p) as "presence.stop succeeds"
 }
 
-pub fn new_version_replaces_the_old_replica_test() {
+pub fn new_version_replaces_the_old_replica_test_() -> peer.Timeout {
+  use <- Timeout(60)
+  use ghost_node <- with_verified_peer
   use <- monitored.isolated
-  use <- with_verified(["fake@host"])
   let p = start(config(unique_name()))
   subscribe(p, "room")
   send_peer(
     p,
-    transfer_ack(fake_ref("fake@host", 1), 1, "room", [#("old", "\"a\"")]),
+    transfer_ack(fake_ref(ghost_node, 1), 1, "room", [#("old", "\"a\"")]),
   )
   let assert Diff("room", [Entry("old", _)], []) = next_diff(p)
     as "next_diff returns Diff('room', [Entry('old', _)], [])"
   // The node's shard restarted: its old entries leave at once.
-  send_peer(p, heartbeat(fake_ref("fake@host", 2), 1))
+  send_peer(p, heartbeat(fake_ref(ghost_node, 2), 1))
   let assert Diff("room", [], [Entry("old", _)]) = next_diff(p)
     as "next_diff returns Diff('room', [], [Entry('old', _)])"
-  assert replicas(p) == [#("fake@host", Up)]
+  assert replicas(p) == [#(ghost_node, Up)]
   let assert Ok([]) = presence.list(p, "room") as "presence.list succeeds"
   send_peer(
     p,
-    transfer_ack(fake_ref("fake@host", 2), 1, "room", [#("new", "\"b\"")]),
+    transfer_ack(fake_ref(ghost_node, 2), 1, "room", [#("new", "\"b\"")]),
   )
   let assert Diff("room", [Entry("new", _)], []) = next_diff(p)
     as "next_diff returns Diff('room', [Entry('new', _)], [])"
@@ -863,10 +865,11 @@ pub fn new_version_replaces_the_old_replica_test() {
   finish(p, "room")
 }
 
-pub fn pool_size_mismatch_is_ignored_and_logged_once_test() {
-  use <- with_verified(["fake@host"])
+pub fn pool_size_mismatch_is_ignored_and_logged_once_test_() -> peer.Timeout {
+  use <- Timeout(60)
+  use ghost_node <- with_verified_peer
   let p = start(config(unique_name()))
-  let ref = fake_ref("fake@host", 1)
+  let ref = fake_ref(ghost_node, 1)
   let #(_, lines) =
     log_capture.capture(fn() {
       send_peer(p, heartbeat(ref, 3))
@@ -883,10 +886,11 @@ pub fn pool_size_mismatch_is_ignored_and_logged_once_test() {
   let assert Ok(Nil) = presence.stop(p) as "presence.stop succeeds"
 }
 
-pub fn oversized_transfer_is_rejected_test() {
-  use <- with_verified(["fake@host"])
+pub fn oversized_transfer_is_rejected_test_() -> peer.Timeout {
+  use <- Timeout(60)
+  use ghost_node <- with_verified_peer
   let p = start(config(unique_name()) |> presence.max_transfer_entries(2))
-  let ref = fake_ref("fake@host", 1)
+  let ref = fake_ref(ghost_node, 1)
   let #(_, lines) =
     log_capture.capture(fn() {
       send_peer(
@@ -931,12 +935,13 @@ pub fn peer_messages_from_a_non_member_are_dropped_test() {
   let assert Ok(Nil) = presence.stop(p) as "presence.stop succeeds"
 }
 
-pub fn malformed_peer_messages_are_logged_test() {
-  use <- with_verified(["fake@host"])
+pub fn malformed_peer_messages_are_logged_test_() -> peer.Timeout {
+  use <- Timeout(60)
+  use ghost_node <- with_verified_peer
   let p = start(config(unique_name()))
   let #(_, lines) =
     log_capture.capture(fn() {
-      list.each(malformed_messages(), send_peer(p, _))
+      list.each(malformed_messages(ghost_node), send_peer(p, _))
       replicas(p)
     })
   let unexpected =
@@ -944,7 +949,7 @@ pub fn malformed_peer_messages_are_logged_test() {
       line.level == "warning"
       && string.contains(line.message, "unexpected replication message")
     })
-  assert list.length(unexpected) == list.length(malformed_messages())
+  assert list.length(unexpected) == list.length(malformed_messages(ghost_node))
   assert replicas(p) == []
   let assert Ok(Nil) = presence.stop(p) as "presence.stop succeeds"
 }
@@ -982,8 +987,9 @@ fn receive_diff(timeout_ms: Int) -> Result(Dynamic, Nil)
 fn unique_integer() -> Int
 
 @external(erlang, "brazier_presence_test_ffi", "malformed_messages")
-fn malformed_messages() -> List(Dynamic)
+fn malformed_messages(node: String) -> List(Dynamic)
 
-/// Run `run` with `nodes` counted as verified cluster members.
-@external(erlang, "brazier_presence_test_ffi", "with_verified")
-fn with_verified(nodes: List(String), run: fn() -> a) -> a
+/// Run `run` on a cluster member with the name of the other, verified,
+/// member, which runs no presence of the test's name (the ghost).
+@external(erlang, "brazier_presence_test_ffi", "with_verified_peer")
+fn with_verified_peer(run: fn(String) -> a) -> Nil

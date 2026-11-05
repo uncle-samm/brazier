@@ -6,7 +6,8 @@
 -include_lib("kernel/include/inet.hrl").
 
 -export([start/1, start_link/1, stop/0, members/0, verified/1, verified_nodes/0,
-         await_verified/1, distribution/0, tls_verify/2, resolve_dns/1, backoff_window/3]).
+         await_verified/1, distribution/0, tls_verify/2, resolve_dns/1, backoff_window/3,
+         connection_id/1]).
 
 -define(NAME, brazier_cluster).
 -define(MEMBERS, brazier_cluster_members).
@@ -62,18 +63,32 @@ stop() ->
 %% Verified peers, sorted.
 members() ->
     try ets:tab2list(?MEMBERS) of
-        Rows -> {ok, lists:sort([Node || {Node, _VerifiedAt} <- Rows])}
+        Rows -> {ok, lists:sort(current_members(Rows))}
     catch
         error:badarg -> {error, not_started}
     end.
 
 %% Whether Node may exchange cluster traffic with this node: it is this node,
-%% or a connected peer that passed the peer check. Without a running
-%% manager no remote node is verified (fail closed: no table, no members).
+%% or a connected peer that passed the peer check on its current
+%% connection. Without a running manager no remote node is verified (fail
+%% closed: no table, no members).
+%%
+%% A member row {Node, VerifiedAtMs, ConnectionId} names the distribution
+%% connection the check passed on (erlang:nodes/2 connection_id). The
+%% manager deletes the row when it handles the nodedown, which can come
+%% well after the connection is gone: in between, the row alone would
+%% still count Node, and a new connection to the same node name (a
+%% reconnect, or another VM that took the name) would be trusted before
+%% its own check. So the row counts only while its connection is the one
+%% Node is connected over now. The cost is one erlang:nodes/2 per call on a
+%% verified node (a list of the connected nodes); an unverified node costs
+%% one ETS lookup.
 verified(Node) when Node =:= node() ->
     true;
 verified(Node) ->
-    try ets:member(?MEMBERS, Node)
+    try ets:lookup(?MEMBERS, Node) of
+        [{Node, _VerifiedAt, ConnectionId}] -> connection_id(Node) =:= {ok, ConnectionId};
+        [] -> false
     catch
         error:badarg -> false
     end.
@@ -81,10 +96,30 @@ verified(Node) ->
 %% Verified peers (not this node), unsorted. [] without a manager.
 verified_nodes() ->
     try ets:tab2list(?MEMBERS) of
-        Rows -> [Node || {Node, _VerifiedAt} <- Rows]
+        Rows -> current_members(Rows)
     catch
         error:badarg -> []
     end.
+
+%% The nodes of member Rows whose connection is still the one they were
+%% verified on (see verified/1).
+current_members(Rows) ->
+    Current = maps:from_list(connections()),
+    [Node || {Node, _VerifiedAt, ConnectionId} <- Rows,
+             maps:get(Node, Current, none) =:= ConnectionId].
+
+%% The id of the distribution connection to Node now: {ok, Id}, or error
+%% when Node is not connected. A new connection to the same node name gets
+%% a new id.
+connection_id(Node) ->
+    case lists:keyfind(Node, 1, connections()) of
+        {Node, Id} -> {ok, Id};
+        false -> error
+    end.
+
+%% [{Node, ConnectionId}] of every connected visible node.
+connections() ->
+    [{Node, Id} || {Node, #{connection_id := Id}} <- erlang:nodes(visible, #{connection_id => true})].
 
 %% Ask the manager to send {brazier_cluster_peer_verified, Node} to the
 %% caller once Node passes the peer check (at once if it has). A rejected
