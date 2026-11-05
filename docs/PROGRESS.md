@@ -813,7 +813,7 @@
     - departures from STREAMS.md are marked "Correction (step 5)" there: an over-max limit, an empty key and an over-long key are refused at runtime (three new refused reasons), not crashes; one error frame per (stream, reason).
   - m118-streams-client: step 6 (5bfb32c, c24e92a, 2db7e46, 2f3017b). Done (merged 2026-11-05): the store decoder and applier run the shared vectors; stores render into containers and keep nodes across updates and moves; item handler ids are relative to the item; a stream fault closes with 4000 `stream fault` (decision D3).
   - At the merge the coordinator made the `sync_vectors.mjs` replay strict (every recorded server `patch` and `model_sync` must carry a valid `streams`), added `stream_limits` to `log_forging_paths_test`'s `SsrConfig` (that test arrived with m118-logs) and resolved one `ws_protocol_test` conflict. The rebuilt runtime bundle is unchanged (`brazier_client_f2ce9d5d8f498075.js`).
-  - Verified on the merged tree: build (zero warnings), format, lint and docs pass; 2270 tests pass 3 runs in a row; `make test-client` passes (ffi harness 77 scenarios, stream vectors 42 checks).
+  - Verified on the merged tree: build (zero warnings), format, lint and docs pass; 2270 tests pass 3 runs in a row; `make test-client` passes (ffi harness 77 scenarios, stream vectors 42 checks). CDP passes 633 of 633 on desktop and 642 of 642 on mobile (the suite has no stream page yet; m118-client adds `examples/timeline`).
   - Follow-ups from streams-server, not fixed yet:
     - [ ] SSR does not refuse an op on an unknown stream.
     - [ ] A `data-brazier-stream` attribute on an element that is not a stream container is not refused.
