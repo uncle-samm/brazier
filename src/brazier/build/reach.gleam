@@ -107,11 +107,25 @@ pub type StreamUse {
   /// `stream.new` or `stream.render` used as a value instead of called, so
   /// its arguments cannot be checked.
   Referenced(at: String, function: String)
-  /// A `function(name, ..)` call (`attribute.attribute` or
-  /// `attribute.data`) whose literal `name` makes `data-brazier-stream`,
-  /// in any case: the attribute that marks a stream's container, which
-  /// only `stream.render` sets.
-  ContainerAttribute(at: String, function: String, name: String)
+  /// A `function(name, ..)` call (`attribute.attribute`, `attribute.data`
+  /// or `attribute.boolean`) whose `name` makes `data-brazier-stream`, in
+  /// any case: the attribute that marks a stream's container, which only
+  /// `stream.render` sets. The build reads every name it can know without
+  /// running code: a literal, a constant of an app module, or a `<>` of
+  /// those. `written` says how a name that is not a literal was written.
+  ///
+  /// A name computed when the view runs is not refused here: the
+  /// attribute's constructor refuses it then, on the server and in the
+  /// browser alike, and the render checks it again. LiveView's HEEx
+  /// compiler draws the same line: it checks a literal `phx-update` value
+  /// at compile time, and leaves `phx-update={@value}` and `{@rest}` to the
+  /// runtime.
+  ContainerAttribute(
+    at: String,
+    function: String,
+    name: String,
+    written: Option(String),
+  )
 }
 
 /// Why the item argument of a `stream.render` call is refused.
@@ -1200,14 +1214,14 @@ const attribute_module = "brazier/attribute"
 type StreamFunction {
   StreamNew
   StreamRender
-  /// `brazier/attribute.attribute` (`prefix` `""`) or `.data` (`prefix`
-  /// `"data-"`): a literal name that makes `render.stream_attribute` is
-  /// refused.
+  /// `brazier/attribute.attribute` or `.boolean` (`prefix` `""`), or
+  /// `.data` (`prefix` `"data-"`): a name the build can know that makes
+  /// `render.stream_attribute` is refused.
   AttributeName(function: String, prefix: String)
 }
 
-/// `stream.new`, `stream.render`, `attribute.attribute` or `attribute.data`
-/// when `expr` names one of them in a user module, through an unshadowed
+/// `stream.new`, `stream.render`, `attribute.attribute`, `attribute.data`
+/// or `attribute.boolean` when `expr` names one of them in a user module, through an unshadowed
 /// import alias or an unqualified import.
 fn stream_callee(
   ctx: Ctx,
@@ -1243,6 +1257,8 @@ fn stream_callee(
           Ok(AttributeName(function: "attribute.attribute", prefix: ""))
         Ok(#(module, "data")) if module == attribute_module ->
           Ok(AttributeName(function: "attribute.data", prefix: "data-"))
+        Ok(#(module, "boolean")) if module == attribute_module ->
+          Ok(AttributeName(function: "attribute.boolean", prefix: ""))
         _ -> Error(Nil)
       }
     }
@@ -1303,18 +1319,133 @@ fn record_call(
           ),
         ),
       )
-    // Only a literal name is read; any other name reaches the render's
-    // name policy, which refuses the container's attribute too.
+    // A name the build can know (`static_name`) is checked here. Any other
+    // name is known only when the view runs, and the attribute's
+    // constructor refuses the container's attribute then
+    // (`render.is_allowed_attribute`): the build does not refuse a name
+    // for being computed, which every helper that forwards a name does.
     AttributeName(function:, prefix:) ->
       case list.first(arguments) {
-        Ok(Some(glance.String(value: name, ..))) ->
-          case string.lowercase(prefix <> name) == render.stream_attribute {
-            True ->
-              add_stream_use(st, ContainerAttribute(at:, function:, name:))
-            False -> st
+        Ok(Some(argument)) ->
+          case static_name(ctx.index, ctx.info, locals, argument) {
+            Ok(name) ->
+              case string.lowercase(prefix <> name) == render.stream_attribute {
+                True ->
+                  add_stream_use(
+                    st,
+                    ContainerAttribute(
+                      at:,
+                      function:,
+                      name:,
+                      written: written_name(argument),
+                    ),
+                  )
+                False -> st
+              }
+            Error(Nil) -> st
           }
-        Ok(Some(_)) | Ok(None) | Error(Nil) -> st
+        Ok(None) | Error(Nil) -> st
       }
+  }
+}
+
+/// The value of an attribute name argument when the build can know it
+/// without running code: a string literal, a constant of an analyzed
+/// module whose value is one, or a `<>` of such parts. `Error(Nil)` for
+/// any other expression (a parameter, a local variable, a call's result).
+fn static_name(
+  index: Index,
+  info: ModuleInfo,
+  locals: Set(String),
+  expr: glance.Expression,
+) -> Result(String, Nil) {
+  static_string(index, info, locals, expr, set.new())
+}
+
+/// `static_name`. `seen` holds the constants being resolved, as
+/// `module.name`: Gleam refuses a constant that refers to itself, so a
+/// constant met again is an app that does not compile, and its name is not
+/// known.
+fn static_string(
+  index: Index,
+  info: ModuleInfo,
+  locals: Set(String),
+  expr: glance.Expression,
+  seen: Set(String),
+) -> Result(String, Nil) {
+  case expr {
+    glance.String(value:, ..) -> Ok(value)
+    glance.BinaryOperator(name: glance.Concatenate, left:, right:, ..) -> {
+      use left <- result.try(static_string(index, info, locals, left, seen))
+      use right <- result.try(static_string(index, info, locals, right, seen))
+      Ok(left <> right)
+    }
+    glance.Variable(name:, ..) ->
+      case set.contains(locals, name), dict.has_key(info.constants, name) {
+        True, _ -> Error(Nil)
+        False, True -> constant_string(index, info.path, name, seen)
+        False, False ->
+          case dict.get(info.values, name) {
+            Ok(#(module, original)) ->
+              constant_string(index, module, original, seen)
+            Error(Nil) -> Error(Nil)
+          }
+      }
+    glance.FieldAccess(
+      container: glance.Variable(name: qualifier, ..),
+      label:,
+      ..,
+    ) ->
+      case set.contains(locals, qualifier) {
+        True -> Error(Nil)
+        False ->
+          case dict.get(info.aliases, qualifier) {
+            Ok(module) -> constant_string(index, module, label, seen)
+            Error(Nil) -> Error(Nil)
+          }
+      }
+    _ -> Error(Nil)
+  }
+}
+
+/// The string value of constant `name` of `module`, when `module` is
+/// analyzed and the constant's value is known (`static_string`).
+fn constant_string(
+  index: Index,
+  module: String,
+  name: String,
+  seen: Set(String),
+) -> Result(String, Nil) {
+  let key = module <> "." <> name
+  case set.contains(seen, key) {
+    True -> Error(Nil)
+    False -> {
+      use info <- result.try(dict.get(index, module))
+      use def <- result.try(dict.get(info.constants, name))
+      // A constant's value has no local variables.
+      static_string(
+        index,
+        info,
+        set.new(),
+        def.definition.value,
+        set.insert(seen, key),
+      )
+    }
+  }
+}
+
+/// How a name argument was written, for the refusal: `None` for a
+/// literal, which the message already shows.
+fn written_name(expr: glance.Expression) -> Option(String) {
+  case expr {
+    glance.String(..) -> None
+    glance.Variable(name:, ..) -> Some("the constant `" <> name <> "`")
+    glance.FieldAccess(
+      container: glance.Variable(name: qualifier, ..),
+      label:,
+      ..,
+    ) -> Some("the constant `" <> qualifier <> "." <> label <> "`")
+    _ -> Some("a concatenation")
   }
 }
 
