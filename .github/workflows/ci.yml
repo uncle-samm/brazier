@@ -7,13 +7,38 @@ on:
   workflow_dispatch:
 
 jobs:
-  gleam:
-    name: Gleam format, build, test, lint, docs
+  # The image is built once and handed to every other job as an artifact.
+  # Building it in each of the 47 jobs ran 47 `gleam deps download`s for the
+  # root and every example at once, and Hex answered "The rate limit for the
+  # Hex API has been exceeded" (every run from 2026-11-04 failed so).
+  image:
+    name: Build CI image
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Build CI image
         run: docker build -f Dockerfile.ci -t brazier-ci .
+      - name: Save CI image
+        run: docker save brazier-ci | gzip -1 > brazier-ci.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: brazier-ci-image
+          path: brazier-ci.tar.gz
+          retention-days: 1
+          # Already gzipped.
+          compression-level: 0
+          if-no-files-found: error
+
+  gleam:
+    name: Gleam format, build, test, lint, docs
+    needs: image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: brazier-ci-image
+      - name: Load CI image
+        run: docker load --input brazier-ci.tar.gz
       - name: Run build, tests, and lint
         run: docker run --rm --shm-size=1g brazier-ci
 
@@ -21,6 +46,7 @@ jobs:
   # mobile adds the horizontal-overflow checks and touch emulation.
   browser-all:
     name: Browser all ${{ matrix.viewport }} shard ${{ matrix.shard }}/23
+    needs: image
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -28,9 +54,11 @@ jobs:
         viewport: [desktop, mobile]
         shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
     steps:
-      - uses: actions/checkout@v4
-      - name: Build CI image
-        run: docker build -f Dockerfile.ci -t brazier-ci .
+      - uses: actions/download-artifact@v4
+        with:
+          name: brazier-ci-image
+      - name: Load CI image
+        run: docker load --input brazier-ci.tar.gz
       - name: Run browser shard
         run: |
           docker run --rm \
