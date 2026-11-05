@@ -63,17 +63,19 @@
     drain_requested/0, mark_draining/0, is_drain_message/1, owner/0, owner_if_any/0,
     count_self/0, count/1, count_for_ip/2, count_for_ip_text/2, children/1,
     ws_acquire_self/2, ws_release_self/0, ws_count_for_ip/2,
-    get_port/1, set_listen_socket/3, listen_socket/1, forget_port/1
+    get_port/1, set_listen_socket/3, listen_socket/1, forget_port/1,
+    keep/2, keeper/1
 ]).
 -export([register_name/2, unregister_name/1, whereis_name/1, send/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
--export([connection_init/3]).
+-export([connection_init/3, keeper_init/2]).
 
 -define(PDICT_KEY, '$brazier_http_conn').
 -define(SHOOT_TIMEOUT_MS, 5000).
 -define(DRAINING_KEY, '$brazier_http_draining').
 -define(OWNER_KEY(Ref), {?MODULE, owner, Ref}).
 -define(PORT_KEY(Ref), {?MODULE, bound_port, Ref}).
+-define(KEEPER_KEY(Ref), {?MODULE, keeper, Ref}).
 
 %% NAMES. Each listener gets one name so its siblings in the supervision
 %% tree (the listen socket owner, the acceptors) and its Listener handle can
@@ -83,14 +85,42 @@
 %% every listener a node ever started (a test suite, or an app that starts
 %% and stops listeners, grew the atom table without bound). This module is
 %% the via registry: the owner's pid lives in a persistent_term keyed by
-%% Ref, beside the listener's remembered bound port, and both are erased by
-%% forget_port/1 when the listener stops for good. A pid fits in one machine
-%% word, so replacing it (an owner restart) or erasing it runs no global GC.
+%% Ref, beside the listener's remembered bound port, and both are erased
+%% when the listener is gone for good (see KEEPER below). A pid fits in one
+%% machine word, so replacing it (an owner restart) or erasing it runs no
+%% global GC.
 %% Reference: Ranch registers each listener's connection supervisor under
 %% the listener's Ref in ranch_server (ranch_server:set_connections_sup/3)
 %% instead of naming it with an atom.
+%%
+%% KEEPER. The entries must outlive a restart of the listener's tree (a
+%% restarted listener rebinds the port it bound first, so a port-0 listener
+%% keeps its port), and must not outlive the last process that can restart
+%% or release the listener. new_name/0 starts one keeper per listener, an
+%% unlinked process that monitors the listener's holders and erases the
+%% owner, bound-port and keeper entries when the last holder goes, whatever
+%% its exit reason. The holders are:
+%%   * the process that made the name, until a holder is added: a name
+%%     that is never started goes with its maker;
+%%   * the process that restarts the listener's tree: the tree's own
+%%     supervisor for server.start (nothing restarts it), the parent
+%%     supervisor for server.supervised (keep/2 from its start function,
+%%     which runs in the parent);
+%%   * a process that will release the listener once its tree is gone (the
+%%     application's watcher, server.stop while it stops the tree): holding
+%%     makes the release, not the tree's DOWN, the one that erases.
+%% forget_port/1 (server.release) has the keeper erase the entries and exit
+%% at once. So a tree that crashes, or is stopped by its parent, without a
+%% release leaves nothing behind.
+%% Reference: ranch_server monitors each listener's supervisor
+%% (ranch_server:set_listener_sup/2) and, on its 'DOWN', erases the
+%% listener's options unless ranch_sup is about to restart it; ranch_sup's
+%% own exit takes the whole table. Here the holders play ranch_sup's part.
 new_name() ->
-    {via, ?MODULE, make_ref()}.
+    Ref = make_ref(),
+    Keeper = spawn(?MODULE, keeper_init, [Ref, self()]),
+    ok = persistent_term:put(?KEEPER_KEY(Ref), Keeper),
+    {via, ?MODULE, Ref}.
 
 %% Whether Name is a listener name made by new_name/0.
 is_name({via, ?MODULE, Ref}) -> is_reference(Ref);
@@ -131,8 +161,8 @@ unregister_name(Ref) when is_reference(Ref) ->
     end.
 
 %% The registered owner when it is alive, else `undefined`: an owner that
-%% exited stays in the table until its restart replaces it or forget_port/1
-%% erases it, and a dead pid must read as no owner (a gen_server:call then
+%% exited stays in the table until its restart replaces it or the listener
+%% is gone for good (KEEPER), and a dead pid must read as no owner (a gen_server:call then
 %% exits with noproc, as it does for an unregistered local name).
 whereis_name(Ref) when is_reference(Ref) ->
     case persistent_term:get(?OWNER_KEY(Ref), undefined) of
@@ -344,12 +374,121 @@ global_count(Tid) ->
     ets:lookup_element(Tid, global, 2).
 
 %% Drop the remembered bound port and the owner entry of a listener that
-%% has been stopped for good. Returns true when a bound port was removed.
-%% The owner entry is absent only when no owner ever started, which the
-%% caller sees as no bound port either.
+%% has been stopped for good, and end its keeper. Returns true when a bound
+%% port was removed: false when the listener never bound, was released
+%% already, or its keeper erased the entries when its last holder went.
 forget_port({via, ?MODULE, Ref}) when is_reference(Ref) ->
+    case keeper_call(Ref, release) of
+        {ok, Forgot} -> Forgot;
+        none -> erase_entries(Ref)
+    end.
+
+%% Add Holder to the holders of the listener named Name (see KEEPER).
+%% true once its keeper holds it; false when the listener has no keeper: it
+%% was released, or its last holder went before this call.
+keep({via, ?MODULE, Ref}, Holder) when is_reference(Ref), is_pid(Holder) ->
+    case keeper_call(Ref, {keep, Holder}) of
+        {ok, kept} -> true;
+        none -> false
+    end.
+
+%% The keeper of the listener named Name: {ok, Pid} | {error, nil}.
+keeper({via, ?MODULE, Ref}) when is_reference(Ref) ->
+    case persistent_term:get(?KEEPER_KEY(Ref), undefined) of
+        undefined -> {error, nil};
+        Pid -> {ok, Pid}
+    end.
+
+%% A request to the keeper of Ref: {ok, Reply} | none when it has gone.
+%% INVARIANT: the monitor delivers a 'DOWN' if the keeper exits before it
+%% replies, so the receive always ends. The keeper erases its own entry
+%% after the listener's entries, so `none` means the entries are gone too,
+%% unless the keeper crashed: that is logged and its entry erased here.
+keeper_call(Ref, Request) ->
+    case persistent_term:get(?KEEPER_KEY(Ref), undefined) of
+        undefined -> none;
+        Keeper ->
+            Mon = monitor(process, Keeper),
+            Keeper ! {Request, self(), Mon},
+            receive
+                {Mon, Reply} ->
+                    demonitor(Mon, [flush]),
+                    {ok, Reply};
+                {'DOWN', Mon, process, Keeper, Reason} ->
+                    case persistent_term:get(?KEEPER_KEY(Ref), undefined) of
+                        Keeper ->
+                            brazier_log_ffi:error(<<"brazier.http_conns">>,
+                                                 "keeper ~p of listener ~p exited without erasing "
+                                                 "its entries: ~p", [Keeper, Ref, Reason]),
+                            true = persistent_term:erase(?KEEPER_KEY(Ref));
+                        _ -> ok
+                    end,
+                    none
+            end
+    end.
+
+%% Erase the owner and bound-port entries: true when a bound port was
+%% removed.
+erase_entries(Ref) ->
     _ = persistent_term:erase(?OWNER_KEY(Ref)),
     persistent_term:erase(?PORT_KEY(Ref)).
+
+%% --- keeper ---
+
+%% Starts holding the process that made the name (Maker) until a holder is
+%% added.
+keeper_init(Ref, Maker) ->
+    Mon = monitor(process, Maker),
+    keeper_loop(Ref, #{Mon => Maker}, {maker, Mon}).
+
+%% Holders is MonitorRef => Pid. Maker is {maker, Mon} while the name's
+%% maker is the only holder, `none` once a holder was added.
+keeper_loop(Ref, Holders, Maker) ->
+    receive
+        {{keep, Holder}, From, Tag} ->
+            Held = case lists:member(Holder, maps:values(Holders)) of
+                true -> Holders;
+                false -> Holders#{monitor(process, Holder) => Holder}
+            end,
+            Rest = case Maker of
+                {maker, MakerMon} when map_get(MakerMon, Held) =/= Holder ->
+                    demonitor(MakerMon, [flush]),
+                    maps:remove(MakerMon, Held);
+                _ -> Held
+            end,
+            From ! {Tag, kept},
+            keeper_loop(Ref, Rest, none);
+        {release, From, Tag} ->
+            Forgot = keeper_erase(Ref),
+            brazier_log_ffi:debug(<<"brazier.http_conns">>,
+                                 "listener ~p released by ~p (bound port forgotten: ~p)",
+                                 [Ref, From, Forgot]),
+            From ! {Tag, Forgot};
+        {'DOWN', Mon, process, Pid, Reason} when is_map_key(Mon, Holders) ->
+            case maps:remove(Mon, Holders) of
+                Rest when map_size(Rest) =:= 0 ->
+                    Forgot = keeper_erase(Ref),
+                    brazier_log_ffi:info(<<"brazier.http_conns">>,
+                                        "listener ~p has no holder left (~p exited: ~p), "
+                                        "erased its entries (bound port forgotten: ~p)",
+                                        [Ref, Pid, Reason, Forgot]);
+                Rest ->
+                    keeper_loop(Ref, Rest, Maker)
+            end;
+        Other ->
+            brazier_log_ffi:warning(<<"brazier.http_conns">>,
+                                   "keeper of listener ~p got an unexpected message ~p", [Ref, Other]),
+            keeper_loop(Ref, Holders, Maker)
+    end.
+
+%% The listener's entries first, the keeper's own last: a keeper_call that
+%% finds no keeper finds no entry either.
+keeper_erase(Ref) ->
+    Forgot = erase_entries(Ref),
+    Self = self(),
+    Self = persistent_term:get(?KEEPER_KEY(Ref)),
+    true = persistent_term:erase(?KEEPER_KEY(Ref)),
+    Forgot.
 
 %% --- gen_server ---
 

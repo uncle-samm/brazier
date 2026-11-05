@@ -83,6 +83,32 @@
     entry, and covers the registry's refusals (a second live owner, a dead
     owner, a send with no owner, an unregister by another process).
 
+- **Issue:** a listener's `persistent_term` entries (its connection owner,
+  its bound port) went only with a release (`server.stop`, the app
+  watcher). A listener tree that crashed with nothing to release it left
+  both behind, and a start that failed to bind left an owner entry naming
+  a dead pid.
+  - **Files:** `src/brazier_http_conns.erl`,
+    `src/brazier/transport/server.gleam`, `src/brazier/application.gleam`
+  - **Resolution:** (Milestone 118, m118-server-residue) Each listener name
+    gets a keeper process, made with the name. The keeper monitors the
+    listener's holders: the process that made the name until a holder is
+    added, the starter of an unsupervised listener (`server.start`), the
+    parent that restarts a supervised one (`server.supervised`, held each
+    time its child spec starts), and any process that will release it
+    (`server.stop`, the app watcher, through `server.hold`). A release
+    erases the entries and ends the keeper; when the last holder exits
+    without one, the keeper erases them and logs it (info). This is the
+    shape of Ranch's cleanup: `ranch_server` monitors a listener's
+    supervisor and drops its options on a stop, while `stop_listener`
+    cleans explicitly; the holders cover the restarted tree, whose pid
+    changes, and keep the bound port for a parent's restart. A start that
+    fails erases what it registered and says whether a port was forgotten.
+    `test/brazier/listener_name_test.gleam` covers a crash with no release,
+    a held listener kept until its release, a holder that exits before
+    releasing, every holder exiting, a supervised listener kept across a
+    parent restart and erased when the parent stops, and a failed start.
+
 - **Issue:** an `init` refusing with 401 closes with 4401, the code of a
   revoked session or expired authentication, so the two are told apart only
   by the close reason and the server log. The client action is the same (a

@@ -389,7 +389,12 @@ logged and ignored, as `init:stop()` ignores a second call. Running apps are
 recorded node-wide, one `persistent_term` per app (as `brazier_http_conns`
 records a bound port), written by a watcher that `start` spawns. The watcher
 monitors the root supervisor and erases the record, with the bound port, as
-soon as the tree goes, stopped or crashed; `stop` returns once it has. Waiters
+soon as the tree goes, stopped or crashed; `stop` returns once it has. A
+listener's own entries (its connection owner and bound port) also follow a
+keeper process per listener, which erases them when the last of its holders
+(the starter or restarting parent, a watcher, `stop`) exits without a
+release, so a listener tree that crashes with nothing to release it leaves
+nothing behind. Waiters
 drain under one node-local `global:trans` lock, so an app is stopped once.
 
 ## Modules

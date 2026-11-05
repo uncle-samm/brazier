@@ -39,6 +39,15 @@
 /// owner and the acceptors too, so no acceptor ever hands a socket to a dead
 /// owner; if the socket owner dies, the acceptors restart on its new socket.
 ///
+/// A listener's connection owner and bound port are remembered node-wide
+/// (`persistent_term`), so a restarted tree finds its owner and rebinds the
+/// port it bound first. A keeper process erases them when the last process
+/// that can restart or release the listener is gone: the tree's own
+/// supervisor for `start`, the parent supervisor for `supervised`, and a
+/// process that holds the listener to release it (`stop`, the
+/// application's watcher). A tree that crashes or is stopped without
+/// `release` leaves nothing behind (see `brazier_http_conns`, KEEPER).
+///
 /// Reference: RFC 6455 (WebSocket), RFC 9112 (HTTP/1.1), ranch.
 import brazier/ip
 import brazier/log
@@ -283,6 +292,12 @@ pub fn start(
     Ok(#(name, builder)) ->
       case static_supervisor.start(builder) {
         Ok(started) -> {
+          // Nothing restarts this tree: its supervisor is its only holder.
+          // INVARIANT: the keeper holds this process, its name's maker,
+          // until a holder is added, and this process is running, so the
+          // keeper is still there; a false here is a keeper bug.
+          let assert True = ffi_conns_keep(name, started.pid)
+            as "a started listener's keeper holds its starter"
           let port = ffi_conns_get_port(name)
           log.info(
             "brazier.server",
@@ -296,12 +311,19 @@ pub fn start(
         }
         Error(err) -> {
           let reason = describe_start_error(err)
+          // A connection owner that started before the failure registered
+          // itself: the listener never ran, so its entries go now.
+          let forgot = ffi_conns_forget_port(name)
           log.error(
             "brazier.server",
             "Failed to start listener on port "
               <> int.to_string(options.port)
               <> ": "
-              <> reason,
+              <> reason
+              <> case forgot {
+              True -> " (its bound port is forgotten)"
+              False -> ""
+            },
           )
           Error(reason)
         }
@@ -327,6 +349,9 @@ pub fn supervised(
       )
       Ok(
         supervision.supervisor(fn() {
+          // This runs in the parent supervisor, which restarts the tree:
+          // the listener's entries stay while it runs.
+          use <- held_by_parent(name, options.port)
           case static_supervisor.start(builder) {
             Ok(started) -> {
               let port = ffi_conns_get_port(name)
@@ -360,6 +385,27 @@ pub fn supervised(
   }
 }
 
+/// Hold a supervised listener's entries for its parent, the process this
+/// runs in, then start the tree with `next`. A listener that was released
+/// does not start again.
+fn held_by_parent(
+  name: ConnsName,
+  port: Int,
+  next: fn() -> Result(actor.Started(Listener), actor.StartError),
+) -> Result(actor.Started(Listener), actor.StartError) {
+  case ffi_conns_keep(name, process.self()) {
+    True -> next()
+    False -> {
+      let reason =
+        "the listener for port "
+        <> int.to_string(port)
+        <> " was released (or its last holder exited) and cannot start again"
+      log.error("brazier.server", "Supervised listener refused: " <> reason)
+      Error(actor.InitFailed(reason))
+    }
+  }
+}
+
 /// Stop a listener started with `start`: closes the listen socket, shuts
 /// down every live connection, and forgets the remembered port.
 pub fn stop(listener: Listener) -> Nil {
@@ -367,25 +413,56 @@ pub fn stop(listener: Listener) -> Nil {
     "brazier.server",
     "Stopping listener on port " <> int.to_string(listener.port),
   )
+  // Held while the tree stops, so this release, not the tree's exit, is
+  // the one that forgets the port. False: the tree already went.
+  let held = hold(listener)
   ffi_stop_supervisor(listener.supervisor)
-  case release(listener) {
-    True -> Nil
-    False ->
+  case release(listener), held {
+    True, _ -> Nil
+    False, True ->
       log.warning(
         "brazier.server",
         "No remembered bound port for listener on port "
           <> int.to_string(listener.port)
-          <> " (stopped twice?)",
+          <> " although it was held: it never bound",
+      )
+    False, False ->
+      log.warning(
+        "brazier.server",
+        "No remembered bound port for listener on port "
+          <> int.to_string(listener.port)
+          <> " (stopped twice, or its tree had exited)",
       )
   }
+}
+
+/// Hold the listener for the calling process, which will `release` it: its
+/// remembered owner and bound port stay after its tree exits, until the
+/// caller releases it or exits itself. Without a holder, the entries go as
+/// soon as nothing can restart the tree, and a release that runs after
+/// that finds nothing. False when the entries are gone already (the
+/// listener was released, or its tree went with no holder left).
+@internal
+pub fn hold(listener: Listener) -> Bool {
+  let held = ffi_conns_keep(listener.conns, process.self())
+  log.debug(
+    "brazier.server",
+    case held {
+      True -> "Holding listener on port "
+      False -> "Nothing left to hold for listener on port "
+    }
+      <> int.to_string(listener.port),
+  )
+  held
 }
 
 /// Forget the remembered bound port of a listener that has stopped for
 /// good. A restarted listener rebinds the port it bound first (so a port-0
 /// listener keeps its port across restarts); once its parent tree has been
-/// stopped, that memory must go. `stop` calls this itself. Returns whether
-/// a port was remembered: a caller that knows the listener ran warns when
-/// it was not.
+/// stopped, that memory must go. `stop` calls this itself, and a tree
+/// that exits with nothing left to restart it, and no holder (`hold`),
+/// forgets its port on its own. Returns whether a port was remembered: a
+/// caller that knows the listener ran warns when it was not.
 pub fn release(listener: Listener) -> Bool {
   let forgot = ffi_conns_forget_port(listener.conns)
   log.debug(
@@ -435,6 +512,13 @@ pub fn get_ws_connection_count_for_ip(
 /// Pids of the live connection handler processes.
 pub fn get_connection_pids(listener: Listener) -> List(process.Pid) {
   ffi_conns_children(listener.conns)
+}
+
+/// The process that erases the listener's remembered entries once nothing
+/// can restart or release it (see `hold`). `Error(Nil)` once they are gone.
+@internal
+pub fn keeper(listener: Listener) -> Result(process.Pid, Nil) {
+  ffi_conns_keeper(listener.conns)
 }
 
 /// Pid of the listener's current connection owner process.
@@ -573,6 +657,12 @@ fn ffi_conns_get_port(name: ConnsName) -> Int
 
 @external(erlang, "brazier_http_conns", "forget_port")
 fn ffi_conns_forget_port(name: ConnsName) -> Bool
+
+@external(erlang, "brazier_http_conns", "keep")
+fn ffi_conns_keep(name: ConnsName, holder: process.Pid) -> Bool
+
+@external(erlang, "brazier_http_conns", "keeper")
+fn ffi_conns_keeper(name: ConnsName) -> Result(process.Pid, Nil)
 
 @external(erlang, "brazier_http_conns", "count")
 fn ffi_conns_count(name: ConnsName) -> Int
