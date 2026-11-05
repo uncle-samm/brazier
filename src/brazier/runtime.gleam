@@ -206,6 +206,13 @@ pub type RuntimeMessage(msg) {
   /// process the app linked) exited, or a process sent the runtime an
   /// exit. Delivered by the VM; nothing sends it.
   ExitTrapped(exit: process.ExitMessage)
+  /// A process the runtime monitors went down: the owner of a registered
+  /// connection's subject (its transport handler). The runtime monitors
+  /// each connection's owner when it registers, as `Phoenix.Channel.Server`
+  /// monitors its transport pid, so a handler that exits without sending
+  /// `ClientDisconnected` is still forgotten. Delivered by the VM; nothing
+  /// sends it.
+  ConnectionOwnerDown(down: process.Down)
 }
 
 /// The runtime's internal state. `model` is the app's server state (for
@@ -224,8 +231,12 @@ pub type RuntimeState(model, msg) {
       transport.ConnectionId,
       Subject(transport.InternalMessage),
     ),
+    /// The monitor on each registered connection's subject owner. Same
+    /// keys as `connections`: both are set together on `ClientConnected`
+    /// and removed together by `forget_connection`.
+    owner_monitors: Dict(transport.ConnectionId, process.Monitor),
     /// Connections that completed a join. Only these receive patches and
-    /// may send events.
+    /// may send events. Always a subset of `connections`.
     joined: Set(transport.ConnectionId),
     /// Per-connection acknowledged event clock.
     client_acks: Dict(transport.ConnectionId, Int),
@@ -640,6 +651,7 @@ fn spawn_actor(
           update: config.update,
           decode_event: config.decode_event,
           connections: dict.new(),
+          owner_monitors: dict.new(),
           joined: set.new(),
           client_acks: dict.new(),
           revision: 0,
@@ -673,6 +685,10 @@ fn spawn_actor(
         process.new_selector()
         |> process.select(subject)
         |> process.select_trapped_exits(ExitTrapped)
+        // Every DOWN: the runtime's own monitors are the connection owner
+        // monitors; a process.call made in the runtime receives its own
+        // DOWN in its selective receive before the actor loop sees it.
+        |> process.select_monitors(ConnectionOwnerDown)
         |> effect.select_after_timers(EffectTimerFired)
 
       actor.initialised(state)
@@ -879,34 +895,27 @@ fn handle_message(
   message: RuntimeMessage(msg),
 ) -> actor.Next(RuntimeState(model, msg), RuntimeMessage(msg)) {
   case message {
-    ClientConnected(conn_id, subject) -> {
-      let state = case dict.has_key(state.connections, conn_id) {
+    ClientConnected(conn_id, subject) ->
+      actor.continue(register_connection(state, conn_id, subject))
+
+    ClientDisconnected(conn_id) ->
+      case dict.has_key(state.connections, conn_id) {
         True -> {
-          log.warning(
-            "brazier.runtime",
-            "Connection "
-              <> conn_id
-              <> " registered again; it must join again before receiving updates",
-          )
-          forget_connection(state, conn_id)
+          log.info("brazier.runtime", "Client disconnected: " <> conn_id)
+          actor.continue(forget_connection(state, conn_id))
         }
+        // The runtime forgot it first: it was closed for backpressure, its
+        // handler was found gone by a send, or its owner's DOWN came first.
         False -> {
-          log.info("brazier.runtime", "Client connected: " <> conn_id)
-          state
+          log.debug(
+            "brazier.runtime",
+            "Client disconnected: " <> conn_id <> " (already forgotten)",
+          )
+          actor.continue(state)
         }
       }
-      actor.continue(
-        RuntimeState(
-          ..state,
-          connections: dict.insert(state.connections, conn_id, subject),
-        ),
-      )
-    }
 
-    ClientDisconnected(conn_id) -> {
-      log.info("brazier.runtime", "Client disconnected: " <> conn_id)
-      actor.continue(forget_connection(state, conn_id))
-    }
+    ConnectionOwnerDown(down) -> actor.continue(handle_owner_down(state, down))
 
     ClientJoined(conn_id, token, path) ->
       actor.continue(handle_join(
@@ -977,7 +986,12 @@ fn handle_message(
                     "brazier.runtime",
                     "Failed to decode event from " <> conn_id <> ": " <> err_str,
                   )
-                  send_to_conn_id(state, conn_id, transport.SendError(err_str))
+                  let state =
+                    send_to_conn_id(
+                      state,
+                      conn_id,
+                      transport.SendError(err_str),
+                    )
                   // The rejected event is still acknowledged so the client
                   // drops its optimistic state and returns to the server's
                   // model.
@@ -1088,16 +1102,134 @@ fn handle_message(
   }
 }
 
-/// Remove every trace of a connection. With no joined connection left the
-/// cache no longer describes anyone's state.
+/// Register a connection's subject and monitor its owner (the transport
+/// handler), as `Phoenix.Channel.Server` monitors its transport pid in
+/// `init_join` and stops on its `:DOWN`. A registration under an id that is
+/// already registered forgets the old one first: it must join again.
+///
+/// A subject with no owner is a named subject whose name no process holds:
+/// nothing can receive what the runtime would send, so it is refused, not
+/// registered.
+fn register_connection(
+  state: RuntimeState(model, msg),
+  conn_id: transport.ConnectionId,
+  subject: Subject(transport.InternalMessage),
+) -> RuntimeState(model, msg) {
+  case process.subject_owner(subject) {
+    Error(Nil) -> {
+      log.warning(
+        "brazier.runtime",
+        "Connection "
+          <> conn_id
+          <> " not registered: its subject is named and no process holds the name",
+      )
+      state
+    }
+    Ok(owner) -> {
+      let state = case dict.has_key(state.connections, conn_id) {
+        True -> {
+          log.warning(
+            "brazier.runtime",
+            "Connection "
+              <> conn_id
+              <> " registered again; it must join again before receiving updates",
+          )
+          forget_connection(state, conn_id)
+        }
+        False -> {
+          log.info("brazier.runtime", "Client connected: " <> conn_id)
+          state
+        }
+      }
+      // A monitor of a process that already exited fires at once (noproc),
+      // so a handler that is gone by now is forgotten when its DOWN is
+      // handled, or earlier by a send that finds it gone.
+      let monitor = process.monitor(owner)
+      RuntimeState(
+        ..state,
+        connections: dict.insert(state.connections, conn_id, subject),
+        owner_monitors: dict.insert(state.owner_monitors, conn_id, monitor),
+      )
+    }
+  }
+}
+
+/// The owner of a connection's subject went down. Its handler exited without
+/// a `ClientDisconnected` the runtime has handled yet (it crashed, was
+/// killed, or the disconnect is still queued behind this): forget the
+/// connection, as `ClientDisconnected` does. A DOWN no connection's monitor
+/// matches cannot come from `forget_connection` (it demonitors with flush),
+/// so it is logged and discarded like any message the actor does not expect.
+fn handle_owner_down(
+  state: RuntimeState(model, msg),
+  down: process.Down,
+) -> RuntimeState(model, msg) {
+  case down {
+    process.ProcessDown(monitor:, pid:, reason:) -> {
+      let owned =
+        dict.to_list(state.owner_monitors)
+        |> list.find(fn(entry) { entry.1 == monitor })
+      case owned {
+        Ok(#(conn_id, _)) -> {
+          log.info(
+            "brazier.runtime",
+            "Connection "
+              <> conn_id
+              <> " handler "
+              <> string.inspect(pid)
+              <> " went down ("
+              <> describe_down_reason(reason)
+              <> "); forgetting it",
+          )
+          forget_connection(state, conn_id)
+        }
+        Error(Nil) -> {
+          log.warning(
+            "brazier.runtime",
+            "Discarding a DOWN of "
+              <> string.inspect(pid)
+              <> " for a monitor no connection holds",
+          )
+          state
+        }
+      }
+    }
+    process.PortDown(port:, ..) -> {
+      log.warning(
+        "brazier.runtime",
+        "Discarding a DOWN of port "
+          <> string.inspect(port)
+          <> ": the runtime monitors no port",
+      )
+      state
+    }
+  }
+}
+
+fn describe_down_reason(reason: process.ExitReason) -> String {
+  case reason {
+    process.Normal -> "normal"
+    _ -> describe_exit(reason)
+  }
+}
+
+/// Remove every trace of a connection, and stop monitoring its owner. With
+/// no joined connection left the cache no longer describes anyone's state.
 fn forget_connection(
   state: RuntimeState(model, msg),
   conn_id: transport.ConnectionId,
 ) -> RuntimeState(model, msg) {
+  case dict.get(state.owner_monitors, conn_id) {
+    // Flushes a DOWN already in the mailbox, so none arrives for a
+    // connection that is no longer registered.
+    Ok(monitor) -> process.demonitor_process(monitor)
+    Error(Nil) -> Nil
+  }
   let joined = set.delete(state.joined, conn_id)
   RuntimeState(
     ..state,
     connections: dict.delete(state.connections, conn_id),
+    owner_monitors: dict.delete(state.owner_monitors, conn_id),
     joined: joined,
     client_acks: dict.delete(state.client_acks, conn_id),
     cached_model: case set.is_empty(joined) {
@@ -1141,7 +1273,6 @@ fn reject_before_join(
     conn_id,
     transport.SendError(reason: what <> " received before join"),
   )
-  state
 }
 
 /// How a join's token is checked.
@@ -1249,7 +1380,6 @@ fn handle_join(
             conn_id,
             transport.SendError(reason: join_refused_reason),
           )
-          state
         }
         Ok(state) -> accept_join(state, conn_id, path)
       }
@@ -1269,6 +1399,26 @@ fn accept_join(
   // Route changes are broadcast to the OTHER joined connections; the
   // joiner is not joined yet and gets the result in its model_sync.
   let state = route_join(state, conn_id, path)
+  case dict.has_key(state.connections, conn_id) {
+    True -> complete_join(state, conn_id)
+    // The route's error frame found the joiner gone or slow, and forgot it
+    // (logged there): there is nothing left to join.
+    False -> {
+      log.debug(
+        "brazier.runtime",
+        "Join of " <> conn_id <> " not completed: forgotten while routing it",
+      )
+      state
+    }
+  }
+}
+
+/// The rest of a join, once its route was applied: the joiner is
+/// registered.
+fn complete_join(
+  state: RuntimeState(model, msg),
+  conn_id: transport.ConnectionId,
+) -> RuntimeState(model, msg) {
   // If the cache is unusable, the other joined connections may be stale
   // too: resync everyone, not just the joiner.
   let stale_others = case state.cached_model {
@@ -1291,7 +1441,7 @@ fn accept_join(
       },
       streams: streams,
     )
-  send_stream_errors(state, [conn_id], stream_errors)
+  let state = send_stream_errors(state, [conn_id], stream_errors)
   let #(state, sent) =
     send_model_sync_to(
       state,
@@ -1312,7 +1462,12 @@ fn accept_join(
         streams: stream_session.client_holds_nothing(state.streams, conn_id),
       )
   }
-  let state = send_title_on_join(state, conn_id)
+  let state = case set.contains(state.joined, conn_id) {
+    True -> send_title_on_join(state, conn_id)
+    // A send of this join found the joiner gone or slow and forgot it
+    // (logged there); the title has no one to go to.
+    False -> state
+  }
   reconcile_subscriptions(state)
 }
 
@@ -1546,8 +1701,8 @@ fn handle_batch(
             }
           }
         })
-      case list.reverse(failures) {
-        [] -> Nil
+      let state = case list.reverse(failures) {
+        [] -> state
         [first, ..] as all ->
           send_to_conn_id(
             state,
@@ -1623,20 +1778,19 @@ fn ack_if_unchanged(
   changed: Bool,
 ) -> RuntimeState(model, msg) {
   case changed {
-    True -> Nil
+    True -> state
+    // The connection was joined when its message arrived, so if it is no
+    // longer registered a send while handling the message forgot it.
     False ->
-      send_to_conn_id(
-        state,
-        conn_id,
+      send_to_targets(state, [conn_id], fn(conn_id) {
         transport.SendPatch(
           ops_json: "[]",
           version: state.revision,
           ack_clock: ack_for(state, conn_id),
           streams_json: stream_session.empty_frame,
-        ),
-      )
+        )
+      })
   }
-  state
 }
 
 /// Why a client-reported path cannot be routed in place.
@@ -1751,7 +1905,6 @@ fn refuse_navigation(
               reason: "navigation path must be a same-origin path",
             ),
           )
-          state
         }
         BadEncoding(reason) -> {
           log.warning(
@@ -1810,7 +1963,6 @@ fn hard_navigate(
       )
     }
   }
-  state
 }
 
 /// Route a join's path: run `on_change` when its message differs from the
@@ -1864,7 +2016,6 @@ fn route_join(
             "Join from " <> conn_id <> ": " <> reason,
           )
           send_to_conn_id(state, conn_id, transport.SendError(reason: reason))
-          state
         }
       }
   }
@@ -2238,10 +2389,10 @@ fn model_not_sent(
   targets: List(transport.ConnectionId),
   reason: String,
 ) -> RuntimeState(model, msg) {
-  list.each(targets, fn(conn_id) {
-    send_to_conn_id(state, conn_id, transport.SendError(reason: reason))
+  let state = RuntimeState(..state, cached_model: NoCache)
+  send_to_targets(state, targets, fn(_conn_id) {
+    transport.SendError(reason: reason)
   })
-  RuntimeState(..state, cached_model: NoCache)
 }
 
 /// Broadcast the current model and the update's `stream_ops` to every
@@ -2266,7 +2417,10 @@ fn broadcast_model(
   let targets = set.to_list(state.joined)
   let update = stream_session.apply(state.streams, stream_ops, targets, event)
   let state = RuntimeState(..state, streams: update.streams)
-  send_stream_errors(state, targets, update.errors)
+  let state = send_stream_errors(state, targets, update.errors)
+  // A connection the error frames found gone or slow was forgotten; the
+  // model frame goes to the ones still joined.
+  let targets = list.filter(targets, set.contains(state.joined, _))
   case targets {
     [] -> {
       log.debug(
@@ -2318,10 +2472,10 @@ fn send_stream_errors(
   state: RuntimeState(model, msg),
   targets: List(transport.ConnectionId),
   errors: List(String),
-) -> Nil {
-  list.each(errors, fn(reason) {
-    list.each(targets, fn(conn_id) {
-      send_to_conn_id(state, conn_id, transport.SendError(reason: reason))
+) -> RuntimeState(model, msg) {
+  list.fold(errors, state, fn(state, reason) {
+    send_to_targets(state, targets, fn(_conn_id) {
+      transport.SendError(reason: reason)
     })
   })
 }
@@ -2334,9 +2488,9 @@ fn send_stream_only(
   state: RuntimeState(model, msg),
   targets: List(transport.ConnectionId),
   update: stream_session.Update,
-) -> Bool {
+) -> #(RuntimeState(model, msg), Bool) {
   case stream_session.has_entries(update) {
-    False -> False
+    False -> #(state, False)
     True -> {
       log.debug(
         "brazier.runtime",
@@ -2347,19 +2501,16 @@ fn send_stream_only(
           <> int.to_string(list.length(targets))
           <> " connection(s)",
       )
-      list.each(targets, fn(conn_id) {
-        send_to_conn_id(
-          state,
-          conn_id,
+      let state =
+        send_to_targets(state, targets, fn(conn_id) {
           transport.SendPatch(
             ops_json: "[]",
             version: state.revision,
             ack_clock: ack_for(state, conn_id),
             streams_json: stream_session.frame(update, conn_id),
-          ),
-        )
-      })
-      True
+          )
+        })
+      #(state, True)
     }
   }
 }
@@ -2393,7 +2544,7 @@ fn title_went_over_limit(
   state: RuntimeState(model, msg),
   targets: List(transport.ConnectionId),
   size: Int,
-) -> Nil {
+) -> RuntimeState(model, msg) {
   log.error(
     "brazier.runtime",
     "Title went over the limit: "
@@ -2424,19 +2575,15 @@ fn report_title_too_large(
   state: RuntimeState(model, msg),
   targets: List(transport.ConnectionId),
   size: Int,
-) -> Nil {
-  list.each(targets, fn(conn_id) {
-    send_to_conn_id(
-      state,
-      conn_id,
-      transport.SendError(
-        reason: "Title too large: "
-        <> int.to_string(size)
-        <> " bytes exceeds the "
-        <> int.to_string(title_max_bytes)
-        <> " byte limit",
-      ),
-    )
+) -> RuntimeState(model, msg) {
+  let reason =
+    "Title too large: "
+    <> int.to_string(size)
+    <> " bytes exceeds the "
+    <> int.to_string(title_max_bytes)
+    <> " byte limit"
+  send_to_targets(state, targets, fn(_conn_id) {
+    transport.SendError(reason: reason)
   })
 }
 
@@ -2460,7 +2607,8 @@ fn send_title_on_join(
           log_title_back_within_limit(string.byte_size(title))
       }
       log.debug("brazier.runtime", "Sending title to joined " <> conn_id)
-      send_to_conn_id(state, conn_id, transport.SendTitle(title: title))
+      let state =
+        send_to_conn_id(state, conn_id, transport.SendTitle(title: title))
       // The other joined connections were synced before this join (a route
       // change is broadcast to them first), so they all have this title.
       RuntimeState(
@@ -2469,7 +2617,7 @@ fn send_title_on_join(
       )
     }
     Error(size) -> {
-      case state.title_sync {
+      let state = case state.title_sync {
         TitleWithinLimit(_) -> title_went_over_limit(state, [conn_id], size)
         TitleOverLimit(_) -> {
           // Already logged for this time over the limit; this connection
@@ -2510,8 +2658,8 @@ fn sync_title(
           last_sent
         }
       }
-      case last_sent == Some(title) {
-        True -> Nil
+      let state = case last_sent == Some(title) {
+        True -> state
         False -> {
           log.info(
             "brazier.runtime",
@@ -2519,8 +2667,8 @@ fn sync_title(
               <> int.to_string(list.length(targets))
               <> " connection(s)",
           )
-          list.each(targets, fn(conn_id) {
-            send_to_conn_id(state, conn_id, transport.SendTitle(title: title))
+          send_to_targets(state, targets, fn(_conn_id) {
+            transport.SendTitle(title: title)
           })
         }
       }
@@ -2532,7 +2680,7 @@ fn sync_title(
     Error(size) ->
       case state.title_sync {
         TitleWithinLimit(last_sent:) -> {
-          title_went_over_limit(state, targets, size)
+          let state = title_went_over_limit(state, targets, size)
           RuntimeState(..state, title_sync: TitleOverLimit(last_sent:))
         }
         TitleOverLimit(_) -> {
@@ -2563,19 +2711,22 @@ fn broadcast_to(
   case check_model_size(model_bytes, "broadcast") {
     TooLarge(size) -> {
       let state = model_too_large(state, targets, size, "broadcast")
-      #(state, send_stream_only(state, targets, update), 0)
+      let #(state, sent) = send_stream_only(state, targets, update)
+      #(state, sent, 0)
     }
     SizeOk ->
       case diff_snapshot(state.cached_model, model_json) {
         InvalidJson(reason) -> {
           let state = model_invalid(state, targets, reason, "broadcast")
-          #(state, send_stream_only(state, targets, update), 0)
+          let #(state, sent) = send_stream_only(state, targets, update)
+          #(state, sent, 0)
         }
         Unchanged(snapshot) -> {
           log.debug("brazier.runtime", "Model unchanged, skipping broadcast")
           let state =
             RuntimeState(..state, cached_model: FullModelCache(snapshot))
-          #(state, send_stream_only(state, targets, update), 0)
+          let #(state, sent) = send_stream_only(state, targets, update)
+          #(state, sent, 0)
         }
         Changed(ops_json, snapshot) -> {
           let revision = state.revision + 1
@@ -2589,18 +2740,17 @@ fn broadcast_to(
             "brazier.runtime",
             "Broadcasting patch revision " <> int.to_string(revision),
           )
-          list.each(targets, fn(conn_id) {
-            send_to_conn_id(
-              state,
-              conn_id,
+          // The cache is set first: a connection forgotten below that
+          // leaves none joined drops it again (`forget_connection`).
+          let state =
+            send_to_targets(state, targets, fn(conn_id) {
               transport.SendPatch(
                 ops_json: ops_json,
                 version: revision,
                 ack_clock: ack_for(state, conn_id),
                 streams_json: stream_session.frame(update, conn_id),
-              ),
-            )
-          })
+              )
+            })
           #(state, True, string.byte_size(ops_json))
         }
         Resync(snapshot) -> {
@@ -2666,18 +2816,18 @@ fn send_snapshot_to(
   frames: fn(transport.ConnectionId) -> String,
 ) -> RuntimeState(model, msg) {
   let model_json = patch.snapshot_json(snapshot)
-  list.each(targets, fn(conn_id) {
-    send_to_conn_id(
-      state,
-      conn_id,
+  // The cache is set first: a connection forgotten below that leaves none
+  // joined drops it again (`forget_connection`).
+  let state = RuntimeState(..state, cached_model: FullModelCache(snapshot))
+  let state =
+    send_to_targets(state, targets, fn(conn_id) {
       transport.SendModelSync(
         model_json: model_json,
         version: state.revision,
         ack_clock: ack_for(state, conn_id),
         streams_json: frames(conn_id),
-      ),
-    )
-  })
+      )
+    })
   log.debug(
     "brazier.runtime",
     "Sent model_sync ("
@@ -2688,7 +2838,7 @@ fn send_snapshot_to(
       <> int.to_string(list.length(targets))
       <> " connection(s)",
   )
-  RuntimeState(..state, cached_model: FullModelCache(snapshot))
+  state
 }
 
 /// Full resync for one connection (or all joined ones when the cache is
@@ -2801,30 +2951,85 @@ fn stop_listener(listener: Option(Subject(ListenerCommand))) -> Nil {
 
 const max_outbound_mailbox_messages = 1000
 
-/// Send to a registered connection by id (logged when it is unknown).
+/// Send a reply to the connection whose message is being handled, by id.
+/// An id that is not registered is logged and nothing is sent. The returned
+/// state has forgotten the connection when the send found it slow (it was
+/// told to close) or gone (see `send_to_connection`).
 fn send_to_conn_id(
   state: RuntimeState(model, msg),
   conn_id: transport.ConnectionId,
   message: transport.InternalMessage,
-) -> Nil {
+) -> RuntimeState(model, msg) {
   case dict.get(state.connections, conn_id) {
-    Ok(subject) -> send_to_connection(conn_id, subject, message)
-    Error(Nil) ->
+    Ok(subject) -> send_to_connection(state, conn_id, subject, message)
+    Error(Nil) -> {
       log.warning(
         "brazier.runtime",
         "Cannot send to unregistered connection " <> conn_id,
       )
+      state
+    }
   }
 }
 
+/// Send to each of `targets` the message `message_for` builds for it, in
+/// order. Every caller passes connections that were registered when the
+/// runtime began handling the current message (joined connections, or the
+/// connection being joined), so a target that is no longer registered was
+/// forgotten by an earlier send of this same message (logged there) and is
+/// skipped. The returned state has forgotten every target a send found slow
+/// or gone.
+fn send_to_targets(
+  state: RuntimeState(model, msg),
+  targets: List(transport.ConnectionId),
+  message_for: fn(transport.ConnectionId) -> transport.InternalMessage,
+) -> RuntimeState(model, msg) {
+  list.fold(targets, state, fn(state, conn_id) {
+    case dict.get(state.connections, conn_id) {
+      Ok(subject) ->
+        send_to_connection(state, conn_id, subject, message_for(conn_id))
+      Error(Nil) -> {
+        log.debug(
+          "brazier.runtime",
+          "Not sending to " <> conn_id <> ": forgotten earlier in this update",
+        )
+        state
+      }
+    }
+  })
+}
+
+/// Send `message` to a registered connection, unless it cannot take it:
+///
+/// - its handler has exited (no mailbox): it is gone, not slow. It is
+///   forgotten, logged once at info; its `ClientDisconnected` or its owner's
+///   DOWN, when either arrives, finds it already forgotten.
+/// - its mailbox holds more than `max_outbound_mailbox_messages`: it is told
+///   to close (`CloseForBackpressure`, which the transport answers with an
+///   `error` frame and close 1013) and forgotten at once, so it is warned
+///   about and told to close once, not again on every later broadcast.
 fn send_to_connection(
+  state: RuntimeState(model, msg),
   conn_id: transport.ConnectionId,
   subject: Subject(transport.InternalMessage),
   message: transport.InternalMessage,
-) -> Nil {
-  case process.subject_owner(subject) {
-    Ok(pid) -> {
-      let queue_len = process_message_queue_len(pid)
+) -> RuntimeState(model, msg) {
+  let queue_len = case process.subject_owner(subject) {
+    Ok(pid) ->
+      process_message_queue_len(pid)
+      |> result.replace_error("handler " <> string.inspect(pid) <> " exited")
+    // A named subject whose name was released after it registered.
+    Error(Nil) -> Error("no process holds its subject's name")
+  }
+  case queue_len {
+    Error(why) -> {
+      log.info(
+        "brazier.runtime",
+        "Connection " <> conn_id <> " is gone (" <> why <> "); forgetting it",
+      )
+      forget_connection(state, conn_id)
+    }
+    Ok(queue_len) ->
       case queue_len > max_outbound_mailbox_messages {
         True -> {
           log.warning(
@@ -2835,7 +3040,7 @@ fn send_to_connection(
               <> int.to_string(max_outbound_mailbox_messages)
               <> " messages ("
               <> int.to_string(queue_len)
-              <> "); closing slow client",
+              <> "); closing slow client and forgetting it",
           )
           process.send(
             subject,
@@ -2843,22 +3048,20 @@ fn send_to_connection(
               reason: "Connection is too far behind; reconnect to resync",
             ),
           )
+          forget_connection(state, conn_id)
         }
-        False -> process.send(subject, message)
+        False -> {
+          process.send(subject, message)
+          state
+        }
       }
-    }
-    Error(Nil) -> {
-      log.warning(
-        "brazier.runtime",
-        "Cannot send to connection " <> conn_id <> ": subject has no owner",
-      )
-      Nil
-    }
   }
 }
 
+/// The length of a local process's mailbox, or `Error(Nil)` when the
+/// process has exited.
 @external(erlang, "brazier_runtime_ffi", "message_queue_len")
-fn process_message_queue_len(pid: Pid) -> Int
+fn process_message_queue_len(pid: Pid) -> Result(Int, Nil)
 
 /// The telemetry `event` of an app message: its constructor name in
 /// snake_case (the atom the BEAM uses for it), or

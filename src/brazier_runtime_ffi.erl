@@ -127,8 +127,16 @@ try_load(Name, Arity) ->
             {error, nil}
     end.
 
+%% {ok, Len} for a live process, {error, nil} for one that has exited: a
+%% dead process has no mailbox, so there is no length to report and the
+%% caller must handle it as gone, never as slow.
+%%
+%% The pid must be local. A connection's subject is owned by its transport
+%% handler, which runs on the runtime's node (the handler starts the runtime
+%% or sends it ClientConnected); process_info raises badarg on a remote pid,
+%% which crashes the runtime loudly if that invariant is ever broken.
 message_queue_len(Pid) ->
     case erlang:process_info(Pid, message_queue_len) of
-        {message_queue_len, Len} -> Len;
-        undefined -> 1000000000
+        {message_queue_len, Len} -> {ok, Len};
+        undefined -> {error, nil}
     end.
