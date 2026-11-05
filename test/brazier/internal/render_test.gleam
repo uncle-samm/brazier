@@ -320,3 +320,42 @@ pub fn attribute_name_href_animation_policy_test() {
   let assert False = render.is_allowed_attribute("srcdoc", "x")
   let assert False = render.is_allowed_attribute("onload", "x")
 }
+
+/// The `attributeName` value is folded in ASCII. A value that names `href`
+/// only after Unicode folding, or that looks like it, names no attribute
+/// for the browser (SVG attribute names are matched code point by code
+/// point), so it is allowed; every ASCII case of `href` is refused.
+pub fn attribute_name_href_check_folds_ascii_only_test() {
+  // Fullwidth `ｈｒｅｆ`, and `href` with a combining mark on the `h`.
+  let assert True =
+    render.is_allowed_attribute(
+      "attributeName",
+      "\u{FF48}\u{FF52}\u{FF45}\u{FF46}",
+    )
+  let assert True = render.is_allowed_attribute("attributeName", "h\u{0301}ref")
+  // A Kelvin sign next to `href` changes nothing: the `href` is still there.
+  let assert False =
+    render.is_allowed_attribute("attributeName", "\u{212A}:href")
+  let assert False = render.is_allowed_attribute("attributeName", "xlink:HrEf")
+}
+
+/// ASCII folding refuses the same `attributeName` values Unicode folding
+/// did: no character outside ASCII lowercases to `h`, `r`, `e` or `f`.
+pub fn attribute_name_href_check_matches_unicode_oracle_test() {
+  let pieces = [
+    "h", "H", "r", "R", "e", "E", "f", "F", "\u{212A}", "\u{0130}", "\u{0301}",
+    "\u{FF48}", ":", "x",
+  ]
+  let values = samples(pieces, 8, 5000)
+  list.each(values, fn(value) {
+    let oracle = !string.contains(string.lowercase(value), "href")
+    let assert True =
+      render.is_allowed_attribute("attributeName", value) == oracle
+      as { "the attributeName check differs on " <> string.inspect(value) }
+  })
+  let refused =
+    list.count(values, fn(value) {
+      !render.is_allowed_attribute("attributeName", value)
+    })
+  assert refused > 0 as "the samples spell href in some case"
+}

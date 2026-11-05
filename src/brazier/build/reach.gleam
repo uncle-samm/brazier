@@ -24,6 +24,7 @@
 import brazier/build/field_type
 import brazier/build/source_location
 import brazier/build/source_map.{type Segment}
+import brazier/internal/ascii
 import brazier/internal/render
 import glance
 import gleam/bit_array
@@ -539,11 +540,15 @@ fn update_usage(st: State, module: String, f: fn(Usage) -> Usage) -> State {
 
 // ----- Names -----
 
+/// Whether `name` starts with `A-Z`. Names come from glance, whose lexer
+/// (glexer's `lex_uppercase_name` and `lex_lowercase_name`) starts an upper
+/// name with `A-Z` and a lower name with `a-z` or `_`: Gleam names are
+/// ASCII by grammar, so the first byte decides, and no Unicode case mapping
+/// is involved.
 fn is_upper_name(name: String) -> Bool {
-  case string.first(name) {
-    Ok(first) ->
-      string.uppercase(first) == first && string.lowercase(first) != first
-    Error(Nil) -> False
+  case <<name:utf8>> {
+    <<first, _:bytes>> -> first >= 0x41 && first <= 0x5a
+    _ -> False
   }
 }
 
@@ -1347,7 +1352,9 @@ fn record_call(
                       at:,
                       function:,
                       name:,
-                      attribute: string.lowercase(prefix <> name),
+                      // ASCII: `is_reserved_attribute_name` accepts
+                      // only `a-z A-Z 0-9 - _ : .`.
+                      attribute: ascii.lowercase(prefix <> name),
                       written: written_name(argument),
                     ),
                   )

@@ -9,6 +9,7 @@
 ///
 /// Anything the codecs cannot encode becomes `UnsupportedType` with a reason,
 /// so the analyzer can fail the build naming the type and field.
+import brazier/internal/ascii
 import glance
 import gleam/dict.{type Dict}
 import gleam/int
@@ -331,9 +332,12 @@ pub fn type_alias_def(scope: Scope, alias: glance.TypeAlias) -> TypeDef {
   }
 }
 
-/// The JSON string an enum variant is encoded as.
+/// The JSON string an enum variant is encoded as: its name with `A-Z`
+/// lowercased. A variant name is a Gleam upper name, `[A-Z][A-Za-z0-9]*`
+/// by glexer's `lex_uppercase_name`, so it is ASCII and ASCII folding is
+/// its whole lowercase.
 pub fn enum_wire_name(variant: String) -> String {
-  string.lowercase(variant)
+  ascii.lowercase(variant)
 }
 
 /// Replace references to type aliases with what they alias. `aliases` maps

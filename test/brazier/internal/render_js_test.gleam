@@ -9,11 +9,11 @@
 //// The test writes a small JavaScript-target project in
 //// `build/brazier_render_js_check` with copies of `render.gleam` (and the
 //// `stream_op.gleam` it imports), `url.gleam` (and the `ascii.gleam` it
-//// imports), `brazier_render_ffi.mjs` and the client `brazier/log` shim,
-//// as the client build copies them. It writes the inputs (the pseudo-random
-//// strings of `render_test` plus URL payloads), runs the project under node,
-//// and compares every result with the Erlang one. It needs `node`, like the
-//// client build.
+//// imports), `brazier_render_ffi.mjs`, `brazier_ascii_ffi.mjs` and the
+//// client `brazier/log` shim, as the client build copies them. It writes
+//// the inputs (the pseudo-random strings of `render_test` plus URL
+//// payloads), runs the project under node, and compares every result with
+//// the Erlang one. It needs `node`, like the client build.
 
 import brazier/build/client_shim
 import brazier/build/files
@@ -49,7 +49,8 @@ const url_payloads = [
   "data:text/html,<script>alert(1)</script>", "data:\u{0E33}image/png,AA",
   "data:image/png;base64,AA", "data:IMAGE/PNG,AA", "data:image/png", "1http:x",
   "java script:x", "A+B.C:x", "\u{212A}http:x", "mailto:a@b.c", "XLink:Href",
-  "xlin\u{212A}:href", "HREF",
+  "xlin\u{212A}:href", "HREF", "\u{FF48}\u{FF52}\u{FF45}\u{FF46}",
+  "h\u{0301}ref", "xlink:HrEf",
 ]
 
 pub fn javascript_ffi_matches_erlang_test_() -> Timeout {
@@ -176,6 +177,7 @@ fn write_project(inputs: List(String)) -> Nil {
       copy("src/brazier/internal/stream_op.gleam"),
     ),
     #("src/brazier_render_ffi.mjs", copy("src/brazier_render_ffi.mjs")),
+    #("src/brazier_ascii_ffi.mjs", copy("src/brazier_ascii_ffi.mjs")),
     #("src/brazier/log.gleam", client_shim.log_module),
     #("src/render_js_check.gleam", check_source),
     #("src/render_js_check_ffi.mjs", check_ffi_source),

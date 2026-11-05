@@ -45,17 +45,6 @@ export function is_event_name(name) {
   return true;
 }
 
-// `name` with `A-Z` lowercased, every other code unit unchanged. Callers
-// pass names `is_markup_name` accepted, which are ASCII, so this is
-// `toLowerCase` for them.
-const UPPER_TEST = /[A-Z]/;
-const UPPER_ALL = /[A-Z]+/g;
-const lowerRun = (upper) => upper.toLowerCase();
-
-export function ascii_lowercase(name) {
-  return UPPER_TEST.test(name) ? name.replace(UPPER_ALL, lowerRun) : name;
-}
-
 const ENTITIES = { "&": "&amp;", '"': "&quot;", "<": "&lt;", ">": "&gt;" };
 const replaceEntity = (character) => ENTITIES[character];
 

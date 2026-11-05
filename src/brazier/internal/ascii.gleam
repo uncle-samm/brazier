@@ -19,9 +19,11 @@
 /// a string holding one never equals an ASCII string it does not already
 /// equal. Text with no `A-Z` is returned without a copy.
 ///
-/// The byte scan lives in the render's FFI, the first user of it.
-@external(erlang, "brazier_render_ffi", "ascii_lowercase")
-@external(javascript, "../../brazier_render_ffi.mjs", "ascii_lowercase")
+/// This is the one ASCII folding on each target (`brazier_ascii_ffi`); the
+/// render folds every attribute name of every render with it, so it scans
+/// bytes (code units) in the FFI rather than walking a `BitArray` here.
+@external(erlang, "brazier_ascii_ffi", "lowercase")
+@external(javascript, "../../brazier_ascii_ffi.mjs", "lowercase")
 pub fn lowercase(text: String) -> String
 
 /// Whether `text` is an RFC 9110 token (§5.6.2): one or more of the

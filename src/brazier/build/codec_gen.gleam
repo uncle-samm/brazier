@@ -40,6 +40,7 @@ import brazier/build/gleam_code.{
   ListExpr, PCtor, PDiscard, PString, PVar, Param, Ref, Str, TNamed, TupleExpr,
   TupleIndex, Var,
 }
+import brazier/internal/ascii
 import gleam/dict.{type Dict}
 import gleam/int
 import gleam/list
@@ -877,12 +878,17 @@ fn module_tag(path: String) -> String {
   string.replace(path, "/", "__")
 }
 
+/// `name`, a Gleam type name (`[A-Z][A-Za-z0-9]*` by glexer's
+/// `lex_uppercase_name`, so ASCII), in snake case: each `A-Z` after the
+/// first character becomes `_` and its lowercase. The folding is ASCII,
+/// as the grammar is: a Unicode case mapping has nothing more to map.
 fn snake_case(name: String) -> String {
   string.to_graphemes(name)
   |> list.index_map(fn(c, index) {
-    case index > 0 && string.uppercase(c) == c && string.lowercase(c) != c {
-      True -> "_" <> string.lowercase(c)
-      False -> string.lowercase(c)
+    let lower = ascii.lowercase(c)
+    case index > 0 && lower != c {
+      True -> "_" <> lower
+      False -> lower
     }
   })
   |> string.concat

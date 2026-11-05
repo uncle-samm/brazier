@@ -15,7 +15,8 @@
 ///
 /// The module is target-neutral: it is compiled to JavaScript for the
 /// client bundle and to Erlang for SSR. Name checks and escaping, which run
-/// for every node, are in `brazier_render_ffi` on each target.
+/// for every node, are in `brazier_render_ffi` on each target; the ASCII
+/// case folding of names is `brazier/internal/ascii`'s.
 ///
 /// A stream (`brazier/stream.render`) renders as its container element,
 /// with `data-brazier-stream="<name>"`, and lists the container in the
@@ -28,6 +29,7 @@
 ///
 /// Reference: Lustre's `vdom/vnode` and `vdom/vattr`, LiveView's
 /// `phx-click` bindings, LiveView's `phx-update="stream"` containers.
+import brazier/internal/ascii
 import brazier/internal/stream_op
 import brazier/internal/url
 import brazier/log
@@ -714,7 +716,7 @@ fn append_events(
 ///   `attribute.unsafe_srcdoc`;
 /// - the reserved `data-brazier-*` names (`is_reserved_attribute_name`).
 pub fn is_valid_attribute_name(name: String) -> Bool {
-  is_markup_name(name) && !is_refused_name(ascii_lowercase(name))
+  is_markup_name(name) && !is_refused_name(ascii.lowercase(name))
 }
 
 /// The prefix of the attributes Brazier's client reads and the render or the
@@ -755,7 +757,7 @@ pub const key_attribute = "data-brazier-key"
 /// attribute a view builds, and a build check can use this to refuse a
 /// name it can know before the view runs.
 pub fn is_reserved_attribute_name(name: String) -> Bool {
-  is_markup_name(name) && is_reserved_name(ascii_lowercase(name))
+  is_markup_name(name) && is_reserved_name(ascii.lowercase(name))
 }
 
 /// Whether attribute `name` may carry `value`: the name is valid
@@ -763,18 +765,31 @@ pub fn is_reserved_attribute_name(name: String) -> Bool {
 /// attribute is not an SVG animation target of `href` or `xlink:href`. An
 /// `<animate>` or `<set>` with `attributeName="href"` rewrites a link's URL
 /// in the browser after the URL policy has checked it, so any
-/// `attributeName` whose value contains `href` (in any case) is refused.
+/// `attributeName` whose value contains `href` in any ASCII case is
+/// refused.
 ///
-/// Reference: DOMPurify refuses `attributeName` values matching `href`
-/// (GHSA-c6gr-qvv4-5v3f).
+/// The value is folded in ASCII (`ascii.lowercase`), not Unicode. The
+/// value names an attribute, and attribute names are matched code point by
+/// code point: SVG attribute names are case-sensitive, so a browser
+/// animates `href` only for `attributeName="href"` (or `xlink:href`), and
+/// a lookalike such as fullwidth `ｈｒｅｆ` names no attribute. Ignoring
+/// ASCII case refuses more than the browser would act on, which costs
+/// nothing. Unicode folding would refuse nothing more: the only characters
+/// outside ASCII that lowercase into ASCII are the Kelvin sign U+212A
+/// (to `k`) and U+0130 (to `i` and a combining dot), and neither gives an
+/// `h`, `r`, `e` or `f`.
+///
+/// Reference: DOMPurify refuses an `attributeName` whose value matches
+/// `href` (GHSA-c6gr-qvv4-5v3f; `stringMatch(value, 'href')`, which is
+/// case-sensitive, so Brazier's ASCII-insensitive check is the stricter).
 pub fn is_allowed_attribute(name: String, value: String) -> Bool {
   is_markup_name(name)
   && {
-    let lower = ascii_lowercase(name)
+    let lower = ascii.lowercase(name)
     !is_refused_name(lower)
     && !{
       lower == "attributename"
-      && string.contains(string.lowercase(value), "href")
+      && string.contains(ascii.lowercase(value), "href")
     }
   }
 }
@@ -806,18 +821,6 @@ pub fn is_valid_tag_name(tag: String) -> Bool {
 pub fn is_valid_event_name(name: String) -> Bool {
   is_event_name(name)
 }
-
-/// `name` with `A-Z` lowercased and every other byte (code unit on
-/// JavaScript) unchanged. A name without `A-Z` is returned as it is.
-///
-/// Callers pass names `is_markup_name` accepted, which are ASCII, so this is
-/// `string.lowercase` for them. It runs for every attribute of every render;
-/// on Erlang `string.lowercase` (OTP's `string:lowercase/1`) raises and
-/// catches an exception internally for each name that is already lowercase,
-/// which costs about 0.1 µs a name.
-@external(erlang, "brazier_render_ffi", "ascii_lowercase")
-@external(javascript, "../../brazier_render_ffi.mjs", "ascii_lowercase")
-fn ascii_lowercase(name: String) -> String
 
 /// One or more of `a-z A-Z 0-9 - _ : .`, scanned byte by byte (code unit by
 /// code unit on JavaScript): every non-ASCII character refuses the name.
