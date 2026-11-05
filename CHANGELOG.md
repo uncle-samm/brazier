@@ -444,6 +444,12 @@ open follow-ups), which is in progress.
 
 ### Changed
 
+- (M118 otp-listdir) Brazier lists and deletes directories with find(1),
+  started without a shell (`brazier_dir_ffi`), and returns names as they
+  are stored, not NFC-composed. A name that is not valid UTF-8 is an error
+  naming the directory and the name's bytes; lint reports it as
+  `unreadable-path`. The build, `brazier/dev` and `brazier/lint` need
+  `find` on the `PATH`; a running app never lists directories.
 - (M118 residue-3) `application.start_supervised` starts an empty root
   supervisor (`brazier_app_sup.erl`) and adds its children one by one, as
   Ranch adds a listener to `ranch_sup`. Restart behaviour is unchanged
@@ -804,6 +810,12 @@ open follow-ups), which is in progress.
 
 ### Fixed
 
+- (M118 otp-listdir) On macOS the build, the client bundle publish, lint
+  and dev reload no longer hang on a directory holding a file whose name
+  starts with a combining mark. OTP's file-name decoder frees the list it
+  returns for such a name (`cleanup_norm` in `erl_unicode.c`), so
+  `file:list_dir/1` and everything built on it never return
+  (docs/design/OTP_LIST_DIR_HANG.md; Linux is not affected).
 - (M118 residue-3) `brazier.start` on a port it cannot bind returns the
   cause (`Supervision tree failed to start: cannot listen on port N:
   eaddrinuse (address already in use)`) instead of `InitFailed("shutdown")`,
@@ -1119,6 +1131,9 @@ open follow-ups), which is in progress.
 
 ### Security
 
+- (M118 otp-listdir) A file named with a leading combining mark in an
+  app's static or source directory can no longer stall a build or dev
+  server on macOS until it is killed with SIGKILL.
 - (M118 residue-3) Static file paths are checked as bytes, not grapheme
   clusters: a combining mark after `.`, `/`, `\` or an encoded escape
   (`%2f` + U+0301) no longer hides a traversal or a separator

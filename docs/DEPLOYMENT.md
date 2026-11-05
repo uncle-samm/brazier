@@ -15,7 +15,12 @@ It finds the app module (the one that calls `brazier.start`, including through
 not count), generates the server codec `src/brazier_codec.gleam`, runs
 `gleam build`, and writes the client bundle
 `priv/static/brazier_client_<hash>.js` with `priv/static/brazier_client.manifest`
-naming it. It needs `node` and `npx` (esbuild is pinned and fetched by `npx`).
+naming it. It needs `node` and `npx` (esbuild is pinned and fetched by `npx`),
+and `find` on the `PATH`: the build, `brazier/dev` and `brazier/lint` list
+directories with find(1), because OTP's own listing never returns on macOS
+for a file name that starts with a combining mark
+([design/OTP_LIST_DIR_HANG.md](design/OTP_LIST_DIR_HANG.md)). macOS, GNU
+and BusyBox `find` all work.
 
 The client code compiles in a generated project,
 `build/brazier_client_app`, whose `manifest.toml` is copied from the app's:

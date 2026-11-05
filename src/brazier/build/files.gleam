@@ -1,5 +1,12 @@
 /// File system helpers for the build. Every failure is an `Error` naming the
 /// path and the operation, so a build step can never fail silently.
+///
+/// Directories are listed by `brazier_dir_ffi`, never by `simplifile` or
+/// `file:list_dir/1`: on macOS OTP's listing never returns for a directory
+/// holding a name that starts with a combining mark, and takes the VM's file
+/// server with it (docs/design/OTP_LIST_DIR_HANG.md). Every listing and
+/// recursive delete in `src/` goes through `list_directory`, `list_files`
+/// and `delete_if_exists` here, or calls `brazier_dir_ffi` directly.
 import brazier/log
 import gleam/list
 import gleam/result
@@ -60,8 +67,9 @@ pub fn is_directory(path: String) -> Result(Bool, String) {
   |> result.map_error(fn(err) { failure("inspect", path, err) })
 }
 
-/// Delete a file or directory. A path that does not exist is not an error;
-/// a path that exists but cannot be deleted is.
+/// Delete a file or directory, and everything below a directory. A path
+/// that does not exist is not an error; a path that exists but cannot be
+/// deleted is. A symlink is deleted, not followed.
 pub fn delete_if_exists(path: String) -> Result(Nil, String) {
   use file <- result.try(is_file(path))
   use directory <- result.try(is_directory(path))
@@ -69,25 +77,73 @@ pub fn delete_if_exists(path: String) -> Result(Nil, String) {
     False -> Ok(Nil)
     True -> {
       log.debug("brazier.build.files", "Deleting " <> path)
-      simplifile.delete(path)
-      |> result.map_error(fn(err) { failure("delete", path, err) })
+      delete_tree(path)
     }
   }
 }
 
 /// Every file below `dir`, recursively, sorted for a stable build order.
+/// A symlink is followed. An entry that is neither a file nor a directory
+/// (a socket, a FIFO, a device) is not a file and is left out, with a
+/// warning naming it.
 pub fn list_files(dir: String) -> Result(List(String), String) {
-  simplifile.get_files(dir)
+  collect_files(dir)
   |> result.map(list.sort(_, string.compare))
-  |> result.map_error(fn(err) { failure("list", dir, err) })
+}
+
+fn collect_files(dir: String) -> Result(List(String), String) {
+  use names <- result.try(list_names(dir))
+  use found, name <- list.try_fold(names, [])
+  let path = child(dir, name)
+  use info <- result.try(
+    simplifile.file_info(path)
+    |> result.map_error(fn(err) { failure("inspect", path, err) }),
+  )
+  case simplifile.file_info_type(info) {
+    simplifile.File -> Ok([path, ..found])
+    simplifile.Directory ->
+      collect_files(path) |> result.map(list.append(_, found))
+    other -> {
+      log.warning(
+        "brazier.build.files",
+        "Leaving "
+          <> path
+          <> " out of the files below "
+          <> dir
+          <> ": it is a "
+          <> string.inspect(other)
+          <> ", not a file or directory",
+      )
+      Ok(found)
+    }
+  }
+}
+
+/// `name` inside `dir`, keeping `dir` as written (`.` included), so every
+/// path `list_files` returns starts with `dir` and a `/`.
+fn child(dir: String, name: String) -> String {
+  case string.ends_with(dir, "/") {
+    True -> dir <> name
+    False -> dir <> "/" <> name
+  }
 }
 
 /// The entries directly inside `dir`, sorted.
 pub fn list_directory(dir: String) -> Result(List(String), String) {
-  simplifile.read_directory(dir)
+  list_names(dir)
   |> result.map(list.sort(_, string.compare))
-  |> result.map_error(fn(err) { failure("list", dir, err) })
 }
+
+/// The names directly inside `dir`, read as raw bytes from find(1). A path
+/// that is not a directory, and a name that is not valid UTF-8, are errors
+/// naming the path.
+@external(erlang, "brazier_dir_ffi", "list")
+fn list_names(dir: String) -> Result(List(String), String)
+
+/// Delete `path`, and everything below it when it is a directory, listing
+/// with find(1) as `list_names` does.
+@external(erlang, "brazier_dir_ffi", "delete_tree")
+fn delete_tree(path: String) -> Result(Nil, String)
 
 /// The directory part of a `/`-separated path: `a/b/c.txt` -> `a/b`, and
 /// `c.txt` -> `.`.
