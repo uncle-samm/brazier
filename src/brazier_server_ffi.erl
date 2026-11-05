@@ -1,14 +1,8 @@
 -module(brazier_server_ffi).
 %% Small process helpers for brazier/transport/server.
--export([whereis/1, stop_supervisor/1]).
+-export([stop_supervisor/1]).
 
 -define(STOP_TIMEOUT_MS, 15000).
-
-whereis(Name) when is_atom(Name) ->
-    case erlang:whereis(Name) of
-        undefined -> {error, nil};
-        Pid -> {ok, Pid}
-    end.
 
 %% Synchronously stop a supervisor that is linked to the caller.
 %% The link is removed first so the caller is not taken down (or sent an
