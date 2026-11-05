@@ -21,6 +21,7 @@
 import assert from "node:assert/strict";
 import {
   applyOps,
+  diffModels,
   escapePathSegment,
   parsePath,
   PatchError,
@@ -244,7 +245,108 @@ assert.ok(applied > 1500, `most random patches must apply (applied ${applied})`)
 assert.ok(refused > 150, `some random patches must be refused (refused ${refused})`);
 
 assert.ok(refusals.size >= 8, `every refusal kind must be hit: ${[...refusals].join("; ")}`);
-console.log(`apply equivalence ok: ${applied} applied, ${refused} refused`);
+
+// === Shifted windows: diffModels detects the shift ===
+//
+// A sliding window (drop k from the front, append m) and its mirror (insert
+// k at the front, drop m from the back) of several lengths, shift amounts
+// (0, 1, 2, half, all, more than all) and element kinds (distinct, mod 3,
+// a two-value alternation, objects), at the root and between pinned
+// elements. For every one, both apply engines must turn the diff into the
+// new model. Where the shift is plainly the cheapest edit (distinct
+// elements, 2k < n) the diff must be exactly the shift's ops; where nothing
+// overlaps (k >= n) there must be no shift. patch_vectors.mjs checks every
+// window against the server diff, op for op.
+
+const KINDS = {
+  distinct: (i) => i,
+  mod3: (i) => ((i % 3) + 3) % 3,
+  alternate: (i) => ((i & 1) === 0 ? "a" : "b"),
+  object: (i) => ({ id: i, label: "event" }),
+};
+
+function values(kind, from, to) {
+  const out = [];
+  for (let i = from; i <= to; i++) out.push(KINDS[kind](i));
+  return out;
+}
+
+const CONTEXTS = {
+  root: { wrap: (w) => w, path: "", offset: 0, suffix: false },
+  pinned: { wrap: (w) => ({ items: ["head", ...w, "foot"], n: 1 }), path: "/items", offset: 1, suffix: true },
+  footer: { wrap: (w) => ({ items: [...w, "foot"] }), path: "/items", offset: 0, suffix: true },
+};
+
+// The ops of a front shift by k (removes highest first, then the inserts),
+// or of a back shift inserting `inserted` and dropping d.
+function frontShiftOps(ctx, n, k, appended) {
+  const ops = [];
+  for (let i = ctx.offset + k - 1; i >= ctx.offset; i--) ops.push({ op: "remove", path: `${ctx.path}/${i}` });
+  if (!ctx.suffix) return [...ops, { op: "append", path: ctx.path, value: appended }];
+  appended.forEach((value, i) => ops.push({ op: "add", path: `${ctx.path}/${ctx.offset + n - k + i}`, value }));
+  return ops;
+}
+function backShiftOps(ctx, n, d, inserted) {
+  const ops = [];
+  for (let i = ctx.offset + n - 1; i >= ctx.offset + n - d; i--) ops.push({ op: "remove", path: `${ctx.path}/${i}` });
+  inserted.forEach((value, i) => ops.push({ op: "add", path: `${ctx.path}/${ctx.offset + i}`, value }));
+  return ops;
+}
+
+let windows = 0;
+let exactShifts = 0;
+let noShifts = 0;
+for (const n of [0, 1, 2, 3, 4, 5, 8, 13, 50, 200, 2000]) {
+  const amounts = [...new Set([0, 1, 2, n >> 1, Math.max(n - 1, 0), n, n + 1])];
+  for (const k of amounts) {
+    for (const m of [...new Set([0, 1, 2, k])]) {
+      for (const kind of Object.keys(KINDS)) {
+        for (const [name, ctx] of Object.entries(CONTEXTS)) {
+          const old = values(kind, 0, n - 1);
+          const front = values(kind, k, n - 1 + m);
+          // 0 - k, not -k: -k is -0 when k is 0, which JSON has no form for.
+          const back = values(kind, 0 - k, n - 1 - m);
+          for (const [direction, next] of [["front", front], ["back", back]]) {
+            const label = `${direction} n=${n} k=${k} m=${m} ${kind} ${name}`;
+            const oldModel = ctx.wrap(old);
+            const newModel = ctx.wrap(next);
+            const ops = diffModels(oldModel, newModel);
+            assert.deepEqual(applyOps(oldModel, ops), newModel, `${label}: applyOps`);
+            assert.deepEqual(referenceApplyOps(oldModel, ops), newModel, `${label}: reference`);
+            windows++;
+            if (kind !== "distinct") continue;
+            if (k >= 1 && m >= 1 && 2 * k < n) {
+              // Cheaper than pairing (at least n - k ops) and than the
+              // size guard (n - k + m elements).
+              const expected =
+                direction === "front"
+                  ? frontShiftOps(ctx, n, k, next.slice(n - k))
+                  : backShiftOps(ctx, n, m, next.slice(0, k));
+              if (direction === "front" || 2 * m < n) {
+                assert.deepEqual(ops, expected, `${label}: shift ops`);
+                exactShifts++;
+              }
+            } else if (direction === "front" && k >= n && n > 0) {
+              // Disjoint windows pair by index: surplus removes or surplus
+              // inserts, never both as a shift has.
+              const removes = ops.some((op) => op.op === "remove");
+              const inserts = ops.some((op) => op.op === "add" || op.op === "append");
+              assert.ok(!(removes && inserts), `${label}: no shift: ${JSON.stringify(ops)}`);
+              noShifts++;
+            }
+          }
+        }
+      }
+    }
+  }
+}
+assert.ok(exactShifts >= 150, `the exact shift shapes must be checked (checked ${exactShifts})`);
+assert.ok(noShifts > 50, `the disjoint windows must be checked (checked ${noShifts})`);
+
+console.log(
+  `apply equivalence ok: ${applied} applied, ${refused} refused; ` +
+    `${windows} shifted windows (${exactShifts} exact shifts, ${noShifts} disjoint)`,
+);
 
 // === Reference: the per-op copying engine before PERF-8, verbatim ===
 
