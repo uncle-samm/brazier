@@ -20,8 +20,12 @@
 //// - runtime list: the runtime's changed events against a model whose list
 ////   encodes to about 50 KB or 500 KB, so one changed field costs whatever
 ////   the per-event work on the whole model costs (encode, diff, patch).
+//// - runtime stream: brazier/bench/stream_bench, the runtime's events
+////   against a full `KeepLast(300)` stream of 1 KB lines: an append (one
+////   insert, one trim) and an update in place of the last line.
 //// - wire: a server message encoded into the WebSocket frame handed to the
-////   socket, for a one-op patch and for a model_sync of the 50 KB model.
+////   socket, for a one-op patch, for a model_sync of the 50 KB model and
+////   for a patch carrying one 1 KB stream insert.
 //// - pubsub: one broadcast timed until every one of S subscribers has it.
 //// - store: put/get/delete timed in blocks of 1000 operations.
 //// - crdt append: one value appended to a replicated list key that holds
@@ -50,6 +54,7 @@ import brazier/bench/patch_bench
 import brazier/bench/presence_bench
 import brazier/bench/report.{type Metric, LowerIsBetter, Metric}
 import brazier/bench/stats
+import brazier/bench/stream_bench
 import brazier/effect
 import brazier/error
 import brazier/log
@@ -185,6 +190,7 @@ pub fn run(prepared: Prepared) -> Result(report.Report, String) {
       #("ws", fn() { ws_scenario(app.port) }),
       #("runtime", runtime_scenario),
       #("runtime list", runtime_list_scenario),
+      #("runtime stream", stream_bench.run),
       #("wire", wire_scenario),
       #("pubsub", pubsub_scenario),
       #("store", store_scenario),
@@ -492,13 +498,15 @@ fn await_ack(rt: Runtime, clock: Int) -> Result(Nil, String) {
 
 // --- wire ---
 
-/// Encode a one-op patch and a model_sync of the 50 KB list model into the
-/// frame the transport hands the socket, in blocks of `wire_block`.
+/// Encode a one-op patch, a model_sync of the 50 KB list model and a patch
+/// carrying one 1 KB stream insert into the frame the transport hands the
+/// socket, in blocks of `wire_block`.
 /// Nanoseconds per frame, median and p99 over the blocks.
 fn wire_scenario() -> Result(List(Metric), String) {
   let model_json =
     encode_bench_model(BenchModel(count: 0, items: list_items(1000)))
   let ops_json = "[{\"op\":\"replace\",\"path\":\"/count\",\"value\":12345}]"
+  let #(stream_patch, stream_patch_bytes) = stream_bench.wire_stream_patch()
   let messages = [
     #(
       "wire.patch",
@@ -520,6 +528,7 @@ fn wire_scenario() -> Result(List(Metric), String) {
       ),
       string.byte_size(model_json),
     ),
+    #("wire.stream_patch", stream_patch, stream_patch_bytes),
   ]
   list.try_map(messages, fn(entry) {
     let #(name, msg, payload_bytes) = entry
