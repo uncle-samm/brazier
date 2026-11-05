@@ -51,6 +51,12 @@ open follow-ups), which is in progress.
   body read cut short by the request deadline is `RequestDeadlineExceeded`,
   and the error descriptions name `body_read_timeout_ms` and
   `request_timeout_ms`.
+- (M118 cluster) **Wire break (between nodes):** the replicated-store CRDT
+  context is `{context, Clock, Cloud, Floors}`, so replicas on mixed versions
+  refuse each other's payloads as malformed. Session revocation pg groups
+  are `{brazier_session, Namespace, Hash}` (SHA-256, not the raw session
+  id), so revocations don't reach nodes on an older version. Upgrade a
+  cluster all at once.
 - (M118 logs) `server.Connection` has a new `resolved` field: the client
   address the WebSocket upgrade resolved once. The middleware gate and every
   later join and navigation reuse it. Code that builds `Connection(socket:)`
@@ -257,6 +263,9 @@ open follow-ups), which is in progress.
   error. Shared delta and fault vectors are in
   `test/fixtures/stream_vectors.json`. Streams are not yet wired into
   effects, the view or the wire (`docs/design/STREAMS.md`).
+- (M118 cluster) `replicated.synced/1` is true when every peer's last
+  digest equals this replica's (and when there are no peers), and
+  `replicated.context_size/1` reports the causal context's size.
 - (M118 tests) The test runner fails a test that leaves messages in its
   mailbox and names them (`docs/TESTING.md`, "Mailbox residue"). Modules
   that still leave messages are listed in `residue_pending/0` in
@@ -641,6 +650,17 @@ open follow-ups), which is in progress.
   receive them.
 - (M118) The prebuilt runtime bundle in `priv/static` is rebuilt, so it
   carries the shifted-array diff.
+- (M118 cluster) Cluster membership is per distribution connection: a stale
+  verified row no longer survives between a disconnect and the nodedown.
+  Peer-check waits survive a cluster manager restart. Session re-checks
+  and store syncs wait until both sides have verified each other, so a
+  revocation is no longer lost while only one side has.
+- (M118 cluster) A refused replicated-store merge backs off per peer
+  (jittered, capped at max(interval, 60 s), logged as a warning). Replicas
+  raise per-node floors once in sync, so the causal context no longer
+  gains an entry on every replica restart. A replica that sees its own
+  node's floor above its incarnation logs an error, stops, and restarts
+  above it.
 - (M118 residue) Creating a named ETS table crashed the caller when the
   table owner the lookup found was gone before it was monitored (it had
   just handed its tables over, or died). The creation now looks the owner
@@ -649,6 +669,10 @@ open follow-ups), which is in progress.
   `ws_protocol_test` and `http_server_test` receive every message they
   cause. Two `http_server_test` tests that flaked on a telemetry event
   left in the mailbox now receive each event exactly.
+- (M118) The CRDT append cost test flaked because a garbage collection in
+  the test process was counted as the append's reductions. The cost is
+  now measured in a fresh process with room for the work, and a trace
+  session asserts no collection ran during it.
 - (M118 logs) A static file name longer than the file system allows is a
   404 logged at debug (as in Plug.Static), not a 500 with an error log.
 - (M118 logs) A malformed forwarding hop is logged once per WebSocket

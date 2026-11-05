@@ -753,15 +753,24 @@
 - Decision, 2026-11-05, streams D6: the server keeps each stream's keys and computes the trims; the client checks the limit and treats going over as a stream fault. The server then knows exactly what the client holds, and both sides are bounded. This differs from LiveView on purpose.
 - Decision, 2026-11-05, streams D7: the server does not decode items again. The dead render and `stream.round_trip` in tests catch a codec mismatch, and a second decode would double the per-op codec cost.
 - [x] Follow-up audit (read-only), done 2026-11-05: 30 M117 follow-ups are still open; they are listed below. The rest were fixed in later workstreams or are recorded decisions.
-- [ ] m118-cluster (started 2026-11-05; owns `brazier_session_ffi.erl`, `session.gleam`, `brazier_cluster_manager.erl`, `brazier_cluster_ffi.erl`, `cluster.gleam`, the replicated store and CRDT, and `CLUSTERING.md`): L409–412, L515–516, L716–719 below.
+- [x] m118-cluster (started 2026-11-05; owns `brazier_session_ffi.erl`, `session.gleam`, `brazier_cluster_manager.erl`, `brazier_cluster_ffi.erl`, `cluster.gleam`, the replicated store and CRDT, and `CLUSTERING.md`): L409–412, L515–516, L716–719 below.
+  - Done (merged 2026-11-05):
+    - L411 (2172a29): a member counts only on the connection it was verified on.
+    - L410 and L412 (a332d2f): waits live in `brazier_cluster_waiters`, owned by the ETS owner, so they survive a manager restart, and session re-checks and store syncs wait for mutual verification.
+    - L409 (ce8966d): session pg groups carry SHA-256(tag, namespace, id), not the raw id.
+    - L716–719 (16f2a52): `replicated.synced/1`; a refused merge backs off with jitter, capped at max(interval, 60 s); per-node floors keep the causal context bounded (at most 4 entries across 15 restarts); the delta_crdt_ex differences are documented.
+    - L515 and L516 (c6a08fa): decided to keep OTP's behaviour and document it in the CLUSTERING.md "Netsplits" section.
+  - On its branch, the cluster modules failed once in the first 10 runs (log not kept), then passed 34 runs in a row.
+  - Follow-up: the `[brazier, store, synced]` telemetry event and a `store.synced` wrapper (the agent didn't own telemetry or store.gleam).
+  - Accepted gap (documented): pg copies bindings on its own schedule, so a revocation sent before a binding arrives can miss it; the WebSocket auth re-check closes that socket later.
 - [x] m118-build (110089a, merged 2026-11-05): L267 below. All 24 examples build.
 - Decision, 2026-11-05: m118-transport's 4409 split keeps init refusals on 4000 + status, and moves the stale build to 4499. 4499 is in the reload band, so every client released since the bands existed still reloads on it. The 4600 refusal band would leave old clients reconnecting forever. `error.refuse(499, _)` becomes a programming error.
 
 **Open M117 follow-ups (audit, 2026-11-05; Lnnn are PROGRESS line numbers at d068c9b).** Real defects first.
-- [ ] L409 (security): session pg group names hold the raw session id, and any connected node, a rejected one included, can list them (`brazier_session_ffi.erl:209,288`). m118-cluster.
-- [ ] L410: await interests are lost when the cluster manager restarts (`brazier_cluster_manager.erl:128,349`). m118-cluster.
-- [ ] L411: a stale verified row survives between a disconnect and the nodedown (`brazier_cluster_ffi.erl:73`). m118-cluster.
-- [ ] L412: a revocation is lost while only one side has verified the other (`brazier_session_ffi.erl:154,330`). m118-cluster.
+- [x] L409 (security): session pg group names hold the raw session id, and any connected node, a rejected one included, can list them (`brazier_session_ffi.erl:209,288`). m118-cluster. Done in m118-cluster, see below.
+- [x] L410: await interests are lost when the cluster manager restarts (`brazier_cluster_manager.erl:128,349`). m118-cluster. Done in m118-cluster, see below.
+- [x] L411: a stale verified row survives between a disconnect and the nodedown (`brazier_cluster_ffi.erl:73`). m118-cluster. Done in m118-cluster, see below.
+- [x] L412: a revocation is lost while only one side has verified the other (`brazier_session_ffi.erl:154,330`). m118-cluster. Done in m118-cluster, see below.
 - [x] L452 (SEC-11), m118-logs 7c3adc8: three sites were still real. The `uri_check` query reason held the raw query, the 417 reason didn't quote `Expect`, and an overlong static name gave a 500. The other sites were already safe. `log_forging_paths_test` has 21 tests covering every site.
   - Follow-up: `log_path.describe` has no length cap, so a long path is logged in full (quoted, so it can't forge a line).
 - [ ] L605: a navigation refused with an `error` frame gets no ack, so its pending scroll fires on a later ack (`runtime.gleam:1565`). After m118-lifecycle.
@@ -769,8 +778,8 @@
   - `message_queue_len` returns a `Result`;
   - the runtime forgets a connection after one close or once it is dead;
   - the runtime monitors the owner pid, as Phoenix.Channel.Server does.
-- [ ] L515–516: with `NoDiscovery` a member lost to a netsplit never reconnects, and `global` can drop members on a netsplit. Neither is a recorded decision. m118-cluster (decide and document).
-- [ ] L716–719: replicated stores expose no "synced" signal; a refused merge has no retry backoff; the causal context gains a clock entry per replica restart and is never compacted; the CRDT was never checked against the `delta_crdt_ex` source. m118-cluster.
+- [x] L515–516: with `NoDiscovery` a member lost to a netsplit never reconnects, and `global` can drop members on a netsplit. Neither is a recorded decision. m118-cluster (decide and document). Done in m118-cluster, see below.
+- [x] L716–719: replicated stores expose no "synced" signal; a refused merge has no retry backoff; the causal context gains a clock entry per replica restart and is never compacted; the CRDT was never checked against the `delta_crdt_ex` source. m118-cluster. Done in m118-cluster, see below.
 - [x] L267 (m118-build): the client build writes no manifest, so every fresh build resolves dependencies from Hex (the cause of the rate-limit failures). m118-build.
 - [ ] L83: the client doesn't key the page root on navigation, so examples wrap each page in `element.keyed`. After m118-transport.
 - [ ] L606: a navigation without a hash doesn't scroll to the top (LiveView does). m118-transport if it fits item 8, otherwise after.
@@ -800,7 +809,8 @@
   - a slow connection gets another `CloseForBackpressure` and another warning on every broadcast.
   It stays inside one connection. The fix touches about 20 send sites in `runtime.gleam`, which m118-streams-server is rewriting, so a dedicated agent builds it from m118-logs' spec once streams-server merges. That agent also decides whether to monitor connection owners, following the Phoenix pattern.
 - Decision, 2026-11-05: m118-streams-client checks the required `streams` field with synthetic frames only. Making the replay of recorded server frames (`sync_vectors.mjs`) strict waits for the merge with the server half, so neither branch carries a red test.
-- [ ] Follow-up: `crdt_test.gleam:597` (`append_cost_does_not_grow_with_the_values_under_the_key_test`) flaked once on m118-transport's branch (3427 vs 992 reductions). m118-cluster owns the CRDT; if it isn't fixed there, phase B.
+- [x] Follow-up: `crdt_test.gleam:597` (`append_cost_does_not_grow_with_the_values_under_the_key_test`) flaked once on m118-transport's branch (3427 vs 992 reductions). m118-cluster owns the CRDT; if it isn't fixed there, phase B.
+  - Failed again in 2 of 6 runs when verifying the m118-cluster merge. Root cause: a garbage collection is charged to the reductions of the process it runs in, and when it runs depends on how full the test process's heap already was, not on the code measured. Fixed in `test/brazier_crdt_test_ffi.erl`: `reductions/1` runs the function in a fresh process whose `min_heap_size` holds the closure (`erts_debug:flat_size`) plus a million words. A trace session on that process proves no collection ran. The sorting oracle in `merging_a_delta_does_not_grow_with_the_state_cloud_test` allocates more than the margin, and what a function allocates doesn't depend on the machine, so a collection means the heap was too small: the measurement runs again with the margin doubled, at most 4 times (16M words). If even that collects, it crashes with `garbage_collected_while_measuring` instead of returning a count that isn't the function's cost. The append test passed 300 times in a loop, both cost tests 50 times each with the doubling, 4 full `gleam test` runs in a row green on the merged m118-cluster tree (2164 each, with build, format, lint and docs), and one measured function gave exactly one count over 50 runs with 4 allocating processes beside it.
 - [ ] Follow-up: `patch_bench` metrics need a baseline (the re-baseline item).
 
 **Phase B (after phase A merges):** the streams build, the open follow-ups above, then the perf re-baseline last, so it measures the final code.
