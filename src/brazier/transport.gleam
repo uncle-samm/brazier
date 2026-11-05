@@ -334,6 +334,10 @@ const max_timer_ms = 4_294_967_295
 /// its own context ("Invalid security limits: ...", or the application's
 /// "BRAZIER_SHUTDOWN_TIMEOUT: ..."), so one refusal makes one log line.
 pub fn validate_drain_timeout(ms: Int) -> Result(Nil, String) {
+  log.debug(
+    "brazier.transport",
+    "Validating a drain timeout of " <> int.to_string(ms) <> "ms",
+  )
   case ms >= 0 && ms <= max_timer_ms {
     True -> Ok(Nil)
     False ->
