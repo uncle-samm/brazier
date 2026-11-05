@@ -8,10 +8,38 @@
 ## Current Status
 
 **Active Milestone:** None
-**Last Completed:** 115 — Imported Contract Codegen
+**Last Completed:** 116 — Route-Scoped CSP Connect Sources
 **Build Status:** GREEN (zero errors, zero warnings)
-**Test Status:** GREEN (756 tests passed, 0 failures)
+**Test Status:** GREEN (766 tests passed, 0 failures)
 **Linter:** PASSING (zero violations)
+
+### Milestone 116: Route-Scoped CSP Connect Sources
+> Let authenticated app routes add narrow CSP `connect-src` origins for
+> route-owned transports such as BrowserPane WebTransport without weakening the
+> global Beacon default.
+
+- [x] Added `middleware.with_csp_connect_src(response, sources)` for route/API
+      handlers that need response-specific `connect-src` additions
+- [x] Added `middleware.csp_connect_src(sources)` for existing scoped
+      middleware composition with `at`, `only`, and `methods`
+- [x] Changed `secure_headers_with_csp` to merge downstream response CSP into
+      its baseline, preserving unrelated directives while emitting one
+      de-duplicated `connect-src`
+- [x] Added regression tests for strict default CSP, adding
+      `https://localhost:4433`, preserving unrelated directives, and avoiding
+      duplicate/conflicting `connect-src` output
+- [x] Documented route-specific CSP connect-source usage in
+      `docs/MIDDLEWARE.md` and `docs/SECURITY.md`
+
+**Notes:**
+- The default policy remains
+  `connect-src 'self' ws: wss:` until a route response explicitly opts into
+  more sources.
+- A first `gleam test test/beacon/middleware_test.gleam` attempt ran the full
+  suite and hit a transient existing simulator port bind failure on port 23487;
+  the full `gleam test` rerun passed with 766 tests and 0 failures.
+- Verification: `gleam build`, `gleam test`, `gleam run -m beacon/lint`, and
+  `git diff --check`.
 
 ### Milestone 115: Imported Contract Codegen
 > Make the mandatory generated contract handle real multi-module apps where

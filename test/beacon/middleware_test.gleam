@@ -3,6 +3,7 @@ import beacon/transport/server.{type Connection, Bytes}
 import gleam/bytes_tree
 import gleam/http/request
 import gleam/http/response
+import gleam/list
 import gleam/string
 
 // --- Pipeline tests ---
@@ -114,6 +115,82 @@ pub fn secure_headers_with_custom_csp_test() {
   // Other security headers are still set
   let assert Ok("nosniff") = response.get_header(resp, "x-content-type-options")
   let assert Ok("SAMEORIGIN") = response.get_header(resp, "x-frame-options")
+}
+
+pub fn secure_headers_keeps_default_connect_src_strict_test() {
+  let handler = fn(_req) {
+    response.new(200)
+    |> response.set_body(Bytes(bytes_tree.from_string("ok")))
+  }
+  let piped = middleware.pipeline([middleware.secure_headers()], handler)
+  let resp = piped(make_request("GET", "/"))
+
+  let assert Ok(csp) = response.get_header(resp, "content-security-policy")
+  let assert True = string.contains(csp, "connect-src 'self' ws: wss:")
+  let assert False = string.contains(csp, "https://localhost:4433")
+  let assert 1 = directive_count(csp, "connect-src")
+}
+
+pub fn route_response_can_add_csp_connect_src_test() {
+  let handler = fn(_req) {
+    response.new(200)
+    |> response.set_body(Bytes(bytes_tree.from_string("browserpane")))
+    |> middleware.with_csp_connect_src(["https://localhost:4433"])
+  }
+  let piped = middleware.pipeline([middleware.secure_headers()], handler)
+  let resp =
+    piped(make_request(
+      "GET",
+      "/credential-capture/browserpane/provider/capture/session",
+    ))
+
+  let assert Ok(csp) = response.get_header(resp, "content-security-policy")
+  let assert True =
+    string.contains(csp, "connect-src 'self' ws: wss: https://localhost:4433")
+  let assert 1 = directive_count(csp, "connect-src")
+}
+
+pub fn csp_connect_src_preserves_unrelated_directives_test() {
+  let handler = fn(_req) {
+    response.new(200)
+    |> response.set_header(
+      "content-security-policy",
+      "frame-src 'none'; connect-src 'self' https://existing.example",
+    )
+    |> response.set_body(Bytes(bytes_tree.from_string("ok")))
+    |> middleware.with_csp_connect_src(["https://localhost:4433"])
+  }
+  let piped = middleware.pipeline([middleware.secure_headers()], handler)
+  let resp = piped(make_request("GET", "/viewer"))
+
+  let assert Ok(csp) = response.get_header(resp, "content-security-policy")
+  let assert True = string.contains(csp, "frame-src 'none'")
+  let assert True = string.contains(csp, "https://existing.example")
+  let assert True = string.contains(csp, "https://localhost:4433")
+  let assert True = string.contains(csp, "img-src 'self' data:")
+  let assert 1 = directive_count(csp, "connect-src")
+}
+
+pub fn csp_connect_src_deduplicates_sources_and_directive_test() {
+  let handler = fn(_req) {
+    response.new(200)
+    |> response.set_header(
+      "content-security-policy",
+      "connect-src 'self' ws: wss: https://localhost:4433; connect-src https://localhost:4433 https://gateway.example",
+    )
+    |> response.set_body(Bytes(bytes_tree.from_string("ok")))
+    |> middleware.with_csp_connect_src([
+      "https://localhost:4433",
+      "https://gateway.example",
+    ])
+  }
+  let piped = middleware.pipeline([middleware.secure_headers()], handler)
+  let resp = piped(make_request("GET", "/viewer"))
+
+  let assert Ok(csp) = response.get_header(resp, "content-security-policy")
+  let assert 1 = directive_count(csp, "connect-src")
+  let assert 1 = source_count(csp, "https://localhost:4433")
+  let assert 1 = source_count(csp, "https://gateway.example")
 }
 
 // --- Request ID tests ---
@@ -286,6 +363,29 @@ fn unique_id() -> String {
 
 @external(erlang, "beacon_test_ffi", "unique_ref")
 fn do_unique_id() -> String
+
+fn directive_count(csp: String, directive_name: String) -> Int {
+  csp
+  |> string.split(";")
+  |> list.filter(fn(directive) {
+    directive
+    |> string.trim
+    |> string.starts_with(directive_name <> " ")
+  })
+  |> list.length
+}
+
+fn source_count(csp: String, source: String) -> Int {
+  csp
+  |> string.split(" ")
+  |> list.filter(fn(part) {
+    part
+    |> string.trim
+    |> string.replace(";", "")
+    == source
+  })
+  |> list.length
+}
 
 import beacon/rate_limit as beacon_rate_limit
 import gleam/http

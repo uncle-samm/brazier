@@ -82,7 +82,19 @@ The `middleware.secure_headers()` middleware (included by default in all apps) s
 - `X-XSS-Protection: 1; mode=block`
 - `Referrer-Policy: strict-origin-when-cross-origin`
 - `Permissions-Policy: camera=(), microphone=(), geolocation=()`
-- `Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' ws: wss:`
+- `Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https://avatars.githubusercontent.com; connect-src 'self' ws: wss:`
+
+For a route that needs an extra WebTransport, EventSource, or fetch target,
+keep the global default strict and add route-specific `connect-src` sources on
+that response:
+
+```gleam
+api.text(200, "viewer")
+|> middleware.with_csp_connect_src(["https://localhost:4433"])
+```
+
+`secure_headers()` merges the route addition into its baseline CSP and
+normalizes the result so the response has one `connect-src` directive.
 
 ## Session Tokens
 

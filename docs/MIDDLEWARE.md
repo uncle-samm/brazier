@@ -25,6 +25,35 @@ let handler = middleware.pipeline(
 | `body_parser(max_bytes)` | Returns 413 if `Content-Length` exceeds `max_bytes` |
 | `cors(config)` | Sets CORS headers; handles preflight OPTIONS with 204 |
 | `secure_headers_with_csp(csp)` | Like `secure_headers()` but applies a custom CSP policy string |
+| `csp_connect_src(sources)` | Adds route-scoped CSP `connect-src` sources when composed with `at`, `only`, or `methods` |
+
+## Route-Specific CSP Connect Sources
+
+Beacon keeps the default `connect-src 'self' ws: wss:` policy strict. When one
+authenticated route needs an additional connection target, add it on that
+response:
+
+```gleam
+api.get("/viewer", fn(_req) {
+  api.text(200, "viewer")
+  |> middleware.with_csp_connect_src(["https://localhost:4433"])
+})
+```
+
+Or scope it as middleware:
+
+```gleam
+beacon.app(init, beacon.no_local, beacon.no_server, update, view)
+|> beacon.with_middleware(
+  middleware.at(
+    "/viewer",
+    middleware.csp_connect_src(["https://gateway.example"]),
+  ),
+)
+```
+
+Beacon merges these sources into the response CSP emitted by
+`secure_headers()` and emits a single `connect-src` directive.
 
 ## Scoping
 

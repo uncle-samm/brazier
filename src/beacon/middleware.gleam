@@ -146,6 +146,7 @@ pub fn secure_headers_with_csp(csp: String) -> Middleware {
     next: fn(Request(Connection)) -> Response(ResponseBody),
   ) -> Response(ResponseBody) {
     let resp = next(req)
+    let csp = merge_response_csp(csp, resp)
     resp
     |> response.set_header("x-content-type-options", "nosniff")
     |> response.set_header("x-frame-options", "SAMEORIGIN")
@@ -156,6 +157,158 @@ pub fn secure_headers_with_csp(csp: String) -> Middleware {
       "camera=(), microphone=(), geolocation=()",
     )
     |> response.set_header("content-security-policy", csp)
+  }
+}
+
+/// Add route-specific Content-Security-Policy `connect-src` sources.
+///
+/// Use this from a route or API handler when one response needs an additional
+/// connection target without weakening the app-wide default policy.
+///
+/// ```gleam
+/// api.text(200, "ok")
+/// |> middleware.with_csp_connect_src(["https://localhost:4433"])
+/// ```
+pub fn with_csp_connect_src(
+  resp: Response(ResponseBody),
+  sources: List(String),
+) -> Response(ResponseBody) {
+  let csp = case response.get_header(resp, "content-security-policy") {
+    Ok(existing_csp) -> existing_csp
+    Error(Nil) -> connect_src_csp
+  }
+
+  resp
+  |> response.set_header(
+    "content-security-policy",
+    add_csp_directive_values(csp, "connect-src", sources),
+  )
+}
+
+/// Middleware form of `with_csp_connect_src`.
+///
+/// Pair with `at`, `only`, or `methods` to scope additions to specific routes.
+pub fn csp_connect_src(sources: List(String)) -> Middleware {
+  fn(
+    req: Request(Connection),
+    next: fn(Request(Connection)) -> Response(ResponseBody),
+  ) -> Response(ResponseBody) {
+    next(req)
+    |> with_csp_connect_src(sources)
+  }
+}
+
+const connect_src_csp = "connect-src 'self' ws: wss:"
+
+type CspDirective {
+  CspDirective(name: String, values: List(String))
+}
+
+fn merge_response_csp(base_csp: String, resp: Response(ResponseBody)) -> String {
+  case response.get_header(resp, "content-security-policy") {
+    Ok(response_csp) -> merge_csp(base_csp, response_csp)
+    Error(Nil) -> render_csp(parse_csp(base_csp))
+  }
+}
+
+fn merge_csp(base_csp: String, response_csp: String) -> String {
+  let base_directives = parse_csp(base_csp)
+  let response_directives = parse_csp(response_csp)
+
+  response_directives
+  |> list.fold(base_directives, fn(directives, directive) {
+    let CspDirective(name, values) = directive
+    upsert_directive(directives, name, values)
+  })
+  |> render_csp
+}
+
+fn add_csp_directive_values(
+  csp: String,
+  directive_name: String,
+  values: List(String),
+) -> String {
+  parse_csp(csp)
+  |> upsert_directive(directive_name, values)
+  |> render_csp
+}
+
+fn parse_csp(csp: String) -> List(CspDirective) {
+  csp
+  |> string.split(";")
+  |> list.fold([], fn(directives, raw_directive) {
+    let directive = string.trim(raw_directive)
+    case directive {
+      "" -> directives
+      _ -> {
+        case directive_parts(directive) {
+          [] -> directives
+          [name, ..values] -> upsert_directive(directives, name, values)
+        }
+      }
+    }
+  })
+}
+
+fn directive_parts(directive: String) -> List(String) {
+  directive
+  |> string.split(" ")
+  |> list.map(string.trim)
+  |> list.filter(fn(part) { part != "" })
+}
+
+fn upsert_directive(
+  directives: List(CspDirective),
+  name: String,
+  values: List(String),
+) -> List(CspDirective) {
+  case directives {
+    [] -> [CspDirective(name, normalize_csp_values(values))]
+    [directive, ..rest] -> {
+      let CspDirective(existing_name, existing_values) = directive
+      case existing_name == name {
+        True -> [
+          CspDirective(
+            existing_name,
+            append_unique_csp_values(existing_values, values),
+          ),
+          ..rest
+        ]
+        False -> [directive, ..upsert_directive(rest, name, values)]
+      }
+    }
+  }
+}
+
+fn normalize_csp_values(values: List(String)) -> List(String) {
+  append_unique_csp_values([], values)
+}
+
+fn append_unique_csp_values(
+  existing: List(String),
+  values: List(String),
+) -> List(String) {
+  values
+  |> list.fold(existing, fn(acc, value) {
+    let value = string.trim(value)
+    case value == "" || list.contains(acc, value) {
+      True -> acc
+      False -> list.append(acc, [value])
+    }
+  })
+}
+
+fn render_csp(directives: List(CspDirective)) -> String {
+  directives
+  |> list.map(render_csp_directive)
+  |> string.join("; ")
+}
+
+fn render_csp_directive(directive: CspDirective) -> String {
+  let CspDirective(name, values) = directive
+  case values {
+    [] -> name
+    _ -> name <> " " <> string.join(values, " ")
   }
 }
 
