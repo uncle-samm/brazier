@@ -482,14 +482,24 @@ stream delta stale.
 | A delete of a key not in the store | Stream fault |
 | An insert whose `at` is not the index it lands at, or a new key whose `at` is past the end | Stream fault |
 | The store would hold more than `limit` items after the entry | Stream fault |
-| An item that does not decode (only when it is rendered) | Stream fault |
+| An item that does not decode, or that `render_item` refuses for any other reason (only when it is rendered) | Stream fault (`item_render_failed`) |
 | Otherwise | Apply to the store; patch every rendered container of that stream |
+
+The rows are checked in this order, and an entry is checked against its
+store before its rendered container, so a fault names the first row it
+hits (the shared vectors in `test/fixtures/stream_vectors.json` fix the
+order). Every entry of a frame is checked before any store changes: a
+fault leaves the stores and the containers as they were, and the frame's
+model part is not applied. Entries for one name in one frame apply in
+order.
 
 A **stream fault** means the store can no longer be trusted, and a
 `request_sync` cannot repair it. The client logs a `console.error` naming
 the stream and the reason, and closes the socket with 4000
 `stream fault`, as it does when a join cannot be written
-(`sendJoin`). That close reconnects with backoff; the new runtime runs
+(`sendJoin`). Frames that arrive on that socket after the fault are
+ignored with a warning, without relying on the browser dropping them.
+That close reconnects with backoff; the new runtime runs
 `init`, which refills every stream. An app bug that faults every time (a
 decoder that does not match its encoder) is therefore a reconnect loop held
 to one attempt per `RECONNECT_MAX_MS`, the same as an `init` that crashes
@@ -657,15 +667,25 @@ fetch runs twice per page load. That is LiveView's `mount` behaviour too.
 ### 8.1 Stores and rendering
 
 The client keeps a `Map` from stream name to a store: `keep`, `limit`, the
-keys in order, and per key the parsed item JSON plus a cache of its
-rendered HTML and handler table. A store is created by the first entry for
-its name. Stores for streams whose container is not rendered are kept and
-bounded like any other.
+keys in order, and per key the parsed item JSON
+(`brazier_client/src/brazier_client/stream.mjs`). A store is created by
+the first entry for its name. Stores for streams whose container is not
+rendered are kept and bounded like any other. What is rendered from a store
+belongs to its container's view, not to the store: the item element and the
+handler table of each key. So the items a reconnect leaves on the page stay
+clickable while the stores are empty.
 
 The client's `render(model, local)` renders a `Stream` node as the
 container's opening and closing tags, with `data-brazier-stream="<name>"`
 and no children, and lists the node in a table of containers next to the
-handler table. `morphChildren` treats an element with
+handler table: `render` returns `#(html, handlers, containers)`. The
+runtime reads a container with `container_name`, `container_keep`,
+`container_limit` and `container_item`, and renders one item with
+`render_item(container, key, item)`, which returns the item's HTML and
+handler table or an error. `container_item` is the item function itself,
+compared by reference only and never called, so the runtime can tell when
+the same element now renders its items with another function. Two
+`element.map` wrappers around one item function compare equal. `morphChildren` treats an element with
 `data-brazier-stream` like one with `data-brazier-preserve-children`
 (`attribute.ignore_updates`): it morphs the container's own attributes and
 does not descend. This is LiveView's `skipFromChildren`.
@@ -673,12 +693,17 @@ does not descend. This is LiveView's `skipFromChildren`.
 After every render, and after every frame that changes a store, the
 stream applier visits each container in the table:
 
-- **A container that is new in the DOM**, or the first frame of a
-  connection: full reconcile. Every child whose key is not in the store is
+- **A container that is new in the DOM**, one whose item function
+  changed, or any container on the first frame of a connection (the first
+  `patch` or `model_sync` it receives, which is the join's `model_sync`):
+  full reconcile. Every child whose key is not in the store is
   removed (its hooks unmounted). Every key in the store is placed in
   order; a child that already has that key is kept and morphed, so it keeps
   its identity, focus and hook state. This is the join path of
-  `dom_patch.ts`, including the stash and restore of nodes inserted again.
+  `dom_patch.ts`. The reconcile works from the children on the page, so it
+  also repairs a container that a fault left half patched. An element that
+  the page morph turns into a container loses its page children first: a
+  child is adopted as an item only when it was rendered as one.
 - **An existing container**: apply the frame's entry only. A reset removes
   every child. Deletes remove their children. Each insert of a new key
   renders the item and inserts it at `at`; each insert of an existing key
@@ -686,9 +711,12 @@ stream applier visits each container in the table:
   moved key was deleted first and is restored from the stash. Moves use
   `moveBefore` when the browser has it.
 
-Rendering an item decodes its JSON with the node's `item` function and
-caches the HTML and handlers until the key is updated. The cache is sound
-because the build guarantees `item` depends on the item only.
+Rendering an item decodes its JSON with the node's `item` function. There
+is no cache of the rendered HTML: an item renders when it is inserted or
+updated, and every item of a container renders again on a full reconcile.
+An insert or update renders that item only, which is what a cache would
+save on the hot path; the build's guarantee that `item` depends on the item
+only is what makes the item's markup independent of its position.
 
 Rendering stays synchronous, as `renderNow` is today: the model render and
 the stream patch of one frame happen in the same task, so the browser
@@ -701,10 +729,13 @@ numbers every child). Inside an item, an id is relative to the item's root
 and starts with `i`: `data-brazier-on-click="i0.2"`. The client resolves
 it by walking up to the closest element with `data-brazier-key` whose
 parent has `data-brazier-stream`, and looks the id up in that item's
-cached handler table. So:
+handler table. An id is an item id only when it matches
+`i<n>(.<n>)*` exactly; an item id outside any item is an error and the
+event is dropped. Throttle and debounce are kept per stream, key and id,
+since every item repeats its ids. So:
 
 - a prepend does not change the attributes of any other item;
-- the cached HTML stays valid wherever the item moves;
+- an item's markup is the same wherever the item moves;
 - pre-hydration event replay records `(stream, key, id)` and finds the
   same item after the join, or drops the event with a warning when the
   join removed it.
@@ -715,8 +746,8 @@ the server's message allowlist like any other (see
 
 ### 8.3 Reconnect and build id
 
-`connect()` empties every store and marks the next `model_sync` as the
-connection's first frame. Until it arrives, the containers keep showing
+`connect()` empties every store and marks the next frame with a `streams`
+field (the join's `model_sync`) as the connection's first frame. Until it arrives, the containers keep showing
 the old items. The join's `model_sync` then reconciles every container:
 items `init` sent again keep their nodes, the rest are removed. This is
 LiveView's rejoin, where items `mount` does not send again are cleared.
@@ -801,7 +832,7 @@ rejoin with non-empty windows, error for every refusal. The browser logs a
 | Ops for a stream not in the current view | browser | Not an error: the store keeps them, bounded by the limit, and the container is filled by a full reconcile when it appears |
 | Delete of a key not in the stream | runtime | Warning, nothing sent |
 | An item function that is anonymous or a capture | build | Build error naming the place |
-| Item root that is not one element, or a stream inside an item | render | SSR crash; browser render throws |
+| Item root that is not one element, or a stream inside an item | render | SSR crash; in the browser `render_item` returns an error, which is a stream fault (`item_render_failed`) |
 | Item that does not decode | SSR, browser | SSR crash (500); browser stream fault |
 | A malformed `streams` field | browser | Stream fault |
 

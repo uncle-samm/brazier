@@ -374,6 +374,23 @@ follows.
   `request_sync`, since the rejected message may have carried state the
   client already applied optimistically. Other `error` reasons are logged.
 - Unknown server message types are logged as errors.
+- **Streams**: every `patch` and `model_sync` must carry a `streams` array
+  (empty when no stream changed). The client applies it to its stream
+  stores before the frame's model part, under every model verdict (apply,
+  ack, stale, gap) and while a prediction holds the model, and checks every
+  entry before any store changes. There is no default for a missing field.
+  A missing or malformed field, an entry for a stream the bundle does not
+  declare, a `keep` or `limit` that differs from the store's or the
+  rendered container's, a delete of a key the store does not hold, a
+  misplaced insert, a store over its limit, or an item `render_item`
+  refuses is a **stream fault**: the client logs a `console.error` naming
+  the stream and the reason (never a key or an item), applies nothing of
+  the frame, ignores later frames on that socket, and closes it with 4000
+  `stream fault`. A `request_sync` cannot repair a store, so that close
+  reconnects with backoff like any other; `connect()` empties every store,
+  and the join's `model_sync` refills them and reconciles the containers
+  on the page. The full rules are in
+  [STREAMS.md](design/STREAMS.md#62-client-rules).
 
 ## Reconnection Flow
 
@@ -544,6 +561,7 @@ the echo.
 | 4401 | Session revoked (`session revoked`) or authentication expired (`authentication expired`). The page reloads, so the server renders it for whoever the cookie now names, or the login page |
 | 4499 | Stale build (`stale build`): the join's `build` is not the bundle the server serves now. The page reloads and gets the current bundle |
 | 4500-4599 | `init` refused with a 5xx status (4503 for `error.unavailable`). The client reconnects with backoff |
+| 4000 | Sent by the client: a stream fault (`stream fault`), a `streams` field that does not fit the client's stream stores. The client reconnects with backoff (see [Client Connection Behaviour](#client-connection-behaviour)) |
 | 4600 | The app's middleware refused the page's live connection (`middleware refused <status>`), sent right after the handshake. The client does not reconnect: it loads the current URL behind the reload guard, so the browser shows the middleware's answer |
 
 An `init` refusal with 409 closes with 4409, and a stale build with 4499,
@@ -566,6 +584,7 @@ code alone and needs no table of reasons:
 | 4400-4499 | `init` or the session refused (4000 + a 4xx status, 4401), or a stale build (4499) | Reload the page, behind the guard |
 | 4500-4599 | `init` refused with a 5xx status | Reconnect with backoff |
 | 4600-4699 | The transport refused the connection before any runtime (4600: the middleware) | 4600: load the page, behind the guard |
+| 4000 | The client, on a stream fault | Reconnect with backoff |
 | Other 4xxx | Not sent by Brazier | Reconnect with backoff, like any unknown close |
 
 4600 cannot collide with `init`'s codes: 4000 + status stays at or below
