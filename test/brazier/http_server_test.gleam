@@ -677,26 +677,37 @@ pub fn ws_upgrade_with_early_data_is_400_test() {
 
 pub fn handler_crash_is_500_and_releases_slot_test() {
   let listener = start_server(fast_limits())
+  use events <- connection_events(listener)
   let socket = open(listener)
+  expect_connection_event(events, #("accepted", "ok"))
   send(socket, get("/crash"))
   let assert Ok(#(500, headers, _)) = raw_recv_response(socket, 2000, True)
     as "handler crash must answer 500"
   let assert Ok("close") = header(headers, "connection")
   assert_closed(socket)
-  await_count(listener, 0)
+  // The connection answered the crash itself and ended normally; the owner
+  // releases its slot before it emits closed.
+  expect_connection_event(events, #("closed", "normal"))
+  let assert 0 = server.get_connection_count(listener)
   // The listener keeps serving.
   let #(status, _, _) = exchange(listener, get("/"))
   let assert 200 = status
+  expect_connection_event(events, #("accepted", "ok"))
+  expect_connection_event(events, #("closed", "normal"))
   server.stop(listener)
 }
 
 pub fn killed_connection_process_releases_slot_test() {
   let listener = start_server(fast_limits())
+  use events <- connection_events(listener)
   let socket = open(listener)
-  await_count(listener, 1)
+  // The connection owner takes a slot before the acceptor emits accepted.
+  expect_connection_event(events, #("accepted", "ok"))
+  let assert 1 = server.get_connection_count(listener)
   let assert [pid] = server.get_connection_pids(listener)
   raw_kill(pid)
-  await_count(listener, 0)
+  expect_connection_event(events, #("closed", "killed"))
+  let assert 0 = server.get_connection_count(listener)
   raw_close(socket)
   server.stop(listener)
 }
@@ -842,21 +853,6 @@ pub fn killed_acceptor_is_restarted_test() {
   let #(status, _, _) = exchange(listener, get("/"))
   let assert 200 = status
   server.stop(listener)
-}
-
-/// Return once the listener has exactly `expected` live connections. The
-/// connection owner takes a slot before the acceptor emits
-/// `[brazier, http, connection, accepted]` and releases it before it emits
-/// `closed`, so each of those events is a point to re-check the count.
-fn await_count(listener: server.Listener, expected: Int) -> Nil {
-  await.until_telemetry(
-    [
-      ["brazier", "http", "connection", "accepted"],
-      ["brazier", "http", "connection", "closed"],
-    ],
-    int.to_string(expected) <> " live connections",
-    fn() { server.get_connection_count(listener) == expected },
-  )
 }
 
 // --- FFI ---
