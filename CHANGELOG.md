@@ -30,6 +30,11 @@ open follow-ups), which is in progress.
 
 ### Breaking
 
+- (M118 residue-3) `brazier/lint` has rule 10, `unicode-case-folding`:
+  `string.lowercase`, `string.uppercase` and `string.capitalise` in `src/`
+  (also through an alias, an unqualified import or a constant) are
+  violations unless the module is in `case_folding_allowed` with a reason.
+  The list is empty: no module folds text that is Unicode by design.
 - (M118 client-decode) Attribute names starting `data-brazier-` are
   reserved for the client, except the app API `data-brazier-hook`,
   `-hook-watch`, `-preserve-children` and `-external` (as LiveView reserves
@@ -439,6 +444,13 @@ open follow-ups), which is in progress.
 
 ### Changed
 
+- (M118 residue-3) `application.start_supervised` starts an empty root
+  supervisor (`brazier_app_sup.erl`) and adds its children one by one, as
+  Ranch adds a listener to `ranch_sup`. Restart behaviour is unchanged
+  (`rest_for_one`, 2 restarts in 5 seconds).
+- (M118 residue-3) One ASCII case folding per target
+  (`brazier_ascii_ffi.erl`, `.mjs`); the render and the build fold
+  attribute names and Gleam names with it. Render time is unchanged.
 - (M118 server-residue-2) The Origin check parses an origin by hand
   instead of compiling a split pattern on every call: about 9 µs to about
   1.5 µs per WebSocket upgrade.
@@ -785,6 +797,12 @@ open follow-ups), which is in progress.
 
 ### Fixed
 
+- (M118 residue-3) `brazier.start` on a port it cannot bind returns the
+  cause (`Supervision tree failed to start: cannot listen on port N:
+  eaddrinuse (address already in use)`) instead of `InitFailed("shutdown")`,
+  and no longer kills a caller that does not trap exits.
+- (M118 residue-3) A static prefix ending in a Prepend character such as
+  U+0600 no longer swallows the `/` after it.
 - (M118 perf-server) Starting a listener no longer creates an atom: its
   connection owner is named by a reference (`{via, brazier_http_conns,
   Ref}`, as Ranch keys listeners), held in a `persistent_term` registry
@@ -1094,6 +1112,13 @@ open follow-ups), which is in progress.
 
 ### Security
 
+- (M118 residue-3) Static file paths are checked as bytes, not grapheme
+  clusters: a combining mark after `.`, `/`, `\` or an encoded escape
+  (`%2f` + U+0301) no longer hides a traversal or a separator
+  (`/static/a%2f\u{301}b` was served, now 403).
+- (M118 residue-3) Attribute names and the SVG `attributeName` check fold
+  case in ASCII only, so the Kelvin sign U+212A never matches `k`; the
+  check stays stricter than DOMPurify's case-sensitive one.
 - (M118 server-residue-2) Protocol text (header names, `Connection` and
   `Upgrade` tokens, schemes, cookie names, media types, digests, file
   extensions) is compared with ASCII-only case folding

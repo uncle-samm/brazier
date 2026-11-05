@@ -378,8 +378,8 @@ Some notes on reading the numbers:
   cost was OTP's `string:lowercase/1`, which raises and catches an
   exception inside for a name that is already lowercase: about 0.1 µs a
   name, 13% of the render, paid twice per attribute. The attribute name
-  policy now lowercases `A-Z` itself; `brazier/internal/url` still calls
-  `string.lowercase` once per attribute (a follow-up in docs/TODO.md).
+  policy now lowercases `A-Z` itself, and since M118 so does
+  `brazier/internal/url` (`brazier/internal/ascii`).
   After both, the same profile renders 100, 1000 and 10,000 rows in
   0.25, 3.0 and 45 ms: 12x, then 15x, the rest being garbage collection
   of the bigger heap. In `http_bench`, three runs each, interleaved on
