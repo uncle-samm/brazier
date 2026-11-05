@@ -60,6 +60,7 @@ import brazier/error
 import brazier/log
 import brazier/runtime
 import brazier/sim/test_app
+import brazier/ssr
 import brazier/store
 import brazier/store/crdt
 import brazier/store/hlc
@@ -77,11 +78,15 @@ import gleam/result
 import gleam/string
 import logging
 
-/// #(connections, events per connection, measured rounds). The latency
-/// p99 is over every event of every round, so the small cells run more
-/// rounds: 1x200 x 5 rounds is 1000 events, whose p99 is its 10 slowest
-/// and moved by any scheduling hiccup.
-const ws_grid = [#(1, 200, 25), #(10, 200, 15), #(100, 200, 5)]
+/// #(connections, events per connection, measured rounds). Each metric is
+/// the median over rounds, so the rounds a burst of outside load must
+/// cover to move it grow with the count. The small cells run more rounds:
+/// 1x200 is 200 events a round, whose p99 is its third-slowest event and
+/// moved by any scheduling hiccup. 100x200 runs 15: a round is about
+/// 0.3 s, so 8 slow rounds (2.4 s) move the median, where at 5 rounds 3
+/// (0.9 s) did. Its gated p99 spread over repeated scenarios under load
+/// was 10-21% at 5 rounds against 5-7% at 15 (docs/PERFORMANCE.md).
+const ws_grid = [#(1, 200, 25), #(10, 200, 15), #(100, 200, 15)]
 
 const ws_warmup_rounds = 1
 
@@ -134,6 +139,7 @@ fn ws_round(
   port: Int,
   conns: Int,
   events: Int,
+  build: option.Option(String),
   timeout_ms: Int,
 ) -> Result(#(Int, List(Int)), String)
 
@@ -215,10 +221,13 @@ pub fn run(prepared: Prepared) -> Result(report.Report, String) {
 // --- ws ---
 
 fn ws_scenario(port: Int) -> Result(List(Metric), String) {
+  use build <- result.try(page_build())
   list.try_map(ws_grid, fn(cell) {
     let #(conns, events, measured) = cell
     let name = "ws." <> int.to_string(conns) <> "x" <> int.to_string(events)
-    let round = fn() { ws_round("localhost", port, conns, events, timeout_ms) }
+    let round = fn() {
+      ws_round("localhost", port, conns, events, option.Some(build), timeout_ms)
+    }
     {
       use _ <- result.try(repeat(ws_warmup_rounds, round))
       use samples <- result.try(
@@ -232,6 +241,28 @@ fn ws_scenario(port: Int) -> Result(List(Metric), String) {
     |> result.map_error(fn(reason) { name <> ": " <> reason })
   })
   |> result.map(list.flatten)
+}
+
+/// The build a page rendered by the bench app sends with its join: the hash
+/// in the `brazier_client_<hash>.js` bundle the listener loaded. Joining
+/// with it is what a real client does, so the server checks the build
+/// instead of warning that the join carries none.
+fn page_build() -> Result(String, String) {
+  use bundle <- result.try(
+    ssr.client_bundle()
+    |> result.map_error(fn(reason) { "ws page build: " <> reason }),
+  )
+  case bundle {
+    "brazier_client_" <> rest ->
+      case string.ends_with(rest, ".js") && string.length(rest) > 3 {
+        True -> Ok(string.drop_end(rest, 3))
+        False -> Error("ws page build: bundle " <> bundle <> " is not .js")
+      }
+    _ ->
+      Error(
+        "ws page build: bundle " <> bundle <> " is not brazier_client_<hash>.js",
+      )
+  }
 }
 
 // --- runtime ---

@@ -48,6 +48,22 @@ headers against the probe. A wrong answer fails the run with a reason.
 
 The HTTP scenarios run 15 measured rounds after 2 warm-up rounds. A round takes 0.1 to 0.5 s, so a burst of outside load must last several seconds to cover the eight rounds that move a median.
 
+`ws.100x200` follows the same rule with 15 rounds; it ran 5 until
+Milestone 118. One round is 20,000 events in about 0.3 s, so at 5 rounds
+three slow rounds, under a second of outside load, moved the median. Its
+gated p99 (the median over rounds of each round's p99), measured over
+repeated scenarios back to back at a load average of 14 to 29:
+
+| Rounds | Scenarios × batches | Spread of the gated p99 | Seconds per scenario |
+|--------|---------------------|-------------------------|----------------------|
+| 5      | 7 × 2, 9 × 2        | 9.5%, 10.3%, 13.7%, 20.6% | 1.8 |
+| 10     | 7 × 1               | 12.2%                   | 3.4 |
+| 15     | 9 × 2               | 4.5%, 6.7%              | 4.9 |
+| 20     | 7 × 1               | 7.2%                    | 6.5 |
+
+Single rounds ranged from 2.8 to 4.8 ms in those runs. 15 rounds halve the
+spread for 3 s more per suite run; 20 buy nothing more.
+
 | Scenario | Load | Metrics |
 |----------|------|---------|
 | http | 8 keep-alive clients, 2000 requests per round against `/bench`, a 2-byte answer | requests/s and per-request p50/p99, each the median over rounds |
@@ -55,7 +71,7 @@ The HTTP scenarios run 15 measured rounds after 2 warm-up rounds. A round takes 
 | gzip | A 100 KB HTML body through `middleware.compress` with `Accept-Encoding: gzip`, 8 clients × 100. The probe gunzips the body, compares it with the original and checks it compressed to under half. | requests/s and per-request p50/p99, each the median over rounds |
 | ssr | `ssr.render_page` of a 100-row (8 × 800 requests) and a 1000-row (8 × 50) view with a click handler per row, as `brazier.start` serves the first page. The probe checks every row and the client bundle's script tag. | requests/s and per-request p50/p99, each the median over rounds |
 | ssr stream | `ssr.stream_300`: as `ssr`, for a page whose `init` fills a `KeepLast(300)` stream with 300 lines of 1 KB text and a click handler each (8 × 50). The probe checks the 300 item keys, in order, and the client bundle's script tag. | requests/s and per-request p50/p99, each the median over rounds |
-| ws | N joined connections × 200 events each, for N = 1, 10, 100, in 25, 15 and 5 measured rounds. Each event is timed from its send to the patch that acknowledges its clock. | events/s and per-event p50/p99, each the median over rounds |
+| ws | N joined connections × 200 events each, for N = 1, 10, 100, in 25, 15 and 15 measured rounds. Every join carries the build id of the bundle the listener serves, as a page rendered by that server sends it. Each event is timed from its send to the patch that acknowledges its clock. | events/s and per-event p50/p99, each the median over rounds |
 | runtime | Events pushed straight into a runtime actor holding a 200-item model, 2000 per round. `changed`: every event changes the model and gets a patch. `unchanged`: none does, and each gets an empty acknowledgement. | pipelined µs/event (median of rounds); p50/p99 of one event at a time, by round |
 | runtime list | As `runtime` `changed`, against a model whose list encodes to about 50 KB (1000 items, 200 events per round, 1000 sequential) and 500 KB (10000 items, 40 per round, 300 sequential). Each event changes one field, so the metric is the cost of the work done on the whole model. | pipelined µs/event (median of rounds); p50/p99 of one event at a time, by round |
 | runtime stream | Events pushed straight into a runtime actor whose `KeepLast(300)` stream of 1 KB lines is full from the join on, 1000 per round after one warm-up round, then 1000 sequential. `append`: each event appends a line, so its frame carries one insert at 299 and the trim of the oldest line. `chunk`: each event re-inserts the last line with 100 more bytes, an update in place with no delete. Every event must be acknowledged by its own patch, in clock order, and each patch's `streams` field is decoded and checked against the event's change after the timer stops. | pipelined µs/event (median of rounds); p50/p99 of one event at a time, by round |

@@ -56,6 +56,33 @@
 
 <!-- Move resolved issues here with full resolution details -->
 
+- **Issue:** every bench suite run after the first left 7 more atoms in
+  the atom table. Listing the atoms each run creates (by index) showed all
+  7 were `brazier_http_conns_<N>`: `brazier_http_conns:new_name/0` named
+  each listener's connection owner with a fresh atom, one per listener
+  start, and the suite starts 7 listeners. Atoms are never collected, so a
+  node that starts and stops listeners (a test suite, a bench, an app that
+  restarts its listener) grew its atom table without bound.
+  - **Files:** `src/brazier_http_conns.erl`,
+    `src/brazier/transport/server.gleam`,
+    `src/brazier_http_listen_socket.erl`,
+    `src/brazier_http_acceptors_sup.erl`, `src/brazier_server_ffi.erl`
+  - **Resolution:** (Milestone 118, m118-perf-server) The owner's name is
+    `{via, brazier_http_conns, Ref}` for a fresh reference, and
+    `brazier_http_conns` is the via registry: the owner's pid sits in a
+    persistent_term keyed by Ref, beside the bound port the listener
+    already kept there, and `forget_port/1` (run by `server.stop`) erases
+    both. A pid fits in one machine word, so an owner restart (which
+    replaces it) or a stop (which erases it) runs no global GC. A dead
+    owner reads as none, so a call to a restarting listener exits with
+    `noproc` as it did for an unregistered atom. This is Ranch's pattern:
+    `ranch_server` registers a listener's connection supervisor under the
+    listener's Ref instead of an atom. The suite census now shows no new
+    atom after the first run. `test/brazier/listener_name_test.gleam`
+    checks that 10 start/stop cycles create no atom and leave no registry
+    entry, and covers the registry's refusals (a second live owner, a dead
+    owner, a send with no owner, an unregister by another process).
+
 - **Issue:** an `init` refusing with 401 closes with 4401, the code of a
   revoked session or expired authentication, so the two are told apart only
   by the close reason and the server log. The client action is the same (a
@@ -192,6 +219,14 @@
     warning, later joins on that connection log at debug. A new connection
     warns again. `test/brazier/join_build_test.gleam` captures the log of
     two joins on one connection and asserts one warning.
+    The ws bench (`test/brazier/bench/suite.gleam`) logged that warning on
+    every connection, and its joins were not the ones a real client sends.
+    It now joins with the hash of the bundle the listener loaded
+    (`ssr.client_bundle`), as a page rendered by that server does, so the
+    server checks the build on each join and logs nothing. The bench fails
+    by name if no bundle is loaded. `brazier/stress` still joins without a
+    build: it may drive a server in another VM, whose bundle it cannot
+    know.
 
 - **Issue:** the client manifest had two readers (`ssr` for the page and
   `transport.check_join_build` for the join), and the join read it from

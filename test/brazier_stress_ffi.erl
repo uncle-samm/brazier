@@ -4,7 +4,8 @@
 %% the join must be answered, every event must be acknowledged by a patch
 %% carrying its clock, and the close handshake must echo 1000. Nothing
 %% sleeps: each step waits for the server's answer, bounded by a deadline.
--export([connect_and_join/4, timed_events/4, close_handshake/2, monotonic_us/0]).
+-export([connect_and_join/4, connect_and_join/5, timed_events/4, close_handshake/2,
+         monotonic_us/0]).
 
 monotonic_us() ->
     erlang:monotonic_time(microsecond).
@@ -12,13 +13,23 @@ monotonic_us() ->
 %% Connect, upgrade, join and send Events events, waiting for each patch.
 %% {ok, {Conn, Acknowledged}} | {error, Reason}. Conn is opaque to Gleam and
 %% must be closed by the process that opened it (close_handshake/2).
+%%
+%% The join carries no build id: brazier/stress may drive a server in
+%% another VM, whose client bundle it cannot know, so the server warns once
+%% per connection that it cannot check the page's build.
 connect_and_join(Host, Port, Events, TimeoutMs) ->
+    connect_and_join(Host, Port, Events, none, TimeoutMs).
+
+%% As connect_and_join/4, but the join carries Build (`{some, Hash}`, the
+%% hash of the `brazier_client_<hash>.js` the server serves, as a page that
+%% loaded that script sends it) or none.
+connect_and_join(Host, Port, Events, Build, TimeoutMs) ->
     Deadline = erlang:monotonic_time(millisecond) + TimeoutMs,
     HostBin = ensure_binary(Host),
     case gen_tcp:connect(binary_to_list(HostBin), Port,
                          [binary, {active, false}, {packet, raw}], TimeoutMs) of
         {ok, Socket} ->
-            case join(Socket, HostBin, Events, Deadline) of
+            case join(Socket, HostBin, join_message(Build), Events, Deadline) of
                 {ok, Buffer, Acknowledged} ->
                     {ok, {{Socket, Buffer}, Acknowledged}};
                 {error, Reason} ->
@@ -29,10 +40,15 @@ connect_and_join(Host, Port, Events, TimeoutMs) ->
             {error, <<"connect: ", (format_reason(Reason))/binary>>}
     end.
 
-join(Socket, Host, Events, Deadline) ->
+join_message(none) ->
+    <<"{\"type\":\"join\",\"token\":\"\",\"path\":\"/\"}">>;
+join_message({some, Build}) when is_binary(Build), Build =/= <<>> ->
+    iolist_to_binary([<<"{\"type\":\"join\",\"token\":\"\",\"path\":\"/\",\"build\":">>,
+                      json:encode(Build), <<"}">>]).
+
+join(Socket, Host, Join, Events, Deadline) ->
     case upgrade(Socket, Host, Deadline) of
         {ok, Buffer0} ->
-            Join = <<"{\"type\":\"join\",\"token\":\"\",\"path\":\"/\"}">>,
             case send_text(Socket, Join) of
                 ok ->
                     case recv_text(Socket, Buffer0, Deadline) of
