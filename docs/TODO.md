@@ -75,10 +75,10 @@
     `src/brazier/lint.gleam`, `src/brazier_dev_ffi.erl`,
     `test/brazier/dir_listing_test.gleam`,
     `test/brazier_dir_test_ffi.erl`,
-    `docs/design/OTP_LIST_DIR_HANG.md`
+    `docs/design/OTP_LIST_DIR_HANG.md`, `docs/design/OTP_SECURITY_REPORT.md`
   - **Attempted:** the upstream report (repro, observed vs expected, source
-    lines, and a one-line fix) is drafted in
-    `docs/design/OTP_LIST_DIR_HANG.md` as a private security report (a heap
+    lines, and a one-line fix tested on 29.1.2) is drafted in
+    `docs/design/OTP_SECURITY_REPORT.md` as a private security report (a heap
     use-after-free reachable from a file name). It is not sent: OTP takes
     reports only from humans, so the maintainer reviews it and sends it to
     erlang-security@erlang.org. When an OTP release has the fix, the
