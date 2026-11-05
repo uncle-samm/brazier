@@ -30,7 +30,7 @@ fn handler(
   reports: Subject(Report),
 ) -> fn(Request(Connection)) -> Option(response.Response(server.ResponseBody)) {
   fn(req: Request(Connection)) {
-    let server.Connection(socket:) = req.body
+    let server.Connection(socket:, ..) = req.body
     case req.path {
       "/read" -> {
         let result = transport_http.read_body(req, limit)
@@ -295,7 +295,7 @@ fn outside_request(content_length: String) -> Request(Connection) {
   request.new()
   |> request.set_method(http.Post)
   |> request.set_header("content-length", content_length)
-  |> request.set_body(server.Connection(socket: dead_socket()))
+  |> request.set_body(server.Connection(socket: dead_socket(), resolved: None))
 }
 
 pub fn invalid_content_length_outside_a_listener_is_named_test() {
@@ -315,7 +315,7 @@ pub fn read_outside_an_active_request_is_named_and_logged_test() {
     "read_body called outside an active HTTP request",
   ])
 
-  let server.Connection(socket:) = req.body
+  let server.Connection(socket:, ..) = req.body
   let #(raw, raw_logs) =
     log_capture.capture(fn() { server.read_body(socket, 5) })
   let assert Error(server.NoActiveRequest) = raw

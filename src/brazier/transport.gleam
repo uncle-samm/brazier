@@ -2417,8 +2417,15 @@ fn dev_live_reload_topic() -> String
 /// Identity of an admitted connection, carried from admission to startup.
 type Admission {
   /// `page` is the page the upgrade mounts (`get_upgrade_page`), which passed
-  /// the middleware gate.
-  Admission(conn_id: ConnectionId, peer_ip: String, page: LivePage)
+  /// the middleware gate. `request` is the upgrade request carrying its one
+  /// client resolution (`server.Connection.resolved`): the connection's
+  /// later gates run on it.
+  Admission(
+    conn_id: ConnectionId,
+    peer_ip: String,
+    page: LivePage,
+    request: Request(Connection),
+  )
 }
 
 /// Start a WebSocket connection on an already-upgraded socket.
@@ -2427,9 +2434,11 @@ type Admission {
 fn start_ws_connection(
   socket: Socket,
   config: TransportConfig,
-  req: Request(Connection),
   admission: Admission,
 ) -> Nil {
+  // The upgrade request with its one client resolution: every later gate
+  // on this connection runs on it.
+  let req = admission.request
   let conn_id = admission.conn_id
   let opened_at = erlang_monotonic_time()
   log.info(
@@ -3027,15 +3036,30 @@ fn handle_ws_request(
       release_connection_slot("peer gone before upgrade")
       Refused("peer_gone")
     }
-    Ok(ip.Client(address: peer_ip, scheme:)) ->
+    Ok(ip.Client(address: peer_ip, scheme:) as resolved) -> {
+      // The middleware gate and every later join and navigation reuse this
+      // resolution (`client.ip`), so the header is parsed once per
+      // connection.
+      let req =
+        request.Request(
+          ..req,
+          body: server.Connection(
+            ..req.body,
+            resolved: Some(ip.Resolved(
+              trusted: guards.trusted,
+              client: resolved,
+            )),
+          ),
+        )
       admit_ws_request(
         socket,
         req,
         scheme,
         config,
         guards,
-        Admission(conn_id:, peer_ip:, page:),
+        Admission(conn_id:, peer_ip:, page:, request: req),
       )
+    }
   }
 }
 
@@ -3047,7 +3071,7 @@ fn admit_ws_request(
   guards: Guards,
   admission: Admission,
 ) -> UpgradeOutcome {
-  let Admission(conn_id:, peer_ip:, page: _) = admission
+  let Admission(conn_id:, peer_ip:, ..) = admission
   let limits = config.security_limits
   let current_count = connection_tracker_count()
   case current_count > limits.max_connections {
@@ -3080,7 +3104,7 @@ fn acquire_ws_slot(
   guards: Guards,
   admission: Admission,
 ) -> UpgradeOutcome {
-  let Admission(conn_id:, peer_ip:, page: _) = admission
+  let Admission(conn_id:, peer_ip:, ..) = admission
   let limits = config.security_limits
   case ws.acquire_ip_slot(peer_ip, limits.max_ws_connections_per_ip) {
     Error(count) ->
@@ -3228,7 +3252,7 @@ fn close_refused_upgrade(
   admission: Admission,
   status: Int,
 ) -> UpgradeOutcome {
-  let Admission(conn_id:, peer_ip:, page:) = admission
+  let Admission(conn_id:, peer_ip:, page:, ..) = admission
   let opened_at = erlang_monotonic_time()
   log.warning(
     "brazier.transport",
@@ -3648,7 +3672,7 @@ fn serve_ws_request(
       #(outcome, upgrade_outcome_label(outcome))
     })
   case outcome {
-    Upgraded(admission) -> start_ws_connection(socket, config, req, admission)
+    Upgraded(admission) -> start_ws_connection(socket, config, admission)
     Refused(label) ->
       log.debug("brazier.transport", "WebSocket upgrade refused: " <> label)
   }

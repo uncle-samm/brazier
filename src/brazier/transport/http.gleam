@@ -566,7 +566,7 @@ pub fn read_body(
   req: Request(server.Connection),
   max_bytes: Int,
 ) -> Result(BitArray, ReadBodyError) {
-  let server.Connection(socket: socket) = req.body
+  let server.Connection(socket: socket, ..) = req.body
   case request.get_header(req, "content-length") {
     Error(Nil) -> {
       log.debug("brazier.http", "read_body: request has no Content-Length")
@@ -1180,7 +1180,8 @@ fn build_request(
   request.Request(
     method: method,
     headers: headers,
-    body: server.Connection(socket: socket),
+    // Nothing has resolved the client yet; a WebSocket upgrade sets it.
+    body: server.Connection(socket: socket, resolved: None),
     scheme: http.Http,
     host: host_name,
     port: port_opt,

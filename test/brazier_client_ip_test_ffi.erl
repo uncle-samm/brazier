@@ -42,5 +42,5 @@ make_request(MethodBin, Path, Headers, Socket) ->
         <<"POST">> -> post;
         _ -> {other, MethodBin}
     end,
-    {request, Method, Headers, {connection, Socket}, http, <<"localhost">>,
+    {request, Method, Headers, {connection, Socket, none}, http, <<"localhost">>,
      {some, 80}, Path, none}.

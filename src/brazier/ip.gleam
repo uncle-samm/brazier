@@ -239,6 +239,14 @@ pub type Client {
   Client(address: String, scheme: Result(String, String))
 }
 
+/// What one request's peer and forwarding headers resolved to, and the
+/// trusted proxies that resolution honoured. A request that carries one
+/// (`server.Connection.resolved`) is never resolved again against the same
+/// proxies, so a problem in its forwarding header is logged once.
+pub type Resolved {
+  Resolved(trusted: TrustedProxies, client: Client)
+}
+
 /// `client_address` and `client_scheme` together, for a caller that needs
 /// both (the WebSocket upgrade: its per-IP cap and its Origin check). The
 /// configured header is parsed once, so a problem in it (a malformed hop,

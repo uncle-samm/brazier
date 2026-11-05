@@ -22,18 +22,40 @@ import brazier/ip
 import brazier/log
 import brazier/transport/server.{type Connection, type Socket}
 import gleam/http/request.{type Request}
+import gleam/option.{Some}
 
 /// The client IP for a request (normalized textual address).
 /// Errors only when the socket peer address cannot be read (the peer left).
+///
+/// A request whose client was already resolved against the same trusted
+/// proxies (`Connection.resolved`, set by a WebSocket upgrade) reuses that
+/// resolution: the forwarding header is not parsed, or logged, again.
+/// Against other proxies the answer may differ, so it is resolved afresh.
 pub fn ip(
   req: Request(Connection),
   trusted: ip.TrustedProxies,
 ) -> Result(String, String) {
-  log.debug(
-    "brazier.client",
-    "Resolving client IP for " <> log_path.describe(req.path),
-  )
-  ip_for_socket(req.body.socket, req.headers, trusted)
+  case req.body.resolved {
+    Some(ip.Resolved(trusted: resolved_against, client:))
+      if resolved_against == trusted
+    -> {
+      log.debug(
+        "brazier.client",
+        "Reusing the resolved client "
+          <> client.address
+          <> " for "
+          <> log_path.describe(req.path),
+      )
+      Ok(client.address)
+    }
+    _ -> {
+      log.debug(
+        "brazier.client",
+        "Resolving client IP for " <> log_path.describe(req.path),
+      )
+      ip_for_socket(req.body.socket, req.headers, trusted)
+    }
+  }
 }
 
 /// `ip`, for callers that hold the socket and headers separately.

@@ -536,7 +536,7 @@ fn ws_request(
   request.Request(
     method: http.Get,
     headers: [#("host", "localhost:8080")],
-    body: server.Connection(socket: fake_socket()),
+    body: server.Connection(socket: fake_socket(), resolved: option.None),
     scheme: http.Http,
     host: "localhost",
     port: option.Some(8080),
