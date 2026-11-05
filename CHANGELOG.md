@@ -266,6 +266,12 @@ open follow-ups), which is in progress.
 
 ### Added
 
+- (M118 followups) `[brazier, runtime, connection, forgotten]` telemetry
+  when the runtime forgets a slow or gone connection, with `count` and
+  `queue_len` measurements and `reason` (`slow` or `down`) and
+  `connection_id` metadata.
+- (M118 followups) docs/CLUSTERING.md documents `store.synced`,
+  `store.list_synced` and the `[brazier, store, synced]` event.
 - (M118 streams) `brazier/stream` declares streams (`stream.new` with a
   `KeepFirst` or `KeepLast` limit and an explicit codec) and builds their
   ops (`insert`, `insert_many`, `delete`, `delete_key`, `reset`), with the
@@ -415,6 +421,24 @@ open follow-ups), which is in progress.
 
 ### Changed
 
+- (M118 followups) The build refuses `data-brazier-stream` outside
+  `stream.render` whenever it can know the attribute name statically: a
+  literal, a constant (local or imported) or a `<>` join of them, given
+  through `attribute.attribute`, `attribute.data` or `attribute.boolean`.
+  A name computed at runtime is still refused by the attribute constructor
+  and the render.
+- (M118 followups) The client bundle build fails on a compiler warning in a
+  file Brazier writes (copied Brazier modules, the log shim, the generated
+  entry, `gleam.toml`, or a warning naming no file), listing each file,
+  line, column and warning. A warning in the app's own code stays a logged
+  warning. `program.gleam_build` returns warnings as a `Warning` type.
+- (M118 followups) `scripts/run_cdp_shards_docker.sh` defaults the shard
+  total to the number of examples the harness in the image selects, and
+  refuses a larger total (those shards would run nothing and pass).
+- (M118 followups) docs/WIRE_PROTOCOL.md says a navigation refused by the
+  runtime is acked with an empty patch (one refused by the transport, or a
+  hard navigation, is not), and gives the order a join receives frames in:
+  the route error, the stream refusals held from `init`, then `model_sync`.
 - (M118 backpressure) A navigation the runtime refuses with an `error`
   frame is followed by an empty patch acking its clock, so the client's
   pending fragment scroll settles on it instead of on a later event.

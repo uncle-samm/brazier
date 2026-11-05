@@ -132,7 +132,15 @@ counter as the events' clocks, and the server acknowledges it like an event:
 the first `model_sync` or `patch` it sends this connection after handling the
 navigation carries `ack_clock` = `clock`, and a navigation that leaves the
 client-visible model as it was is answered with an ack (an empty patch). A
-navigation the server refuses (`hard_navigate`, `error`) gets no ack. A
+navigation the server answers with `hard_navigate` gets no ack: the browser
+loads the page. A navigation the runtime refuses with an `error` frame is
+followed by an empty patch acking its clock, because an `error` frame
+carries no clock: the runtime sends
+`{"type":"error","reason":"navigation path must be a same-origin path"}`,
+then the ack. The transport's own refusals, below, are sent before the
+navigation reaches the runtime and get no ack. Over a WebSocket the
+transport checks the same-origin rule first, so the runtime's `error` is
+seen only by a client of the runtime that bypasses that gate. A
 `navigate` without `clock` is acknowledged at 0; one whose `clock` is not an
 integer is malformed.
 ```json
@@ -158,8 +166,9 @@ The middleware runs on a `GET` of the target page first, as it does at the
 upgrade. A page it refuses is not navigated to: the server sends
 `hard_navigate` to the path, so the browser loads it over HTTP and gets the
 middleware's answer. A path that is not a same-origin path gets
-`{"type":"error","reason":"Invalid page path"}`. A `join` whose `path` is
-not the upgrade's page is gated the same way.
+`{"type":"error","reason":"Invalid page path"}`. Neither is acked: the
+navigation never reaches the runtime. A `join` whose `path` is not the
+upgrade's page is gated the same way.
 
 **request_sync** -- Client requests a full authoritative model sync after it
 cannot safely apply a server patch. The server responds with `model_sync`
@@ -243,6 +252,8 @@ of its update:
 ```json
 {"type": "error", "reason": "Stream log: refused 1 op(s): the item is 70013 bytes, over the limit of 65536"}
 ```
+A refusal made before any connection joined is held for the runtime's first
+join, which gets its `error` before its `model_sync` (see **error** below).
 The browser client's rules for applying an entry, and the `stream fault`
 close when one cannot be applied, are in
 [design/STREAMS.md](design/STREAMS.md#62-client-rules).
@@ -265,6 +276,22 @@ client parse it twice.
 ```json
 {"type": "error", "reason": "Rate limited"}
 ```
+An `error` frame can arrive before a join's `model_sync`, including the
+first `model_sync` a connection gets. The runtime sends a join, in this
+order:
+
+1. an `error` for a join `path` it cannot route (not a same-origin path,
+   an invalid encoding, or no route for it);
+2. on the runtime's first join, one `error` per stream refusal made before
+   any connection had joined (`init`, the initial route, messages before
+   the join, the join's own route), oldest first. At most 32 are kept; past
+   that, one more `error` says how many more there were. On a later join,
+   one `error` per stream refusal of the update its route made;
+3. the `model_sync`.
+
+The browser client logs each `error` and keeps waiting for the
+`model_sync`. A join refused for its token gets
+`{"type":"error","reason":"join refused"}` and no `model_sync`.
 
 **navigate** -- Server-initiated navigation (`router.push` / `router.replace`).
 The client pushes the path onto the history, or replaces the current entry

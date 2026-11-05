@@ -43,6 +43,7 @@
     stream_refused/4,
     runtime_stop/2,
     runtime_stop_failed/4,
+    runtime_connection_forgotten/3,
     effect_run_span/2,
     effect_timer_rejected/1,
     effect_after_rejected/1,
@@ -286,6 +287,15 @@ runtime_stop(Uptime, Reason) ->
 runtime_stop_failed(Uptime, Reason, Kind, Error) ->
     telemetry:execute([?PREFIX, runtime, stop], #{uptime => Uptime},
                       #{reason => Reason, kind => Kind, error => Error}).
+
+%% [brazier, runtime, connection, forgotten]
+runtime_connection_forgotten(Reason, QueueLen, ConnectionId) ->
+    telemetry:execute([?PREFIX, runtime, connection, forgotten],
+                      #{count => 1, queue_len => QueueLen},
+                      #{reason => forget_reason(Reason), connection_id => ConnectionId}).
+
+forget_reason(connection_slow) -> slow;
+forget_reason(connection_down) -> down.
 
 %% [brazier, effect, run] span. The label is `effect`, not `kind`: telemetry
 %% writes the exception class to `kind` on the exception event, which would

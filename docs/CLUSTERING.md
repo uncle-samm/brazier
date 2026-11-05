@@ -642,6 +642,37 @@ delays the next state request to that peer:
 
 ### Knowing when a replica is in sync
 
+An app asks its store. `store.synced` takes a key-value store and
+`store.list_synced` a list store. Both return `Result(Bool, SyncedError)`:
+
+```gleam
+import brazier/store
+import brazier/store/replicated
+
+/// Whether this node's replica of the cart holds every other node's writes.
+pub fn cart_in_sync(cart: store.Store(Int)) -> Result(Bool, String) {
+  case store.synced(cart) {
+    Ok(in_sync) -> Ok(in_sync)
+    Error(store.NotReplicated(topic:)) -> Error(topic <> " is a local store")
+    Error(store.ReplicaFailed(err)) ->
+      Error(replicated.describe_write_error(err))
+  }
+}
+```
+
+- `Ok(True)`: every peer replica last sent a digest equal to this
+  replica's. Then every value written anywhere before those digests were
+  sent is on this node.
+- `Ok(False)`: some peer replica has not (see the rules below).
+- `Error(store.NotReplicated(topic:))`: the store was opened `Local`. It
+  has no replicas, so "in sync" means nothing for it. Logged at warning.
+- `Error(store.ReplicaFailed(replicated.Unavailable(reason)))`: this
+  node's replica did not answer within 5 seconds, or was not running (for
+  example while its supervisor restarts it). Logged at error.
+
+Both ask `replicated.synced`, the same question put to the replica
+process, for code that holds a `replicated.Server`:
+
 <!-- docs-check: wrap
 import brazier/store/replicated
 
@@ -661,9 +692,7 @@ case replicated.start(replicated.KeyValue, "cart", replicated.default_config()) 
 ```
 
 `replicated.start` returns the running replica when the store is already
-open with the same configuration. `replicated.synced` is `Ok(True)` when
-every peer replica last sent a digest equal to this replica's. Then every
-value written anywhere before those digests were sent is on this node.
+open with the same configuration. The rules for both:
 
 - **Peers** are the replicas of the store on members (see
   [Membership](#membership)), as pg lists them. A node that has not opened
@@ -677,7 +706,8 @@ value written anywhere before those digests were sent is on this node.
 - **It follows pg.** Just after a peer connects or its replica restarts,
   pg may not list the new replica yet. Until it does, the replica does not
   count it, and a digest from it is not counted either.
-- Changes of the in-sync state are logged at debug level.
+- Changes of the in-sync state are logged at debug level, and each change
+  into sync emits `[brazier, store, synced]` (see [Telemetry](#telemetry)).
 
 Use it to wait before serving reads that must include other nodes' writes,
 for example in a readiness check after a deploy. Like the rest of the
@@ -738,7 +768,19 @@ with an incarnation above that floor.
   `too_many_entries`, and `reason` names the malformed field or the limit
   (`max_delta_bytes`, `max_sync_bytes`, `max_entries`), or is `none`. A
   malformed payload reports `entries` 0, since its entries cannot be
-  counted. See [TELEMETRY.md](TELEMETRY.md).
+  counted.
+- `[brazier, store, synced]` is emitted by the replica when it comes in
+  sync after being out of sync: the moment `store.synced` would turn from
+  `Ok(False)` to `Ok(True)`. `peers` is the number of peer replicas (0 for
+  a replica alone) and `store` the store's name. It is emitted once per
+  change, not while the replica stays in sync, so a local write, a merge
+  or a new peer that takes it out of sync is followed by another event once
+  the digests agree again. A replica alone emits it once, soon after it
+  starts. Count it per `store` to see how often replicas fall behind, and
+  read the time between a node's start and its first event to see how
+  long a joining node takes to catch up.
+
+See [TELEMETRY.md](TELEMETRY.md).
 
 ### Caveats
 

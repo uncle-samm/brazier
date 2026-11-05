@@ -141,6 +141,7 @@ pub fn catalogue() -> List(List(String)) {
     ["ws", "backpressure"],
     ["ws", "navigation_refused"],
     ["runtime", "stop"],
+    ["runtime", "connection", "forgotten"],
     ["stream", "delta"],
     ["stream", "refused"],
     ["effect", "timer", "rejected"],
@@ -192,6 +193,16 @@ pub type RuntimeSpan {
   Mount
   HandleEvent
   Navigate
+}
+
+/// Why the runtime forgot a connection without being told it disconnected.
+pub type ForgetReason {
+  /// Its handler's mailbox held more than the runtime's limit: it was told
+  /// to close (1013).
+  ConnectionSlow
+  /// Its handler had exited: a send found no process, or the runtime
+  /// handled the DOWN of its monitor.
+  ConnectionDown
 }
 
 pub type SessionEvent {
@@ -357,6 +368,17 @@ pub fn stream_refused(
   bytes: Int,
   stream: String,
   reason: String,
+) -> Nil
+
+/// `[brazier, runtime, connection, forgotten]`: the runtime dropped a
+/// connection it found slow or down, once per connection. `queue_len` is
+/// the handler's mailbox length for a slow one, 0 for one that is down.
+@external(erlang, "brazier_telemetry_ffi", "runtime_connection_forgotten")
+@internal
+pub fn runtime_connection_forgotten(
+  reason: ForgetReason,
+  queue_len: Int,
+  connection_id: String,
 ) -> Nil
 
 /// `[brazier, runtime, stop]` for a `Shutdown`.

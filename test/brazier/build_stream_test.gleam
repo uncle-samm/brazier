@@ -2,12 +2,14 @@
 /// and unique names, named item functions, client code limited to the
 /// client half of `brazier/stream`, and the stream lists the build writes
 /// into the server codec, the client entry and the contract report.
+import brazier/attribute
 import brazier/build/analyzer.{type Analysis, StreamDecl}
 import brazier/build/client_entry
 import brazier/build/contract
 import brazier/build/files
 import brazier/build/server_codec
 import brazier/build/sources
+import gleam/dynamic.{type Dynamic}
 import gleam/list
 import gleam/option.{None, Some}
 import gleam/string
@@ -416,6 +418,135 @@ pub fn other_data_attributes_are_accepted_test() {
     ))
   let assert [StreamDecl(name: "log", ..)] = analysis.streams
 }
+
+pub fn the_stream_attribute_through_a_constant_is_refused_test() {
+  let reason =
+    analyze_error([
+      #(
+        "app",
+        with_div_attributes(
+          "import brazier/attribute\n\nconst container = \"data-brazier-stream\"\n",
+          "attribute.attribute(container, \"log\")",
+        ),
+      ),
+    ])
+  assert_contains(
+    reason,
+    "`attribute.attribute(\"data-brazier-stream\", ..)` (the name is the constant `container`) sets data-brazier-stream",
+  )
+}
+
+pub fn the_stream_attribute_through_another_modules_constants_is_refused_test() {
+  // A qualified constant of another app module, itself a `<>` of a
+  // constant and a literal.
+  let names =
+    "pub const prefix = \"data-brazier-\"
+
+pub const container = prefix <> \"Stream\"
+"
+  let reason =
+    analyze_error([
+      #(
+        "app",
+        with_div_attributes(
+          "import brazier/attribute\nimport names\n",
+          "attribute.attribute(names.container, \"log\")",
+        ),
+      ),
+      #("names", names),
+    ])
+  assert_contains(
+    reason,
+    "`attribute.attribute(\"data-brazier-Stream\", ..)` (the name is the constant `names.container`) sets data-brazier-stream",
+  )
+}
+
+pub fn the_stream_attribute_through_an_unqualified_constant_is_refused_test() {
+  let names = "pub const container = \"brazier-stream\"\n"
+  let reason =
+    analyze_error([
+      #(
+        "app",
+        with_div_attributes(
+          "import brazier/attribute\nimport names.{container}\n",
+          "attribute.data(container, \"log\")",
+        ),
+      ),
+      #("names", names),
+    ])
+  assert_contains(
+    reason,
+    "`attribute.data(\"brazier-stream\", ..)` (the name is the constant `container`) sets data-brazier-stream",
+  )
+}
+
+pub fn the_stream_attribute_through_a_concatenation_is_refused_test() {
+  let reason =
+    analyze_error([
+      #(
+        "app",
+        with_div_attributes(
+          "import brazier/attribute\n",
+          "attribute.data(\"brazier-\" <> \"stream\", \"log\")",
+        ),
+      ),
+    ])
+  assert_contains(
+    reason,
+    "`attribute.data(\"brazier-stream\", ..)` (the name is a concatenation) sets data-brazier-stream",
+  )
+}
+
+pub fn the_stream_attribute_through_boolean_is_refused_test() {
+  let reason =
+    analyze_error([
+      #(
+        "app",
+        with_div_attributes(
+          "import brazier/attribute\n",
+          "attribute.boolean(\"data-brazier-stream\", True)",
+        ),
+      ),
+    ])
+  assert_contains(
+    reason,
+    "`attribute.boolean(\"data-brazier-stream\", ..)` sets data-brazier-stream",
+  )
+}
+
+/// A local variable shadows the constant of the same name: its value is
+/// not known to the build.
+pub fn a_parameter_shadowing_a_constant_is_not_read_test() {
+  let source =
+    with_div_attributes(
+      "import brazier/attribute\n\nconst name = \"data-brazier-stream\"\n",
+      "named(\"data-x\")",
+    )
+    <> "\npub fn named(name: String) -> attribute.Attribute(Msg) {\n  attribute.attribute(name, \"log\")\n}\n\npub fn unused() -> String {\n  name\n}\n"
+  let analysis = analyze_app(source)
+  let assert [StreamDecl(name: "log", ..)] = analysis.streams
+}
+
+/// A name computed when the view runs is not refused by the build: every
+/// helper that forwards a name would be. The attribute's constructor
+/// refuses the container's attribute then, however the name was built.
+pub fn a_computed_name_is_refused_when_the_view_runs_test() {
+  let source =
+    with_div_attributes("import brazier/attribute\n", "named(\"data-x\")")
+    <> "\npub fn named(name: String) -> attribute.Attribute(Msg) {\n  attribute.attribute(name, \"log\")\n}\n"
+  let analysis = analyze_app(source)
+  let assert [StreamDecl(name: "log", ..)] = analysis.streams
+  let computed = "data-" <> string.lowercase("BRAZIER") <> "-stream"
+  let assert Error(#("error", _)) =
+    rescue(fn() { attribute.attribute(computed, "log") })
+  let assert Error(#("error", _)) =
+    rescue(fn() { attribute.boolean(string.uppercase(computed), True) })
+  let assert Error(#("error", _)) =
+    rescue(fn() { attribute.data(string.drop_start(computed, 5), "log") })
+}
+
+@external(erlang, "brazier_telemetry_test_ffi", "rescue")
+fn rescue(run: fn() -> a) -> Result(a, #(String, Dynamic))
 
 // --- generated exports -------------------------------------------------------
 

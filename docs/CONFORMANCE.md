@@ -72,16 +72,25 @@ optional canonical/filter selection.
 For local per-container sharding, use the Docker runner:
 
 ```sh
-BRAZIER_CDP_TOTAL_SHARDS=23 BRAZIER_CDP_VIEWPORTS=desktop BRAZIER_CDP_PARALLEL=5 make browser-all-docker-shards
+BRAZIER_CDP_VIEWPORTS=desktop BRAZIER_CDP_PARALLEL=5 make browser-all-docker-shards
 ```
+
+By default the runner makes one shard per example: the total is the number
+of examples the harness selects (its `ALL_EXAMPLES`, 25 today), read from
+the harness inside the image the shards run. `BRAZIER_CDP_TOTAL_SHARDS`
+sets a smaller total; a total above the example count is refused, since a
+shard past it would run no example and pass.
 
 The Docker runner also supports selected shard lists and warmed images:
 
 ```sh
-BRAZIER_CDP_SHARDS="1,6,11" BRAZIER_CDP_TOTAL_SHARDS=23 make browser-all-docker-shards
-BRAZIER_CDP_PREBUILD_EXAMPLES=1 BRAZIER_CDP_TOTAL_SHARDS=23 make browser-all-docker-shards
+BRAZIER_CDP_SHARDS="1,6,11" make browser-all-docker-shards
+BRAZIER_CDP_PREBUILD_EXAMPLES=1 make browser-all-docker-shards
 BRAZIER_CDP_SKIP_DOCKER_BUILD=1 BRAZIER_CDP_DOCKER_IMAGE=brazier-cdp:boxd make browser-all-docker-shards
 ```
+
+The measurements below were taken with 23 shards, one per example, when the
+harness had 23 examples.
 
 Latest measured local timings on the 10 CPU / 16 GB development host:
 
