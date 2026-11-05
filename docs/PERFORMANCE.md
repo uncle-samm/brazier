@@ -86,6 +86,14 @@ spread for 3 s more per suite run; 20 buy nothing more.
 The client scenarios do not measure the DOM work: node has no DOM. The
 morph, and the stream item insertion, need a browser measurement over CDP.
 
+The CDP suite's `rows` section takes one (`examples/rows`, 1000 rows, 100
+timed updates after 10 warm-up, median and p99 over 5 rounds, written to
+`build/bench/cdp_morph_<viewport>.json`). It is a measurement, not a gated
+metric. Chrome rounds `performance.now` to 100 µs, and two desktop runs of
+unchanged code put the morph median at 5200 and 6800 µs, about 30% apart:
+past the 25% floor before any load. A regression in the morph shows
+there as a number to compare by hand, base commit next to branch.
+
 Every percentile is taken per round. A metric's median (p50) and p99 are
 the medians over rounds of each round's median and p99, as a throughput is
 the median round's. They are not percentiles of the pooled samples of every
@@ -188,111 +196,165 @@ Why these numbers:
 
 ## Baseline
 
-`bench/baselines.json`, 5 runs, recorded 2026-11-04T21:05:39Z by `make
-bench-baseline`. Every one of its 87 metrics is gated.
+`bench/baselines.json`, 5 runs, recorded 2026-11-05T08:55:47Z by `make
+bench-baseline` at commit 7bef17a (Milestone 118). Every one of its
+110 metrics is gated; 3 spread past the 25% floor, the widest
+`presence.track.10.p99` at 40%.
 
 - **Machine:** Apple M2 Pro, 10 logical processors and 10 schedulers
   online, OTP 28, erts 16.3, aarch64-apple-darwin.
-- **Not an idle machine:** the load average (1, 5 and 15 minutes) was
-  2.18 3.82 4.95 before the runs and 8.18 7.02 6.14
-  after, because other agents' builds and tests were running. The file
-  records both under `conditions`. This baseline is to be replaced by one
-  taken on an idle machine; until then, treat a failure near the limit as
-  a reason to rerun on a quiet machine before blaming the code.
+- **Load:** the load average (1, 5 and 15 minutes) was 7.89 6.99 6.60
+  before the runs and 6.44 6.99 6.76 after. The machine had
+  no builds or tests running, but other apps kept the load near 7. A
+  machine in that state runs most metrics 1.2 to 1.6x slower than the
+  2026-11-04 baseline did. That this is the machine and not the code was
+  measured head to head: the 2026-11-04 baseline's commit (4b274e8) and
+  this one, run alternately twice each in one session, differed by at
+  most 13% on every metric except the ones the code changed and
+  `presence.untrack.10000.p99`, whose two runs of the old commit were
+  25% apart (see
+  [Changes since the 2026-11-04 baseline](#changes-since-the-2026-11-04-baseline)).
+  As before, treat a failure near the limit as a reason to rerun on a
+  quieter machine before blaming the code.
 
 | Metric | Median | Range | Spread | Tolerance |
 |--------|--------|-------|--------|-----------|
-| `http.keepalive.8c.throughput` | 61910 req/s | 61353..62696 | 2.2% | 25% |
-| `http.keepalive.8c.latency_p50` | 124.0 µs | 122.0..125.0 | 2.4% | 25% |
-| `http.keepalive.8c.latency_p99` | 225.0 µs | 222.0..229.0 | 3.1% | 25% |
-| `http.static.100kb.200.throughput` | 14054 req/s | 13958..14233 | 2.0% | 25% |
-| `http.static.100kb.200.latency_p50` | 555.5 µs | 552.0..561.0 | 1.6% | 25% |
-| `http.static.100kb.200.latency_p99` | 839.0 µs | 826.0..844.0 | 2.1% | 25% |
-| `http.static.100kb.304.throughput` | 21930 req/s | 21286..22896 | 7.3% | 25% |
-| `http.static.100kb.304.latency_p50` | 354.0 µs | 337.0..365.0 | 7.9% | 25% |
-| `http.static.100kb.304.latency_p99` | 575.0 µs | 537.0..592.0 | 9.6% | 25% |
-| `http.static.10mb.200.throughput` | 812.9 req/s | 805.6..817.6 | 1.5% | 25% |
-| `http.static.10mb.200.latency_p50` | 4738 µs | 4674..4802 | 2.7% | 25% |
-| `http.static.10mb.200.latency_p99` | 6549 µs | 6447..6562 | 1.8% | 25% |
-| `http.static.10mb.304.throughput` | 22223 req/s | 21065..23160 | 9.4% | 25% |
-| `http.static.10mb.304.latency_p50` | 347.0 µs | 332.0..368.0 | 10.4% | 25% |
-| `http.static.10mb.304.latency_p99` | 565.0 µs | 553.0..607.0 | 9.6% | 25% |
-| `http.gzip_100kb.throughput` | 7336 req/s | 7290..7462 | 2.4% | 25% |
-| `http.gzip_100kb.latency_p50` | 1016 µs | 1004..1033 | 2.9% | 25% |
-| `http.gzip_100kb.latency_p99` | 1643 µs | 1624..1649 | 1.5% | 25% |
-| `ssr.rows_100.throughput` | 7505 req/s | 7434..7647 | 2.8% | 25% |
-| `ssr.rows_100.latency_p50` | 1043 µs | 1024..1052 | 2.7% | 25% |
-| `ssr.rows_100.latency_p99` | 1555 µs | 1518..1597 | 5.1% | 25% |
-| `ssr.rows_1000.throughput` | 943.9 req/s | 919.7..950.7 | 3.3% | 25% |
-| `ssr.rows_1000.latency_p50` | 7930 µs | 7905..7986 | 1.0% | 25% |
-| `ssr.rows_1000.latency_p99` | 15012 µs | 14068..16435 | 15.8% | 25% |
-| `ws.1x200.throughput` | 15518 events/s | 15378..15598 | 1.4% | 25% |
-| `ws.1x200.latency_p50` | 62.0 µs | 61.5..62.5 | 1.6% | 25% |
-| `ws.1x200.latency_p99` | 101.0 µs | 97.0..102.0 | 5.0% | 25% |
-| `ws.10x200.throughput` | 60080 events/s | 59643..61497 | 3.1% | 25% |
-| `ws.10x200.latency_p50` | 158.0 µs | 155.0..159.0 | 2.5% | 25% |
-| `ws.10x200.latency_p99` | 276.0 µs | 263.0..282.0 | 6.9% | 25% |
-| `ws.100x200.throughput` | 71213 events/s | 70762..71929 | 1.6% | 25% |
-| `ws.100x200.latency_p50` | 1316 µs | 1307..1326 | 1.4% | 25% |
-| `ws.100x200.latency_p99` | 2910 µs | 2848..2937 | 3.1% | 25% |
-| `runtime.changed.pipelined` | 31.6 µs/event | 31.5..31.9 | 1.2% | 25% |
-| `runtime.changed.latency_p50` | 25.3 µs | 25.2..25.3 | 0.3% | 25% |
-| `runtime.changed.latency_p99` | 44.5 µs | 39.3..51.1 | 26.5% | 26.5% |
-| `runtime.unchanged.pipelined` | 17.8 µs/event | 17.0..21.2 | 23.4% | 25% |
-| `runtime.unchanged.latency_p50` | 13.5 µs | 13.4..13.5 | 0.6% | 25% |
-| `runtime.unchanged.latency_p99` | 25.1 µs | 24.4..26.2 | 7.3% | 25% |
-| `runtime.list_50kb.changed.pipelined` | 147.7 µs/event | 145.5..148.5 | 2.1% | 25% |
-| `runtime.list_50kb.changed.latency_p50` | 151.0 µs | 151.0..151.3 | 0.2% | 25% |
-| `runtime.list_50kb.changed.latency_p99` | 189.4 µs | 175.7..198.0 | 11.8% | 25% |
-| `runtime.list_500kb.changed.pipelined` | 1816 µs/event | 1739..1828 | 4.9% | 25% |
-| `runtime.list_500kb.changed.latency_p50` | 1825 µs | 1738..1844 | 5.8% | 25% |
-| `runtime.list_500kb.changed.latency_p99` | 2350 µs | 2314..2387 | 3.1% | 25% |
-| `wire.patch.median` | 320.2 ns/frame | 318.7..321.9 | 1.0% | 25% |
-| `wire.patch.p99` | 441.9 ns/frame | 419.4..467.5 | 10.9% | 25% |
-| `wire.model_sync_50kb.median` | 316.3 ns/frame | 314.8..328.9 | 4.4% | 25% |
-| `wire.model_sync_50kb.p99` | 416.9 ns/frame | 404.4..465.6 | 14.7% | 25% |
-| `pubsub.fanout.1.p50` | 1.38 µs | 1.33..1.38 | 3.0% | 25% |
-| `pubsub.fanout.1.p99` | 2.83 µs | 2.46..3.50 | 36.8% | 36.8% |
-| `pubsub.fanout.100.p50` | 105.3 µs | 100.9..105.9 | 4.7% | 25% |
-| `pubsub.fanout.100.p99` | 232.4 µs | 221.8..244.3 | 9.6% | 25% |
-| `pubsub.fanout.1000.p50` | 1287 µs | 1239..1307 | 5.3% | 25% |
-| `pubsub.fanout.1000.p99` | 1677 µs | 1654..1687 | 2.0% | 25% |
-| `store.put.median` | 1014 ns/op | 1004..1029 | 2.5% | 25% |
-| `store.put.p99` | 1159 ns/op | 1095..1166 | 6.1% | 25% |
-| `store.get.median` | 132.3 ns/op | 131.2..138.6 | 5.6% | 25% |
-| `store.get.p99` | 151.8 ns/op | 139.8..164.4 | 16.2% | 25% |
-| `store.delete.median` | 994.5 ns/op | 986.5..1054 | 6.8% | 25% |
-| `store.delete.p99` | 1125 ns/op | 1098..1160 | 5.5% | 25% |
-| `store.crdt_append.10.median` | 816.4 ns/op | 801.5..822.2 | 2.5% | 25% |
-| `store.crdt_append.10.p99` | 896.5 ns/op | 844.2..973.6 | 14.4% | 25% |
-| `store.crdt_append.1000.median` | 489.1 ns/op | 486.2..489.9 | 0.7% | 25% |
-| `store.crdt_append.1000.p99` | 535.2 ns/op | 530.0..545.9 | 3.0% | 25% |
-| `store.crdt_append.10000.median` | 538.7 ns/op | 529.0..546.8 | 3.3% | 25% |
-| `store.crdt_append.10000.p99` | 597.5 ns/op | 573.0..612.0 | 6.5% | 25% |
-| `presence.track.10.median` | 5.29 µs | 5.25..5.33 | 1.6% | 25% |
-| `presence.track.10.p99` | 18.9 µs | 17.8..20.2 | 13.0% | 25% |
-| `presence.untrack.10.median` | 3.38 µs | 3.33..3.38 | 1.2% | 25% |
-| `presence.untrack.10.p99` | 15.5 µs | 13.2..17.4 | 26.8% | 26.8% |
-| `presence.list.10.median` | 3.42 µs | 3.38..3.42 | 1.2% | 25% |
-| `presence.list.10.p99` | 10.6 µs | 9.67..13.0 | 31.4% | 31.4% |
-| `presence.track.10000.median` | 5.88 µs | 5.67..6.04 | 6.4% | 25% |
-| `presence.track.10000.p99` | 17.3 µs | 15.0..17.8 | 16.2% | 25% |
-| `presence.untrack.10000.median` | 4.04 µs | 3.88..4.08 | 5.1% | 25% |
-| `presence.untrack.10000.p99` | 12.8 µs | 11.1..13.1 | 16.0% | 25% |
-| `presence.list.10000.median` | 5890 µs | 5197..6125 | 15.8% | 25% |
-| `presence.list.10000.p99` | 7479 µs | 6930..7671 | 9.9% | 25% |
-| `client.render.rows_100.median` | 156.2 µs | 155.5..157.3 | 1.1% | 25% |
-| `client.render.rows_100.p99` | 308.7 µs | 305.6..323.8 | 5.9% | 25% |
-| `client.patch.rows_100.median` | 260.4 µs | 259.7..261.6 | 0.7% | 25% |
-| `client.patch.rows_100.p99` | 412.4 µs | 408.2..439.2 | 7.5% | 25% |
-| `client.render.rows_1000.median` | 1647 µs | 1634..1664 | 1.8% | 25% |
-| `client.render.rows_1000.p99` | 2872 µs | 2742..2928 | 6.5% | 25% |
-| `client.patch.rows_1000.median` | 2765 µs | 2745..2788 | 1.5% | 25% |
-| `client.patch.rows_1000.p99` | 4054 µs | 3952..4154 | 5.0% | 25% |
+| `http.keepalive.8c.throughput` | 54672 req/s | 54013..54875 | 1.6% | 25% |
+| `http.keepalive.8c.latency_p50` | 141.0 µs | 140.0..142.0 | 1.4% | 25% |
+| `http.keepalive.8c.latency_p99` | 241.0 µs | 239.0..246.0 | 2.9% | 25% |
+| `http.static.100kb.200.throughput` | 12615 req/s | 12608..12699 | 0.7% | 25% |
+| `http.static.100kb.200.latency_p50` | 623.0 µs | 618.5..623.0 | 0.7% | 25% |
+| `http.static.100kb.200.latency_p99` | 905.0 µs | 895.0..914.0 | 2.1% | 25% |
+| `http.static.100kb.304.throughput` | 20901 req/s | 19539..21180 | 7.8% | 25% |
+| `http.static.100kb.304.latency_p50` | 373.0 µs | 367.0..398.0 | 8.3% | 25% |
+| `http.static.100kb.304.latency_p99` | 581.0 µs | 574.0..609.0 | 6.0% | 25% |
+| `http.static.10mb.200.throughput` | 671.9 req/s | 661.4..681.0 | 2.9% | 25% |
+| `http.static.10mb.200.latency_p50` | 5704 µs | 5578..5792 | 3.8% | 25% |
+| `http.static.10mb.200.latency_p99` | 7673 µs | 7573..7742 | 2.2% | 25% |
+| `http.static.10mb.304.throughput` | 20964 req/s | 19203..21274 | 9.9% | 25% |
+| `http.static.10mb.304.latency_p50` | 372.0 µs | 367.0..405.0 | 10.2% | 25% |
+| `http.static.10mb.304.latency_p99` | 579.0 µs | 567.0..629.0 | 10.7% | 25% |
+| `http.gzip_100kb.throughput` | 5899 req/s | 5850..5924 | 1.3% | 25% |
+| `http.gzip_100kb.latency_p50` | 1306 µs | 1294..1320 | 2.0% | 25% |
+| `http.gzip_100kb.latency_p99` | 1852 µs | 1830..1859 | 1.6% | 25% |
+| `ssr.rows_100.throughput` | 9718 req/s | 9577..9790 | 2.2% | 25% |
+| `ssr.rows_100.latency_p50` | 795.0 µs | 782.0..805.0 | 2.9% | 25% |
+| `ssr.rows_100.latency_p99` | 1220 µs | 1196..1233 | 3.0% | 25% |
+| `ssr.rows_1000.throughput` | 1147 req/s | 1129..1173 | 3.8% | 25% |
+| `ssr.rows_1000.latency_p50` | 6734 µs | 6628..6760 | 1.9% | 25% |
+| `ssr.rows_1000.latency_p99` | 9635 µs | 9561..9944 | 4.0% | 25% |
+| `ssr.stream_300.throughput` | 889.0 req/s | 881.6..906.8 | 2.8% | 25% |
+| `ssr.stream_300.latency_p50` | 8688 µs | 8505..8849 | 4.0% | 25% |
+| `ssr.stream_300.latency_p99` | 11298 µs | 11033..11462 | 3.8% | 25% |
+| `ws.1x200.throughput` | 12026 events/s | 11804..12588 | 6.5% | 25% |
+| `ws.1x200.latency_p50` | 81.0 µs | 76.0..82.0 | 7.4% | 25% |
+| `ws.1x200.latency_p99` | 124.0 µs | 113.0..131.0 | 14.5% | 25% |
+| `ws.10x200.throughput` | 50924 events/s | 50624..51529 | 1.8% | 25% |
+| `ws.10x200.latency_p50` | 188.0 µs | 184.0..188.0 | 2.1% | 25% |
+| `ws.10x200.latency_p99` | 317.0 µs | 315.0..322.0 | 2.2% | 25% |
+| `ws.100x200.throughput` | 61337 events/s | 61108..61523 | 0.7% | 25% |
+| `ws.100x200.latency_p50` | 1534 µs | 1526..1538 | 0.8% | 25% |
+| `ws.100x200.latency_p99` | 3224 µs | 3180..3276 | 3.0% | 25% |
+| `runtime.changed.pipelined` | 48.2 us/event | 48.0..48.7 | 1.4% | 25% |
+| `runtime.changed.latency_p50` | 37.0 µs | 36.9..37.2 | 0.8% | 25% |
+| `runtime.changed.latency_p99` | 61.3 µs | 55.7..66.3 | 17.2% | 25% |
+| `runtime.unchanged.pipelined` | 23.7 us/event | 23.1..25.1 | 8.0% | 25% |
+| `runtime.unchanged.latency_p50` | 20.1 µs | 20.0..20.3 | 1.2% | 25% |
+| `runtime.unchanged.latency_p99` | 32.1 µs | 29.5..36.0 | 20.0% | 25% |
+| `runtime.list_50kb.changed.pipelined` | 209.1 us/event | 206.3..211.3 | 2.4% | 25% |
+| `runtime.list_50kb.changed.latency_p50` | 215.0 µs | 214.4..215.2 | 0.4% | 25% |
+| `runtime.list_50kb.changed.latency_p99` | 263.9 µs | 236.3..268.0 | 12.0% | 25% |
+| `runtime.list_500kb.changed.pipelined` | 2462 us/event | 2389..2473 | 3.4% | 25% |
+| `runtime.list_500kb.changed.latency_p50` | 2488 µs | 2440..2495 | 2.2% | 25% |
+| `runtime.list_500kb.changed.latency_p99` | 3207 µs | 3047..3363 | 9.9% | 25% |
+| `runtime.stream.append.pipelined` | 116.8 us/event | 115.5..121.0 | 4.6% | 25% |
+| `runtime.stream.append.latency_p50` | 111.9 µs | 110.3..115.4 | 4.5% | 25% |
+| `runtime.stream.append.latency_p99` | 152.7 µs | 142.0..182.5 | 26.5% | 26.5% |
+| `runtime.stream.chunk.pipelined` | 97.8 us/event | 94.1..102.5 | 8.6% | 25% |
+| `runtime.stream.chunk.latency_p50` | 90.9 µs | 90.0..91.2 | 1.3% | 25% |
+| `runtime.stream.chunk.latency_p99` | 126.0 µs | 115.2..135.0 | 15.8% | 25% |
+| `wire.patch.median` | 521.7 ns/frame | 515.0..523.7 | 1.7% | 25% |
+| `wire.patch.p99` | 668.6 ns/frame | 622.9..688.1 | 9.8% | 25% |
+| `wire.model_sync_50kb.median` | 523.9 ns/frame | 521.8..526.1 | 0.8% | 25% |
+| `wire.model_sync_50kb.p99` | 680.6 ns/frame | 649.8..793.3 | 21.1% | 25% |
+| `wire.stream_patch.median` | 518.8 ns/frame | 515.4..524.8 | 1.8% | 25% |
+| `wire.stream_patch.p99` | 665.8 ns/frame | 653.4..684.4 | 4.7% | 25% |
+| `pubsub.fanout.1.p50` | 1.96 µs | 1.92..1.96 | 2.1% | 25% |
+| `pubsub.fanout.1.p99` | 5.67 µs | 3.79..5.83 | 36.0% | 36.0% |
+| `pubsub.fanout.100.p50` | 122.9 µs | 122.4..125.8 | 2.8% | 25% |
+| `pubsub.fanout.100.p99` | 257.0 µs | 228.3..282.6 | 21.1% | 25% |
+| `pubsub.fanout.1000.p50` | 1502 µs | 1362..1513 | 10.0% | 25% |
+| `pubsub.fanout.1000.p99` | 1861 µs | 1839..1939 | 5.4% | 25% |
+| `store.put.median` | 1379 ns/op | 1366..1404 | 2.8% | 25% |
+| `store.put.p99` | 1477 ns/op | 1450..1543 | 6.3% | 25% |
+| `store.get.median` | 138.9 ns/op | 138.6..142.3 | 2.7% | 25% |
+| `store.get.p99` | 157.0 ns/op | 153.1..171.0 | 11.4% | 25% |
+| `store.delete.median` | 1362 ns/op | 1341..1403 | 4.5% | 25% |
+| `store.delete.p99` | 1504 ns/op | 1449..1528 | 5.3% | 25% |
+| `store.crdt_append.10.median` | 4262 ns/op | 4212..4288 | 1.8% | 25% |
+| `store.crdt_append.10.p99` | 4518 ns/op | 4451..4571 | 2.7% | 25% |
+| `store.crdt_append.1000.median` | 3829 ns/op | 3791..3844 | 1.4% | 25% |
+| `store.crdt_append.1000.p99` | 4005 ns/op | 3996..4023 | 0.7% | 25% |
+| `store.crdt_append.10000.median` | 3800 ns/op | 3780..3829 | 1.3% | 25% |
+| `store.crdt_append.10000.p99` | 3977 ns/op | 3954..3983 | 0.7% | 25% |
+| `presence.track.10.median` | 7.42 µs | 7.08..7.46 | 5.0% | 25% |
+| `presence.track.10.p99` | 24.7 µs | 18.0..27.8 | 39.8% | 39.8% |
+| `presence.untrack.10.median` | 4.71 µs | 4.62..4.75 | 2.7% | 25% |
+| `presence.untrack.10.p99` | 20.7 µs | 20.4..23.8 | 16.7% | 25% |
+| `presence.list.10.median` | 4.83 µs | 4.79..4.83 | 0.9% | 25% |
+| `presence.list.10.p99` | 14.2 µs | 13.9..15.1 | 8.5% | 25% |
+| `presence.track.10000.median` | 8.29 µs | 8.04..8.34 | 3.5% | 25% |
+| `presence.track.10000.p99` | 21.2 µs | 18.3..21.8 | 16.5% | 25% |
+| `presence.untrack.10000.median` | 5.67 µs | 5.58..5.75 | 2.9% | 25% |
+| `presence.untrack.10000.p99` | 15.8 µs | 13.4..16.7 | 20.6% | 25% |
+| `presence.list.10000.median` | 7587 µs | 6942..7683 | 9.8% | 25% |
+| `presence.list.10000.p99` | 9368 µs | 9195..9550 | 3.8% | 25% |
+| `patch.window_200.ops` | 3.00 ops | 3.00..3.00 | 0.0% | 25% |
+| `patch.window_200.bytes` | 199.0 bytes | 199.0..199.0 | 0.0% | 25% |
+| `patch.window_200.diff.median` | 54.4 µs | 53.3..54.6 | 2.4% | 25% |
+| `patch.window_200.diff.p99` | 57.5 µs | 55.9..58.0 | 3.7% | 25% |
+| `patch.window_2000.ops` | 3.00 ops | 3.00..3.00 | 0.0% | 25% |
+| `patch.window_2000.bytes` | 199.0 bytes | 199.0..199.0 | 0.0% | 25% |
+| `patch.window_2000.diff.median` | 474.8 µs | 466.5..478.4 | 2.5% | 25% |
+| `patch.window_2000.diff.p99` | 519.5 µs | 516.0..528.1 | 2.3% | 25% |
+| `client.render.rows_100.median` | 197.9 µs | 196.0..198.6 | 1.4% | 25% |
+| `client.render.rows_100.p99` | 395.7 µs | 383.6..414.9 | 7.9% | 25% |
+| `client.patch.rows_100.median` | 249.7 µs | 243.8..251.3 | 3.0% | 25% |
+| `client.patch.rows_100.p99` | 434.0 µs | 399.7..459.2 | 13.7% | 25% |
+| `client.render.rows_1000.median` | 2085 µs | 2072..2101 | 1.4% | 25% |
+| `client.render.rows_1000.p99` | 3567 µs | 3523..3612 | 2.5% | 25% |
+| `client.patch.rows_1000.median` | 2610 µs | 2564..2631 | 2.6% | 25% |
+| `client.patch.rows_1000.p99` | 4239 µs | 4142..4319 | 4.2% | 25% |
+| `client.stream.append.300.median` | 27.8 µs | 27.6..28.7 | 4.0% | 25% |
+| `client.stream.append.300.p99` | 92.0 µs | 82.9..100.4 | 19.0% | 25% |
+| `client.stream.chunk.300.median` | 26.9 µs | 26.6..28.1 | 5.6% | 25% |
+| `client.stream.chunk.300.p99` | 85.6 µs | 80.2..92.7 | 14.6% | 25% |
 
 A `make bench-check` right after this baseline passed, under a load
-average of 7 to 9. Its worst metric was `pubsub.fanout.1.p99`, at 1.15×
-its median against a limit of 1.37×; every other metric was within 1.07×.
+average of about 7. Its worst metrics were the 304 responses of
+`http.static`, at 1.09x their medians against a limit of 1.25x.
+
+### Changes since the 2026-11-04 baseline
+
+Each ratio is the mean of two runs of 7bef17a over the mean of two runs
+of 4b274e8, interleaved on the same machine (above 1 is slower):
+
+- **Faster:** `ssr.rows_100` 0.62 to 0.69 and `ssr.rows_1000` 0.51 to
+  0.72 (the render's `iolist_to_binary` and ASCII name folding, below);
+  `client.patch` 0.68 to 0.79 (the generated decoders of
+  `brazier/internal/wire_decode`); `store.get` 0.84.
+- **`store.crdt_append`: 3.6x at 10 keys, 5.2x at 1000 and 10,000.** The
+  accepted cost of the incremental anti-entropy digest: each write hashes
+  the elements it adds and removes with SHA-256, so reading the digest is
+  O(1) instead of a sorted hash of the whole state (about 1.2M reductions
+  at 10,000 keys) on every sync tick.
+- **`wire.patch` and `wire.model_sync_50kb`: 1.13x** on the medians, with
+  under 2% noise between runs. Within the gate's floor, not yet
+  explained; a follow-up in docs/TODO.md.
+- **`presence.list.10.p99`: 1.56x** (13 µs), with under 5% noise; the
+  median did not move. A follow-up in docs/TODO.md.
+- New metrics, first baselined here: `ssr.stream_300`, `runtime.stream.*`,
+  `wire.stream_patch`, `patch.window_*` and `client.stream.*`.
 
 Some notes on reading the numbers:
 

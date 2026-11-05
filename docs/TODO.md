@@ -45,6 +45,26 @@
     `eaddrnotavail`, whose text is OS-specific, and the listener has no
     bind-address option to test it through.
 
+- **Issue:** `wire.patch` and `wire.model_sync_50kb` are 13% slower on
+  their medians than at 4b274e8 (the 2026-11-04 baseline's commit), with
+  under 2% noise between runs. Inside the gate's 25% floor, so
+  `bench-check` passes it.
+  - **Context:** Milestone 118 re-baseline, an A/B of 4b274e8 and 7bef17a
+    run alternately on one machine (docs/PERFORMANCE.md, "Changes since
+    the 2026-11-04 baseline").
+  - **Files:** `src/brazier/transport.gleam` (`encode_server_message`),
+    `test/brazier/bench/suite.gleam` (the wire scenario)
+  - **Attempted:** nothing yet. Bisect the commits between the two that
+    touch the frame encoding or the bench's wire scenario.
+
+- **Issue:** `presence.list.10.p99` is 1.56x what it was at 4b274e8 (about
+  13 µs), with under 5% noise between runs; its median and the 10,000-entry
+  metrics did not move.
+  - **Context:** the same A/B as the `wire` issue above.
+  - **Files:** `src/brazier/presence.gleam`, `src/brazier_presence_ffi.erl`,
+    `test/brazier/bench/presence_bench.gleam`
+  - **Attempted:** nothing yet.
+
 - **Issue:** `presence.list` grows faster than the room past about 10,000
   entries: 0.46 µs an entry at 3,000, 0.61 at 10,000 and 0.92 to 1.13 at
   30,000. Every `brazier.presence` session that starts following a topic
