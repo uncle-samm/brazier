@@ -960,7 +960,7 @@ fn handle_message(
               <> int.to_string(clock),
           )
           warn_client_ops(conn_id, ops)
-          let state = record_ack(state, conn_id, clock)
+          let state = record_ack(state, conn_id, clock, EventClock)
           case
             state.decode_event(event_name, handler_id, event_data, target_path)
           {
@@ -1021,7 +1021,7 @@ fn handle_message(
           // Acknowledged like an event (LiveView answers a live_patch with
           // a reply), so the client can tell the render of the new page
           // from a broadcast that arrives before it.
-          let state = record_ack(state, conn_id, clock)
+          let state = record_ack(state, conn_id, clock, NavigationClock)
           let #(state, answered) = handle_navigation(state, conn_id, path)
           actor.continue(ack_if_unchanged(state, conn_id, answered))
         }
@@ -1660,7 +1660,7 @@ fn handle_batch(
           let #(event_name, handler_id, event_data, target_path, clock, ops) =
             evt
           warn_client_ops(conn_id, ops)
-          let acc_state = record_ack(acc_state, conn_id, clock)
+          let acc_state = record_ack(acc_state, conn_id, clock, BatchEventClock)
           case
             acc_state.decode_event(
               event_name,
@@ -1729,17 +1729,39 @@ fn handle_batch(
   }
 }
 
+/// What carried a clock: events, events of a batch and navigations share
+/// one per-connection counter on the client.
+type ClockSource {
+  EventClock
+  BatchEventClock
+  NavigationClock
+}
+
+fn clock_source_label(source: ClockSource) -> String {
+  case source {
+    EventClock -> "event"
+    BatchEventClock -> "batch event"
+    NavigationClock -> "navigation"
+  }
+}
+
+/// Record `clock` as acknowledged for `conn_id`. A clock below the one
+/// already recorded is logged as a warning naming its `source` and does not
+/// move the ack back.
 fn record_ack(
   state: RuntimeState(model, msg),
   conn_id: transport.ConnectionId,
   clock: Int,
+  source: ClockSource,
 ) -> RuntimeState(model, msg) {
   let previous = ack_for(state, conn_id)
   case clock < previous {
     True ->
       log.warning(
         "brazier.runtime",
-        "Non-monotonic event clock from "
+        "Non-monotonic "
+          <> clock_source_label(source)
+          <> " clock from "
           <> conn_id
           <> ": "
           <> int.to_string(clock)
