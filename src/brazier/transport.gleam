@@ -806,8 +806,16 @@ fn release_connection_slot(context: String) -> Nil {
 
 /// Encode a ServerMessage to the JSON text sent over the wire.
 pub fn encode_server_message(msg: ServerMessage) -> String {
-  encode_server_message_tree(msg) |> string_tree.to_string
+  encode_server_message_tree(msg) |> json_tree_to_string
 }
+
+/// The text of an encoded message. A message's tree is gleam_json's iodata
+/// of UTF-8 binaries (Gleam strings, and model and ops text that is already
+/// JSON), so `iolist_to_binary` gives the same bytes as
+/// `string_tree.to_string`, whose `unicode:characters_to_binary` checks the
+/// UTF-8 again: a 66 KB `model_sync` took 48 µs with it, 1.2 µs without.
+@external(erlang, "erlang", "iolist_to_binary")
+fn json_tree_to_string(tree: StringTree) -> String
 
 /// Encode a ServerMessage to the JSON text sent over the wire, as a string
 /// tree the socket writes without flattening it into one binary.
@@ -2719,7 +2727,7 @@ fn parse_origin(value: String) -> Result(Origin, String) {
   case string.split_once(string.trim(value), "://") {
     Error(Nil) -> Error("origin has no scheme")
     Ok(#(raw_scheme, rest)) -> {
-      let scheme = string.lowercase(raw_scheme)
+      let scheme = ascii_lowercase(raw_scheme)
       use port <- result.try(default_port(scheme))
       let #(authority, has_path) = case string.split_once(rest, "/") {
         Ok(#(authority, _path)) -> #(authority, True)
@@ -2732,40 +2740,81 @@ fn parse_origin(value: String) -> Result(Origin, String) {
 }
 
 /// Parse `host[:port]` (IPv6 hosts in brackets). Host is lowercased.
+///
+/// An authority is ASCII (RFC 3986 §3.2.2: a registered name is ASCII
+/// letters, digits, punctuation and percent-escapes), so a byte outside
+/// ASCII is refused: a browser sends an internationalized name in its
+/// ASCII form (`xn--`, RFC 5890), and a name in any other form never
+/// names the host it looks like.
 fn parse_authority(
   authority: String,
   default: Int,
 ) -> Result(#(String, Int), String) {
-  let forbidden = ["@", "?", "#", " ", "\\", "\t"]
-  case list.any(forbidden, fn(c) { string.contains(authority, c) }) {
-    True -> Error("invalid characters in host")
-    False ->
+  case authority_refusal(bit_array.from_string(authority)) {
+    Error(reason) -> Error(reason)
+    Ok(Nil) ->
       case authority {
         "" -> Error("empty host")
         "[" <> ipv6_rest ->
           case string.split_once(ipv6_rest, "]") {
             Ok(#("", _)) -> Error("empty IPv6 host")
             Ok(#(address, "")) ->
-              Ok(#("[" <> string.lowercase(address) <> "]", default))
+              Ok(#("[" <> ascii_lowercase(address) <> "]", default))
             Ok(#(address, ":" <> port_text)) -> {
               use port <- result.try(parse_port(port_text))
-              Ok(#("[" <> string.lowercase(address) <> "]", port))
+              Ok(#("[" <> ascii_lowercase(address) <> "]", port))
             }
             _ -> Error("malformed IPv6 host")
           }
         _ ->
           case string.split(authority, ":") {
             [""] | ["", _] -> Error("empty host")
-            [host] -> Ok(#(string.lowercase(host), default))
+            [host] -> Ok(#(ascii_lowercase(host), default))
             [host, port_text] -> {
               use port <- result.try(parse_port(port_text))
-              Ok(#(string.lowercase(host), port))
+              Ok(#(ascii_lowercase(host), port))
             }
             _ -> Error("malformed host")
           }
       }
   }
 }
+
+/// Why an authority's bytes are refused, scanned once: `@` (userinfo), `?`
+/// and `#` (a query or fragment), `\`, space and every other ASCII control
+/// character, and any byte outside ASCII.
+fn authority_refusal(bytes: BitArray) -> Result(Nil, String) {
+  case bytes {
+    <<byte, rest:bytes>> ->
+      case byte {
+        0x40 | 0x3f | 0x23 | 0x5c | 0x7f -> Error("invalid characters in host")
+        _ if byte <= 0x20 -> Error("invalid characters in host")
+        _ if byte >= 0x80 ->
+          Error(
+            "non-ASCII characters in host (an internationalized name is sent in its ASCII form, xn--)",
+          )
+        _ -> authority_refusal(rest)
+      }
+    _ -> {
+      // Invariant: the bytes are a string's (`bit_array.from_string`), which
+      // are whole bytes, so what is left past the last byte is nothing.
+      let assert <<>> = bytes
+        as "brazier/transport: an authority's bytes are whole bytes"
+      Ok(Nil)
+    }
+  }
+}
+
+/// `text` with `A-Z` lowercased and every other byte unchanged.
+///
+/// Schemes and hosts are compared case-insensitively in ASCII only
+/// (RFC 3986 §3.1 and §3.2.2, RFC 6454 §4). `string.lowercase` lowercases
+/// in Unicode, where the Kelvin sign U+212A becomes `k`; it is also slow,
+/// since OTP's `string:lowercase/1` raises and catches an exception
+/// internally for each string already in lowercase, and the Host check runs
+/// for every request. The render's FFI holds the byte scan.
+@external(erlang, "brazier_render_ffi", "ascii_lowercase")
+fn ascii_lowercase(text: String) -> String
 
 /// The errors of `parse_origin`, `parse_authority` and `parse_port` end up
 /// in log lines and quote any client text they repeat (SEC-11).
@@ -2921,7 +2970,7 @@ fn check_host_name(name: String) -> Result(String, String) {
       )
     False, False -> {
       use #(host, _port) <- result.try(parse_authority(name, 0))
-      case host == string.lowercase(name), string.ends_with(host, ".") {
+      case host == ascii_lowercase(name), string.ends_with(host, ".") {
         False, _ -> Error("a host name has no port")
         True, True -> Error("drop the trailing dot")
         True, False -> Ok(host)
@@ -3046,14 +3095,15 @@ pub fn origin_allowed(
     case list.contains(allowed_origins.origins, same) {
       True -> Ok(Nil)
       False -> {
-        use port <- result.try(default_port(string.lowercase(request_scheme)))
+        let request_scheme = ascii_lowercase(request_scheme)
+        use port <- result.try(default_port(request_scheme))
         use #(host, port) <- result.try(
           parse_authority(string.trim(request_host), port)
           |> result.map_error(fn(reason) { "invalid Host: " <> reason }),
         )
         let own =
           Origin(
-            scheme: string.lowercase(request_scheme),
+            scheme: request_scheme,
             host: host,
             port: port,
             has_path: False,

@@ -34,7 +34,8 @@ pub type Timeout {
 }
 
 /// URL values around the scheme parser: case, control characters, combining
-/// marks after the colon, non-ASCII in the scheme, data media types.
+/// marks after the colon, non-ASCII in the scheme, data media types; and URL
+/// attribute names in other cases, with a Kelvin sign for a `k`.
 const url_payloads = [
   "", "/relative", "https://example.com/a?b=c", "JaVaScRiPt:alert(1)",
   " \t\njavascript:alert(1)", "\u{0000}javascript:alert(1)",
@@ -46,7 +47,8 @@ const url_payloads = [
   "\u{00A0}javascript:alert(1)", "vbscript:msgbox(1)", "ms-msdt:x",
   "data:text/html,<script>alert(1)</script>", "data:\u{0E33}image/png,AA",
   "data:image/png;base64,AA", "data:IMAGE/PNG,AA", "data:image/png", "1http:x",
-  "java script:x", "A+B.C:x", "\u{212A}http:x", "mailto:a@b.c",
+  "java script:x", "A+B.C:x", "\u{212A}http:x", "mailto:a@b.c", "XLink:Href",
+  "xlin\u{212A}:href", "HREF",
 ]
 
 pub fn javascript_ffi_matches_erlang_test_() -> Timeout {
@@ -88,10 +90,16 @@ pub fn javascript_ffi_matches_erlang_test_() -> Timeout {
           <> js
         }
     })
-    // The comparison covers refusals as well as values that pass.
+    // The comparison covers refusals as well as values that pass: a value
+    // refused in `href` and `src`, and a name whose `javascript:` value is
+    // refused, so a URL attribute in another case.
     let assert True =
       list.any(url_payloads, fn(payload) {
-        string.ends_with(check(payload), "error;error")
+        string.contains(check(payload), ";error;error;")
+      })
+    let assert True =
+      list.any(url_payloads, fn(payload) {
+        string.ends_with(check(payload), ";true;error")
       })
     Nil
   })
@@ -110,6 +118,8 @@ pub fn check(input: String) -> String {
     bool(render.is_allowed_attribute(input, "x")),
     url_result(url.check("href", input)),
     url_result(url.check("src", input)),
+    bool(url.is_url_attribute(input)),
+    url_result(url.check(input, "javascript:alert(1)")),
   ]
   |> string.join(";")
 }
@@ -215,6 +225,8 @@ fn check(input: String) -> String {
     bool(render.is_allowed_attribute(input, \"x\")),
     url_result(url.check(\"href\", input)),
     url_result(url.check(\"src\", input)),
+    bool(url.is_url_attribute(input)),
+    url_result(url.check(input, \"javascript:alert(1)\")),
   ]
   |> string.join(\";\")
 }

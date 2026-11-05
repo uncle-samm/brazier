@@ -31,6 +31,41 @@ pub fn origin_matching_host_allowed_test() {
     )
 }
 
+pub fn origin_scheme_and_host_compare_in_ascii_case_only_test() {
+  let assert Ok(Nil) =
+    transport.origin_allowed_for_host(
+      "HTTP://Kitchen.Example:8080",
+      "kitchen.EXAMPLE:8080",
+    )
+  // The Kelvin sign U+212A lowercases to `k` in Unicode, not in ASCII: an
+  // Origin naming it is not the page's own origin.
+  let assert Error(reason) =
+    transport.origin_allowed_for_host(
+      "http://\u{212A}itchen.example:8080",
+      "kitchen.example:8080",
+    )
+  assert string.contains(reason, "non-ASCII characters in host")
+  let assert Error(reason) =
+    transport.origin_allowed_for_host(
+      "http://kitchen.example:8080",
+      "\u{212A}itchen.example:8080",
+    )
+  assert string.contains(reason, "invalid Host: non-ASCII characters in host")
+  // A listed origin with a non-ASCII host is refused when it is parsed.
+  let assert Error(reason) =
+    transport.parse_allowed_origins(["https://b\u{00FC}cher.example"])
+  assert string.contains(reason, "non-ASCII characters in host")
+  let assert Ok(origins) =
+    transport.parse_allowed_origins(["HTTPS://App.Example.com"])
+  let assert Ok(Nil) =
+    transport.origin_allowed(
+      "https://app.example.COM",
+      "http",
+      "localhost:8080",
+      origins,
+    )
+}
+
 pub fn response_header_rejects_crlf_value_test() {
   let assert Error(_) =
     transport_http.validate_response_header(
