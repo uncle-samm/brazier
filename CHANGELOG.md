@@ -30,6 +30,15 @@ open follow-ups), which is in progress.
 
 ### Breaking
 
+- (M118 client-decode) Attribute names starting `data-brazier-` are
+  reserved for the client, except the app API `data-brazier-hook`,
+  `-hook-watch`, `-preserve-children` and `-external` (as LiveView reserves
+  the `phx-` names it owns). `attribute.attribute`, `attribute.data` and
+  `attribute.boolean` crash on any other, `boolean(name, False)` included,
+  and so does the render for a name built another way. A stream item whose
+  root sets `data-brazier-key` now crashes the render instead of returning
+  an Error, as `data-brazier-stream` already did.
+
 - (M118 backpressure) `RuntimeMessage` gains `ConnectionOwnerDown`;
   `runtime.HeldStreamErrors`, `runtime.held_stream_errors_max` and
   `runtime.LiveJoin` are new, and `RuntimeState` gains `held_stream_errors`
@@ -427,6 +436,16 @@ open follow-ups), which is in progress.
 
 ### Changed
 
+- (M118 client-decode) Generated codecs decode through
+  `brazier/internal/wire_decode`, which stops at the first error and builds
+  its path only on failure, on the server and in the browser. The browser
+  decodes a 1000-row model in about 275 µs instead of about 965 µs. A
+  failure is the first error `gleam/dynamic/decode` would report, with the
+  same expected, found and path; the others are no longer collected.
+- (M118 client-decode) The client takes its event names from the render
+  instead of walking the handler table again (about 195 µs to 0.1 µs at
+  1000 rows). `client.patch` at 1000 rows went from about 2809 to about
+  1816 µs.
 - (M118 server-residue) URL attribute checks and Host/Origin validation
   lowercase names, schemes and hosts as ASCII instead of with OTP
   `string:lowercase` (`url.check(class, x)` about 155 to about 74 ns,

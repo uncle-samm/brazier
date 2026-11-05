@@ -5,7 +5,6 @@ import brazier/html
 import brazier/internal/render
 import brazier/log_capture
 import brazier/svg
-import gleam/dict
 import gleam/dynamic
 import gleam/dynamic/decode
 import gleam/list
@@ -155,6 +154,16 @@ pub fn inner_key_wins_over_outer_key_test() {
   let assert "<div data-brazier-key=\"inner\"></div>" = element.to_string(node)
 }
 
+pub fn keyed_keeps_the_view_attributes_after_the_key_test() {
+  let node =
+    element.keyed(
+      "row-1",
+      html.li([attribute.class("row"), event.on_click("picked")], []),
+    )
+  let assert "<li data-brazier-key=\"row-1\" class=\"row\" data-brazier-on-click=\"0\"></li>" =
+    element.to_string(node)
+}
+
 pub fn keyed_text_renders_text_test() {
   let assert "hi" = element.to_string(element.keyed("k", element.text("hi")))
 }
@@ -233,6 +242,40 @@ pub fn keyed_does_not_add_a_level_test() {
   let assert ["click"] = render.event_names(handlers)
 }
 
+/// The render collects each event name once, sorted, from every depth,
+/// and they are exactly the names in the handler table's keys.
+pub fn event_names_are_collected_by_the_render_test() {
+  let node =
+    html.form([event.on_submit(fn(_fields) { "sent" })], [
+      html.input([event.on_input(fn(value) { value })]),
+      html.ul([], [
+        html.li([event.on_click("a"), event.on_input(fn(value) { value })], []),
+        html.li([event.on_click("b")], [
+          html.button([event.on("dblclick", decode.success("c"))], []),
+        ]),
+      ]),
+      html.p([], [element.text("no handler")]),
+    ])
+  let #(_html, handlers) = render.render(element.to_node(node))
+  let names = render.event_names(handlers)
+  let assert ["click", "dblclick", "input", "submit"] = names
+  let from_keys =
+    render.keys(handlers)
+    |> list.map(fn(key) {
+      let assert Ok(#(name, _id)) = string.split_once(key, ":")
+        as "element_test: a handler key is name:id"
+      name
+    })
+    |> list.unique
+    |> list.sort(string.compare)
+  let assert True = from_keys == names
+  // A view without handlers listens for nothing.
+  let #(_html, none) =
+    render.render(element.to_node(html.div([], [element.text("x")])))
+  let assert [] = render.event_names(none)
+  let assert [] = render.keys(none)
+}
+
 pub fn handler_table_runs_decoder_test() {
   let node = html.input([event.on_input(fn(value) { "typed:" <> value })])
   let #(_html, handlers) = render.render(element.to_node(node))
@@ -273,7 +316,7 @@ pub fn last_handler_for_same_event_wins_test() {
     html.button([event.on_click("first"), event.on_click("second")], [])
   let #(html_string, handlers) = render.render(element.to_node(node))
   let assert "<button data-brazier-on-click=\"0\"></button>" = html_string
-  let assert 1 = dict.size(handlers)
+  let assert ["click:0"] = render.keys(handlers)
   let assert Ok(handler) = render.lookup(handlers, "click", "0")
   let assert Ok("second") = render.run(handler, dynamic.properties([]))
 }
@@ -454,6 +497,104 @@ pub fn srcdoc_attribute_crashes_test() {
     crashes_with(fn() { attribute.attribute("SrcDoc", "<p>x</p>") }, "srcdoc")
   let assert True =
     crashes_with(fn() { attribute.boolean("SRCDOC", True) }, "srcdoc")
+}
+
+/// Names in the reserved `data-brazier-*` namespace that the client reads
+/// and only the render (or the client) sets, in mixed case, and names
+/// next to the app API ones.
+const reserved_names = [
+  "data-brazier-key", "DATA-BRAZIER-KEY", "data-brazier-on-click",
+  "data-brazier-on-submit", "data-brazier-prevent-click", "data-brazier-stream",
+  "data-brazier-dev", "data-brazier-dev-build", "data-brazier-error",
+  "data-brazier-error-notice", "data-brazier-", "Data-Brazier-Token",
+  "data-brazier-hooks", "data-brazier-hook-watchers", "data-brazier-external-x",
+]
+
+pub fn reserved_names_crash_in_every_constructor_test() {
+  list.each(reserved_names, fn(name) {
+    let assert True =
+      crashes_with(fn() { attribute.attribute(name, "x") }, "data-brazier-*")
+      as { "attribute.attribute(" <> name <> ") must crash" }
+    let assert True =
+      crashes_with(fn() { attribute.boolean(name, True) }, "name policy")
+      as { "attribute.boolean(" <> name <> ", True) must crash" }
+    // A refused name is a bug in the view whatever the model says, so a
+    // boolean that is off crashes too.
+    let assert True =
+      crashes_with(fn() { attribute.boolean(name, False) }, "name policy")
+      as { "attribute.boolean(" <> name <> ", False) must crash" }
+    let assert False = render.is_valid_attribute_name(name)
+    let assert True = render.is_reserved_attribute_name(name)
+  })
+  let assert True =
+    crashes_with(fn() { attribute.data("brazier-key", "x") }, "data-brazier-*")
+  let assert True =
+    crashes_with(
+      fn() { attribute.data("Brazier-On-Click", "0.1") },
+      "data-brazier-*",
+    )
+}
+
+pub fn reserved_names_crash_the_render_when_built_directly_test() {
+  // A tree built with the internal constructors bypasses the attribute
+  // constructor; the render refuses the names again.
+  list.each(reserved_names, fn(name) {
+    let assert True =
+      crashes_with(
+        fn() {
+          render.to_string(
+            render.Element("div", [render.Attribute(name, "x")], []),
+          )
+        },
+        "name policy",
+      )
+      as { "the render must refuse " <> name }
+  })
+  // A key the view sets itself, under `element.keyed` too.
+  let assert True =
+    crashes_with(
+      fn() {
+        render.to_string(render.Keyed(
+          "k",
+          render.Element(
+            "li",
+            [render.Attribute("data-brazier-key", "own")],
+            [],
+          ),
+        ))
+      },
+      "name policy",
+    )
+}
+
+pub fn app_api_brazier_names_are_allowed_test() {
+  let names = [
+    "data-brazier-hook", "data-brazier-hook-watch",
+    "data-brazier-preserve-children", "data-brazier-external",
+    "Data-Brazier-Hook", "DATA-BRAZIER-EXTERNAL",
+  ]
+  list.each(names, fn(name) {
+    let assert True = render.is_valid_attribute_name(name)
+      as { name <> " is app API" }
+    let assert False = render.is_reserved_attribute_name(name)
+  })
+  // Names that only look like the namespace are the app's.
+  let assert True = render.is_valid_attribute_name("data-braziers-key")
+  let assert True = render.is_valid_attribute_name("data-brazier")
+  let assert True = render.is_valid_attribute_name("x-data-brazier-key")
+  let assert False = render.is_reserved_attribute_name("data-brazier")
+  // A name that is not markup is refused, not reserved.
+  let assert False = render.is_reserved_attribute_name("data-brazier-k y")
+  let node =
+    html.a(
+      [
+        attribute.href("/files/report.pdf"),
+        attribute.data("brazier-external", ""),
+      ],
+      [],
+    )
+  let assert "<a href=\"/files/report.pdf\" data-brazier-external=\"\"></a>" =
+    element.to_string(node)
 }
 
 pub fn unsafe_srcdoc_renders_escaped_value_test() {

@@ -34,8 +34,14 @@ pub fn from_attr(attr: render.Attr(msg)) -> Attribute(msg) {
 ///
 /// - an inline event attribute such as `onclick`: use `brazier/event`;
 /// - `srcdoc`: use `unsafe_srcdoc`;
-/// - `data-brazier-stream`: it marks a stream's container, which only
-///   `brazier/stream.render` sets;
+/// - a `data-brazier-*` name, which Brazier's client reads and only the
+///   render sets (`data-brazier-key` for `element.keyed`,
+///   `data-brazier-stream` for `brazier/stream.render`,
+///   `data-brazier-on-*` for `brazier/event`, and the others the client
+///   uses). Four are app API and allowed: `data-brazier-hook` (`hook`),
+///   `data-brazier-hook-watch` (`watch`),
+///   `data-brazier-preserve-children` (`ignore_updates`) and
+///   `data-brazier-external` (a link the client does not navigate);
 /// - `attributeName` with a value containing `href` (`href`,
 ///   `xlink:href`): an SVG `<animate>` or `<set>` targeting a link's URL
 ///   would change it after the URL policy has checked it;
@@ -48,11 +54,11 @@ pub fn from_attr(attr: render.Attr(msg)) -> Attribute(msg) {
 /// attribute and logs a warning.
 pub fn attribute(name: String, value: String) -> Attribute(msg) {
   // Invariant: attribute names come from application code, not user input.
-  // An inline event handler, `srcdoc`, an animation of `href` or a name that
-  // could break out of the tag is a bug in the view, so it crashes rather
-  // than rendering.
+  // An inline event handler, `srcdoc`, a reserved `data-brazier-*` name, an
+  // animation of `href` or a name that could break out of the tag is a bug
+  // in the view, so it crashes rather than rendering.
   let assert True = render.is_allowed_attribute(name, value)
-    as "brazier/attribute.attribute: attribute refused by the name policy (on*, srcdoc, data-brazier-stream, attributeName=href, or characters outside a-z A-Z 0-9 - _ : .)"
+    as "brazier/attribute.attribute: attribute refused by the name policy (on*, srcdoc, data-brazier-* other than -hook, -hook-watch, -preserve-children and -external, attributeName=href, or characters outside a-z A-Z 0-9 - _ : .)"
   case url.check(name, value) {
     Ok(value) -> Attribute(render.Attribute(name, value))
     Error(blocked) -> {
@@ -93,8 +99,13 @@ pub fn map(attribute: Attribute(a), f: fn(a) -> b) -> Attribute(b) {
 }
 
 /// A boolean attribute: present with an empty value when `on` is true,
-/// absent otherwise.
+/// absent otherwise. A name `attribute` refuses crashes either way.
 pub fn boolean(name: String, on: Bool) -> Attribute(msg) {
+  // Invariant: as in `attribute`, a refused name is a bug in the view. It
+  // is checked when `on` is false too, so the bug does not wait for the
+  // model to turn the attribute on.
+  let assert True = render.is_allowed_attribute(name, "")
+    as "brazier/attribute.boolean: attribute refused by the name policy (on*, srcdoc, data-brazier-* other than -hook, -hook-watch, -preserve-children and -external, or characters outside a-z A-Z 0-9 - _ : .)"
   case on {
     True -> attribute(name, "")
     False -> none()
@@ -218,7 +229,8 @@ pub fn tabindex(index: Int) -> Attribute(msg) {
   attribute("tabindex", int_to_string(index))
 }
 
-/// A `data-<name>` attribute.
+/// A `data-<name>` attribute. `data("brazier-key", ..)` and the other
+/// reserved `data-brazier-*` names crash, as in `attribute`.
 pub fn data(name: String, value: String) -> Attribute(msg) {
   attribute("data-" <> name, value)
 }

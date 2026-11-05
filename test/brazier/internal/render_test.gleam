@@ -71,7 +71,13 @@ fn oracle_attribute_name(name: String) -> Bool {
     let lower = string.lowercase(name)
     !string.starts_with(lower, "on")
     && lower != "srcdoc"
-    && lower != render.stream_attribute
+    && {
+      !string.starts_with(lower, "data-brazier-")
+      || lower == "data-brazier-hook"
+      || lower == "data-brazier-hook-watch"
+      || lower == "data-brazier-preserve-children"
+      || lower == "data-brazier-external"
+    }
   }
 }
 
@@ -115,8 +121,12 @@ pub const attribute_names = [
   "on", "On", "oN", "ON", "OnClick", "oNcLiCk", "ONLOAD", "onx", "o", "n",
   "SRCDOC", "SrcDoc", "sRcDoC", "srcdocX", "XSrcDoc", "Data-Brazier-Stream",
   "DATA-BRAZIER-STREAM", "data-brazier-Stream", "data-brazier-streams",
-  "attributeName", "ATTRIBUTENAME", "AttributeName", "class", "CLASS",
-  "aria-Label", "xlink:HREF", "Z", "a", "ÖnClick", "ońclick",
+  "data-brazier-KEY", "Data-Brazier-On-Click", "data-brazier-", "data-brazier",
+  "data-brazier-hook", "DATA-BRAZIER-HOOK-WATCH",
+  "data-brazier-Preserve-Children", "data-brazier-external",
+  "data-brazier-hooks", "data-brazier-externals", "attributeName",
+  "ATTRIBUTENAME", "AttributeName", "class", "CLASS", "aria-Label", "xlink:HREF",
+  "Z", "a", "ÖnClick", "ońclick",
 ]
 
 /// MINSTD (Park and Miller). The product stays below 2^53, so the sequence

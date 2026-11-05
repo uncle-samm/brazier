@@ -452,21 +452,51 @@ pub fn main() -> Nil {
   // A constructor only the server builds, an unknown one and malformed
   // JSON never decode from a client.
   let assert True = string.contains(click, \"\\\"SetScore\\\"\")
-  let assert Error(_) =
+  let refused =
+    \"Cannot decode the client message: UnableToDecode([DecodeError(\\\"\"
+    <> \"codec_fixture.Msg sent by the client (a constructor the browser builds)\"
+    <> \"\\\", \\\"Dict\\\", [\\\"__brazier_msg\\\"])])\"
+  let assert Error(secret) =
     brazier_codec.decode_event(
       \"click\",
       \"0\",
       string.replace(click, \"\\\"SetScore\\\"\", \"\\\"GotSecret\\\"\"),
       \"\",
     )
-  let assert Error(_) =
+  let assert True = secret == refused
+  let assert Error(unknown) =
     brazier_codec.decode_event(
       \"click\",
       \"0\",
       string.replace(click, \"\\\"SetScore\\\"\", \"\\\"Nope\\\"\"),
       \"\",
     )
-  let assert Error(_) = brazier_codec.decode_event(\"click\", \"0\", \"{\", \"\")
+  let assert True = unknown == refused
+  // A missing field and a value of the wrong type name their path.
+  let assert True = string.contains(click, \"\\\"tag\\\"\")
+  let assert Error(untagged) =
+    brazier_codec.decode_event(
+      \"click\",
+      \"0\",
+      string.replace(click, \"\\\"tag\\\"\", \"\\\"tog\\\"\"),
+      \"\",
+    )
+  let assert True =
+    untagged
+    == \"Cannot decode the client message: UnableToDecode([DecodeError(\\\"Field\\\", \\\"Nothing\\\", [\\\"__brazier_msg\\\", \\\"tag\\\"])])\"
+  let assert Error(no_envelope) =
+    brazier_codec.decode_event(\"click\", \"0\", \"[]\", \"\")
+  let assert True =
+    no_envelope
+    == \"Cannot decode the client message: UnableToDecode([DecodeError(\\\"Dict\\\", \\\"List\\\", [])])\"
+  let assert Error(malformed) =
+    brazier_codec.decode_event(\"click\", \"0\", \"{\", \"\")
+  let assert True =
+    string.starts_with(malformed, \"Cannot decode the client message: \")
+  let assert Error(bad_model) = brazier_codec.decode_model(read(\"bad.json\"))
+  let assert True =
+    bad_model
+    == \"Cannot decode the model: UnableToDecode([DecodeError(\\\"Int\\\", \\\"String\\\", [\\\"count\\\"])])\"
   // The server decodes its own encoding, also without the optional value
   // and with empty collections.
   let assert Ok(decoded) =
@@ -513,9 +543,11 @@ const other = entry.decode_model(read('other.json'));
 if (!other.isOk() || entry.same_model(model, other[0])) {
   fail('same_model: a different model is equal');
 }
-if (entry.decode_model(read('bad.json')).isOk()) {
-  fail('decode_model accepted a malformed model');
-}
+const bad = entry.decode_model(read('bad.json'));
+if (bad.isOk()) fail('decode_model accepted a malformed model');
+const badExpected =
+  'Cannot decode the model: [DecodeError(expected: \"Int\", found: \"String\", path: [\"count\"])]';
+if (bad[0] !== badExpected) fail('decode_model error: ' + bad[0]);
 if (entry.is_simple()) fail('is_simple is true for a full_application');
 
 const local = entry.init_local(model);

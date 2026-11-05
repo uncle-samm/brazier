@@ -126,9 +126,13 @@ pub fn handler(decoder: decode.Decoder(msg)) -> Handler(msg) {
   )
 }
 
-/// The handler table of one render.
-pub type Handlers(msg) =
-  Dict(String, Handler(msg))
+/// The handler table of one render, with the distinct event names in it.
+/// The walk that fills the table collects the names as it inserts each
+/// handler, so the client knows which events to listen for without walking
+/// the table again after every render.
+pub opaque type Handlers(msg) {
+  Handlers(table: Dict(String, Handler(msg)), names: List(String))
+}
 
 /// The key of the handler for event `name` on the element with position
 /// `id` in a handler table.
@@ -142,7 +146,12 @@ pub fn lookup(
   name: String,
   id: String,
 ) -> Result(Handler(msg), Nil) {
-  dict.get(handlers, key(name, id))
+  dict.get(handlers.table, key(name, id))
+}
+
+/// The keys of a handler table (`key(name, id)`), sorted.
+pub fn keys(handlers: Handlers(msg)) -> List(String) {
+  dict.keys(handlers.table) |> list.sort(string.compare)
 }
 
 /// Run a handler's decoder against an event object.
@@ -153,18 +162,10 @@ pub fn run(
   decode.run(event, handler.decoder)
 }
 
-/// The distinct event names in a handler table, sorted.
+/// The distinct event names in a handler table, sorted. The render that
+/// built the table collected them; this reads no handler.
 pub fn event_names(handlers: Handlers(msg)) -> List(String) {
-  handlers
-  |> dict.keys
-  |> list.filter_map(fn(handler_key) {
-    case string.split_once(handler_key, ":") {
-      Ok(#(name, _id)) -> Ok(name)
-      Error(Nil) -> Error(Nil)
-    }
-  })
-  |> list.unique
-  |> list.sort(string.compare)
+  handlers.names
 }
 
 /// A short description of decode errors for log lines.
@@ -252,7 +253,7 @@ pub fn render_containers(
   // never fails.
   let assert [] = done.faults
     as "brazier/internal/render: an empty render recorded a fault"
-  #(tree_to_string(done.html), done.handlers, list.reverse(done.containers))
+  #(tree_to_string(done.html), finish(done), list.reverse(done.containers))
 }
 
 /// Render a tree to HTML, each stream container holding the HTML `fill`
@@ -278,8 +279,9 @@ pub fn render_filled(
 /// the handler table is the item's own (docs/design/STREAMS.md 8.2).
 ///
 /// `Error` when the item does not decode, when its root is not one element
-/// (text, `none`, raw HTML, a keyed node or a stream), when the root sets
-/// its own `data-brazier-key`, or when the item renders a stream. The
+/// (text, `none`, raw HTML, a keyed node or a stream), or when the item
+/// renders a stream. Crashes, as every render does, on an attribute the
+/// name policy refuses, `data-brazier-key` on the root included. The
 /// server renders SSR items and the client renders inserted items with this
 /// function, so the two give the same HTML.
 pub fn render_item(
@@ -293,27 +295,24 @@ pub fn render_item(
     |> result.map_error(fn(reason) { prefix <> "does not decode: " <> reason }),
   )
   case root {
-    Element(tag, attributes, children) ->
-      case has_attribute(attributes, "data-brazier-key") {
-        True ->
-          Error(
-            prefix
-            <> "the item's root sets data-brazier-key; the stream keys it",
-          )
-        False -> {
-          let keyed =
-            Element(
-              tag,
-              [Attribute("data-brazier-key", key), ..attributes],
-              children,
-            )
-          let done = walk(keyed, "i0", InItem, new_walk())
-          case done.faults {
-            [] -> Ok(#(tree_to_string(done.html), done.handlers))
-            faults -> Error(prefix <> string.join(list.reverse(faults), "; "))
-          }
-        }
+    Element(tag, attributes, children) -> {
+      // The stream keys the root itself. `key_attribute` is reserved, so a
+      // root that sets it crashes the walk as any reserved name does.
+      let done =
+        walk_element(
+          new_walk(),
+          tag,
+          [#(key_attribute, key)],
+          attributes,
+          children,
+          "i0",
+          InItem,
+        )
+      case done.faults {
+        [] -> Ok(#(tree_to_string(done.html), finish(done)))
+        faults -> Error(prefix <> string.join(list.reverse(faults), "; "))
       }
+    }
     Text(_) ->
       Error(prefix <> "the item's root is text; it must be one element")
     Nothing ->
@@ -341,15 +340,22 @@ type Mode(msg) {
   InItem
 }
 
-/// What a walk has built so far. `containers` and `faults` are in reverse
+/// What a walk has built so far. `names` holds each event name in
+/// `handlers` once, unsorted. `containers` and `faults` are in reverse
 /// order.
 type Walk(msg) {
   Walk(
     html: StringTree,
-    handlers: Handlers(msg),
+    handlers: Dict(String, Handler(msg)),
+    names: List(String),
     containers: List(Container(msg)),
     faults: List(String),
   )
+}
+
+/// The handler table a walk built, its event names sorted.
+fn finish(done: Walk(msg)) -> Handlers(msg) {
+  Handlers(table: done.handlers, names: list.sort(done.names, string.compare))
 }
 
 /// The HTML a walk built. A walk appends only strings to its tree.
@@ -368,6 +374,7 @@ fn new_walk() -> Walk(msg) {
   Walk(
     html: string_tree.new(),
     handlers: dict.new(),
+    names: [],
     containers: [],
     faults: [],
   )
@@ -388,61 +395,134 @@ fn walk(
     RawHtml(raw) -> Walk(..acc, html: string_tree.append(acc.html, raw))
     Text(content) ->
       Walk(..acc, html: string_tree.append(acc.html, escape_html(content)))
-    Keyed(key, child) -> walk(add_key(child, key), id, mode, acc)
-    Element(tag, attributes, children) -> {
-      let acc = open_tag(acc, tag, [], attributes, id)
-      case is_void_element(tag) {
-        True -> acc
-        False -> {
-          let #(acc, _index) =
-            list.fold(children, #(acc, 0), fn(state, child) {
-              let #(acc, index) = state
-              let acc =
-                walk(child, id <> "." <> int.to_string(index), mode, acc)
-              #(acc, index + 1)
-            })
-          close_tag(acc, tag)
-        }
-      }
-    }
+    Keyed(key, child) -> walk_keyed(child, key, id, mode, acc)
+    Element(tag, attributes, children) ->
+      walk_element(acc, tag, [], attributes, children, id, mode)
     Stream(name, limit, tag, attributes, item, item_ref) ->
-      case mode {
-        InItem ->
-          Walk(..acc, faults: [
-            "the item renders the stream " <> name <> " inside it",
-            ..acc.faults
-          ])
-        View(fill) -> {
-          // Invariant: a stream's items are children of its container, so
-          // the container must be able to hold children.
-          let assert False = is_void_element(tag)
-            as "brazier/internal/render: a stream's container cannot be a void element"
-          // The stream sets `stream_attribute` itself; the name policy
-          // refuses it in `attributes` (`collect_attributes`).
-          // Invariant: the client keeps one store per stream and patches its
-          // one container (docs/design/STREAMS.md 5.3).
-          let assert False =
-            list.any(acc.containers, fn(container) { container.name == name })
-            as "brazier/internal/render: a stream is rendered at most once per view"
-          let container =
-            Container(name: name, limit: limit, item: item, item_ref: item_ref)
-          let acc =
-            open_tag(acc, tag, [#(stream_attribute, name)], attributes, id)
-          let acc = Walk(..acc, containers: [container, ..acc.containers])
-          let acc = case fill(container) {
-            Ok(inner) -> Walk(..acc, html: string_tree.append(acc.html, inner))
-            Error(reason) -> Walk(..acc, faults: [reason, ..acc.faults])
-          }
-          close_tag(acc, tag)
-        }
+      walk_stream(
+        acc,
+        Container(name: name, limit: limit, item: item, item_ref: item_ref),
+        tag,
+        [],
+        attributes,
+        id,
+        mode,
+      )
+  }
+}
+
+/// Walk the node under an `element.keyed` wrapper: its element carries
+/// `key_attribute`, which the render sets as one of the element's own
+/// attributes since the name policy refuses it in a view's attributes. A
+/// keyed node under the wrapper keys the element itself, so the innermost
+/// key wins. Text, `none` and raw HTML have no element to carry the key.
+fn walk_keyed(
+  node: Node(msg),
+  key: String,
+  id: String,
+  mode: Mode(msg),
+  acc: Walk(msg),
+) -> Walk(msg) {
+  case node {
+    Element(tag, attributes, children) ->
+      walk_element(
+        acc,
+        tag,
+        [#(key_attribute, key)],
+        attributes,
+        children,
+        id,
+        mode,
+      )
+    Stream(name, limit, tag, attributes, item, item_ref) ->
+      walk_stream(
+        acc,
+        Container(name: name, limit: limit, item: item, item_ref: item_ref),
+        tag,
+        [#(key_attribute, key)],
+        attributes,
+        id,
+        mode,
+      )
+    Keyed(_, _) | Text(_) | Nothing | RawHtml(_) -> walk(node, id, mode, acc)
+  }
+}
+
+/// Walk an element whose own attributes (set by the render, see
+/// `open_tag`) are `own`.
+fn walk_element(
+  acc: Walk(msg),
+  tag: String,
+  own: List(#(String, String)),
+  attributes: List(Attr(msg)),
+  children: List(Node(msg)),
+  id: String,
+  mode: Mode(msg),
+) -> Walk(msg) {
+  let acc = open_tag(acc, tag, own, attributes, id)
+  case is_void_element(tag) {
+    True -> acc
+    False -> {
+      let #(acc, _index) =
+        list.fold(children, #(acc, 0), fn(state, child) {
+          let #(acc, index) = state
+          let acc = walk(child, id <> "." <> int.to_string(index), mode, acc)
+          #(acc, index + 1)
+        })
+      close_tag(acc, tag)
+    }
+  }
+}
+
+/// Walk a stream's container, its own attributes `stream_attribute` and
+/// then `own`.
+fn walk_stream(
+  acc: Walk(msg),
+  container: Container(msg),
+  tag: String,
+  own: List(#(String, String)),
+  attributes: List(Attr(msg)),
+  id: String,
+  mode: Mode(msg),
+) -> Walk(msg) {
+  case mode {
+    InItem ->
+      Walk(..acc, faults: [
+        "the item renders the stream " <> container.name <> " inside it",
+        ..acc.faults
+      ])
+    View(fill) -> {
+      // Invariant: a stream's items are children of its container, so
+      // the container must be able to hold children.
+      let assert False = is_void_element(tag)
+        as "brazier/internal/render: a stream's container cannot be a void element"
+      // Invariant: the client keeps one store per stream and patches its
+      // one container (docs/design/STREAMS.md 5.3).
+      let assert False =
+        list.any(acc.containers, fn(other) { other.name == container.name })
+        as "brazier/internal/render: a stream is rendered at most once per view"
+      let acc =
+        open_tag(
+          acc,
+          tag,
+          [#(stream_attribute, container.name), ..own],
+          attributes,
+          id,
+        )
+      let acc = Walk(..acc, containers: [container, ..acc.containers])
+      let acc = case fill(container) {
+        Ok(inner) -> Walk(..acc, html: string_tree.append(acc.html, inner))
+        Error(reason) -> Walk(..acc, faults: [reason, ..acc.faults])
       }
+      close_tag(acc, tag)
+    }
   }
 }
 
 /// Append `<tag own attributes>` and record the element's handlers under
-/// `id`. `own` are the attributes the renderer sets itself, which the name
-/// policy refuses in `attributes` (a stream container's
-/// `stream_attribute`).
+/// `id`. `own` are the attributes the renderer sets itself, reserved names
+/// that the name policy refuses in `attributes` (`stream_attribute`,
+/// `key_attribute`).
 fn open_tag(
   acc: Walk(msg),
   tag: String,
@@ -457,10 +537,17 @@ fn open_tag(
   let assert True = is_valid_tag_name(tag)
     as "brazier/internal/render: tag names are a-z A-Z 0-9 - _ : ."
   let #(plain, events) = collect_attributes(attributes)
-  let handlers =
-    list.fold(events, acc.handlers, fn(handlers, event) {
+  let #(handlers, names) =
+    list.fold(events, #(acc.handlers, acc.names), fn(state, event) {
+      let #(handlers, names) = state
       let #(name, handler) = event
-      dict.insert(handlers, key(name, id), handler)
+      let handlers = dict.insert(handlers, key(name, id), handler)
+      // A view has a few distinct event names and many handlers, so the
+      // list stays short.
+      case list.contains(names, name) {
+        True -> #(handlers, names)
+        False -> #(handlers, [name, ..names])
+      }
     })
   let html =
     acc.html
@@ -470,7 +557,7 @@ fn open_tag(
     |> append_plain(plain)
     |> append_events(events, id)
     |> string_tree.append(">")
-  Walk(..acc, html: html, handlers: handlers)
+  Walk(..acc, html: html, handlers: handlers, names: names)
 }
 
 fn close_tag(acc: Walk(msg), tag: String) -> Walk(msg) {
@@ -481,48 +568,6 @@ fn close_tag(acc: Walk(msg), tag: String) -> Walk(msg) {
       |> string_tree.append(tag)
       |> string_tree.append(">"),
   )
-}
-
-/// Put `data-brazier-key` on the element under a keyed wrapper. An explicit
-/// inner key wins over an outer one.
-fn add_key(node: Node(msg), key: String) -> Node(msg) {
-  case node {
-    Element(tag, attributes, children) ->
-      case has_attribute(attributes, "data-brazier-key") {
-        True -> node
-        False ->
-          Element(
-            tag,
-            [Attribute("data-brazier-key", key), ..attributes],
-            children,
-          )
-      }
-    Stream(name, limit, tag, attributes, item, item_ref) ->
-      case has_attribute(attributes, "data-brazier-key") {
-        True -> node
-        False ->
-          Stream(
-            name: name,
-            limit: limit,
-            tag: tag,
-            attributes: [Attribute("data-brazier-key", key), ..attributes],
-            item: item,
-            item_ref: item_ref,
-          )
-      }
-    Keyed(inner, child) -> Keyed(inner, child)
-    Text(_) | Nothing | RawHtml(_) -> node
-  }
-}
-
-fn has_attribute(attributes: List(Attr(msg)), name: String) -> Bool {
-  list.any(attributes, fn(attr) {
-    case attr {
-      Attribute(attr_name, _) -> attr_name == name
-      UnsafeSrcdoc(_) -> name == "srcdoc"
-      Event(_, _) | NoAttribute -> False
-    }
-  })
 }
 
 /// Split attributes into plain name/value pairs and events.
@@ -543,9 +588,10 @@ fn collect_attributes(
           // Invariant: `brazier/attribute.attribute` asserts the same check.
           // The constructors of this module are public, so an attribute
           // built directly is checked again here: an inline event handler,
-          // `srcdoc` or an animation of `href` is a bug in the view.
+          // `srcdoc`, a reserved `data-brazier-*` name or an animation of
+          // `href` is a bug in the view.
           let assert True = is_allowed_attribute(name, value)
-            as "brazier/internal/render: attribute refused by the name policy (on*, srcdoc, data-brazier-stream, attributeName=href, or characters outside a-z A-Z 0-9 - _ : .)"
+            as "brazier/internal/render: attribute refused by the name policy (on*, srcdoc, data-brazier-* other than -hook, -hook-watch, -preserve-children and -external, attributeName=href, or characters outside a-z A-Z 0-9 - _ : .)"
           case checked_value(name, value) {
             Error(Nil) -> acc
             Ok(value) -> #(merge_plain(plain, name, value), events)
@@ -666,17 +712,51 @@ fn append_events(
 /// - `srcdoc`, whose value is a whole HTML document that runs with the
 ///   page's origin unless the iframe is sandboxed. Use
 ///   `attribute.unsafe_srcdoc`;
-/// - `stream_attribute` (`data-brazier-stream`), which only a stream's
-///   container carries.
+/// - the reserved `data-brazier-*` names (`is_reserved_attribute_name`).
 pub fn is_valid_attribute_name(name: String) -> Bool {
   is_markup_name(name) && !is_refused_name(ascii_lowercase(name))
 }
+
+/// The prefix of the attributes Brazier's client reads and the render or the
+/// client sets: `data-brazier-key`, `-stream`, `-on-<event>`,
+/// `-prevent-<event>`, `-dev`, `-dev-build`, `-error` and `-error-notice`.
+/// An app that set one would steer the client: a forged `-on-click` sends a
+/// handler id the view never rendered, a forged `-stream` makes the client
+/// patch an element that is not a container. So the whole prefix is
+/// reserved, and a name the client reads later is reserved already.
+/// Reference: LiveView's client owns the `data-phx-*` attributes it sets
+/// (`data-phx-id`, `data-phx-session`); Brazier refuses its own in the view
+/// rather than trusting the app not to set them.
+pub const reserved_prefix = "data-brazier-"
+
+/// The `data-brazier-*` names that are app API, which the name policy
+/// allows: `attribute.hook`, `attribute.watch`, `attribute.ignore_updates`
+/// and the link attribute that opts out of client navigation
+/// (docs/ROUTING.md). Lowercase.
+pub const app_attributes = [
+  "data-brazier-external", "data-brazier-hook", "data-brazier-hook-watch",
+  "data-brazier-preserve-children",
+]
 
 /// The attribute that marks a stream's container. Only the render of a
 /// `Stream` node sets it: the client applies a stream's ops to the element
 /// that carries it, so the name policy refuses it, in any case, on every
 /// attribute a view builds (docs/design/STREAMS.md 7.5).
 pub const stream_attribute = "data-brazier-stream"
+
+/// The attribute that gives an element its identity for the client's
+/// morph. Only the render sets it, for `element.keyed` and for a stream
+/// item's root; the name policy refuses it in a view's attributes.
+pub const key_attribute = "data-brazier-key"
+
+/// Whether `name` is a valid markup name in the reserved `data-brazier-*`
+/// namespace (`reserved_prefix`) that is not app API (`app_attributes`).
+/// Matching is case-insensitive. The render refuses such a name on every
+/// attribute a view builds, and a build check can use this to refuse a
+/// name it can know before the view runs.
+pub fn is_reserved_attribute_name(name: String) -> Bool {
+  is_markup_name(name) && is_reserved_name(ascii_lowercase(name))
+}
 
 /// Whether attribute `name` may carry `value`: the name is valid
 /// (`is_valid_attribute_name`), and the
@@ -703,7 +783,14 @@ pub fn is_allowed_attribute(name: String, value: String) -> Bool {
 fn is_refused_name(lower: String) -> Bool {
   string.starts_with(lower, "on")
   || lower == "srcdoc"
-  || lower == stream_attribute
+  || is_reserved_name(lower)
+}
+
+/// `lower` is an ASCII-only lowercase name. Only a name with the reserved
+/// prefix reaches the allowlist.
+fn is_reserved_name(lower: String) -> Bool {
+  string.starts_with(lower, reserved_prefix)
+  && !list.contains(app_attributes, lower)
 }
 
 /// Whether `tag` is safe to render as a tag name: one or more of

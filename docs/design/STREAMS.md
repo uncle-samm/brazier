@@ -749,6 +749,17 @@ The attribute name policy (`render.is_refused_name`, which also refuses
 the render crashes on it, inside an item too. The build refuses it first
 when the name is a literal (section 10).
 
+Correction (client-decode): the policy now reserves the whole
+`data-brazier-*` namespace (`render.is_reserved_attribute_name`), except
+the four names that are app API (`-hook`, `-hook-watch`,
+`-preserve-children`, `-external`; see `render.app_attributes`).
+`data-brazier-stream` is one case of it. `data-brazier-key` is another: the
+render sets it as one of the element's own attributes for `element.keyed`
+and for an item's root, so an item root that sets it crashes the render
+like any reserved name, where `render_item` used to return an `Error` for
+it. The build still refuses only `data-brazier-stream` before the view
+runs.
+
 After every render, and after every frame that changes a store, the
 stream applier visits each container in the table:
 
@@ -822,6 +833,8 @@ item types.
 - **`element.keyed`.** The stream sets each item root's
   `data-brazier-key` to the stream key. `element.keyed` inside an item
   works as usual among its siblings. A keyed item root is an error (5.3).
+  An item root that sets `data-brazier-key` itself crashes the render: the
+  name is reserved (section 8.1, correction client-decode).
 - **Hooks inside items.** An inserted item's hooks mount, an item morphed
   in place gets `update` when a watched attribute changes
   (`attribute.watch`), and a deleted, trimmed or reset item's hooks

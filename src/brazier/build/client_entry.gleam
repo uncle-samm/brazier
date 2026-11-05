@@ -51,7 +51,8 @@ const render_module = "brazier_render"
 
 const local_module = "brazier_local"
 
-const dynamic_module = "brazier_dynamic"
+/// `gleam/dynamic`, imported with the standard imports of `codec_gen`.
+const dynamic_module = codec_gen.dynamic_module
 
 const stream_op_module = "brazier_stream_op"
 
@@ -62,7 +63,11 @@ pub fn generate(analysis: Analysis) -> Result(String, String) {
   let msg = field_type.NamedType(analysis.msg.0, analysis.msg.1)
   use model_type <- result.try(codec_gen.type_expr(analysis.model))
   use msg_type <- result.try(codec_gen.type_expr(msg))
-  use model_decoder <- result.try(codec_gen.decoder(codecs, analysis.model))
+  use model_decoded <- result.try(codec_gen.decode_value(
+    codecs,
+    analysis.model,
+    Var("data"),
+  ))
   use encode_msg <- result.try(codec_gen.encode(codecs, msg, Var("msg")))
   use helpers <- result.try(codec_gen.helpers(codecs, [msg], [analysis.model]))
   let bool = TNamed(None, "Bool", [])
@@ -81,28 +86,26 @@ pub fn generate(analysis: Analysis) -> Result(String, String) {
           [Param("data", TNamed(Some(dynamic_module), "Dynamic", []))],
           codec_gen.result_type(model_type),
           [
+            // The error is reported as a list, as `decode.run` reported its
+            // errors; the decoders stop at the first.
+            Let(PVar("brazier_decoded"), model_decoded),
             ExprStmt(
-              Case(
-                [
-                  Call(Ref(Some(codec_gen.decode), "run"), [
-                    Arg(Var("data")),
-                    Arg(model_decoder),
-                  ]),
-                ],
-                [
-                  Clause(
-                    [codec_gen.ok_pattern("brazier_value")],
-                    codec_gen.ok(Var("brazier_value")),
-                  ),
-                  Clause(
-                    [codec_gen.error_pattern_named("brazier_error")],
-                    codec_gen.inspect_error(
-                      "Cannot decode the model: ",
-                      "brazier_error",
-                    ),
-                  ),
-                ],
-              ),
+              Case([Var("brazier_decoded")], [
+                Clause(
+                  [codec_gen.ok_pattern("brazier_value")],
+                  codec_gen.ok(Var("brazier_value")),
+                ),
+                Clause(
+                  [codec_gen.error_pattern_named("brazier_error")],
+                  codec_gen.error(BinOp(
+                    gleam_code.Concat,
+                    Str("Cannot decode the model: "),
+                    Call(Ref(Some(codec_gen.string_module), "inspect"), [
+                      Arg(ListExpr([Var("brazier_error")])),
+                    ]),
+                  )),
+                ),
+              ]),
             ),
           ],
         ),
@@ -235,7 +238,6 @@ pub fn generate(analysis: Analysis) -> Result(String, String) {
         Import("brazier/internal/render", Some(render_module)),
         Import("brazier/internal/stream_op", Some(stream_op_module)),
         Import("brazier/local", Some(local_module)),
-        Import("gleam/dynamic", Some(dynamic_module)),
       ],
       user_imports,
     ])

@@ -15,8 +15,8 @@ import brazier/build/analyzer.{type Analysis}
 import brazier/build/codec_gen
 import brazier/build/field_type
 import brazier/build/gleam_code.{
-  Arg, Call, Case, Clause, ExprStmt, Function, ListExpr, Module, Param, Ref, Str,
-  Var,
+  Arg, BinOp, Call, Case, Clause, Concat, Ctor, ExprStmt, Function, ListExpr,
+  Module, Param, Ref, Str, Var,
 }
 import brazier/log
 import gleam/dict
@@ -44,8 +44,18 @@ pub fn generate(analysis: Analysis) -> Result(String, String) {
     analysis.model,
     Var("model"),
   ))
-  use model_decoder <- result.try(codec_gen.decoder(codecs, analysis.model))
+  use model_decoded <- result.try(codec_gen.decode_value(
+    codecs,
+    analysis.model,
+    Var(data_var),
+  ))
   use msg_decoder <- result.try(codec_gen.decoder(codecs, msg))
+  let msg_decoded =
+    Call(Ref(Some(codec_gen.wire), "field"), [
+      Arg(Var(data_var)),
+      Arg(Str(msg_key)),
+      Arg(msg_decoder),
+    ])
   use helpers <- result.try(
     codec_gen.helpers(codecs, [analysis.model], [analysis.model, msg]),
   )
@@ -64,7 +74,7 @@ pub fn generate(analysis: Analysis) -> Result(String, String) {
       ["The Model `encode_model` wrote."],
       [Param("data", codec_gen.string_type())],
       codec_gen.result_type(model_type),
-      [ExprStmt(parse("data", model_decoder, "Cannot decode the model: "))],
+      [ExprStmt(parse("data", model_decoded, "Cannot decode the model: "))],
     ),
     Function(
       "decode_event",
@@ -83,7 +93,7 @@ pub fn generate(analysis: Analysis) -> Result(String, String) {
       [
         ExprStmt(parse(
           "data",
-          codec_gen.decode_call("at", [ListExpr([Str(msg_key)]), msg_decoder]),
+          msg_decoded,
           "Cannot decode the client message: ",
         )),
       ],
@@ -128,24 +138,50 @@ pub fn stream_names(analysis: Analysis) -> List(String) {
   |> list.sort(string.compare)
 }
 
-/// `case brazier_json.parse(var, decoder) { Ok(v) -> Ok(v)  Error(e) ->
-/// Error(prefix <> inspect(e)) }`
+/// `case brazier_json.parse(var, brazier_decode.dynamic) { .. }`, then
+/// `decoded`, an expression over `brazier_data` of type
+/// `Result(t, brazier_decode.DecodeError)`. Both failures are reported as
+/// `prefix <> inspect(json.DecodeError)`, a decoder failure as
+/// `UnableToDecode([error])`, as `brazier_json.parse` reports a failure of a
+/// decoder it runs.
 fn parse(
   var: String,
-  decoder: gleam_code.Expr,
+  decoded: gleam_code.Expr,
   prefix: String,
 ) -> gleam_code.Expr {
-  Case(
-    [Call(Ref(Some(codec_gen.json), "parse"), [Arg(Var(var)), Arg(decoder)])],
-    [
-      Clause(
-        [codec_gen.ok_pattern("brazier_value")],
-        codec_gen.ok(Var("brazier_value")),
-      ),
-      Clause(
-        [codec_gen.error_pattern_named("brazier_error")],
-        codec_gen.inspect_error(prefix, "brazier_error"),
-      ),
-    ],
-  )
+  let parsed =
+    Call(Ref(Some(codec_gen.json), "parse"), [
+      Arg(Var(var)),
+      Arg(Ref(Some(codec_gen.decode), "dynamic")),
+    ])
+  let unable =
+    Call(Ctor(Some(codec_gen.json), "UnableToDecode"), [
+      Arg(ListExpr([Var("brazier_error")])),
+    ])
+  Case([parsed], [
+    Clause(
+      [codec_gen.error_pattern_named("brazier_error")],
+      codec_gen.inspect_error(prefix, "brazier_error"),
+    ),
+    Clause(
+      [codec_gen.ok_pattern(data_var)],
+      Case([decoded], [
+        Clause(
+          [codec_gen.ok_pattern("brazier_value")],
+          codec_gen.ok(Var("brazier_value")),
+        ),
+        Clause(
+          [codec_gen.error_pattern_named("brazier_error")],
+          codec_gen.error(BinOp(
+            Concat,
+            Str(prefix),
+            Call(Ref(Some(codec_gen.string_module), "inspect"), [Arg(unable)]),
+          )),
+        ),
+      ]),
+    ),
+  ])
 }
+
+/// The parsed JSON the decoders read.
+const data_var = "brazier_data"
