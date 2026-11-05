@@ -31,6 +31,7 @@ import brazier/pubsub
 import brazier/session.{type ExternalBackend, type SessionStore, External}
 import brazier/store
 import brazier/store/replicated.{Config}
+import gleam/dynamic.{type Dynamic}
 import gleam/dynamic/decode
 import gleam/erlang/atom
 import gleam/erlang/node.{type Node}
@@ -609,11 +610,7 @@ fn bound_seen_from(p: Peer, name: String, id: String, expected: Int) -> Bool {
   let namespace = "external:" <> name
   peer.until(
     p,
-    peer.pg_changes("brazier_session_pg", #(
-      atom.create("brazier_session"),
-      namespace,
-      id,
-    )),
+    peer.pg_changes("brazier_session_pg", session_group(namespace, id)),
     fn() { bound_everywhere(namespace, id) == expected },
     wait_ms,
   )
@@ -729,3 +726,6 @@ fn await_revocation(
 
 @external(erlang, "brazier_session_test_ffi", "bound_everywhere")
 fn bound_everywhere(namespace: String, id: String) -> Int
+
+@external(erlang, "brazier_session_ffi", "session_group")
+fn session_group(namespace: String, id: String) -> Dynamic

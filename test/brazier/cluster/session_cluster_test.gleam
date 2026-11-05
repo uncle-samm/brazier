@@ -19,7 +19,7 @@ import brazier/presence/holder.{type Holder}
 import brazier/session.{type ExternalBackend, type SessionStore, External}
 import brazier/telemetry
 import gleam/dict
-import gleam/erlang/atom
+import gleam/dynamic.{type Dynamic}
 import gleam/erlang/node.{type Node}
 import gleam/erlang/process.{type Pid}
 import gleam/list
@@ -70,7 +70,7 @@ fn bind_on(p: Peer, store: SessionStore, id: String) -> Socket {
 /// on each join and leave of its pg group.
 fn bound_seen_from(p: Peer, name: String, id: String, expected: Int) -> Bool {
   let namespace = "external:" <> name
-  let group = #(atom.create("brazier_session"), namespace, id)
+  let group = session_group(namespace, id)
   peer.until(
     p,
     peer.pg_changes("brazier_session_pg", group),
@@ -248,3 +248,6 @@ fn await_revoked(
 
 @external(erlang, "brazier_session_test_ffi", "bound_everywhere")
 fn bound_everywhere(namespace: String, id: String) -> Int
+
+@external(erlang, "brazier_session_ffi", "session_group")
+fn session_group(namespace: String, id: String) -> Dynamic

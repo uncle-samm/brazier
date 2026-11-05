@@ -19,7 +19,6 @@ import brazier/presence/holder.{type Holder}
 import brazier/session.{type ExternalBackend, type SessionStore, External}
 import brazier/telemetry
 import gleam/dynamic.{type Dynamic}
-import gleam/erlang/atom
 import gleam/erlang/node.{type Node}
 import gleam/erlang/process.{type Pid}
 import gleam/list
@@ -231,6 +230,32 @@ pub fn a_revocation_skipped_by_a_one_sided_check_is_caught_up_test_() -> peer.Ti
   assert telemetry.string(event, "reason") == Ok("recheck")
 }
 
+/// pg replicates group names to every connected node, where
+/// pg:which_groups lists them. A binding's group is seen from the other
+/// node, but neither the session id nor its binding fingerprint is in any
+/// group name there.
+pub fn group_names_seen_from_another_node_hold_no_session_id_test_() -> peer.Timeout {
+  use <- Timeout(60)
+  use peers <- peer.with_members(2, "brazier_mw_groups")
+  let assert [a, b] = peers as "with_members(2) starts two peers"
+  let name = "groupnames"
+  let a_node = peer.node(a)
+  peer.on(a, fn() { start_db(name) })
+  let store_a = start_store(a, name, a_node)
+  let store_b = start_store(b, name, a_node)
+
+  let s = peer.on(a, fn() { session.create(store_a) })
+  let _socket = bind_on(b, store_b, s.id)
+  assert bound_seen_from(a, name, s.id, 1)
+
+  let names = peer.on(a, group_names)
+  assert list.contains(names, session_group("external:" <> name, s.id))
+  assert !names_mention(names, s.id)
+  assert !names_mention(names, fingerprint(s.id))
+  // B's own view is the same.
+  assert !names_mention(peer.on(b, group_names), s.id)
+}
+
 // --- Helpers ----------------------------------------------------------------
 
 fn members(p: Peer) -> List(Node) {
@@ -291,7 +316,7 @@ fn bind_on(p: Peer, store: SessionStore, id: String) -> Socket {
 /// on each join and leave of its pg group.
 fn bound_seen_from(p: Peer, name: String, id: String, expected: Int) -> Bool {
   let namespace = "external:" <> name
-  let group = #(atom.create("brazier_session"), namespace, id)
+  let group = session_group(namespace, id)
   peer.until(
     p,
     peer.pg_changes("brazier_session_pg", group),
@@ -406,6 +431,18 @@ fn await_revoked(
 
 @external(erlang, "brazier_session_test_ffi", "bound_everywhere")
 fn bound_everywhere(namespace: String, id: String) -> Int
+
+@external(erlang, "brazier_session_ffi", "session_group")
+fn session_group(namespace: String, id: String) -> Dynamic
+
+@external(erlang, "brazier_session_bindings_test_ffi", "group_names")
+fn group_names() -> List(Dynamic)
+
+@external(erlang, "brazier_session_bindings_test_ffi", "names_mention")
+fn names_mention(names: List(Dynamic), needle: String) -> Bool
+
+@external(erlang, "brazier_session_bindings_test_ffi", "fingerprint")
+fn fingerprint(id: String) -> String
 
 @external(erlang, "brazier_membership_window_ffi", "node_named")
 fn node_named(name: String) -> Node

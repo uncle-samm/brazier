@@ -23,7 +23,8 @@
     notify_revoked/3,
     notify_revoked_local/3,
     local_bound_sessions/1,
-    start_maintenance/4
+    session_group/2,
+    start_maintenance/5
 ]).
 
 %% Session rows are stored as:
@@ -40,6 +41,11 @@
 %% underscore/hyphen (max 255 bytes). Each distinct store creates one atom.
 
 -define(PG_SCOPE, brazier_session_pg).
+%% Node-local map from a binding's pg group back to its session id (see
+%% "Group names" below). Not "brazier_session_" + a name: that prefix is
+%% the session stores' (session_ets_new/1).
+-define(BINDINGS, brazier_bound_sessions).
+-define(GROUP_DOMAIN, "brazier-session-group-v1").
 
 session_ets_new(Name) ->
     case validate_atom_name(Name) of
@@ -145,7 +151,8 @@ constant_time_equal(_, _) ->
 
 %% --- Live-connection registry (pg) ---
 %% Processes bound to a session (WebSocket handlers) join the pg group
-%% {brazier_session, Namespace, SessionId} in the brazier_session_pg scope.
+%% {brazier_session, Namespace, Key} in the brazier_session_pg scope, where
+%% Key is a hash of the session id (see "Group names" below).
 %% pg removes members when they exit or when their node disconnects, so the
 %% registry cannot leak dead processes. Namespace is the same on every node
 %% for a shared (External) store, so a revocation on one node reaches the
@@ -168,6 +175,25 @@ constant_time_equal(_, _) ->
 %% While the scope is not running no process can be bound (pg would hold
 %% the members), so the read and notify functions report no members, and
 %% bind_process/3 crashes loudly.
+%%
+%% Group names: pg replicates group names to every connected node, and
+%% pg:which_groups/1 lists them there, verified cluster member or not. A
+%% session id is a bearer secret, so it is never part of a group name: the
+%% group carries Key = SHA-256 over a domain tag, the namespace and the id.
+%% Session ids are 256 random bits, so the hash can be neither inverted nor
+%% guessed, and an unkeyed hash is enough (the pattern of Rack's session
+%% private_id, CVE-2019-16782). The domain tag keeps Key distinct from
+%% binding_fingerprint/1, the plain SHA-256 that signed tokens carry. The
+%% namespace stays readable: it is the store's name, not a secret.
+%%
+%% Ids back: the re-check (local_bound_sessions/1) needs the ids of the
+%% sessions bound on this node, which the group names no longer give. Each
+%% binding writes a row {{Namespace, Key, Pid}, SessionId} to the node-local
+%% table brazier_bound_sessions (owned by brazier_ets_owner) before it joins
+%% the group. Rows of processes that have exited are deleted on every
+%% maintenance sweep and before each re-check; a process never comes back
+%% to life, so deleting them never races a binding. The table holds one row
+%% per live binding plus the bindings that ended since the last sweep.
 
 ensure_registry() ->
     case pg:start(?PG_SCOPE) of
@@ -207,7 +233,35 @@ registry_running() ->
     whereis(?PG_SCOPE) =/= undefined.
 
 group(Namespace, SessionId) ->
-    {brazier_session, Namespace, SessionId}.
+    {brazier_session, Namespace, group_key(Namespace, SessionId)}.
+
+%% The pg group a process bound to SessionId in Namespace joins. Exported
+%% for tests, which look the group up on other nodes.
+session_group(Namespace, SessionId) when is_binary(Namespace), is_binary(SessionId) ->
+    group(Namespace, SessionId).
+
+group_key(Namespace, SessionId) ->
+    crypto:hash(sha256, <<?GROUP_DOMAIN, (byte_size(Namespace)):32, Namespace/binary,
+                          SessionId/binary>>).
+
+%% The bindings table, created on first use.
+bindings() ->
+    case ets:whereis(?BINDINGS) of
+        undefined ->
+            case brazier_ets_ffi:ensure_table(atom_to_binary(?BINDINGS), ets_set) of
+                {ok, ?BINDINGS} ->
+                    brazier_log_ffi:info(<<"brazier.session">>,
+                                        "Created the session bindings table ~p", [?BINDINGS]),
+                    ?BINDINGS;
+                {error, Reason} ->
+                    brazier_log_ffi:error(<<"brazier.session">>,
+                                         "Cannot create the session bindings table ~p: ~p",
+                                         [?BINDINGS, Reason]),
+                    erlang:error({brazier_session_bindings_unavailable, Reason})
+            end;
+        _Tid ->
+            ?BINDINGS
+    end.
 
 %% Whether Pid is bound to the session on this node. A process cannot have
 %% been bound while the scope is not running: bind_process/3 crashes then.
@@ -229,7 +283,11 @@ bind_process(Namespace, SessionId, Pid) ->
                                  [Pid, ?PG_SCOPE]),
             erlang:error({brazier_session_registry_down, ?PG_SCOPE})
     end,
-    Group = group(Namespace, SessionId),
+    Key = group_key(Namespace, SessionId),
+    Group = {brazier_session, Namespace, Key},
+    %% The row goes in first, so a re-check that sees the pg member always
+    %% finds its id. Rewriting it on a repeated bind changes nothing.
+    true = ets:insert(bindings(), {{Namespace, Key, Pid}, SessionId}),
     Members = pg:get_local_members(?PG_SCOPE, Group),
     case lists:member(Pid, Members) of
         true -> length(Members);
@@ -281,21 +339,63 @@ send_revoked(Members, SessionId, Reason) ->
     end, Members),
     length(Members).
 
-%% Session ids in Namespace with at least one bound process on this node.
+%% Session ids in Namespace with at least one bound process on this node:
+%% the ids of the live rows in the bindings table whose group still has a
+%% local member (a restarted scope has lost its members).
 local_bound_sessions(Namespace) ->
     case registry_running() of
         true ->
-            [Id || {brazier_session, Ns, Id} = Group <- pg:which_groups(?PG_SCOPE),
-                   Ns =:= Namespace,
-                   pg:get_local_members(?PG_SCOPE, Group) =/= []];
+            _Pruned = prune_bindings(Namespace),
+            Bound = lists:usort([{Key, Id} || {{_, Key, _}, Id} <- binding_rows(Namespace)]),
+            [Id || {Key, Id} <- Bound,
+                   pg:get_local_members(?PG_SCOPE, {brazier_session, Namespace, Key}) =/= []];
         false ->
             []
+    end.
+
+%% Delete the rows of bindings in Namespace whose process has exited.
+%% Returns how many were deleted.
+prune_bindings(Namespace) ->
+    Dead = [Row || {{_, _, Pid}, _} = Row <- binding_rows(Namespace), not is_process_alive(Pid)],
+    lists:foreach(fun(Row) -> true = ets:delete_object(?BINDINGS, Row) end, Dead),
+    case Dead of
+        [] ->
+            ok;
+        _ ->
+            brazier_log_ffi:debug(<<"brazier.session">>,
+                                 "Pruned ~b ended session binding(s) in ~ts",
+                                 [length(Dead), Namespace])
+    end,
+    length(Dead).
+
+%% The bindings rows of Namespace. No table means no process on this node
+%% was ever bound. A local member of one of Namespace's groups with no
+%% table means the table was lost (its owner crashed, see brazier_ets_ffi
+%% LOST TABLES) and the ids of those bindings with it: that crashes.
+binding_rows(Namespace) ->
+    case ets:whereis(?BINDINGS) of
+        undefined ->
+            case [G || {brazier_session, Ns, _} = G <- pg:which_groups(?PG_SCOPE),
+                       Ns =:= Namespace,
+                       pg:get_local_members(?PG_SCOPE, G) =/= []] of
+                [] ->
+                    [];
+                Groups ->
+                    brazier_log_ffi:error(<<"brazier.session">>,
+                                         "~b session group(s) in ~ts have local members but the "
+                                         "bindings table ~p is gone",
+                                         [length(Groups), Namespace, ?BINDINGS]),
+                    erlang:error({brazier_session_bindings_lost, Namespace})
+            end;
+        _Tid ->
+            ets:match_object(?BINDINGS, {{Namespace, '_', '_'}, '_'})
     end.
 
 %% --- Maintenance process ---
 %% An unlinked process per store that
 %%   - runs SweepFun every IntervalMs (timer via send_after, so other
-%%     messages do not postpone the sweep), and
+%%     messages do not postpone the sweep), after deleting the bindings
+%%     rows of Namespace's exited processes (prune_bindings/1), and
 %%   - runs RecheckFun(Node) when Node and this node have verified each
 %%     other ({brazier_cluster_peer_mutual, Node}, see
 %%     brazier_cluster_ffi:subscribe_mutual/1): a revocation goes only from
@@ -321,13 +421,17 @@ local_bound_sessions(Namespace) ->
 %% revocation sent after the mutual notice but before the sender's pg has
 %% learnt of a remote binding misses that binding, and no re-check follows.
 %% The transport's periodic auth re-check of every socket bounds it.
-start_maintenance(Owner, IntervalMs, SweepFun, RecheckFun)
-        when is_integer(IntervalMs), IntervalMs > 0 ->
+start_maintenance(Owner, Namespace, IntervalMs, SweepFun, RecheckFun)
+        when is_binary(Namespace), is_integer(IntervalMs), IntervalMs > 0 ->
+    Sweep = fun() ->
+        run_guarded(prune_bindings, fun() -> prune_bindings(Namespace) end),
+        run_guarded(sweep, fun() -> SweepFun() end)
+    end,
     Pid = spawn(fun() ->
         Ref = erlang:monitor(process, Owner),
         ok = net_kernel:monitor_nodes(true),
         erlang:send_after(IntervalMs, self(), brazier_session_sweep),
-        maintenance_loop(Ref, IntervalMs, SweepFun, RecheckFun)
+        maintenance_loop(Ref, IntervalMs, Sweep, RecheckFun)
     end),
     case brazier_cluster_ffi:subscribe_mutual(Pid) of
         {ok, nil} ->
@@ -349,7 +453,7 @@ maintenance_loop(Ref, IntervalMs, SweepFun, RecheckFun) ->
             nil = brazier_cluster_ffi:unsubscribe_mutual(self()),
             ok;
         brazier_session_sweep ->
-            run_guarded(sweep, fun() -> SweepFun() end),
+            SweepFun(),
             erlang:send_after(IntervalMs, self(), brazier_session_sweep),
             maintenance_loop(Ref, IntervalMs, SweepFun, RecheckFun);
         {nodeup, Node} ->

@@ -268,7 +268,7 @@ await_revoked(Pid, Id, Reason, Deadline, Others) ->
 
 %% Bound processes for a session on every node this node sees.
 bound_everywhere(Namespace, Id) ->
-    length(pg:get_members(brazier_session_pg, {brazier_session, Namespace, Id})).
+    length(pg:get_members(brazier_session_pg, brazier_session_ffi:session_group(Namespace, Id))).
 
 %% Whether Fun raises (any class).
 raises(Fun) ->
