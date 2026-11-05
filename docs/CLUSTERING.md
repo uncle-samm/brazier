@@ -1060,4 +1060,6 @@ secret key and checks that store, PubSub, presence and revocation traffic
 crosses in neither direction.
 
 Peers stop when the test ends, whether it passes or fails. The tests wait
-on conditions with a deadline (`peer.eventually`), never with sleeps.
+with `peer.until`: a condition re-checked after each message that announces
+a change (a telemetry event, a monitor, a node up or down), never with
+sleeps or polls.

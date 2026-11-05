@@ -26,7 +26,7 @@
 
 -export([with_cluster/3, with_cluster_args/4, with_members/3, with_members_args/4,
          with_long_name_cluster/3, rpc/3, crash/1, stop/1, partition/2,
-         heal/2, restore/2, connect/2, node_of/1, pause/1, alive/1, add_peer/2, add_peer_args/3,
+         heal/2, restore/2, connect/2, node_of/1, alive/1, add_peer/2, add_peer_args/3,
          await_member/3, await_members/3, membership_changed/4, monitor_nodes/1, pg_monitor/2, pg_demonitor/2,
          trace_receive/2, now_ms/0, registered/1, on_node/3]).
 
@@ -319,9 +319,6 @@ restore(A, B) ->
     {ok, true} = rpc(A, fun() -> erlang:set_cookie(NodeB, erlang:get_cookie()) end, 5000),
     {ok, true} = rpc(B, fun() -> erlang:set_cookie(NodeA, erlang:get_cookie()) end, 5000),
     nil.
-
-pause(Ms) ->
-    receive after Ms -> nil end.
 
 %% --- Wakes for peer.until (each runs in the waiting process) ---
 

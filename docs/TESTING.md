@@ -503,4 +503,3 @@ These are the waits that remain, and why.
 | `brazier/stress` | `hold_duration_ms` | Holding connections open is the load being measured (0 in tests). |
 | `brazier/sim` pool | `stagger_ms` | Connection pacing is part of the scenario. |
 | CDP pong pause | see [Waiting](#waiting) | The stillness is under test. |
-| Peer-node tests (`cluster/*`, `ws8c_presence_*`, `ws10b_presence_restart_semantics`) | `peer.eventually`: re-checks every 10 ms until a deadline | A poll, not a barrier, and the one left to replace. It waits for state to converge across nodes (replication, pg, `net_kernel`), or, in `ws10b_presence_restart_semantics`, for a session to track itself again after its shard restarts. No single process announces either to the test. Do not use it in single-node tests: those wait on a monitor, a sys hook (`await.watch_info`, `watch_exit`, `watch_down`) or a message. |

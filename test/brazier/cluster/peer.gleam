@@ -15,8 +15,9 @@
 //// announcement. The
 //// subscription comes first, so a change is either seen by the first check
 //// or followed by a message that triggers another; this is ExUnit's
-//// `assert_receive` rather than a sleep. `eventually` polls, and is only
-//// for state that announces nothing. Each call site says why it polls.
+//// `assert_receive` rather than a sleep. There is no polling helper: for
+//// state that announces nothing, wake on a trace (`receives`) or a sys hook
+//// (`info`) instead.
 ////
 //// PubSub, replicated stores, presence and session revocation exchange
 //// messages only with verified cluster members, so a test of traffic
@@ -323,23 +324,6 @@ pub fn any(wakes: List(Wake)) -> Wake {
   }
 }
 
-/// Poll `check` every 10ms until it returns True or `timeout_ms` passes.
-/// Returns whether it held. Only for state that announces nothing (see the
-/// module doc); prefer `until`.
-pub fn eventually(check: fn() -> Bool, timeout_ms: Int) -> Bool {
-  case check() {
-    True -> True
-    False ->
-      case timeout_ms <= 0 {
-        True -> False
-        False -> {
-          pause(10)
-          eventually(check, timeout_ms - 10)
-        }
-      }
-  }
-}
-
 /// The process registered as `name` on the node this runs on (call it
 /// inside `on` for a peer's process).
 @external(erlang, "brazier_peer_ffi", "registered")
@@ -385,9 +369,6 @@ fn rpc_ffi(peer: Peer, run: fn() -> a, timeout_ms: Int) -> Result(a, String)
 
 @external(erlang, "brazier_peer_ffi", "on_node")
 fn on_node_ffi(node: Node, run: fn() -> a, timeout_ms: Int) -> a
-
-@external(erlang, "brazier_peer_ffi", "pause")
-fn pause(ms: Int) -> Nil
 
 @external(erlang, "brazier_peer_ffi", "monitor_nodes")
 fn monitor_nodes(on: Bool) -> Nil

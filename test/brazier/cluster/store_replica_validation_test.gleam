@@ -43,10 +43,7 @@ pub fn malformed_peer_payloads_are_refused_test_() -> peer.Timeout {
     })
   let assert [kv, ..] = stores as "every peer opened the store"
   peer.on(a, fn() { store.put(kv, "before", "1") })
-  assert peer.eventually(
-    fn() { peer.on(b, fn() { store.get(kv, "before") }) == Ok("1") },
-    wait_ms,
-  )
+  assert sees(b, kv, "before", "1")
   let assert Ok(pid) = peer.on(b, fn() { replica_pid(name) })
     as "b's replica runs"
   let syncs = relay.events(b, [["brazier", "store", "sync", "stop"]])
@@ -101,8 +98,18 @@ pub fn malformed_peer_payloads_are_refused_test_() -> peer.Timeout {
 
   // Replication still works.
   peer.on(a, fn() { store.put(kv, "after", "2") })
-  assert peer.eventually(
-    fn() { peer.on(b, fn() { store.get(kv, "after") }) == Ok("2") },
+  assert sees(b, kv, "after", "2")
+}
+
+/// Whether `p`'s replica comes to hold `key` = `value`, re-checked after
+/// each merge there. A remote write reaches a replica only through a merge,
+/// and the merge's `[brazier, store, sync]` stop event comes after the
+/// replica and its ETS mirror are updated, so the check after it sees it.
+fn sees(p: Peer, kv: store.Store(String), key: String, value: String) -> Bool {
+  peer.until(
+    p,
+    peer.events([["brazier", "store", "sync", "stop"]]),
+    fn() { store.get(kv, key) == Ok(value) },
     wait_ms,
   )
 }
