@@ -23,6 +23,36 @@ which publishes to Hex after the `hex` environment is approved.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-11-06
+
+The first release published through a GitHub release
+(`.github/workflows/publish.yml`).
+
+### Fixed
+
+- `brazier/build/program.run` passes the working directory and arguments to
+  the program as UTF-8 bytes. They were character lists, which the VM encodes
+  with its file name encoding; when the locale is not UTF-8 (a bare
+  container) that is latin1, and any character past U+00FF raised `badarg`.
+- The production `Dockerfile` runs on `erlang:29-alpine`. Its builder stage
+  (the Gleam image) compiles with OTP 29, but the runtime stage ran
+  `erlang:28-alpine`; the build now fails when the two stages run different
+  OTP releases.
+
+### Changed
+
+- Brazier is tested on Erlang/OTP 29: CI's image, the local `mise.toml` pin
+  (29.1.2) and the production `Dockerfile` all run it.
+- The production `Dockerfile` takes an optional read-only Hex key as the
+  BuildKit secret `hexpm_read_api_key`, for builds on an IP that shares the
+  Hex API's unauthenticated rate limit (docs/DEPLOYMENT.md).
+
+### Added
+
+- `scripts/check_production_image.sh [EXAMPLE APP_MODULE]` builds the
+  production image, starts it, and fails unless it reports healthy and
+  answers `/health`. CI runs it on the counter example.
+
 ## [0.1.0] - 2026-11-05
 
 The first release. It holds Milestone 117, the full review remediation. The workstreams are listed in
