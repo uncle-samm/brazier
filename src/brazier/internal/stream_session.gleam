@@ -92,6 +92,16 @@ pub fn has_entries(update: Update) -> Bool {
   dict.size(update.frames) > 0
 }
 
+/// The `streams` array of `update` for `conn_id`, and `update` without it:
+/// for a connection whose entries ride another frame than the update's
+/// broadcast (a joiner's, in its join `model_sync`).
+pub fn take_frame(update: Update, conn_id: String) -> #(String, Update) {
+  #(
+    frame(update, conn_id),
+    Update(..update, frames: dict.delete(update.frames, conn_id)),
+  )
+}
+
 /// The `streams` array of a frame that changes no stream.
 pub const empty_frame = "[]"
 
@@ -252,6 +262,11 @@ fn apply_to_connections(
 ///   no item is kept to send again, so its windows stay and it is sent
 ///   `[]`; a rejoin while they hold keys is logged at warning.
 /// - Any other join: the connection holds nothing yet.
+///
+/// The runtime joins a later connection (or a rejoin) before it applies the
+/// join's route, so that the route's update is applied to its windows too;
+/// the first join after its route, so that the route's items are in the
+/// snapshot.
 pub fn join(
   streams: Streams,
   conn_id: String,

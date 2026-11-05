@@ -280,6 +280,45 @@ pub type RuntimeState(model, msg) {
     title_sync: TitleSync,
     /// The stream windows of the session and of each joined connection.
     streams: stream_session.Streams,
+    /// The stream refusals made before the runtime's first join, which no
+    /// connection was joined to be sent; the first join is sent them.
+    held_stream_errors: HeldStreamErrors,
+    /// The later join (or rejoin) whose route `accept_join` is applying.
+    live_join: Option(LiveJoin),
+  )
+}
+
+/// Stream refusals made while no connection had joined the runtime yet
+/// (`init`, the initial route, messages before the first join, the first
+/// join's own route). Each was logged at error when it was refused; the
+/// runtime's first join is sent them as `error` frames before its
+/// model_sync (docs/design/STREAMS.md 7.4, 12). At most
+/// `held_stream_errors_max` reasons are kept; the rest are counted and the
+/// first join is told how many.
+pub type HeldStreamErrors {
+  HeldStreamErrors(
+    /// The kept reasons, newest first.
+    reasons: List(String),
+    /// The number of reasons not kept, past the bound.
+    dropped: Int,
+  )
+}
+
+/// The most stream refusal reasons held for the first join.
+pub const held_stream_errors_max = 32
+
+/// A join after the runtime's first one (or a rejoin) while its route is
+/// applied. The joiner has its stream windows but is not joined yet: the
+/// route's update applies its stream ops to those windows, and the entries
+/// and refusals it makes for the joiner wait for its join model_sync.
+pub type LiveJoin {
+  LiveJoin(
+    conn_id: transport.ConnectionId,
+    /// The `streams` array of the join model_sync.
+    frame: String,
+    /// The reasons of the `error` frames to send the joiner before its
+    /// join model_sync.
+    errors: List(String),
   )
 }
 
@@ -634,14 +673,19 @@ fn spawn_actor(
       ))
       // No connection has joined: the ops of `init` and the initial route
       // fill the session's windows, which keep their items until the first
-      // join (docs/design/STREAMS.md 7.2).
-      let streams =
+      // join (docs/design/STREAMS.md 7.2). Their refusals are held for it.
+      let #(streams, held_stream_errors) =
         list.fold(
           initial_stream_ops,
-          stream_session.new(config.streams.names, config.streams.limits),
-          fn(streams, update) {
+          #(
+            stream_session.new(config.streams.names, config.streams.limits),
+            no_held_stream_errors,
+          ),
+          fn(acc, update) {
+            let #(streams, held) = acc
             let #(cause, ops) = update
-            stream_session.apply(streams, ops, [], cause).streams
+            let applied = stream_session.apply(streams, ops, [], cause)
+            #(applied.streams, hold_stream_errors(held, applied.errors, cause))
           },
         )
       run_effects(initial_effects, subject)
@@ -672,6 +716,8 @@ fn spawn_actor(
           title: config.title,
           title_sync: TitleWithinLimit(last_sent: None),
           streams: streams,
+          held_stream_errors: held_stream_errors,
+          live_join: None,
         )
       log.debug("brazier.runtime", "Runtime initialising")
       // Trap exits so a stop caused by a linked process still reports
@@ -1396,11 +1442,20 @@ fn accept_join(
   conn_id: transport.ConnectionId,
   path: String,
 ) -> RuntimeState(model, msg) {
+  // A later join (or a rejoin) gets its stream windows before its route is
+  // applied, so that the route's stream ops reach them; the first join gets
+  // its windows after, from the session's, which the route filled.
+  let state = case state.accepted_first_join {
+    False -> state
+    True -> begin_live_join(state, conn_id)
+  }
   // Route changes are broadcast to the OTHER joined connections; the
   // joiner is not joined yet and gets the result in its model_sync.
   let state = route_join(state, conn_id, path)
+  let live_join = state.live_join
+  let state = RuntimeState(..state, live_join: None)
   case dict.has_key(state.connections, conn_id) {
-    True -> complete_join(state, conn_id)
+    True -> complete_join(state, conn_id, live_join)
     // The route's error frame found the joiner gone or slow, and forgot it
     // (logged there): there is nothing left to join.
     False -> {
@@ -1413,11 +1468,34 @@ fn accept_join(
   }
 }
 
+/// Give a join after the first one (or a rejoin) its stream windows, before
+/// its route is applied: a new connection's start empty (no replay,
+/// docs/design/STREAMS.md 7.3), a rejoin keeps its own (7.2).
+fn begin_live_join(
+  state: RuntimeState(model, msg),
+  conn_id: transport.ConnectionId,
+) -> RuntimeState(model, msg) {
+  // Invariant: a join completes or is dropped within one message, and the
+  // joiner is not joined while it joins (a rejoin left the joined set).
+  let assert None = state.live_join
+    as "brazier/runtime: a join started while another one was in progress"
+  let assert False = set.contains(state.joined, conn_id)
+    as "brazier/runtime: a joining connection is in the joined set"
+  let #(streams, frame, errors) = stream_session.join(state.streams, conn_id)
+  RuntimeState(
+    ..state,
+    streams: streams,
+    live_join: Some(LiveJoin(conn_id: conn_id, frame: frame, errors: errors)),
+  )
+}
+
 /// The rest of a join, once its route was applied: the joiner is
-/// registered.
+/// registered. `live_join` is the join's stream state when it is not the
+/// runtime's first (`begin_live_join`).
 fn complete_join(
   state: RuntimeState(model, msg),
   conn_id: transport.ConnectionId,
+  live_join: Option(LiveJoin),
 ) -> RuntimeState(model, msg) {
   // If the cache is unusable, the other joined connections may be stale
   // too: resync everyone, not just the joiner.
@@ -1425,11 +1503,35 @@ fn complete_join(
     NoCache -> set.to_list(state.joined)
     _ -> []
   }
-  // The joiner's stream entries: on the runtime's first join, every window
-  // filled before it (docs/design/STREAMS.md 7.2). The others' stores are
-  // not part of a resync.
-  let #(streams, join_frame, stream_errors) =
-    stream_session.join(state.streams, conn_id)
+  // The joiner's stream entries and refusals. On the runtime's first join:
+  // every window filled before it (docs/design/STREAMS.md 7.2), and every
+  // refusal made before it. On a later join: what its route's update made
+  // for its windows. The others' stores are not part of a resync.
+  let #(state, join_frame, stream_errors) = case live_join {
+    Some(LiveJoin(conn_id: joiner, frame: frame, errors: errors)) -> {
+      let assert True = joiner == conn_id
+        as "brazier/runtime: a join completed with another connection's stream state"
+      #(state, frame, errors)
+    }
+    None -> {
+      // Invariant: `accept_join` begins a live join for every join after
+      // the first.
+      let assert False = state.accepted_first_join
+        as "brazier/runtime: a later join has no live join stream state"
+      let #(streams, frame, snapshot_errors) =
+        stream_session.join(state.streams, conn_id)
+      let held = take_held_stream_errors(state.held_stream_errors, conn_id)
+      #(
+        RuntimeState(
+          ..state,
+          streams: streams,
+          held_stream_errors: no_held_stream_errors,
+        ),
+        frame,
+        list.append(held, snapshot_errors),
+      )
+    }
+  }
   let state =
     RuntimeState(
       ..state,
@@ -1439,7 +1541,6 @@ fn complete_join(
         True -> state.client_acks
         False -> dict.insert(state.client_acks, conn_id, 0)
       },
-      streams: streams,
     )
   let state = send_stream_errors(state, [conn_id], stream_errors)
   let #(state, sent) =
@@ -2448,8 +2549,63 @@ fn broadcast_model(
   stream_ops: List(stream_op.Op),
 ) -> #(RuntimeState(model, msg), Bool) {
   let targets = set.to_list(state.joined)
-  let update = stream_session.apply(state.streams, stream_ops, targets, event)
+  // A later joiner whose route this update is takes the stream ops on its
+  // own windows; its entries and refusals ride its join model_sync. A
+  // joiner forgotten while routing it has no windows left.
+  let joiner = case state.live_join {
+    Some(live) ->
+      case dict.has_key(state.connections, live.conn_id) {
+        True -> Some(live)
+        False -> None
+      }
+    None -> None
+  }
+  let stream_targets = case joiner {
+    Some(live) -> [live.conn_id, ..targets]
+    None -> targets
+  }
+  let update =
+    stream_session.apply(state.streams, stream_ops, stream_targets, event)
   let state = RuntimeState(..state, streams: update.streams)
+  let #(state, update) = case joiner {
+    Some(live) -> {
+      // Invariant: a join's route runs one update (`route_join`).
+      let assert True = live.frame == stream_session.empty_frame
+        as "brazier/runtime: a joiner's route ran more than one update"
+      let #(frame, update) = stream_session.take_frame(update, live.conn_id)
+      #(
+        RuntimeState(
+          ..state,
+          live_join: Some(
+            LiveJoin(
+              ..live,
+              frame: frame,
+              errors: list.append(live.errors, update.errors),
+            ),
+          ),
+        ),
+        update,
+      )
+    }
+    None ->
+      case state.accepted_first_join {
+        // No connection has joined yet: the first join is sent these.
+        False -> #(
+          RuntimeState(
+            ..state,
+            held_stream_errors: hold_stream_errors(
+              state.held_stream_errors,
+              update.errors,
+              event,
+            ),
+          ),
+          update,
+        )
+        // Nothing is replayed (docs/design/STREAMS.md 7.3): with no
+        // connection joined, a refusal is in the error log only.
+        True -> #(state, update)
+      }
+  }
   let state = send_stream_errors(state, targets, update.errors)
   // A connection the error frames found gone or slow was forgotten; the
   // model frame goes to the ones still joined.
@@ -2511,6 +2667,87 @@ fn send_stream_errors(
       transport.SendError(reason: reason)
     })
   })
+}
+
+const no_held_stream_errors = HeldStreamErrors(reasons: [], dropped: 0)
+
+/// Hold the stream refusals of an update made before the runtime's first
+/// join (`cause` names it), up to `held_stream_errors_max` reasons; the
+/// rest are counted.
+fn hold_stream_errors(
+  held: HeldStreamErrors,
+  errors: List(String),
+  cause: String,
+) -> HeldStreamErrors {
+  list.fold(errors, held, fn(held, reason) {
+    case list.length(held.reasons) < held_stream_errors_max {
+      True -> {
+        log.debug(
+          "brazier.runtime",
+          "No connection joined yet; the stream refusal of the update for "
+            <> cause
+            <> " is held for the first join",
+        )
+        HeldStreamErrors(..held, reasons: [reason, ..held.reasons])
+      }
+      False -> {
+        let dropped = held.dropped + 1
+        log.warning(
+          "brazier.runtime",
+          "No connection joined yet and "
+            <> int.to_string(held_stream_errors_max)
+            <> " stream refusals are held for the first join; the refusal of the update for "
+            <> cause
+            <> " is counted only ("
+            <> int.to_string(dropped)
+            <> " counted so far)",
+        )
+        HeldStreamErrors(..held, dropped: dropped)
+      }
+    }
+  })
+}
+
+/// The `error` frame reasons the runtime's first join `conn_id` is sent for
+/// the refusals held before it, oldest first; one more names the number of
+/// refusals past the bound.
+fn take_held_stream_errors(
+  held: HeldStreamErrors,
+  conn_id: transport.ConnectionId,
+) -> List(String) {
+  let reasons = list.reverse(held.reasons)
+  let reasons = case held.dropped {
+    0 -> reasons
+    dropped -> {
+      log.warning(
+        "brazier.runtime",
+        "First join "
+          <> conn_id
+          <> ": "
+          <> int.to_string(dropped)
+          <> " stream refusal(s) made before it were past the bound of "
+          <> int.to_string(held_stream_errors_max)
+          <> "; it is sent their count only",
+      )
+      list.append(reasons, [
+        int.to_string(dropped)
+        <> " more stream refusal(s) before the join; see the server log",
+      ])
+    }
+  }
+  case reasons {
+    [] -> Nil
+    _ ->
+      log.info(
+        "brazier.runtime",
+        "First join "
+          <> conn_id
+          <> ": sending "
+          <> int.to_string(list.length(reasons))
+          <> " error frame(s) for the stream refusals made before it",
+      )
+  }
+  reasons
 }
 
 /// The model sent no frame, but `update` has stream entries: send them on

@@ -570,6 +570,16 @@ client never sends one: it sends `join` once per socket, in `onopen`. The
 runtime logs that rejoin at warning when a window is not empty, and its
 `model_sync` carries `"streams": []`.
 
+Correction (backpressure): a join after the first, and a rejoin, is given
+its windows before its route runs, so the ops of a route change it causes
+(the joiner's route differs from the session's) are applied to its windows
+and their entries ride its join `model_sync`. Before, the windows were made
+after the route ran, so the joiner was sent the route's model but not its
+entries, and its windows disagreed with what it was later sent. The first
+join still runs its route first and is then sent every window (above). A
+rejoin's `model_sync` therefore carries `"streams": []` only when its route
+changes nothing.
+
 ### 7.3 Windows and deltas
 
 The runtime keeps one window per stream: the keys in order, at most
@@ -616,6 +626,15 @@ entries each connection is sent, and their `at` indices, are computed
 against its own windows. A connection's windows are dropped when it
 disconnects, and emptied when its join `model_sync` was not sent.
 
+Correction (backpressure): the bound `stream_frame_max_bytes` applies to
+each connection's frame, not only to the session's delta. A connection's
+windows can differ from the session's (a `KeepLast(1)` window full in the
+session trims a `Prepend` at once, while a later joiner's empty window keeps
+it), so one connection's entries can be over the bound when the session's
+are not. Then every op of the update is refused, for every connection, as
+in 7.4, and the error log names the connection
+(`frame_too_large, for connection <id>`).
+
 ### 7.4 Bounds
 
 | Bound (`SecurityLimits` field) | Default | When it is exceeded |
@@ -649,6 +668,18 @@ Correction (step 5): these bounds are `SecurityLimits` fields
 each must be positive, and `stream_max_limit` at most 1000, the largest
 limit the wire and the client accept. An earlier draft made them
 constants; decision D4 set the defaults above.
+
+Correction (backpressure): a refusal made before the first join (in `init`,
+the route message or a message dispatched before any connection joined)
+was only logged, so the first client was never told its streams lacked the
+refused items. The runtime now holds those reasons, at most
+`runtime.held_stream_errors_max` (32), and sends them to the first join as
+`error` frames, oldest first, before its `model_sync`; refusals past the
+bound are counted, logged at warning, and sent as one more `error`
+("N more stream refusal(s) before the join; see the server log"). After the
+first join, a refusal made while no connection is joined is logged only:
+no later joiner is sent items from before its join (7.3), so it is not
+sent their refusals either.
 
 ### 7.5 Unknown streams and duplicate declarations
 
@@ -843,6 +874,8 @@ rejoin with non-empty windows, error for every refusal. The browser logs a
 | Limit over `stream_max_limit` | runtime | That op refused, `limit_out_of_range` |
 | Empty or over-long key | runtime | That op refused, `key_empty` or `key_too_large` |
 | Item over `item_max_bytes` | runtime | That op refused, error log, `error` frame; the rest of the update is sent |
+| Any refusal before the first join | runtime | Error log; the reason is held (at most 32, then counted) and sent to the first join as an `error` frame before its `model_sync` (Correction (backpressure), 7.4) |
+| Any refusal after the first join while no connection is joined | runtime | Error log only; nothing is replayed to a later join |
 | More ops than `ops_max_per_update`, or stream entries over `frame_max_bytes` | runtime | Every op of the update refused; the model part is sent |
 | Ops for a stream not in the current view | browser | Not an error: the store keeps them, bounded by the limit, and the container is filled by a full reconcile when it appears |
 | Delete of a key not in the stream | runtime | Warning, nothing sent |
