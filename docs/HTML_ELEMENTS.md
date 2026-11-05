@@ -146,9 +146,30 @@ a user controls. Its counterpart for an `<iframe>` document is
 - `attributeName` with a value containing `href`, which would let an SVG
   animation rewrite a link after the URL policy checked it (see
   [SVG.md](SVG.md#animation));
+- a `data-brazier-*` name, except the four below that are app API. Brazier's
+  client reads these names and only the render sets them:
+  `data-brazier-key` (use `element.keyed`), `data-brazier-stream` (use
+  `stream.render`), `data-brazier-on-<event>` and
+  `data-brazier-prevent-<event>` (use `brazier/event`), and the ones the
+  server or the client puts on the app root. A forged one would steer the
+  client, so the whole prefix is reserved (LiveView's client owns its
+  `data-phx-*` attributes the same way);
 - a name with characters outside `a-z A-Z 0-9 - _ : .`.
 
-Names match case-insensitively, so `SrcDoc` and `ONCLICK` crash too.
+Names match case-insensitively, so `SrcDoc`, `ONCLICK` and
+`Data-Brazier-Key` crash too. `attribute.data("brazier-key", ..)` builds the
+same name and crashes the same way, and `attribute.boolean` crashes on a
+refused name even when it is `False`. The render refuses the same names again
+on an attribute built without the constructor.
+
+The `data-brazier-*` names that are app API:
+
+| Name | Set with |
+|------|----------|
+| `data-brazier-hook` | `attribute.hook(name)` |
+| `data-brazier-hook-watch` | `attribute.watch(names)` |
+| `data-brazier-preserve-children` | `attribute.ignore_updates()` |
+| `data-brazier-external` | `attribute.data("brazier-external", "")` on a link the client must not navigate itself (see [ROUTING.md](ROUTING.md#links)) |
 
 **`attribute.unsafe_srcdoc(html)`** gives an `<iframe>` a whole document.
 The value is attribute-escaped, as every value is, and the browser decodes it

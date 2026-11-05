@@ -178,8 +178,11 @@ pub fn the_stream_attribute_is_refused_when_built_test() {
   let assert Error(#("error", _)) =
     rescue(fn() { attribute.data("brazier-stream", "x") })
   let assert False = render.is_valid_attribute_name("DATA-BRAZIER-STREAM")
-  let assert True = render.is_valid_attribute_name("data-brazier-streams")
-  let assert True = render.is_valid_attribute_name("data-brazier-stream-x")
+  // The whole `data-brazier-*` namespace is reserved, so names next to it
+  // are refused too.
+  let assert False = render.is_valid_attribute_name("data-brazier-streams")
+  let assert False = render.is_valid_attribute_name("data-brazier-stream-x")
+  let assert True = render.is_valid_attribute_name("data-stream")
 }
 
 pub fn the_stream_attribute_on_a_plain_element_crashes_the_render_test() {
@@ -225,6 +228,37 @@ pub fn the_stream_attribute_in_an_item_is_refused_test() {
     })
   let assert Error(#("error", _)) =
     rescue(fn() { render.render_item(marked, "k", item(Line(1, "a"))) })
+}
+
+pub fn an_item_root_that_sets_its_own_key_is_refused_test() {
+  // The stream keys an item's root; `data-brazier-key` is reserved, so the
+  // constructor refuses it and the render refuses a directly built one.
+  let assert Error(#("error", _)) =
+    rescue(fn() { attribute.attribute("data-brazier-key", "own") })
+  let container = the_container(stream.render(log(), "ol", [], render_line))
+  let own_key =
+    render.Container(..container, item: fn(_value) {
+      Ok(
+        render.Element("li", [render.Attribute("data-brazier-key", "own")], []),
+      )
+    })
+  let assert Error(#("error", _)) =
+    rescue(fn() { render.render_item(own_key, "k", item(Line(1, "a"))) })
+  // A handler id forged on an item's element is refused the same way.
+  let forged =
+    render.Container(..container, item: fn(_value) {
+      Ok(
+        render.Element("li", [], [
+          render.Element(
+            "button",
+            [render.Attribute("data-brazier-on-click", "0.1")],
+            [],
+          ),
+        ]),
+      )
+    })
+  let assert Error(#("error", _)) =
+    rescue(fn() { render.render_item(forged, "k", item(Line(1, "a"))) })
 }
 
 pub fn a_bad_container_tag_crashes_test() {
@@ -293,12 +327,6 @@ pub fn keyed_root(line: Line) -> Element(Msg) {
   element.keyed("own", html.li([], [html.text(line.text)]))
 }
 
-pub fn own_key_root(line: Line) -> Element(Msg) {
-  html.li([attribute.attribute("data-brazier-key", "own")], [
-    html.text(line.text),
-  ])
-}
-
 pub fn stream_root(_line: Line) -> Element(Msg) {
   stream.render(other(), "ol", [], render_line)
 }
@@ -318,8 +346,6 @@ pub fn an_item_root_must_be_one_element_test() {
     string.contains(root_error(raw_root), "root is unsafe_raw_html")
   let assert True =
     string.contains(root_error(keyed_root), "root is element.keyed")
-  let assert True =
-    string.contains(root_error(own_key_root), "sets data-brazier-key")
   let assert True =
     string.contains(root_error(stream_root), "root is the stream other")
 }
