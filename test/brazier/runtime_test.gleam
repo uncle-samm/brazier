@@ -224,7 +224,8 @@ fn join_routed(
 }
 
 pub fn start_applies_initial_route_before_first_sync_test() {
-  let #(_subject, _transport, first) = join_routed("/users/7?tab=posts", "r1")
+  let #(subject, transport_subject, first) =
+    join_routed("/users/7?tab=posts", "r1")
   // on_change ran exactly once (at start); the join for the same route did
   // not run it again.
   let assert transport.SendModelSync(
@@ -233,6 +234,7 @@ pub fn start_applies_initial_route_before_first_sync_test() {
     ack_clock: 0,
     streams_json: "[]",
   ) = first
+  stop(subject, [transport_subject])
 }
 
 pub fn start_refused_by_init_starts_no_runtime_test() {
@@ -288,7 +290,8 @@ pub fn start_with_a_crashing_init_is_a_startup_error_test() {
       "init or the initial route crashed for \"/\"",
     ])
   // The caller survived and can start a healthy runtime.
-  let assert Ok(_subject) = runtime.start(counter_config(), test_context())
+  let assert Ok(subject) = runtime.start(counter_config(), test_context())
+  stop(subject, [])
 }
 
 pub fn start_with_unknown_route_keeps_init_state_test() {
@@ -322,6 +325,7 @@ pub fn start_with_unknown_route_keeps_init_state_test() {
         streams_json: "[]",
       ),
     )
+  stop(subject, [transport_subject])
 }
 
 pub fn start_refuses_badly_encoded_url_test() {
@@ -351,6 +355,7 @@ pub fn navigation_runs_on_change_for_known_route_test() {
   )) = process.receive(transport_subject, await.deadline_ms)
   let assert True = string.contains(ops, "settings")
   let assert True = string.contains(ops, "home,settings")
+  stop(subject, [transport_subject])
 }
 
 // --- client paths in logs (SEC-17) ---
@@ -383,6 +388,7 @@ pub fn join_and_navigation_logs_omit_the_query_test() {
       // The patch is sent after the navigation is logged.
       let assert Ok(transport.SendPatch(ops_json: ops, ..)) =
         process.receive(transport_subject, await.deadline_ms)
+      stop(subject, [transport_subject])
       ops
     })
   let assert True =
@@ -409,6 +415,7 @@ pub fn navigation_to_same_route_runs_on_change_again_test() {
   let assert Ok(transport.SendPatch(ops_json: ops, version: 1, ..)) =
     process.receive(transport_subject, await.deadline_ms)
   let assert True = string.contains(ops, "settings,settings")
+  stop(subject, [transport_subject])
 }
 
 pub fn navigation_to_unknown_route_hard_navigates_test() {
@@ -419,6 +426,7 @@ pub fn navigation_to_unknown_route_hard_navigates_test() {
   )
   let assert Ok(transport.SendHardNavigate(path: "/nope")) =
     process.receive(transport_subject, await.deadline_ms)
+  stop(subject, [transport_subject])
 }
 
 pub fn navigation_with_bad_encoding_hard_navigates_test() {
@@ -429,6 +437,7 @@ pub fn navigation_with_bad_encoding_hard_navigates_test() {
   )
   let assert Ok(transport.SendHardNavigate(path: "/users/%E0%A4")) =
     process.receive(transport_subject, await.deadline_ms)
+  stop(subject, [transport_subject])
 }
 
 pub fn navigation_to_non_local_path_is_refused_test() {
@@ -453,6 +462,7 @@ pub fn navigation_to_non_local_path_is_refused_test() {
   let assert Ok(transport.SendModelSync(model_json: json, ..)) =
     process.receive(transport_subject, await.deadline_ms)
   let assert "{\"page\":\"home\",\"visits\":\"home\",\"tab\":\"\"}" = json
+  stop(subject, [transport_subject])
 }
 
 pub fn refused_navigation_log_omits_the_query_test() {
@@ -484,6 +494,7 @@ pub fn refused_navigation_log_omits_the_query_test() {
     cluster_log_capture.contains(lines, "warning", "\"//evil.example/x\"")
   let assert False =
     list.any(lines, fn(line) { string.contains(line.message, "s3cr3t") })
+  stop(subject, [transport_subject])
 }
 
 pub fn navigation_without_router_hard_navigates_test() {
@@ -495,6 +506,7 @@ pub fn navigation_without_router_hard_navigates_test() {
   )
   let assert Ok(transport.SendHardNavigate(path: "/elsewhere")) =
     process.receive(transport_subject, await.deadline_ms)
+  stop(subject, [transport_subject])
 }
 
 pub fn join_for_different_route_runs_on_change_test() {
@@ -519,6 +531,7 @@ pub fn join_for_different_route_runs_on_change_test() {
         _ -> False
       }
     })
+  stop(subject, [transport_subject])
 }
 
 /// Receive exactly `n` messages (1s timeout each).
@@ -607,6 +620,7 @@ pub fn runtime_starts_successfully_test() {
     transport.SendMount(..) -> panic as "Join must not send SendMount"
     _ -> panic as "Expected SendModelSync after join"
   }
+  stop(subject, [transport_subject])
 }
 
 pub fn runtime_accepts_client_connect_test() {
@@ -636,6 +650,7 @@ pub fn runtime_accepts_client_connect_test() {
     transport.SendMount(..) -> panic as "Join must not send SendMount"
     _ -> panic as "Expected SendModelSync after connect + join"
   }
+  stop(subject, [fake_transport_subject])
 }
 
 pub fn runtime_sends_model_sync_on_join_test() {
@@ -664,6 +679,7 @@ pub fn runtime_sends_model_sync_on_join_test() {
     transport.SendMount(..) -> panic as "Join must not send SendMount"
     _ -> panic as "Expected SendModelSync message on join"
   }
+  stop(subject, [transport_subject])
 }
 
 pub fn runtime_sends_model_sync_on_event_test() {
@@ -709,6 +725,7 @@ pub fn runtime_sends_model_sync_on_event_test() {
       }
     })
   let assert True = has_update
+  stop(subject, [transport_subject])
 }
 
 pub fn runtime_handles_disconnect_test() {
@@ -739,6 +756,7 @@ pub fn runtime_handles_disconnect_test() {
   // The barrier proves the runtime handled the event (it is still alive)
   // and sent nothing to the disconnected transport.
   let assert [] = await.settle(subject, transport_subject)
+  stop(subject, [transport_subject])
 }
 
 pub fn runtime_handles_unknown_event_test() {
@@ -793,6 +811,7 @@ pub fn runtime_handles_unknown_event_test() {
         streams_json: "[]",
       ),
     )
+  stop(subject, [transport_subject])
 }
 
 pub fn runtime_effect_dispatches_message_test() {
@@ -847,7 +866,7 @@ pub fn runtime_effect_dispatches_message_test() {
         _ -> False
       }
     })
-  Nil
+  stop(subject, [transport_subject])
 }
 
 pub fn live_update_does_not_render_server_view_test() {
@@ -951,6 +970,7 @@ pub fn live_update_does_not_render_server_view_test() {
       }
     })
   let assert True = recovered
+  stop(subject, [transport_subject])
 }
 
 pub fn runtime_shutdown_test() {
@@ -1052,6 +1072,7 @@ pub fn client_request_sync_sends_model_sync_without_mount_test() {
     })
   let assert True = has_model_sync
   let assert False = has_mount
+  stop(subject, [transport_subject])
 }
 
 fn recovery_config(
@@ -1129,6 +1150,7 @@ pub fn state_recovery_rejects_token_signed_with_other_secret_test() {
     )
   let #(conn, first) = join_and_receive(subject, "forged_conn", token)
   assert_join_refused(subject, "forged_conn", conn, first)
+  stop(subject, [conn])
 }
 
 pub fn state_recovery_rejects_tampered_token_test() {
@@ -1143,6 +1165,7 @@ pub fn state_recovery_rejects_tampered_token_test() {
   let tampered = token <> "x"
   let #(conn, first) = join_and_receive(subject, "tampered_conn", tampered)
   assert_join_refused(subject, "tampered_conn", conn, first)
+  stop(subject, [conn])
 }
 
 /// No token can verify with an empty secret, so state recovery without one
@@ -1161,6 +1184,7 @@ pub fn state_recovery_refuses_join_without_token_test() {
     runtime.start(recovery_config(recovery_secret), test_context())
   let #(conn, first) = join_and_receive(subject, "no_token_conn", "")
   assert_join_refused(subject, "no_token_conn", conn, first)
+  stop(subject, [conn])
 }
 
 /// Without state recovery a missing token is fine (it would carry nothing),
@@ -1171,10 +1195,11 @@ pub fn join_without_recovery_refuses_bad_token_test() {
       runtime.RuntimeConfig(..counter_config(), secret_key: recovery_secret),
       test_context(),
     )
-  let #(_, first) = join_and_receive(subject, "plain_conn", "")
+  let #(plain, first) = join_and_receive(subject, "plain_conn", "")
   let assert transport.SendModelSync(..) = first
   let #(conn, first) = join_and_receive(subject, "bad_conn", "garbage")
   assert_join_refused(subject, "bad_conn", conn, first)
+  stop(subject, [plain, conn])
 }
 
 pub fn state_recovery_rejects_session_bound_token_without_session_test() {
@@ -1189,6 +1214,7 @@ pub fn state_recovery_rejects_session_bound_token_without_session_test() {
     )
   let #(conn, first) = join_and_receive(subject, "unbound_conn", token)
   assert_join_refused(subject, "unbound_conn", conn, first)
+  stop(subject, [conn])
 }
 
 pub fn state_recovery_rejects_token_for_other_session_test() {
@@ -1220,6 +1246,7 @@ pub fn state_recovery_rejects_token_for_other_session_test() {
   )
   let assert Ok(first) = process.receive(transport_subject, await.deadline_ms)
   assert_join_refused(subject, "other_session", transport_subject, first)
+  stop(subject, [transport_subject])
 }
 
 pub fn state_recovery_rejects_expired_token_test() {
@@ -1235,6 +1262,7 @@ pub fn state_recovery_rejects_expired_token_test() {
     )
   let #(conn, first) = join_and_receive(subject, "expired_conn", token)
   assert_join_refused(subject, "expired_conn", conn, first)
+  stop(subject, [conn])
 }
 
 /// The page render puts the model in every join token while recovery is
@@ -1246,6 +1274,7 @@ pub fn state_recovery_refuses_a_token_without_a_model_test() {
     ssr.sign_join_token(recovery_secret, "", option.None, ssr_now())
   let #(conn, first) = join_and_receive(subject, "modelless_conn", modelless)
   assert_join_refused(subject, "modelless_conn", conn, first)
+  stop(subject, [conn])
 }
 
 pub fn state_recovery_rejects_model_the_deserializer_refuses_test() {
@@ -1260,6 +1289,7 @@ pub fn state_recovery_rejects_model_the_deserializer_refuses_test() {
     )
   let #(conn, first) = join_and_receive(subject, "bad_model_conn", token)
   assert_join_refused(subject, "bad_model_conn", conn, first)
+  stop(subject, [conn])
 }
 
 pub fn state_recovery_only_applies_to_first_join_test() {
@@ -1270,7 +1300,8 @@ pub fn state_recovery_only_applies_to_first_join_test() {
   // The first join recovers its token's model.
   let first_token =
     ssr.sign_join_token(recovery_secret, "", option.Some("0"), ssr_now())
-  let #(_, first) = join_and_receive(subject, "first_conn", first_token)
+  let #(first_conn, first) =
+    join_and_receive(subject, "first_conn", first_token)
   let assert transport.SendModelSync(model_json: "0", ..) = first
   let token =
     runtime.create_state_token(
@@ -1278,8 +1309,9 @@ pub fn state_recovery_only_applies_to_first_join_test() {
       fn(m: CounterModel) { int.to_string(m.count) },
       recovery_secret,
     )
-  let #(_, second) = join_and_receive(subject, "second_conn", token)
+  let #(second_conn, second) = join_and_receive(subject, "second_conn", token)
   let assert transport.SendModelSync(model_json: "0", ..) = second
+  stop(subject, [first_conn, second_conn])
 }
 
 pub fn state_recovery_from_token_test() {
@@ -1292,13 +1324,14 @@ pub fn state_recovery_from_token_test() {
       recovery_secret,
     )
   // The model sync carries the recovered state (3), not the init state (0).
-  let #(_, first) = join_and_receive(subject, "recovery_conn", token)
+  let #(conn, first) = join_and_receive(subject, "recovery_conn", token)
   let assert transport.SendModelSync(
     model_json: "3",
     version: 0,
     ack_clock: 0,
     streams_json: "[]",
   ) = first
+  stop(subject, [conn])
 }
 
 /// SEC-17: at join, `restore` gets the state `init` built, so server-only
@@ -1318,11 +1351,11 @@ pub fn state_recovery_at_join_restores_onto_the_init_state_test() {
   let assert Ok(subject) = runtime.start(config, test_context())
   let token =
     ssr.sign_join_token(recovery_secret, "", option.Some("77"), ssr_now())
-  let #(_, first) = join_and_receive(subject, "fresh_join_conn", token)
+  let #(conn, first) = join_and_receive(subject, "fresh_join_conn", token)
   // 77 recovered + 5 from init.
   let assert transport.SendModelSync(model_json: "82", ..) = first
     as "restore receives the state init built"
-  Nil
+  stop(subject, [conn])
 }
 
 pub fn state_recovery_from_session_bound_token_test() {
@@ -1352,6 +1385,7 @@ pub fn state_recovery_from_session_bound_token_test() {
   )
   let assert Ok(transport.SendModelSync(model_json: "7", ..)) =
     process.receive(transport_subject, await.deadline_ms)
+  stop(subject, [transport_subject])
 }
 
 @external(erlang, "brazier_ssr_ffi", "system_time_seconds")
@@ -1420,6 +1454,7 @@ pub fn model_sync_sent_after_event_test() {
       }
     })
   let assert True = has_update
+  stop(subject, [transport_subject])
 }
 
 // === Patch optimization proof tests ===
@@ -1484,6 +1519,7 @@ pub fn sends_patch_not_model_sync_after_join_test() {
     })
   let assert True = has_patch
   let assert False = has_full_sync
+  stop(subject, [transport_subject])
 }
 
 pub fn patch_contains_only_changed_field_test() {
@@ -1531,6 +1567,7 @@ pub fn patch_contains_only_changed_field_test() {
   // Ops should contain /count and be small (< 60 bytes)
   let assert True = string.contains(ops, "/count")
   let assert True = string.length(ops) < 60
+  stop(subject, [transport_subject])
 }
 
 pub fn client_ops_are_ignored_server_update_authoritative_test() {
@@ -1634,6 +1671,7 @@ pub fn client_ops_are_ignored_server_update_authoritative_test() {
       }
     })
   let assert False = leaked_derived_client_value
+  stop(subject, [transport_subject])
 }
 
 pub fn post_mount_updates_never_send_html_mount_test() {
@@ -1686,6 +1724,7 @@ pub fn post_mount_updates_never_send_html_mount_test() {
       }
     })
   let assert True = has_state_update
+  stop(subject, [transport_subject])
 }
 
 pub fn slow_client_mailbox_triggers_backpressure_close_test() {
@@ -1726,6 +1765,7 @@ pub fn slow_client_mailbox_triggers_backpressure_close_test() {
       }
     })
   let assert True = has_backpressure_close
+  stop(subject, [transport_subject])
 }
 
 fn fill_transport_mailbox(
@@ -1792,6 +1832,7 @@ pub fn multiple_increments_produce_patches_test() {
   // All 5 should be patches, zero should be full syncs
   let assert True = patch_count == 5
   let assert True = sync_count == 0
+  stop(subject, [transport_subject])
 }
 
 pub fn patch_content_correct_after_many_increments_test() {
@@ -1845,6 +1886,7 @@ pub fn patch_content_correct_after_many_increments_test() {
     let assert transport.SendPatch(ops_json: ops, ..) = m
     let assert True = string.length(ops) < 60
   })
+  stop(subject, [transport_subject])
 }
 
 /// `[1, 2, ..., n]`: the clocks of n events.
@@ -1925,6 +1967,7 @@ pub fn server_state_not_in_model_sync_test() {
     let assert False = string.contains(json, "secret_api_key")
     let assert True = string.contains(json, "count")
   })
+  stop(subject, [transport_subject])
 }
 
 // === server_state Model Encoder Tests ===
@@ -2004,6 +2047,7 @@ pub fn server_state_background_effect_pushes_update_test() {
   list.each(update_jsons, fn(json) {
     let assert False = string.contains(json, "server_secret")
   })
+  stop(subject, [transport_subject])
 }
 
 pub fn server_state_user_event_pushes_update_test() {
@@ -2093,6 +2137,7 @@ pub fn server_state_user_event_pushes_update_test() {
   list.each(update_jsons, fn(json) {
     let assert False = string.contains(json, "private_key")
   })
+  stop(subject, [transport_subject])
 }
 
 // === Error Path Tests ===
@@ -2162,6 +2207,7 @@ pub fn runtime_handles_malformed_event_data_test() {
   ] = await.settle(subject, transport_subject)
   let assert True = first == count_patch(1)
   let assert True = second == count_patch(2)
+  stop(subject, [transport_subject])
 }
 
 pub fn runtime_handles_rapid_events_test() {
@@ -2209,6 +2255,7 @@ pub fn runtime_handles_rapid_events_test() {
       )
     })
   let assert True = msgs == expected
+  stop(subject, [transport_subject])
 }
 
 // === Connection Isolation Test ===
@@ -2297,6 +2344,8 @@ pub fn connection_isolation_test() {
   list.each(b_syncs, fn(json) {
     let assert True = string.contains(json, "\"count\":0")
   })
+  stop(subject_a, [transport_a])
+  stop(subject_b, [transport_b])
 }
 
 /// Verify that on_update_effect wrapping works: the chained effect is
@@ -2387,10 +2436,7 @@ pub fn on_update_effect_is_invoked_test() {
   let assert Ok(transport.SendPatch(version: 1, ack_clock: 1, ..)) =
     process.receive(transport_subject, await.deadline_ms)
     as "the increment was patched to revision 1, acking clock 1"
-  stop_runtime(subject)
-  let assert [] = await.drain(transport_subject)
-    as "the runtime sent nothing else"
-  Nil
+  stop(subject, [transport_subject])
 }
 
 /// Shut a runtime down and return once it has exited, so nothing it sends
@@ -2401,6 +2447,50 @@ fn stop_runtime(subject: process.Subject(runtime.RuntimeMessage(msg))) -> Nil {
   process.send(subject, runtime.Shutdown)
   await.expect_down(pid, "the runtime after Shutdown")
 }
+
+/// `stop_runtime`, then check that each of the runtime's connections was
+/// sent nothing the test did not receive.
+fn stop(
+  subject: process.Subject(runtime.RuntimeMessage(msg)),
+  connections: List(process.Subject(transport.InternalMessage)),
+) -> Nil {
+  stop_runtime(subject)
+  list.each(connections, assert_nothing_sent)
+}
+
+fn assert_nothing_sent(
+  connection: process.Subject(transport.InternalMessage),
+) -> Nil {
+  let assert [] = await.drain(connection)
+    as "the connection was sent no frame the test did not receive"
+  Nil
+}
+
+/// Run a `start_and_connect*` and return its handlers, with a `shutdown`
+/// that returns once the runtime has exited. The returned `shutdown` only
+/// sends `Shutdown`, so the runtime is found as the one process the start
+/// linked to this test process (`actor.start` links it).
+fn start_connected(
+  start: fn() ->
+    Result(
+      #(fn(transport.ConnectionId, transport.ClientMessage) -> Nil, fn() -> Nil),
+      error.BrazierError,
+    ),
+) -> #(fn(transport.ConnectionId, transport.ClientMessage) -> Nil, fn() -> Nil) {
+  let #(started, linked) = new_links(start)
+  let assert Ok(#(on_event, shutdown)) = started as "the runtime started"
+  let assert [runtime_pid] = linked
+    as "the start linked this test to one process, the runtime"
+  #(on_event, fn() {
+    shutdown()
+    await.expect_down(runtime_pid, "the runtime after shutdown")
+  })
+}
+
+/// Run `start` and return its result with the processes it linked to the
+/// calling process.
+@external(erlang, "brazier_runtime_test_ffi", "new_links")
+fn new_links(start: fn() -> a) -> #(a, List(process.Pid))
 
 /// An init that seeds the count from the `user_id` cookie, -1 without one.
 fn cookie_init(
@@ -2434,35 +2524,41 @@ pub fn connected_init_reads_request_cookie_test() {
     |> request.set_header("cookie", "user_id=42")
   let config = runtime.RuntimeConfig(..counter_config(), init: cookie_init)
   let transport_subject = process.new_subject()
-  let assert Ok(#(on_event, shutdown)) =
-    runtime.start_and_connect_with_request(
-      config,
-      "ws_init_conn",
-      transport_subject,
-      req,
-    )
+  let #(on_event, shutdown) =
+    start_connected(fn() {
+      runtime.start_and_connect_with_request(
+        config,
+        "ws_init_conn",
+        transport_subject,
+        req,
+      )
+    })
   on_event("ws_init_conn", transport.ClientJoin(token: "", path: "/"))
   // The first thing the join sends is the model sync: never a mount.
   let assert Ok(first) = process.receive(transport_subject, await.deadline_ms)
   let assert True = has_count_sync([first], 42)
   shutdown()
+  assert_nothing_sent(transport_subject)
 }
 
 /// Without a request, init gets the context it was handed (no cookies).
 pub fn start_and_connect_uses_given_context_test() {
   let config = runtime.RuntimeConfig(..counter_config(), init: cookie_init)
   let transport_subject = process.new_subject()
-  let assert Ok(#(on_event, shutdown)) =
-    runtime.start_and_connect(
-      config,
-      test_context(),
-      "default_init_conn",
-      transport_subject,
-    )
+  let #(on_event, shutdown) =
+    start_connected(fn() {
+      runtime.start_and_connect(
+        config,
+        test_context(),
+        "default_init_conn",
+        transport_subject,
+      )
+    })
   on_event("default_init_conn", transport.ClientJoin(token: "", path: "/"))
   let assert Ok(first) = process.receive(transport_subject, await.deadline_ms)
   let assert True = has_count_sync([first], -1)
   shutdown()
+  assert_nothing_sent(transport_subject)
 }
 
 /// A WebSocket upgrade without `?path=` is refused before any runtime starts.
@@ -2501,13 +2597,15 @@ pub fn join_recovers_state_from_httponly_cookie_test() {
     )
 
   let transport_subject = process.new_subject()
-  let assert Ok(#(on_event, shutdown)) =
-    runtime.start_and_connect_with_request(
-      config,
-      "cookie_join_conn",
-      transport_subject,
-      req,
-    )
+  let #(on_event, shutdown) =
+    start_connected(fn() {
+      runtime.start_and_connect_with_request(
+        config,
+        "cookie_join_conn",
+        transport_subject,
+        req,
+      )
+    })
 
   on_event(
     "cookie_join_conn",
@@ -2516,6 +2614,7 @@ pub fn join_recovers_state_from_httponly_cookie_test() {
   let assert Ok(first) = process.receive(transport_subject, await.deadline_ms)
   let assert True = has_count_sync([first], 77)
   shutdown()
+  assert_nothing_sent(transport_subject)
 }
 
 fn cookie_recovery_config(
@@ -2649,19 +2748,22 @@ pub fn session_join_restores_onto_the_fresh_state_test() {
       secret_key: cookie_secret,
     )
   let transport_subject = process.new_subject()
-  let assert Ok(#(on_event, shutdown)) =
-    runtime.start_and_connect_with_request(
-      config,
-      "fresh_state_conn",
-      transport_subject,
-      req,
-    )
+  let #(on_event, shutdown) =
+    start_connected(fn() {
+      runtime.start_and_connect_with_request(
+        config,
+        "fresh_state_conn",
+        transport_subject,
+        req,
+      )
+    })
   on_event("fresh_state_conn", transport.ClientJoin(token: "", path: "/"))
   let assert Ok(first) = process.receive(transport_subject, await.deadline_ms)
     as "the join answers with a model sync"
   // 77 recovered + 5 from init: restore saw init's state.
   let assert True = has_count_sync([first], 82)
   shutdown()
+  assert_nothing_sent(transport_subject)
 }
 
 /// A crash in `restore` on the cookie path is caught like a crash in
@@ -2729,15 +2831,18 @@ pub fn session_join_refuses_expired_token_without_recovery_test() {
 /// Without state recovery a session-path connection needs no cookie.
 pub fn session_join_without_cookie_or_recovery_starts_test() {
   let transport_subject = process.new_subject()
-  let assert Ok(#(on_event, shutdown)) =
-    runtime.start_and_connect_with_request(
-      runtime.RuntimeConfig(..counter_config(), secret_key: cookie_secret),
-      "no_cookie_conn",
-      transport_subject,
-      ws_request(option.Some("path=%2F")),
-    )
+  let #(on_event, shutdown) =
+    start_connected(fn() {
+      runtime.start_and_connect_with_request(
+        runtime.RuntimeConfig(..counter_config(), secret_key: cookie_secret),
+        "no_cookie_conn",
+        transport_subject,
+        ws_request(option.Some("path=%2F")),
+      )
+    })
   on_event("no_cookie_conn", transport.ClientJoin(token: "", path: "/"))
   let assert Ok(transport.SendModelSync(..)) =
     process.receive(transport_subject, await.deadline_ms)
   shutdown()
+  assert_nothing_sent(transport_subject)
 }

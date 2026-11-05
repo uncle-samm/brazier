@@ -216,13 +216,17 @@ fn frame(session: Session, what: String) -> transport.InternalMessage {
 /// sends can reach a later test; the connection was sent nothing the test
 /// did not receive.
 fn shutdown(session: Session) -> Nil {
-  let assert Ok(pid) = process.subject_owner(session.runtime)
-    as "a started runtime has an owner process"
-  process.send(session.runtime, runtime.Shutdown)
-  await.expect_down(pid, "the runtime after Shutdown")
+  stop_runtime(session.runtime)
   let assert [] = await.drain(session.transport)
     as "the connection was sent no frame the test did not receive"
   Nil
+}
+
+/// Send `Shutdown` and return once the runtime has exited.
+fn stop_runtime(subject: Subject(runtime.RuntimeMessage(Msg))) -> Nil {
+  let pid = owner(process.subject_owner(subject))
+  process.send(subject, runtime.Shutdown)
+  await.expect_down(pid, "the runtime after Shutdown")
 }
 
 // --- mount ------------------------------------------------------------------
@@ -237,7 +241,7 @@ pub fn mount_is_a_span_without_a_connection_test() {
     as "telemetry.string succeeds"
   let stop = stop_of(events, "mount", "none")
   assert_tags(stop, "mount", "none")
-  process.send(subject, runtime.Shutdown)
+  stop_runtime(subject)
 }
 
 // --- handle_event and render ------------------------------------------------
@@ -355,6 +359,7 @@ pub fn no_render_span_without_joined_connections_test() {
   let assert Ok(subject) = runtime.start(config(option.None), context_for("/"))
     as "the test runtime must start"
   use events <- listen()
+  let pid = owner(process.subject_owner(subject))
   process.send(subject, runtime.EffectDispatched(Increment))
   process.send(subject, runtime.Shutdown)
   // Events from one process arrive in order: the stop comes first only
@@ -366,6 +371,7 @@ pub fn no_render_span_without_joined_connections_test() {
     })
   let assert ["brazier", "runtime", "stop"] = next.name
     as "next.name is ['brazier', 'runtime', 'stop']"
+  await.expect_down(pid, "the runtime after Shutdown")
 }
 
 // --- navigate ---------------------------------------------------------------
