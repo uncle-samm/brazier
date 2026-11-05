@@ -374,6 +374,12 @@ pub fn broadcasts_emit_telemetry_with_scope_test() {
   let assert Ok(Nil) = pubsub.local_broadcast(topic, 2)
   let assert Ok(local) = process.receive(events, 0)
   let assert Ok("local") = telemetry.string(local, "scope")
+
+  // The subscriber forwards both broadcasts asynchronously: receive them,
+  // so neither reaches the mailbox after the test ends.
+  let assert [Ok(1), Ok(2)] =
+    collect(out, 2, [])
+    |> list.map(fn(d) { decode.run(d.message, decode.int) })
 }
 
 // --- FFI ---------------------------------------------------------------------

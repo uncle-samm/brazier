@@ -734,12 +734,17 @@
 > coordinator's verify, then into `main`.
 
 **Phase A (parallel):**
-- [ ] m118-lifecycle: `runtime.gleam`, `application.gleam`, `brazier_application_ffi.erl`, `ws8c_runtime_stop_test`. Resolve the atom-DOWN flake; title over `title_max_bytes` reported once, not every update; `receive_wait_event` takes only its parent's `EXIT`; a crashed tree's `persistent_term` entry is cleared.
-- [ ] m118-transport: `transport*`, `ssr`, `error.gleam`, `brazier_client/src` except `patch.mjs`, `test_all_cdp.py`. Join build-id warning once per connection; manifest read once in production; 4409 split from the init-409 close; dev reload not missed while reconnecting; `read_body` error type; outbound-pending hook counts debounced sends; server side of `rejected_middleware` (4000 + status); scroll to `#fragment` after live navigation.
-- [ ] m118-diff-shift: `brazier_patch_ffi.erl`, `brazier_client/src/brazier_client/patch.mjs` and their tests (the shift item below).
-- [ ] m118-tests: existing tests and test FFI outside the files above. Redirected 2026-11-05: its four original items were done in M117 by w5-test-hygiene (L574–589; the follow-up lines at L553–556 were stale). It takes w5-test-hygiene's leftovers instead: the 2 polls in `store_replica_validation_test`, `await_restart` spinning on `yield`, and a mailbox-residue check (child_module, router and presence_test only, for now).
+- [x] m118-lifecycle (8644a44, 976de93; merged 2026-11-05): `runtime.gleam`, `application.gleam`, `brazier_application_ffi.erl`, `ws8c_runtime_stop_test`. Resolve the atom-DOWN flake; title over `title_max_bytes` reported once, not every update; `receive_wait_event` takes only its parent's `EXIT`; a crashed tree's `persistent_term` entry is cleared.
+- [x] m118-transport: `transport*`, `ssr`, `error.gleam`, `brazier_client/src` except `patch.mjs`, `test_all_cdp.py`. Join build-id warning once per connection; manifest read once in production; 4409 split from the init-409 close; dev reload not missed while reconnecting; `read_body` error type; outbound-pending hook counts debounced sends; server side of `rejected_middleware` (4000 + status); scroll to `#fragment` after live navigation.
+  - Done (3e0ba7e, merged 2026-11-05): all 8 items. CDP desktop 633 and mobile 642 passed on its branch. The wire break is 4409 → 4499, plus an optional `dev_build` on `join` and a `reload` reply.
+  - Follow-up: 4401 is both an init 401 and a revoked session (`docs/TODO.md`, open). The bundle hash named in older PROGRESS entries is stale, which is expected: the bundle is rebuilt whenever the client changes.
+- [x] m118-diff-shift (b18e0b9, merged 2026-11-05; KMP in both diffs, window_2000 148091 → 199 bytes, about 6.5 ms → 340 µs; non-shift edits within 8%, a reversed array 27% slower with the same op count): `brazier_patch_ffi.erl`, `brazier_client/src/brazier_client/patch.mjs` and their tests (the shift item below).
+- [x] m118-tests (0c83bb2, eb5ec00, 9925df7; merged 2026-11-05): existing tests and test FFI outside the files above. Redirected 2026-11-05: its four original items were done in M117 by w5-test-hygiene (L574–589; the follow-up lines at L553–556 were stale). It takes w5-test-hygiene's leftovers instead: the 2 polls in `store_replica_validation_test`, `await_restart` spinning on `yield`, and a mailbox-residue check (child_module, router and presence_test only, for now).
+  - Done: both polls replaced and `peer.eventually` removed; restarts wait on a supervisor hook; the runner fails a test that leaves messages. On the merged tree the check caught `broadcasts_emit_telemetry_with_scope_test` leaving its two forwarded broadcasts, and m118-transport's new `join_build_test` leaving its `on_close` notices (both branches were cut before the check existed); the coordinator fixed both by receiving the messages.
+  - Follow-up (phase B): the modules still in `residue_pending/0` (build_handshake_test, dev_reload_test, ws_protocol_test, session_security_test, runtime_test, runtime_versioning_test, http_server_test, runtime_telemetry_test).
 - [x] Streams design (`docs/design/STREAMS.md`, c61fea0, merged 2026-11-05), posted to Modorra (R1, questions Q1–Q6 open). The coordinator decided D1–D7 (below).
-- [ ] m118-streams-core (started 2026-11-05; new files only): design steps 1–2 without the effect and runtime wiring. These are `brazier/internal/stream_op`, the window and its delta, the shared vectors, and `brazier/stream` (declaration, op values, test helpers).
+- [x] m118-streams-core (d7ea204, a58294a; merged 2026-11-05; 72 tests; new files only): design steps 1–2 without the effect and runtime wiring. These are `brazier/internal/stream_op`, the window and its delta, the shared vectors, and `brazier/stream` (declaration, op values, test helpers).
+  - Departures from the design, accepted: an empty or too-long key is a typed error; a `limit` over `stream_max_limit` is refused when the window is created; a refused op skips only that op and the rest of the update applies (the runtime step must log it and send an `error` frame); `TooManyOps` and `FrameTooLarge` refuse the whole update; an insert trimmed in the same update isn't counted in telemetry; doc-comment examples aren't compiled.
 - Decision, 2026-11-05, streams D1: the item codec is explicit `encode`/`decoder` on `stream.new`, as `presence.new` has it. A generated codec would need items erased to `Dynamic` and a name-keyed encoder table, which is more machinery for no gain to the first user.
 - Decision, 2026-11-05, streams D2: item render functions must be named, and the build refuses closures and captures. Items then never depend on the model, and a model change re-renders no item (LiveView's rule too).
 - Decision, 2026-11-05, streams D3: a stream fault on the client closes with 4000 `stream fault` and reconnects; init refills the stream. The reconnect backoff bounds a loop from an app codec bug, and telemetry and a client error log make it visible. The alternative, a stream left wrong until the next reconnect, is the silent degradation the rules forbid.
@@ -749,7 +754,7 @@
 - Decision, 2026-11-05, streams D7: the server does not decode items again. The dead render and `stream.round_trip` in tests catch a codec mismatch, and a second decode would double the per-op codec cost.
 - [x] Follow-up audit (read-only), done 2026-11-05: 30 M117 follow-ups are still open; they are listed below. The rest were fixed in later workstreams or are recorded decisions.
 - [ ] m118-cluster (started 2026-11-05; owns `brazier_session_ffi.erl`, `session.gleam`, `brazier_cluster_manager.erl`, `brazier_cluster_ffi.erl`, `cluster.gleam`, the replicated store and CRDT, and `CLUSTERING.md`): L409–412, L515–516, L716–719 below.
-- [ ] m118-build (started 2026-11-05; owns `src/brazier/build/**`): L267 below.
+- [x] m118-build (110089a, merged 2026-11-05): L267 below. All 24 examples build.
 - Decision, 2026-11-05: m118-transport's 4409 split keeps init refusals on 4000 + status, and moves the stale build to 4499. 4499 is in the reload band, so every client released since the bands existed still reloads on it. The 4600 refusal band would leave old clients reconnecting forever. `error.refuse(499, _)` becomes a programming error.
 
 **Open M117 follow-ups (audit, 2026-11-05; Lnnn are PROGRESS line numbers at d068c9b).** Real defects first.
@@ -762,14 +767,18 @@
 - [ ] L453: a cascade of `CloseForBackpressure` closes was seen once; needs a reproduction. After m118-transport.
 - [ ] L515–516: with `NoDiscovery` a member lost to a netsplit never reconnects, and `global` can drop members on a netsplit. Neither is a recorded decision. m118-cluster (decide and document).
 - [ ] L716–719: replicated stores expose no "synced" signal; a refused merge has no retry backoff; the causal context gains a clock entry per replica restart and is never compacted; the CRDT was never checked against the `delta_crdt_ex` source. m118-cluster.
-- [ ] L267: the client build writes no manifest, so every fresh build resolves dependencies from Hex (the cause of the rate-limit failures). m118-build.
+- [x] L267 (m118-build): the client build writes no manifest, so every fresh build resolves dependencies from Hex (the cause of the rate-limit failures). m118-build.
 - [ ] L83: the client doesn't key the page root on navigation, so examples wrap each page in `element.keyed`. After m118-transport.
 - [ ] L606: a navigation without a hash doesn't scroll to the top (LiveView does). m118-transport if it fits item 8, otherwise after.
 - [ ] L607: the non-monotonic clock warning says "event clock" for navigations too. After m118-lifecycle.
 - [ ] L608–609: a bad proxy hop can be logged twice, and one refused limit makes two log lines. After m118-transport.
 - [ ] L190: the owner-moved DOWN race in `create_via_owner` has no test. L414: the churn test survives some mutants. After m118-tests.
-- [ ] L589: no check for messages a test leaves in the mailbox. m118-tests (partly).
+- [x] L589 (m118-tests; the pending modules are a phase B follow-up): no check for messages a test leaves in the mailbox. m118-tests (partly).
 - [ ] Perf, before the re-baseline: L637 SSR at 1000 rows takes about 8 ms; L638 client decode and patch at 1000 rows; L639 `presence.list` copies the whole room; L640 a DOM morph bench (CDP); L642 6 atoms leak per suite run; L643 `ws.100x200` runs only 5 rounds.
+
+- [x] Coordinator, 2026-11-05: merged phase A except m118-cluster, rebuilt the prebuilt runtime bundle (`priv/static`, it predated the shifted-array diff), and wrote the CHANGELOG entries.
+- [ ] Follow-up: `crdt_test.gleam:597` (`append_cost_does_not_grow_with_the_values_under_the_key_test`) flaked once on m118-transport's branch (3427 vs 992 reductions). m118-cluster owns the CRDT; if it isn't fixed there, phase B.
+- [ ] Follow-up: `patch_bench` metrics need a baseline (the re-baseline item).
 
 **Phase B (after phase A merges):** the streams build, the open follow-ups above, then the perf re-baseline last, so it measures the final code.
 
@@ -783,7 +792,7 @@
   - it is a wire addition, so it needs a CHANGELOG **Wire break:** entry;
   - write a design in `docs/design/` and post it to Modorra before building.
 - Decision, 2026-11-05: `effect.push_hook` (LiveView `push_event`) is parked. Modorra's only use case, streamed turn output, is covered by streams, and the terminal and diffs have their own channels.
-- [ ] Array diff detects a shift. Today a sliding window (drop from the front and append in one update) matches no prefix or suffix, so the diff pairs elements by index and replaces the whole array on every event. Detect a small shift k (old[k..] == new[..n-k]), so the diff becomes k `remove` ops plus an `append`. Check Myers / LiveView streams first. The Erlang and JS diffs must stay op-for-op identical (equivalence harness).
+- [x] (m118-diff-shift) Array diff detects a shift. Today a sliding window (drop from the front and append in one update) matches no prefix or suffix, so the diff pairs elements by index and replaces the whole array on every event. Detect a small shift k (old[k..] == new[..n-k]), so the diff becomes k `remove` ops plus an `append`. Check Myers / LiveView streams first. The Erlang and JS diffs must stay op-for-op identical (equivalence harness).
 
 
 ### Earlier milestones (1–116)

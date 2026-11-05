@@ -24,9 +24,33 @@ without contacting Hex.
 
 Milestone 117, the full review remediation. The workstreams are listed in
 `docs/PROGRESS.md`. WS5 and WS6 changed postgleam, which is a separate package
-with its own changelog, so they are not listed here.
+with its own changelog, so they are not listed here. Entries tagged `(M118
+...)` come from Milestone 118 (streams, the shifted-array diff and the
+open follow-ups), which is in progress.
 
 ### Breaking
+
+- (M118 transport) **Wire break:** a page from an older bundle is closed
+  with 4499 `stale build`, not 4409, so every stale-build close is in the
+  reload range (4400-4499) and 4409 is free. In dev mode `join` may carry
+  an optional `dev_build`, and a join from a stale dev build gets a
+  `reload` reply instead of a close. An old client that sees 4499 reloads
+  as it did for 4409, since both are in the reload range.
+- (M118 transport) `error.refuse(499, _)` crashes `init`: 4000 + 499 is the
+  stale-build close code, so a refusal can't use it.
+- (M118 transport) `transport.check_join_build` is `@internal` and takes a
+  `ConnectionState`; `transport.check_join_dev_build` checks the dev build.
+  `ConnectionState` has a new field, `warned_no_build`.
+- (M118 transport) The client manifest is read once, at startup. Outside
+  dev mode, a rebuilt bundle needs a restart. `ssr.render_page_from` is
+  replaced by `ssr.render_page_with_bundle`, which takes the bundle name
+  (`ssr.client_bundle()`, loaded by `ssr.load_client_bundle()` at start; a
+  failed load fails the start).
+- (M118 transport) `server.read_body` returns `BodyReadError`, and
+  `transport_http.read_body` returns `ReadBodyError`, instead of strings. A
+  body read cut short by the request deadline is `RequestDeadlineExceeded`,
+  and the error descriptions name `body_read_timeout_ms` and
+  `request_timeout_ms`.
 
 - The package is renamed from `beacon` to `brazier`. There are no aliases or
   compatibility re-exports: every old name below stops existing.
@@ -220,6 +244,22 @@ with its own changelog, so they are not listed here.
 
 ### Added
 
+- (M118 streams) `brazier/stream` declares streams (`stream.new` with a
+  `KeepFirst` or `KeepLast` limit and an explicit codec) and builds their
+  ops (`insert`, `insert_many`, `delete`, `delete_key`, `reset`), with the
+  test helpers `stream.emitted` and `stream.round_trip`. The internal
+  `stream_window` keeps each stream's keys and computes exact per-update
+  deltas, trims included, and refuses every stream bound with a typed
+  error. Shared delta and fault vectors are in
+  `test/fixtures/stream_vectors.json`. Streams are not yet wired into
+  effects, the view or the wire (`docs/design/STREAMS.md`).
+- (M118 tests) The test runner fails a test that leaves messages in its
+  mailbox and names them (`docs/TESTING.md`, "Mailbox residue"). Modules
+  that still leave messages are listed in `residue_pending/0` in
+  `test/brazier_test_runner_ffi.erl` until they are fixed.
+- (M118 diff-shift) `test/brazier/bench/patch_bench.gleam` measures the
+  model diff on sliding windows and on edits that are not shifts.
+
 - (M117 transport follow-ups) A live navigation to another page's fragment
   (`/docs#install`, by a link or `router.push`) scrolls to it once the new
   page is rendered: to the element with that id, else the `<a>` with that
@@ -317,6 +357,29 @@ with its own changelog, so they are not listed here.
   way, as `[brazier, ws, upgrade]` does.
 
 ### Changed
+
+- (M118 diff-shift) The model diff (server and client, op for op) finds a
+  shifted array middle in linear time with Knuth-Morris-Pratt. A sliding
+  window (drop k items at the front, add m at the end) is k `remove` ops
+  and one `append`, not a replace of the whole array: a 2000-item window
+  went from 148091 bytes to 199 bytes and from about 6.5 ms to 340 µs. The
+  mirror case (remove at the back, add at the front) is found by the same
+  scan. There are no new op types.
+- (M118 build) The generated client project gets a `manifest.toml`
+  derived from the app's lock, so its `gleam build` never resolves
+  versions from Hex. Parallel builds no longer hit the Hex rate limit, and
+  two builds of one app compile the same client packages. The build fails
+  with a message naming the fix, instead of resolving from Hex, on a
+  missing app `manifest.toml`, a Hex entry without `outer_checksum`, a
+  lock requirement with no entry of its own, or a
+  `build/packages/packages.toml` that disagrees with the lock.
+- (M118 transport) A join without a build id is a warning once per
+  connection, then debug. In dev mode the page carries its dev build, and
+  a join from before the last rebuild (a page between sockets during a
+  rebuild) gets `reload` and is not dispatched.
+- (M118 transport) `window.__brazierOutboundPendingForTest()` returns
+  `{queued, scheduled, debounced}`, so a debounced send whose timer has not
+  fired no longer looks drained.
 
 - (PERF-9) Every bench metric is gated:
   - A metric's tolerance is max(25%, spread), not max(25%, 2 × spread), so
@@ -538,6 +601,31 @@ with its own changelog, so they are not listed here.
   the touched tests carries an `as` message.
 
 ### Fixed
+
+- (M118 lifecycle) A page title over `runtime.title_max_bytes` is reported
+  once each time it goes over the limit, not after every update. Going
+  back within the limit is logged, and going over again is reported again.
+- (M118 lifecycle) `application.wait_forever` no longer returns when an
+  unrelated linked process exits normally. Only the normal exit of an
+  application it waits on ends the wait. Other normal exits are logged,
+  and abnormal exits still end it loudly.
+- (M118 lifecycle) An application whose tree crashes is forgotten at once,
+  with its bound port, and the crash is logged with its reason. SIGTERM no
+  longer finds a crashed tree still recorded, and `stop` returns only
+  after the record is cleared.
+- (M118 lifecycle) The `ws8c_runtime_stop_test` flake is explained: on
+  OTP 28 the scheduler can hold back a monitor signal, so the DOWN said
+  `noproc`. The barrier added in Milestone 117 fixes it; a replay test now
+  covers the `noproc` case.
+- (M118 tests) The store-replica tests wait for the peer's
+  `[brazier, store, sync, stop]` events instead of polling, and
+  `peer.eventually` is removed. The supervisor-restart tests wait on a
+  supervisor hook instead of spinning on `erlang:yield`.
+- (M118) `pubsub_test` left both forwarded broadcasts in the mailbox of
+  the next test, and `join_build_test` its `on_close` notices; they now
+  receive them.
+- (M118) The prebuilt runtime bundle in `priv/static` is rebuilt, so it
+  carries the shifted-array diff.
 
 - (M117 transport follow-ups) A WebSocket upgrade logged a malformed
   forwarding hop (and a `Forwarded` request's unconfigured `X-Forwarded-*`

@@ -88,6 +88,19 @@ fn join(
   Nil
 }
 
+/// Close the socket and wait until the server has run `on_close` for it,
+/// so the notice is received here and not left for the next test.
+fn close(socket: RawSocket, observer: Subject(Observed)) -> Nil {
+  raw_ws.close(socket)
+  closed(observer)
+}
+
+fn closed(observer: Subject(Observed)) -> Nil {
+  let assert Ok(ClosedConn(_)) = process.receive(observer, 5000)
+    as "on_close must run"
+  Nil
+}
+
 /// The build id of the bundle the listener loaded at startup.
 fn current_build() -> String {
   let assert Ok(bundle) = ssr.client_bundle()
@@ -142,7 +155,7 @@ pub fn a_join_from_the_current_build_reads_no_file_test() {
   trace_file_calls(handler)
   join(socket, observer, Some(current_build()))
   let assert [] = traced_file_calls(handler)
-  raw_ws.close(socket)
+  close(socket, observer)
   server.stop(listener)
 }
 
@@ -168,7 +181,7 @@ pub fn a_join_without_a_build_reads_no_file_test() {
   trace_file_calls(handler)
   join(socket, observer, None)
   let assert [] = traced_file_calls(handler)
-  raw_ws.close(socket)
+  close(socket, observer)
   server.stop(listener)
 }
 
@@ -185,8 +198,8 @@ pub fn a_join_without_a_build_warns_once_per_connection_test() {
       join(first, observer, None)
       let #(second, _) = open(port, observer)
       join(second, observer, None)
-      raw_ws.close(first)
-      raw_ws.close(second)
+      close(first, observer)
+      close(second, observer)
     })
   // One warning for each connection, not one for each join.
   let assert 2 = no_build_warnings(lines)
@@ -207,6 +220,7 @@ pub fn a_join_with_a_build_after_one_without_is_still_checked_test() {
   raw_ws.send_text(socket, join_text(Some("00000000deadbeef")))
   let assert raw_ws.Close(code: 4499, reason: "stale build") =
     raw_ws.recv(socket)
+  closed(observer)
   raw_ws.close(socket)
   server.stop(listener)
 }
