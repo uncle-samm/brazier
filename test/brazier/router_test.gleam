@@ -301,6 +301,8 @@ pub fn push_from_event_navigates_that_connection_test() {
   click(subject, "nav_push", "push:/users/7?tab=posts")
   let assert Ok(transport.SendNavigate(path: "/users/7?tab=posts")) =
     process.receive(transport_subject, 1000)
+  expect_ack(transport_subject)
+  assert_nothing_more(transport_subject)
 }
 
 pub fn replace_from_event_sends_replace_navigate_test() {
@@ -308,6 +310,8 @@ pub fn replace_from_event_sends_replace_navigate_test() {
   click(subject, "nav_replace", "replace:/settings")
   let assert Ok(transport.SendReplaceNavigate(path: "/settings")) =
     process.receive(transport_subject, 1000)
+  expect_ack(transport_subject)
+  assert_nothing_more(transport_subject)
 }
 
 pub fn redirect_from_event_sends_hard_navigate_test() {
@@ -315,12 +319,15 @@ pub fn redirect_from_event_sends_hard_navigate_test() {
   click(subject, "nav_redirect", "redirect:/login")
   let assert Ok(transport.SendHardNavigate(path: "/login")) =
     process.receive(transport_subject, 1000)
+  expect_ack(transport_subject)
+  assert_nothing_more(transport_subject)
 }
 
 pub fn non_local_push_from_event_sends_nothing_test() {
   let #(subject, transport_subject) = joined("nav_evil")
   click(subject, "nav_evil", "push://evil.example/x")
-  assert_no_navigation(transport_subject)
+  expect_ack(transport_subject)
+  assert_nothing_more(transport_subject)
 }
 
 pub fn push_from_event_navigates_only_that_connection_test() {
@@ -329,7 +336,9 @@ pub fn push_from_event_navigates_only_that_connection_test() {
   click(subject, "nav_a", "push:/first")
   let assert Ok(transport.SendNavigate(path: "/first")) =
     process.receive(first, 1000)
-  assert_no_navigation(second)
+  expect_ack(first)
+  assert_nothing_more(first)
+  assert_nothing_more(second)
 }
 
 pub fn push_outside_event_navigates_every_connection_test() {
@@ -381,28 +390,23 @@ fn receive_navigation(
   }
 }
 
-/// Drain what the connection receives for 200ms (event acks are patches)
-/// and assert none of it navigates.
-fn assert_no_navigation(
+/// The click's acknowledgement: navigating leaves the model unchanged, so
+/// it is an empty patch at the joined revision.
+fn expect_ack(
   transport_subject: process.Subject(transport.InternalMessage),
 ) -> Nil {
-  let assert [] =
-    drain(transport_subject, [])
-    |> list.filter(fn(message) {
-      case message {
-        transport.SendPatch(..) | transport.SendModelSync(..) -> False
-        _ -> True
-      }
-    })
+  let assert Ok(transport.SendPatch(ops_json: "[]", version: 0, ack_clock: 1)) =
+    process.receive(transport_subject, 1000)
   Nil
 }
 
-fn drain(
+/// Assert the connection has been sent nothing more. Call it once the
+/// click's ack has arrived: the runtime runs a click's update and its
+/// navigation effects before it sends the ack, so anything else the click
+/// sent is already in the mailbox.
+fn assert_nothing_more(
   transport_subject: process.Subject(transport.InternalMessage),
-  acc: List(transport.InternalMessage),
-) -> List(transport.InternalMessage) {
-  case process.receive(transport_subject, 200) {
-    Ok(message) -> drain(transport_subject, [message, ..acc])
-    Error(Nil) -> list.reverse(acc)
-  }
+) -> Nil {
+  let assert Error(Nil) = process.receive(transport_subject, 0)
+  Nil
 }

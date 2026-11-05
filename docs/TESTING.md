@@ -134,6 +134,34 @@ also assert that a live join and normal post-mount updates send no
 Client-sent `ops` are untrusted. Runtime tests send malicious ops and
 assert that the server-computed update wins.
 
+## Mailbox residue
+
+eunit runs every test of every module in one process, so a message one
+test leaves in its mailbox reaches the next test's receive. The suite's
+runner (`test/brazier_test_runner_ffi.erl`) therefore empties the mailbox
+after each test and fails the test, naming the messages, when it left any.
+A test that fails on its own reports its own failure; its residue is
+emptied too. Once a module's tests have run, the runner also fails the
+module when they left a telemetry handler attached.
+
+A test is done when it has received everything it caused. Usually that
+means asserting on the messages it ignored:
+
+- A runtime answers a client event that leaves the model unchanged with
+  an ack, an empty `SendPatch(ops_json: "[]", ..)`. Expect the ack, and
+  any `SendError`, after the frame under test.
+- A telemetry handler forwards every matching event. Receive one per
+  action that emits it, not only the first.
+
+A message that arrives only after its test has ended is blamed on the
+test that is running then. When a failure names messages that test could
+not have caused, look at the test before it.
+
+Some modules still leave residue and wait for a fix by the workstream that
+owns them. They are listed in `residue_pending/0` in the runner, which
+empties their residue without failing the test. Remove a module from the
+list once its tests leave nothing; never add one.
+
 ## Capturing logs: `brazier/log_capture`
 
 `log_capture.capture(fun)` runs `fun` and returns its result together with

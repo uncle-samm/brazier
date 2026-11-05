@@ -225,18 +225,34 @@ pub fn runtime_routes_child_effect_back_through_parent_update_test() {
 pub fn runtime_child_message_without_effect_sends_nothing_more_test() {
   let seen = process.new_subject()
   let subject = start_parent(seen)
-  let _transport = join(subject, "child_conn_2")
+  let transport_subject = join(subject, "child_conn_2")
   click(subject, "child_conn_2", reset_id)
   let assert Ok(ChildMsg(child_counter.Reset)) = process.receive(seen, 500)
-  let assert Error(Nil) = process.receive(seen, 100)
+  // Reset leaves the model as it was: the click is only acknowledged, with
+  // an empty patch at the joined revision. The runtime sends the ack after
+  // the update and its effects have run, so by then anything more would
+  // already be in the mailbox.
+  let assert Ok(transport.SendPatch(ops_json: "[]", version: 0, ack_clock: 1)) =
+    process.receive(transport_subject, 500)
+  let assert Error(Nil) = process.receive(transport_subject, 0)
+  let assert Error(Nil) = process.receive(seen, 0)
   process.send(subject, runtime.Shutdown)
 }
 
 pub fn runtime_refuses_click_on_child_root_test() {
   let seen = process.new_subject()
   let subject = start_parent(seen)
-  let _transport = join(subject, "child_conn_3")
+  let transport_subject = join(subject, "child_conn_3")
   click(subject, "child_conn_3", "0.1")
-  let assert Error(Nil) = process.receive(seen, 200)
+  // The refused click is reported to the client, then acknowledged so it
+  // drops its optimistic state. The update never ran: the ack is the last
+  // thing the runtime does with the click.
+  let assert Ok(transport.SendError(
+    reason: "RuntimeError: No click handler at 0.1",
+  )) = process.receive(transport_subject, 500)
+  let assert Ok(transport.SendPatch(ops_json: "[]", version: 0, ack_clock: 1)) =
+    process.receive(transport_subject, 500)
+  let assert Error(Nil) = process.receive(transport_subject, 0)
+  let assert Error(Nil) = process.receive(seen, 0)
   process.send(subject, runtime.Shutdown)
 }

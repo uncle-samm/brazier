@@ -455,9 +455,16 @@ pub fn oversized_meta_is_refused_with_telemetry_test() {
   let assert Error(MetaTooLarge(11)) =
     holder.run(h, fn() { presence.update(p, "room", "fits", "123456789") })
     as "holder.run returns Error(MetaTooLarge(11))"
-  let assert Ok(event) = process.receive(events, wait_ms)
-    as "process.receive succeeds"
-  let assert Ok(1) = telemetry.int(event, "count") as "telemetry.int succeeds"
+  // One event per refusal, the track's then the update's: each is emitted
+  // in the holder before its call returns.
+  let assert Ok(tracked) = process.receive(events, wait_ms)
+    as "the refused track reports limit_exceeded"
+  let assert Ok(1) = telemetry.int(tracked, "count")
+    as "the refused track counts 1"
+  let assert Ok(updated) = process.receive(events, wait_ms)
+    as "the refused update reports limit_exceeded"
+  let assert Ok(1) = telemetry.int(updated, "count")
+    as "the refused update counts 1"
   assert keys(p, "room") == ["fits"]
   holder.kill(h)
   let assert Ok(Nil) = presence.stop(p) as "presence.stop succeeds"
