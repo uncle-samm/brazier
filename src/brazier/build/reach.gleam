@@ -16,9 +16,14 @@
 /// Emission slices the source of each reached definition out of its file
 /// and regenerates the imports from what those definitions use, so a
 /// server-only import, function, constant or type never reaches the client
-/// project.
+/// project. Each emitted module records a `source_map.Segment` per copied
+/// definition, so a compiler warning at a line of the copy is reported at
+/// the line of the file it was sliced from (the app's, or Brazier's for
+/// `brazier/stream`). A warning in a line emission writes (an import, an
+/// `@external` attribute) can only be a Brazier bug, and fails the build.
 import brazier/build/field_type
 import brazier/build/source_location
+import brazier/build/source_map.{type Segment}
 import brazier/internal/render
 import glance
 import gleam/bit_array
@@ -1682,6 +1687,10 @@ pub type Emitted {
     /// JavaScript FFI files the module's externals load, as paths relative
     /// to the source directory, e.g. `app/widget_ffi.mjs`.
     ffi_files: List(String),
+    /// Where each definition copied into `source` came from in the module's
+    /// file, in copy order: positions in `source` map back through them
+    /// (see `source_map`).
+    segments: List(Segment),
   )
 }
 
@@ -1717,6 +1726,25 @@ fn usage_of(reach: Reach, path: String) -> Usage {
   }
 }
 
+/// One reached definition as the copy holds it.
+type Piece {
+  Piece(
+    /// The definition's byte offset in the module's source.
+    start: Int,
+    /// The line the build writes before the definition (its JavaScript
+    /// external), or "".
+    glue: String,
+    /// The definition, verbatim from the source.
+    text: String,
+    /// The JavaScript FFI path its external loads.
+    ffi: Option(String),
+  )
+}
+
+/// The copy is the regenerated imports and a blank line, then each piece
+/// in source order (its glue line, then its text) with a blank line between
+/// two pieces. Each piece's text gets a segment at the copy line it lands
+/// on.
 fn emit_module(
   info: ModuleInfo,
   items: List(Item),
@@ -1726,29 +1754,51 @@ fn emit_module(
   use pieces <- result.try(
     list.try_map(items, fn(item) { definition_text(info, bytes, item) }),
   )
-  let pieces = list.sort(pieces, fn(a, b) { int.compare(a.0, b.0) })
+  let pieces = list.sort(pieces, fn(a, b) { int.compare(a.start, b.start) })
   let ffi_files =
-    list.filter_map(pieces, fn(piece) { option.to_result(piece.2, Nil) })
+    list.filter_map(pieces, fn(piece) { option.to_result(piece.ffi, Nil) })
   use ffi_files <- result.try(
     list.try_map(list.unique(ffi_files), resolve_ffi_path(info.path, _)),
   )
-  let imports = list.filter_map(info.ast.imports, emit_import(_, usage))
-  let body = list.map(pieces, fn(piece) { piece.1 })
-  let source =
-    case imports {
-      [] -> body
-      _ -> [string.join(imports, "\n"), ..body]
-    }
-    |> string.join("\n\n")
-  Ok(Emitted(path: info.path, source: source <> "\n", ffi_files:))
+  let header = case list.filter_map(info.ast.imports, emit_import(_, usage)) {
+    [] -> ""
+    imports -> string.join(imports, "\n") <> "\n\n"
+  }
+  use #(_next_line, segments) <- result.try(
+    list.try_fold(
+      pieces,
+      #(source_map.newlines(header) + 1, []),
+      fn(acc, piece) {
+        let #(line, segments) = acc
+        use segment <- result.map(source_map.segment(
+          copy_line: line + source_map.newlines(piece.glue),
+          text: piece.text,
+          source: info.source,
+          start: piece.start,
+        ))
+        // The piece's lines, then the blank line after it.
+        #(line + source_map.newlines(piece.glue <> piece.text) + 2, [
+          segment,
+          ..segments
+        ])
+      },
+    ),
+  )
+  let body = list.map(pieces, fn(piece) { piece.glue <> piece.text })
+  Ok(Emitted(
+    path: info.path,
+    source: header <> string.join(body, "\n\n") <> "\n",
+    ffi_files:,
+    segments: list.reverse(segments),
+  ))
 }
 
-/// #(start offset, text, JavaScript FFI path) of one definition.
+/// One definition's piece.
 fn definition_text(
   info: ModuleInfo,
   bytes: BitArray,
   item: Item,
-) -> Result(#(Int, String, Option(String)), String) {
+) -> Result(Piece, String) {
   let not_found = fn() {
     Error(
       "Invariant violated: "
@@ -1790,20 +1840,21 @@ fn with_externals(
   bytes: BitArray,
   attributes: List(glance.Attribute),
   span: glance.Span,
-) -> Result(#(Int, String, Option(String)), String) {
+) -> Result(Piece, String) {
   use text <- result.map(slice(bytes, span))
   case javascript_external(attributes) {
-    Some(#(path, name)) -> #(
-      span.start,
-      "@external(javascript, "
-        <> string.inspect(path)
-        <> ", "
-        <> string.inspect(name)
-        <> ")\n"
-        <> text,
-      Some(path),
-    )
-    None -> #(span.start, text, None)
+    Some(#(path, name)) ->
+      Piece(
+        start: span.start,
+        glue: "@external(javascript, "
+          <> string.inspect(path)
+          <> ", "
+          <> string.inspect(name)
+          <> ")\n",
+        text:,
+        ffi: Some(path),
+      )
+    None -> Piece(start: span.start, glue: "", text:, ffi: None)
   }
 }
 

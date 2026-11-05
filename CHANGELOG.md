@@ -462,6 +462,15 @@ open follow-ups), which is in progress.
   entry, `gleam.toml`, or a warning naming no file), listing each file,
   line, column and warning. A warning in the app's own code stays a logged
   warning. `program.gleam_build` returns warnings as a `Warning` type.
+- (M118 warnlines) A client compile warning in the app's own code is
+  logged at the app's own file, line and column, with the client project's
+  copy alongside; it used to name the sliced copy in
+  `build/brazier_client_app`. The build also fails on a warning in a line
+  it generated in an app module (a regenerated import or an `@external`
+  attribute; only a Brazier bug causes one), naming the copy's place and
+  never a guessed source line, and on an app warning with no line and
+  column. A refused warning in `brazier/stream` names Brazier's own source
+  line.
 - (M118 followups) `scripts/run_cdp_shards_docker.sh` defaults the shard
   total to the number of examples the harness in the image selects, and
   refuses a larger total (those shards would run nothing and pass).
