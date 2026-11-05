@@ -46,8 +46,9 @@
       `prim_file:list_dir_convert` the name becomes `Name = [Name]`.
     - `file_server` then copies a cyclic term forever.
     - `master` has the same code. It dates from R14B01.
-  - **Platforms:** macOS (OTP 28.4, erts 16.3, Darwin 25.6.0) hangs;
-    `+fnl` avoids it. Linux (OTP 28.5.0.8, Debian 13, `erlang:28` image) is
+  - **Platforms:** macOS (Darwin 25.6.0) hangs on OTP 28.4 (erts 16.3),
+    28.5.0.8 (erts 16.4.0.7) and 29.1.2 (erts 17.1.1), the latest of both
+    lines on 2026-11-05; `+fnl` avoids it. Linux (OTP 28.5.0.8, Debian 13, `erlang:28` image) is
     not affected: `list_dir` returns `{ok, [[769, 98]]}` and `del_dir_r`
     returns `ok`.
   - **Brazier now:** every directory listing in `src/` goes through
@@ -77,8 +78,10 @@
     `docs/design/OTP_LIST_DIR_HANG.md`
   - **Attempted:** the upstream report (repro, observed vs expected, source
     lines, and a one-line fix) is drafted in
-    `docs/design/OTP_LIST_DIR_HANG.md`. It is not posted: posting needs the
-    maintainer's permission. When an OTP release has the fix, the
+    `docs/design/OTP_LIST_DIR_HANG.md` as a private security report (a heap
+    use-after-free reachable from a file name). It is not sent: OTP takes
+    reports only from humans, so the maintainer reviews it and sends it to
+    erlang-security@erlang.org. When an OTP release has the fix, the
     tripwires fail, and the find-based listing can be revisited for that
     release.
 
