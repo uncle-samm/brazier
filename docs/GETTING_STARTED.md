@@ -219,6 +219,16 @@ pub fn main() {
 `init_local` runs once in the browser with the first synced model.
 `examples/counter_local` is the complete version of this app.
 
+### Streams
+
+A list that grows without bound, such as a chat log or an agent's output,
+does not belong in any of these layers: the server would keep every item
+for every session. A stream (`brazier/stream`) holds it instead. `update`
+returns ops that insert, update, move or delete items, the runtime sends
+each change once, and the browser keeps the items, at most the stream's
+limit of them; the server keeps their keys only. A `simple` app cannot fill
+one. See [STREAMS.md](STREAMS.md); `examples/timeline` is the complete app.
+
 ### The `Context`
 
 `init` receives a `brazier.Context` describing the request:

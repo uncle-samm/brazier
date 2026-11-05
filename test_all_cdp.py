@@ -108,6 +108,7 @@ ALL_EXAMPLES = [
     "local_first_form",
     "route_server_workspace",
     "auth_workspace",
+    "timeline",
 ]
 
 CDP_PORT = int(os.environ.get("CDP_PORT", "9223"))
@@ -145,6 +146,7 @@ CANONICAL_EXAMPLES = {
     "routed_workspace",
     "route_server_workspace",
     "auth_workspace",
+    "timeline",
 }
 CONTRACT_REPORTS = {}
 # Examples whose view has no event handlers: the browser sends no messages.
@@ -1815,6 +1817,69 @@ def expect_path_and_text(path, fragment, msg):
         msg,
     )
 
+# Page identity across renders (L83). Every element under #brazier-app gets
+# a JS property no markup can set, the root and the window get a marker, and
+# the elements are kept in a list, so a later check can tell a reused node
+# from a new one and a live navigation from a page load.
+def mark_page_nodes(label):
+    marker = json.dumps(f"page-{time.time_ns()}")
+    marked = evl(
+        "(function(){"
+        'var root = document.getElementById("brazier-app");'
+        'var nodes = Array.from(root.querySelectorAll("*"));'
+        "nodes.forEach(function(n){ n.__cdpOldPage = true; });"
+        f"window.__cdpMarkedNodes = nodes; root.__cdpRootMarker = {marker}; window.__cdpPageMarker = {marker};"
+        "return nodes.length;})()"
+    )
+    check(isinstance(marked, int) and marked > 0, f"{label}: page nodes marked ({marked})")
+    return json.loads(marker)
+
+OLD_PAGE_NODES_JS = (
+    'Array.from(document.getElementById("brazier-app").querySelectorAll("*"))'
+    ".filter(function(n){ return n.__cdpOldPage === true; }).length"
+)
+DETACHED_MARKED_NODES_JS = "window.__cdpMarkedNodes.filter(function(n){ return !n.isConnected; }).length"
+
+def check_same_root_and_document(label, marker):
+    check(
+        str(evl('document.getElementById("brazier-app").__cdpRootMarker || ""')) == marker,
+        f"{label}: the app root element is the same",
+    )
+    check(str(evl("window.__cdpPageMarker || ''")) == marker, f"{label}: no page load")
+
+def check_page_morphs_in_place(label, act, rendered_js):
+    """A model change on the same page morphs it: every element of the page
+    is still in the document afterwards."""
+    marker = mark_page_nodes(label)
+    clear_cdp_events()
+    act()
+    expect_js(rendered_js, f"{label}: the change renders")
+    check(count_js(DETACHED_MARKED_NODES_JS) == 0, f"{label}: no element of the page is replaced ({evl(DETACHED_MARKED_NODES_JS)} detached)")
+    check_same_root_and_document(label, marker)
+
+def check_page_replaced_on_live_navigation(label, link_sel, path, page_js):
+    """The first render of a live navigation's page replaces the root's
+    children: no element of the old page is reused, the focused element of
+    the old page does not keep focus, and the root element stays. The link
+    is focused before the click, as a keyboard user's would be. `page_js`
+    is true only once the new page is rendered."""
+    marker = mark_page_nodes(label)
+    focused = evl(f"(function(){{var a = document.querySelector({json.dumps(link_sel)}); if (!a) return 'none'; a.focus(); return document.activeElement === a ? 'focused' : 'not focused';}})()")
+    check(focused == "focused", f"{label}: the link on the old page has focus ({focused})")
+    clear_cdp_events()
+    click(link_sel)
+    rendered = wait_for_js(f"location.pathname === {json.dumps(path)} && ({page_js})")
+    check(rendered, f"{label}: the new page renders at {path} ({evl('location.pathname')})")
+    old = count_js(OLD_PAGE_NODES_JS)
+    check(old == 0, f"{label}: no element of the old page is reused ({old} kept)")
+    check(
+        evl("!(document.activeElement && document.activeElement.__cdpOldPage)") is True,
+        f"{label}: focus does not stay on an element of the old page",
+    )
+    check_same_root_and_document(label, marker)
+    sent = [p.get("path") for p in websocket_json_payloads("Sent") if p.get("type") == "navigate"]
+    check(sent == [path], f"{label}: one navigate for {path} ({sent})")
+
 print("-- 19: Routed Workspace --")
 if start_example("routed_workspace", module="main"):
     navigate("/")
@@ -1866,8 +1931,14 @@ if start_example("routed_workspace", module="main"):
     expect_text("compact: true", "Local compact toggle changes")
     check_local_ws_quiet("Routed workspace compact")
 
-    clear_cdp_events()
-    click('a[href="/settings"]')
+    # The pipeline page's form, typed into above, is not morphed into the
+    # settings page's: the page is replaced.
+    check_page_replaced_on_live_navigation(
+        "Routed workspace navigation to settings",
+        'a[href="/settings"]',
+        "/settings",
+        '!!document.querySelector("[data-testid=draft-name]")',
+    )
     expect_path_and_text("/settings", "Settings", "Client navigation: settings URL and view")
     expect_text("Ada / owner / v1", "Settings renders saved profile")
 
@@ -1968,6 +2039,59 @@ def check_fragment_scroll_after_live_navigation(path, fragment_text, other_path,
     )
     check(removed == "removed", f"Fragment scroll: test link and padding removed ({removed})")
 
+ROUTED_ABOUT_JS = '(document.getElementById("brazier-app")?.textContent || "").includes("does not scan the filesystem")'
+
+SCROLL_STATE_JS = (
+    "JSON.stringify({path: location.pathname, hash: location.hash, "
+    "scrollY: Math.round(window.scrollY), height: document.documentElement.scrollHeight, "
+    "marker: window.__brazierCdpScrollNav || null})"
+)
+
+def check_scroll_top_after_live_navigation(link_sel, path, page_js, back_path, back_page_js):
+    """A live navigation to a URL without a fragment scrolls to the top once
+    the new page is rendered (L606), as a page load does and as LiveView's
+    pushState does; history.pushState alone keeps the scroll, and the body
+    is padded so every page is tall enough to keep it. Back to the previous
+    entry keeps the browser's scroll restoration: the client does not scroll
+    after rendering that page. The current URL is back_path, the page the
+    link is on."""
+    marker = json.dumps(f"scroll-{time.time_ns()}")
+    setup = evl(
+        "(function(){"
+        'var style = document.createElement("style"); style.id = "cdp-scroll-pad";'
+        'style.textContent = "body{padding-bottom:4000px}";'
+        "document.head.appendChild(style);"
+        f"window.__brazierCdpScrollNav = {marker}; window.scrollTo(0, 1500);"
+        'return "ready";})()'
+    )
+    check(setup == "ready", f"Scroll to top: padding installed ({setup})")
+    check(str(evl("location.pathname")) == back_path, f"Scroll to top: starts at {back_path} ({evl('location.pathname')})")
+    check(wait_for_js("Math.round(window.scrollY) === 1500"), f"Scroll to top: scrolled down first ({evl(SCROLL_STATE_JS)})")
+
+    clear_cdp_events()
+    click(link_sel)
+    topped = wait_for_js(
+        f"location.pathname === {json.dumps(path)} && location.hash === \"\" && ({page_js}) && window.scrollY === 0"
+    )
+    check(topped, f"Scroll to top: live navigation to {path} scrolls to the top once the page renders ({evl(SCROLL_STATE_JS)})")
+    check(str(evl("window.__brazierCdpScrollNav")) == json.loads(marker), "Scroll to top: no page load")
+
+    clear_cdp_events()
+    went = evl('history.back(); "ok"')
+    check(went == "ok", f"Scroll to top: history.back() evaluated ({went})")
+    # The browser restores the entry's scroll before popstate; the page
+    # renders when the navigate is answered, and the client must not scroll
+    # then, so the check waits for that page and reads the scroll after it.
+    restored = wait_for_js(
+        f"location.pathname === {json.dumps(back_path)} && ({back_page_js}) && Math.round(window.scrollY) === 1500"
+    )
+    check(restored, f"Scroll to top: back to {back_path} keeps the browser's scroll restoration ({evl(SCROLL_STATE_JS)})")
+    expect(lambda: websocket_type_count("Sent", "navigate") == 1, "Scroll to top: back sends one navigate")
+    check(str(evl("window.__brazierCdpScrollNav")) == json.loads(marker), "Scroll to top: still no page load")
+
+    removed = evl('(function(){document.getElementById("cdp-scroll-pad").remove(); window.scrollTo(0, 0); return "removed";})()')
+    check(removed == "removed", f"Scroll to top: padding removed ({removed})")
+
 print("-- 20: Explicit Routing --")
 if start_example("routed", module="main"):
     install_dom_monitor()
@@ -1983,8 +2107,17 @@ if start_example("routed", module="main"):
     check_model_ws_update("Routed model event", events=1)
     check(websocket_payload_count("Sent", '"type":"event_batch"') == 0, "Model event does not send event_batch")
 
-    clear_cdp_events()
-    click('a[href="/about"]')
+    check_page_morphs_in_place(
+        "Routed model event on the same page",
+        lambda: click_by_text("+"),
+        f"({ROUTED_COUNT_JS}) === \"2\"",
+    )
+    check_page_replaced_on_live_navigation(
+        "Routed navigation to about",
+        'a[href="/about"]',
+        "/about",
+        ROUTED_ABOUT_JS,
+    )
     expect_path_and_text("/about", "About", "Client navigation: about URL and view")
     check("does not scan the filesystem" in str(text()), "Client navigation: no filesystem route scan copy")
 
@@ -2014,6 +2147,10 @@ if start_example("routed", module="main"):
     # After the conformance check: the padding it installs is not the app's
     # layout.
     check_fragment_scroll_after_live_navigation("/about", "About", "/settings", "Settings")
+    check_scroll_top_after_live_navigation(
+        'a[href="/about"]', "/about", ROUTED_ABOUT_JS,
+        "/settings", '!!document.querySelector("[data-testid=name-input]")',
+    )
     check(errors() == "0", f"Zero errors ({error_list()})")
 
     # The browser logs the 404 document load itself as a console error, so
@@ -2173,6 +2310,269 @@ if start_example("auth_workspace", module="auth_workspace"):
     check("Sign in" in str(logged_out_html), "Logout clears session before next SSR")
     check('data-testid="login-csrf"' in str(logged_out_html) and str(login_csrf) not in str(logged_out_html),
           "Login renewed the login CSRF token: the next guest page has a new one")
+    check(errors() == "0", f"Zero errors ({error_list()})")
+stop_server(); print()
+
+# == 22. Timeline ==
+# A brazier/stream (docs/STREAMS.md): the agent's steps live in the
+# browser, not in the model. Every check below watches the DOM nodes of the
+# stream's items, not only their text.
+TIMELINE_KEYS_JS = (
+    'JSON.stringify(Array.from(document.querySelectorAll("#timeline > li"))'
+    '.map(function(li){ return li.getAttribute("data-brazier-key"); }))'
+)
+TIMELINE_STATUS_JS = 'document.querySelector("[data-testid=status]")?.textContent || ""'
+TIMELINE_SEED = ["planner:1", "coder:2", "planner:3"]
+
+def timeline_key(seq):
+    return ("coder:" if seq % 2 == 0 else "planner:") + str(seq)
+
+def timeline_keys():
+    return json.loads(str(evl(TIMELINE_KEYS_JS)))
+
+def timeline_item_js(key):
+    return (
+        'Array.from(document.querySelectorAll("#timeline > li"))'
+        f".find(function(li){{ return li.getAttribute(\"data-brazier-key\") === {json.dumps(key)}; }})"
+    )
+
+def timeline_button_js(key, cls):
+    return f"({timeline_item_js(key)})?.querySelector({json.dumps('button.' + cls)})"
+
+def timeline_status():
+    return str(evl(TIMELINE_STATUS_JS))
+
+def timeline_hook_counts():
+    return json.loads(str(evl('JSON.stringify(window.timelineHooks ? window.timelineHooks.counts : null)')))
+
+def timeline_mounted_meters():
+    """Mounts minus unmounts: the hooks alive on the page."""
+    counts = timeline_hook_counts()
+    return counts["mount"] - counts["unmount"]
+
+def timeline_mark_items(label):
+    """Keep every item's node, by key, to compare against later."""
+    marked = evl(
+        "(function(){ window.__tlNodes = {};"
+        'Array.from(document.querySelectorAll("#timeline > li")).forEach(function(li){'
+        ' window.__tlNodes[li.getAttribute("data-brazier-key")] = li; });'
+        "return Object.keys(window.__tlNodes).length; })()"
+    )
+    check(isinstance(marked, int) and marked > 0, f"{label}: items marked ({marked})")
+
+def timeline_same_node(key):
+    return js_true(evl(
+        f"(function(){{ var old = window.__tlNodes[{json.dumps(key)}]; var now = {timeline_item_js(key)};"
+        " return !!old && old === now && old.isConnected; })()"
+    ))
+
+def timeline_click(key, cls, label):
+    return js_click(timeline_button_js(key, cls), f"{label}: the {cls} button of {key}")
+
+def timeline_wait_status(fragment, label):
+    expect_js(f"({TIMELINE_STATUS_JS}).includes({json.dumps(fragment)})", f"{label}: status shows {fragment!r} ({timeline_status()})")
+
+def timeline_console(level, fragment):
+    """Console messages of `level` holding `fragment`, from the CDP events."""
+    found = []
+    for event in cdp_events:
+        if event.get("method") != "Runtime.consoleAPICalled":
+            continue
+        params = event.get("params", {})
+        if params.get("type") != level:
+            continue
+        message = " ".join(str(arg.get("value", arg.get("description", ""))) for arg in params.get("args", []))
+        if fragment in message:
+            found.append(message)
+    return found
+
+print("-- 22: Timeline --")
+if start_example("timeline", module="main"):
+    install_dom_monitor()
+    navigate("/")
+    reset_dom_monitor()
+    check("Agent timeline" in str(text()), "SSR: the timeline page renders")
+    check(timeline_keys() == TIMELINE_SEED, f"Join: the seed steps, in order ({timeline_keys()})")
+    timeline_wait_status("Next: step 4.", "Join")
+    expect_js(
+        "window.timelineHooks && window.timelineHooks.counts.mount === 3",
+        f"Hook: ChunkMeter mounts once per seed step ({timeline_hook_counts()})",
+    )
+    check(
+        timeline_hook_counts() == {"mount": 3, "update": 0, "unmount": 0},
+        f"Hook: nothing updates or unmounts on the join ({timeline_hook_counts()})",
+    )
+    check_dom_conformance("Timeline hydration")
+
+    # Prepend and append keep every node, and the focus inside an item.
+    label = "Prepend and append"
+    timeline_mark_items(label)
+    focused = evl(f"(function(){{ var b = {timeline_button_js('coder:2', 'pick')}; b.focus(); window.__tlFocus = b; return document.activeElement === b; }})()")
+    check(js_true(focused), f"{label}: the Pick button of coder:2 has focus")
+    clear_cdp_events()
+    click("#prepend")
+    expect(lambda: timeline_keys()[:1] == ["coder:4"], f"{label}: the prepended step is first ({timeline_keys()})")
+    click("#append")
+    expect(lambda: timeline_keys()[-1:] == ["planner:5"], f"{label}: the appended step is last ({timeline_keys()})")
+    check(timeline_keys() == ["coder:4", *TIMELINE_SEED, "planner:5"], f"{label}: order ({timeline_keys()})")
+    check(all(timeline_same_node(key) for key in TIMELINE_SEED), f"{label}: the seed steps keep their nodes")
+    check(js_true(evl("document.activeElement === window.__tlFocus && window.__tlFocus.isConnected")), f"{label}: focus stays on the Pick button of coder:2")
+    expect_js("window.timelineHooks.counts.mount === 5", f"{label}: the new steps' meters mount ({timeline_hook_counts()})")
+    check(websocket_type_count("Received", "patch") >= 2, f"{label}: the steps arrive as patches")
+    timeline_wait_status("Streaming: step 5.", label)
+
+    # A move (a delete and an insert of one key in one update) keeps the
+    # node, its hook and the focus inside it.
+    label = "Move to top"
+    timeline_mark_items(label)
+    focused = evl(f"(function(){{ var b = {timeline_button_js('planner:5', 'pick')}; b.focus(); window.__tlFocus = b; return document.activeElement === b; }})()")
+    check(js_true(focused), f"{label}: the Pick button of planner:5 has focus")
+    timeline_click("planner:5", "top", label)
+    expect(lambda: timeline_keys()[:1] == ["planner:5"], f"{label}: planner:5 is first ({timeline_keys()})")
+    check(timeline_keys() == ["planner:5", "coder:4", *TIMELINE_SEED], f"{label}: order ({timeline_keys()})")
+    check(all(timeline_same_node(key) for key in timeline_keys()), f"{label}: every step keeps its node")
+    check(js_true(evl("document.activeElement === window.__tlFocus")), f"{label}: focus stays on the moved step's Pick button")
+    check(timeline_hook_counts() == {"mount": 5, "update": 0, "unmount": 0}, f"{label}: the moved meter neither unmounts nor mounts ({timeline_hook_counts()})")
+
+    # An update in place: the key is in the stream, so the step stays first
+    # (not appended), keeps its node, and its hook updates.
+    label = "Update in place"
+    for chunks, words in [(1, "reading"), (2, "reading the"), (3, "reading the file")]:
+        click("#chunk")
+        expect_js(
+            f"({timeline_item_js('planner:5')})?.querySelector('.meter').getAttribute('data-chunks') === {json.dumps(str(chunks))}",
+            f"{label}: chunk {chunks} arrives",
+        )
+        check(f"Step 5 {words}" in str(evl(f"({timeline_item_js('planner:5')}).querySelector('.text').textContent")), f"{label}: the text grows to {words!r}")
+    check(timeline_keys()[:1] == ["planner:5"], f"{label}: the step stays where it is ({timeline_keys()})")
+    check(timeline_same_node("planner:5"), f"{label}: the step keeps its node")
+    check(str(evl(f"({timeline_item_js('planner:5')}).querySelector('.meter').textContent")) == "###", f"{label}: the hook drew the meter, and the morph left it")
+    check(timeline_hook_counts() == {"mount": 5, "update": 3, "unmount": 0}, f"{label}: one hook update per chunk ({timeline_hook_counts()})")
+    check(js_true(evl('window.timelineHooks.events.slice(-3).every(function(e){ return e[0] === "update" && e[1] === "planner:5"; })')), f"{label}: the updates are planner:5's")
+
+    # Handler ids inside an item are relative to it, so a click after
+    # prepends shifted every item runs the clicked item's message.
+    label = "Click after prepends"
+    click("#prepend")
+    expect(lambda: timeline_keys()[:1] == ["coder:6"], f"{label}: coder:6 prepended ({timeline_keys()})")
+    click("#prepend")
+    expect(lambda: timeline_keys()[:1] == ["planner:7"], f"{label}: planner:7 prepended ({timeline_keys()})")
+    clear_cdp_events()
+    timeline_click("coder:2", "pick", label)
+    timeline_wait_status("Picked: step 2.", label)
+    timeline_click("planner:7", "pick", label)
+    timeline_wait_status("Picked: step 7.", label)
+    check(sent_event_count() == 2, f"{label}: one event per click ({sent_event_count()})")
+
+    # A delete removes the node and unmounts its hook.
+    label = "Delete"
+    timeline_mark_items(label)
+    timeline_click("coder:4", "delete", label)
+    expect(lambda: "coder:4" not in timeline_keys(), f"{label}: coder:4 is gone ({timeline_keys()})")
+    check(js_true(evl("!window.__tlNodes['coder:4'].isConnected")), f"{label}: its node left the document")
+    check(timeline_hook_counts()["unmount"] == 1, f"{label}: its meter unmounted ({timeline_hook_counts()})")
+    check(js_true(evl('JSON.stringify(window.timelineHooks.events.slice(-1)) === JSON.stringify([["unmount", "coder:4"]])')), f"{label}: the unmount is coder:4's")
+    check(all(timeline_same_node(key) for key in timeline_keys()), f"{label}: the other steps keep their nodes")
+
+    # KeepLast(20): a fill of 25 keeps its last 20 and trims the front; a
+    # prepend into the full stream drops the new step; an append trims one.
+    label = "Limit"
+    click("#fill")
+    fill_keys = [timeline_key(seq) for seq in range(13, 33)]
+    expect(lambda: timeline_keys() == fill_keys, f"{label}: the last 20 of the fill remain ({timeline_keys()})")
+    timeline_wait_status("Next: step 33.", label)
+    expect(lambda: timeline_mounted_meters() == 20, f"{label}: 20 meters are mounted ({timeline_hook_counts()})")
+    click("#prepend")
+    timeline_wait_status("Next: step 34.", label)
+    check(timeline_keys() == fill_keys, f"{label}: a prepend into the full stream is dropped ({timeline_keys()[:2]})")
+    click("#append")
+    expect(lambda: timeline_keys()[-1:] == ["coder:34"], f"{label}: the append is last ({timeline_keys()[-2:]})")
+    check(timeline_keys() == fill_keys[1:] + ["coder:34"], f"{label}: the append trimmed the first step ({timeline_keys()[:2]})")
+    check(timeline_mounted_meters() == 20, f"{label}: still 20 meters mounted ({timeline_hook_counts()})")
+
+    label = "Reset"
+    click("#reset")
+    expect(lambda: timeline_keys() == TIMELINE_SEED, f"{label}: the seed again ({timeline_keys()})")
+    timeline_wait_status("Picked: none. Streaming: none.", label)
+    expect(lambda: timeline_mounted_meters() == 3, f"{label}: 3 meters are mounted ({timeline_hook_counts()})")
+
+    # A reconnect is a new session: init refills the stream, and the join
+    # reconciles the page, keeping the node of every step it still holds.
+    label = "Reconnect"
+    click("#append")
+    expect(lambda: timeline_keys() == [*TIMELINE_SEED, "planner:35"], f"{label}: planner:35 appended ({timeline_keys()})")
+    timeline_mark_items(label)
+    hooks_before = timeline_hook_counts()
+    force_socket_reconnect(label, "Agent timeline")
+    timeline_wait_status("Next: step 4.", label)
+    expect(lambda: timeline_keys() == TIMELINE_SEED, f"{label}: the join holds init's steps only ({timeline_keys()})")
+    check(all(timeline_same_node(key) for key in TIMELINE_SEED), f"{label}: the seed steps keep their nodes")
+    check(js_true(evl("!window.__tlNodes['planner:35'].isConnected")), f"{label}: planner:35, not in init, left the document")
+    hooks_after = timeline_hook_counts()
+    check(
+        hooks_after == {**hooks_before, "unmount": hooks_before["unmount"] + 1},
+        f"{label}: only planner:35's meter unmounts ({hooks_before} -> {hooks_after})",
+    )
+    check(errors() == "0", f"Zero errors ({error_list()})")
+
+    # A frame the server never sends: an insert whose item the decoder
+    # refuses. One console.error, a 4000 close, a reconnect and a refill.
+    label = "Forged frame"
+    clear_cdp_events()
+    clear_browser_errors()
+    forged = json.dumps({
+        "type": "patch", "ops": [], "version": 1_000_000, "ack_clock": 0,
+        "streams": [{
+            "name": "timeline", "keep": "last", "limit": 20, "reset": False, "deletes": [],
+            "inserts": [{"key": "coder:900", "at": 0, "item": {"bogus": True}}],
+        }],
+    })
+    delivered = evl(f"window.__brazierDeliverFrameForTest ? window.__brazierDeliverFrameForTest({json.dumps(forged)}) : 'missing'")
+    check(str(delivered) != "missing", f"{label}: the frame test hook is available")
+    expect(lambda: cdp_method_count("Network.webSocketClosed") > 0, f"{label}: the socket closes")
+    expect(lambda: len(timeline_console("warning", "WebSocket closed (code 4000")) == 1, f"{label}: the socket closes with 4000 ({timeline_console('warning', 'WebSocket closed')})")
+    reconnected = wait_for_js(f"{APP_READY_JS} && ({TIMELINE_STATUS_JS}).includes('Next: step 4.')", timeout=2 * WAIT_SECONDS)
+    check(reconnected, f"{label}: the client reconnects")
+    expect(lambda: websocket_type_count("Sent", "join") == 1, f"{label}: one new join")
+    check(timeline_keys() == TIMELINE_SEED, f"{label}: the forged step never rendered ({timeline_keys()})")
+    error_count = count_js("window.__e.length")
+    error_text = str(evl("window.__e.join(' | ')"))
+    check(error_count == 1 and "Stream fault" in error_text and "item_render_failed" in error_text, f"{label}: exactly one console.error, the stream fault ({error_count}: {error_text[:200]})")
+    check(not browser_errors, f"{label}: no other browser error ({browser_errors})")
+    clear_browser_errors()
+
+    # A click on a server-rendered step before the join answers is queued
+    # and replayed once the join's model_sync renders. The test holds the
+    # first connect instead of timing a slow network.
+    label = "Click before hydration"
+    clear_cdp_events()
+    hold = cdp_checked("Page.addScriptToEvaluateOnNewDocument", {"source": "window.__BRAZIER_HOLD_CONNECT_FOR_TEST = true;"})
+    hold_id = hold["result"]["identifier"] if hold else None
+    marker = json.dumps(f"nav-{time.time_ns()}")
+    evl(f"window.__brazierCdpNav = {marker}; 0")
+    cdp("Page.navigate", {"url": f"http://localhost:{BRAZIER_PORT}/"})
+    held = wait_for_js(
+        f'window.__brazierCdpNav !== {marker} && document.readyState === "complete"'
+        ' && typeof window.__brazierReleaseConnectForTest === "function"'
+        ' && window.timelineHooks !== undefined'
+    )
+    if hold_id is not None:
+        cdp_checked("Page.removeScriptToEvaluateOnNewDocument", {"identifier": hold_id})
+    check(held, f"{label}: the page loads with the connect held")
+    check(str(evl("window.__brazierWsState()")) == "-1", f"{label}: no socket yet")
+    check(timeline_keys() == TIMELINE_SEED, f"{label}: SSR renders the seed steps ({timeline_keys()})")
+    timeline_mark_items(label)
+    timeline_click("coder:2", "pick", label)
+    check("Picked: none." in timeline_status(), f"{label}: nothing ran before hydration ({timeline_status()})")
+    released = evl("window.__brazierReleaseConnectForTest()")
+    check(str(released) == "0", f"{label}: the connect starts ({released})")
+    expect_js(APP_READY_JS, f"{label}: the client joins")
+    timeline_wait_status("Picked: step 2.", label)
+    expect(lambda: len(timeline_console("log", "Replayed 1 event(s) from before hydration")) == 1, f"{label}: the client replayed the click")
+    check(all(timeline_same_node(key) for key in TIMELINE_SEED), f"{label}: the join kept the server-rendered steps' nodes")
+    sent_events = [p for p in websocket_json_payloads("Sent") if p.get("type") in ("event", "event_batch")]
+    check(len(sent_events) == 1, f"{label}: one event sent ({sent_events})")
+    expect_js("window.timelineHooks.counts.mount === 3", f"{label}: the meters mount on the join ({timeline_hook_counts()})")
     check(errors() == "0", f"Zero errors ({error_list()})")
 stop_server(); print()
 

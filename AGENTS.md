@@ -21,6 +21,7 @@ Codex reads this file (`AGENTS.md`) for project-local guidance. There is no repo
 | `docs/EFFECTS.md` | Effects, timers, async patterns |
 | `docs/MIDDLEWARE.md` | HTTP middleware pipeline, scoping, built-ins |
 | `docs/STATE_MANAGEMENT.md` | Stores, PubSub, dynamic subscriptions, sessions |
+| `docs/STREAMS.md` | Streams: keyed lists the server sends once and does not keep, limits, hooks in items |
 | `docs/COMPONENTS.md` | Composable MVU units |
 | `docs/CLUSTERING.md` | Multi-node clustering, PubSub and presence across nodes, distribution security |
 | `docs/TELEMETRY.md` | Telemetry events and metrics |

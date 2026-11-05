@@ -290,6 +290,12 @@ open follow-ups), which is in progress.
 - (M118 streams) Telemetry events `[brazier, stream, delta]` and
   `[brazier, stream, refused]`, and a `stream_bytes` measurement on the
   render span's stop.
+- (M118 client) `examples/timeline`, the canonical stream example, with
+  its browser slice (`make browser-timeline`).
+- (M118 client) `docs/STREAMS.md`, the streams guide.
+- (M118 client) Stream benches: `runtime.stream.append` and `chunk`,
+  `wire.stream_patch`, `ssr.stream_300`, `client.stream.append.300` and
+  `client.stream.chunk.300`. They have no baseline yet.
 - (M118 streams-build) `store.synced` and `store.list_synced` report
   whether a replicated store's replica is in sync with every peer, as
   `Result(Bool, SyncedError)`: `NotReplicated(topic)` for a local store,
@@ -706,6 +712,14 @@ open follow-ups), which is in progress.
   the test process was counted as the append's reductions. The cost is
   now measured in a fresh process with room for the work, and a trace
   session asserts no collection ran during it.
+- (M118 client) A live navigation (a link, `router.push`,
+  `router.replace`) replaces the page instead of morphing the old one into
+  it, so pages no longer need an `element.keyed` root, and it scrolls to
+  the top when the URL has no fragment. Back and forward keep the browser's
+  scroll restoration.
+- (M118 client) docs/HTML_ELEMENTS.md named a `Brazier.hooks` object and an
+  `updated` callback that don't exist; it now names
+  `window.brazierClient.registerHook` and `update(node, state)`.
 - (M118 streams-build) The dead render refused nothing: an op on an
   undeclared stream is now refused there with `unknown_stream`, as live.
 - (M118 streams-build) `data-brazier-stream` is refused outside

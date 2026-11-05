@@ -18,10 +18,15 @@
 ////   1000-row view with a click handler per row through
 ////   `ssr.render_page`, as `brazier.start` serves a page. The probe checks
 ////   every row is in the HTML.
+//// - ssr.stream_300: a dead render of a page whose view is a full
+////   `KeepLast(300)` stream of 1 KB lines (brazier/bench/stream_bench),
+////   `init` inserting every line. The probe checks the page holds the 300
+////   items, keyed and in order.
 
 import brazier/attribute
 import brazier/bench/measure.{check, string_of}
 import brazier/bench/report.{type Metric}
+import brazier/bench/stream_bench
 import brazier/effect
 import brazier/element.{type Element}
 import brazier/event
@@ -30,6 +35,7 @@ import brazier/internal/stream_window
 import brazier/middleware
 import brazier/ssr
 import brazier/static
+import brazier/stream
 import brazier/transport
 import brazier/transport/server.{type Connection, Bytes}
 import gleam/bit_array
@@ -86,6 +92,9 @@ fn ssr_pages() -> List(#(Int, Int)) {
 }
 
 const ssr_clients = 8
+
+/// Requests per client of ssr.stream_300, whose page is about 330 KB.
+const ssr_stream_requests = 50
 
 @external(erlang, "brazier_bench_ffi", "http_round")
 fn http_round(
@@ -158,7 +167,8 @@ pub fn run() -> Result(List(Metric), String) {
   use rendered <- result.try(
     list.try_map(ssr_pages(), ssr_scenario) |> result.map(list.flatten),
   )
-  Ok(list.flatten([keepalive, static_metrics, gzip, rendered]))
+  use streamed <- result.try(ssr_stream_scenario())
+  Ok(list.flatten([keepalive, static_metrics, gzip, rendered, streamed]))
 }
 
 fn get(path: String, headers: List(#(String, String))) -> String {
@@ -533,6 +543,102 @@ fn ssr_scenario(page: #(Int, Int)) -> Result(List(Metric), String) {
     port,
     ssr_clients,
     ssr_requests,
+    request,
+    #(200, bit_array.byte_size(page), [#("content-type", content_type)]),
+  )
+}
+
+type LogModel {
+  LogModel(picked: String)
+}
+
+type LogMsg {
+  Picked(id: String)
+}
+
+fn ssr_stream_scenario() -> Result(List(Metric), String) {
+  let name = "ssr.stream_" <> int.to_string(stream_bench.stream_limit)
+  let config =
+    ssr.SsrConfig(
+      init: fn(_ctx) {
+        Ok(#(
+          LogModel(picked: ""),
+          stream.insert_many(
+            stream_bench.log(),
+            stream_bench.initial_lines(),
+            at: stream.Append,
+          ),
+        ))
+      },
+      update: fn(_model: LogModel, msg: LogMsg) {
+        case msg {
+          Picked(id:) -> #(LogModel(picked: id), effect.none())
+        }
+      },
+      route: None,
+      view: fn(model: LogModel) {
+        html.div([attribute.class("log")], [
+          html.p([], [html.text("picked " <> model.picked)]),
+          stream.render(stream_bench.log(), "ol", [], fn(line) {
+            stream_bench.render_line(line, Picked)
+          }),
+        ])
+      },
+      title: fn(_) { "Log" },
+      secret_key: "bench-secret-key-that-is-long-enough-for-hmac",
+      head_html: None,
+      dev_mode: False,
+      recovery_encoder: None,
+      stream_limits: stream_window.default_limits(),
+      stream_names: [stream_bench.stream_name],
+    )
+  let listener =
+    transport.TransportConfig(
+      ..base_config(ssr_stream_requests),
+      ssr_factory: Some(fn(req, _path) { ssr.render_page(config, req) }),
+    )
+  use port <- with_listener(name, listener)
+  let request = get("/", [])
+  use #(status, headers, page) <- result.try(http_fetch(
+    port,
+    request,
+    measure.timeout_ms,
+  ))
+  use <- check(status == 200, "the probe got a " <> int.to_string(status))
+  use html <- result.try(
+    bit_array.to_string(page)
+    |> result.replace_error("the page is not UTF-8"),
+  )
+  // Every item, keyed and in order: the text after each key attribute
+  // starts with the next key.
+  let keyed = case string.split(html, "data-brazier-key=\"") {
+    [_before, ..items] ->
+      list.map(items, fn(item) {
+        case string.split_once(item, "\"") {
+          Ok(#(key, _)) -> key
+          Error(Nil) -> ""
+        }
+      })
+    [] -> []
+  }
+  let expected = list.map(stream_bench.initial_lines(), fn(line) { line.id })
+  use <- check(
+    keyed == expected,
+    "the page's keyed items are not the "
+      <> int.to_string(stream_bench.stream_limit)
+      <> " lines in order: "
+      <> string.slice(string.join(keyed, ","), 0, 300),
+  )
+  use <- check(
+    string.contains(html, "brazier_client_"),
+    "the page does not load the client bundle",
+  )
+  use content_type <- result.try(header(headers, "content-type"))
+  timed(
+    name,
+    port,
+    ssr_clients,
+    ssr_stream_requests,
     request,
     #(200, bit_array.byte_size(page), [#("content-type", content_type)]),
   )

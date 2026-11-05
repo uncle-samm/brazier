@@ -781,8 +781,8 @@
 - [x] L515–516: with `NoDiscovery` a member lost to a netsplit never reconnects, and `global` can drop members on a netsplit. Neither is a recorded decision. m118-cluster (decide and document). Done in m118-cluster, see below.
 - [x] L716–719: replicated stores expose no "synced" signal; a refused merge has no retry backoff; the causal context gains a clock entry per replica restart and is never compacted; the CRDT was never checked against the `delta_crdt_ex` source. m118-cluster. Done in m118-cluster, see below.
 - [x] L267 (m118-build): the client build writes no manifest, so every fresh build resolves dependencies from Hex (the cause of the rate-limit failures). m118-build.
-- [ ] L83: the client doesn't key the page root on navigation, so examples wrap each page in `element.keyed`. After m118-transport.
-- [ ] L606: a navigation without a hash doesn't scroll to the top (LiveView does). m118-transport if it fits item 8, otherwise after.
+- [x] L83: the client doesn't key the page root on navigation, so examples wrap each page in `element.keyed`. After m118-transport. Done in m118-client (4a51c81).
+- [x] L606: a navigation without a hash doesn't scroll to the top (LiveView does). m118-transport if it fits item 8, otherwise after. Done in m118-client (4a51c81).
 - [ ] L607: the non-monotonic clock warning says "event clock" for navigations too. After m118-lifecycle.
 - [x] L608–609, m118-logs ef5aa61, adfbc0e and d588536: the client is resolved once per WebSocket connection (`server.Connection.resolved` and `Admission.request`), and a refused setting logs one line.
 - [x] L190 and L414, m118-residue (merged 2026-11-05):
@@ -843,7 +843,16 @@
     - `log_path.describe` keeps 256 bytes of the path, never splitting a character, and marks the cut after the closing quote;
     - 2310 tests pass twice on its branch;
     - [ ] follow-ups: an attribute name that isn't a literal is caught only at render, not by the build; docs/CLUSTERING.md could mention the synced event; decide whether the client project build runs with `--warnings-as-errors`; one early full run on its branch had 1 failure whose name was lost (not seen in 5 runs since; watched in the coordinator's runs).
-  - m118-client: streams step 7 (`examples/timeline`, its CDP checks, benches, `docs/STREAMS.md`), L83, L606.
+  - m118-client: streams step 7 (`examples/timeline`, its CDP checks, benches, `docs/STREAMS.md`), L83, L606. Done (4a51c81..7cc9d72, merged 2026-11-05):
+    - a live navigation replaces the page instead of morphing it, and scrolls to the top when the URL has no fragment (L83, L606); two new ffi harness scenarios (79);
+    - `examples/timeline` with its CDP slice; `docs/STREAMS.md` with Learn More rows in CLAUDE.md and AGENTS.md;
+    - the design §16 benches in `test/brazier/bench/stream_bench.gleam`, compared in docs/PERFORMANCE.md with the model-list scenarios (a 300 KB list estimated at ~1 ms per event from `list_50kb`/`list_500kb`, against 88 µs for a stream append). Each runtime stream event must be acknowledged by its own patch, so a change that merges patches fails the bench loudly;
+    - on its branch: 2270 tests pass twice, 25 examples build, CDP 761/761 desktop and 771/771 mobile;
+    - at the merge, `http_bench`'s new SSR config lacked streams-build's `stream_names`; the coordinator added it. The runtime bundle rebuilds to the committed `brazier_client_a4c06a770aa6358c.js`;
+    - docs/HTML_ELEMENTS.md's hook API (`Brazier.hooks`, `updated`) fixed by the coordinator;
+    - verified on the merged tree: build (zero warnings), format, lint, docs, `make test-client` pass; 2315 tests pass 3 runs in a row; CDP 761/761 desktop and 771/771 mobile;
+    - [ ] follow-ups: the 15 stream metrics need a baseline (the re-baseline item); scroll is not restored on popstate; the CDP harness's `expect_path_and_text` wait is weak; the client test seams are covered only by CDP; the Docker CDP runner defaults to 23 shards for 25 examples (harmless: sharding is modulo, two shards run two examples).
+    - Not reproduced: on its branch one log line from `app_lifecycle_test`'s peer named a beam in another worktree's build. Peers take the runner's own absolute code path (`brazier_peer_ffi.erl:401`), and in the coordinator's four runs every path names this worktree, so it most likely came from a command run in the wrong directory.
   Left for after them: the perf items L637–643, then the re-baseline on an idle machine.
 - Decision, 2026-11-05: 4401 stays shared by an `init` 401 and a revoked or expired session. Both mean "authentication is no longer valid; reload" to the client. The server tells them apart by a distinct cause in the close's log line and telemetry metadata. m118-logs builds it.
 - Decision, 2026-11-05: m118-logs reproduced L453. Both problems are in the runtime's send paths:

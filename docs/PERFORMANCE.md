@@ -2,8 +2,8 @@
 
 Brazier has one benchmark suite. It measures the HTTP listener, static
 files, gzip, server rendering, WebSocket event round trips, the runtime
-actor, the wire encoding, PubSub fan-out, the store, presence and the
-browser client's render and patch work. Its baseline is committed, and
+actor, streams, the wire encoding, PubSub fan-out, the store, presence and
+the browser client's render, patch and stream work. Its baseline is committed, and
 `make bench-check` fails when a metric regresses past its tolerance, and
 when any metric cannot be gated.
 
@@ -21,7 +21,7 @@ failure, not a misleadingly fast number.
 | `make bench-baseline` | `BRAZIER_BENCH_RUNS` runs (default 5, minimum 3) back to back, written to `bench/baselines.json` with the load average before and after. Refuses, writing `build/bench/refused_baseline.json` instead, when any metric is too noisy to gate. |
 
 Each invocation first prepares the fixtures once: it writes the static
-files and builds the client fixture app. That work is not part of any run.
+files and builds the two client fixture apps. That work is not part of any run.
 
 Run `bench-baseline` on an otherwise idle machine. Commit the new
 `bench/baselines.json` together with the change that moved the numbers,
@@ -34,8 +34,8 @@ compared. Baselines do not transfer between machines.
 ## Scenarios
 
 The suite lives in `test/brazier/bench/suite.gleam`, which runs the
-scenarios of `http_bench.gleam`, `presence_bench.gleam` and
-`client_bench.gleam` beside its own. The generators are in
+scenarios of `http_bench.gleam`, `stream_bench.gleam`,
+`presence_bench.gleam` and `client_bench.gleam` beside its own. The generators are in
 `test/brazier_bench_ffi.erl`. Each HTTP scenario starts its own listener,
 and the ws scenario its own counter app, on an OS-assigned port. Every
 scenario is warmed up before it is measured. Logging is raised to `warning`
@@ -54,18 +54,21 @@ The HTTP scenarios run 15 measured rounds after 2 warm-up rounds. A round takes 
 | static | `brazier/static` serving a 100 KB file (8 clients × 500 requests) and a 10 MB file (4 clients × 25), sent with sendfile (`.200`), and the same files revalidated with the probe's ETag (`.304`, 8 clients × 1000, timed first). The run fails unless the file's digest comes from the digest cache, as it does in production once a file is older than the cache's racy window. | requests/s and per-request p50/p99, each the median over rounds |
 | gzip | A 100 KB HTML body through `middleware.compress` with `Accept-Encoding: gzip`, 8 clients × 100. The probe gunzips the body, compares it with the original and checks it compressed to under half. | requests/s and per-request p50/p99, each the median over rounds |
 | ssr | `ssr.render_page` of a 100-row (8 × 800 requests) and a 1000-row (8 × 50) view with a click handler per row, as `brazier.start` serves the first page. The probe checks every row and the client bundle's script tag. | requests/s and per-request p50/p99, each the median over rounds |
+| ssr stream | `ssr.stream_300`: as `ssr`, for a page whose `init` fills a `KeepLast(300)` stream with 300 lines of 1 KB text and a click handler each (8 × 50). The probe checks the 300 item keys, in order, and the client bundle's script tag. | requests/s and per-request p50/p99, each the median over rounds |
 | ws | N joined connections × 200 events each, for N = 1, 10, 100, in 25, 15 and 5 measured rounds. Each event is timed from its send to the patch that acknowledges its clock. | events/s and per-event p50/p99, each the median over rounds |
 | runtime | Events pushed straight into a runtime actor holding a 200-item model, 2000 per round. `changed`: every event changes the model and gets a patch. `unchanged`: none does, and each gets an empty acknowledgement. | pipelined µs/event (median of rounds); p50/p99 of one event at a time, by round |
 | runtime list | As `runtime` `changed`, against a model whose list encodes to about 50 KB (1000 items, 200 events per round, 1000 sequential) and 500 KB (10000 items, 40 per round, 300 sequential). Each event changes one field, so the metric is the cost of the work done on the whole model. | pipelined µs/event (median of rounds); p50/p99 of one event at a time, by round |
-| wire | A one-op `patch` and a `model_sync` of the 50 KB model, each encoded into the frame `send_ws_message` hands `gen_tcp:send/2`, in 500 blocks of 200 | ns/frame median and p99 of the block timings, by round |
+| runtime stream | Events pushed straight into a runtime actor whose `KeepLast(300)` stream of 1 KB lines is full from the join on, 1000 per round after one warm-up round, then 1000 sequential. `append`: each event appends a line, so its frame carries one insert at 299 and the trim of the oldest line. `chunk`: each event re-inserts the last line with 100 more bytes, an update in place with no delete. Every event must be acknowledged by its own patch, in clock order, and each patch's `streams` field is decoded and checked against the event's change after the timer stops. | pipelined µs/event (median of rounds); p50/p99 of one event at a time, by round |
+| wire | A one-op `patch` and a `model_sync` of the 50 KB model, each encoded into the frame `send_ws_message` hands `gen_tcp:send/2`, in 500 blocks of 200. `wire.stream_patch` is a one-op `patch` whose `streams` field inserts one 1 KB line and trims one. | ns/frame median and p99 of the block timings, by round |
 | pubsub | Broadcasts to S subscribers, each timed until every subscriber has it: 20000 to 1, 2000 to 100, 1000 to 1000 | µs p50/p99, by round |
 | store | put/get/delete, timed in 50 blocks of 1000 operations | ns/op median and p99 of the block timings, by round |
 | crdt append | One value appended to a replicated list key holding 10, 1000 or 10000 values (`brazier/store/crdt`, the work the replica server and every receiving node do per write), in 50 blocks of 1000 | ns/op median and p99 of the block timings, by round |
 | presence | A `brazier/presence` tracker with a room of 10 entries and one of 10000 (100 holder processes × 100 keys), filled before anything is timed. `track`/`untrack`: 10000 of each, each timed until the subscriber has the diff naming exactly that key. `list`: the whole room, checked to hold every entry, 2000 times for 10 entries and 50 for 10000. | µs median and p99, by round |
 | client | The browser client's work for a 100- and a 1000-row model, in node, with the client entry a real `build.build` produces. `render`: `render` and `event_names`, what `renderNow` does before the DOM morph (2000 and 400 calls). `patch`: `handlePatch` before the morph, that is `JSON.parse` of the ops, `applyOps`, `decode_model`, `render` and `event_names`, for a patch that changes every tenth label and the selection. The client's HTML must equal the server's before and after the patch. | µs median and p99, by round |
+| client stream | A second fixture app holding a full `KeepLast(300)` stream of 1 KB lines. Its generator applies the app's own ops with the server's stream windows (`stream_window.apply_update`) and writes the `streams` fields the runtime sends, and the server's HTML for each new item (`render.render_item`). Node fills a store with the 300-line frame, then times one frame applied to it: `JSON.parse`, `decodeStreams`, `applyEntry`, and `render_item` with `event_names` for each inserted or updated item, what `applyFrameStreams` does before the DOM work (500 warm-up and 2000 timed calls). `append`: one insert and one trim. `chunk`: the last line grown by 100 bytes. Every call's item HTML must equal the server's. | µs median and p99, by round |
 
-The client scenario does not measure the DOM morph: node has no DOM. The
-morph needs a browser measurement over CDP.
+The client scenarios do not measure the DOM work: node has no DOM. The
+morph, and the stream item insertion, need a browser measurement over CDP.
 
 Every percentile is taken per round. A metric's median (p50) and p99 are
 the medians over rounds of each round's median and p99, as a throughput is
@@ -294,6 +297,49 @@ Some notes on reading the numbers:
   often lands on the same tick in every run. That, not a perfectly quiet
   machine, is why `runtime.changed.latency_p50` and
   `runtime.list_50kb.changed.latency_p50` show near-zero spreads.
+
+## Streams
+
+The stream scenarios (design §16 of `docs/design/STREAMS.md`) postdate the
+2026-11-04 baseline, so `bench/baselines.json` does not hold their 15
+metrics, and `make bench-check` fails them as unexpected until the next
+`make bench-baseline`. One `make bench` on 2026-11-05, on the baseline's
+machine with other agents' builds running:
+
+| Metric | Value |
+|--------|-------|
+| `ssr.stream_300.throughput` | 867.8 req/s |
+| `ssr.stream_300.latency_p50` | 8832 µs |
+| `ssr.stream_300.latency_p99` | 12259 µs |
+| `runtime.stream.append.pipelined` | 87.8 µs/event |
+| `runtime.stream.append.latency_p50` | 82.2 µs |
+| `runtime.stream.append.latency_p99` | 135.4 µs |
+| `runtime.stream.chunk.pipelined` | 67.8 µs/event |
+| `runtime.stream.chunk.latency_p50` | 63.5 µs |
+| `runtime.stream.chunk.latency_p99` | 91.5 µs |
+| `wire.stream_patch.median` | 383.1 ns/frame |
+| `wire.stream_patch.p99` | 481.7 ns/frame |
+| `client.stream.append.300.median` | 21.4 µs |
+| `client.stream.append.300.p99` | 81.7 µs |
+| `client.stream.chunk.300.median` | 20.2 µs |
+| `client.stream.chunk.300.p99` | 64.4 µs |
+
+The design compares a stream with a model list of the same size. The suite
+has no 300 KB list scenario; the two it has bracket one. In the same run,
+`runtime.list_50kb.changed.pipelined` was 150.9 µs/event and
+`runtime.list_500kb.changed.pipelined` 1779 µs/event, so a list event costs
+about 3.5 µs per KB of model, and by that slope a 300 KB list would cost
+about 1 ms an event. That is an estimate, not a measurement. Against it,
+an append to the 300 KB stream costs 88 µs: the runtime encodes and sends
+only the line the event adds and the key it trims, while a list event
+re-encodes and diffs the whole model. On the client, applying one stream
+frame and rendering its line takes about 21 µs, against 2.75 ms for a
+1000-row `client.patch`, which re-renders the whole view.
+
+`ssr.stream_300` is a page of about 300 KB of escaped text and 300
+handlers; at 8.8 ms it costs about what `ssr.rows_1000` does (7.9 ms in the
+same run). The first page renders every item, so a stream saves nothing
+there.
 
 ## Runtime re-measurement
 

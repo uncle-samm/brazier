@@ -16,6 +16,7 @@ checks.
 | `examples/routed_workspace` | Explicit route-aware app with Local/model state |
 | `examples/route_server_workspace` | Explicit route mini-apps with route-local private `Server` state |
 | `examples/auth_workspace` | API login/logout, HttpOnly auth cookie, a per-browser login CSRF cookie, CSRF-checked API writes (`auth.protect_api_with_csrf`), `ws_auth` with `auth.allow_guests_ws`, `init` through `auth.init_from_session`, a role-gated route, route-aware SSR, and server-private session state |
+| `examples/timeline` | A `brazier/stream` (see [STREAMS.md](STREAMS.md)): append, prepend, update in place, move, delete, a `KeepLast` limit and a reset, with node identity, focus, item handlers, an item hook, the reconnect reconcile, a stream fault and pre-hydration replay checked in the browser |
 
 ## Required Checks
 
@@ -142,11 +143,38 @@ following guarantees:
 - Server-only fields such as session ID, CSRF token, audit key, and audit log never
   appear in the public client model, DOM, or client bundle.
 
+## Timeline Contract
+
+`examples/timeline` is the canonical stream app: an agent's steps in a
+`KeepLast(20)` stream, with a session-private log on the server. Its browser
+slice (`make browser-timeline`) asserts, on the DOM nodes of the items:
+
+- The join renders the steps `init` inserted, and the `ChunkMeter` hook
+  inside each step mounts once.
+- A prepend and an append keep every other step's node and the focus on a
+  button inside a step.
+- A move (a delete and an insert of one key in one update) keeps the step's
+  node, its hook and the focus inside it.
+- An update in place keeps the step where it is and its node; the hook
+  updates once per change of its watched attribute, and the morph leaves the
+  children the hook owns.
+- A click on a step after prepends shifted every step runs that step's
+  message.
+- A delete removes the node and unmounts its hook.
+- A fill past the limit keeps the last 20, a prepend into the full stream is
+  dropped, and an append trims the first step.
+- After a forced reconnect, the join keeps the node of every step `init`
+  inserts again, removes the others and unmounts only their hooks.
+- A forged frame whose item the decoder refuses logs one `console.error`,
+  closes the socket with 4000, reconnects and refills the stream.
+- A click on a server-rendered step before the join answers (the harness
+  holds the first connect) is replayed once the join renders.
+
 ## Browser Harness Status
 
 `test_all_cdp.py --canonical` contains browser coverage for the canonical
 `counter`, `counter_local`, `local_first_form`, `private_session`, `routed`,
-`routed_workspace`, `route_server_workspace`, and `auth_workspace` slices. The
+`routed_workspace`, `route_server_workspace`, `auth_workspace`, and `timeline` slices. The
 browser harness runs through the project-local `.venv` and
 `requirements-dev.txt`. `make browser-all` removes the canonical filter and
 runs every example slice implemented in the harness. `--shard INDEX/TOTAL`

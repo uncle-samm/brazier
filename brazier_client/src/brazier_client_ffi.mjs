@@ -309,6 +309,20 @@ function boot() {
   // the server-rendered markup names, so they can be queued and replayed.
   listenFor(markupEventNames(root));
   setupNavigation();
+  if (window.__BRAZIER_ENABLE_TEST_HOOKS === true && window.__BRAZIER_HOLD_CONNECT_FOR_TEST === true) {
+    // Test seam: the page stays server-rendered, with its events queued for
+    // replay, until the test releases the first connect (a slow network's
+    // join, without timing).
+    console.log("[brazier] Test hook: the first connect waits for __brazierReleaseConnectForTest()");
+    window.__brazierReleaseConnectForTest = () => {
+      if (ws !== null) {
+        throw new Error("[brazier] invariant violated: __brazierReleaseConnectForTest called after the client connected");
+      }
+      connect();
+      return ws.readyState;
+    };
+    return;
+  }
   connect();
 }
 
@@ -339,7 +353,11 @@ function markupEventNames(root) {
 
 // === Rendering ===
 
-function renderNow() {
+// `server` is true for a render of the server's model (adoptAuthoritativeModel):
+// only such a render can show the page of a navigation the server
+// acknowledged, and it replaces the root's children instead of morphing them
+// (see unrenderedNavigations). A render of a local change always morphs.
+function renderNow(server = false) {
   renderPending = false;
   if (!clientInitialized || !appRoot) return;
   mark("render-start");
@@ -351,7 +369,12 @@ function renderNow() {
   // before it changes the page.
   const containers = streamContainerTable(rendered[2]);
   const t1 = performance.now();
-  morphInnerHTML(appRoot, html);
+  if (server && navigationRenderDue()) {
+    replaceRootChildren(appRoot, html);
+    settleNavigations();
+  } else {
+    morphInnerHTML(appRoot, html);
+  }
   handlers = table;
   listenFor(app.event_names(table).toArray());
   renderStreamContainers(containers);
@@ -753,7 +776,7 @@ function adoptAuthoritativeModel(modelValue) {
     clientInitialized = true;
     console.log("[brazier] Client ready (from model_sync)");
   }
-  renderNow();
+  renderNow(true);
   return null;
 }
 
@@ -1227,13 +1250,21 @@ function connect() {
   }
   pendingModelEventClock = queuedClock;
   predicted = queuedClock > 0;
-  // A navigation written to the old socket is never acknowledged on this
-  // one, but the join is for the current URL, so its model_sync renders the
-  // page the navigation went to. A still-queued navigate keeps its clock.
-  const scroll = pendingFragmentScroll;
-  if (scroll !== null && !outbound.some((msg) => msg.type === "navigate" && msg.clock === scroll.clock)) {
-    trace("reconnect.fragment_scroll_on_join", { hash: scroll.hash, clock: scroll.clock });
-    pendingFragmentScroll = { hash: scroll.hash, clock: 0 };
+  // The join is for the current URL, so its model_sync renders the page of
+  // every navigation not rendered yet: it replaces the page (clock 0). A
+  // navigation written to the old socket is never acknowledged on this one,
+  // so the join scrolls for it too; a still-queued navigate is sent once
+  // synced and keeps its clock, so its scroll waits for its ack, after its
+  // on_change ran.
+  const queuedNavigate = (clock) => outbound.some((msg) => msg.type === "navigate" && msg.clock === clock);
+  const scroll = pendingNavigationScroll;
+  if (scroll !== null && !queuedNavigate(scroll.clock)) {
+    trace("reconnect.navigation_scroll_on_join", { hash: scroll.hash, clock: scroll.clock });
+    pendingNavigationScroll = { hash: scroll.hash, clock: 0 };
+  }
+  if (unrenderedNavigations.length > 0) {
+    trace("reconnect.navigation_render_on_join", { navigations: unrenderedNavigations.length });
+    unrenderedNavigations = [0];
   }
   readyForServerEvents = false;
   socketJoined = false;
@@ -1462,6 +1493,16 @@ if (typeof window !== "undefined") {
       scheduled: pumpTimer !== null,
       debounced: debounced.size,
     });
+    // Hand `raw` to the current socket's message handler, as a frame the
+    // server sent: a test forges a frame the server never would.
+    window.__brazierDeliverFrameForTest = (raw) => {
+      if (typeof raw !== "string") {
+        throw new Error("[brazier] __brazierDeliverFrameForTest takes the frame's text, got " + typeof raw);
+      }
+      if (!ws) throw new Error("[brazier] __brazierDeliverFrameForTest: there is no socket to deliver the frame on");
+      handleMessage(ws, raw);
+      return ws.readyState;
+    };
   }
 }
 
@@ -1644,7 +1685,7 @@ function handleModelSync(model, version, ackClock) {
   reconnectAttempts = 0;
   console.log("[brazier] Model synced v" + version);
   trace("model_sync", { version, ackClock });
-  if (!held) resolveFragmentScroll();
+  if (!held) resolveNavigations();
   readyForServerEvents = true;
   flushPendingEarlyEvents();
   pumpOutbound();
@@ -1742,7 +1783,7 @@ function handlePatch(ops, version, ackClock) {
   currentModelVersion = version;
   console.log("[brazier] Patch applied v" + version + " (" + ops.length + " ops)");
   trace("patch", { version, ackClock, ops: ops.length });
-  resolveFragmentScroll();
+  resolveNavigations();
   mark("patch-end");
   measure("patch", "patch-start", "patch-end");
 }
@@ -1761,7 +1802,7 @@ function handleAckPatch(version, ackClock) {
   // The page shows the cached model unless a prediction or a locked input
   // needs the re-render below.
   if (!wasPending && !(wasLocked && !inputLocked())) {
-    resolveFragmentScroll();
+    resolveNavigations();
     return;
   }
   try {
@@ -1778,7 +1819,7 @@ function handleAckPatch(version, ackClock) {
     requestFullSync("ack_render_failed");
     return;
   }
-  resolveFragmentScroll();
+  resolveNavigations();
 }
 
 function requestFullSync(reason) {
@@ -1809,30 +1850,48 @@ function currentPath() {
 // popstate; it is the same page, so no navigate is sent for it.
 let routePath = null;
 
-// A live navigation to another page's #fragment, waiting for that page:
-// { hash, clock }, clock being the navigate's. The browser does not scroll
-// for pushState, and the new page exists only once the server's answer to
-// the navigate is rendered, so the first applied frame whose ack_clock
-// covers the clock scrolls to the fragment, or to the top when the page has
-// no such element. LiveView's Browser.pushState does the same after the
-// patch reply is rendered (getHashTargetEl, then scrollIntoView, else
-// window.scroll(0, 0)).
-let pendingFragmentScroll = null;
+// The scroll of a live navigation (a link, or the server's router.push and
+// router.replace), waiting for the new page: { hash, clock }, clock being
+// the navigate's and hash the URL's fragment ("" for none). The browser does
+// not scroll for pushState, and the new page exists only once the server's
+// answer to the navigate is rendered, so the first applied frame whose
+// ack_clock covers the clock scrolls: to the top for a URL without a
+// fragment, else to the fragment, or to the top when the page has no such
+// element. LiveView's Browser.pushState does the same once the reply of a
+// live navigation is rendered (getHashTargetEl, then scrollIntoView, else
+// window.scroll(0, 0)). Back and forward schedule none (popstate): they keep
+// the browser's scroll restoration.
+let pendingNavigationScroll = null;
+
+// The clocks of the navigates whose page is not rendered yet, in order. The
+// first render whose ack_clock covers one replaces the app root's children
+// instead of morphing them (renderNow), so no node of the old page is reused
+// for the new one: focus, typed values, scroll positions and hooks do not
+// carry over to another page that happens to share markup with it. This is
+// LiveView's live navigation, where replaceMain puts a new root element in
+// place of the old view's, whose hooks are destroyed with it. A model change
+// on the same page still morphs. Clock 0 stands for a navigate lost with a
+// socket, which the next join answers (connect).
+let unrenderedNavigations = [];
 
 // Tell the server about a route change. `path` is what the server routes on
-// (pathname and search) and `hash` the URL's fragment ("" for none). The
-// navigate takes its clock from the event counter, so the frame that shows
-// the new page is the first one acknowledging it.
-function sendNavigate(path, hash) {
+// (pathname and search) and `hash` the URL's fragment ("" for none).
+// `scroll` is false for back and forward. The navigate takes its clock from
+// the event counter, so the frame that shows the new page is the first one
+// acknowledging it.
+function sendNavigate(path, hash, scroll) {
   const clock = ++eventClock;
-  pendingFragmentScroll = hash === "" || hash === "#" ? null : { hash, clock };
+  const fragment = hash === "#" ? "" : hash;
   if (!send({ type: "navigate", path, clock })) {
     // send() reported the full queue; the page will not change, so there is
-    // no fragment of it to scroll to.
-    pendingFragmentScroll = null;
+    // nothing to replace or scroll for. A scroll pending for an earlier
+    // navigation is dropped too: the URL is no longer that page's.
+    pendingNavigationScroll = null;
     return;
   }
-  if (pendingFragmentScroll !== null) trace("navigate.fragment_pending", { path, hash, clock });
+  unrenderedNavigations.push(clock);
+  pendingNavigationScroll = scroll ? { hash: fragment, clock } : null;
+  trace("navigate.pending", { path, hash: fragment, clock, scroll });
 }
 
 // The element a fragment names: the HTML indicated-part rules (an element
@@ -1857,15 +1916,35 @@ function fragmentTarget(hash) {
   return null;
 }
 
+// Whether the render about to run shows the page of a navigation: the
+// server acknowledged a navigate whose page is not rendered yet.
+function navigationRenderDue() {
+  return unrenderedNavigations.length > 0 && unrenderedNavigations[0] <= latestAckClock;
+}
+
+// Drop the navigations the server acknowledged: their page is rendered, or
+// the frame that acknowledged them left the model as it was (an ack), so the
+// page on screen is already theirs.
+function settleNavigations() {
+  if (unrenderedNavigations.length === 0) return;
+  unrenderedNavigations = unrenderedNavigations.filter((clock) => clock > latestAckClock);
+}
+
 // Called after every applied (not held) model_sync, patch or ack.
-function resolveFragmentScroll() {
-  const pending = pendingFragmentScroll;
+function resolveNavigations() {
+  settleNavigations();
+  const pending = pendingNavigationScroll;
   if (pending === null || latestAckClock < pending.clock) return;
-  pendingFragmentScroll = null;
-  // The user moved to another fragment (an in-page link) before the page
-  // arrived; the browser already scrolled for that one.
+  pendingNavigationScroll = null;
+  // The user moved to a fragment (an in-page link) before the page arrived;
+  // the browser already scrolled for that one.
   if (location.hash !== pending.hash) {
-    trace("navigate.fragment_superseded", { hash: pending.hash, now: location.hash });
+    trace("navigate.scroll_superseded", { hash: pending.hash, now: location.hash });
+    return;
+  }
+  if (pending.hash === "") {
+    window.scrollTo(0, 0);
+    trace("navigate.scroll_top");
     return;
   }
   const target = fragmentTarget(pending.hash);
@@ -1914,7 +1993,7 @@ function handleServerNavigate(path, replace) {
   // first "#" starts it) and the client scrolls to the fragment once the
   // page is rendered.
   const hashAt = path.indexOf("#");
-  sendNavigate(hashAt < 0 ? path : path.slice(0, hashAt), hashAt < 0 ? "" : location.hash);
+  sendNavigate(hashAt < 0 ? path : path.slice(0, hashAt), hashAt < 0 ? "" : location.hash, true);
 }
 
 // Hard navigation: a full page load, e.g. to receive Set-Cookie headers.
@@ -1966,7 +2045,7 @@ function setupNavigation() {
     // server is told only the path, which is what it routes on.
     history.pushState(null, "", path + url.hash);
     routePath = path;
-    sendNavigate(path, url.hash);
+    sendNavigate(path, url.hash, true);
   });
   // Back and forward. Moving between fragments of the same page fires
   // popstate too, and is not a navigation: LiveView's popstate handler
@@ -1979,9 +2058,10 @@ function setupNavigation() {
     }
     leaveRoute(path);
     routePath = path;
-    // Back and forward keep the browser's scroll restoration, so no
-    // fragment scroll is scheduled (and a pending one is dropped).
-    sendNavigate(path, "");
+    // Back and forward keep the browser's scroll restoration, so no scroll
+    // is scheduled (and a pending one is dropped). The page is still
+    // replaced when it renders.
+    sendNavigate(path, "", false);
   });
 }
 
@@ -2006,6 +2086,32 @@ function morphInnerHTML(container, html) {
   if (devMode) trace("morph", { childCount: container.childNodes.length });
 
   restoreReplacedFocus(container, focused, focusedTag, focusedName, focusedValue, selStart, selEnd, locked);
+  focusAutofocused(container);
+}
+
+// The page of a live navigation: every child of the app root is removed
+// (its hooks unmount) and the new markup is put in its place, so no element
+// of the old page is reused for the new one. The root element itself stays,
+// as it holds the page's runtime attributes. Nothing old keeps focus, so
+// none is restored; an autofocus element of the new page takes it. Stream
+// containers are new elements, which renderStreamContainers fills from
+// their stores.
+function replaceRootChildren(container, html) {
+  const fragment = parseFragment(html);
+  autofocusQueue = [];
+  hookTouched = [];
+  const removed = container.childNodes.length;
+  while (container.firstChild) {
+    const node = container.firstChild;
+    unmountSubtree(node);
+    container.removeChild(node);
+  }
+  for (let c = fragment.firstChild; c; c = c.nextSibling) {
+    inserted(container.appendChild(c.cloneNode(true)));
+  }
+  syncHooks(container);
+  console.log("[brazier] Navigation rendered a new page: replaced " + removed + " root node(s) with " + container.childNodes.length);
+  trace("navigate.root_replaced", { removed, added: container.childNodes.length });
   focusAutofocused(container);
 }
 

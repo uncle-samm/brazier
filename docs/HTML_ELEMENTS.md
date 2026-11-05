@@ -172,8 +172,8 @@ time. See [SECURITY.md](SECURITY.md#url-policy).
 | Function | LiveView | Description |
 |----------|----------|-------------|
 | `attribute.ignore_updates()` | `phx-update="ignore"` | The browser does not touch the element's children after the first render |
-| `attribute.hook("Chart")` | `phx-hook` | Attaches a JavaScript hook registered with `Brazier.hooks` |
-| `attribute.watch(["data-points"])` | | Attribute changes that call the hook's `updated` callback |
+| `attribute.hook("Chart")` | `phx-hook` | Attaches the JavaScript hook registered with `window.brazierClient.registerHook("Chart", hook)`; the client calls its `mount(node)` and `unmount(node, state)` |
+| `attribute.watch(["data-points"])` | | Attribute changes that call the hook's `update(node, state)` |
 
 ## Events (`brazier/event`)
 

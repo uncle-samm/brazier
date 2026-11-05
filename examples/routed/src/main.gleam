@@ -126,14 +126,14 @@ pub fn view(model: Model) -> Element(Msg) {
           html.a([attribute.href(href(StatsPage))], [html.text("Stats")]),
         ],
       ),
-      // Keyed by route: a route change replaces the page's DOM instead of
-      // morphing one page's nodes into the next page.
-      element.keyed(href(model.route), case model.route {
+      // A client navigation renders the new page in place of the old one's
+      // DOM: the client replaces the root's children instead of morphing.
+      case model.route {
         HomePage -> home.view(model.home) |> element.map(Home)
         AboutPage -> about.view()
         SettingsPage -> settings.view(model.name, SetName)
         StatsPage -> stats.view(model.visits)
-      }),
+      },
     ],
   )
 }
