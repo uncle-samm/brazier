@@ -80,7 +80,7 @@ pub fn the_registry_holds_one_live_owner_test() {
 pub fn a_listener_tree_that_crashes_without_release_leaves_no_entry_test() {
   let before = registry_entries()
   let listener = start_unlinked()
-  let assert Ok(keeper) = server.keeper(listener)
+  let assert Ok(keeper) = server.get_keeper(listener)
   process.kill(server.get_supervisor(listener))
   // Nothing restarts a started tree and nothing holds it: its keeper
   // erases the entries and exits.
@@ -88,7 +88,7 @@ pub fn a_listener_tree_that_crashes_without_release_leaves_no_entry_test() {
   let assert True = registry_entries() == before
     as "a listener tree that crashed without release leaves no entry"
   let assert Error(Nil) = server.get_connection_owner(listener)
-  let assert Error(Nil) = server.keeper(listener)
+  let assert Error(Nil) = server.get_keeper(listener)
   let assert False = server.hold(listener) as "a gone listener is not held"
   let assert False = server.release(listener) as "nothing is left to release"
 }
@@ -107,13 +107,13 @@ pub fn a_held_listener_keeps_its_port_until_released_test() {
   let assert True = server.release(listener)
     as "the holder's release forgets the bound port"
   let assert True = registry_entries() == before
-  let assert Error(Nil) = server.keeper(listener)
+  let assert Error(Nil) = server.get_keeper(listener)
 }
 
 pub fn a_holder_that_exits_without_release_leaves_no_entry_test() {
   let before = registry_entries()
   let listener = start_unlinked()
-  let assert Ok(keeper) = server.keeper(listener)
+  let assert Ok(keeper) = server.get_keeper(listener)
   let held = process.new_subject()
   let holder =
     process.spawn_unlinked(fn() {
@@ -129,7 +129,7 @@ pub fn a_holder_that_exits_without_release_leaves_no_entry_test() {
   process.kill(holder)
   await.expect_down(holder, "the holder")
   let assert True = server.release(listener)
-  let assert Error(Nil) = server.keeper(listener)
+  let assert Error(Nil) = server.get_keeper(listener)
   await.expect_down(keeper, "the released listener's keeper")
   let assert True = registry_entries() == before
 }
@@ -137,7 +137,7 @@ pub fn a_holder_that_exits_without_release_leaves_no_entry_test() {
 pub fn a_listener_whose_holders_all_exit_leaves_no_entry_test() {
   let before = registry_entries()
   let listener = start_unlinked()
-  let assert Ok(keeper) = server.keeper(listener)
+  let assert Ok(keeper) = server.get_keeper(listener)
   let held = process.new_subject()
   let holder =
     process.spawn_unlinked(fn() {
@@ -176,14 +176,14 @@ pub fn a_supervised_listener_keeps_its_port_while_its_parent_runs_test() {
     |> static_supervisor.start
   process.unlink(parent.pid)
   let assert Ok(first) = process.receive(started, 5000)
-  let assert Ok(keeper) = server.keeper(first)
+  let assert Ok(keeper) = server.get_keeper(first)
   // The parent holds the entries, not this process, which built the spec.
   let assert True = registry_entries() == before + 3
   restart_only_child(parent.pid)
   let assert Ok(second) = process.receive(started, 5000)
   let assert True = server.get_port(second) == server.get_port(first)
     as "a listener restarted by its parent rebinds the port it bound first"
-  let assert Ok(same) = server.keeper(second)
+  let assert Ok(same) = server.get_keeper(second)
   let assert True = same == keeper
   let assert True = registry_entries() == before + 3
   // The parent stops and nobody releases the listener: its entries go with

@@ -517,7 +517,7 @@ pub fn get_connection_pids(listener: Listener) -> List(process.Pid) {
 /// The process that erases the listener's remembered entries once nothing
 /// can restart or release it (see `hold`). `Error(Nil)` once they are gone.
 @internal
-pub fn keeper(listener: Listener) -> Result(process.Pid, Nil) {
+pub fn get_keeper(listener: Listener) -> Result(process.Pid, Nil) {
   ffi_conns_keeper(listener.conns)
 }
 
