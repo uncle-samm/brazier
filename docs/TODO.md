@@ -46,21 +46,60 @@
     entries still decode. Another is a list that hands the caller one
     chunk of entries at a time.
 
-- **Issue:** on macOS, OTP 28's `file:list_dir/1` never returns (100% CPU,
+- **Issue:** on macOS, OTP's `file:list_dir/1` never returns (100% CPU,
   and the node ignores SIGTERM) for a directory that holds a name starting
-  with a combining mark, such as U+0301 + `b` (bytes `cc 81 62`). Names
-  with a mark elsewhere list, NFC-normalized. `file:del_dir_r/1` lists, so
-  `simplifile.delete` hangs on such a directory. Brazier lists directories
-  too: the client bundle build lists the app's static directory
-  (`build/client_bundle.gleam`), so a static file named that way would hang
-  the build. `unicode:characters_to_nfc_list([769, 98])` returns at once.
-  - **Context:** Milestone 118, m118-residue-3, the combining-mark static
-    tests.
-  - **Files:** `test/brazier/static_serving_test.gleam` (`delete_files`),
-    `src/brazier/build/client_bundle.gleam`
-  - **Attempted:** the tests delete such names one by one with
-    `simplifile.delete_file` before `cleanup`. Not yet reduced to an OTP
-    bug report, nor checked on Linux or another OTP release.
+  with a combining mark, such as U+0301 + `b` (bytes `cc 81 62`). The same
+  goes for `list_dir_all`, `prim_file:list_dir`, `file:del_dir_r/1`,
+  `filelib:wildcard/1`, and simplifile's `read_directory`, `get_files` and
+  `delete`. Brazier no longer lists through OTP, so it does not hang. The
+  upstream bug stays open until an OTP release fixes it.
+  - **Context:** Milestone 118, found in m118-residue-3 (the combining-mark
+    static tests), and reduced in m118-otp-listdir.
+  - **Root cause:** an OTP bug in `erts/emulator/beam/erl_unicode.c`.
+    `cleanup_norm` (lines 1475-1498) builds cons cells but never writes
+    its heap pointer back (`*hpp = hp`). Then `do_utf8_to_list_normalize`
+    (1569) calls `HRelease` (1627) and frees the cells it returns.
+    - It runs only for the macOS name encoding (`ERL_FILENAME_UTF8_MAC`),
+      and only when the name starts with a code point that may compose.
+    - The next allocation reuses those cells, so in
+      `prim_file:list_dir_convert` the name becomes `Name = [Name]`.
+    - `file_server` then copies a cyclic term forever.
+    - `master` has the same code. It dates from R14B01.
+  - **Platforms:** macOS (OTP 28.4, erts 16.3, Darwin 25.6.0) hangs;
+    `+fnl` avoids it. Linux (OTP 28.5.0.8, Debian 13, `erlang:28` image) is
+    not affected: `list_dir` returns `{ok, [[769, 98]]}` and `del_dir_r`
+    returns `ok`.
+  - **Brazier now:** every directory listing in `src/` goes through
+    `brazier_dir_ffi`, which runs find(1) as a port with no shell and reads
+    the names as raw bytes. The VM never decodes a name, so the bug cannot
+    be reached. The callers are:
+    - `brazier/build/files` (the client bundle, build and discovery);
+    - the three walkers in `brazier/lint`;
+    - `brazier_dev_ffi:reload_modules`.
+
+    Names come back as written on disk, not NFC-composed. A name that is
+    not valid UTF-8 is an error naming the directory and the name's bytes;
+    lint reports it as `unreadable-path`. `files.delete_if_exists` deletes
+    trees with the same listing.
+  - **Tests:** `test/brazier/dir_listing_test.gleam`. Every test that
+    touches a marked name runs in a child VM (`test/brazier/child_vm.gleam`)
+    that is killed with SIGKILL on a timeout, so a regression cannot hang
+    the suite. Two tripwires fail when OTP fixes the bug:
+    - `otp_decoder_frees_the_name_it_returns_on_macos_test`;
+    - `otp_list_dir_hangs_on_macos_and_the_child_is_killed_test`.
+
+    The `delete_files` workaround in `static_serving_test` is gone.
+  - **Files:** `src/brazier_dir_ffi.erl`, `src/brazier/build/files.gleam`,
+    `src/brazier/lint.gleam`, `src/brazier_dev_ffi.erl`,
+    `test/brazier/dir_listing_test.gleam`,
+    `test/brazier_dir_test_ffi.erl`,
+    `docs/design/OTP_LIST_DIR_HANG.md`
+  - **Attempted:** the upstream report (repro, observed vs expected, source
+    lines, and a one-line fix) is drafted in
+    `docs/design/OTP_LIST_DIR_HANG.md`. It is not posted: posting needs the
+    maintainer's permission. When an OTP release has the fix, the
+    tripwires fail, and the find-based listing can be revisited for that
+    release.
 
 ## Resolved Issues
 
