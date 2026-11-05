@@ -1,4 +1,4 @@
-.PHONY: build test test-client test-flake bench bench-check bench-baseline browser-canonical browser-canonical-desktop browser-canonical-mobile browser-all browser-all-desktop browser-all-mobile browser-all-shard browser-all-docker-shards browser-timeline push tag publish publish-dry-run release
+.PHONY: build test test-client test-flake bench bench-check bench-baseline browser-canonical browser-canonical-desktop browser-canonical-mobile browser-all browser-all-desktop browser-all-mobile browser-all-shard browser-all-docker-shards browser-timeline push tag github-release publish publish-dry-run release
 
 build:
 	gleam build
@@ -76,5 +76,10 @@ publish:
 publish-dry-run:
 	bash scripts/publish.sh --dry-run
 
+# Publishing the GitHub release starts .github/workflows/publish.yml, which
+# publishes to Hex once the hex environment is approved.
+github-release:
+	bash scripts/github_release.sh
+
 # The dry run gates the release before anything is pushed or tagged.
-release: publish-dry-run push tag publish
+release: publish-dry-run push tag github-release

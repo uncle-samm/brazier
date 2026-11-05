@@ -17,6 +17,9 @@ below it were written before the rename and keep the old names.
 `scripts/publish.sh` refuses to publish unless the `gleam.toml` version has a
 `## [X.Y.Z]` heading here. `make publish-dry-run` runs the whole release gate
 without contacting Hex.
+`make release` runs the dry run, pushes main, tags `vX.Y.Z` and creates the
+GitHub release; publishing the release runs `.github/workflows/publish.yml`,
+which publishes to Hex after the `hex` environment is approved.
 
 ## [Unreleased]
 

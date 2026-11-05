@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Publish the package to Hex, after the release gate passes.
 #
-# Usage: scripts/publish.sh [--dry-run]
+# Usage: scripts/publish.sh [--dry-run | --release-tag vX.Y.Z]
 #
 # Refuses, before publishing anything, when:
 #   - the working tree has uncommitted or untracked changes;
@@ -13,12 +13,20 @@
 #   - `gleam test` fails;
 #   - `scripts/check_docs.sh` fails;
 #   - `gleam export hex-tarball` cannot build the package;
-#   - (real publish only) neither HEXPM_API_KEY nor .hex_api_key holds a key.
+#   - (real publish only) neither HEXPM_API_KEY nor .hex_api_key holds a key;
+#   - (--release-tag only) the tag is not v<gleam.toml version>, or HEAD is
+#     not the commit it names.
 #
 # --dry-run runs every check and builds the tarball, then stops. It never
 # contacts Hex. `gleam publish` has no dry-run flag of its own, so the dry run
 # ends at `gleam export hex-tarball`, which builds the package `gleam publish`
 # would upload.
+#
+# --release-tag is the publish from a GitHub release
+# (.github/workflows/publish.yml): it checks the tag against the version and
+# HEAD, then answers Gleam's confirmation prompts with --yes, since nobody is
+# at a terminal. Approving the workflow's `hex` environment is the
+# confirmation.
 set -euo pipefail
 
 ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
@@ -27,15 +35,19 @@ cd "$ROOT"
 . scripts/release_lib.sh
 
 usage() {
-  echo "usage: scripts/publish.sh [--dry-run]" >&2
+  echo "usage: scripts/publish.sh [--dry-run | --release-tag vX.Y.Z]" >&2
   exit 2
 }
 
 dry_run=0
+release_tag=""
 case "$#" in
   0) ;;
   1)
     if [ "$1" = "--dry-run" ]; then dry_run=1; else usage; fi
+    ;;
+  2)
+    if [ "$1" = "--release-tag" ] && [ -n "$2" ]; then release_tag=$2; else usage; fi
     ;;
   *) usage ;;
 esac
@@ -50,6 +62,19 @@ name=$(release_name)
 version=$(release_version)
 release_require_changelog_heading "$version"
 release_step "gleam.toml ($name $version) matches a CHANGELOG.md heading"
+
+if [ -n "$release_tag" ]; then
+  if [ "$release_tag" != "v$version" ]; then
+    release_refuse "the release tag $release_tag does not name gleam.toml's version $version (expected v$version)"
+  fi
+  if ! tag_commit=$(git rev-parse -q --verify "refs/tags/$release_tag^{commit}"); then
+    release_refuse "the tag $release_tag is not in this checkout"
+  fi
+  if [ "$tag_commit" != "$head" ]; then
+    release_refuse "HEAD $head is not $release_tag's commit $tag_commit"
+  fi
+  release_step "the release tag $release_tag is HEAD"
+fi
 
 # Remove the package's own build output first, so the compiler re-checks
 # every module and cannot hide a warning in the cache.
@@ -111,6 +136,11 @@ if [ -z "${HEXPM_API_KEY:-}" ]; then
   export HEXPM_API_KEY
 fi
 
-release_step "publishing $name $version to Hex; answer Gleam's prompts to confirm"
-gleam publish
+if [ -n "$release_tag" ]; then
+  release_step "publishing $name $version to Hex from the release $release_tag"
+  gleam publish --yes
+else
+  release_step "publishing $name $version to Hex; answer Gleam's prompts to confirm"
+  gleam publish
+fi
 release_step "published $name $version from $head"

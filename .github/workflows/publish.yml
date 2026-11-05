@@ -1,0 +1,55 @@
+name: Publish
+
+# Publishing a GitHub release tagged v<version> publishes that version to
+# Hex. scripts/publish.sh runs the release gate on the tagged commit first
+# and refuses a tag that does not name gleam.toml's version.
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hex-publish
+  cancel-in-progress: false
+
+jobs:
+  hex:
+    name: Publish ${{ github.event.release.tag_name }} to Hex
+    runs-on: ubuntu-latest
+    # The `hex` environment holds HEXPM_API_KEY, a key that can publish, so
+    # only this job can read it. A required reviewer on the environment makes
+    # every publish wait for approval.
+    environment: hex
+    env:
+      HEXPM_API_KEY: ${{ secrets.HEXPM_API_KEY }}
+      HEXPM_READ_API_KEY: ${{ secrets.HEXPM_READ_API_KEY }}
+      RELEASE_TAG: ${{ github.event.release.tag_name }}
+    steps:
+      - name: Require the Hex keys
+        run: |
+          if [ -z "$HEXPM_API_KEY" ]; then
+            echo "::error::The hex environment has no HEXPM_API_KEY secret. Add a Hex key that can publish brazier to it." >&2
+            exit 1
+          fi
+          if [ -z "$HEXPM_READ_API_KEY" ]; then
+            echo "::error::The HEXPM_READ_API_KEY secret is not set. The CI image build needs it (see ci.yml)." >&2
+            exit 1
+          fi
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ github.event.release.tag_name }}
+          persist-credentials: false
+      # The image is the toolchain CI tests with. It leaves out .git, which
+      # publish.sh needs for its clean-tree and tag checks, so the checkout is
+      # mounted at /src and the gate runs there.
+      - name: Build CI image
+        run: docker build --secret id=hexpm_read_api_key,env=HEXPM_READ_API_KEY -f Dockerfile.ci -t brazier-ci .
+      - name: Publish
+        run: |
+          docker run --rm --shm-size=1g \
+            -v "$PWD:/src" -w /src \
+            -e HEXPM_API_KEY -e HEXPM_READ_API_KEY -e RELEASE_TAG \
+            brazier-ci \
+            sh -c 'git config --global --add safe.directory /src && bash scripts/publish.sh --release-tag "$RELEASE_TAG"'
