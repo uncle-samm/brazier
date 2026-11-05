@@ -50,7 +50,7 @@ start_link_gleam(ConnsName, Backlog, SendTimeoutMs) ->
     end.
 
 init({ConnsName, Backlog, SendTimeoutMs}) ->
-    true = is_atom(ConnsName),
+    true = brazier_http_conns:is_name(ConnsName),
     true = is_integer(Backlog) andalso Backlog > 0,
     true = is_integer(SendTimeoutMs) andalso SendTimeoutMs > 0,
     %% Trap exits so a shutdown from the supervisor runs terminate/2, and so

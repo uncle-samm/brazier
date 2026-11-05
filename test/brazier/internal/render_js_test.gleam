@@ -54,6 +54,7 @@ pub fn javascript_ffi_matches_erlang_test_() -> Timeout {
     let inputs =
       list.flatten([
         url_payloads,
+        render_test.attribute_names,
         render_test.samples(render_test.text_pieces, 40, 1000),
         render_test.samples(render_test.name_pieces, 8, 1000),
       ])
@@ -106,6 +107,7 @@ pub fn check(input: String) -> String {
     bool(render.is_valid_event_name(input)),
     bool(render.is_valid_attribute_name(input)),
     bool(render.is_allowed_attribute("attributeName", input)),
+    bool(render.is_allowed_attribute(input, "x")),
     url_result(url.check("href", input)),
     url_result(url.check("src", input)),
   ]
@@ -210,6 +212,7 @@ fn check(input: String) -> String {
     bool(render.is_valid_event_name(input)),
     bool(render.is_valid_attribute_name(input)),
     bool(render.is_allowed_attribute(\"attributeName\", input)),
+    bool(render.is_allowed_attribute(input, \"x\")),
     url_result(url.check(\"href\", input)),
     url_result(url.check(\"src\", input)),
   ]

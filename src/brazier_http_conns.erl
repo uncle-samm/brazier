@@ -58,29 +58,106 @@
 -behaviour(gen_server).
 
 -export([
-    new_name/0, start_link/7, start_link_gleam/7,
+    new_name/0, is_name/1, owner_pid/1, start_link/7, start_link_gleam/7,
     start_connection/2, release_self/0, release_pid/2,
     drain_requested/0, mark_draining/0, is_drain_message/1, owner/0, owner_if_any/0,
     count_self/0, count/1, count_for_ip/2, count_for_ip_text/2, children/1,
     ws_acquire_self/2, ws_release_self/0, ws_count_for_ip/2,
     get_port/1, set_listen_socket/3, listen_socket/1, forget_port/1
 ]).
+-export([register_name/2, unregister_name/1, whereis_name/1, send/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 -export([connection_init/3]).
 
 -define(PDICT_KEY, '$brazier_http_conn').
 -define(SHOOT_TIMEOUT_MS, 5000).
 -define(DRAINING_KEY, '$brazier_http_draining').
+-define(OWNER_KEY(Ref), {?MODULE, owner, Ref}).
+-define(PORT_KEY(Ref), {?MODULE, bound_port, Ref}).
 
-%% Each listener gets one registered name so siblings in the supervision
-%% tree (the acceptors) can find the current conns process across restarts.
-%% One atom is created per listener start; listeners are long-lived.
+%% NAMES. Each listener gets one name so its siblings in the supervision
+%% tree (the listen socket owner, the acceptors) and its Listener handle can
+%% find the current conns process across restarts. The name is
+%% {via, brazier_http_conns, Ref} for a fresh reference, not an atom: atoms
+%% are never collected, so an atom per listener start leaked one atom for
+%% every listener a node ever started (a test suite, or an app that starts
+%% and stops listeners, grew the atom table without bound). This module is
+%% the via registry: the owner's pid lives in a persistent_term keyed by
+%% Ref, beside the listener's remembered bound port, and both are erased by
+%% forget_port/1 when the listener stops for good. A pid fits in one machine
+%% word, so replacing it (an owner restart) or erasing it runs no global GC.
+%% Reference: Ranch registers each listener's connection supervisor under
+%% the listener's Ref in ranch_server (ranch_server:set_connections_sup/3)
+%% instead of naming it with an atom.
 new_name() ->
-    list_to_atom("brazier_http_conns_" ++ integer_to_list(erlang:unique_integer([positive]))).
+    {via, ?MODULE, make_ref()}.
 
-start_link(Name, Port, Handler, MaxConns, MaxPerIp, TrustedCidrs, DrainMs) ->
-    gen_server:start_link({local, Name}, ?MODULE,
-                          {Port, Handler, MaxConns, MaxPerIp, TrustedCidrs, DrainMs}, []).
+%% Whether Name is a listener name made by new_name/0.
+is_name({via, ?MODULE, Ref}) -> is_reference(Ref);
+is_name(_) -> false.
+
+%% The live connection owner of the listener named Name:
+%% {ok, Pid} | {error, nil} while none is running (stopped, or restarting).
+owner_pid({via, ?MODULE, Ref}) ->
+    case whereis_name(Ref) of
+        undefined -> {error, nil};
+        Pid -> {ok, Pid}
+    end.
+
+%% --- via registry (gen_server {via, Module, Name}) ---
+
+%% Register Pid as the owner for Ref. `no` while another live owner holds
+%% it: the listener's supervisor starts one owner at a time, so a second
+%% live owner is a bug and gen_server refuses to start it.
+register_name(Ref, Pid) when is_reference(Ref), is_pid(Pid) ->
+    case whereis_name(Ref) of
+        undefined ->
+            ok = persistent_term:put(?OWNER_KEY(Ref), Pid),
+            yes;
+        Live ->
+            brazier_log_ffi:error(<<"brazier.http_conns">>,
+                                 "owner ~p refused: ~p already owns the listener", [Pid, Live]),
+            no
+    end.
+
+%% gen_server calls this when the owner's init fails. Erases the entry only
+%% when it still names the caller, so a failed start cannot unregister an
+%% owner it never was.
+unregister_name(Ref) when is_reference(Ref) ->
+    Self = self(),
+    case persistent_term:get(?OWNER_KEY(Ref), undefined) of
+        Self -> true = persistent_term:erase(?OWNER_KEY(Ref));
+        _ -> false
+    end.
+
+%% The registered owner when it is alive, else `undefined`: an owner that
+%% exited stays in the table until its restart replaces it or forget_port/1
+%% erases it, and a dead pid must read as no owner (a gen_server:call then
+%% exits with noproc, as it does for an unregistered local name).
+whereis_name(Ref) when is_reference(Ref) ->
+    case persistent_term:get(?OWNER_KEY(Ref), undefined) of
+        undefined -> undefined;
+        Pid when is_pid(Pid) ->
+            case is_process_alive(Pid) of
+                true -> Pid;
+                false -> undefined
+            end
+    end.
+
+%% As global:send/2: a message to a name with no live owner exits with
+%% badarg instead of being dropped.
+send(Ref, Msg) when is_reference(Ref) ->
+    case whereis_name(Ref) of
+        undefined -> erlang:error(badarg, [Ref, Msg]);
+        Pid ->
+            Pid ! Msg,
+            Pid
+    end.
+
+start_link({via, ?MODULE, Ref} = Name, Port, Handler, MaxConns, MaxPerIp, TrustedCidrs, DrainMs)
+        when is_reference(Ref) ->
+    gen_server:start_link(Name, ?MODULE,
+                          {Ref, Port, Handler, MaxConns, MaxPerIp, TrustedCidrs, DrainMs}, []).
 
 %% Gleam supervision start shape: {ok, {started, Pid, Name}} | {error, StartError}.
 start_link_gleam(Name, Port, Handler, MaxConns, MaxPerIp, TrustedCidrs, DrainMs) ->
@@ -266,19 +343,19 @@ ws_count_for_ip(Conns, IpText) when is_binary(IpText) ->
 global_count(Tid) ->
     ets:lookup_element(Tid, global, 2).
 
-self_name() ->
-    {registered_name, Name} = process_info(self(), registered_name),
-    Name.
-
-%% Drop the remembered bound port of a listener that has been stopped for
-%% good. Returns true when an entry was removed.
-forget_port(Name) when is_atom(Name) ->
-    persistent_term:erase({?MODULE, bound_port, Name}).
+%% Drop the remembered bound port and the owner entry of a listener that
+%% has been stopped for good. Returns true when a bound port was removed.
+%% The owner entry is absent only when no owner ever started, which the
+%% caller sees as no bound port either.
+forget_port({via, ?MODULE, Ref}) when is_reference(Ref) ->
+    _ = persistent_term:erase(?OWNER_KEY(Ref)),
+    persistent_term:erase(?PORT_KEY(Ref)).
 
 %% --- gen_server ---
 
-init({Port, Handler, MaxConns, MaxPerIp, TrustedCidrs, DrainMs}) ->
+init({Ref, Port, Handler, MaxConns, MaxPerIp, TrustedCidrs, DrainMs}) ->
     process_flag(trap_exit, true),
+    true = is_reference(Ref),
     true = is_function(Handler, 1),
     true = is_integer(MaxConns) andalso MaxConns > 0,
     true = is_integer(MaxPerIp) andalso MaxPerIp > 0,
@@ -288,12 +365,12 @@ init({Port, Handler, MaxConns, MaxPerIp, TrustedCidrs, DrainMs}) ->
     true = is_integer(Port) andalso Port >= 0 andalso Port =< 65535,
     %% After a restart of this process, reuse the port that was actually
     %% bound the first time (the configured port may be 0).
-    BoundPort = persistent_term:get({?MODULE, bound_port, self_name()}, Port),
+    BoundPort = persistent_term:get(?PORT_KEY(Ref), Port),
     true = ets:insert(Tid, [{global, 0}, {port, BoundPort}]),
     brazier_log_ffi:info(<<"brazier.http_conns">>,
                         "started port=~p max_connections=~p max_connections_per_ip=~p drain_timeout_ms=~p",
                         [BoundPort, MaxConns, MaxPerIp, DrainMs]),
-    {ok, #{tid => Tid, handler => Handler, max => MaxConns, max_per_ip => MaxPerIp,
+    {ok, #{ref => Ref, tid => Tid, handler => Handler, max => MaxConns, max_per_ip => MaxPerIp,
            trusted => TrustedCidrs, drain_ms => DrainMs, children => #{}}}.
 
 handle_call({start_connection, Ip}, _From, State) ->
@@ -330,10 +407,10 @@ handle_call({start_connection, Ip}, _From, State) ->
     end;
 handle_call(get_port, _From, State = #{tid := Tid}) ->
     {reply, ets:lookup_element(Tid, port, 2), State};
-handle_call({set_listen_socket, Socket, Port}, _From, State = #{tid := Tid})
+handle_call({set_listen_socket, Socket, Port}, _From, State = #{ref := Ref, tid := Tid})
         when is_integer(Port), Port > 0 ->
     true = ets:insert(Tid, [{port, Port}, {listen_socket, Socket}]),
-    Key = {?MODULE, bound_port, self_name()},
+    Key = ?PORT_KEY(Ref),
     case persistent_term:get(Key, undefined) of
         Port -> ok;
         _ -> persistent_term:put(Key, Port)

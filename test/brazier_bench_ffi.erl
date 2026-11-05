@@ -7,7 +7,7 @@
 %% by a deadline.
 -export([now_us/0, now_ns/0, machine/0, load_average/0, utc_now/0,
          getenv/1, halt/1,
-         http_round/6, http_fetch/3, gunzip/1, ws_round/5, pubsub_fanout/5,
+         http_round/6, http_fetch/3, gunzip/1, ws_round/6, pubsub_fanout/5,
          presence_fill/5, presence_release/2, presence_round/5,
          gc/0, expect_empty_mailbox/1, isolated/2, vm_census/0]).
 
@@ -338,12 +338,14 @@ read_body(_Socket, _Body, Have, Length, _Mode, _TimeoutMs) ->
 %% events one at a time and timing each from its send to the patch that
 %% acknowledges it (brazier_stress_ffi checks every answer). All
 %% connections join before any sends, so the round times only events.
-%% Every connection closes with the 1000 handshake afterwards.
+%% Every connection closes with the 1000 handshake afterwards. Each join
+%% carries Build (`{some, Hash}`), the page build a page rendered by this
+%% server sends, so the bench joins as a real client does.
 %% {ok, {ElapsedUs, LatenciesUs}} | {error, Reason}.
-ws_round(Host, Port, Conns, Events, TimeoutMs) ->
+ws_round(Host, Port, Conns, Events, Build, TimeoutMs) ->
     Parent = self(),
     Go = make_ref(),
-    Pids = [spawn_monitor(fun() -> ws_client(Parent, Go, Host, Port, Events, TimeoutMs) end)
+    Pids = [spawn_monitor(fun() -> ws_client(Parent, Go, Host, Port, Events, Build, TimeoutMs) end)
             || _ <- lists:seq(1, Conns)],
     case await_joined(Pids, TimeoutMs) of
         ok ->
@@ -361,8 +363,8 @@ ws_round(Host, Port, Conns, Events, TimeoutMs) ->
             {error, Reason}
     end.
 
-ws_client(Parent, Go, Host, Port, Events, TimeoutMs) ->
-    case brazier_stress_ffi:connect_and_join(Host, Port, 0, TimeoutMs) of
+ws_client(Parent, Go, Host, Port, Events, Build, TimeoutMs) ->
+    case brazier_stress_ffi:connect_and_join(Host, Port, 0, Build, TimeoutMs) of
         {ok, {Conn, 0}} ->
             Parent ! {self(), joined},
             receive Go -> ok end,

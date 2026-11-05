@@ -29,7 +29,7 @@ start_link_gleam(ConnsName, NumAcceptors) ->
     end.
 
 init({ConnsName, NumAcceptors}) ->
-    true = is_atom(ConnsName),
+    true = brazier_http_conns:is_name(ConnsName),
     true = is_integer(NumAcceptors) andalso NumAcceptors > 0,
     case brazier_http_conns:listen_socket(ConnsName) of
         {ok, ListenSocket} ->

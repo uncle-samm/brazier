@@ -14,9 +14,74 @@
   - **Resolution:** how it was fixed (fill in when resolved)
 -->
 
+- **Issue:** `brazier/internal/url.is_url_attribute` lowercases every
+  attribute name with `string.lowercase`. On Erlang, OTP's
+  `string:lowercase/1` raises and catches an exception inside for a name
+  that is already lowercase, about 0.1 µs a name, and `attribute.attribute`
+  pays it once per attribute it builds (`url.check`). The render's name
+  policy had the same cost twice per attribute and now lowercases `A-Z`
+  itself (`brazier_render_ffi:ascii_lowercase`), which took 13% off a
+  1000-row render with the other fix of Milestone 118's SSR work.
+  - **Context:** Milestone 118, m118-perf-server, profiling `ssr.rows_1000`
+    (docs/PERFORMANCE.md, "Growth with size").
+  - **Files:** `src/brazier/internal/url.gleam`,
+    `src/brazier_render_ffi.erl`, `src/brazier_render_ffi.mjs`
+  - **Attempted:** nothing in url.gleam: it was outside that agent's files.
+    The names it lowercases come from `attribute.attribute`, which has
+    already passed them through the ASCII-only markup name check, so
+    `render.ascii_lowercase` (made public, or moved to a shared internal
+    module) gives the same result; `render_js_test` already compares the
+    two targets on `url.check`.
+
+- **Issue:** `presence.list` grows faster than the room past about 10,000
+  entries: 0.46 µs an entry at 3,000, 0.61 at 10,000 and 0.92 to 1.13 at
+  30,000. Every `brazier.presence` session that starts following a topic
+  pays one list, so a join into a 30,000-entry room costs about 30 ms of
+  the watcher's time.
+  - **Context:** Milestone 118, m118-perf-server, `presence.list.10000`
+    at about 5.9 ms (docs/PERFORMANCE.md, "`presence.list.10000`").
+  - **Files:** `src/brazier/presence.gleam`,
+    `src/brazier_presence_ffi.erl`, `src/brazier_presence_shard.erl`
+  - **Attempted:** a profile shows the ETS copy and the JSON decode flat
+    per entry and the growth in collecting the caller's heap. Neither a
+    one-pass decode-and-group nor reading in 256-row chunks gained more
+    than 4 to 6%, so neither shipped. What is left changes what a list
+    returns or what the shards store, for the design to decide. One
+    option is metas kept as terms for this node's entries, decoded once
+    at track: no decode on read, but the shard row grows and remote
+    entries still decode. Another is a list that hands the caller one
+    chunk of entries at a time.
+
 ## Resolved Issues
 
 <!-- Move resolved issues here with full resolution details -->
+
+- **Issue:** every bench suite run after the first left 7 more atoms in
+  the atom table. Listing the atoms each run creates (by index) showed all
+  7 were `brazier_http_conns_<N>`: `brazier_http_conns:new_name/0` named
+  each listener's connection owner with a fresh atom, one per listener
+  start, and the suite starts 7 listeners. Atoms are never collected, so a
+  node that starts and stops listeners (a test suite, a bench, an app that
+  restarts its listener) grew its atom table without bound.
+  - **Files:** `src/brazier_http_conns.erl`,
+    `src/brazier/transport/server.gleam`,
+    `src/brazier_http_listen_socket.erl`,
+    `src/brazier_http_acceptors_sup.erl`, `src/brazier_server_ffi.erl`
+  - **Resolution:** (Milestone 118, m118-perf-server) The owner's name is
+    `{via, brazier_http_conns, Ref}` for a fresh reference, and
+    `brazier_http_conns` is the via registry: the owner's pid sits in a
+    persistent_term keyed by Ref, beside the bound port the listener
+    already kept there, and `forget_port/1` (run by `server.stop`) erases
+    both. A pid fits in one machine word, so an owner restart (which
+    replaces it) or a stop (which erases it) runs no global GC. A dead
+    owner reads as none, so a call to a restarting listener exits with
+    `noproc` as it did for an unregistered atom. This is Ranch's pattern:
+    `ranch_server` registers a listener's connection supervisor under the
+    listener's Ref instead of an atom. The suite census now shows no new
+    atom after the first run. `test/brazier/listener_name_test.gleam`
+    checks that 10 start/stop cycles create no atom and leave no registry
+    entry, and covers the registry's refusals (a second live owner, a dead
+    owner, a send with no owner, an unregister by another process).
 
 - **Issue:** an `init` refusing with 401 closes with 4401, the code of a
   revoked session or expired authentication, so the two are told apart only
@@ -154,6 +219,14 @@
     warning, later joins on that connection log at debug. A new connection
     warns again. `test/brazier/join_build_test.gleam` captures the log of
     two joins on one connection and asserts one warning.
+    The ws bench (`test/brazier/bench/suite.gleam`) logged that warning on
+    every connection, and its joins were not the ones a real client sends.
+    It now joins with the hash of the bundle the listener loaded
+    (`ssr.client_bundle`), as a page rendered by that server does, so the
+    server checks the build on each join and logs nothing. The bench fails
+    by name if no bundle is loaded. `brazier/stress` still joins without a
+    build: it may drive a server in another VM, whose bundle it cannot
+    know.
 
 - **Issue:** the client manifest had two readers (`ssr` for the page and
   `transport.check_join_build` for the join), and the join read it from

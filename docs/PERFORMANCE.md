@@ -48,6 +48,22 @@ headers against the probe. A wrong answer fails the run with a reason.
 
 The HTTP scenarios run 15 measured rounds after 2 warm-up rounds. A round takes 0.1 to 0.5 s, so a burst of outside load must last several seconds to cover the eight rounds that move a median.
 
+`ws.100x200` follows the same rule with 15 rounds; it ran 5 until
+Milestone 118. One round is 20,000 events in about 0.3 s, so at 5 rounds
+three slow rounds, under a second of outside load, moved the median. Its
+gated p99 (the median over rounds of each round's p99), measured over
+repeated scenarios back to back at a load average of 14 to 29:
+
+| Rounds | Scenarios × batches | Spread of the gated p99 | Seconds per scenario |
+|--------|---------------------|-------------------------|----------------------|
+| 5      | 7 × 2, 9 × 2        | 9.5%, 10.3%, 13.7%, 20.6% | 1.8 |
+| 10     | 7 × 1               | 12.2%                   | 3.4 |
+| 15     | 9 × 2               | 4.5%, 6.7%              | 4.9 |
+| 20     | 7 × 1               | 7.2%                    | 6.5 |
+
+Single rounds ranged from 2.8 to 4.8 ms in those runs. 15 rounds halve the
+spread for 3 s more per suite run; 20 buy nothing more.
+
 | Scenario | Load | Metrics |
 |----------|------|---------|
 | http | 8 keep-alive clients, 2000 requests per round against `/bench`, a 2-byte answer | requests/s and per-request p50/p99, each the median over rounds |
@@ -55,7 +71,7 @@ The HTTP scenarios run 15 measured rounds after 2 warm-up rounds. A round takes 
 | gzip | A 100 KB HTML body through `middleware.compress` with `Accept-Encoding: gzip`, 8 clients × 100. The probe gunzips the body, compares it with the original and checks it compressed to under half. | requests/s and per-request p50/p99, each the median over rounds |
 | ssr | `ssr.render_page` of a 100-row (8 × 800 requests) and a 1000-row (8 × 50) view with a click handler per row, as `brazier.start` serves the first page. The probe checks every row and the client bundle's script tag. | requests/s and per-request p50/p99, each the median over rounds |
 | ssr stream | `ssr.stream_300`: as `ssr`, for a page whose `init` fills a `KeepLast(300)` stream with 300 lines of 1 KB text and a click handler each (8 × 50). The probe checks the 300 item keys, in order, and the client bundle's script tag. | requests/s and per-request p50/p99, each the median over rounds |
-| ws | N joined connections × 200 events each, for N = 1, 10, 100, in 25, 15 and 5 measured rounds. Each event is timed from its send to the patch that acknowledges its clock. | events/s and per-event p50/p99, each the median over rounds |
+| ws | N joined connections × 200 events each, for N = 1, 10, 100, in 25, 15 and 15 measured rounds. Every join carries the build id of the bundle the listener serves, as a page rendered by that server sends it. Each event is timed from its send to the patch that acknowledges its clock. | events/s and per-event p50/p99, each the median over rounds |
 | runtime | Events pushed straight into a runtime actor holding a 200-item model, 2000 per round. `changed`: every event changes the model and gets a patch. `unchanged`: none does, and each gets an empty acknowledgement. | pipelined µs/event (median of rounds); p50/p99 of one event at a time, by round |
 | runtime list | As `runtime` `changed`, against a model whose list encodes to about 50 KB (1000 items, 200 events per round, 1000 sequential) and 500 KB (10000 items, 40 per round, 300 sequential). Each event changes one field, so the metric is the cost of the work done on the whole model. | pipelined µs/event (median of rounds); p50/p99 of one event at a time, by round |
 | runtime stream | Events pushed straight into a runtime actor whose `KeepLast(300)` stream of 1 KB lines is full from the join on, 1000 per round after one warm-up round, then 1000 sequential. `append`: each event appends a line, so its frame carries one insert at 299 and the trim of the oldest line. `chunk`: each event re-inserts the last line with 100 more bytes, an update in place with no delete. Every event must be acknowledged by its own patch, in clock order, and each patch's `streams` field is decoded and checked against the event's change after the timer stops. | pipelined µs/event (median of rounds); p50/p99 of one event at a time, by round |
@@ -286,11 +302,70 @@ Some notes on reading the numbers:
   both the old and the new frame, is not in the metric. The flat encoding
   these rows replaced measured 117 µs per 50 KB `model_sync` and about
   1 µs per patch.
-- **Growth with size.** SSR and the node client both scale linearly with
-  rows: `ssr.rows_1000` is about 8 ms a page against 1 ms at 100 rows,
-  and `client.patch.rows_1000` about 2.8 ms. `presence.list.10000` is
-  about 5.9 ms, a full copy of 10,000 presences, while `track` and
-  `untrack` stay flat at 4 to 6 µs.
+- **Growth with size.** The table's `ssr.rows_1000` (about 8 ms a page
+  against 1 ms at 100 rows) was superlinear. A single-process profile of
+  the page (2026-11-05, a loaded machine) put the render at 0.3 ms for
+  100 rows, 4 ms for 1000 and 110 ms for 10,000: 14x, then 28x, for 10x
+  the rows, while every function's call count grew linearly. The growth
+  was `string_tree.to_string`, which is `unicode:characters_to_binary`:
+  on the deep left-nested iolist a render builds it costs 0.017 µs a
+  piece at 3,000 pieces, 0.028 at 30,000 and 0.121 at 300,000, where
+  `iolist_to_binary` stays at 0.011 to 0.015. A render's tree holds only
+  Gleam strings, which are UTF-8 already, so the walk now ends with
+  `iolist_to_binary` (`brazier_render_ffi:iodata_to_string`). The second
+  cost was OTP's `string:lowercase/1`, which raises and catches an
+  exception inside for a name that is already lowercase: about 0.1 µs a
+  name, 13% of the render, paid twice per attribute. The attribute name
+  policy now lowercases `A-Z` itself; `brazier/internal/url` still calls
+  `string.lowercase` once per attribute (a follow-up in docs/TODO.md).
+  After both, the same profile renders 100, 1000 and 10,000 rows in
+  0.25, 3.0 and 45 ms: 12x, then 15x, the rest being garbage collection
+  of the bigger heap. In `http_bench`, three runs each, interleaved on
+  the same loaded machine: `ssr.rows_1000` went from 913 to 929 req/s
+  (p50 8.2 to 8.4 ms) to 1146 to 1195 req/s (p50 6.5 to 6.7 ms), about
+  28% more pages; `ssr.rows_100` did not move outside its noise (8650 to
+  9890 req/s either way) and `ssr.stream_300` rose about 3% (826 to 838
+  req/s, then 850 to 866). `ssr.stream_300` is linear: of its 5.4 ms
+  single-process page, the 300 items cost about 1 to 2.5 µs per KB in
+  each of escaping, decoding the item JSON back (the check that the
+  stream's encoder and decoder agree) and its UTF-8 check in
+  `gleam/dynamic/decode`, and encoding the join's JSON.
+  `client.patch.rows_1000` is about 2.8 ms.
+- **`presence.list.10000`** is about 5.9 ms, while `track` and `untrack`
+  stay flat at 4 to 6 µs. A list copies every row of the topic out of
+  the shard's ETS table into the caller and decodes each meta, which is
+  Phoenix's pattern too: `Phoenix.Tracker.list` is one `:ets.select` of
+  the topic and `Phoenix.Presence.list` groups the result by key. Phoenix
+  keeps metas as terms; Brazier keeps the JSON it replicates and decodes
+  it with the tracker's decoder on read, the type check on metas that
+  came from other nodes. A single-process profile (2026-11-05, load 6 to
+  9), median of 21 fresh processes, in µs per entry:
+
+  | Entries | `ets:select` | `json.parse` | `list` | `list`, heap that never collects |
+  |---------|------|------|------|------|
+  | 3,000 | 0.21 | 0.16 | 0.46 | 0.35 |
+  | 10,000 | 0.42 to 0.53 | 0.17 | 0.61 to 0.63 | 0.38 to 0.40 |
+  | 30,000 | 0.38 | 0.19 | 0.92 to 1.13 | 0.45 to 0.51 |
+
+  With a heap big enough to never collect, every stage stays near flat
+  per entry, the select at 0.13 to 0.21 µs and the decode at 0.11 (OTP's
+  `json:decode` alone is 0.05; the rest is gleam_json's wrapper and the
+  decoder). What grows is the collection of the caller's heap as the
+  10,000 entries' 340,000 words land on it, about a third of the list at
+  10,000 entries and half of it at 30,000. Two changes measured no real
+  gain, so neither shipped. Grouping and decoding in one pass instead of
+  `try_map`, `chunk` and `map` gave no difference outside the noise.
+  Reading the topic in chunks of 256 rows (`ets:select/3`), decoding each
+  before reading the next so the raw rows of the whole room are never
+  live at once, cut a list's minor collections from 8 to 3. Yet in four
+  interleaved A/B runs against the old code it was 5.5 to 5.9 ms against
+  5.9 to 6.1, 4 to 6%, and the heap after a list was the same 196,650
+  words, as the result itself is most of it. A `brazier.presence`
+  watcher lists a topic once when its session starts following it and
+  again to reconcile after a shard restart, and otherwise applies diffs,
+  as a Phoenix channel pushes `presence_state` once on join and then
+  diffs. So the list cost is paid per join, not per change. The open
+  issue is in docs/TODO.md.
 - **Repeated p50 values.** On Darwin, `erlang:monotonic_time` ticks at
   about 41.67 ns, so every timing is a whole number of ticks. A
   percentile taken over thousands of samples from a tight distribution

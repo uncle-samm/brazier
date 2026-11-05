@@ -252,11 +252,7 @@ pub fn render_containers(
   // never fails.
   let assert [] = done.faults
     as "brazier/internal/render: an empty render recorded a fault"
-  #(
-    string_tree.to_string(done.html),
-    done.handlers,
-    list.reverse(done.containers),
-  )
+  #(tree_to_string(done.html), done.handlers, list.reverse(done.containers))
 }
 
 /// Render a tree to HTML, each stream container holding the HTML `fill`
@@ -271,7 +267,7 @@ pub fn render_filled(
 ) -> Result(String, String) {
   let done = walk(node, "0", View(fill: fill), new_walk())
   case done.faults {
-    [] -> Ok(string_tree.to_string(done.html))
+    [] -> Ok(tree_to_string(done.html))
     faults -> Error(string.join(list.reverse(faults), "; "))
   }
 }
@@ -313,7 +309,7 @@ pub fn render_item(
             )
           let done = walk(keyed, "i0", InItem, new_walk())
           case done.faults {
-            [] -> Ok(#(string_tree.to_string(done.html), done.handlers))
+            [] -> Ok(#(tree_to_string(done.html), done.handlers))
             faults -> Error(prefix <> string.join(list.reverse(faults), "; "))
           }
         }
@@ -354,6 +350,18 @@ type Walk(msg) {
     containers: List(Container(msg)),
     faults: List(String),
   )
+}
+
+/// The HTML a walk built. A walk appends only strings to its tree.
+///
+/// On Erlang a `StringTree` of strings is an iolist of UTF-8 binaries, and
+/// `brazier_render_ffi:iodata_to_string` flattens it without checking the
+/// UTF-8 again. `string_tree.to_string` checks it, and on a big page that
+/// check grows faster than the page (10,000 rows rendered in 110 ms with
+/// it, 45 ms without). On JavaScript a tree is already a string.
+@external(erlang, "brazier_render_ffi", "iodata_to_string")
+fn tree_to_string(tree: StringTree) -> String {
+  string_tree.to_string(tree)
 }
 
 fn new_walk() -> Walk(msg) {
@@ -661,7 +669,7 @@ fn append_events(
 /// - `stream_attribute` (`data-brazier-stream`), which only a stream's
 ///   container carries.
 pub fn is_valid_attribute_name(name: String) -> Bool {
-  is_markup_name(name) && !is_refused_name(string.lowercase(name))
+  is_markup_name(name) && !is_refused_name(ascii_lowercase(name))
 }
 
 /// The attribute that marks a stream's container. Only the render of a
@@ -682,7 +690,7 @@ pub const stream_attribute = "data-brazier-stream"
 pub fn is_allowed_attribute(name: String, value: String) -> Bool {
   is_markup_name(name)
   && {
-    let lower = string.lowercase(name)
+    let lower = ascii_lowercase(name)
     !is_refused_name(lower)
     && !{
       lower == "attributename"
@@ -711,6 +719,18 @@ pub fn is_valid_tag_name(tag: String) -> Bool {
 pub fn is_valid_event_name(name: String) -> Bool {
   is_event_name(name)
 }
+
+/// `name` with `A-Z` lowercased and every other byte (code unit on
+/// JavaScript) unchanged. A name without `A-Z` is returned as it is.
+///
+/// Callers pass names `is_markup_name` accepted, which are ASCII, so this is
+/// `string.lowercase` for them. It runs for every attribute of every render;
+/// on Erlang `string.lowercase` (OTP's `string:lowercase/1`) raises and
+/// catches an exception internally for each name that is already lowercase,
+/// which costs about 0.1 µs a name.
+@external(erlang, "brazier_render_ffi", "ascii_lowercase")
+@external(javascript, "../../brazier_render_ffi.mjs", "ascii_lowercase")
+fn ascii_lowercase(name: String) -> String
 
 /// One or more of `a-z A-Z 0-9 - _ : .`, scanned byte by byte (code unit by
 /// code unit on JavaScript): every non-ASCII character refuses the name.

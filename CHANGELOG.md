@@ -427,6 +427,13 @@ open follow-ups), which is in progress.
 
 ### Changed
 
+- (M118 perf-server) Server-side rendering of large pages is faster: the
+  render flattens its output with `iolist_to_binary` and lowercases
+  attribute names without OTP `string:lowercase` (`ssr.rows_1000`: about
+  920 to about 1170 req/s).
+- (M118 perf-server) Bench: ws joins carry the client bundle's build id,
+  so the bench no longer logs "carries no build id" on every join, and
+  `ws.100x200` runs 15 measured rounds instead of 5 for a steadier p99.
 - (M118 perf-client) The client renders after an event only when the event
   changed the model or the local state. A Msg only the server handles waits
   for the server's patch or ack instead of re-rendering and morphing an
@@ -726,6 +733,12 @@ open follow-ups), which is in progress.
   the touched tests carries an `as` message.
 
 ### Fixed
+
+- (M118 perf-server) Starting a listener no longer creates an atom: its
+  connection owner is named by a reference (`{via, brazier_http_conns,
+  Ref}`, as Ranch keys listeners), held in a `persistent_term` registry
+  that is cleared when the listener stops. A node that starts and stops
+  listeners no longer grows its atom table.
 
 - (M118 backpressure) A dead connection read as 1000000000 queued
   messages, and a slow one was closed again, with another warning, on

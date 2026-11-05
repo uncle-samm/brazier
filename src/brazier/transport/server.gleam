@@ -259,7 +259,9 @@ pub fn default_listener_options(port: Int) -> ListenerOptions {
   )
 }
 
-/// Registered name of a listener's connection owner (an Erlang atom).
+/// Name of a listener's connection owner: `{via, brazier_http_conns, Ref}`,
+/// a reference rather than an atom, so starting a listener creates no atom
+/// (see `brazier_http_conns:new_name/0`).
 type ConnsName
 
 /// A running listener.
@@ -584,7 +586,7 @@ fn ffi_conns_ws_count_for_ip(name: ConnsName, address: String) -> Int
 @external(erlang, "brazier_http_conns", "children")
 fn ffi_conns_children(name: ConnsName) -> List(process.Pid)
 
-@external(erlang, "brazier_server_ffi", "whereis")
+@external(erlang, "brazier_http_conns", "owner_pid")
 fn ffi_whereis(name: ConnsName) -> Result(process.Pid, Nil)
 
 @external(erlang, "brazier_server_ffi", "stop_supervisor")

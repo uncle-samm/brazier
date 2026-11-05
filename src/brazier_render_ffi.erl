@@ -13,7 +13,8 @@
 %% that a combining mark follows.
 -module(brazier_render_ffi).
 
--export([is_markup_name/1, is_event_name/1, escape_html/1, escape_attr/1, identity/1]).
+-export([is_markup_name/1, is_event_name/1, ascii_lowercase/1, escape_html/1, escape_attr/1,
+         identity/1, iodata_to_string/1]).
 
 -define(IS_ALNUM(C),
     ((C >= $a andalso C =< $z) orelse
@@ -46,6 +47,25 @@ event_bytes(<<C, Rest/binary>>) when ?IS_ALNUM(C) orelse C =:= $- orelse C =:= $
     event_bytes(Rest);
 event_bytes(_) ->
     false.
+
+%% `Name` with `A-Z` lowercased, every other byte unchanged. A name with no
+%% `A-Z` is returned as it is, without a copy. Unlike `string:lowercase/1`,
+%% which raises and catches an exception for every name that is already
+%% lowercase, this only scans bytes; it is the same for the ASCII names
+%% `is_markup_name/1` accepts.
+-spec ascii_lowercase(binary()) -> binary().
+ascii_lowercase(Name) ->
+    case has_upper(Name) of
+        false -> Name;
+        true -> << <<(lower_byte(C))>> || <<C>> <= Name >>
+    end.
+
+has_upper(<<>>) -> false;
+has_upper(<<C, _/binary>>) when C >= $A, C =< $Z -> true;
+has_upper(<<_, Rest/binary>>) -> has_upper(Rest).
+
+lower_byte(C) when C >= $A, C =< $Z -> C + 32;
+lower_byte(C) -> C.
 
 %% Escape `&`, `<` and `>`.
 -spec escape_html(binary()) -> binary().
@@ -87,3 +107,14 @@ attr(<<>>, Text, Skip, Len, Acc) ->
 %% container's `item_ref`, compared and never called.
 -spec identity(term()) -> term().
 identity(Value) -> Value.
+
+%% The string a render's `StringTree` holds. The tree is built only from
+%% Gleam strings, which are UTF-8 binaries, so it is an iolist of valid
+%% UTF-8 and `iolist_to_binary/1` gives the same bytes as
+%% `string_tree.to_string` (`unicode:characters_to_binary/1`) without
+%% validating them again. On the deep left-nested iolist a walk builds,
+%% `characters_to_binary` grows faster than the tree: 0.017 µs a piece at
+%% 3,000 pieces, 0.121 µs at 300,000, where `iolist_to_binary` stays at
+%% 0.011 to 0.015 µs (docs/PERFORMANCE.md, "Growth with size").
+-spec iodata_to_string(iodata()) -> binary().
+iodata_to_string(Tree) -> iolist_to_binary(Tree).
