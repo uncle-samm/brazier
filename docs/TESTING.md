@@ -86,7 +86,7 @@ busy loops never trip it.
 | `watch_info(pid, atom)` + `expect_info` | Wait for an OTP process to receive and handle a timer tick (through the sys debug hook) instead of sleeping past its interval. |
 | `watch_exit(sup, child)` + `expect_info` | Wait for a supervisor to handle a child's exit, i.e. to have restarted it. |
 | `watch_pg_scope` + `expect_pg_leave` | Wait for pg to drop an exited member before reading group membership. |
-| `until_telemetry(events, what, condition)` | Re-check state that another process updates and then announces with a telemetry event (e.g. an HTTP slot released before `[brazier, http, connection, closed]`). |
+| `until_telemetry(events, what, condition)` | Re-check state that another process updates and then announces with a telemetry event (e.g. an HTTP slot released before `[brazier, http, connection, closed]`). It can leave residue (see [Mailbox residue](#mailbox-residue)). |
 
 A bounded wait for *nothing* to arrive is still a time window. Use one
 only after a barrier proves that the work which could produce the
@@ -104,9 +104,12 @@ make that state happen rather than waiting for it:
 | Something must happen after a message has arrived | `erlang:trace(Pid, true, ['receive'])` and wait for the trace message. | `sweep_of_an_owner_that_dies_mid_call_is_a_call_failure_test` kills the owner once the call is in its mailbox |
 | A client must be slow (slowloris) | Send a byte each time `gen_tcp:recv` times out, until the server answers. | `slow_headers_get_408_test` (`drip_until_answer`) |
 | A process must have handled earlier messages | `await.barrier`. | see the table above |
+| A supervisor must not restart a child yet | `sys:suspend` the supervisor, kill the child, wait for the child's `DOWN`, act, then `sys:resume` and `watch_exit` + `barrier` for the restart. | `pubsub_restart_race_test` ("down" holds) |
+| A process must be caught at one point inside a function (a race window) | Block multi-scheduling, have the process `erlang:yield()` and then `erlang:bump_reductions(4000 - Budget)`, and suspend it when it is scheduled out; budgets 1, 2, ... stop it at every call in turn. Trace calls to read where it stopped, but never put a trace pattern on a BIF inside the window: it takes away the scheduling point before that call. | `pubsub_restart_race_test` |
 
-The fixtures for these are in `test/brazier_rate_limit_test_ffi.erl` and
-`test/brazier_http_raw_ffi.erl`.
+The fixtures for these are in `test/brazier_rate_limit_test_ffi.erl`,
+`test/brazier_http_raw_ffi.erl` and
+`test/brazier_pubsub_restart_race_test_ffi.erl`.
 
 Example: a runtime test, connected through a fake transport subject:
 
@@ -151,7 +154,16 @@ means asserting on the messages it ignored:
   an ack, an empty `SendPatch(ops_json: "[]", ..)`. Expect the ack, and
   any `SendError`, after the frame under test.
 - A telemetry handler forwards every matching event. Receive one per
-  action that emits it, not only the first.
+  action that emits it, not only the first. Telemetry events are
+  node-wide, so forward only those emitted by the processes under test (a
+  handler runs in the emitting process): `connection_events` in
+  `http_server_test` forwards only its listener's acceptors and connection
+  owner.
+- `await.until_telemetry` stops at the first event after which its
+  condition holds, and an event emitted between that check and the detach
+  is left behind. Where every event can be named, receive each one instead.
+- A socket the test closes is done when its connection's close notice
+  (`ClosedConn`) has arrived, not when `close` returns.
 
 A message that arrives only after its test has ended is blamed on the
 test that is running then. When a failure names messages that test could

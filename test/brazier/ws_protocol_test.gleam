@@ -336,6 +336,19 @@ fn assert_closed_with(probe: Probe, server: Server, code: Int) -> Nil {
   raw_close(probe.socket)
 }
 
+/// Close the client side and wait until the server has run `on_close` for
+/// this connection, so the notice is received here and not left for the
+/// next test. The handler dispatches its events and then runs `on_close`
+/// from the same process, so once a test has received every event it
+/// caused, the notice is the next observation.
+fn close(server: Server, probe: Probe) -> Nil {
+  raw_close(probe.socket)
+  let assert Ok(ClosedConn(closed)) = process.receive(server.observer, 5000)
+    as "on_close must run"
+  let assert True = closed == probe.conn_id
+  Nil
+}
+
 fn event_json(handler_id: String) -> String {
   "{\"type\":\"event\",\"name\":\"click\",\"handler_id\":\""
   <> handler_id
@@ -503,7 +516,7 @@ pub fn ping_is_answered_with_matching_pong_test() {
   let assert Ok(Nil) =
     raw_send(probe.socket, masked_frame(1, 9, <<"abc":utf8>>))
   let assert Ok(#(10, <<"abc":utf8>>)) = raw_recv_frame(probe.socket, 3000)
-  raw_close(probe.socket)
+  close(server, probe)
 }
 
 pub fn fragmented_message_with_interleaved_ping_is_reassembled_test() {
@@ -520,7 +533,7 @@ pub fn fragmented_message_with_interleaved_ping_is_reassembled_test() {
     raw_send(probe.socket, masked_frame(1, 0, <<"eat\"}":utf8>>))
   let assert Ok(#(10, <<"mid":utf8>>)) = raw_recv_frame(probe.socket, 3000)
   let assert "{\"type\":\"heartbeat_ack\"}" = recv_text(probe.socket)
-  raw_close(probe.socket)
+  close(server, probe)
 }
 
 pub fn state_frames_embed_model_and_ops_raw_on_the_socket_test() {
@@ -551,7 +564,7 @@ pub fn state_frames_embed_model_and_ops_raw_on_the_socket_test() {
     == "{\"type\":\"patch\",\"ops\":"
     <> ops_json
     <> ",\"version\":5,\"ack_clock\":3}"
-  raw_close(probe.socket)
+  close(server, probe)
 }
 
 pub fn many_frames_in_one_tcp_segment_are_all_processed_test() {
@@ -571,7 +584,7 @@ pub fn many_frames_in_one_tcp_segment_are_all_processed_test() {
       id
     })
   let assert ["one", "two", "three"] = ids
-  raw_close(probe.socket)
+  close(server, probe)
 }
 
 // --- Handshake validation ---
@@ -666,7 +679,7 @@ pub fn forwarded_https_from_trusted_proxy_matches_https_origin_test() {
     |> with_header("X-Forwarded-Proto", "https")
     |> with_header("Origin", "https://" <> host_header(server.port))
   let probe = open_with(server, headers)
-  raw_close(probe.socket)
+  close(server, probe)
 }
 
 /// Behind a proxy that sets `Forwarded`, its `proto=` is the scheme, and an
@@ -684,7 +697,7 @@ pub fn forwarded_proto_from_trusted_proxy_decides_the_origin_scheme_test() {
     |> with_header("Forwarded", "for=203.0.113.7;proto=https")
     |> with_header("Origin", https_origin)
   let probe = open_with(server, headers)
-  raw_close(probe.socket)
+  close(server, probe)
   let spoofed =
     upgrade_headers(server.port)
     |> with_header("Forwarded", "for=203.0.113.7;proto=http")
@@ -715,7 +728,7 @@ pub fn invalid_forwarded_proto_from_untrusted_peer_is_ignored_test() {
   let headers =
     with_header(upgrade_headers(server.port), "X-Forwarded-Proto", "gopher")
   let probe = open_with(server, headers)
-  raw_close(probe.socket)
+  close(server, probe)
 }
 
 /// Behind a trusted proxy the per-IP cap counts the forwarded client, not
@@ -727,10 +740,9 @@ pub fn per_ip_slot_uses_forwarded_client_behind_trusted_proxy_test() {
   let probe = open_with(server, headers)
   let assert 1 = ws_slots(server, "203.0.113.7")
   let assert 0 = ws_slots(server, host)
-  raw_close(probe.socket)
   // cleanup_connection releases the slot (a synchronous ETS update) before
   // it calls on_close, so once on_close has run the count is final.
-  let assert True = await_closed(server.observer, probe.conn_id)
+  close(server, probe)
   let assert 0 = ws_slots(server, "203.0.113.7")
 }
 
@@ -743,7 +755,7 @@ pub fn per_ip_slot_ignores_spoofed_forwarded_for_test() {
   let probe = open_with(server, headers)
   let assert 1 = ws_slots(server, host)
   let assert 0 = ws_slots(server, "198.51.100.9")
-  raw_close(probe.socket)
+  close(server, probe)
 }
 
 pub fn allow_listed_origin_is_accepted_test() {
@@ -759,7 +771,7 @@ pub fn allow_listed_origin_is_accepted_test() {
       "https://app.example.com",
     )
   let probe = open_with(server, headers)
-  raw_close(probe.socket)
+  close(server, probe)
 }
 
 /// Invalid limits are refused when the listener starts, so a misconfigured
@@ -800,9 +812,8 @@ pub fn per_ip_cap_rejects_with_429_and_releases_slots_test() {
   // A rejection must not leak a slot.
   let assert 2 = ws_slots(server, host)
   // Closing one connection frees its slot for a new one.
-  raw_close(first.socket)
   // The slot is released before on_close runs, so the count is final.
-  let assert True = await_closed(server.observer, first.conn_id)
+  close(server, first)
   let assert 1 = ws_slots(server, host)
   let fourth = open(server)
   let assert 2 = ws_slots(server, host)
@@ -830,8 +841,9 @@ pub fn killed_handler_releases_its_slot_test() {
   // The freed slot admits a new connection under the cap of one.
   let next = open(test_server)
   let assert 1 = ws_slots(test_server, host)
+  // The killed handler ran no cleanup, so only `next` reports on_close.
   raw_close(probe.socket)
-  raw_close(next.socket)
+  close(test_server, next)
 }
 
 /// Each listener counts its own WebSockets: a cap reached on one does not
@@ -845,8 +857,8 @@ pub fn listeners_count_slots_apart_test() {
   let b = open(second)
   let assert 1 = ws_slots(first, host)
   let assert 1 = ws_slots(second, host)
-  raw_close(a.socket)
-  raw_close(b.socket)
+  close(first, a)
+  close(second, b)
 }
 
 // --- Liveness ---
@@ -876,7 +888,7 @@ pub fn answered_pings_keep_connection_alive_test() {
   let probe = open(server)
   answer_pings(probe.socket, 6)
   let assert True = process.is_alive(probe.handler)
-  raw_close(probe.socket)
+  close(server, probe)
 }
 
 fn answer_pings(socket: RawSocket, remaining: Int) -> Nil {
@@ -947,7 +959,7 @@ pub fn heartbeats_count_as_activity_test() {
     process.sleep(550)
   })
   let assert True = process.is_alive(probe.handler)
-  raw_close(probe.socket)
+  close(server, probe)
 }
 
 // --- Backpressure ---
@@ -1029,7 +1041,7 @@ pub fn batch_of_100_events_counts_as_100_test() {
   send_text(probe.socket, event_json("after"))
   let assert transport.ClientEvent(handler_id: "after", ..) =
     next_event(server.observer)
-  raw_close(probe.socket)
+  close(server, probe)
 }
 
 pub fn batches_share_the_per_second_budget_test() {
@@ -1047,7 +1059,7 @@ pub fn batches_share_the_per_second_budget_test() {
   send_text(probe.socket, event_json("after"))
   let assert transport.ClientEvent(handler_id: "after", ..) =
     next_event(server.observer)
-  raw_close(probe.socket)
+  close(server, probe)
 }
 
 pub fn oversized_batch_is_rejected_test() {
@@ -1062,7 +1074,7 @@ pub fn oversized_batch_is_rejected_test() {
   send_text(probe.socket, event_json("after"))
   let assert transport.ClientEvent(handler_id: "after", ..) =
     next_event(server.observer)
-  raw_close(probe.socket)
+  close(server, probe)
 }
 
 pub fn decode_error_flood_closes_1008_test() {
@@ -1085,7 +1097,7 @@ pub fn decode_errors_below_threshold_keep_connection_test() {
       recv_text(probe.socket)
   })
   let assert True = process.is_alive(probe.handler)
-  raw_close(probe.socket)
+  close(server, probe)
 }
 
 pub fn rate_violation_flood_closes_1008_test() {
@@ -1216,7 +1228,7 @@ pub fn old_session_id_is_unusable_after_login_rotation_test() {
   raw_close(socket)
   // ...and the new id can.
   let renewed = open_with(server, cookie_headers(server.port, fresh.id))
-  raw_close(renewed.socket)
+  close(server, renewed)
 }
 
 pub fn failed_auth_recheck_closes_4401_test() {
@@ -1257,6 +1269,11 @@ pub fn failed_auth_recheck_closes_4401_test() {
   let assert True = process.is_alive(probe.handler)
   session.delete(store, sess.id)
   assert_closed_with(probe, server, 4401)
+  // The handler is down, so every re-check it ran has reported: any that
+  // passed before the delete, then the failure that closed the socket.
+  let assert [Error("session gone"), ..passed] =
+    list.reverse(await.drain(checks))
+  let assert True = list.all(passed, fn(check) { check == Ok(Nil) })
 }
 
 pub fn allow_guests_ws_recheck_closes_a_signed_out_socket_4401_test() {
@@ -1295,14 +1312,22 @@ pub fn allow_guests_ws_recheck_closes_a_signed_out_socket_4401_test() {
       c.0 == signed_in.handler && result.is_error(c.1)
     })
   assert_closed_with(signed_in, server, 4401)
+  // The signed-in handler is down, so what is left are guest re-checks,
+  // and each one passed.
+  let assert True =
+    list.all(await.drain(checks), fn(c) { c == #(guest.handler, Ok(Nil)) })
   // The guest socket stays open through a re-check that ran after the close.
-  let _ = await.drain(checks)
   let _ =
     await.expect(checks, "a guest re-check that passes", matching: fn(c) {
       c == #(guest.handler, Ok(Nil))
     })
   let assert True = process.is_alive(guest.handler)
-  raw_close(guest.socket)
+  close(server, guest)
+  // Once the guest handler is down every re-check it ran has reported, and
+  // each one passed.
+  await.expect_down(guest.handler, "guest WebSocket handler")
+  let assert True =
+    list.all(await.drain(checks), fn(c) { c == #(guest.handler, Ok(Nil)) })
 }
 
 // --- Pure helpers ---

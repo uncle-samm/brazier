@@ -136,13 +136,6 @@ residue(Pending, Module, Function, Residue) ->
 %% it. Remove a module once its tests leave none; never add one.
 residue_pending() ->
     [
-     %% closed_conn notices from the fake transport.
-     'brazier@build_handshake_test',
-     %% A closed_conn notice.
-     'brazier@dev_reload_test',
-     %% [brazier, http, connection, accepted | closed] events a cap test
-     %% does not receive.
-     'brazier@http_server_test',
      %% An unreceived model_sync and patch.
      'brazier@runtime_test',
      %% Event acks (empty patches), send_error and send_hard_navigate
@@ -152,9 +145,7 @@ residue_pending() ->
      'brazier@runtime_versioning_test',
      %% [brazier, session, expired] events and a brazier_session_revoked
      %% message.
-     'brazier@session_security_test',
-     %% closed_conn notices from the fake transport.
-     'brazier@ws_protocol_test'
+     'brazier@session_security_test'
     ].
 
 drain_mailbox(Acc) ->

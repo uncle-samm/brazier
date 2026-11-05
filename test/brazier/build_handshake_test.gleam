@@ -105,6 +105,21 @@ fn open(port: Int, observer: Subject(Observed)) -> #(RawSocket, String, Pid) {
   #(socket, conn_id, handler)
 }
 
+/// Close the socket and wait until the server has run `on_close` for this
+/// connection, so the notice is received here and not left for the next
+/// test.
+fn close(
+  socket: RawSocket,
+  observer: Subject(Observed),
+  conn_id: String,
+) -> Nil {
+  raw_close(socket)
+  let assert Ok(ClosedConn(closed)) = process.receive(observer, 5000)
+    as "on_close must run"
+  let assert True = closed == conn_id
+  Nil
+}
+
 fn send_join(socket: RawSocket, build: Option(String)) -> Nil {
   let build_field = case build {
     Some(id) -> ",\"build\":\"" <> id <> "\""
@@ -226,18 +241,18 @@ pub fn a_join_from_the_current_build_is_dispatched_test() {
     process.receive(observer, 3000)
     as "the join must be dispatched"
   let assert True = cid == conn_id
-  raw_close(socket)
+  close(socket, observer, conn_id)
   server.stop(listener)
 }
 
 pub fn a_join_without_a_build_is_dispatched_test() {
   let #(listener, port, observer) = start_server()
-  let #(socket, _conn_id, _handler) = open(port, observer)
+  let #(socket, conn_id, _handler) = open(port, observer)
   send_join(socket, None)
   let assert Ok(GotEvent(_, transport.ClientJoin(token: "", path: "/"))) =
     process.receive(observer, 3000)
     as "the join must be dispatched"
-  raw_close(socket)
+  close(socket, observer, conn_id)
   server.stop(listener)
 }
 
@@ -245,13 +260,13 @@ pub fn a_build_that_is_not_a_string_is_a_decode_error_test() {
   // A wrong-typed build is a malformed join, counted like any decode error;
   // it is never dispatched.
   let #(listener, port, observer) = start_server()
-  let #(socket, _conn_id, _handler) = open(port, observer)
+  let #(socket, conn_id, _handler) = open(port, observer)
   let text = "{\"type\":\"join\",\"token\":\"\",\"path\":\"/\",\"build\":7}"
   let assert Ok(Nil) = raw_send(socket, masked_frame(1, 1, <<text:utf8>>))
   send_join(socket, None)
   let assert Ok(GotEvent(_, transport.ClientJoin(token: "", path: "/"))) =
     process.receive(observer, 3000)
     as "only the well-formed join is dispatched"
-  raw_close(socket)
+  close(socket, observer, conn_id)
   server.stop(listener)
 }
