@@ -239,10 +239,25 @@ pub type RuntimeState(model, msg) {
     started_at: Int,
     /// The document title for the server state, when the app has one.
     title: Option(fn(model) -> String),
-    /// The title the joined connections were last sent. `None` until the
-    /// first join (the server render carried the title until then).
-    last_title: Option(String),
+    /// What the joined connections were last told about the title.
+    title_sync: TitleSync,
   )
+}
+
+/// What the joined connections were last told about the title. A title
+/// over `title_max_bytes` is reported once when it goes over the limit,
+/// not after every update while it stays over; it is reported again only
+/// after it has been back under the limit.
+pub type TitleSync {
+  /// The title is within the limit. `last_sent` is the title the joined
+  /// connections were last sent: `None` until the first join (the server
+  /// render carried the title until then), and after a connection joined
+  /// while the title was over the limit (it has the server render's title,
+  /// so the next title within the limit goes to everyone).
+  TitleWithinLimit(last_sent: Option(String))
+  /// The title is over the limit and has been reported to the joined
+  /// connections; they still show `last_sent`.
+  TitleOverLimit(last_sent: Option(String))
 }
 
 /// Configuration needed to start a runtime. `brazier.start` builds it from
@@ -561,7 +576,7 @@ fn spawn_actor(
           presence: watcher,
           started_at: started_at,
           title: config.title,
-          last_title: None,
+          title_sync: TitleWithinLimit(last_sent: None),
         )
       log.debug("brazier.runtime", "Runtime initialising")
       // Trap exits so a stop caused by a linked process still reports
@@ -2142,23 +2157,45 @@ fn current_title(
   }
 }
 
-/// Report a title over `title_max_bytes` to `targets`; nothing is sent in
-/// its place and the last title sent stays the browsers' title.
-fn title_too_large(
+/// The title has gone over `title_max_bytes`: log it once for this time
+/// over the limit and report it to `targets`. Nothing is sent in its place
+/// and the last title sent stays the browsers' title.
+fn title_went_over_limit(
   state: RuntimeState(model, msg),
   targets: List(transport.ConnectionId),
   size: Int,
 ) -> Nil {
   log.error(
     "brazier.runtime",
-    "Title is "
+    "Title went over the limit: "
       <> int.to_string(size)
       <> " bytes, over the "
       <> int.to_string(title_max_bytes)
-      <> " byte limit; not sent to "
+      <> " byte limit; not sent, reported to "
       <> int.to_string(list.length(targets))
-      <> " connection(s)",
+      <> " connection(s) until it is back under the limit",
   )
+  report_title_too_large(state, targets, size)
+}
+
+/// The title went back under `title_max_bytes` after it was reported.
+fn log_title_back_within_limit(size: Int) -> Nil {
+  log.info(
+    "brazier.runtime",
+    "Title back within the "
+      <> int.to_string(title_max_bytes)
+      <> " byte limit at "
+      <> int.to_string(size)
+      <> " bytes; a later title over it is reported again",
+  )
+}
+
+/// Send the `error` frame for a title over `title_max_bytes` to `targets`.
+fn report_title_too_large(
+  state: RuntimeState(model, msg),
+  targets: List(transport.ConnectionId),
+  size: Int,
+) -> Nil {
   list.each(targets, fn(conn_id) {
     send_to_conn_id(
       state,
@@ -2187,13 +2224,40 @@ fn send_title_on_join(
   case current_title(state) {
     Ok(None) -> state
     Ok(Some(title)) -> {
+      case state.title_sync {
+        TitleWithinLimit(_) -> Nil
+        // The state changed while no connection was joined to be synced.
+        TitleOverLimit(_) ->
+          log_title_back_within_limit(string.byte_size(title))
+      }
       log.debug("brazier.runtime", "Sending title to joined " <> conn_id)
       send_to_conn_id(state, conn_id, transport.SendTitle(title: title))
-      RuntimeState(..state, last_title: Some(title))
+      // The other joined connections were synced before this join (a route
+      // change is broadcast to them first), so they all have this title.
+      RuntimeState(
+        ..state,
+        title_sync: TitleWithinLimit(last_sent: Some(title)),
+      )
     }
     Error(size) -> {
-      title_too_large(state, [conn_id], size)
-      state
+      case state.title_sync {
+        TitleWithinLimit(_) -> title_went_over_limit(state, [conn_id], size)
+        TitleOverLimit(_) -> {
+          // Already logged for this time over the limit; this connection
+          // has not been told yet.
+          log.debug(
+            "brazier.runtime",
+            "Title still over the limit at "
+              <> int.to_string(size)
+              <> " bytes; reported to joined "
+              <> conn_id,
+          )
+          report_title_too_large(state, [conn_id], size)
+        }
+      }
+      // The joiner shows the server render's title, not the last one sent,
+      // so the next title within the limit is sent to everyone.
+      RuntimeState(..state, title_sync: TitleOverLimit(last_sent: None))
     }
   }
 }
@@ -2201,16 +2265,24 @@ fn send_title_on_join(
 /// After an update, send the title to `targets` (every joined connection)
 /// when it differs from the one they were last sent. The title is a
 /// function of the server state, so it can change when the client-visible
-/// model does not.
+/// model does not. A title over the limit is reported when it goes over,
+/// and not again until it has been back within the limit.
 fn sync_title(
   state: RuntimeState(model, msg),
   targets: List(transport.ConnectionId),
 ) -> RuntimeState(model, msg) {
   case current_title(state) {
     Ok(None) -> state
-    Ok(Some(title)) ->
-      case state.last_title == Some(title) {
-        True -> state
+    Ok(Some(title)) -> {
+      let last_sent = case state.title_sync {
+        TitleWithinLimit(last_sent:) -> last_sent
+        TitleOverLimit(last_sent:) -> {
+          log_title_back_within_limit(string.byte_size(title))
+          last_sent
+        }
+      }
+      case last_sent == Some(title) {
+        True -> Nil
         False -> {
           log.info(
             "brazier.runtime",
@@ -2221,13 +2293,29 @@ fn sync_title(
           list.each(targets, fn(conn_id) {
             send_to_conn_id(state, conn_id, transport.SendTitle(title: title))
           })
-          RuntimeState(..state, last_title: Some(title))
         }
       }
-    Error(size) -> {
-      title_too_large(state, targets, size)
-      state
+      RuntimeState(
+        ..state,
+        title_sync: TitleWithinLimit(last_sent: Some(title)),
+      )
     }
+    Error(size) ->
+      case state.title_sync {
+        TitleWithinLimit(last_sent:) -> {
+          title_went_over_limit(state, targets, size)
+          RuntimeState(..state, title_sync: TitleOverLimit(last_sent:))
+        }
+        TitleOverLimit(_) -> {
+          log.debug(
+            "brazier.runtime",
+            "Title still over the limit at "
+              <> int.to_string(size)
+              <> " bytes; already reported",
+          )
+          state
+        }
+      }
   }
 }
 

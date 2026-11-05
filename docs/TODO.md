@@ -51,13 +51,50 @@ Found while merging WS10b (Milestone 117, 2026-11-04).
 - **Issue:** `window.__brazierOutboundPendingForTest()` does not count a
   debounced send whose timer has not fired (`brazier_client_ffi.mjs`).
   - **Files:** `brazier_client/src/brazier_client_ffi.mjs`, `test_all_cdp.py`
-- **Issue:** a title over `runtime.title_max_bytes` is reported with an
-  `error` frame and a log line after every update while it stays too large.
-  - **Files:** `src/brazier/runtime.gleam`
 
 ## Resolved Issues
 
 <!-- Move resolved issues here with full resolution details -->
+
+- **Issue:** a title over `runtime.title_max_bytes` is reported with an
+  `error` frame and a log line after every update while it stays too large.
+  - **Files:** `src/brazier/runtime.gleam`
+  - **Resolution:** (Milestone 118, m118-lifecycle) The runtime reported
+    from the size check alone, with no memory of having reported, so every
+    update re-sent the error. The runtime state now holds a `TitleSync`
+    (`TitleWithinLimit` / `TitleOverLimit`, each with the last title sent).
+    Going over the limit is logged as an error and reported to every
+    connection once; while it stays over, an update logs at debug and sends
+    nothing, and a connection that joins meanwhile is told once. Going back
+    within the limit is logged (info), sends the title if it differs from
+    the one last sent, and re-arms the report. `runtime_title_limit_test`
+    covers staying over, going over again after being within, and a join
+    while over, counting the log lines.
+- **Issue:** `ws8c_runtime_stop_test`
+  (`failing_linked_process_reports_stop_with_exit_test`) failed once: the
+  stop event carried the owner's reason, but the runtime's DOWN reason was
+  an atom.
+  - **Files:** `test/brazier/ws8c_runtime_stop_test.gleam`
+  - **Resolution:** (Milestone 118, m118-lifecycle) The test, not the
+    runtime. On OTP 28 `erlang:monitor` on a normal scheduler parks the
+    monitor signal in the scheduler's pending slot (`erl_proc_sig_queue.c`,
+    `erts_proc_sig_send_monitor`); it is enqueued only when the sender is
+    scheduled out, signals the same target again, or creates another
+    monitor. The helper's exit reached the runtime from another process,
+    so the runtime could leave first, and a monitor that reaches an exited
+    process reports `noproc`: the atom. Measured with the real runtime and
+    a forced spin while the monitor is parked: 1079 and 598 of 2000 runs
+    gave `noproc`; with a message to the runtime after the monitor, and
+    with `await.barrier_pid`, 0 of 2000 each. The flake was recorded
+    (fa127d4) before the barrier was added after the monitor (3bc6444),
+    which fixes it: the synchronous request goes to the same target, so it
+    enqueues the monitor first. The module doc now names the mechanism,
+    `monitor_reaching_an_exited_runtime_reports_noproc_test` replays the
+    symptom in a fixed order, and the diagnostic is removed. The parked
+    slot cannot be held from Erlang code (any schedule-out flushes it), so
+    no test can force the race; what stretched the window in that one run
+    (likely the OS descheduling a scheduler thread on a loaded clean build)
+    is not known.
 
 - **Issue:** several simulation tests allow leaked processes or failed
   connections (`sim_test.gleam:177`, `:247`, `:320`, `:377-379`), against
