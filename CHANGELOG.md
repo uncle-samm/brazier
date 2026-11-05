@@ -35,7 +35,10 @@ open follow-ups), which is in progress.
   `-hook-watch`, `-preserve-children` and `-external` (as LiveView reserves
   the `phx-` names it owns). `attribute.attribute`, `attribute.data` and
   `attribute.boolean` crash on any other, `boolean(name, False)` included,
-  and so does the render for a name built another way. A stream item whose
+  and so does the render for a name built another way. The build refuses a
+  reserved name it can know without running code (a literal, a constant
+  or a `<>` of those), naming the place, as it did `data-brazier-stream`
+  (coordinator). A stream item whose
   root sets `data-brazier-key` now crashes the render instead of returning
   an Error, as `data-brazier-stream` already did.
 

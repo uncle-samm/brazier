@@ -22,6 +22,7 @@ import brazier/build/field_type.{type FieldType, type TypeDef}
 import brazier/build/reach
 import brazier/build/source_location
 import brazier/build/stream_item
+import brazier/internal/render
 import brazier/log
 import brazier/stream
 import glance
@@ -236,7 +237,7 @@ fn streams(
           Ok(#(at, module, owner, name))
         reach.Rendered(..)
         | reach.Referenced(..)
-        | reach.ContainerAttribute(..) -> Error(Nil)
+        | reach.ReservedAttribute(..) -> Error(Nil)
       }
     })
   let named =
@@ -337,7 +338,7 @@ fn stream_use_error(stream_use: reach.StreamUse) -> Result(String, Nil) {
         <> kind
         <> ". The browser renders an item only when it is inserted or updated, so an item cannot depend on the model or Local state; put state that changes every item on the container's attributes, or insert the items again.",
       )
-    reach.ContainerAttribute(at:, function:, name:, written:) ->
+    reach.ReservedAttribute(at:, function:, name:, attribute:, written:) ->
       Ok(
         at
         <> ": `"
@@ -349,7 +350,7 @@ fn stream_use_error(stream_use: reach.StreamUse) -> Result(String, Nil) {
           None -> ""
           Some(written) -> " (the name is " <> written <> ")"
         }
-        <> " sets data-brazier-stream, which marks a stream's container: the browser applies the stream's inserts and deletes to the element that carries it. Only `stream.render` sets it; render the stream with `stream.render(my_stream(), \"ol\", attributes, render_item)`.",
+        <> reserved_attribute_reason(attribute),
       )
     reach.Referenced(at:, function:) ->
       Ok(
@@ -360,6 +361,23 @@ fn stream_use_error(stream_use: reach.StreamUse) -> Result(String, Nil) {
         <> function
         <> "(..)`) so the build can check its arguments.",
       )
+  }
+}
+
+/// Why setting the reserved name `attribute` (lowercased) is refused, and
+/// what to use instead.
+fn reserved_attribute_reason(attribute: String) -> String {
+  case attribute {
+    _ if attribute == render.stream_attribute ->
+      " sets data-brazier-stream, which marks a stream's container: the browser applies the stream's inserts and deletes to the element that carries it. Only `stream.render` sets it; render the stream with `stream.render(my_stream(), \"ol\", attributes, render_item)`."
+    _ if attribute == render.key_attribute ->
+      " sets data-brazier-key, which gives an element its identity for the browser's morph. Only the render sets it; key a child with `element.keyed(key, child)`, and a stream keys its items itself."
+    _ ->
+      " sets "
+      <> attribute
+      <> ", a name Brazier reserves for its client (docs/HTML_ELEMENTS.md). The `data-brazier-` names an app may set are "
+      <> string.join(render.app_attributes, ", ")
+      <> "; events go through `brazier/event`."
   }
 }
 
@@ -404,7 +422,7 @@ fn simple_app_stream_errors(
             )
           reach.Declared(..)
           | reach.Referenced(..)
-          | reach.ContainerAttribute(..) -> Error(Nil)
+          | reach.ReservedAttribute(..) -> Error(Nil)
         }
       })
     app_call.Application | app_call.FullApplication -> []

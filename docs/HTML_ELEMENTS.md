@@ -160,7 +160,10 @@ Names match case-insensitively, so `SrcDoc`, `ONCLICK` and
 `Data-Brazier-Key` crash too. `attribute.data("brazier-key", ..)` builds the
 same name and crashes the same way, and `attribute.boolean` crashes on a
 refused name even when it is `False`. The render refuses the same names again
-on an attribute built without the constructor.
+on an attribute built without the constructor. A reserved `data-brazier-*`
+name the build can know without running code (a literal, a constant, or a
+`<>` of those, given to `attribute.attribute`, `attribute.data` or
+`attribute.boolean`) fails the build instead, naming the place.
 
 The `data-brazier-*` names that are app API:
 

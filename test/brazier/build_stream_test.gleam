@@ -411,12 +411,71 @@ pub fn mark() -> attribute.Attribute(msg) {
 }
 
 pub fn other_data_attributes_are_accepted_test() {
+  // A `data-brazier-` name that is app API, and names outside the prefix.
   let analysis =
     analyze_app(with_div_attributes(
       "import brazier/attribute\n",
-      "attribute.data(\"brazier-streams\", \"x\"), attribute.attribute(\"data-stream\", \"log\")",
+      "attribute.data(\"Brazier-Hook\", \"x\"), attribute.attribute(\"data-stream\", \"log\"), attribute.data(\"brazierkey\", \"k\")",
     ))
   let assert [StreamDecl(name: "log", ..)] = analysis.streams
+}
+
+pub fn the_key_attribute_on_an_element_is_refused_test() {
+  let reason =
+    analyze_error([
+      #(
+        "app",
+        with_div_attributes(
+          "import brazier/attribute\n",
+          "attribute.attribute(\"data-brazier-key\", \"k\")",
+        ),
+      ),
+    ])
+  assert_contains(reason, "app.gleam:")
+  assert_contains(
+    reason,
+    "`attribute.attribute(\"data-brazier-key\", ..)` sets data-brazier-key, which gives an element its identity",
+  )
+  assert_contains(reason, "`element.keyed(key, child)`")
+}
+
+pub fn a_reserved_event_attribute_through_a_constant_is_refused_test() {
+  let reason =
+    analyze_error([
+      #(
+        "app",
+        with_div_attributes(
+          "import brazier/attribute\n\nconst click = \"Brazier-On-Click\"\n",
+          "attribute.data(click, \"1\")",
+        ),
+      ),
+    ])
+  assert_contains(
+    reason,
+    "`attribute.data(\"Brazier-On-Click\", ..)` (the name is the constant `click`) sets data-brazier-on-click, a name Brazier reserves for its client",
+  )
+  assert_contains(
+    reason,
+    "data-brazier-external, data-brazier-hook, data-brazier-hook-watch, data-brazier-preserve-children",
+  )
+}
+
+pub fn a_reserved_name_brazier_may_add_later_is_refused_test() {
+  // The whole prefix is reserved, not only the names the client reads today.
+  let reason =
+    analyze_error([
+      #(
+        "app",
+        with_div_attributes(
+          "import brazier/attribute\n",
+          "attribute.boolean(\"data-brazier-\" <> \"future\", False)",
+        ),
+      ),
+    ])
+  assert_contains(
+    reason,
+    "`attribute.boolean(\"data-brazier-future\", ..)` (the name is a concatenation) sets data-brazier-future, a name Brazier reserves for its client",
+  )
 }
 
 pub fn the_stream_attribute_through_a_constant_is_refused_test() {

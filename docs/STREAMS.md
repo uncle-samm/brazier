@@ -223,6 +223,12 @@ The rules, each checked:
   changes.
 - The item's root is one element: not text, `element.none()`,
   `unsafe_raw_html` or `element.keyed`. The stream keys the root itself.
+- Only the render sets `data-brazier-stream` (the container's mark) and
+  `data-brazier-key` (an item's key). A view that sets either, or any other
+  reserved `data-brazier-*` name, fails the build when the name is known
+  without running code, and crashes the attribute's constructor or the
+  render otherwise (see
+  [HTML_ELEMENTS.md](HTML_ELEMENTS.md#attributes-brazierattribute)).
 - A view renders a stream at most once, and never inside another stream's
   item. A second render crashes the render.
 - A `brazier.simple` app cannot render a stream: its `update` returns no
@@ -314,7 +320,8 @@ belongs to the session, not to a route.
 
 | Case | Caught by | What happens |
 |------|-----------|--------------|
-| A name that is not a literal, a name declared twice, an item function that is anonymous or a capture, a stream in a `simple` app | build | Build error naming the place |
+| A name that is not a literal, a name declared twice, an item function that is anonymous or a capture, a stream in a `simple` app, a reserved `data-brazier-*` attribute name the build can know | build | Build error naming the place |
+| A reserved `data-brazier-*` attribute name known only when the view runs | attribute constructor, render | Crash with a message |
 | A bad name, or a limit below 1 | `stream.new` | Crash with a message |
 | An empty key, a key over 256 bytes, an item over 64 KB, a limit over `stream_max_limit`, a name the build did not declare, a second limit for one name | runtime | That op is refused |
 | Over 1000 ops in one update, or over 1 MB of stream entries in one frame | runtime | Every stream op of the update is refused; the model part is sent |

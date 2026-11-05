@@ -113,9 +113,11 @@ pub type StreamUse {
   /// its arguments cannot be checked.
   Referenced(at: String, function: String)
   /// A `function(name, ..)` call (`attribute.attribute`, `attribute.data`
-  /// or `attribute.boolean`) whose `name` makes `data-brazier-stream`, in
-  /// any case: the attribute that marks a stream's container, which only
-  /// `stream.render` sets. The build reads every name it can know without
+  /// or `attribute.boolean`) whose `name` makes a reserved `data-brazier-*`
+  /// name (`render.is_reserved_attribute_name`), in any case: one the
+  /// render or the client owns, such as `data-brazier-stream`, which marks
+  /// a stream's container and only `stream.render` sets. `attribute` is the
+  /// whole name, lowercased. The build reads every name it can know without
   /// running code: a literal, a constant of an app module, or a `<>` of
   /// those. `written` says how a name that is not a literal was written.
   ///
@@ -125,10 +127,11 @@ pub type StreamUse {
   /// compiler draws the same line: it checks a literal `phx-update` value
   /// at compile time, and leaves `phx-update={@value}` and `{@rest}` to the
   /// runtime.
-  ContainerAttribute(
+  ReservedAttribute(
     at: String,
     function: String,
     name: String,
+    attribute: String,
     written: Option(String),
   )
 }
@@ -1220,8 +1223,8 @@ type StreamFunction {
   StreamNew
   StreamRender
   /// `brazier/attribute.attribute` or `.boolean` (`prefix` `""`), or
-  /// `.data` (`prefix` `"data-"`): a name the build can know that makes
-  /// `render.stream_attribute` is refused.
+  /// `.data` (`prefix` `"data-"`): a name the build can know that makes a
+  /// reserved name (`render.is_reserved_attribute_name`) is refused.
   AttributeName(function: String, prefix: String)
 }
 
@@ -1271,8 +1274,9 @@ fn stream_callee(
 }
 
 /// `stream.new` or `stream.render` used as a value, not called. An
-/// attribute function used as a value is not recorded: the render refuses
-/// the container's attribute on any element (`render.stream_attribute`).
+/// attribute function used as a value is not recorded: the attribute's
+/// constructor and the render refuse a reserved name on any element
+/// (`render.is_reserved_attribute_name`).
 fn record_reference(
   st: State,
   ctx: Ctx,
@@ -1326,22 +1330,24 @@ fn record_call(
       )
     // A name the build can know (`static_name`) is checked here. Any other
     // name is known only when the view runs, and the attribute's
-    // constructor refuses the container's attribute then
-    // (`render.is_allowed_attribute`): the build does not refuse a name
-    // for being computed, which every helper that forwards a name does.
+    // constructor refuses a reserved name then
+    // (`render.is_reserved_attribute_name`): the build does not refuse a
+    // name for being computed, which every helper that forwards a name
+    // does.
     AttributeName(function:, prefix:) ->
       case list.first(arguments) {
         Ok(Some(argument)) ->
           case static_name(ctx.index, ctx.info, locals, argument) {
             Ok(name) ->
-              case string.lowercase(prefix <> name) == render.stream_attribute {
+              case render.is_reserved_attribute_name(prefix <> name) {
                 True ->
                   add_stream_use(
                     st,
-                    ContainerAttribute(
+                    ReservedAttribute(
                       at:,
                       function:,
                       name:,
+                      attribute: string.lowercase(prefix <> name),
                       written: written_name(argument),
                     ),
                   )
