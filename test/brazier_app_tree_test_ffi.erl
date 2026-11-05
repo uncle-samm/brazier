@@ -3,10 +3,8 @@
 %% Helpers for the root supervision tree tests (app_tree_test). They run on
 %% peer nodes, so the tree owns PubSub and the session scope there.
 
--export([children/1, await_restart/3, crash/2, http_status/1,
+-export([children/1, restarted/3, crash/2, http_status/1,
          snapshot/0, leftovers/1, whereis_name/1, receive_broadcast/2]).
-
--define(MAX_POLLS, 100000).
 
 %% The root supervisor's children in start order (static_supervisor gives
 %% child N the id N). Crashes if a child is not running.
@@ -17,22 +15,16 @@ children(Sup) ->
          Other -> erlang:error({child_not_running, Id, Other})
      end || {Id, Child, _Type, _Modules} <- Rows].
 
-%% Wait until child Index (0-based) runs with a pid other than Old. Each
-%% check is a call to the supervisor (no sleeping): the killed child's EXIT
-%% may reach the supervisor after a call, so a stale answer means asking
-%% again. The bound turns a supervisor that never restarts it into a crash.
-await_restart(Sup, Index, Old) ->
-    await_restart(Sup, Index, Old, ?MAX_POLLS).
-
-await_restart(_Sup, Index, Old, 0) ->
-    erlang:error({child_not_restarted, Index, Old});
-await_restart(Sup, Index, Old, N) ->
+%% Crash unless child Index (0-based) runs with a pid other than Old. Call
+%% it once Sup has handled Old's exit signal (await.with_watch_exit on Sup,
+%% then await.expect_info): a supervisor restarts a child, and under
+%% rest_for_one the children after it, inside its handling of the EXIT, so
+%% a stale pid here is a supervisor that did not restart it.
+restarted(Sup, Index, Old) ->
     Rows = lists:keysort(1, supervisor:which_children(Sup)),
     case lists:keyfind(Index, 1, Rows) of
         {Index, Pid, _, _} when is_pid(Pid), Pid =/= Old -> nil;
-        _ ->
-            erlang:yield(),
-            await_restart(Sup, Index, Old, N - 1)
+        Row -> erlang:error({child_not_restarted, Index, Old, Row})
     end.
 
 %% Crash child Pid of Sup and return once it is gone: a worker is killed, a

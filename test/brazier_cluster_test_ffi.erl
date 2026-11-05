@@ -688,10 +688,20 @@ churn_round(Index, P, Name, Topic, PerRound, Iterations) ->
     [receive {churning, Pid} -> ok
      after 5000 -> error({churner_never_subscribed, Pid})
      end || {Pid, _Ref} <- Before],
-    true = exit(Partition, kill),
-    During = churners(Index, P, Topic, PerRound, Iterations, []),
-    ok = await_restart(Name, Partition, erlang:monotonic_time(millisecond) + 5000),
-    Before ++ During.
+    %% The hook is on the partition supervisor before the kill, so its
+    %% handling of the EXIT, which is when it restarts the partition, can't
+    %% be missed. The later churners race that restart.
+    Sup = whereis(brazier_pubsub_partition_sup),
+    true = is_pid(Sup),
+    {ok, Watch} = brazier_await_ffi:watch_exit(Sup, Partition),
+    try
+        true = exit(Partition, kill),
+        During = churners(Index, P, Topic, PerRound, Iterations, []),
+        ok = await_restart(Watch, Sup, Name, Partition),
+        Before ++ During
+    after
+        nil = brazier_await_ffi:unwatch(Watch)
+    end.
 
 %% Start Count churners whose subscriptions live in partition Index
 %% (brazier_pubsub_ffi:partition/2 hashes the pid); processes that hash
@@ -741,15 +751,19 @@ await_churner({Pid, Ref}) ->
         {churner_still_running, Pid}
     end.
 
-await_restart(Name, Old, Deadline) ->
+%% Return once Sup has handled Old's exit signal (the watch's notice, then a
+%% sys:get_state barrier): a one_for_one supervisor restarts the child
+%% inside that handling, so the partition's name then belongs to its
+%% replacement. Anything else is a supervisor that did not restart it.
+await_restart(Watch, Sup, Name, Old) ->
+    case brazier_await_ffi:next_info(Watch, 5000) of
+        {ok, nil} -> ok;
+        {error, nil} -> error({partition_exit_not_handled, Name, Old})
+    end,
+    {ok, nil} = brazier_await_ffi:barrier(Sup, 5000),
     case whereis(Name) of
-        New when is_pid(New), New =/= Old ->
-            ok;
-        _ ->
-            case erlang:monotonic_time(millisecond) > Deadline of
-                true -> error({partition_not_restarted, Name});
-                false -> erlang:yield(), await_restart(Name, Old, Deadline)
-            end
+        New when is_pid(New), New =/= Old -> ok;
+        Other -> error({partition_not_restarted, Name, Old, Other})
     end.
 
 %% --- Benchmarks ---

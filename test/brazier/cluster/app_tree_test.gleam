@@ -9,6 +9,7 @@
 
 import brazier/app_config_fixture
 import brazier/application.{type App}
+import brazier/await
 import brazier/cluster
 import brazier/cluster/log_capture
 import brazier/cluster/peer.{type Peer, Timeout}
@@ -114,8 +115,7 @@ fn crash_child(p: Peer, app: App, index: Int) -> #(List(Pid), List(Pid)) {
     let before = children(app.supervisor_pid)
     let assert Ok(victim) = list.drop(before, index) |> list.first
       as "list.drop succeeds"
-    crash(app.supervisor_pid, victim)
-    await_restart(app.supervisor_pid, index, victim)
+    crash_and_await_restart(app.supervisor_pid, index, victim)
     // Every later child is restarted before the supervisor answers calls
     // again, so a stale pid of a later child here would be a real bug.
     #(before, children(app.supervisor_pid))
@@ -407,8 +407,7 @@ pub fn wait_forever_crashes_when_the_tree_gives_up_test_() -> peer.Timeout {
       // inside the window makes the supervisor give up.
       list.each([1, 2], fn(_) {
         let victim = listener_pid(app)
-        crash(app.supervisor_pid, victim)
-        await_restart(app.supervisor_pid, 3, victim)
+        crash_and_await_restart(app.supervisor_pid, 3, victim)
       })
       crash(app.supervisor_pid, listener_pid(app))
       monitored.down_reason(monitor, "the process in wait_forever")
@@ -434,8 +433,22 @@ fn receive_broadcast(topic: String, timeout: Int) -> Result(String, Nil) {
 @external(erlang, "brazier_app_tree_test_ffi", "children")
 fn children(supervisor: Pid) -> List(Pid)
 
-@external(erlang, "brazier_app_tree_test_ffi", "await_restart")
-fn await_restart(supervisor: Pid, index: Int, old: Pid) -> Nil
+/// Crash child `index` of `supervisor`, `victim` (see `crash`), and return
+/// once the supervisor has handled its exit signal: a supervisor restarts
+/// the child (and, under rest_for_one, the children after it) while it
+/// handles the EXIT, so the new pid is in place then. The sys hook is
+/// installed before the crash, so the EXIT can't be missed.
+fn crash_and_await_restart(supervisor: Pid, index: Int, victim: Pid) -> Nil {
+  use watch <- await.with_watch_exit(supervisor, victim)
+  crash(supervisor, victim)
+  await.expect_info(watch, supervisor, "the supervisor handling the crash")
+  restarted(supervisor, index, victim)
+}
+
+/// Crash unless child `index` of `supervisor` runs with a pid other than
+/// `old`.
+@external(erlang, "brazier_app_tree_test_ffi", "restarted")
+fn restarted(supervisor: Pid, index: Int, old: Pid) -> Nil
 
 /// Crash a child of `supervisor` and return once it is gone. A worker is
 /// killed. A child supervisor is terminated with an abnormal reason, so it

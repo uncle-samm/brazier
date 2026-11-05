@@ -10,6 +10,7 @@
 
 import brazier/app_config_fixture
 import brazier/application.{type App}
+import brazier/await
 import brazier/cluster/peer.{Timeout}
 import brazier/effect
 import brazier/html
@@ -144,8 +145,7 @@ pub fn owner_without_tables_restarts_test_() -> peer.Timeout {
         holder.run(holder, fn() { application.start_supervised(config()) })
       let before = children(app.supervisor_pid)
       let victim = owner_child(app)
-      crash(app.supervisor_pid, victim)
-      await_restart(app.supervisor_pid, 0, victim)
+      crash_and_await_restart(app.supervisor_pid, 0, victim)
       let after = children(app.supervisor_pid)
       // RestForOne: the owner is first, so every child restarted.
       let kept =
@@ -229,8 +229,22 @@ fn owner_pid() -> Result(Pid, String)
 @external(erlang, "brazier_app_tree_test_ffi", "children")
 fn children(supervisor: Pid) -> List(Pid)
 
-@external(erlang, "brazier_app_tree_test_ffi", "await_restart")
-fn await_restart(supervisor: Pid, index: Int, old: Pid) -> Nil
+/// Crash child `index` of `supervisor`, `victim` (see `crash`), and return
+/// once the supervisor has handled its exit signal: a supervisor restarts
+/// the child (and, under rest_for_one, the children after it) while it
+/// handles the EXIT, so the new pid is in place then. The sys hook is
+/// installed before the crash, so the EXIT can't be missed.
+fn crash_and_await_restart(supervisor: Pid, index: Int, victim: Pid) -> Nil {
+  use watch <- await.with_watch_exit(supervisor, victim)
+  crash(supervisor, victim)
+  await.expect_info(watch, supervisor, "the supervisor handling the crash")
+  restarted(supervisor, index, victim)
+}
+
+/// Crash unless child `index` of `supervisor` runs with a pid other than
+/// `old`.
+@external(erlang, "brazier_app_tree_test_ffi", "restarted")
+fn restarted(supervisor: Pid, index: Int, old: Pid) -> Nil
 
 @external(erlang, "brazier_app_tree_test_ffi", "crash")
 fn crash(supervisor: Pid, child: Pid) -> Nil
