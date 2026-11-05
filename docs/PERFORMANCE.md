@@ -345,6 +345,15 @@ Some notes on reading the numbers:
   `client.patch.rows_100` from 261.6 to 194.8 µs and
   `client.patch.rows_1000` from 2809 to 2091 µs. `client.render`, which
   does not decode, did not move (155.4 and 156.0 µs at 100 rows).
+- **The client's event names.** After every render the client asks which
+  events the view listens for. `event_names` used to walk the handler
+  table, split every key and sort the unique names: 192.6 µs at 1000 rows,
+  one handler per row. The render now collects each distinct name as it
+  inserts a handler, so `event_names` reads a list: 0.1 µs at both sizes.
+  The render itself pays for the collecting, from 1399.7 to about 1470 µs
+  at 1000 rows; `client.render.rows_1000` went from 1706 to 1439 µs and
+  `client.patch.rows_1000` from 2091 to 1819 µs (2026-11-05, same
+  machine, not a re-baseline).
 - **`presence.list.10000`** is about 5.9 ms, while `track` and `untrack`
   stay flat at 4 to 6 µs. A list copies every row of the topic out of
   the shard's ETS table into the caller and decodes each meta, which is

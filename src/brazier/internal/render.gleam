@@ -126,9 +126,13 @@ pub fn handler(decoder: decode.Decoder(msg)) -> Handler(msg) {
   )
 }
 
-/// The handler table of one render.
-pub type Handlers(msg) =
-  Dict(String, Handler(msg))
+/// The handler table of one render, with the distinct event names in it.
+/// The walk that fills the table collects the names as it inserts each
+/// handler, so the client knows which events to listen for without walking
+/// the table again after every render.
+pub opaque type Handlers(msg) {
+  Handlers(table: Dict(String, Handler(msg)), names: List(String))
+}
 
 /// The key of the handler for event `name` on the element with position
 /// `id` in a handler table.
@@ -142,7 +146,12 @@ pub fn lookup(
   name: String,
   id: String,
 ) -> Result(Handler(msg), Nil) {
-  dict.get(handlers, key(name, id))
+  dict.get(handlers.table, key(name, id))
+}
+
+/// The keys of a handler table (`key(name, id)`), sorted.
+pub fn keys(handlers: Handlers(msg)) -> List(String) {
+  dict.keys(handlers.table) |> list.sort(string.compare)
 }
 
 /// Run a handler's decoder against an event object.
@@ -153,18 +162,10 @@ pub fn run(
   decode.run(event, handler.decoder)
 }
 
-/// The distinct event names in a handler table, sorted.
+/// The distinct event names in a handler table, sorted. The render that
+/// built the table collected them; this reads no handler.
 pub fn event_names(handlers: Handlers(msg)) -> List(String) {
-  handlers
-  |> dict.keys
-  |> list.filter_map(fn(handler_key) {
-    case string.split_once(handler_key, ":") {
-      Ok(#(name, _id)) -> Ok(name)
-      Error(Nil) -> Error(Nil)
-    }
-  })
-  |> list.unique
-  |> list.sort(string.compare)
+  handlers.names
 }
 
 /// A short description of decode errors for log lines.
@@ -252,7 +253,7 @@ pub fn render_containers(
   // never fails.
   let assert [] = done.faults
     as "brazier/internal/render: an empty render recorded a fault"
-  #(tree_to_string(done.html), done.handlers, list.reverse(done.containers))
+  #(tree_to_string(done.html), finish(done), list.reverse(done.containers))
 }
 
 /// Render a tree to HTML, each stream container holding the HTML `fill`
@@ -309,7 +310,7 @@ pub fn render_item(
             )
           let done = walk(keyed, "i0", InItem, new_walk())
           case done.faults {
-            [] -> Ok(#(tree_to_string(done.html), done.handlers))
+            [] -> Ok(#(tree_to_string(done.html), finish(done)))
             faults -> Error(prefix <> string.join(list.reverse(faults), "; "))
           }
         }
@@ -341,15 +342,22 @@ type Mode(msg) {
   InItem
 }
 
-/// What a walk has built so far. `containers` and `faults` are in reverse
+/// What a walk has built so far. `names` holds each event name in
+/// `handlers` once, unsorted. `containers` and `faults` are in reverse
 /// order.
 type Walk(msg) {
   Walk(
     html: StringTree,
-    handlers: Handlers(msg),
+    handlers: Dict(String, Handler(msg)),
+    names: List(String),
     containers: List(Container(msg)),
     faults: List(String),
   )
+}
+
+/// The handler table a walk built, its event names sorted.
+fn finish(done: Walk(msg)) -> Handlers(msg) {
+  Handlers(table: done.handlers, names: list.sort(done.names, string.compare))
 }
 
 /// The HTML a walk built. A walk appends only strings to its tree.
@@ -368,6 +376,7 @@ fn new_walk() -> Walk(msg) {
   Walk(
     html: string_tree.new(),
     handlers: dict.new(),
+    names: [],
     containers: [],
     faults: [],
   )
@@ -457,10 +466,17 @@ fn open_tag(
   let assert True = is_valid_tag_name(tag)
     as "brazier/internal/render: tag names are a-z A-Z 0-9 - _ : ."
   let #(plain, events) = collect_attributes(attributes)
-  let handlers =
-    list.fold(events, acc.handlers, fn(handlers, event) {
+  let #(handlers, names) =
+    list.fold(events, #(acc.handlers, acc.names), fn(state, event) {
+      let #(handlers, names) = state
       let #(name, handler) = event
-      dict.insert(handlers, key(name, id), handler)
+      let handlers = dict.insert(handlers, key(name, id), handler)
+      // A view has a few distinct event names and many handlers, so the
+      // list stays short.
+      case list.contains(names, name) {
+        True -> #(handlers, names)
+        False -> #(handlers, [name, ..names])
+      }
     })
   let html =
     acc.html
@@ -470,7 +486,7 @@ fn open_tag(
     |> append_plain(plain)
     |> append_events(events, id)
     |> string_tree.append(">")
-  Walk(..acc, html: html, handlers: handlers)
+  Walk(..acc, html: html, handlers: handlers, names: names)
 }
 
 fn close_tag(acc: Walk(msg), tag: String) -> Walk(msg) {

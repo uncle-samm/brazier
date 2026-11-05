@@ -10,12 +10,10 @@ import brazier/html
 import brazier/internal/render
 import brazier/internal/stream_op
 import brazier/stream.{type Stream, KeepFirst, KeepLast}
-import gleam/dict
 import gleam/dynamic.{type Dynamic}
 import gleam/dynamic/decode
 import gleam/int
 import gleam/json
-import gleam/list
 import gleam/string
 
 pub type Line {
@@ -242,8 +240,8 @@ pub fn an_item_is_keyed_with_item_relative_ids_test() {
     render.render_item(container, "line-7", item(Line(7, "a < b")))
   let assert "<li data-brazier-key=\"line-7\" class=\"line\"><span>a &lt; b</span><button data-brazier-on-click=\"i0.1\">Pick</button><button data-brazier-on-click=\"i0.2\">Remove</button></li>" =
     html
-  let assert ["click:i0.1", "click:i0.2"] =
-    dict.keys(handlers) |> list.sort(string.compare)
+  let assert ["click:i0.1", "click:i0.2"] = render.keys(handlers)
+  let assert ["click"] = render.event_names(handlers)
   let assert Picked(7) = click(handlers, "i0.1")
   let assert Removed(7) = click(handlers, "i0.2")
 }

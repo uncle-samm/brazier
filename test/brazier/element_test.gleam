@@ -5,7 +5,6 @@ import brazier/html
 import brazier/internal/render
 import brazier/log_capture
 import brazier/svg
-import gleam/dict
 import gleam/dynamic
 import gleam/dynamic/decode
 import gleam/list
@@ -233,6 +232,40 @@ pub fn keyed_does_not_add_a_level_test() {
   let assert ["click"] = render.event_names(handlers)
 }
 
+/// The render collects each event name once, sorted, from every depth,
+/// and they are exactly the names in the handler table's keys.
+pub fn event_names_are_collected_by_the_render_test() {
+  let node =
+    html.form([event.on_submit(fn(_fields) { "sent" })], [
+      html.input([event.on_input(fn(value) { value })]),
+      html.ul([], [
+        html.li([event.on_click("a"), event.on_input(fn(value) { value })], []),
+        html.li([event.on_click("b")], [
+          html.button([event.on("dblclick", decode.success("c"))], []),
+        ]),
+      ]),
+      html.p([], [element.text("no handler")]),
+    ])
+  let #(_html, handlers) = render.render(element.to_node(node))
+  let names = render.event_names(handlers)
+  let assert ["click", "dblclick", "input", "submit"] = names
+  let from_keys =
+    render.keys(handlers)
+    |> list.map(fn(key) {
+      let assert Ok(#(name, _id)) = string.split_once(key, ":")
+        as "element_test: a handler key is name:id"
+      name
+    })
+    |> list.unique
+    |> list.sort(string.compare)
+  let assert True = from_keys == names
+  // A view without handlers listens for nothing.
+  let #(_html, none) =
+    render.render(element.to_node(html.div([], [element.text("x")])))
+  let assert [] = render.event_names(none)
+  let assert [] = render.keys(none)
+}
+
 pub fn handler_table_runs_decoder_test() {
   let node = html.input([event.on_input(fn(value) { "typed:" <> value })])
   let #(_html, handlers) = render.render(element.to_node(node))
@@ -273,7 +306,7 @@ pub fn last_handler_for_same_event_wins_test() {
     html.button([event.on_click("first"), event.on_click("second")], [])
   let #(html_string, handlers) = render.render(element.to_node(node))
   let assert "<button data-brazier-on-click=\"0\"></button>" = html_string
-  let assert 1 = dict.size(handlers)
+  let assert ["click:0"] = render.keys(handlers)
   let assert Ok(handler) = render.lookup(handlers, "click", "0")
   let assert Ok("second") = render.run(handler, dynamic.properties([]))
 }
