@@ -100,11 +100,21 @@ pub type StreamUse {
     name: Result(String, String),
   )
   /// A `stream.render` call: `Ok` when its item argument is a named
-  /// function, or what the argument is instead.
-  Rendered(at: String, item: Result(Nil, String))
+  /// function, or why it is refused.
+  Rendered(at: String, item: Result(Nil, ItemRefusal))
   /// `stream.new` or `stream.render` used as a value instead of called, so
   /// its arguments cannot be checked.
   Referenced(at: String, function: String)
+}
+
+/// Why the item argument of a `stream.render` call is refused.
+pub type ItemRefusal {
+  /// It is not a named top-level function: `kind` says what it is.
+  NotNamedFunction(kind: String)
+  /// `written` names a definition of `module`, which the analyzer does not
+  /// index (a dependency's, or a Brazier module's), so the build cannot
+  /// check that it is a top-level function.
+  UncheckedModule(written: String, module: String)
 }
 
 /// The Brazier module whose definitions reach the client one by one, as
@@ -132,8 +142,11 @@ pub fn is_framework_module(module_path: String) -> Bool {
 /// True for a Brazier module the analyzer indexes and the client gets
 /// pruned to the reached definitions, as a user module: `brazier/stream`.
 pub fn is_pruned_framework_module(module_path: String) -> Bool {
-  module_path == stream_module
+  list.contains(pruned_framework_modules, module_path)
 }
+
+/// Every pruned Brazier module (`is_pruned_framework_module`).
+pub const pruned_framework_modules = [stream_module]
 
 /// Index parsed modules, given as #(module path, source, AST).
 pub fn index(
@@ -705,14 +718,30 @@ fn check_framework(
               <> "`, but "
               <> module
               <> " does not run in the browser. Client code (what `view`, a `simple` app's `update` and a Local layer reach) may use only "
-              <> string.join(
-              set.to_list(ctx.allowed) |> list.sort(string.compare),
-              ", ",
-            )
+              <> describe_client_modules(ctx.allowed)
               <> " and non-Brazier packages.",
           )
       }
   }
+}
+
+/// The Brazier modules client code may use, for messages: the ones
+/// `check_framework` lets through, `allowed` and the pruned modules, from
+/// the same lists, so the text cannot drift from the check. A pruned module
+/// is listed with the definitions client code may use of it.
+fn describe_client_modules(allowed: Set(String)) -> String {
+  set.to_list(allowed)
+  |> list.append(pruned_framework_modules)
+  |> list.unique
+  |> list.sort(string.compare)
+  |> list.map(fn(module) {
+    case module == stream_module {
+      True ->
+        module <> " (only " <> string.join(stream_client_names, ", ") <> ")"
+      False -> module
+    }
+  })
+  |> string.join(", ")
 }
 
 /// `qualifier.name` where `qualifier` is an import alias.
@@ -1300,19 +1329,20 @@ fn stream_name_argument(
 }
 
 /// The item argument of `stream.render`: `Ok` when it names a top-level
-/// function, or what it is instead.
+/// function, or why it is refused.
 fn item_argument(
   ctx: Ctx,
   locals: Set(String),
   argument: Result(Option(glance.Expression), Nil),
-) -> Result(Nil, String) {
+) -> Result(Nil, ItemRefusal) {
+  let not_named = fn(kind) { Error(NotNamedFunction(kind)) }
   case argument {
-    Error(Nil) -> Error("missing")
-    Ok(None) -> Error("a capture hole")
+    Error(Nil) -> not_named("missing")
+    Ok(None) -> not_named("a capture hole")
     Ok(Some(glance.Variable(name:, ..))) ->
       case set.contains(locals, name), is_upper_name(name) {
-        True, _ -> Error("the local variable `" <> name <> "`")
-        False, True -> Error("the constructor `" <> name <> "`")
+        True, _ -> not_named("the local variable `" <> name <> "`")
+        False, True -> not_named("the constructor `" <> name <> "`")
         False, False ->
           case
             dict.has_key(ctx.info.functions, name),
@@ -1320,12 +1350,12 @@ fn item_argument(
             dict.get(ctx.info.values, name)
           {
             True, _, _ -> Ok(Nil)
-            False, True, _ -> Error("the constant `" <> name <> "`")
+            False, True, _ -> not_named("the constant `" <> name <> "`")
             False, False, Ok(#(module, original)) ->
               imported_item(ctx, module, original, name)
             // The compiler rejects a name that is not defined.
             False, False, Error(Nil) ->
-              Error("`" <> name <> "`, which is not defined")
+              not_named("`" <> name <> "`, which is not defined")
           }
       }
     Ok(Some(
@@ -1338,31 +1368,35 @@ fn item_argument(
       case module_alias(ctx, locals, qualifier) {
         Ok(module) ->
           imported_item(ctx, module, label, qualifier <> "." <> label)
-        Error(Nil) -> Error(describe_expression(expr))
+        Error(Nil) -> not_named(describe_expression(expr))
       }
-    Ok(Some(expr)) -> Error(describe_expression(expr))
+    Ok(Some(expr)) -> not_named(describe_expression(expr))
   }
 }
 
-/// `written` names `module.name`. A function of a module the analyzer does
-/// not index (a dependency's) is accepted: its source is not here.
+/// `written` names `module.name`. The definition is checked in `module`'s
+/// source; a module the analyzer does not index (a dependency's, or a
+/// Brazier module's) has no source here, so its definition is refused
+/// rather than accepted unchecked.
 fn imported_item(
   ctx: Ctx,
   module: String,
   name: String,
   written: String,
-) -> Result(Nil, String) {
+) -> Result(Nil, ItemRefusal) {
   case is_upper_name(name), dict.get(ctx.index, module) {
-    True, _ -> Error("the constructor `" <> written <> "`")
-    False, Error(Nil) -> Ok(Nil)
+    True, _ -> Error(NotNamedFunction("the constructor `" <> written <> "`"))
+    False, Error(Nil) -> Error(UncheckedModule(written:, module:))
     False, Ok(info) ->
       case
         dict.has_key(info.functions, name),
         dict.has_key(info.constants, name)
       {
         True, _ -> Ok(Nil)
-        False, True -> Error("the constant `" <> written <> "`")
-        False, False -> Error("`" <> written <> "`, which is not defined")
+        False, True ->
+          Error(NotNamedFunction("the constant `" <> written <> "`"))
+        False, False ->
+          Error(NotNamedFunction("`" <> written <> "`, which is not defined"))
       }
   }
 }

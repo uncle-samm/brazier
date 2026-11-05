@@ -150,6 +150,112 @@ pub fn unannotated_stream_has_no_item_type_test() {
   let assert [StreamDecl(name: "log", item_type: None, ..)] = analysis.streams
 }
 
+/// `app` with `log`'s return annotation replaced by `annotation`, and
+/// `extra` appended (imports go first, so `extra_imports` is separate).
+fn with_annotation(
+  annotation: String,
+  extra_imports: String,
+  extra: String,
+) -> String {
+  app
+  |> string.replace(
+    "pub fn log() -> Stream(Line) {",
+    "pub fn log() -> " <> annotation <> " {",
+  )
+  |> string.replace(
+    "import gleam/json\n",
+    "import gleam/json\n" <> extra_imports,
+  )
+  |> string.append(extra)
+}
+
+fn item_type_of(source: String) -> option.Option(String) {
+  let assert [StreamDecl(name: "log", item_type:, ..)] =
+    analyze_app(source).streams
+  item_type
+}
+
+pub fn a_dependency_item_type_is_qualified_test() {
+  // A stream's items are carried by its own encode and decoder, not by a
+  // generated codec, so a dependency's type is a valid item type.
+  let source =
+    with_annotation(
+      "Stream(timestamp.Timestamp)",
+      "import gleam/time/timestamp\n",
+      "",
+    )
+  let assert Some("gleam/time/timestamp.Timestamp") = item_type_of(source)
+}
+
+pub fn prelude_and_imported_item_types_are_written_test() {
+  let source =
+    with_annotation(
+      "Stream(#(Option(Line), Result(Int, String)))",
+      "import gleam/option.{type Option}\n",
+      "",
+    )
+  let assert Some("#(gleam/option.Option(app.Line), Result(Int, String))") =
+    item_type_of(source)
+}
+
+pub fn an_item_type_through_type_aliases_is_resolved_test() {
+  let plain =
+    with_annotation("LogStream", "", "\npub type LogStream = Stream(Line)\n")
+  let assert Some("app.Line") = item_type_of(plain)
+  let generic =
+    with_annotation("Of(Line)", "", "\npub type Of(item) = Stream(item)\n")
+  let assert Some("app.Line") = item_type_of(generic)
+}
+
+pub fn an_owner_that_returns_no_stream_has_no_item_type_test() {
+  // The owner's annotation is not a `Stream` (the build reads annotations,
+  // not inferred types), so it names no item type.
+  let source = with_annotation("#(Stream(Line), Int)", "", "")
+  let assert None = item_type_of(source)
+}
+
+pub fn an_unresolved_item_type_is_refused_test() {
+  let reason =
+    analyze_error([#("app", with_annotation("Stream(Missing)", "", ""))])
+  assert_contains(reason, "app.gleam:")
+  assert_contains(
+    reason,
+    "the stream \"log\": the return annotation `Stream(Missing)` of `app.log` does not name the item type: type `Missing` is not defined in app or imported unqualified",
+  )
+}
+
+pub fn an_item_type_from_a_module_not_imported_is_refused_test() {
+  let reason =
+    analyze_error([#("app", with_annotation("Stream(nope.Line)", "", ""))])
+  assert_contains(
+    reason,
+    "`nope.Line` uses module `nope`, which app does not import",
+  )
+}
+
+pub fn an_item_type_hole_is_refused_test() {
+  let reason = analyze_error([#("app", with_annotation("Stream(_)", "", ""))])
+  assert_contains(
+    reason,
+    "the return annotation `Stream(_)` of `app.log` does not name the item type: the type hole `_` names no type",
+  )
+}
+
+pub fn an_item_type_variable_is_refused_test() {
+  let reason =
+    analyze_error([#("app", with_annotation("Stream(item)", "", ""))])
+  assert_contains(reason, "the type variable `item` names no concrete type")
+}
+
+pub fn a_stream_with_two_type_arguments_is_refused_test() {
+  let reason =
+    analyze_error([#("app", with_annotation("Stream(Line, Int)", "", ""))])
+  assert_contains(
+    reason,
+    "the return annotation `Stream(Line, Int)` of `app.log` cannot be read: `Stream` takes one type argument, the item type; found 2",
+  )
+}
+
 pub fn app_without_streams_lists_none_test() {
   let source =
     "import brazier
@@ -403,6 +509,54 @@ pub fn piped_anonymous_item_is_refused_test() {
       ),
     ])
   assert_contains(reason, "not an anonymous function")
+}
+
+/// `app` importing `widgets`, a module the analyzer is not given: a
+/// dependency's, whose source the build does not read.
+fn with_dependency(import_line: String, render: String) -> String {
+  app
+  |> string.replace("import gleam/json\n", "import gleam/json\n" <> import_line)
+  |> with_render(render)
+}
+
+pub fn qualified_item_from_a_dependency_is_refused_test() {
+  let source =
+    with_dependency(
+      "import widgets\n",
+      "stream.render(log(), \"ol\", [], widgets.render_line)",
+    )
+  let reason = analyze_error([#("app", source)])
+  assert_contains(reason, "app.gleam:")
+  assert_contains(
+    reason,
+    "the item function of `stream.render` is `widgets.render_line`, from widgets, which the build does not analyze",
+  )
+  assert_contains(reason, "Wrap it in a named function of an app module")
+}
+
+pub fn unqualified_item_from_a_dependency_is_refused_test() {
+  let source =
+    with_dependency(
+      "import widgets.{render_row}\n",
+      "stream.render(log(), \"ol\", [], render_row)",
+    )
+  let reason = analyze_error([#("app", source)])
+  assert_contains(
+    reason,
+    "the item function of `stream.render` is `render_row`, from widgets",
+  )
+}
+
+pub fn item_from_a_brazier_module_is_refused_test() {
+  // Brazier's own modules are not analyzed either (only `brazier/stream`).
+  let reason =
+    analyze_error([
+      #("app", with_render(app, "stream.render(log(), \"ol\", [], html.text)")),
+    ])
+  assert_contains(
+    reason,
+    "the item function of `stream.render` is `html.text`, from brazier/html",
+  )
 }
 
 pub fn every_refusal_is_reported_together_test() {

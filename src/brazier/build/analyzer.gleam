@@ -21,6 +21,7 @@ import brazier/build/codec_gen.{type Codecs, Codecs}
 import brazier/build/field_type.{type FieldType, type TypeDef}
 import brazier/build/reach
 import brazier/build/source_location
+import brazier/build/stream_item
 import brazier/log
 import brazier/stream
 import glance
@@ -251,32 +252,38 @@ fn streams(
     ])
     |> list.unique
     |> list.sort(string.compare)
-  case errors {
-    [] -> {
-      let decls =
-        list.map(named, fn(entry) {
-          let #(name, #(at, module, owner, _)) = entry
-          StreamDecl(
-            name:,
-            at:,
-            item_type: stream_item_type(index, module, owner),
-          )
-        })
-        |> list.sort(fn(a, b) { string.compare(a.name, b.name) })
-      list.each(decls, fn(decl) {
-        log.info(
-          "brazier.build.analyzer",
-          "Stream "
-            <> decl.name
-            <> " declared at "
-            <> decl.at
-            <> " (items: "
-            <> option.unwrap(decl.item_type, "type not annotated")
-            <> ")",
-        )
+  use Nil <- result.try(stream_errors(errors))
+  let #(decls, errors) =
+    list.map(named, fn(entry) {
+      let #(name, #(at, module, owner, _)) = entry
+      stream_item.item_type(index, module, owner)
+      |> result.map(fn(item_type) { StreamDecl(name:, at:, item_type:) })
+      |> result.map_error(fn(reason) {
+        at <> ": the stream \"" <> name <> "\": " <> reason
       })
-      Ok(decls)
-    }
+    })
+    |> result.partition
+  use Nil <- result.map(stream_errors(list.sort(errors, string.compare)))
+  let decls = list.sort(decls, fn(a, b) { string.compare(a.name, b.name) })
+  list.each(decls, fn(decl) {
+    log.info(
+      "brazier.build.analyzer",
+      "Stream "
+        <> decl.name
+        <> " declared at "
+        <> decl.at
+        <> " (items: "
+        <> option.unwrap(decl.item_type, "type not annotated")
+        <> ")",
+    )
+  })
+  decls
+}
+
+/// `Error` listing `errors`, each logged at error, when there is any.
+fn stream_errors(errors: List(String)) -> Result(Nil, String) {
+  case errors {
+    [] -> Ok(Nil)
     errors -> {
       list.each(errors, log.error("brazier.build.analyzer", _))
       Error(
@@ -308,7 +315,20 @@ fn stream_use_error(stream_use: reach.StreamUse) -> Result(String, Nil) {
         <> ". The build reads the names to check they are unique and to list them for the runtime and the client.",
       )
     reach.Rendered(item: Ok(Nil), ..) -> Error(Nil)
-    reach.Rendered(item: Error(kind), at:) ->
+    reach.Rendered(item: Error(reach.UncheckedModule(written:, module:)), at:) ->
+      Ok(
+        at
+        <> ": the item function of `stream.render` is `"
+        <> written
+        <> "`, from "
+        <> module
+        <> ", which the build does not analyze, so it cannot check that `"
+        <> written
+        <> "` is a named top-level function. Wrap it in a named function of an app module: `fn render_item(item) { "
+        <> written
+        <> "(item) }`, and pass `render_item`.",
+      )
+    reach.Rendered(item: Error(reach.NotNamedFunction(kind)), at:) ->
       Ok(
         at
         <> ": the item function of `stream.render` must be a named top-level function (`render_line` or `module.render_line`), not "
@@ -371,30 +391,6 @@ fn simple_app_stream_errors(
       })
     app_call.Application | app_call.FullApplication -> []
   }
-}
-
-/// `Item` from `owner`'s `-> Stream(Item)` return annotation.
-fn stream_item_type(
-  index: reach.Index,
-  module: String,
-  owner: String,
-) -> option.Option(String) {
-  let found = {
-    use info <- result.try(dict.get(index, module))
-    use def <- result.try(dict.get(info.functions, owner))
-    case def.definition.return {
-      Some(glance.NamedType(name:, module: qualifier, parameters: [item], ..)) ->
-        case is_type(info, qualifier, name, reach.stream_module, "Stream") {
-          True -> {
-            let scope = field_type.scope(info.ast, info.path, user_paths(index))
-            Ok(field_type.describe(field_type.resolve(scope, item)))
-          }
-          False -> Error(Nil)
-        }
-      _ -> Error(Nil)
-    }
-  }
-  option.from_result(found)
 }
 
 fn describe_ref(ref: FunctionRef) -> String {
