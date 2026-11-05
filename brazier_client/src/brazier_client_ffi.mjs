@@ -309,6 +309,20 @@ function boot() {
   // the server-rendered markup names, so they can be queued and replayed.
   listenFor(markupEventNames(root));
   setupNavigation();
+  if (window.__BRAZIER_ENABLE_TEST_HOOKS === true && window.__BRAZIER_HOLD_CONNECT_FOR_TEST === true) {
+    // Test seam: the page stays server-rendered, with its events queued for
+    // replay, until the test releases the first connect (a slow network's
+    // join, without timing).
+    console.log("[brazier] Test hook: the first connect waits for __brazierReleaseConnectForTest()");
+    window.__brazierReleaseConnectForTest = () => {
+      if (ws !== null) {
+        throw new Error("[brazier] invariant violated: __brazierReleaseConnectForTest called after the client connected");
+      }
+      connect();
+      return ws.readyState;
+    };
+    return;
+  }
   connect();
 }
 
@@ -1479,6 +1493,16 @@ if (typeof window !== "undefined") {
       scheduled: pumpTimer !== null,
       debounced: debounced.size,
     });
+    // Hand `raw` to the current socket's message handler, as a frame the
+    // server sent: a test forges a frame the server never would.
+    window.__brazierDeliverFrameForTest = (raw) => {
+      if (typeof raw !== "string") {
+        throw new Error("[brazier] __brazierDeliverFrameForTest takes the frame's text, got " + typeof raw);
+      }
+      if (!ws) throw new Error("[brazier] __brazierDeliverFrameForTest: there is no socket to deliver the frame on");
+      handleMessage(ws, raw);
+      return ws.readyState;
+    };
   }
 }
 
