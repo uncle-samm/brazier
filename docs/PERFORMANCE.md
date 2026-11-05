@@ -314,9 +314,42 @@ Some notes on reading the numbers:
   each of escaping, decoding the item JSON back (the check that the
   stream's encoder and decoder agree) and its UTF-8 check in
   `gleam/dynamic/decode`, and encoding the join's JSON.
-  `client.patch.rows_1000` is about 2.8 ms. `presence.list.10000` is
-  about 5.9 ms, a full copy of 10,000 presences, while `track` and
-  `untrack` stay flat at 4 to 6 µs.
+  `client.patch.rows_1000` is about 2.8 ms.
+- **`presence.list.10000`** is about 5.9 ms, while `track` and `untrack`
+  stay flat at 4 to 6 µs. A list copies every row of the topic out of
+  the shard's ETS table into the caller and decodes each meta, which is
+  Phoenix's pattern too: `Phoenix.Tracker.list` is one `:ets.select` of
+  the topic and `Phoenix.Presence.list` groups the result by key. Phoenix
+  keeps metas as terms; Brazier keeps the JSON it replicates and decodes
+  it with the tracker's decoder on read, the type check on metas that
+  came from other nodes. A single-process profile (2026-11-05, load 6 to
+  9), median of 21 fresh processes, in µs per entry:
+
+  | Entries | `ets:select` | `json.parse` | `list` | `list`, heap that never collects |
+  |---------|------|------|------|------|
+  | 3,000 | 0.21 | 0.16 | 0.46 | 0.35 |
+  | 10,000 | 0.42 to 0.53 | 0.17 | 0.61 to 0.63 | 0.38 to 0.40 |
+  | 30,000 | 0.38 | 0.19 | 0.92 to 1.13 | 0.45 to 0.51 |
+
+  With a heap big enough to never collect, every stage stays near flat
+  per entry, the select at 0.13 to 0.21 µs and the decode at 0.11 (OTP's
+  `json:decode` alone is 0.05; the rest is gleam_json's wrapper and the
+  decoder). What grows is the collection of the caller's heap as the
+  10,000 entries' 340,000 words land on it, about a third of the list at
+  10,000 entries and half of it at 30,000. Two changes measured no real
+  gain, so neither shipped. Grouping and decoding in one pass instead of
+  `try_map`, `chunk` and `map` gave no difference outside the noise.
+  Reading the topic in chunks of 256 rows (`ets:select/3`), decoding each
+  before reading the next so the raw rows of the whole room are never
+  live at once, cut a list's minor collections from 8 to 3. Yet in four
+  interleaved A/B runs against the old code it was 5.5 to 5.9 ms against
+  5.9 to 6.1, 4 to 6%, and the heap after a list was the same 196,650
+  words, as the result itself is most of it. A `brazier.presence`
+  watcher lists a topic once when its session starts following it and
+  again to reconcile after a shard restart, and otherwise applies diffs,
+  as a Phoenix channel pushes `presence_state` once on join and then
+  diffs. So the list cost is paid per join, not per change. The open
+  issue is in docs/TODO.md.
 - **Repeated p50 values.** On Darwin, `erlang:monotonic_time` ticks at
   about 41.67 ns, so every timing is a whole number of ticks. A
   percentile taken over thousands of samples from a tight distribution

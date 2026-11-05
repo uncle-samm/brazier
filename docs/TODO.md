@@ -33,6 +33,25 @@
     module) gives the same result; `render_js_test` already compares the
     two targets on `url.check`.
 
+- **Issue:** `presence.list` grows faster than the room past about 10,000
+  entries: 0.46 µs an entry at 3,000, 0.61 at 10,000 and 0.92 to 1.13 at
+  30,000. Every `brazier.presence` session that starts following a topic
+  pays one list, so a join into a 30,000-entry room costs about 30 ms of
+  the watcher's time.
+  - **Context:** Milestone 118, m118-perf-server, `presence.list.10000`
+    at about 5.9 ms (docs/PERFORMANCE.md, "`presence.list.10000`").
+  - **Files:** `src/brazier/presence.gleam`,
+    `src/brazier_presence_ffi.erl`, `src/brazier_presence_shard.erl`
+  - **Attempted:** a profile shows the ETS copy and the JSON decode flat
+    per entry and the growth in collecting the caller's heap. Neither a
+    one-pass decode-and-group nor reading in 256-row chunks gained more
+    than 4 to 6%, so neither shipped. What is left changes what a list
+    returns or what the shards store, for the design to decide. One
+    option is metas kept as terms for this node's entries, decoded once
+    at track: no decode on read, but the shard row grows and remote
+    entries still decode. Another is a list that hands the caller one
+    chunk of entries at a time.
+
 ## Resolved Issues
 
 <!-- Move resolved issues here with full resolution details -->
