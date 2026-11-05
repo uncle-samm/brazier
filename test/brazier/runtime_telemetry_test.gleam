@@ -6,6 +6,7 @@
 /// `SetCount(9)` is `"set_count"`; or `"mount"` or `"unknown"`) and
 /// `connection_id`. Handlers forward to a subject owned by the test and the
 /// tests synchronize on those events; nothing sleeps.
+import brazier/await
 import brazier/effect
 import brazier/error
 import brazier/internal/context
@@ -204,8 +205,24 @@ fn patch_bytes(event: Event) -> Int {
   bytes
 }
 
+/// The next frame the runtime sent the session's connection.
+fn frame(session: Session, what: String) -> transport.InternalMessage {
+  let assert Ok(message) = process.receive(session.transport, await.deadline_ms)
+    as what
+  message
+}
+
+/// Shut the runtime down and return once it has exited, so nothing it
+/// sends can reach a later test; the connection was sent nothing the test
+/// did not receive.
 fn shutdown(session: Session) -> Nil {
+  let assert Ok(pid) = process.subject_owner(session.runtime)
+    as "a started runtime has an owner process"
   process.send(session.runtime, runtime.Shutdown)
+  await.expect_down(pid, "the runtime after Shutdown")
+  let assert [] = await.drain(session.transport)
+    as "the connection was sent no frame the test did not receive"
+  Nil
 }
 
 // --- mount ------------------------------------------------------------------
@@ -237,6 +254,13 @@ pub fn decoded_event_reports_its_constructor_test() {
   let render = stop_of(events, "render", session.conn_id)
   assert_tags(render, "increment", session.conn_id)
   assert patch_bytes(render) > 0
+  let assert transport.SendPatch(
+    ops_json: "[{\"op\":\"replace\",\"path\":\"/count\",\"value\":1}]",
+    version: 1,
+    ack_clock: 1,
+    streams_json: "[]",
+  ) = frame(session, "the increment's patch")
+    as "the increment was patched to count 1 at revision 1"
   shutdown(session)
 }
 
@@ -244,12 +268,24 @@ pub fn undecodable_event_reports_unknown_test() {
   let session = joined(option.None)
   use events <- listen()
   // The handler id is client-chosen: it never becomes a tag.
-  click(session, "handler_" <> int.to_string(unique_integer()))
+  let handler_id = "handler_" <> int.to_string(unique_integer())
+  click(session, handler_id)
   assert_tags(
     stop_of(events, "handle_event", session.conn_id),
     "unknown",
     session.conn_id,
   )
+  // The refusal, then the ack of clock 1 with nothing to patch.
+  let assert transport.SendError(reason:) = frame(session, "the refusal")
+    as "the undecodable event was refused with an error frame"
+  assert reason == "RuntimeError: Unknown handler: " <> handler_id
+  let assert transport.SendPatch(
+    ops_json: "[]",
+    version: 0,
+    ack_clock: 1,
+    streams_json: "[]",
+  ) = frame(session, "the ack")
+    as "the refused event was acked at revision 0"
   shutdown(session)
 }
 
@@ -274,6 +310,17 @@ pub fn batch_reports_each_event_and_one_render_test() {
   let render = stop_of(events, "render", session.conn_id)
   assert_tags(render, "batch", session.conn_id)
   assert patch_bytes(render) > 0
+  let assert transport.SendError(
+    reason: "1 of 3 batched events rejected: RuntimeError: Unknown handler: nope",
+  ) = frame(session, "the batch's refusal")
+    as "the rejected event of the batch was reported"
+  let assert transport.SendPatch(
+    ops_json: "[{\"op\":\"replace\",\"path\":\"/count\",\"value\":2}]",
+    version: 1,
+    ack_clock: 2,
+    streams_json: "[]",
+  ) = frame(session, "the batch's patch")
+    as "the batch was patched once, to count 2, acking clock 2"
   shutdown(session)
 }
 
@@ -284,6 +331,13 @@ pub fn effect_update_renders_without_a_connection_test() {
   let render = stop_of(events, "render", "none")
   assert_tags(render, "set_count", "none")
   assert patch_bytes(render) > 0
+  let assert transport.SendPatch(
+    ops_json: "[{\"op\":\"replace\",\"path\":\"/count\",\"value\":9}]",
+    version: 1,
+    ack_clock: 0,
+    streams_json: "[]",
+  ) = frame(session, "the effect's patch")
+    as "the effect's update was patched to the joined connection"
   shutdown(session)
 }
 
@@ -335,6 +389,13 @@ pub fn routed_navigation_reports_the_route_message_test() {
   let render = stop_of(events, "render", session.conn_id)
   assert_tags(render, "visit", session.conn_id)
   assert patch_bytes(render) > 0
+  let assert transport.SendPatch(
+    ops_json: "[{\"op\":\"replace\",\"path\":\"/page\",\"value\":\"settings\"}]",
+    version: 1,
+    ack_clock: 0,
+    streams_json: "[]",
+  ) = frame(session, "the navigation's patch")
+    as "the navigation was patched to the settings page"
   shutdown(session)
 }
 
@@ -350,9 +411,9 @@ pub fn unroutable_navigation_reports_unknown_test() {
     "unknown",
     session.conn_id,
   )
-  let assert Ok(transport.SendHardNavigate(path: "/nope")) =
-    process.receive(session.transport, 2000)
-    as "process.receive succeeds"
+  let assert transport.SendHardNavigate(path: "/nope") =
+    frame(session, "the hard navigation")
+    as "an unroutable path is a hard navigation"
   shutdown(session)
 }
 
@@ -372,6 +433,9 @@ pub fn navigation_without_router_reports_unknown_test() {
     "unknown",
     session.conn_id,
   )
+  let assert transport.SendHardNavigate(path: "/elsewhere") =
+    frame(session, "the hard navigation")
+    as "without a router a navigation is a hard navigation"
   shutdown(session)
 }
 

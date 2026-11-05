@@ -375,19 +375,46 @@ pub fn with_watch_pg_scope(scope: String, run: fn(ScopeWatch) -> a) -> a {
 /// check, so an update that lands at any point is either seen by that
 /// check or followed by an event that triggers another. The events are
 /// node-wide; one from elsewhere only causes an extra check.
+///
+/// It leaves nothing in the mailbox, whether it returns or crashes. Events
+/// emitted after the check that held are only further prompts to look, so
+/// they are dropped: the handler sends through a process alias of its own
+/// (as `monitored.listening` does), and after the detach the alias is
+/// deactivated and its events still queued are removed. An emitter that
+/// looked the handler up before the detach and sends after it sends to an
+/// inactive alias, which the runtime drops. Only this call's events are
+/// removed; any other message stays for the test to receive.
 pub fn until_telemetry(
   events: List(List(String)),
   what: String,
   condition: fn() -> Bool,
 ) -> Nil {
+  until_telemetry_within(events, what, deadline_ms, condition)
+}
+
+/// `until_telemetry` with a deadline of `within` ms instead of
+/// `deadline_ms`, for the helper's own test of its failure.
+@internal
+pub fn until_telemetry_within(
+  events: List(List(String)),
+  what: String,
+  within: Int,
+  condition: fn() -> Bool,
+) -> Nil {
   let emitted = process.new_subject()
+  let alias = new_alias()
   let id = "brazier_await_" <> int.to_string(unique_integer())
   case telemetry.start() {
     Ok(Nil) -> Nil
     Error(reason) -> panic as { "until_telemetry: " <> string.inspect(reason) }
   }
+  // Registered before the attach, so it runs after the detach below: once
+  // no emitter can find the handler, the alias is closed.
+  use <- with_cleanup(fn() { close_alias(alias, emitted) })
   case
-    telemetry.attach(id, events, fn(event) { process.send(emitted, event.name) })
+    telemetry.attach(id, events, fn(event) {
+      send_through_alias(alias, emitted, event.name)
+    })
   {
     Ok(Nil) -> Nil
     Error(reason) ->
@@ -405,7 +432,7 @@ pub fn until_telemetry(
           }
       }
     })
-    recheck(emitted, condition, now_ms() + deadline_ms, 0)
+    recheck(emitted, condition, now_ms() + within, 0)
   }
   case outcome {
     Ok(Nil) -> Nil
@@ -414,7 +441,7 @@ pub fn until_telemetry(
         "expected "
         <> what
         <> " within "
-        <> int.to_string(deadline_ms)
+        <> int.to_string(within)
         <> " ms; still false after "
         <> int.to_string(seen)
         <> " events"
@@ -437,6 +464,26 @@ fn recheck(
       }
   }
 }
+
+/// A process alias (`erlang:alias/0`) of the calling process.
+type Alias
+
+@external(erlang, "erlang", "alias")
+fn new_alias() -> Alias
+
+/// Send `name` on `subject`'s tag to the alias instead of the owner's pid
+/// (`monitored.listening`'s forwarding).
+@external(erlang, "brazier_monitored_ffi", "send_through_alias")
+fn send_through_alias(
+  alias: Alias,
+  subject: Subject(List(String)),
+  name: List(String),
+) -> Nil
+
+/// Deactivate `alias` and remove the messages on `subject`'s tag already in
+/// the mailbox. Crashes if the alias was not active.
+@external(erlang, "brazier_monitored_ffi", "close_alias")
+fn close_alias(alias: Alias, subject: Subject(List(String))) -> Nil
 
 /// `monitored.with_cleanup`, which this module cannot import: `monitored`
 /// imports it.

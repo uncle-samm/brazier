@@ -294,9 +294,8 @@ open follow-ups), which is in progress.
   digest equals this replica's (and when there are no peers), and
   `replicated.context_size/1` reports the causal context's size.
 - (M118 tests) The test runner fails a test that leaves messages in its
-  mailbox and names them (`docs/TESTING.md`, "Mailbox residue"). Modules
-  that still leave messages are listed in `residue_pending/0` in
-  `test/brazier_test_runner_ffi.erl` until they are fixed.
+  mailbox and names them (`docs/TESTING.md`, "Mailbox residue"). No
+  module is exempt.
 - (M118 diff-shift) `test/brazier/bench/patch_bench.gleam` measures the
   model diff on sliding windows and on edits that are not shifts.
 
@@ -700,6 +699,14 @@ open follow-ups), which is in progress.
   the test process was counted as the append's reductions. The cost is
   now measured in a fresh process with room for the work, and a trace
   session asserts no collection ran during it.
+- (M118 residue2) `await.until_telemetry` (a test helper) left events in
+  the mailbox: one that arrived after the condition held, or from an
+  emitter that found the handler just before the detach. Its handler now
+  sends through a per-call process alias, closed and flushed after the
+  detach, and it crashes naming what it waited for when the deadline
+  passes. `runtime_test`, `runtime_telemetry_test`,
+  `runtime_versioning_test` and `session_security_test` receive every
+  frame they cause and stop their runtimes.
 - (M118 streams) The client's `syncHooks` threw its invariant when one
   frame inserted a key and then deleted it.
 - (M118 logs) A static file name longer than the file system allows is a

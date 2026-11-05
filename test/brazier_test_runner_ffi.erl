@@ -2,7 +2,7 @@
 
 %% The test suite's runner: gleeunit's discovery and options, with two
 %% checks. Each test fails when it leaves a message in the test process's
-%% mailbox (mailbox_checked/4), and one more test per module fails when the
+%% mailbox (mailbox_checked/3), and one more test per module fails when the
 %% module's tests left a telemetry handler attached.
 %%
 %% Telemetry handlers are node-wide. One left attached by a test keeps
@@ -14,7 +14,7 @@
 %% reported against the module that leaked, as ExUnit reports an on_exit
 %% failure against its test.
 
--export([run/0, handler_snapshot/0, handler_check/2, mailbox_checked/4,
+-export([run/0, handler_snapshot/0, handler_check/2, mailbox_checked/3,
          checked_generated/3]).
 
 run() ->
@@ -96,9 +96,6 @@ checked_generated(Module, Function, {timeout, Seconds, Run}) when is_function(Ru
 checked_generated(Module, Function, Other) ->
     erlang:error({unsupported_test_generator, Module, Function, Other}).
 
-mailbox_checked(Module, Function, Run) ->
-    mailbox_checked(residue_pending(), Module, Function, Run).
-
 %% Run one test, then fail it, naming the messages, if it left any in the
 %% test process's mailbox. eunit runs every test of every module in this
 %% process, so a message a test leaves (a late reply, an event it did not
@@ -109,44 +106,20 @@ mailbox_checked(Module, Function, Run) ->
 %% then: a test is done when it has received everything it caused.
 %%
 %% The mailbox is emptied either way, so residue never reaches the next
-%% test. When the test itself failed its failure is the one reported. The
-%% residue of a module in Pending is emptied without failing the test.
-mailbox_checked(Pending, Module, Function, Run) ->
+%% test. When the test itself failed its failure is the one reported. No
+%% module is exempt.
+mailbox_checked(Module, Function, Run) ->
     try Run() of
         _ ->
             case drain_mailbox([]) of
                 [] -> nil;
-                Residue -> residue(Pending, Module, Function, Residue)
+                Residue -> erlang:error({mailbox_residue, {Module, Function}, Residue})
             end
     catch
         Class:Reason:Stack ->
             _ = drain_mailbox([]),
             erlang:raise(Class, Reason, Stack)
     end.
-
-residue(Pending, Module, Function, Residue) ->
-    case lists:member(Module, Pending) of
-        true -> nil;
-        false -> erlang:error({mailbox_residue, {Module, Function}, Residue})
-    end.
-
-%% Modules whose tests still leave messages in the mailbox, each waiting
-%% for a fix by the workstream that owns it (docs/TESTING.md, "Mailbox
-%% residue"). Their residue is emptied after each test without failing
-%% it. Remove a module once its tests leave none; never add one.
-residue_pending() ->
-    [
-     %% An unreceived model_sync and patch.
-     'brazier@runtime_test',
-     %% Event acks (empty patches), send_error and send_hard_navigate
-     %% frames the telemetry assertions do not receive.
-     'brazier@runtime_telemetry_test',
-     %% Unreceived patches and bare {Ref, Int} replies.
-     'brazier@runtime_versioning_test',
-     %% [brazier, session, expired] events and a brazier_session_revoked
-     %% message.
-     'brazier@session_security_test'
-    ].
 
 drain_mailbox(Acc) ->
     receive

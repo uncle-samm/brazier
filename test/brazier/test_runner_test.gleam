@@ -50,7 +50,7 @@ pub fn mailbox_check_passes_a_test_that_leaves_nothing_test() {
   let inbox = process.new_subject()
   let assert Ok(Nil) =
     rescue(fn() {
-      mailbox_checked([], fake_module(), fake_function(), fn() {
+      mailbox_checked(fake_module(), fake_function(), fn() {
         process.send(inbox, "received in the test")
         let assert Ok("received in the test") = process.receive(inbox, 0)
         Nil
@@ -63,7 +63,7 @@ pub fn mailbox_check_fails_the_test_that_left_a_message_test() {
   let inbox = process.new_subject()
   let assert Error(#("error", reason)) =
     rescue(fn() {
-      mailbox_checked([], fake_module(), fake_function(), fn() {
+      mailbox_checked(fake_module(), fake_function(), fn() {
         process.send(inbox, "left behind")
       })
     })
@@ -84,7 +84,7 @@ pub fn mailbox_check_reports_the_tests_own_failure_test() {
   let inbox = process.new_subject()
   let assert Error(#("error", reason)) =
     rescue(fn() {
-      mailbox_checked([], fake_module(), fake_function(), fn() {
+      mailbox_checked(fake_module(), fake_function(), fn() {
         process.send(inbox, "left by a failing test")
         fail_with("the test's own failure")
       })
@@ -93,19 +93,6 @@ pub fn mailbox_check_reports_the_tests_own_failure_test() {
   assert reason == dynamic.string("the test's own failure")
   let assert Error(Nil) = process.receive(inbox, 0)
     as "a failing test's residue is emptied too"
-}
-
-pub fn mailbox_check_empties_a_pending_modules_residue_test() {
-  let inbox = process.new_subject()
-  let assert Ok(Nil) =
-    rescue(fn() {
-      mailbox_checked([fake_module()], fake_module(), fake_function(), fn() {
-        process.send(inbox, "left by a pending module")
-      })
-    })
-    as "residue of a module waiting for its fix does not fail the test"
-  let assert Error(Nil) = process.receive(inbox, 0)
-    as "a pending module's residue is emptied"
 }
 
 pub fn unsupported_test_generator_crashes_naming_the_test_test() {
@@ -131,12 +118,7 @@ fn fake_function() -> Atom {
 }
 
 @external(erlang, "brazier_test_runner_ffi", "mailbox_checked")
-fn mailbox_checked(
-  pending: List(Atom),
-  module: Atom,
-  function: Atom,
-  run: fn() -> Nil,
-) -> Nil
+fn mailbox_checked(module: Atom, function: Atom, run: fn() -> Nil) -> Nil
 
 @external(erlang, "brazier_test_runner_ffi", "checked_generated")
 fn checked_generated(

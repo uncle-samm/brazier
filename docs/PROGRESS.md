@@ -741,7 +741,7 @@
 - [x] m118-diff-shift (b18e0b9, merged 2026-11-05; KMP in both diffs, window_2000 148091 → 199 bytes, about 6.5 ms → 340 µs; non-shift edits within 8%, a reversed array 27% slower with the same op count): `brazier_patch_ffi.erl`, `brazier_client/src/brazier_client/patch.mjs` and their tests (the shift item below).
 - [x] m118-tests (0c83bb2, eb5ec00, 9925df7; merged 2026-11-05): existing tests and test FFI outside the files above. Redirected 2026-11-05: its four original items were done in M117 by w5-test-hygiene (L574–589; the follow-up lines at L553–556 were stale). It takes w5-test-hygiene's leftovers instead: the 2 polls in `store_replica_validation_test`, `await_restart` spinning on `yield`, and a mailbox-residue check (child_module, router and presence_test only, for now).
   - Done: both polls replaced and `peer.eventually` removed; restarts wait on a supervisor hook; the runner fails a test that leaves messages. On the merged tree the check caught `broadcasts_emit_telemetry_with_scope_test` leaving its two forwarded broadcasts, and m118-transport's new `join_build_test` leaving its `on_close` notices (both branches were cut before the check existed); the coordinator fixed both by receiving the messages.
-  - Follow-up (phase B): the modules still in `residue_pending/0` (build_handshake_test, dev_reload_test, ws_protocol_test, session_security_test, runtime_test, runtime_versioning_test, http_server_test, runtime_telemetry_test).
+  - Follow-up (phase B): the modules still in `residue_pending/0` (build_handshake_test, dev_reload_test, ws_protocol_test, session_security_test, runtime_test, runtime_versioning_test, http_server_test, runtime_telemetry_test). Done: m118-residue took four and m118-residue2 the rest; `residue_pending/0` is deleted.
 - [x] Streams design (`docs/design/STREAMS.md`, c61fea0, merged 2026-11-05), posted to Modorra (R1, questions Q1–Q6 open). The coordinator decided D1–D7 (below).
 - [x] m118-streams-core (d7ea204, a58294a; merged 2026-11-05; 72 tests; new files only): design steps 1–2 without the effect and runtime wiring. These are `brazier/internal/stream_op`, the window and its delta, the shared vectors, and `brazier/stream` (declaration, op values, test helpers).
   - Departures from the design, accepted: an empty or too-long key is a typed error; a `limit` over `stream_max_limit` is refused when the window is created; a refused op skips only that op and the rest of the update applies (the runtime step must log it and send an `error` frame); `TooManyOps` and `FrameTooLarge` refuse the whole update; an insert trimmed in the same update isn't counted in telemetry; doc-comment examples aren't compiled.
@@ -800,8 +800,8 @@
     - build_handshake, dev_reload, ws_protocol and http_server are off `residue_pending` (2987480);
     - two http_server tests flaked 1 in 6 on residue `await.until_telemetry` left behind; they now receive each event exactly;
     - 2095 tests pass on its branch, and `make test-flake` passes 5 of 5;
-    - still pending: runtime, runtime_telemetry, runtime_versioning and session_security;
-    - follow-up: `await.until_telemetry` can leave residue (an event emitted before it detaches), and session_security, runtime_versioning and http_fuzz still use it.
+    - still pending: runtime, runtime_telemetry, runtime_versioning and session_security (done in m118-residue2, see below);
+    - follow-up: `await.until_telemetry` can leave residue (an event emitted before it detaches), and session_security, runtime_versioning and http_fuzz still use it. Done in m118-residue2, see below.
   The two streams halves merge together before CDP runs, because each breaks the suite on its own.
   - m118-streams-server: STREAMS.md steps 2–5 (68f6e38, 3772a5c, 73ee693, 42416b3). Done (merged 2026-11-05 with m118-streams-client):
     - stream ops are effects, rendered by a stream container node with item-relative handler ids; the dead render fills streams;
@@ -824,11 +824,16 @@
     - [ ] A route change on a join after the first is not sent to the joiner; check against STREAMS.md (nothing is replayed by design).
     - [ ] The connection-level `FrameTooLarge` path has no test.
     - [ ] Stream errors during init are only logged, since no connection exists yet; decide whether the first join must carry them.
-    - [ ] `http_fuzz_test` flaked with MailboxResidue on its branch (it still uses `await.until_telemetry`; see the residue follow-up above).
+    - [x] `http_fuzz_test` flaked with MailboxResidue on its branch (it still uses `await.until_telemetry`; see the residue follow-up above).
   - Open from streams-client: a gleam test should run `stream_vectors.mjs` (today only `make test-client` does).
 - [ ] Phase B, second round (started 2026-11-05 at e747080, disjoint files):
   - m118-backpressure: L453 runtime level, L605, L607, and the streams runtime follow-ups (later joiner's route, init stream errors, the `FrameTooLarge` test);
-  - m118-residue2: the `until_telemetry` residue and the last four `residue_pending` modules;
+  - m118-residue2: the `until_telemetry` residue and the last four `residue_pending` modules. Done (6bb3b1e, merged 2026-11-05):
+    - `await.until_telemetry` sends through a per-call process alias, closed with `erlang:unalias/1` and flushed after the detach (as OTP's `gen:call` drops late replies); it crashes naming `what` at the deadline. New `await_telemetry_test` covers a late sender, a foreign message, the deadline and a crashing condition. This also cleared http_fuzz's residue flake;
+    - runtime, runtime_telemetry, runtime_versioning and session_security receive every frame they cause and stop their runtimes; none of the residue had its cause in `runtime.gleam`. The session_security sweeper test's comment said no revocation is sent on expiry; the lookup does send one, and the test asserts it;
+    - `residue_pending/0` is deleted: no module is exempt;
+    - 2275 tests pass 3 runs in a row and `make test-flake` passes 5 of 5 on its branch;
+    - [ ] follow-up: many other `runtime_versioning_test` tests don't stop their runtimes; they pass the check, but each should stop and wait for the exit like the fixed ones.
   - m118-streams-build: the streams build/SSR follow-ups, the `stream_vectors.mjs` gleam test, the `[brazier, store, synced]` event and `store.synced`, the `log_path.describe` cap;
   - m118-client: streams step 7 (`examples/timeline`, its CDP checks, benches, `docs/STREAMS.md`), L83, L606.
   Left for after them: the perf items L637–643, then the re-baseline on an idle machine.

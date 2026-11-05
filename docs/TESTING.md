@@ -86,7 +86,7 @@ busy loops never trip it.
 | `watch_info(pid, atom)` + `expect_info` | Wait for an OTP process to receive and handle a timer tick (through the sys debug hook) instead of sleeping past its interval. |
 | `watch_exit(sup, child)` + `expect_info` | Wait for a supervisor to handle a child's exit, i.e. to have restarted it. |
 | `watch_pg_scope` + `expect_pg_leave` | Wait for pg to drop an exited member before reading group membership. |
-| `until_telemetry(events, what, condition)` | Re-check state that another process updates and then announces with a telemetry event (e.g. an HTTP slot released before `[brazier, http, connection, closed]`). It can leave residue (see [Mailbox residue](#mailbox-residue)). |
+| `until_telemetry(events, what, condition)` | Re-check state that another process updates and then announces with a telemetry event (e.g. an HTTP slot released before `[brazier, http, connection, closed]`). It crashes, naming `what`, when the condition still fails at the deadline, and it leaves nothing in the mailbox (see [Mailbox residue](#mailbox-residue)). |
 
 A bounded wait for *nothing* to arrive is still a time window. Use one
 only after a barrier proves that the work which could produce the
@@ -159,20 +159,26 @@ means asserting on the messages it ignored:
   handler runs in the emitting process): `connection_events` in
   `http_server_test` forwards only its listener's acceptors and connection
   owner.
-- `await.until_telemetry` stops at the first event after which its
-  condition holds, and an event emitted between that check and the detach
-  is left behind. Where every event can be named, receive each one instead.
+- `await.until_telemetry` checks its condition, then again after each
+  event, and stops at the first check that holds. Its handler sends to a
+  process alias of its own, under a tag unique to the call, and the helper
+  detaches the handler and then closes the alias (`erlang:unalias/1`, as
+  `gen:call` drops late replies). It then removes the events already
+  queued under its tag, and the runtime drops any an emitter sends after
+  that: so it leaves nothing, whether the condition held, failed at the
+  deadline or crashed, and it never takes a message that is not one of its
+  own events. A test that uses it still owns the messages its condition's
+  work caused.
 - A socket the test closes is done when its connection's close notice
   (`ClosedConn`) has arrived, not when `close` returns.
 
 A message that arrives only after its test has ended is blamed on the
 test that is running then. When a failure names messages that test could
-not have caused, look at the test before it.
+not have caused, look at the test before it. A test that starts a runtime
+is done when the runtime has exited: send it `Shutdown` and
+`await.expect_down` its pid, then `await.drain` its transport subjects.
 
-Some modules still leave residue and wait for a fix by the workstream that
-owns them. They are listed in `residue_pending/0` in the runner, which
-empties their residue without failing the test. Remove a module from the
-list once its tests leave nothing; never add one.
+No module is exempt from the check.
 
 ## Capturing logs: `brazier/log_capture`
 
