@@ -67,8 +67,10 @@ ENV PYTHON_BIN=/app/.venv/bin/python
 # per IP that GitHub runners share. A read-only key (HEXPM_READ_API_KEY, which
 # Gleam reads) raises that to the account's own limit. It is a BuildKit
 # secret, so it is in no layer of the image; ci.yml requires it, a local build
-# may leave it out.
-RUN --mount=type=secret,id=hexpm_read_api_key,required=false \
+# may leave it out. BuildKit mounts a secret readable by root only, and this
+# step runs as brazier, so the mount is made readable: it exists only while
+# this step runs.
+RUN --mount=type=secret,id=hexpm_read_api_key,required=false,mode=0444 \
     set -eu; \
     if [ -s /run/secrets/hexpm_read_api_key ]; then \
       HEXPM_READ_API_KEY="$(cat /run/secrets/hexpm_read_api_key)"; \
