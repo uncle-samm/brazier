@@ -71,6 +71,17 @@ that crashes or is killed, ends only that connection: the others on the
 listener keep sending and receiving (`backpressure_isolation_test`). See
 [Backpressure](WIRE_PROTOCOL.md#backpressure).
 
+The runtime checks the same bound before each send to a connection. A
+handler more than 1000 messages behind is logged once at warning, sent one
+`CloseForBackpressure` and forgotten: later updates send it nothing, and
+its stream windows are dropped. A handler that has exited is not slow: the
+send finds it gone, logs it at info and forgets it. The runtime also
+monitors each connection's handler, as `Phoenix.Channel.Server` monitors
+its transport, so a handler that crashes or is killed without a disconnect
+is forgotten when its DOWN arrives (logged at info). A disconnect for a
+connection already forgotten is logged at debug
+(`runtime_backpressure_test`).
+
 ## Rate Limiting
 
 Each connection may send `max_events_per_second` events per one-second

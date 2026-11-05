@@ -773,8 +773,8 @@
 - [x] L412: a revocation is lost while only one side has verified the other (`brazier_session_ffi.erl:154,330`). m118-cluster. Done in m118-cluster, see below.
 - [x] L452 (SEC-11), m118-logs 7c3adc8: three sites were still real. The `uri_check` query reason held the raw query, the 417 reason didn't quote `Expect`, and an overlong static name gave a 500. The other sites were already safe. `log_forging_paths_test` has 21 tests covering every site.
   - [x] Follow-up: `log_path.describe` has no length cap, so a long path is logged in full (quoted, so it can't forge a line). Done in m118-streams-build.
-- [ ] L605: a navigation refused with an `error` frame gets no ack, so its pending scroll fires on a later ack (`runtime.gleam:1565`). After m118-lifecycle.
-- [ ] L453: the transport level is done (m118-logs 095daf6). `backpressure_isolation_test` shows that no close causes another: 6 sockets, 2 killed, 1 suspended under 1002 messages, which gets exactly one 1013. The runtime level is reproduced in `docs/design/backpressure_cascade_repro.gleam.txt`: a dead pid reads as 1000000000 queued, and a slow connection is closed again on every broadcast. Next, a dedicated agent after m118-streams-server merges builds it:
+- [x] L605: a navigation refused with an `error` frame gets no ack, so its pending scroll fires on a later ack (`runtime.gleam:1565`). After m118-lifecycle. Done in m118-backpressure (ea0365f, runtime path; see the m118-backpressure record for the transport gate).
+- [x] L453: the transport level is done (m118-logs 095daf6). `backpressure_isolation_test` shows that no close causes another: 6 sockets, 2 killed, 1 suspended under 1002 messages, which gets exactly one 1013. The runtime level is reproduced in `docs/design/backpressure_cascade_repro.gleam.txt`: a dead pid reads as 1000000000 queued, and a slow connection is closed again on every broadcast. Next, a dedicated agent after m118-streams-server merges builds it: Done in m118-backpressure (5d58181).
   - `message_queue_len` returns a `Result`;
   - the runtime forgets a connection after one close or once it is dead;
   - the runtime monitors the owner pid, as Phoenix.Channel.Server does.
@@ -783,7 +783,7 @@
 - [x] L267 (m118-build): the client build writes no manifest, so every fresh build resolves dependencies from Hex (the cause of the rate-limit failures). m118-build.
 - [x] L83: the client doesn't key the page root on navigation, so examples wrap each page in `element.keyed`. After m118-transport. Done in m118-client (4a51c81).
 - [x] L606: a navigation without a hash doesn't scroll to the top (LiveView does). m118-transport if it fits item 8, otherwise after. Done in m118-client (4a51c81).
-- [ ] L607: the non-monotonic clock warning says "event clock" for navigations too. After m118-lifecycle.
+- [x] L607: the non-monotonic clock warning says "event clock" for navigations too. After m118-lifecycle. Done in m118-backpressure (613f454).
 - [x] L608–609, m118-logs ef5aa61, adfbc0e and d588536: the client is resolved once per WebSocket connection (`server.Connection.resolved` and `Admission.request`), and a refused setting logs one line.
 - [x] L190 and L414, m118-residue (merged 2026-11-05):
   - L190 was a real defect: if a table's owner was gone before the monitor (`noproc`), `create_via_owner` crashed the caller. It now asks again within the bounded `Moves` (0119b7c), and `ets_owner_race_test` reproduces the race deterministically.
@@ -821,19 +821,27 @@
     - [x] Item render functions from dependency modules are accepted without the named-function check. Done in m118-streams-build.
     - [x] The `check_framework` message's allowlist text omits `brazier/stream`. Done in m118-streams-build.
     - [x] `stream_item_type` gives `None` for an annotation it cannot resolve; it must fail loudly. Done in m118-streams-build.
-    - [ ] A route change on a join after the first is not sent to the joiner; check against STREAMS.md (nothing is replayed by design).
-    - [ ] The connection-level `FrameTooLarge` path has no test.
-    - [ ] Stream errors during init are only logged, since no connection exists yet; decide whether the first join must carry them.
+    - [x] A route change on a join after the first is not sent to the joiner; check against STREAMS.md (nothing is replayed by design). Done in m118-backpressure (ce1dc00).
+    - [x] The connection-level `FrameTooLarge` path has no test. Done in m118-backpressure (ce1dc00).
+    - [x] Stream errors during init are only logged, since no connection exists yet; decide whether the first join must carry them. Done in m118-backpressure (ce1dc00).
     - [x] `http_fuzz_test` flaked with MailboxResidue on its branch (it still uses `await.until_telemetry`; see the residue follow-up above).
   - [x] Open from streams-client: a gleam test should run `stream_vectors.mjs` (today only `make test-client` does). Done in m118-streams-build.
 - [ ] Phase B, second round (started 2026-11-05 at e747080, disjoint files):
-  - m118-backpressure: L453 runtime level, L605, L607, and the streams runtime follow-ups (later joiner's route, init stream errors, the `FrameTooLarge` test);
+  - m118-backpressure: L453 runtime level, L605, L607, and the streams runtime follow-ups (later joiner's route, init stream errors, the `FrameTooLarge` test). Done (5d58181, ea0365f, 613f454, ce1dc00, merged 2026-11-05):
+    - L453: connection owners are monitored (`ConnectionOwnerDown`), as `Phoenix.Channel.Server` does; a slow or gone connection is forgotten once, with one log line; docs/ERROR_HANDLING.md describes it;
+    - L605: a navigation the runtime refuses with an `error` is followed by an empty patch acking its clock; one refused with `hard_navigate` is answered by the page load;
+    - L607: the clock warning names its source (event, batch event, navigation);
+    - a later join or rejoin that changes the route gets the route's stream entries (its windows are created before its route runs); refusals made before the first join reach it as `error` frames, at most `held_stream_errors_max` (32), then one counting the rest; refusals while nobody is joined after that are logged only, since a later joiner never gets items from before it (§7.3). STREAMS.md has "Correction (backpressure)" notes in §7.2–7.4 and §12;
+    - on its branch 1 of 11 `gleam test` runs had 1 unnamed failure (see the flake hunt below);
+    - verified on the tree with m118-client, the residue2 follow-up and m118-backpressure merged: build (zero warnings), format, lint, docs, `make test-client` pass; 2340 tests pass 3 runs in a row; CDP 761/761 desktop and 771/771 mobile. Every run kept its full log, so a recurrence of the unnamed failure will be named;
+    - [ ] follow-ups: the transport's own gate (`gate_live_page`) refuses a non-same-origin navigation with an error and no ack, because the transport doesn't know the model version an ack carries. The client only sends same-origin paths, but URL normalisation can make one `//…` (a link to `/.//x`), so that link's pending fragment scroll waits for a later ack. Fixing it means either a `clock` on `error` frames (a wire addition) or the client refusing a `//` pathname itself. No telemetry event marks a forgotten connection. docs/WIRE_PROTOCOL.md should say a refused navigation is acked and that `error` frames can come before the first `model_sync`.
   - m118-residue2: the `until_telemetry` residue and the last four `residue_pending` modules. Done (6bb3b1e, merged 2026-11-05):
     - `await.until_telemetry` sends through a per-call process alias, closed with `erlang:unalias/1` and flushed after the detach (as OTP's `gen:call` drops late replies); it crashes naming `what` at the deadline. New `await_telemetry_test` covers a late sender, a foreign message, the deadline and a crashing condition. This also cleared http_fuzz's residue flake;
     - runtime, runtime_telemetry, runtime_versioning and session_security receive every frame they cause and stop their runtimes; none of the residue had its cause in `runtime.gleam`. The session_security sweeper test's comment said no revocation is sent on expiry; the lookup does send one, and the test asserts it;
     - `residue_pending/0` is deleted: no module is exempt;
     - 2275 tests pass 3 runs in a row and `make test-flake` passes 5 of 5 on its branch;
-    - [ ] follow-up: many other `runtime_versioning_test` tests don't stop their runtimes; they pass the check, but each should stop and wait for the exit like the fixed ones.
+    - [x] follow-up: many other `runtime_versioning_test` tests don't stop their runtimes; they pass the check, but each should stop and wait for the exit like the fixed ones. Done (d12c031, merged 2026-11-05): every test in `runtime_test`, `runtime_versioning_test` and `runtime_telemetry_test` that starts a runtime sends `Shutdown`, waits for the exit (`await.expect_down`) and asserts each connection got nothing it didn't receive. The `start_and_connect*` tests find the runtime as the one process the start linked to the test (`brazier_runtime_test_ffi:new_links/1`). 2275 tests pass 3 runs in a row and `make test-flake` 5 of 5 on its branch.
+      - At the merge with m118-backpressure, `refused_navigation_log_omits_the_query_test` failed every run: backpressure acks a refused navigation, and this stricter stop caught the ack the test didn't read. The test now reads the ack.
   - m118-streams-build: the streams build/SSR follow-ups, the `stream_vectors.mjs` gleam test, the `[brazier, store, synced]` event and `store.synced`, the `log_path.describe` cap. Done (5fed3d1..c97ac0d, merged 2026-11-05):
     - SSR refuses an op on an undeclared stream (`unknown_stream`); `data-brazier-stream` is refused outside `stream.render`, in the build and the render;
     - the build refuses item functions from dependency or Brazier modules, fails on an unresolvable item type, and its allowlist message lists `brazier/stream`;

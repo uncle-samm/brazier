@@ -30,6 +30,11 @@ open follow-ups), which is in progress.
 
 ### Breaking
 
+- (M118 backpressure) `RuntimeMessage` gains `ConnectionOwnerDown`;
+  `runtime.HeldStreamErrors`, `runtime.held_stream_errors_max` and
+  `runtime.LiveJoin` are new, and `RuntimeState` gains `held_stream_errors`
+  and `live_join`.
+
 - (M118 transport) **Wire break:** a page from an older bundle is closed
   with 4499 `stale build`, not 4409, so every stale-build close is in the
   reload range (4400-4499) and 4409 is free. In dev mode `join` may carry
@@ -410,6 +415,16 @@ open follow-ups), which is in progress.
 
 ### Changed
 
+- (M118 backpressure) A navigation the runtime refuses with an `error`
+  frame is followed by an empty patch acking its clock, so the client's
+  pending fragment scroll settles on it instead of on a later event.
+- (M118 backpressure) The non-monotonic clock warning names what carried
+  the clock: an event, a batch event or a navigation.
+- (M118 backpressure) The first join receives the stream refusals made
+  before it (during `init`) as `error` frames before its `model_sync`, at
+  most 32; past that it gets one error counting the rest, which are in the
+  server log.
+
 - (M118 diff-shift) The model diff (server and client, op for op) finds a
   shifted array middle in linear time with Knuth-Morris-Pratt. A sliding
   window (drop k items at the front, add m at the end) is k `remove` ops
@@ -664,6 +679,16 @@ open follow-ups), which is in progress.
   the touched tests carries an `as` message.
 
 ### Fixed
+
+- (M118 backpressure) A dead connection read as 1000000000 queued
+  messages, and a slow one was closed again, with another warning, on
+  every broadcast. The runtime now monitors each connection's owner (as
+  `Phoenix.Channel.Server` does) and forgets a slow or gone connection
+  once, with one log line.
+- (M118 backpressure) A join after the first, or a rejoin, that changed
+  the route got the route's model but not its stream entries, so its
+  windows disagreed with every later op. The joiner's windows now exist
+  before its route runs, and its `model_sync` carries the route's entries.
 
 - (M118 lifecycle) A page title over `runtime.title_max_bytes` is reported
   once each time it goes over the limit, not after every update. Going
