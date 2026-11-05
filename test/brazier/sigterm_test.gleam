@@ -207,8 +207,9 @@ pub fn stopping_twice_is_one_warning_test() {
   Nil
 }
 
-/// A tree that died without `stop` still held its bound-port memory;
-/// stopping it reports that and forgets the port.
+/// A tree that died without `stop` is forgotten, bound port included, by
+/// its watcher; stopping it is one warning, and returns with the port
+/// forgotten whichever of the two got there first.
 pub fn stopping_a_dead_tree_forgets_its_port_test() {
   let started = process.new_subject()
   // Monitored from the spawn, so its DOWN carries the reason it died with.
@@ -237,11 +238,11 @@ pub fn stopping_a_dead_tree_forgets_its_port_test() {
     monitored.down_reason(starter_monitor, "the starter linked to the tree")
   let #(outcome, lines) = own_log.capture(fn() { application.stop(app) })
   let assert Error(error.ConfigError(reason)) = outcome
-  let assert True = string.contains(reason, "its port is forgotten now")
+  let assert True = string.contains(reason, "or its tree exited")
   let assert False = own_log.has(lines, level: "error", containing: [])
-  // Forgotten already: a second stop says it was stopped.
+  let assert False = server.release(app.listener)
   let assert Error(error.ConfigError(again)) = application.stop(app)
-  let assert True = string.contains(again, "it was stopped already")
+  let assert True = string.contains(again, "is not running")
   Nil
 }
 

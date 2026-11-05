@@ -37,13 +37,6 @@ Found while merging WS10b (Milestone 117, 2026-11-04).
 - **Issue:** an `init` refusing with 409 closes with 4409, the same code as
   a stale build, so the two cannot be told apart from the close code.
   - **Files:** `src/brazier/error.gleam`, `src/brazier/transport/ws.gleam`
-- **Issue:** `brazier_application_ffi:receive_wait_event` takes any
-  `{'EXIT', _, normal}` as a shutdown request, so a linked helper that exits
-  normally stops the wait.
-  - **Files:** `src/brazier_application_ffi.erl`
-- **Issue:** the node-wide app record keeps the `persistent_term` entry of a
-  tree that crashed until a `stop` or a SIGTERM finds it not running.
-  - **Files:** `src/brazier_application_ffi.erl`
 - **Issue:** a page that is reconnecting while dev mode rebuilds misses the
   `reload` (it is not subscribed between sockets); it then joins with a
   stale build and reloads through 4409 instead, behind the reload guard.
@@ -55,6 +48,45 @@ Found while merging WS10b (Milestone 117, 2026-11-04).
 ## Resolved Issues
 
 <!-- Move resolved issues here with full resolution details -->
+
+- **Issue:** `brazier_application_ffi:receive_wait_event` takes any
+  `{'EXIT', _, normal}` as a shutdown request, so a linked helper that exits
+  normally stops the wait.
+  - **Files:** `src/brazier_application_ffi.erl`,
+    `src/brazier/application.gleam`
+  - **Resolution:** (Milestone 118, m118-lifecycle) `wait_forever` traps
+    exits, so every linked process's exit reaches its receive, and the
+    receive matched `normal` from any sender. A helper that finished (a
+    `process.spawn` task) therefore ended the wait as if the application had
+    been stopped: `wait_forever` returned while the application was still
+    running. `wait_forever` now notes, before it traps exits, the supervisors
+    of the remembered applications linked to it, and `receive_wait_event`
+    takes that list: a `normal` exit of one of them is the stop; a `normal`
+    exit of any other linked process is logged (info) and the wait goes on,
+    as it would without trapping exits; any abnormal exit still ends the
+    wait loudly. An application stopped before the list is taken sends
+    nothing the waiter could receive, trapped or not, as before.
+    `app_lifecycle_test` covers a helper that exits normally (logged, the
+    waiter keeps waiting, then `stop` ends the wait) and one that crashes.
+- **Issue:** the node-wide app record keeps the `persistent_term` entry of a
+  tree that crashed until a `stop` or a SIGTERM finds it not running.
+  - **Files:** `src/brazier_application_ffi.erl`,
+    `src/brazier/application.gleam`
+  - **Resolution:** (Milestone 118, m118-lifecycle) The record was written
+    by `start` and erased by `stop` only, so nothing noticed a tree that died
+    on its own: the record (and the listener's remembered bound port) stayed
+    until a `stop` or a SIGTERM drain found the tree not running. Each
+    application now has a watcher, spawned unlinked by `start`, which
+    monitors the root supervisor before it writes the record (so a tree that
+    dies at any point after its start is reported, `noproc` at worst). When
+    the monitor fires, stopped or crashed, the watcher erases the record and
+    the bound port, logs it (info for a stop, error with the reason for a
+    crash) and exits, as OTP's application controller drops an application
+    whose master exits. `stop` returns once the watcher has forgotten the
+    tree, and fails if it exited without doing so. `app_lifecycle_test`
+    covers a killed tree (forgotten at once, the error logged, a later
+    `stop` one warning), a stop, and a SIGTERM after a crash (nothing to
+    drain, no warning).
 
 - **Issue:** a title over `runtime.title_max_bytes` is reported with an
   `error` frame and a log line after every update while it stays too large.
