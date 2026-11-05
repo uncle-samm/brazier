@@ -10,10 +10,10 @@
 
 ## Current Status
 
-**Active Milestone:** 118 — Streams, open issues, the runtime-stop flake
-**Last Completed:** 117 — Full Review Remediation (merged into main 2026-11-05, perf re-baseline deferred to 118)
+**Active Milestone:** 118 — merged into main 2026-11-05; only the night re-baseline is open
+**Last Completed:** 117 — Full Review Remediation (merged into main 2026-11-05)
 **Build Status:** GREEN (zero errors, zero warnings) on Gleam 1.19.2
-**Test Status:** GREEN (1932 tests passed, 0 failures)
+**Test Status:** GREEN (2484 tests passed, 0 failures; CDP 1033/1033 desktop, 1044/1044 mobile)
 **Linter:** PASSING (zero violations)
 
 ### Milestone 117: Full Review Remediation ✅
@@ -907,7 +907,7 @@
         - verified on the merged tree (all of phase C): build (zero warnings), format, lint, docs, `make test-client` pass; 2377 tests pass 3 runs in a row; CDP 1033/1033 desktop, whose 26 example builds log no app warning and are refused none;
         - [x] follow-up (done in phase D, m118-server-residue): refusals in Brazier modules copied whole (`brazier/element`, …) name only the copy path (its line equals the source's); naming `brazier_root/src/<module>.gleam` too would be easy.
   - The unnamed flake: every run's log is kept; if it recurs it is named and fixed at its root.
-- [ ] Phase D (started 2026-11-05 at caba494, disjoint files), the open follow-ups of phase C:
+- [x] Phase D (started 2026-11-05 at caba494, disjoint files), the open follow-ups of phase C:
   - m118-client-decode: direct model decoders for `decode_model` (paths built only on failure; Modorra R3), `event_names` computed during the render, the render reserving the other `data-brazier-*` names. Owns codec_gen, client_entry, server_codec, analyzer, the render and its ffi, the attribute module, `brazier_client/`, `priv/static`, `client_bench`. Done (a71e3ee, 667afd2, d74ce47, merged 2026-11-05):
     - numbers, median µs at 100 / 1000 rows: decode model 98.2 / 964.6 → 27.3 / 275; `event_names` 19.6 / 195.3 → 0.1 / 0.1; render 134.5 / 1418.5 → 139 / 1461 (about 5% for collecting names); `client.patch` 261.6 / 2809 → 177.1 / 1816; `client.render` 155.4 / 1634 → 139.7 / 1479;
     - Decision: generated codecs (server and browser) decode through `brazier/internal/wire_decode`, plain `fn(Dynamic) -> Result(a, DecodeError)` functions that stop at the first failure and add a path segment only on the way out of one (Elm's `Json.Decode`, serde). The error is the first one `gleam/dynamic/decode` would report, same expected, found (`dynamic.classify`) and path; the rest are no longer collected. Only an object's own keys are fields, an array is never an object, a tuple's length is checked first, a field-less record must still be an object, a too-large integer arriving as a float is a decode error;
@@ -963,7 +963,9 @@
     - a leave whose table row is missing crashes the shard (`presence_table_out_of_sync`): the table no longer mirrors the CRDT, and the restart refills it from peers;
     - `presence.list.10000.median` 4.46–5.17 → 1.40–1.65 ms, `presence.list.10.median` 3.33–3.42 → 2.50–2.63 µs; at 30,000 entries 0.650 → 0.225 µs an entry. The bench times each list in a fresh process with a sized heap and one untimed warm-up, tracing GC (`brazier_bench_ffi:presence_list_sample`); `list.10.p99` about 6.1–6.6 µs;
     - 5 new tests in `presence_test`: metas grouped by key, list reductions per entry flat from 1,000 to 10,000 entries (reductions, not time), `decode_diff` checking the message, a handle with another decoder refused everywhere, and a peer's undecodable metas (wrong type, a crashing decoder, odd JSON, odd `ref_prev`, odd shape) failing their reads while a good one reads; 2466 tests pass twice on its branch. Merged: build 0 warnings, bundle unchanged, format, lint, docs and client checks pass, `gleam test` 2484 ×3, CDP 1033/1033 desktop and 1044/1044 mobile.
-  - Then the perf re-baseline (patch_bench, the 15 stream metrics, the CDP morph decision), on an idle machine.
+  - Then the perf re-baseline (patch_bench, the 15 stream metrics, the CDP morph decision), on an idle machine. Moved out of phase D to the open item below.
+- Decision, 2026-11-05, by Sam: merge 118 into `main` now and redo the re-baseline later, at night with every application closed, as in M117. Three `make bench-baseline` runs on the final tree (97f8b04) were refused, each for different p99s over the 50% spread: (1) `http.static` 304/200 p99s, `runtime.stream.chunk.p99`, `wire.patch.p99`, `wire.model_sync_50kb.p99`; (2) `wire.stream_patch.p99` 85%, `presence.untrack.10000.p99` 54%; (3) `wire.model_sync_50kb.p99` 51.8%, `presence.track.10000.p99` 50.0%. Load average stayed 5–7 (the Claude app and WindowServer). A different set each run is noise, not code; `make bench-check` against the 7bef17a baseline passed after each. The gate's spread rule is not changed, and `bench/baselines.json` stays the 7bef17a baseline, so `make bench-check` on `main` passes. The refused file was not adopted: its two ungated metrics would fail every check with `TooNoisy`.
+- [ ] Perf re-baseline on the final 118 code, at night with every application closed (Sam): `make bench-baseline`, then `make bench-check` against it. Regenerate docs/PERFORMANCE.md's table from the file.
 - Decision, 2026-11-05: 4401 stays shared by an `init` 401 and a revoked or expired session. Both mean "authentication is no longer valid; reload" to the client. The server tells them apart by a distinct cause in the close's log line and telemetry metadata. m118-logs builds it.
 - Decision, 2026-11-05: m118-logs reproduced L453. Both problems are in the runtime's send paths:
   - `message_queue_len` returns an invented 1000000000 for a dead pid, so a dead connection is reported as slow on every broadcast;
