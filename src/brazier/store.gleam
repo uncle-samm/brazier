@@ -34,6 +34,7 @@ import brazier/pubsub
 import brazier/state_manager
 import brazier/store/replicated
 import brazier/telemetry
+import gleam/bool
 import gleam/list
 import gleam/option.{None, Some}
 import gleam/result
@@ -288,6 +289,28 @@ pub fn topic(store: Store(value)) -> String {
   store.topic
 }
 
+/// Why `synced` / `list_synced` has no answer.
+pub type SyncedError {
+  /// The store is `Local`: it has no replicas to be in sync with. `topic`
+  /// names the store.
+  NotReplicated(topic: String)
+  /// The node's replica did not answer (see `replicated.WriteError`).
+  ReplicaFailed(replicated.WriteError)
+}
+
+/// Whether this node's replica of a replicated store is in sync with every
+/// peer replica: each one last sent a digest equal to this replica's (see
+/// `replicated.synced`, which this asks). `Ok(True)` with no peer. Every
+/// value written anywhere before those digests were sent is then readable
+/// on this node. Each change into sync also emits
+/// `[brazier, store, synced]` (docs/TELEMETRY.md).
+///
+/// A `Local` store is `Error(NotReplicated(..))`: it has no replicas, so
+/// "in sync" has no meaning for it.
+pub fn synced(store: Store(value)) -> Result(Bool, SyncedError) {
+  writer_synced(store.topic, store.writer)
+}
+
 /// A list store — any number of values per key. Appending the same value
 /// twice stores it twice. Auto-broadcasts on append/delete.
 ///
@@ -511,6 +534,46 @@ fn delete_values(
 /// Get the PubSub topic for this list store (return it from `brazier.subscriptions`).
 pub fn list_topic(store: ListStore(value)) -> String {
   store.topic
+}
+
+/// `synced` for a list store.
+pub fn list_synced(store: ListStore(value)) -> Result(Bool, SyncedError) {
+  writer_synced(store.topic, store.writer)
+}
+
+fn writer_synced(topic: String, writer: Writer) -> Result(Bool, SyncedError) {
+  case writer {
+    LocalWriter -> {
+      log.warning(
+        "brazier.store",
+        "synced asked of the local store " <> topic <> ", which has no replicas",
+      )
+      Error(NotReplicated(topic:))
+    }
+    ReplicatedWriter(server) ->
+      case replicated.synced(server) {
+        Ok(in_sync) -> {
+          log.debug(
+            "brazier.store",
+            "Replicated store "
+              <> topic
+              <> " in sync: "
+              <> bool.to_string(in_sync),
+          )
+          Ok(in_sync)
+        }
+        Error(err) -> {
+          log.error(
+            "brazier.store",
+            "synced failed for the replicated store "
+              <> topic
+              <> ": "
+              <> replicated.describe_write_error(err),
+          )
+          Error(ReplicaFailed(err))
+        }
+      }
+  }
 }
 
 // === Failures ===

@@ -49,6 +49,7 @@
     effect_background_rejected/1,
     ssr_join_token_too_large/2,
     store_write/4,
+    store_synced/2,
     store_sync_span/3,
     session_event/2,
     pubsub_broadcast/3,
@@ -314,6 +315,10 @@ ssr_join_token_too_large(Bytes, Budget) ->
 store_write(Count, Store, Op, Mode) ->
     telemetry:execute([?PREFIX, store, write], #{count => Count},
                       #{store => Store, op => Op, mode => Mode}).
+
+%% [brazier, store, synced]
+store_synced(Peers, Store) ->
+    telemetry:execute([?PREFIX, store, synced], #{peers => Peers}, #{store => Store}).
 
 %% [brazier, store, sync] span. Run returns
 %% {Result, Entries, Bytes, Outcome, Reason}; the stop metadata adds

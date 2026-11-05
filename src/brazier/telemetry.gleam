@@ -148,6 +148,7 @@ pub fn catalogue() -> List(List(String)) {
     ["effect", "background", "rejected"],
     ["ssr", "join_token", "too_large"],
     ["store", "write"],
+    ["store", "synced"],
     ["session", "created"],
     ["session", "revoked"],
     ["session", "expired"],
@@ -408,6 +409,13 @@ pub fn ssr_join_token_too_large(bytes: Int, budget: Int) -> Nil
 @external(erlang, "brazier_telemetry_ffi", "store_write")
 @internal
 pub fn store_write(count: Int, store: String, op: String, mode: String) -> Nil
+
+/// `[brazier, store, synced]`: the replica of `store` came in sync with
+/// its `peers` peer replicas (0 when it has none), after being out of sync.
+/// Emitted on each such change, not while it stays in sync.
+@external(erlang, "brazier_telemetry_ffi", "store_synced")
+@internal
+pub fn store_synced(peers: Int, store: String) -> Nil
 
 /// `[brazier, store, sync]` span. `run` returns the result with the number
 /// of entries and bytes in the payload, the merge's `result` (`ok`,

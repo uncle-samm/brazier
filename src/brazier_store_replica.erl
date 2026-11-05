@@ -713,14 +713,16 @@ synced_with(Peers, S = #{peer_digests := Digests}) ->
     Digest = state_digest(S),
     lists:all(fun(Pid) -> maps:get(node(Pid), Digests, none) =:= {Pid, Digest} end, Peers).
 
-%% Log a change of the in-sync state; on reaching it with at least one
-%% peer, raise this node's floor if an earlier incarnation needs it.
-note_sync(S = #{in_sync := Was}) ->
+%% Log a change of the in-sync state, and emit [brazier, store, synced] on
+%% reaching it; on reaching it with at least one peer, raise this node's
+%% floor if an earlier incarnation needs it.
+note_sync(S = #{in_sync := Was, name := Name}) ->
     Peers = peers(S),
     case {Was, synced_with(Peers, S)} of
         {false, true} ->
             brazier_log_ffi:debug(<<"brazier.store">>, "Replica ~ts is in sync with its ~b peers",
                                  [label(S), length(Peers)]),
+            brazier_telemetry_ffi:store_synced(length(Peers), Name),
             maybe_raise_floor(S#{in_sync := true}, length(Peers));
         {true, false} ->
             brazier_log_ffi:debug(<<"brazier.store">>, "Replica ~ts is no longer in sync with its ~b peers",

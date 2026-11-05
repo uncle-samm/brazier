@@ -157,6 +157,7 @@ measurements: `system_time` and `monotonic_time` on start, `duration` and
 | `[brazier, effect, background, rejected]` | none | `limit` | yes, `brazier/effect` |
 | `[brazier, store, write]` | `count` | `store`, `op`, `mode`: `local` or `replicated` | yes, `brazier/store` |
 | `[brazier, store, sync]` S | `entries`, `bytes` (stop) | `store`, `peer`; `result`, `reason` (stop) | yes, `brazier_store_replica` (replicated stores) |
+| `[brazier, store, synced]` | `peers` | `store` | yes, `brazier_store_replica` (replicated stores) |
 | `[brazier, session, created \| revoked \| expired \| contention]` | `count` | `reason` | yes, `brazier/session` |
 | `[brazier, pubsub, broadcast]` | `local_subscribers`, `remote_nodes` | `scope`: `cluster`, `local` or `direct` | yes |
 | `[brazier, pubsub, forward, overloaded]` | `queue_len` | `shard` | yes, at most once per second per worker |
@@ -321,6 +322,14 @@ Notes on individual events:
   counted. Count refusals by `result`, not by `entries`: an empty delta (a
   removal) is `ok` with `entries` 0. See
   [CLUSTERING.md](CLUSTERING.md#replicated-stores).
+- `[brazier, store, synced]` is emitted when a replica that was out of sync
+  comes in sync: every peer replica's last digest equals its own (the
+  state `store.synced` and `replicated.synced` report). `peers` is the
+  number of peer replicas, 0 for a replica alone. It is emitted once per
+  change, not while the replica stays in sync. A local write, a merge or a
+  new peer takes it out of sync while some peer has not seen the change,
+  and the next agreeing digests emit it again. A replica alone emits it
+  once, soon after it starts.
 - `[brazier, pubsub, broadcast]`: for `scope: "cluster"`, `remote_nodes` is
   the number of remote nodes forwarded to, one message each, however many
   subscribers they have. `local_broadcast` reports `remote_nodes` 0, and a
