@@ -6,7 +6,10 @@
 /// - `decode_model(data)`: the Model from the parsed `model` value of a
 ///   `model_sync` frame (a Dynamic; the frame is parsed once).
 /// - `init_local(model)`: the first Local state, `Nil` without a layer.
-/// - `render(model, local)`: the view as `#(html, handlers)`.
+/// - `render(model, local)`: the view as `#(html, handlers, containers)`.
+/// - `stream_names()`, and `container_name`, `container_keep`,
+///   `container_limit`, `container_item` and `render_item(container, key,
+///   item)` for the stream containers of the last render.
 /// - `lookup_handler(handlers, event, id)`, `run_handler(handler, event)`,
 ///   `handler_options(handler)` and `event_names(handlers)`: the handler
 ///   table of the last render.
@@ -23,8 +26,8 @@ import brazier/build/codec_gen
 import brazier/build/field_type
 import brazier/build/gleam_code.{
   type Definition, type Expr, Arg, BinOp, Call, Case, Clause, Ctor, ExprStmt,
-  FieldAccess, Function, Import, Let, Module, PVar, Param, Ref, THole, TNamed,
-  TTuple, TupleExpr, Var,
+  FieldAccess, Function, Import, Let, ListExpr, Module, PVar, Param, Ref, Str,
+  THole, TNamed, TTuple, TupleExpr, Var,
 }
 import brazier/build/server_codec
 import brazier/log
@@ -49,6 +52,8 @@ const render_module = "brazier_render"
 const local_module = "brazier_local"
 
 const dynamic_module = "brazier_dynamic"
+
+const stream_op_module = "brazier_stream_op"
 
 /// Generate the entry module.
 pub fn generate(analysis: Analysis) -> Result(String, String) {
@@ -212,6 +217,7 @@ pub fn generate(analysis: Analysis) -> Result(String, String) {
         ),
       ],
       simple_update(call, model_type, msg_type),
+      stream_exports(analysis, msg_type),
       helpers,
     ])
   let user_imports =
@@ -227,6 +233,7 @@ pub fn generate(analysis: Analysis) -> Result(String, String) {
       [
         Import("brazier/element", Some(element)),
         Import("brazier/internal/render", Some(render_module)),
+        Import("brazier/internal/stream_op", Some(stream_op_module)),
         Import("brazier/local", Some(local_module)),
         Import("gleam/dynamic", Some(dynamic_module)),
       ],
@@ -310,12 +317,12 @@ fn render(
   Function(
     "render",
     True,
-    ["The view as HTML and its handler table."],
+    ["The view as HTML, its handler table and its stream containers."],
     [Param("model", model_type), Param(local_param, THole)],
     THole,
     [
       ExprStmt(
-        render_call("render", [
+        render_call("render_containers", [
           Call(Ref(Some(element), "to_node"), [
             Arg(call_ref(call.view, view_args)),
           ]),
@@ -374,6 +381,90 @@ fn update_local(
         ],
       )
   }
+}
+
+/// `stream_names()` and the stream container exports
+/// (docs/design/STREAMS.md 8.1).
+fn stream_exports(
+  analysis: Analysis,
+  msg_type: gleam_code.TypeExpr,
+) -> List(Definition) {
+  let string = codec_gen.string_type()
+  let dynamic = TNamed(Some(dynamic_module), "Dynamic", [])
+  let container_type = TNamed(Some(render_module), "Container", [msg_type])
+  let container = Param("container", container_type)
+  let field = fn(label) { FieldAccess(Var("container"), label) }
+  [
+    Function(
+      "stream_names",
+      True,
+      ["The streams the app declares, sorted."],
+      [],
+      TNamed(None, "List", [string]),
+      [
+        ExprStmt(ListExpr(list.map(server_codec.stream_names(analysis), Str))),
+      ],
+    ),
+    Function(
+      "container_name",
+      True,
+      ["The name of a rendered stream container's stream."],
+      [container],
+      string,
+      [ExprStmt(field("name"))],
+    ),
+    Function(
+      "container_keep",
+      True,
+      ["The end a container's limit keeps: \"first\" or \"last\"."],
+      [container],
+      string,
+      [
+        ExprStmt(
+          Call(Ref(Some(stream_op_module), "keep_to_string"), [
+            Arg(FieldAccess(field("limit"), "keep")),
+          ]),
+        ),
+      ],
+    ),
+    Function(
+      "container_limit",
+      True,
+      ["The number of items a container's limit keeps."],
+      [container],
+      int_type(),
+      [ExprStmt(FieldAccess(field("limit"), "count"))],
+    ),
+    Function(
+      "container_item",
+      True,
+      [
+        "The container's item function, to compare with `===`: the same",
+        "function gives the same value.",
+      ],
+      [container],
+      dynamic,
+      [ExprStmt(field("item_ref"))],
+    ),
+    Function(
+      "render_item",
+      True,
+      [
+        "One item of a container, from its parsed JSON: its HTML, keyed, and",
+        "its handler table with item-relative ids.",
+      ],
+      [container, Param("key", string), Param("item", dynamic)],
+      TNamed(None, "Result", [
+        TTuple([string, TNamed(Some(render_module), "Handlers", [msg_type])]),
+        string,
+      ]),
+      [
+        ExprStmt(
+          render_call("render_item", [Var("container"), Var("key"), Var("item")]),
+        ),
+      ],
+    ),
+  ]
 }
 
 fn simple_update(

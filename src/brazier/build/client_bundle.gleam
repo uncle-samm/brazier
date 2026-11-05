@@ -155,12 +155,21 @@ fn project_files(
   analysis: Analysis,
 ) -> Result(List(ProjectFile), String) {
   use entry_module <- result.try(client_entry.generate(analysis))
+  // An emitted Brazier module (`brazier/stream`) loads its FFI files from
+  // Brazier's sources, a user module from the app's.
   use ffi <- result.try(
     analysis.client
-    |> list.flat_map(fn(emitted) { emitted.ffi_files })
+    |> list.flat_map(fn(emitted) {
+      let root = case reach.is_framework_module(emitted.path) {
+        True -> files.join(brazier_root, "src")
+        False -> src_dir
+      }
+      list.map(emitted.ffi_files, fn(path) { #(root, path) })
+    })
     |> list.unique
-    |> list.try_map(fn(path) {
-      use text <- result.map(files.read(files.join(src_dir, path)))
+    |> list.try_map(fn(entry) {
+      let #(root, path) = entry
+      use text <- result.map(files.read(files.join(root, path)))
       #("src/" <> path, text)
     }),
   )

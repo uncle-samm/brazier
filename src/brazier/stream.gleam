@@ -372,7 +372,10 @@ fn limit_count(limit: Limit) -> Int {
   }
 }
 
-fn is_valid_name(name: String) -> Bool {
+/// The rule `new` asserts, which the build checks too on every literal name
+/// (`brazier/build/analyzer`).
+@internal
+pub fn is_valid_name(name: String) -> Bool {
   case string.to_utf_codepoints(name) |> list.map(string.utf_codepoint_to_int) {
     [] -> False
     [first, ..rest] ->

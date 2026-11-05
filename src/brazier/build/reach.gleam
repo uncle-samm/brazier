@@ -81,12 +81,58 @@ pub type Reach {
     /// a value (called, passed, or updated), never as a pattern.
     built: Set(#(String, String)),
     usage: Dict(String, Usage),
+    /// The uses of `stream.new` and `stream.render` in the reached user
+    /// code, in no particular order.
+    streams: List(StreamUse),
   )
 }
+
+/// A use of `brazier/stream.new` or `brazier/stream.render` in a user
+/// module (docs/design/STREAMS.md 10). `at` is the place, as
+/// `path.gleam:line:column`.
+pub type StreamUse {
+  /// A `stream.new` call: its name argument as the literal string, or what
+  /// the argument is instead.
+  Declared(
+    at: String,
+    module: String,
+    owner: String,
+    name: Result(String, String),
+  )
+  /// A `stream.render` call: `Ok` when its item argument is a named
+  /// function, or what the argument is instead.
+  Rendered(at: String, item: Result(Nil, String))
+  /// `stream.new` or `stream.render` used as a value instead of called, so
+  /// its arguments cannot be checked.
+  Referenced(at: String, function: String)
+}
+
+/// The Brazier module whose definitions reach the client one by one, as
+/// user modules' do: its other definitions run only on the server.
+pub const stream_module = "brazier/stream"
+
+/// The definitions of `brazier/stream` client code may use. The rest make
+/// effects or are test helpers, which run only on the server.
+const stream_client_names = [
+  "Stream", "Limit", "KeepFirst", "KeepLast", "Position", "Append", "Prepend",
+  "new", "name", "limit", "key", "render",
+]
+
+/// The Brazier modules the reached definitions of `brazier/stream` may use,
+/// besides the client modules.
+const stream_internal_modules = [
+  "brazier/internal/render", "brazier/internal/stream_op",
+]
 
 /// True for the modules Brazier itself provides: `brazier` and `brazier/*`.
 pub fn is_framework_module(module_path: String) -> Bool {
   module_path == "brazier" || string.starts_with(module_path, "brazier/")
+}
+
+/// True for a Brazier module the analyzer indexes and the client gets
+/// pruned to the reached definitions, as a user module: `brazier/stream`.
+pub fn is_pruned_framework_module(module_path: String) -> Bool {
+  module_path == stream_module
 }
 
 /// Index parsed modules, given as #(module path, source, AST).
@@ -163,7 +209,11 @@ type State {
     pending: List(Item),
     built: Set(#(String, String)),
     usage: Dict(String, Usage),
+    streams: List(StreamUse),
     errors: List(String),
+    /// True when walking client code: the Brazier allowlist and the
+    /// browser checks apply. False for `scan`.
+    client: Bool,
   )
 }
 
@@ -175,6 +225,7 @@ type Ctx {
     info: ModuleInfo,
     /// The definition being walked, for messages.
     owner: String,
+    client: Bool,
   )
 }
 
@@ -186,6 +237,41 @@ pub fn walk(
   allowed: List(String),
   roots: List(Item),
 ) -> Result(Reach, List(String)) {
+  traverse(index, allowed, roots, True)
+}
+
+/// The stream uses in every function and constant of `modules`, whatever
+/// runs them: the build checks every `stream.new` of the app's modules, not
+/// only the client's (docs/design/STREAMS.md 10). No client check applies.
+pub fn scan(
+  index: Index,
+  modules: List(String),
+) -> Result(List(StreamUse), List(String)) {
+  use roots <- result.try(
+    list.try_map(modules, fn(module) {
+      case dict.get(index, module) {
+        Ok(info) ->
+          Ok(list.append(
+            dict.keys(info.functions) |> list.map(FunctionItem(module, _)),
+            dict.keys(info.constants) |> list.map(ConstantItem(module, _)),
+          ))
+        Error(Nil) ->
+          Error([
+            "Invariant violated: scanned module " <> module <> " is not indexed",
+          ])
+      }
+    }),
+  )
+  traverse(index, [], list.flatten(roots), False)
+  |> result.map(fn(reached) { reached.streams })
+}
+
+fn traverse(
+  index: Index,
+  allowed: List(String),
+  roots: List(Item),
+  client: Bool,
+) -> Result(Reach, List(String)) {
   let state =
     run(
       State(
@@ -193,13 +279,21 @@ pub fn walk(
         pending: roots,
         built: set.new(),
         usage: dict.new(),
+        streams: [],
         errors: [],
+        client:,
       ),
       index,
       set.from_list(allowed),
     )
   case state.errors {
-    [] -> Ok(Reach(items: state.seen, built: state.built, usage: state.usage))
+    [] ->
+      Ok(Reach(
+        items: state.seen,
+        built: state.built,
+        usage: state.usage,
+        streams: state.streams,
+      ))
     errors -> Error(list.unique(list.reverse(errors)))
   }
 }
@@ -230,7 +324,14 @@ fn visit(st: State, index: Index, allowed: Set(String), item: Item) -> State {
           <> " outside the analyzed modules",
       )
     Ok(info) -> {
-      let ctx = Ctx(index:, allowed:, info:, owner: item.name)
+      // The reached definitions of a pruned Brazier module use Brazier's
+      // internal client modules too.
+      let allowed = case is_pruned_framework_module(item.module) {
+        True -> set.union(allowed, set.from_list(stream_internal_modules))
+        False -> allowed
+      }
+      let ctx =
+        Ctx(index:, allowed:, info:, owner: item.name, client: st.client)
       case item {
         FunctionItem(name:, ..) ->
           case dict.get(info.functions, name) {
@@ -287,7 +388,7 @@ fn visit_function(
   def: glance.Definition(glance.Function),
 ) -> State {
   let glance.Definition(attributes:, definition: function) = def
-  let st = case erlang_only(attributes, function) {
+  let st = case ctx.client && erlang_only(attributes, function) {
     True ->
       add_error(
         st,
@@ -476,7 +577,8 @@ fn constructor(
 }
 
 /// A value `name` defined in another module: followed when it is a user
-/// module, checked when it is a Brazier module, left alone otherwise.
+/// module or a pruned Brazier module, checked when it is another Brazier
+/// module, left alone otherwise.
 fn external_value(
   st: State,
   ctx: Ctx,
@@ -487,24 +589,76 @@ fn external_value(
 ) -> State {
   case dict.get(ctx.index, module) {
     Ok(info) ->
-      case is_upper_name(name) {
-        True ->
-          case dict.get(info.constructors, name) {
-            Ok(type_name) -> constructor(st, module, type_name, name, as_value)
-            Error(Nil) -> st
-          }
-        False ->
-          case
-            dict.has_key(info.functions, name),
-            dict.has_key(info.constants, name)
-          {
-            True, _ -> add_item(st, FunctionItem(module, name))
-            False, True -> add_item(st, ConstantItem(module, name))
-            False, False -> st
-          }
+      case client_name_refused(ctx, module, name) {
+        True -> refuse_server_name(st, ctx, module, name, span)
+        False -> follow_value(st, info, module, name, as_value)
       }
     Error(Nil) -> check_framework(st, ctx, module, name, span)
   }
+}
+
+/// Follow `module.name` into its indexed module.
+fn follow_value(
+  st: State,
+  info: ModuleInfo,
+  module: String,
+  name: String,
+  as_value: Bool,
+) -> State {
+  case is_upper_name(name) {
+    True ->
+      case dict.get(info.constructors, name) {
+        Ok(type_name) -> constructor(st, module, type_name, name, as_value)
+        Error(Nil) -> st
+      }
+    False ->
+      case
+        dict.has_key(info.functions, name),
+        dict.has_key(info.constants, name)
+      {
+        True, _ -> add_item(st, FunctionItem(module, name))
+        False, True -> add_item(st, ConstantItem(module, name))
+        False, False -> st
+      }
+  }
+}
+
+/// True when client code in a user module uses a definition of a pruned
+/// Brazier module that runs only on the server, such as `stream.insert`.
+fn client_name_refused(ctx: Ctx, module: String, name: String) -> Bool {
+  ctx.client
+  && is_pruned_framework_module(module)
+  && !is_framework_module(ctx.info.path)
+  && !list.contains(stream_client_names, name)
+}
+
+fn refuse_server_name(
+  st: State,
+  ctx: Ctx,
+  module: String,
+  name: String,
+  span: glance.Span,
+) -> State {
+  add_error(
+    st,
+    at(ctx, span)
+      <> ": `"
+      <> ctx.info.path
+      <> "."
+      <> ctx.owner
+      <> "` uses `"
+      <> module
+      <> "."
+      <> name
+      <> "`, which runs only on the server. Client code (what `view`, a `simple` app's `update` and a Local layer reach) may use only "
+      <> string.join(
+      list.map(stream_client_names, fn(n) { module <> "." <> n }),
+      ", ",
+    )
+      <> " of "
+      <> module
+      <> ": stream ops are effects, which `update` returns on the server.",
+  )
 }
 
 fn check_framework(
@@ -514,29 +668,50 @@ fn check_framework(
   name: String,
   span: glance.Span,
 ) -> State {
-  case is_framework_module(module) && !set.contains(ctx.allowed, module) {
+  case
+    ctx.client
+    && is_framework_module(module)
+    && !set.contains(ctx.allowed, module)
+  {
     False -> st
     True ->
-      add_error(
-        st,
-        at(ctx, span)
-          <> ": `"
-          <> ctx.info.path
-          <> "."
-          <> ctx.owner
-          <> "` uses `"
-          <> module
-          <> "."
-          <> name
-          <> "`, but "
-          <> module
-          <> " does not run in the browser. Client code (what `view`, a `simple` app's `update` and a Local layer reach) may use only "
-          <> string.join(
-          set.to_list(ctx.allowed) |> list.sort(string.compare),
-          ", ",
-        )
-          <> " and non-Brazier packages.",
-      )
+      case is_pruned_framework_module(module) {
+        // The build gives the analyzer the pruned modules' sources.
+        True ->
+          add_error(
+            st,
+            "Invariant violated: "
+              <> at(ctx, span)
+              <> " uses "
+              <> module
+              <> "."
+              <> name
+              <> ", but the source of "
+              <> module
+              <> " was not given to the analyzer",
+          )
+        False ->
+          add_error(
+            st,
+            at(ctx, span)
+              <> ": `"
+              <> ctx.info.path
+              <> "."
+              <> ctx.owner
+              <> "` uses `"
+              <> module
+              <> "."
+              <> name
+              <> "`, but "
+              <> module
+              <> " does not run in the browser. Client code (what `view`, a `simple` app's `update` and a Local layer reach) may use only "
+              <> string.join(
+              set.to_list(ctx.allowed) |> list.sort(string.compare),
+              ", ",
+            )
+              <> " and non-Brazier packages.",
+          )
+      }
   }
 }
 
@@ -723,7 +898,7 @@ fn walk_fields(
         walk_expr(st, ctx, locals, item)
       // `f(label:)` passes the variable or function named `label`.
       glance.ShorthandField(label:, location:) ->
-        ref_value(st, ctx, locals, label, location, True)
+        walk_expr(st, ctx, locals, glance.Variable(location:, name: label))
     }
   })
 }
@@ -736,8 +911,10 @@ fn walk_expr(
 ) -> State {
   case expr {
     glance.Int(..) | glance.Float(..) | glance.String(..) -> st
-    glance.Variable(location:, name:) ->
-      ref_value(st, ctx, locals, name, location, True)
+    glance.Variable(location:, ..)
+    | glance.FieldAccess(location:, container: glance.Variable(..), ..) ->
+      record_reference(st, ctx, locals, expr, location)
+      |> walk_callee(ctx, locals, expr)
     glance.NegateInt(value:, ..) | glance.NegateBool(value:, ..) ->
       walk_expr(st, ctx, locals, value)
     glance.Block(statements:, ..) ->
@@ -783,29 +960,38 @@ fn walk_expr(
         case field.item {
           Some(item) -> walk_expr(st, ctx, locals, item)
           // `Record(..r, label:)` uses the variable named `label`.
-          None -> ref_value(st, ctx, locals, field.label, location, True)
+          None ->
+            walk_expr(
+              st,
+              ctx,
+              locals,
+              glance.Variable(location:, name: field.label),
+            )
         }
       })
     }
-    glance.FieldAccess(
-      location:,
-      container: glance.Variable(name: qualifier, ..) as container,
-      label:,
-    ) ->
-      case module_alias(ctx, locals, qualifier) {
-        Ok(path) ->
-          ref_qualified(st, ctx, qualifier, path, label, location, True)
-        Error(Nil) -> walk_expr(st, ctx, locals, container)
-      }
     glance.FieldAccess(container:, ..) -> walk_expr(st, ctx, locals, container)
-    glance.Call(function:, arguments:, ..) ->
-      walk_expr(st, ctx, locals, function)
-      |> walk_fields(ctx, locals, arguments)
+    glance.Call(location:, function:, arguments:) ->
+      walk_call(st, ctx, locals, location, function, arguments, None)
     glance.TupleIndex(tuple:, ..) -> walk_expr(st, ctx, locals, tuple)
-    glance.FnCapture(function:, arguments_before:, arguments_after:, ..) ->
-      walk_expr(st, ctx, locals, function)
-      |> walk_fields(ctx, locals, arguments_before)
-      |> walk_fields(ctx, locals, arguments_after)
+    glance.FnCapture(
+      location:,
+      label:,
+      function:,
+      arguments_before:,
+      arguments_after:,
+    ) ->
+      walk_capture(
+        st,
+        ctx,
+        locals,
+        location,
+        label,
+        function,
+        arguments_before,
+        arguments_after,
+        None,
+      )
     glance.BitString(segments:, ..) ->
       list.fold(segments, st, fn(st, segment) {
         let #(value, options) = segment
@@ -829,11 +1015,370 @@ fn walk_expr(
         |> walk_expr(ctx, bound, clause.body)
       })
     }
+    glance.BinaryOperator(name: glance.Pipe, left:, right:, ..) ->
+      walk_pipe(st, ctx, locals, left, right)
     glance.BinaryOperator(left:, right:, ..) ->
       walk_expr(st, ctx, locals, left) |> walk_expr(ctx, locals, right)
     glance.Echo(expression:, message:, ..) ->
       walk_optional_expr(st, ctx, locals, expression)
       |> walk_optional_expr(ctx, locals, message)
+  }
+}
+
+/// The function of a call, or a reference: a variable or `alias.name`.
+/// Walking it records no stream use; the caller does.
+fn walk_callee(
+  st: State,
+  ctx: Ctx,
+  locals: Set(String),
+  function: glance.Expression,
+) -> State {
+  case function {
+    glance.Variable(location:, name:) ->
+      ref_value(st, ctx, locals, name, location, True)
+    glance.FieldAccess(
+      location:,
+      container: glance.Variable(name: qualifier, ..) as container,
+      label:,
+    ) ->
+      case module_alias(ctx, locals, qualifier) {
+        Ok(path) ->
+          ref_qualified(st, ctx, qualifier, path, label, location, True)
+        Error(Nil) -> walk_expr(st, ctx, locals, container)
+      }
+    _ -> walk_expr(st, ctx, locals, function)
+  }
+}
+
+/// `function(arguments)`, or `piped |> function(arguments)` when `piped` is
+/// `Some`.
+fn walk_call(
+  st: State,
+  ctx: Ctx,
+  locals: Set(String),
+  location: glance.Span,
+  function: glance.Expression,
+  arguments: List(glance.Field(glance.Expression)),
+  piped: Option(glance.Expression),
+) -> State {
+  let st = case stream_callee(ctx, locals, function) {
+    Ok(callee) -> {
+      let given = list.map(positional(arguments), Some)
+      let given = case piped {
+        Some(left) -> [Some(left), ..given]
+        None -> given
+      }
+      record_call(st, ctx, locals, callee, location, given)
+    }
+    Error(Nil) -> st
+  }
+  walk_callee(st, ctx, locals, function)
+  |> walk_fields(ctx, locals, arguments)
+}
+
+/// `function(before.., _, after..)`, or `piped |> function(.., _, ..)` when
+/// `piped` is `Some`: the pipe fills the hole.
+fn walk_capture(
+  st: State,
+  ctx: Ctx,
+  locals: Set(String),
+  location: glance.Span,
+  label: Option(String),
+  function: glance.Expression,
+  before: List(glance.Field(glance.Expression)),
+  after: List(glance.Field(glance.Expression)),
+  piped: Option(glance.Expression),
+) -> State {
+  let st = case stream_callee(ctx, locals, function) {
+    Ok(callee) -> {
+      // A labelled hole fills a labelled parameter, not a positional one.
+      let hole = case label {
+        None -> [piped]
+        Some(_) -> []
+      }
+      let given =
+        list.flatten([
+          list.map(positional(before), Some),
+          hole,
+          list.map(positional(after), Some),
+        ])
+      record_call(st, ctx, locals, callee, location, given)
+    }
+    Error(Nil) -> st
+  }
+  walk_callee(st, ctx, locals, function)
+  |> walk_fields(ctx, locals, before)
+  |> walk_fields(ctx, locals, after)
+}
+
+/// `left |> right`: `right` is called with `left` as its first argument, or
+/// as its hole when it is a capture.
+fn walk_pipe(
+  st: State,
+  ctx: Ctx,
+  locals: Set(String),
+  left: glance.Expression,
+  right: glance.Expression,
+) -> State {
+  let st = walk_expr(st, ctx, locals, left)
+  case right {
+    glance.Call(location:, function:, arguments:) ->
+      walk_call(st, ctx, locals, location, function, arguments, Some(left))
+    glance.FnCapture(
+      location:,
+      label:,
+      function:,
+      arguments_before:,
+      arguments_after:,
+    ) ->
+      walk_capture(
+        st,
+        ctx,
+        locals,
+        location,
+        label,
+        function,
+        arguments_before,
+        arguments_after,
+        Some(left),
+      )
+    glance.Variable(location:, ..)
+    | glance.FieldAccess(location:, container: glance.Variable(..), ..) ->
+      case stream_callee(ctx, locals, right) {
+        Ok(callee) ->
+          record_call(st, ctx, locals, callee, location, [Some(left)])
+          |> walk_callee(ctx, locals, right)
+        Error(Nil) -> walk_expr(st, ctx, locals, right)
+      }
+    _ -> walk_expr(st, ctx, locals, right)
+  }
+}
+
+// ----- Stream uses -----
+
+type StreamFunction {
+  StreamNew
+  StreamRender
+}
+
+fn stream_function_name(function: StreamFunction) -> String {
+  case function {
+    StreamNew -> "new"
+    StreamRender -> "render"
+  }
+}
+
+/// `stream.new` or `stream.render` when `expr` names one of them in a user
+/// module, through an unshadowed import alias or an unqualified import.
+fn stream_callee(
+  ctx: Ctx,
+  locals: Set(String),
+  expr: glance.Expression,
+) -> Result(StreamFunction, Nil) {
+  case is_framework_module(ctx.info.path) {
+    True -> Error(Nil)
+    False -> {
+      let named = case expr {
+        glance.Variable(name:, ..) ->
+          case
+            set.contains(locals, name)
+            || dict.has_key(ctx.info.functions, name)
+            || dict.has_key(ctx.info.constants, name)
+          {
+            True -> Error(Nil)
+            False ->
+              case dict.get(ctx.info.values, name) {
+                Ok(#(module, original)) if module == stream_module ->
+                  Ok(original)
+                _ -> Error(Nil)
+              }
+          }
+        glance.FieldAccess(
+          container: glance.Variable(name: qualifier, ..),
+          label:,
+          ..,
+        ) ->
+          case module_alias(ctx, locals, qualifier) {
+            Ok(module) if module == stream_module -> Ok(label)
+            _ -> Error(Nil)
+          }
+        _ -> Error(Nil)
+      }
+      case named {
+        Ok("new") -> Ok(StreamNew)
+        Ok("render") -> Ok(StreamRender)
+        _ -> Error(Nil)
+      }
+    }
+  }
+}
+
+/// `stream.new` or `stream.render` used as a value, not called.
+fn record_reference(
+  st: State,
+  ctx: Ctx,
+  locals: Set(String),
+  expr: glance.Expression,
+  location: glance.Span,
+) -> State {
+  case stream_callee(ctx, locals, expr) {
+    Ok(function) ->
+      add_stream_use(
+        st,
+        Referenced(
+          at: at(ctx, location),
+          function: stream_function_name(function),
+        ),
+      )
+    Error(Nil) -> st
+  }
+}
+
+/// A call of `stream.new` or `stream.render` with its positional arguments
+/// in order; `None` is a capture hole.
+fn record_call(
+  st: State,
+  ctx: Ctx,
+  locals: Set(String),
+  function: StreamFunction,
+  location: glance.Span,
+  arguments: List(Option(glance.Expression)),
+) -> State {
+  let at = at(ctx, location)
+  case function {
+    StreamNew ->
+      add_stream_use(
+        st,
+        Declared(
+          at:,
+          module: ctx.info.path,
+          owner: ctx.owner,
+          name: stream_name_argument(list.first(arguments)),
+        ),
+      )
+    StreamRender ->
+      add_stream_use(
+        st,
+        Rendered(
+          at:,
+          item: item_argument(
+            ctx,
+            locals,
+            list.drop(arguments, 3) |> list.first,
+          ),
+        ),
+      )
+  }
+}
+
+fn add_stream_use(st: State, stream_use: StreamUse) -> State {
+  State(..st, streams: [stream_use, ..st.streams])
+}
+
+/// The unlabelled arguments of a call, in order.
+fn positional(
+  arguments: List(glance.Field(glance.Expression)),
+) -> List(glance.Expression) {
+  list.filter_map(arguments, fn(field) {
+    case field {
+      glance.UnlabelledField(item:) -> Ok(item)
+      glance.LabelledField(..) | glance.ShorthandField(..) -> Error(Nil)
+    }
+  })
+}
+
+/// The name argument of `stream.new`: the literal string, or what it is.
+fn stream_name_argument(
+  argument: Result(Option(glance.Expression), Nil),
+) -> Result(String, String) {
+  case argument {
+    Ok(Some(glance.String(value:, ..))) -> Ok(value)
+    Ok(Some(expr)) -> Error(describe_expression(expr))
+    Ok(None) -> Error("a capture hole")
+    Error(Nil) -> Error("missing")
+  }
+}
+
+/// The item argument of `stream.render`: `Ok` when it names a top-level
+/// function, or what it is instead.
+fn item_argument(
+  ctx: Ctx,
+  locals: Set(String),
+  argument: Result(Option(glance.Expression), Nil),
+) -> Result(Nil, String) {
+  case argument {
+    Error(Nil) -> Error("missing")
+    Ok(None) -> Error("a capture hole")
+    Ok(Some(glance.Variable(name:, ..))) ->
+      case set.contains(locals, name), is_upper_name(name) {
+        True, _ -> Error("the local variable `" <> name <> "`")
+        False, True -> Error("the constructor `" <> name <> "`")
+        False, False ->
+          case
+            dict.has_key(ctx.info.functions, name),
+            dict.has_key(ctx.info.constants, name),
+            dict.get(ctx.info.values, name)
+          {
+            True, _, _ -> Ok(Nil)
+            False, True, _ -> Error("the constant `" <> name <> "`")
+            False, False, Ok(#(module, original)) ->
+              imported_item(ctx, module, original, name)
+            // The compiler rejects a name that is not defined.
+            False, False, Error(Nil) ->
+              Error("`" <> name <> "`, which is not defined")
+          }
+      }
+    Ok(Some(
+      glance.FieldAccess(
+        container: glance.Variable(name: qualifier, ..),
+        label:,
+        ..,
+      ) as expr,
+    )) ->
+      case module_alias(ctx, locals, qualifier) {
+        Ok(module) ->
+          imported_item(ctx, module, label, qualifier <> "." <> label)
+        Error(Nil) -> Error(describe_expression(expr))
+      }
+    Ok(Some(expr)) -> Error(describe_expression(expr))
+  }
+}
+
+/// `written` names `module.name`. A function of a module the analyzer does
+/// not index (a dependency's) is accepted: its source is not here.
+fn imported_item(
+  ctx: Ctx,
+  module: String,
+  name: String,
+  written: String,
+) -> Result(Nil, String) {
+  case is_upper_name(name), dict.get(ctx.index, module) {
+    True, _ -> Error("the constructor `" <> written <> "`")
+    False, Error(Nil) -> Ok(Nil)
+    False, Ok(info) ->
+      case
+        dict.has_key(info.functions, name),
+        dict.has_key(info.constants, name)
+      {
+        True, _ -> Ok(Nil)
+        False, True -> Error("the constant `" <> written <> "`")
+        False, False -> Error("`" <> written <> "`, which is not defined")
+      }
+  }
+}
+
+fn describe_expression(expr: glance.Expression) -> String {
+  case expr {
+    glance.Fn(..) -> "an anonymous function"
+    glance.FnCapture(..) -> "a function capture"
+    glance.Call(..) -> "a function call"
+    glance.Variable(name:, ..) -> "the variable `" <> name <> "`"
+    glance.FieldAccess(..) -> "a record field"
+    glance.Int(..) | glance.Float(..) | glance.String(..) -> "a literal"
+    glance.Case(..) -> "a case expression"
+    glance.Block(..) -> "a block"
+    glance.BinaryOperator(name: glance.Pipe, ..) -> "a pipeline"
+    _ -> "an expression"
   }
 }
 

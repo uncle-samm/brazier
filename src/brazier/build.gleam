@@ -115,7 +115,7 @@ pub fn build(project: String, target: Target) -> Result(Built, String) {
     "brazier.build",
     "Building " <> app.path <> " (" <> app.module_path <> ")",
   )
-  use analysis <- result.try(analyze(src_dir, app))
+  use analysis <- result.try(analyze(src_dir, brazier_root, app))
   use Nil <- result.try(contract.write(project, app.path, analysis))
   use codec_path <- result.try(write_codec(project, src_dir, analysis))
   use Nil <- result.try(compile(project, config.name, codec_path))
@@ -154,13 +154,18 @@ fn find_app(
   }
 }
 
-fn analyze(src_dir: String, app: AppModule) -> Result(Analysis, String) {
+fn analyze(
+  src_dir: String,
+  brazier_root: String,
+  app: AppModule,
+) -> Result(Analysis, String) {
   use externals <- result.try(sources.app_externals(src_dir, app))
+  use pruned <- result.try(sources.pruned_framework_sources(brazier_root))
   use analysis <- result.try(
-    analyzer.analyze(app.module_path, [
-      #(app.module_path, app.source),
-      ..externals
-    ])
+    analyzer.analyze(
+      app.module_path,
+      list.flatten([[#(app.module_path, app.source)], externals, pruned]),
+    )
     |> result.map_error(fn(reason) {
       "Analysis of " <> app.path <> " failed: " <> reason
     }),
@@ -173,7 +178,9 @@ fn analyze(src_dir: String, app: AppModule) -> Result(Analysis, String) {
       <> string.inspect(list.length(analysis.client))
       <> " client modules, "
       <> string.inspect(set.size(analysis.codecs.allowed))
-      <> " client-built constructors",
+      <> " client-built constructors, "
+      <> string.inspect(list.length(analysis.streams))
+      <> " streams",
   )
   Ok(analysis)
 }
