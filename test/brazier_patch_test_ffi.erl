@@ -1,6 +1,6 @@
 -module(brazier_patch_test_ffi).
 -export([random_pair/1, random_chain/2, compare_apply/1, run_node/2, write_file/2,
-         scratch_path/1]).
+         scratch_path/1, window_pairs/0, random_window_pair/1]).
 
 %% Property-test helpers for the patch round trip (server diff -> client apply).
 
@@ -113,6 +113,79 @@ mutate(_Scalar) ->
         2 -> gen_array(1);
         3 -> gen_scalar()
     end.
+
+%% === Shifted windows ===
+%%
+%% window_pairs/0 enumerates {OldJson, NewJson} pairs whose arrays shift:
+%% old holds V(0..N-1); a front shift drops K from the front and appends M,
+%% a back shift inserts K at the front and drops M from the back. Every
+%% length in window_lengths/0 meets every shift amount in shift_amounts/1
+%% (0, 1, 2, half, all, more than all) and every element kind (distinct
+%% integers, integers mod 3, a two-value alternation, objects), at the
+%% root and inside maps with pinned elements before and after the window.
+%% random_window_pair/1 adds seeded windows over a two-value alphabet, the
+%% worst case for overlaps and cost ties.
+
+-spec window_pairs() -> [{binary(), binary()}].
+window_pairs() ->
+    [encode_pair(wrap(Context, Old), wrap(Context, New))
+     || N <- window_lengths(),
+        K <- shift_amounts(N),
+        M <- lists:usort([0, 1, 2, K]),
+        Kind <- [int, mod3, alternate, object],
+        Direction <- [front, back],
+        {Old, New} <- [window(Kind, Direction, N, K, M)],
+        Context <- contexts(N)].
+
+window_lengths() -> [0, 1, 2, 3, 4, 5, 8, 13, 50, 200].
+
+shift_amounts(N) -> lists:usort([0, 1, 2, N div 2, max(N - 1, 0), N, N + 1]).
+
+%% The 200-element windows run at the root only, to keep the vectors file
+%% small; the shorter ones cover the pinned contexts.
+contexts(N) when N > 50 -> [root];
+contexts(_N) -> [root, pinned, footer, nested].
+
+window(Kind, front, N, K, M) ->
+    {values(Kind, 0, N - 1), values(Kind, K, N - 1 + M)};
+window(Kind, back, N, K, M) ->
+    {values(Kind, 0, N - 1), values(Kind, -K, N - 1 - M)}.
+
+%% V(From..To), empty when From > To.
+values(_Kind, From, To) when From > To ->
+    [];
+values(Kind, From, To) ->
+    [value(Kind, I) || I <- lists:seq(From, To)].
+
+value(int, I) -> I;
+value(mod3, I) -> ((I rem 3) + 3) rem 3;
+value(alternate, I) -> case I band 1 of 0 -> <<"a">>; 1 -> <<"b">> end;
+value(object, I) -> #{<<"id">> => I, <<"label">> => <<"event">>}.
+
+wrap(root, Window) -> Window;
+wrap(pinned, Window) -> #{<<"items">> => [<<"head">>] ++ Window ++ [<<"foot">>], <<"n">> => 1};
+wrap(footer, Window) -> #{<<"items">> => Window ++ [<<"foot">>]};
+wrap(nested, Window) -> #{<<"a">> => #{<<"b~/">> => [<<"head">> | Window]}}.
+
+encode_pair(Old, New) ->
+    {iolist_to_binary(json:encode(Old)), iolist_to_binary(json:encode(New))}.
+
+%% A seeded window over the alphabet [0, 1]: old has 0-40 elements, new is
+%% old with K dropped from one end and M random elements added at the
+%% other (or at the same end, an edit that is no shift).
+-spec random_window_pair(integer()) -> {binary(), binary()}.
+random_window_pair(Seed) ->
+    rand:seed(exsss, {Seed, Seed * 11 + 5, Seed * 3 + 7}),
+    Bits = fun(Count) -> [rand:uniform(2) - 1 || _ <- lists:seq(1, Count)] end,
+    Old = Bits(rand:uniform(41) - 1),
+    K = rand:uniform(length(Old) + 1) - 1,
+    Added = Bits(rand:uniform(5) - 1),
+    New = case rand:uniform(3) of
+        1 -> lists:nthtail(K, Old) ++ Added;
+        2 -> Added ++ lists:sublist(Old, length(Old) - K);
+        3 -> Added ++ lists:nthtail(K, Old)
+    end,
+    encode_pair(Old, New).
 
 %% === Apply engine equivalence ===
 %%

@@ -114,6 +114,13 @@ function compareKeys(a, b) {
   return ab.length - bb.length;
 }
 
+// Mirrors diff_arrays/3 op for op: strip the common prefix and suffix, then
+// emit whichever has fewer ops, the middles paired by index or a shift (a
+// sliding window drops k from the front and appends; its mirror inserts at
+// the front and drops from the back). A tie goes to the shift; a patch
+// larger than the array becomes one replace. The shift search and the
+// references behind it are described above find_shift/5 in
+// brazier_patch_ffi.erl.
 function diffArray(oldArr, newArr, path, ops) {
   let prefix = 0;
   while (
@@ -134,29 +141,161 @@ function diffArray(oldArr, newArr, path, ops) {
   const oldMidLen = oldArr.length - prefix - suffix;
   const newMidLen = newArr.length - prefix - suffix;
   const paired = Math.min(oldMidLen, newMidLen);
-  const local = [];
-  for (let i = 0; i < paired; i++) {
-    const index = prefix + i;
-    diffValues(oldArr[index], newArr[index], childPath(path, index), local);
-  }
+  const surplusOps = [];
   if (oldMidLen > paired) {
-    for (let index = prefix + oldMidLen - 1; index >= prefix + paired; index--) {
-      local.push({ op: "remove", path: childPath(path, index) });
-    }
+    pushRemoves(surplusOps, path, prefix + oldMidLen - 1, prefix + paired);
   } else if (newMidLen > paired) {
     const surplus = newArr.slice(prefix + paired, prefix + newMidLen);
     if (suffix === 0) {
-      local.push({ op: "append", path, value: surplus });
+      surplusOps.push({ op: "append", path, value: surplus });
     } else {
-      for (let i = 0; i < surplus.length; i++) {
-        local.push({ op: "add", path: childPath(path, prefix + paired + i), value: surplus[i] });
+      pushAdds(surplusOps, path, prefix + paired, surplus);
+    }
+  }
+  const oldMid = oldArr.slice(prefix, prefix + oldMidLen);
+  const newMid = newArr.slice(prefix, prefix + newMidLen);
+  const shift = findShift(oldMid, newMid, suffix);
+  let local;
+  if (shift === null) {
+    local = diffPaired(oldMid, newMid, path, prefix, paired, Infinity).concat(surplusOps);
+  } else {
+    // The paired ops win only with strictly fewer ops, so the pairing stops
+    // as soon as it reaches the shift's count, and the shift's ops are built
+    // only when it wins.
+    const pairedOps = diffPaired(
+      oldMid,
+      newMid,
+      path,
+      prefix,
+      paired,
+      shift.cost - surplusOps.length,
+    );
+    if (pairedOps === null) {
+      local = shiftOps(shift, oldMid, newMid, path, prefix, suffix);
+      if (local.length !== shift.cost) {
+        throw new Error(`shift cost differs: ${shift.cost} counted, ${local.length} built`);
       }
+    } else {
+      local = pairedOps.concat(surplusOps);
     }
   }
   if (local.length > newArr.length) {
     ops.push({ op: "replace", path, value: newArr });
   } else {
     for (const op of local) ops.push(op);
+  }
+}
+
+// Remove ops for indices from down to to (from >= to), highest first.
+function pushRemoves(ops, path, from, to) {
+  for (let index = from; index >= to; index--) {
+    ops.push({ op: "remove", path: childPath(path, index) });
+  }
+}
+
+// Add ops inserting values at first, first + 1, ...
+function pushAdds(ops, path, first, values) {
+  for (let i = 0; i < values.length; i++) {
+    ops.push({ op: "add", path: childPath(path, first + i), value: values[i] });
+  }
+}
+
+// Diff the paired middle elements by index (mirrors diff_paired/7). Returns
+// the ops, or null as soon as their count reaches budget: the caller then
+// has an alternative with no more ops.
+function diffPaired(oldMid, newMid, path, prefix, paired, budget) {
+  const ops = [];
+  for (let i = 0; i < paired; i++) {
+    if (ops.length >= budget) return null;
+    diffValues(oldMid[i], newMid[i], childPath(path, prefix + i), ops);
+  }
+  return ops.length >= budget ? null : ops;
+}
+
+// { side: "front" | "back", overlap, cost } or null (mirrors find_shift/5),
+// where cost is the number of ops shiftOps emits for it. The shift with
+// fewer ops wins; a tie goes to front.
+function findShift(oldMid, newMid, suffix) {
+  if (oldMid.length < 2 || newMid.length < 2) return null;
+  const front = overlap(oldMid, newMid);
+  const back = overlap(newMid, oldMid);
+  const frontCost = oldMid.length - front + (suffix === 0 ? 1 : newMid.length - front);
+  const backCost = oldMid.length - back + newMid.length - back;
+  if (front === 0 && back === 0) return null;
+  if (back === 0) return { side: "front", overlap: front, cost: frontCost };
+  if (front === 0) return { side: "back", overlap: back, cost: backCost };
+  return frontCost <= backCost
+    ? { side: "front", overlap: front, cost: frontCost }
+    : { side: "back", overlap: back, cost: backCost };
+}
+
+// The ops of a shift in the order they apply (mirrors shift_ops/6).
+function shiftOps(shift, oldMid, newMid, path, prefix, suffix) {
+  const ops = [];
+  if (shift.side === "front") {
+    pushRemoves(ops, path, prefix + oldMid.length - shift.overlap - 1, prefix);
+    const appended = newMid.slice(shift.overlap);
+    if (suffix === 0) {
+      ops.push({ op: "append", path, value: appended });
+    } else {
+      pushAdds(ops, path, prefix + shift.overlap, appended);
+    }
+  } else {
+    pushRemoves(ops, path, prefix + oldMid.length - 1, prefix + shift.overlap);
+    pushAdds(ops, path, prefix, newMid.slice(0, newMid.length - shift.overlap));
+  }
+  return ops;
+}
+
+// The length of the longest suffix of text that is a prefix of pattern, 0
+// when there is none: Knuth-Morris-Pratt (mirrors overlap/4, which holds
+// the invariants asserted here).
+function overlap(text, pattern) {
+  const textLen = text.length;
+  const patternLen = pattern.length;
+  let anchored = false;
+  for (let i = 1; i < textLen && !anchored; i++) {
+    anchored = deepEqual(text[i], pattern[0]);
+  }
+  if (!anchored) return 0;
+  let compared = 0;
+  // failure[i] is the longest proper prefix of pattern[0..i] that is also
+  // its suffix.
+  const failure = new Int32Array(patternLen);
+  let q = 0;
+  for (let i = 1; i < patternLen; i++) {
+    [q, compared] = extend(pattern, pattern[i], q, failure, compared);
+    failure[i] = q;
+  }
+  q = 0;
+  for (let i = 0; i < textLen; i++) {
+    // A whole match of pattern inside text falls back before the next element.
+    if (q === patternLen) q = failure[patternLen - 1];
+    [q, compared] = extend(pattern, text[i], q, failure, compared);
+  }
+  if (!(q < textLen && q < patternLen)) {
+    throw new Error(`shift overlap ${q} not shorter than the middles (${textLen}, ${patternLen})`);
+  }
+  if (compared > 2 * (textLen + patternLen)) {
+    throw new Error(`shift search made ${compared} comparisons for ${textLen} + ${patternLen}`);
+  }
+  if (
+    q > 0 &&
+    !(deepEqual(text[textLen - q], pattern[0]) && deepEqual(text[textLen - 1], pattern[q - 1]))
+  ) {
+    throw new Error(`shift overlap ${q} ends differ`);
+  }
+  return q;
+}
+
+// Extend the matched prefix of length q by element, falling back along the
+// failure function until it extends or reaches 0.
+function extend(pattern, element, q, failure, compared) {
+  for (;;) {
+    compared++;
+    if (deepEqual(pattern[q], element)) return [q + 1, compared];
+    if (q === 0) return [0, compared];
+    q = failure[q - 1];
   }
 }
 

@@ -19,6 +19,13 @@
 /// Map keys are diffed in sorted (UTF-8 bytewise) order, so the server and
 /// the JS client (`brazier_client/patch.mjs`) produce identical op lists.
 ///
+/// Arrays keep their common prefix and suffix untouched. A shifted middle,
+/// such as a "last N events" window that drops its oldest and appends,
+/// diffs as removes plus an `append` (or `add` ops), found in linear time;
+/// otherwise the middle elements pair by index. A patch with more ops than
+/// the new array has elements replaces the array whole. See `diff_arrays/3`
+/// in `brazier_patch_ffi.erl`.
+///
 /// Applying an unknown op, a malformed op, a malformed pointer or an op
 /// whose target does not exist is an error — never a silent skip. The
 /// client mirrors this: any patch failure requests a full model sync.

@@ -689,6 +689,285 @@ pub fn diff_array_truncation_to_empty_test() {
   result |> should.equal(new)
 }
 
+// === Shift detection ===
+//
+// A sliding window (drop k from the front, append m) and its mirror (insert
+// at the front, drop from the back) diff as removes plus an append or adds,
+// not as every element paired with its neighbour. See diff_arrays/3 in
+// src/brazier_patch_ffi.erl.
+
+/// The diff of `old` to `new` must be exactly `expected`, and applying it
+/// must give `new`.
+fn expect_ops(old: String, new: String, expected: String) -> Nil {
+  let ops = diff(old, new)
+  let assert True = ops == expected
+    as {
+      "old="
+      <> old
+      <> " new="
+      <> new
+      <> "\nwant "
+      <> expected
+      <> "\ngot  "
+      <> ops
+    }
+  let assert Ok(result) = patch.apply_ops(old, ops)
+  let assert True = canonical(result) == canonical(new)
+    as { "ops " <> ops <> " gave " <> result <> ", want " <> new }
+  Nil
+}
+
+fn ints(from: Int, to: Int) -> String {
+  "["
+  <> int.range(from: to, to: from - 1, with: [], run: fn(acc, i) {
+    [int.to_string(i), ..acc]
+  })
+  |> string.join(",")
+  <> "]"
+}
+
+pub fn diff_sliding_window_removes_front_and_appends_test() {
+  log.configure()
+  expect_ops(
+    ints(1, 6),
+    ints(2, 7),
+    "[{\"op\":\"remove\",\"path\":\"/0\"},{\"op\":\"append\",\"path\":\"\",\"value\":[7]}]",
+  )
+}
+
+pub fn diff_sliding_window_drops_several_and_appends_several_test() {
+  log.configure()
+  expect_ops(
+    "{\"items\":" <> ints(1, 10) <> "}",
+    "{\"items\":" <> ints(3, 13) <> "}",
+    "[{\"op\":\"remove\",\"path\":\"/items/1\"},{\"op\":\"remove\",\"path\":\"/items/0\"},{\"op\":\"append\",\"path\":\"/items\",\"value\":[11,12,13]}]",
+  )
+}
+
+pub fn diff_sliding_window_of_objects_test() {
+  log.configure()
+  let event = fn(id) { "{\"id\":" <> int.to_string(id) <> ",\"label\":\"e\"}" }
+  let window = fn(first) {
+    "["
+    <> string.join(
+      list.map([first, first + 1, first + 2, first + 3], event),
+      ",",
+    )
+    <> "]"
+  }
+  expect_ops(
+    window(10),
+    window(11),
+    "[{\"op\":\"remove\",\"path\":\"/0\"},{\"op\":\"append\",\"path\":\"\",\"value\":[{\"id\":14,\"label\":\"e\"}]}]",
+  )
+}
+
+/// A pinned element after the window: the new elements go before it as
+/// adds, after the removes.
+pub fn diff_sliding_window_before_a_suffix_adds_test() {
+  log.configure()
+  expect_ops(
+    "[1,2,3,4,5,99]",
+    "[3,4,5,6,7,99]",
+    "[{\"op\":\"remove\",\"path\":\"/1\"},{\"op\":\"remove\",\"path\":\"/0\"},{\"op\":\"add\",\"path\":\"/3\",\"value\":6},{\"op\":\"add\",\"path\":\"/4\",\"value\":7}]",
+  )
+}
+
+/// A pinned element before the window: the indices start after it.
+pub fn diff_sliding_window_after_a_prefix_test() {
+  log.configure()
+  expect_ops(
+    "[0,1,2,3,4]",
+    "[0,2,3,4,5]",
+    "[{\"op\":\"remove\",\"path\":\"/1\"},{\"op\":\"append\",\"path\":\"\",\"value\":[5]}]",
+  )
+}
+
+/// The mirror: insert at the front, drop from the back.
+pub fn diff_back_shift_drops_back_and_adds_front_test() {
+  log.configure()
+  expect_ops(
+    ints(1, 8),
+    ints(-1, 6),
+    "[{\"op\":\"remove\",\"path\":\"/7\"},{\"op\":\"remove\",\"path\":\"/6\"},{\"op\":\"add\",\"path\":\"/0\",\"value\":-1},{\"op\":\"add\",\"path\":\"/1\",\"value\":0}]",
+  )
+}
+
+/// Shift 0 is a pure append or a pure prepend, as before.
+pub fn diff_shift_zero_is_an_append_or_a_prepend_test() {
+  log.configure()
+  expect_ops(
+    ints(1, 5),
+    ints(1, 7),
+    "[{\"op\":\"append\",\"path\":\"\",\"value\":[6,7]}]",
+  )
+  expect_ops(
+    ints(1, 5),
+    ints(0, 5),
+    "[{\"op\":\"add\",\"path\":\"/0\",\"value\":0}]",
+  )
+  expect_ops(ints(1, 5), ints(1, 5), "[]")
+}
+
+/// Shift the whole length: nothing overlaps, so the elements pair by index.
+pub fn diff_shift_by_whole_length_pairs_by_index_test() {
+  log.configure()
+  expect_ops(
+    ints(1, 3),
+    ints(4, 6),
+    "[{\"op\":\"replace\",\"path\":\"/0\",\"value\":4},{\"op\":\"replace\",\"path\":\"/1\",\"value\":5},{\"op\":\"replace\",\"path\":\"/2\",\"value\":6}]",
+  )
+}
+
+/// Pairing wins when it emits strictly fewer ops: here 3 replaces against
+/// 2 removes and 2 adds.
+pub fn diff_paired_wins_when_cheaper_than_the_shift_test() {
+  log.configure()
+  expect_ops(
+    "[1,2,3,99]",
+    "[3,4,5,99]",
+    "[{\"op\":\"replace\",\"path\":\"/0\",\"value\":3},{\"op\":\"replace\",\"path\":\"/1\",\"value\":4},{\"op\":\"replace\",\"path\":\"/2\",\"value\":5}]",
+  )
+}
+
+/// A tie between pairing and the shift goes to the shift; a tie between
+/// the front and the back shift goes to the front.
+pub fn diff_shift_ties_test() {
+  log.configure()
+  expect_ops(
+    "[1,2,3]",
+    "[3,4,5]",
+    "[{\"op\":\"remove\",\"path\":\"/1\"},{\"op\":\"remove\",\"path\":\"/0\"},{\"op\":\"append\",\"path\":\"\",\"value\":[4,5]}]",
+  )
+  expect_ops(
+    "[1,2,1]",
+    "[2,1,2]",
+    "[{\"op\":\"remove\",\"path\":\"/0\"},{\"op\":\"append\",\"path\":\"\",\"value\":[2]}]",
+  )
+  expect_ops(
+    "[1,2]",
+    "[2,1]",
+    "[{\"op\":\"remove\",\"path\":\"/0\"},{\"op\":\"append\",\"path\":\"\",\"value\":[1]}]",
+  )
+}
+
+/// Duplicates: the longest overlap is taken, so the fewest elements move.
+pub fn diff_shift_over_duplicates_takes_the_longest_overlap_test() {
+  log.configure()
+  expect_ops(
+    "[1,2,1,2,1,2]",
+    "[2,1,2,1,2,3]",
+    "[{\"op\":\"remove\",\"path\":\"/0\"},{\"op\":\"append\",\"path\":\"\",\"value\":[3]}]",
+  )
+  expect_ops(
+    "[\"a\",\"a\",\"a\",\"a\",\"a\",\"a\"]",
+    "[\"a\",\"a\",\"a\",\"a\",\"a\",\"b\"]",
+    "[{\"op\":\"replace\",\"path\":\"/5\",\"value\":\"b\"}]",
+  )
+  expect_ops(
+    "[0,7,7,7,7]",
+    "[7,7,7,7,8]",
+    "[{\"op\":\"remove\",\"path\":\"/0\"},{\"op\":\"append\",\"path\":\"\",\"value\":[8]}]",
+  )
+}
+
+/// The size guard still holds: a shift costing more ops than the new array
+/// has elements becomes one replace.
+pub fn diff_costly_shift_replaces_the_array_test() {
+  log.configure()
+  expect_ops(
+    ints(1, 10),
+    "[10,11]",
+    "[{\"op\":\"replace\",\"path\":\"\",\"value\":[10,11]}]",
+  )
+}
+
+/// Arrays too short for an overlap (it is shorter than both middles).
+pub fn diff_short_arrays_never_shift_test() {
+  log.configure()
+  expect_ops("[]", "[1]", "[{\"op\":\"append\",\"path\":\"\",\"value\":[1]}]")
+  // One remove is more ops than the empty array has elements.
+  expect_ops("[1]", "[]", "[{\"op\":\"replace\",\"path\":\"\",\"value\":[]}]")
+  expect_ops("[1]", "[2]", "[{\"op\":\"replace\",\"path\":\"/0\",\"value\":2}]")
+  expect_ops("[1]", "[2,1]", "[{\"op\":\"add\",\"path\":\"/0\",\"value\":2}]")
+}
+
+/// A shift inside a value that changes type is no shift: the value is
+/// replaced. Malformed JSON on either side is refused, never diffed.
+pub fn diff_shift_unhappy_inputs_test() {
+  log.configure()
+  expect_ops(
+    "{\"items\":[1,2,3]}",
+    "{\"items\":{\"0\":2,\"1\":3,\"2\":4}}",
+    "[{\"op\":\"replace\",\"path\":\"/items\",\"value\":{\"0\":2,\"1\":3,\"2\":4}}]",
+  )
+  let assert Error(_) = patch.diff("[1,2,3,4", "[2,3,4,5]")
+  let assert Error(_) = patch.diff("[1,2,3,4]", "[2,3,4,5")
+  let assert Error(_) = patch.diff("[1,2,3,4]", "[2,3,4,5]]")
+  Nil
+}
+
+/// 100 000 equal elements, the worst case for an overlap search: a naive
+/// one compares every start against every element. diff_arrays/3 asserts
+/// that its search stays within 2 * (|old| + |new|) comparisons, so this
+/// diff crashes rather than goes quadratic.
+pub fn diff_shift_of_a_large_run_of_duplicates_test() {
+  log.configure()
+  let run = string.repeat("7,", 100_000)
+  expect_ops(
+    "[0," <> run <> "7]",
+    "[" <> run <> "7,8]",
+    "[{\"op\":\"remove\",\"path\":\"/0\"},{\"op\":\"append\",\"path\":\"\",\"value\":[8]}]",
+  )
+  // No overlap at all, though the anchor occurs everywhere: the search runs
+  // to the end and finds none, and the arrays pair by index.
+  expect_ops(
+    "[5," <> run <> "3]",
+    "[" <> run <> "4]",
+    "[{\"op\":\"replace\",\"path\":\"/0\",\"value\":7},{\"op\":\"replace\",\"path\":\"/100000\",\"value\":4},{\"op\":\"remove\",\"path\":\"/100001\"}]",
+  )
+}
+
+/// A large sliding window: one remove and one append, whatever its length.
+pub fn diff_large_sliding_window_test() {
+  log.configure()
+  let assert Ok(count) =
+    patch.count_ops(diff(ints(0, 99_999), ints(1, 100_000)))
+  count |> should.equal(2)
+}
+
+@external(erlang, "brazier_patch_test_ffi", "window_pairs")
+fn window_pairs() -> List(#(String, String))
+
+@external(erlang, "brazier_patch_test_ffi", "random_window_pair")
+fn random_window_pair(seed: Int) -> #(String, String)
+
+fn random_window_pairs() -> List(#(String, String)) {
+  int.range(from: 1, to: 301, with: [], run: fn(acc, seed) {
+    [random_window_pair(seed), ..acc]
+  })
+}
+
+/// Every shifted window diffs to ops that give the new window on the
+/// server; client_applies_server_diffs_test checks the client agrees.
+pub fn server_roundtrips_shifted_windows_test() {
+  log.configure()
+  let pairs = list.append(window_pairs(), random_window_pairs())
+  let assert True = list.length(pairs) > 5000
+    as "the window vectors must cover every length, shift and kind"
+  list.each(pairs, fn(pair) {
+    let #(old, new) = pair
+    let ops = diff(old, new)
+    let assert Ok(result) = patch.apply_ops(old, ops)
+      as { "old=" <> old <> " new=" <> new <> " ops=" <> ops }
+    let assert True = canonical(result) == canonical(new)
+      as {
+        "old=" <> old <> " new=" <> new <> " ops=" <> ops <> " gave " <> result
+      }
+    Nil
+  })
+}
+
 pub fn server_mirror_roundtrips_random_vectors_test() {
   log.configure()
   int.range(from: 1, to: 301, with: Nil, run: fn(_, seed) {
@@ -728,14 +1007,19 @@ fn canonical(json: String) -> String {
 
 pub fn client_applies_server_diffs_test() {
   log.configure()
+  let pairs =
+    list.flatten([
+      int.range(from: 1, to: 301, with: [], run: fn(acc, seed) {
+        [random_pair(seed), ..acc]
+      }),
+      window_pairs(),
+      random_window_pairs(),
+    ])
   let roundtrip =
-    int.range(from: 1, to: 301, with: [], run: fn(acc, seed) {
-      let #(old, new) = random_pair(seed)
+    list.map(pairs, fn(pair) {
+      let #(old, new) = pair
       let ops = diff(old, new)
-      [
-        "{\"old\":" <> old <> ",\"new\":" <> new <> ",\"ops\":" <> ops <> "}",
-        ..acc
-      ]
+      "{\"old\":" <> old <> ",\"new\":" <> new <> ",\"ops\":" <> ops <> "}"
     })
   let invalid =
     list.map(invalid_vectors(), fn(vector) {
@@ -757,8 +1041,17 @@ pub fn client_applies_server_diffs_test() {
   let path = scratch_path("patch_vectors.json")
   let assert Ok(Nil) = write_file(path, contents)
   case run_node("brazier_client/test/patch_vectors.mjs", path) {
-    Ok(output) ->
-      output |> string.contains("patch vectors ok") |> should.be_true
+    Ok(output) -> {
+      // The count proves the shifted windows reached the client: each one
+      // must diff there op for op as it did here.
+      let expected =
+        "patch vectors ok: "
+        <> int.to_string(list.length(pairs))
+        <> " roundtrip"
+      let assert True = string.contains(output, expected)
+        as { "expected \"" <> expected <> "\", got: " <> output }
+      Nil
+    }
     Error(output) -> panic as { "client patch vectors failed: " <> output }
   }
 }

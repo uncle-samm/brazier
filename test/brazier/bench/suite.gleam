@@ -29,6 +29,8 @@
 ////   server and every receiving node do per write), in blocks of 1000.
 //// - presence: brazier/bench/presence_bench, track/untrack/list in rooms
 ////   of 10 and 10000 entries.
+//// - patch: brazier/bench/patch_bench, the server diff of a sliding
+////   window of 200 and 2000 events (ops, bytes and time per diff).
 //// - client: brazier/bench/client_bench, the browser's render and patch
 ////   work for 100 and 1000 rows, in node.
 ////
@@ -44,6 +46,7 @@ import brazier/bench/measure.{
   check, gc, isolated, median_and_p99, now_ns, percentiles_by_round, repeat,
   repeat_from, rounds, string_of, throughput_and_latency, timeout_ms,
 }
+import brazier/bench/patch_bench
 import brazier/bench/presence_bench
 import brazier/bench/report.{type Metric, LowerIsBetter, Metric}
 import brazier/bench/stats
@@ -187,6 +190,7 @@ pub fn run(prepared: Prepared) -> Result(report.Report, String) {
       #("store", store_scenario),
       #("crdt append", crdt_append_scenario),
       #("presence", presence_bench.run),
+      #("patch", patch_bench.run),
       #("client", fn() { client_bench.run(prepared.client) }),
     ]
     |> list.try_map(fn(scenario) { isolated(scenario.0, scenario.1) })
