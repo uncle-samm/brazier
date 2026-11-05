@@ -306,25 +306,20 @@ pub fn start_with_unknown_route_keeps_init_state_test() {
     subject,
     runtime.ClientJoined(conn_id: "r_unknown", token: "", path: "/nowhere"),
   )
+  // The join's route error comes before its model_sync
+  // (docs/WIRE_PROTOCOL.md, `error`).
   let msgs = receive_n(transport_subject, 2, [])
-  let assert True =
-    list.any(msgs, fn(msg) {
-      case msg {
-        transport.SendError(reason: reason) ->
-          string.contains(reason, "no route for the joined path \"/nowhere\"")
-        _ -> False
-      }
-    })
-  let assert True =
-    list.contains(
-      msgs,
-      transport.SendModelSync(
-        model_json: "{\"page\":\"none\",\"visits\":\"\",\"tab\":\"\"}",
-        version: 0,
-        ack_clock: 0,
-        streams_json: "[]",
-      ),
-    )
+  let assert [
+    transport.SendError(reason: reason),
+    transport.SendModelSync(
+      model_json: "{\"page\":\"none\",\"visits\":\"\",\"tab\":\"\"}",
+      version: 0,
+      ack_clock: 0,
+      streams_json: "[]",
+    ),
+  ] = msgs
+    as string.inspect(msgs)
+  assert string.contains(reason, "no route for the joined path \"/nowhere\"")
   stop(subject, [transport_subject])
 }
 
