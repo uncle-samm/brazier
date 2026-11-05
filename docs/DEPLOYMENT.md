@@ -38,6 +38,12 @@ the bundle it names is missing, so run the build in your image or release
 pipeline, not at startup. Automatic rebuilding exists only in dev mode
 (`gleam run -m brazier/dev`).
 
+The server reads the manifest once, when it starts, and every page and every
+join uses the bundle it named then; no request reads it again. Rebuilding
+the bundle under a running server therefore changes nothing until the server
+restarts, which is what a release does. Under `brazier/dev` each successful
+rebuild loads the new manifest.
+
 ## Environment Variables
 
 `brazier.start` takes its port and secret key as arguments and options, not
@@ -322,9 +328,12 @@ the drain is over.
 
 A page that reconnects to an instance running a different build (a new
 release, or a rolling deploy that sends it to an old instance) is refused
-with **4409** `stale build` when it joins, and reloads to fetch the bundle
+with **4499** `stale build` when it joins, and reloads to fetch the bundle
 that instance serves. The join carries the page's build id, the hash in its
-`brazier_client_<hash>.js` URL; the server compares it with its own manifest.
+`brazier_client_<hash>.js` URL; the server compares it with the manifest it
+read when it started. (Before this release the code was 4409, which an
+`init` refusing with 409 also uses; a proxy or alert that matched 4409 for
+stale builds must now match 4499.)
 The reload goes through the client's reload guard (at most 3 per tab within
 60 s), so a rolling deploy that keeps sending a tab between builds ends in an
 error page rather than a reload loop: route a client to one build at a time

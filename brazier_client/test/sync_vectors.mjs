@@ -107,7 +107,8 @@ check("closeAction rejects a code that is not an integer", () => {
   assert.throws(() => closeAction(4401.5));
 });
 check("4400 to 4499 reload the page", () => {
-  for (const code of [4400, 4401, 4403, 4404, CLOSE_STALE_BUILD, 4499]) {
+  assert.equal(CLOSE_STALE_BUILD, 4499);
+  for (const code of [4400, 4401, 4403, 4404, 4409, CLOSE_STALE_BUILD]) {
     assert.equal(closeAction(code), "reload", String(code));
   }
 });

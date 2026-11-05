@@ -65,13 +65,20 @@ pub fn unavailable(reason: String) -> InitError {
   InitError(status: 503, reason: reason)
 }
 
+/// The one status in 400 to 599 an `init` cannot refuse with: its close
+/// code, 4499, is the stale-build close (`transport/ws.close_stale_build`).
+/// 499 is not an HTTP status (nginx uses it in its logs for a client that
+/// went away), so no answer needs it.
+pub const reserved_status = 499
+
 /// Refuse the session with an HTTP error status, for example 404 for a
 /// record that does not exist or 403 for one the user may not see.
 ///
-/// A status outside 400 to 599 is a programming error and crashes `init`
-/// (answered as a crash: 500, or close 1011).
+/// A status outside 400 to 599, or 499 (`reserved_status`), is a
+/// programming error and crashes `init` (answered as a crash: 500, or
+/// close 1011).
 pub fn refuse(status: Int, reason: String) -> InitError {
-  let valid = status >= 400 && status <= 599
+  let valid = status >= 400 && status <= 599 && status != reserved_status
   case valid {
     True -> Nil
     False ->
@@ -79,11 +86,13 @@ pub fn refuse(status: Int, reason: String) -> InitError {
         "brazier.error",
         "init refused with status "
           <> int.to_string(status)
-          <> ", which is not an HTTP error status (400 to 599): "
+          <> ", which is not an HTTP error status init can refuse with (400 to "
+          <> "599, except 499, whose close code is the stale-build close): "
           <> reason,
       )
   }
-  let assert True = valid as "error.refuse: the status must be 400 to 599"
+  let assert True = valid
+    as "error.refuse: the status must be 400 to 599, and not 499"
   InitError(status: status, reason: reason)
 }
 

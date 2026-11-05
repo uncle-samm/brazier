@@ -98,10 +98,14 @@ runtime starts and the socket closes with `4000 + status` and the reason
 URL, a refused presence track) closes it with 1011 `startup failure`.
 
 The client then sends `join` with the content hash of the bundle it runs.
-The transport compares it with the bundle `brazier_client.manifest` names: a
-page from another build is closed with 4409 `stale build` and reloads, and
-an unreadable manifest closes with 1011. A join from the current build (or
-one with no build id, which is logged as a warning) goes to the runtime,
+The transport compares it with the bundle `brazier_client.manifest` named
+when the server started (`ssr.client_bundle`, held in memory; `brazier/dev`
+loads it again after each rebuild): a page from another build is closed
+with 4499 `stale build` and reloads, and a server with no loaded bundle
+closes the join with 1011. Under `brazier/dev` the join also carries the
+page's dev build, and a page rendered before the last rebuild is answered
+with `reload`. A join from the current build (or one with no build id,
+which is logged as a warning once per connection) goes to the runtime,
 which answers with a `model_sync` of the encoded model. With state recovery,
 the join token is verified before `init` runs, and its model is decoded and
 handed to the app's `restore` with the state `init` and the route produced.
@@ -193,7 +197,7 @@ a `model_sync`, not JSON text), `init_local`, `render`, `lookup_handler`,
   `model_sync`.
 - **Connection.** Heartbeats every 30 s, a client send budget, reconnect
   with exponential backoff and jitter. Close codes 4400 to 4499 (an `init`
-  refusal with a client error, 4401 for a revoked session, 4409 for a page
+  refusal with a client error, 4401 for a revoked session, 4499 for a page
   from another build) stop reconnecting and reload the page, at most 3 times
   per tab within 60 s (counted in `sessionStorage`); after that the page
   shows an error state. A 1001 (the server is draining) reconnects. Dev
@@ -231,7 +235,7 @@ app project:
    `priv/static/brazier_client_<hash>.js` and the manifest. A failure deletes
    the manifest, so `brazier.start` refuses stale artifacts. The `<hash>` is
    the build id the client sends in `join`, so a running server closes a
-   page from an older bundle with 4409 and the page reloads.
+   page from an older bundle with 4499 and the page reloads.
 
 `gleam run -m brazier/build/runtime_bundle` rebuilds the repository's
 prebuilt runtime bundle from `brazier_client/src`.

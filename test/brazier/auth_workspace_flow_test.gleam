@@ -491,7 +491,7 @@ fn read_form(
         Error(Nil) -> Error("Invalid UTF-8 request body")
       }
     }
-    Error(reason) -> Error(reason)
+    Error(error) -> Error(transport_http.describe_read_body_error(error))
   }
 }
 

@@ -14,36 +14,14 @@
   - **Resolution:** how it was fixed (fill in when resolved)
 -->
 
-Found while making the docs match the code (Milestone 117, WS10a, 2026-11-03).
-The docs describe the current behaviour; each item is a code change.
+Found while splitting the stale-build close code (Milestone 118, 2026-11-05).
 
-- **Issue:** `transport/http.read_body` returns `Result(BitArray, String)`
-  and is internal (`transport/http.gleam:508`); the public way to read a body
-  is `api.read_text` / `api.read_form`. Older docs pointed users at
-  `read_body`.
-  - **Files:** `src/brazier/transport/http.gleam`
-
-Found while merging WS10b (Milestone 117, 2026-11-04).
-
-- **Issue:** a join without a build id is logged as a warning on every join
-  (`transport.check_join_build`). A client that loads the unversioned
-  `/brazier_client.js` fills the log; one warning per connection is enough.
-  - **Files:** `src/brazier/transport.gleam`
-- **Issue:** the client manifest has two readers (`transport.check_join_build`
-  and `ssr`), and the join path reads it from disk on every join, a cost
-  the benches do not measure. Production could read it once; dev mode needs
-  the re-read.
-  - **Files:** `src/brazier/transport.gleam`, `src/brazier/ssr.gleam`, `bench/`
-- **Issue:** an `init` refusing with 409 closes with 4409, the same code as
-  a stale build, so the two cannot be told apart from the close code.
+- **Issue:** an `init` refusing with 401 closes with 4401, the code of a
+  revoked session or expired authentication, so the two are told apart only
+  by the close reason and the server log. The client action is the same (a
+  reload behind the guard), so nothing misbehaves; a monitor that counts
+  revocations by close code also counts 401 refusals.
   - **Files:** `src/brazier/error.gleam`, `src/brazier/transport/ws.gleam`
-- **Issue:** a page that is reconnecting while dev mode rebuilds misses the
-  `reload` (it is not subscribed between sockets); it then joins with a
-  stale build and reloads through 4409 instead, behind the reload guard.
-  - **Files:** `src/brazier/transport.gleam`
-- **Issue:** `window.__brazierOutboundPendingForTest()` does not count a
-  debounced send whose timer has not fired (`brazier_client_ffi.mjs`).
-  - **Files:** `brazier_client/src/brazier_client_ffi.mjs`, `test_all_cdp.py`
 
 ## Resolved Issues
 
@@ -127,6 +105,101 @@ Found while merging WS10b (Milestone 117, 2026-11-04).
     no test can force the race; what stretched the window in that one run
     (likely the OS descheduling a scheduler thread on a loaded clean build)
     is not known.
+
+- **Issue:** `transport/http.read_body` returned `Result(BitArray, String)`,
+  and `transport/server.read_body` did too, so a caller could only match on
+  text: `upload` could not tell a too-large body (413) from a failed read
+  (400) without comparing strings, and a new failure reached every caller
+  unnoticed.
+  - **Files:** `src/brazier/transport/http.gleam`,
+    `src/brazier/transport/server.gleam`, `src/brazier_transport_ffi.erl`,
+    `src/brazier/api.gleam`, `src/brazier/upload.gleam`
+  - **Resolution:** (Milestone 118) `transport_http.read_body` returns a
+    `ReadBodyError` (`MissingContentLength`, `InvalidContentLength`,
+    `BodyTooLarge(length, limit)`, `BodyAlreadyConsumed`,
+    `BodyReadFailed(server.BodyReadError)`), and `server.read_body` a
+    `BodyReadError` (`NoActiveRequest`, `BodyUnavailable`,
+    `ReadPastBody(requested, remaining)`, `BodyReadTimeout`,
+    `RequestDeadlineExceeded`, `SocketFailed(reason)`), each with a
+    `describe_*` function. Every caller lists every variant, so a new one
+    is a compile error at each of them: `api.read_text` replies with the
+    description, `upload.read_multipart` maps `BodyTooLarge` to
+    `RequestTooLarge` (413) and the rest to `BodyReadError`, and
+    `finish_body` logs the description. A body read that a request
+    deadline cut short used to be reported as a read timeout; it is now
+    `RequestDeadlineExceeded`. `test/brazier/read_body_error_test.gleam`
+    drives each variant through a listener over a raw socket (or, for the
+    two a listener never lets through, a request built outside one).
+    While there, `upload`'s early Content-Length check logged the raw
+    request path; it now quotes it (`log_forging_paths_test`).
+
+- **Issue:** a join without a build id was logged as a warning on every
+  join, so a client on the unversioned `/brazier_client.js` filled the log.
+  - **Files:** `src/brazier/transport.gleam`
+  - **Resolution:** (Milestone 118) `ConnectionState` remembers that the
+    connection already warned: the first join without a build id logs a
+    warning, later joins on that connection log at debug. A new connection
+    warns again. `test/brazier/join_build_test.gleam` captures the log of
+    two joins on one connection and asserts one warning.
+
+- **Issue:** the client manifest had two readers (`ssr` for the page and
+  `transport.check_join_build` for the join), and the join read it from
+  disk on every join, a cost the benches did not measure; the two could
+  also disagree mid-rebuild.
+  - **Files:** `src/brazier/ssr.gleam`, `src/brazier/transport.gleam`,
+    `src/brazier.gleam`, `src/brazier/dev.gleam`,
+    `src/brazier_bundle_manifest_ffi.erl`
+  - **Resolution:** (Milestone 118) `ssr.load_client_bundle` reads the
+    manifest and stores the outcome in one `persistent_term` slot;
+    `ssr.client_bundle` is the one reader, used by the page render and the
+    join check. The server loads it when it starts (`brazier.start` and
+    `transport.start_listener`), and a failed load fails the start;
+    `brazier/dev` loads it again after each successful rebuild. No other
+    code reads the manifest. `test/brazier/join_build_test.gleam` traces
+    file operations during a join and asserts there are none, and
+    `test/brazier/dev_build_test.gleam` covers a listener that cannot load
+    the bundle, a join after a failed load (1011), and a bundle read once
+    and again only on a load.
+
+- **Issue:** an `init` refusing with 409 closed with 4409, the same code as
+  a stale build, so the two could not be told apart from the close code.
+  - **Files:** `src/brazier/error.gleam`, `src/brazier/transport/ws.gleam`,
+    `brazier_client/src/brazier_client/patch.mjs`
+  - **Resolution:** (Milestone 118) stale build closes with 4499
+    (`ws.close_stale_build`, the client's `CLOSE_STALE_BUILD`), still in
+    the 4400-4499 reload band, so an older page reloads on it too. `init`
+    keeps 4000 + status, and `error.refuse(499, _)` is a programming error
+    that crashes `init` (`error.reserved_status`), so no refusal can share
+    the stale-build code. 499 is not an HTTP status. The client harness
+    and `sync_vectors.mjs` pin 4499, and `build_handshake_test` asserts it
+    on the wire.
+
+- **Issue:** a page that was reconnecting while dev mode rebuilt missed the
+  `reload` broadcast (it is not subscribed between sockets), and ran on
+  with the old server's page; it reloaded only when its client bundle also
+  changed, through the stale-build close and its guard.
+  - **Files:** `src/brazier/transport.gleam`, `src/brazier/ssr.gleam`,
+    `src/brazier/dev.gleam`, `brazier_client/src/brazier_client_ffi.mjs`
+  - **Resolution:** (Milestone 118) each dev rebuild sets a new dev build
+    (`ssr.new_dev_build`), rendered as `data-brazier-dev-build` on
+    `#brazier-app`. The client sends it in the join as `dev_build`, and the
+    server answers a join whose dev build is not the current one with
+    `reload` and does not dispatch it. Outside dev mode nothing is checked.
+    `test/brazier/dev_build_test.gleam` covers a matching, a stale and a
+    missing dev build, and a page between sockets during a rebuild that
+    reloads on its join; the client harness asserts the join carries it
+    on reconnect and that a `reload` answer reloads outside the guard.
+
+- **Issue:** `window.__brazierOutboundPendingForTest()` did not count a
+  debounced send whose timer had not fired, so a CDP check could see the
+  outbound queue as drained while a send was still to come.
+  - **Files:** `brazier_client/src/brazier_client_ffi.mjs`,
+    `test_all_cdp.py`
+  - **Resolution:** (Milestone 118) the hook returns
+    `{queued, scheduled, debounced}`, `debounced` counting the debounce
+    timers still pending, and `test_all_cdp.py`'s drained state requires
+    `debounced: 0`. A harness scenario counts one debounced send before its
+    timer fires and none after.
 
 - **Issue:** several simulation tests allow leaked processes or failed
   connections (`sim_test.gleam:177`, `:247`, `:320`, `:377-379`), against

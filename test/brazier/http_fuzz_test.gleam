@@ -33,7 +33,8 @@ fn handler(
     "/echo" ->
       case transport_http.read_body(req, 1_000_000) {
         Ok(body) -> Some(text(200, bit_array.inspect(body)))
-        Error(reason) -> Some(text(400, reason))
+        Error(error) ->
+          Some(text(400, transport_http.describe_read_body_error(error)))
       }
     _ -> {
       let host = case request.get_header(req, "host") {

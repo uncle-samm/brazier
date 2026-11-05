@@ -19,26 +19,39 @@ over HTTP to show the middleware's answer (see
 
 **join** -- Sent after WebSocket opens. `path` drives routing. `token` remains in the JSON shape for direct runtime tests and non-browser clients, but browser join/session recovery uses the HttpOnly `brazier_join_token` cookie from the WebSocket upgrade request.
 ```json
-{"type": "join", "token": "", "path": "/", "build": "8a13610f74006aaf"}
+{"type": "join", "token": "", "path": "/", "build": "8a13610f74006aaf", "dev_build": "k3x9q"}
 ```
 `build` is optional. It is the build id of the client bundle the page
 loaded: the content hash in `/brazier_client_<hash>.js`, which the client
 reads from the URL of its own script (`document.currentScript`). The server
-compares it with the bundle `priv/static/brazier_client.manifest` names now,
-read on every join:
+compares it with the bundle `priv/static/brazier_client.manifest` named when
+the server started (or, under `brazier/dev`, after the last rebuild). The
+manifest is read then, not on each join, so a join touches no file:
 
 - the same bundle: the join goes on;
 - another one (the app was rebuilt or redeployed since the page loaded): the
-  server closes with **4409** `stale build`, and the client reloads the page
+  server closes with **4499** `stale build`, and the client reloads the page
   behind its reload guard (see
   [Client Connection Behaviour](#client-connection-behaviour)), so a page
   never decodes a model with the codec of another build;
-- the manifest cannot be read, or names a bundle that does not exist: the
-  server logs an error and closes with **1011** `internal error`;
+- the server has no loaded bundle (a failed load; a server that cannot read
+  its manifest at start does not start): the server logs an error and closes
+  with **1011** `internal error`;
 - no `build` (the page loaded the client from the unversioned
   `/brazier_client.js`, or a non-browser client): the join goes on unchecked,
-  and the server logs a warning. The client also warns once when it finds no
-  build id in its script URL.
+  and the server logs a warning once per connection, at debug on later
+  joins. The client also warns once when it finds no build id in its script
+  URL.
+
+`dev_build` is optional too, and only a server under `brazier/dev` reads it.
+It is the dev build the page was rendered under: the server renders it as
+`data-brazier-dev-build` on `#brazier-app`, and a new one is made on every
+rebuild. A join whose `dev_build` is not the server's current one is from a
+page rendered before the last rebuild, which may have been between sockets
+when the rebuild's `reload` frame went out: the server answers
+`{"type": "reload"}` and does not dispatch the join, and the page reloads
+(see **reload** under [Server Messages](#server-messages-server-to-browser)).
+A join without `dev_build`, or a server outside dev mode, is not checked.
 
 A join without `build` stays accepted because non-browser clients and the
 unversioned bundle have no build id to send, and refusing them would break
@@ -47,7 +60,7 @@ client from before `model` and `ops` became raw JSON values gets a
 `model_sync` it cannot read. It does not run on with a wrong model: it fails
 the sync loudly, retries `request_sync` up to 3 times, logs an error and
 stops (see [Versioning](#versioning)). A page that loads its bundle by hash
-always sends `build`, and gets 4409 instead.
+always sends `build`, and gets 4499 instead.
 
 A `build` that is not a string makes the join a message that fails to
 decode. The check follows LiveView's `phx-track-static`: the client reports
@@ -92,7 +105,7 @@ not dispatch it. It counts as a message that failed to decode (see
 
 `ops` used to be a string holding the JSON array (see `CHANGELOG.md`). That
 form is now refused as invalid ops. A page whose bundle is from before the
-change sends its `build` id on join and gets **4409** `stale build`, so it
+change sends its `build` id on join and gets **4499** `stale build`, so it
 reloads with the current bundle before it sends an event (see `build` under
 **join** above).
 
@@ -240,8 +253,11 @@ this triggers a real HTTP request — use when the browser needs to receive HTTP
 `gleam run -m brazier/dev` every WebSocket handler subscribes to the PubSub
 topic `brazier:dev:reload`, and each successful rebuild broadcasts on it, so
 every open page gets one `reload`. The server keeps the socket open; the
-page's reload closes it. Outside dev mode no handler subscribes and the
-server never sends it.
+page's reload closes it. A page that was between sockets during the
+broadcast misses it, so the server also answers a `join` whose `dev_build`
+is not the current one with `reload` instead of dispatching it (see
+**join**). Outside dev mode no handler subscribes, no join is checked, and
+the server never sends it.
 ```json
 {"type": "reload"}
 ```
@@ -307,7 +323,7 @@ follows.
 
 - **4400 to 4499**: the server refused this page's session. That is `init`
   refusing with a 4xx status (4000 + the status), 4401 for a revoked session
-  or failed authentication, and 4409 `stale build` for a page from another
+  or failed authentication, and 4499 `stale build` for a page from another
   build. The client stops reconnecting, logs an error and reloads the page.
   The new page load decides: the server renders the page again (a fresh
   session, the login page, or the page with the current bundle) or answers
@@ -521,18 +537,25 @@ the echo.
 | 1007 | Invalid UTF-8 in a text message |
 | 1008 | Policy violation: rate limit or decode-error flood |
 | 1009 | Message too big |
-| 1011 | Internal error (`internal error`): `init` crashed, the runtime did not start, the handler got a message it does not know, or a join's build cannot be checked because the client bundle is missing. The client reconnects with backoff |
+| 1011 | Internal error (`internal error`): `init` crashed, the runtime did not start, the handler got a message it does not know, or a join's build cannot be checked because the server has no loaded client bundle. The client reconnects with backoff |
 | 1013 | Try again later (backpressure or overload) |
 | 4400-4499 | The server refused this page's session. The client does not reconnect: it reloads the page, at most 3 times per tab within 60 seconds |
-| 4000 + status | `init` refused with that 4xx status (4404, 4403, ...) |
+| 4000 + status | `init` refused with that 4xx status (4404, 4403, 4409, ...). Never 4499: `error.refuse(499, _)` is a programming error and crashes `init` |
 | 4401 | Session revoked (`session revoked`) or authentication expired (`authentication expired`). The page reloads, so the server renders it for whoever the cookie now names, or the login page |
-| 4409 | Stale build (`stale build`): the join's `build` is not the bundle the server serves now. The page reloads and gets the current bundle |
+| 4499 | Stale build (`stale build`): the join's `build` is not the bundle the server serves now. The page reloads and gets the current bundle |
 | 4500-4599 | `init` refused with a 5xx status (4503 for `error.unavailable`). The client reconnects with backoff |
 | 4600 | The app's middleware refused the page's live connection (`middleware refused <status>`), sent right after the handshake. The client does not reconnect: it loads the current URL behind the reload guard, so the browser shows the middleware's answer |
 
-An `init` refusal with 401 or 409 also closes with 4401 or 4409. The action
-is the same, a reload, and the close reason and the server log tell them
-apart.
+An `init` refusal with 409 closes with 4409, and a stale build with 4499,
+so the close code alone tells them apart. 499 is not an HTTP status (nginx
+uses it in its logs for a client that went away), so no `init` needs it,
+and `error.reserved_status` names it. Stale build closed with 4409 before
+this release (see `CHANGELOG.md`); a page from before then reloads on
+either code, because both are in the reload band.
+
+An `init` refusal with 401 still closes with 4401, the code of a revoked
+session or expired authentication. The action is the same, a reload, and
+the close reason and the server log tell them apart.
 
 **The 4xxx scheme.** RFC 6455 §7.4.2 leaves 4000-4999 to applications.
 Brazier splits it by what the client does, so the client decides from the
@@ -540,7 +563,7 @@ code alone and needs no table of reasons:
 
 | Range | Who closes | Client action |
 |-------|------------|---------------|
-| 4400-4499 | `init` or the session refused (4000 + a 4xx status, 4401, 4409) | Reload the page, behind the guard |
+| 4400-4499 | `init` or the session refused (4000 + a 4xx status, 4401), or a stale build (4499) | Reload the page, behind the guard |
 | 4500-4599 | `init` refused with a 5xx status | Reconnect with backoff |
 | 4600-4699 | The transport refused the connection before any runtime (4600: the middleware) | 4600: load the page, behind the guard |
 | Other 4xxx | Not sent by Brazier | Reconnect with backoff, like any unknown close |

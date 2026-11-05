@@ -490,6 +490,9 @@ function freshGlobals(options = {}) {
   globalThis.sessionStorage = options.storage || new FakeStorage();
   root = new FakeElement("div");
   root.setAttribute("id", "brazier-app");
+  // Attributes the server rendered on #brazier-app, such as
+  // data-brazier-dev-build under brazier/dev.
+  for (const [name, value] of Object.entries(options.rootAttributes || {})) root.setAttribute(name, value);
   parseInto(root, options.ssr || "");
   globalThis.location = {
     protocol: "http:",
@@ -597,15 +600,40 @@ scenario("the outbound test hook reports the queue and a scheduled send, only wh
   s.open();
   // Before the first model_sync, events wait in the queue.
   for (let i = 1; i <= 3; i++) runtime.ws_send(JSON.stringify(event(i)));
-  assert.deepEqual(pending(), { queued: 3, scheduled: false });
+  assert.deepEqual(pending(), { queued: 3, scheduled: false, debounced: 0 });
   sync(s, 0, {});
-  assert.deepEqual(pending(), { queued: 0, scheduled: false });
+  assert.deepEqual(pending(), { queued: 0, scheduled: false, debounced: 0 });
   // Over the budget, the rest waits for a scheduled paced send.
   for (let i = 4; i < 4 + 45; i++) runtime.ws_send(JSON.stringify(event(i)));
   const owed = pending();
-  assert.ok(owed.queued > 0 && owed.scheduled === true, JSON.stringify(owed));
+  assert.ok(owed.queued > 0 && owed.scheduled === true && owed.debounced === 0, JSON.stringify(owed));
   advance(2000);
-  assert.deepEqual(pending(), { queued: 0, scheduled: false });
+  assert.deepEqual(pending(), { queued: 0, scheduled: false, debounced: 0 });
+});
+
+// A debounced Msg whose timer has not fired is owed to the server just as a
+// queued one is: a drained report while it waits would let a browser check
+// pass before the event is ever sent.
+scenario("the outbound test hook counts a debounced send until its timer fires", async () => {
+  const view = () => ({
+    html: '<input name="q" data-brazier-on-input="0.0">',
+    handlers: [{ name: "input", id: "0.0", debounce: 200, decode: (e) => ok({ q: e.target.value }) }],
+  });
+  await loadRuntime({ view, testHooks: true });
+  const pending = globalThis.window.__brazierOutboundPendingForTest;
+  const s = sockets[0];
+  s.open();
+  sync(s, 0, {});
+  const input = el('[name="q"]');
+  input.value = "a";
+  fire(input, "input");
+  assert.deepEqual(pending(), { queued: 0, scheduled: false, debounced: 1 }, "the waiting input is reported");
+  advance(199);
+  assert.equal(s.events().length, 0);
+  assert.deepEqual(pending(), { queued: 0, scheduled: false, debounced: 1 }, "still owed one tick early");
+  advance(1);
+  assert.deepEqual(s.msgs(), [{ q: "a" }]);
+  assert.deepEqual(pending(), { queued: 0, scheduled: false, debounced: 0 }, "drained once sent");
 });
 
 scenario("a bundle without a complete generated app is reported and never connects", async () => {
@@ -668,22 +696,53 @@ scenario("a bundle loaded from /brazier_client.js or no script joins without a b
   }
 });
 
+// Under brazier/dev the server renders the dev build it served the page
+// from; the join sends it back on every socket, so a page that was between
+// sockets when the app was rebuilt learns of the rebuild on its next join.
+scenario("the join carries the page's dev build, on reconnect too", async () => {
+  await loadRuntime({ rootAttributes: { "data-brazier-dev-build": "00ff00ff00ff00ff" } });
+  sockets[0].open();
+  assert.deepEqual(sockets[0].sent[0].msg, { type: "join", token: "", path: "/", build: TEST_BUILD, dev_build: "00ff00ff00ff00ff" });
+  sync(sockets[0], 0, {});
+  sockets[0].serverClose(1006);
+  advance(reconnectDelay());
+  sockets[1].open();
+  assert.equal(sockets[1].sent[0].msg.dev_build, "00ff00ff00ff00ff", "a rejoin sends the page's dev build, not a newer one");
+});
+
+scenario("a page without a dev build joins without a dev_build field", async () => {
+  await loadRuntime();
+  sockets[0].open();
+  assert.equal("dev_build" in sockets[0].sent[0].msg, false);
+});
+
+// The server answers a join from another dev build with a reload frame
+// instead of a model_sync: the page reloads before it ever syncs.
+scenario("a reload frame in answer to a join reloads the page before any model_sync", async () => {
+  const storage = new FakeStorage();
+  await loadRuntime({ storage, rootAttributes: { "data-brazier-dev-build": "00ff00ff00ff00ff" } });
+  sockets[0].open();
+  sockets[0].deliver({ type: "reload" });
+  assert.equal(reloads, 1);
+  assert.equal(storage.getItem("brazier:reloads"), null, "a dev reload is not counted by the reload guard");
+});
+
 // --- close codes ---
-scenario("4409 (stale build) reloads behind the reload guard", async () => {
+scenario("4499 (stale build) reloads behind the reload guard", async () => {
   const storage = new FakeStorage();
   for (let i = 0; i < 3; i++) {
     await loadRuntime({ storage, now: 2_000_000 + i * 1000 });
     sockets[0].open();
-    sockets[0].serverClose(4409);
+    sockets[0].serverClose(4499);
     assert.equal(reloads, 1, `stale build ${i + 1} reloads`);
     assert.equal(pendingTimeouts().length, 0, "no reconnect scheduled");
   }
   await loadRuntime({ storage, now: 2_003_000, ssr: "<p>stale</p>" });
   sockets[0].open();
-  sockets[0].serverClose(4409);
+  sockets[0].serverClose(4499, "stale build");
   assert.equal(reloads, 0, "the fourth stale build within 60s does not reload");
   assert.ok(root.hasAttribute("data-brazier-error"));
-  assert.equal(errorsMatching("close 4409").length, 1);
+  assert.equal(errorsMatching("close 4499 stale build").length, 1);
   advance(120000);
   assert.equal(sockets.length, 1, "never reconnects");
 });

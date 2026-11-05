@@ -120,7 +120,10 @@ pub fn empty(status: Int) -> Response {
   |> response.set_body(Bytes(bytes_tree.new()))
 }
 
-/// Read a UTF-8 request body with an explicit byte cap.
+/// Read a UTF-8 request body with an explicit byte cap. The error says why
+/// there is no body: no or an invalid Content-Length, a body over
+/// `max_bytes`, a body already read, a failed or timed-out read, or bytes
+/// that are not UTF-8. Each is logged where it is found.
 pub fn read_text(req: Request, max_bytes: Int) -> Result(String, String) {
   case transport_http.read_body(req, max_bytes) {
     Ok(bits) -> {
@@ -129,7 +132,15 @@ pub fn read_text(req: Request, max_bytes: Int) -> Result(String, String) {
         Error(Nil) -> Error("Invalid UTF-8 request body")
       }
     }
-    Error(reason) -> Error(reason)
+    // Every reason is a reply to the caller, named by its description; each
+    // is listed so that a new one is a compile error here, not a silent
+    // pass-through.
+    Error(transport_http.MissingContentLength as error)
+    | Error(transport_http.InvalidContentLength as error)
+    | Error(transport_http.BodyTooLarge(..) as error)
+    | Error(transport_http.BodyAlreadyConsumed as error)
+    | Error(transport_http.BodyReadFailed(..) as error) ->
+      Error(transport_http.describe_read_body_error(error))
   }
 }
 

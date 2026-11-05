@@ -24,7 +24,11 @@ fn test_handler(
     "/echo" ->
       case transport_http.read_body(req, 1_000_000) {
         Ok(body) -> Some(text_response(200, bits_to_string(body)))
-        Error(reason) -> Some(text_response(400, reason))
+        Error(error) ->
+          Some(text_response(
+            400,
+            transport_http.describe_read_body_error(error),
+          ))
       }
     "/ignore" -> Some(text_response(200, "ignored"))
     "/close" ->

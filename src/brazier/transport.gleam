@@ -11,6 +11,7 @@ import brazier/cookie
 import brazier/error
 import brazier/internal/local_path
 import brazier/internal/log_path
+import brazier/internal/render
 import brazier/ip
 import brazier/log
 import brazier/middleware
@@ -42,7 +43,6 @@ import gleam/result
 import gleam/string
 import gleam/string_tree.{type StringTree}
 import gleam/uri
-import simplifile
 
 /// Unique identifier for a WebSocket connection.
 /// Used for logging and session tracking.
@@ -565,6 +565,9 @@ pub type ConnectionState {
     bytes_in: Int,
     /// Bytes written to the client after the upgrade.
     bytes_out: Int,
+    /// Whether a join without a build id was already warned about on this
+    /// connection (`check_build`): later ones are logged at debug.
+    warned_no_build: Bool,
   )
 }
 
@@ -776,12 +779,25 @@ pub fn encode_server_message_tree(msg: ServerMessage) -> StringTree {
 @external(erlang, "brazier_transport_ffi", "json_raw")
 fn json_raw(json_text: String) -> json.Json
 
-/// A decoded client message and, for a `join`, the build id it carries:
-/// the hash of the client bundle its page loaded (`brazier_client_<hash>.js`),
-/// `None` when the join names none. Only the transport reads the build id,
-/// so it is not part of `ClientJoin`.
+/// A decoded client message and, for a `join`, the builds its page reports
+/// (`no_page_build` for every other message). Only the transport reads
+/// them, so they are not part of `ClientJoin`.
 type ClientFrame =
-  #(ClientMessage, Option(String))
+  #(ClientMessage, PageBuild)
+
+/// The builds a `join`'s page was served with.
+type PageBuild {
+  PageBuild(
+    /// The hash of the client bundle the page loaded
+    /// (`brazier_client_<hash>.js`), `None` when the join names none.
+    bundle: Option(String),
+    /// The dev build the page was rendered under (`ssr.new_dev_build`),
+    /// `None` outside `brazier/dev`.
+    dev: Option(String),
+  )
+}
+
+const no_page_build = PageBuild(bundle: None, dev: None)
 
 /// Build a decoder for client message JSON.
 /// Uses the "type" field to determine which variant to decode.
@@ -805,10 +821,10 @@ fn client_frame_decoder() -> decode.Decoder(ClientFrame) {
           clock: clock,
           ops: ops,
         ),
-        None,
+        no_page_build,
       ))
     }
-    "heartbeat" -> decode.success(#(ClientHeartbeat, None))
+    "heartbeat" -> decode.success(#(ClientHeartbeat, no_page_build))
     "join" -> {
       use token <- decode.optional_field("token", "", decode.string)
       use path <- decode.optional_field("path", "/", decode.string)
@@ -817,14 +833,22 @@ fn client_frame_decoder() -> decode.Decoder(ClientFrame) {
         None,
         decode.map(decode.string, Some),
       )
-      decode.success(#(ClientJoin(token: token, path: path), build))
+      use dev_build <- decode.optional_field(
+        "dev_build",
+        None,
+        decode.map(decode.string, Some),
+      )
+      decode.success(#(
+        ClientJoin(token: token, path: path),
+        PageBuild(bundle: build, dev: dev_build),
+      ))
     }
     "navigate" -> {
       use path <- decode.field("path", decode.string)
       use clock <- decode.optional_field("clock", 0, decode.int)
-      decode.success(#(ClientNavigate(path: path, clock: clock), None))
+      decode.success(#(ClientNavigate(path: path, clock: clock), no_page_build))
     }
-    "request_sync" -> decode.success(#(ClientRequestSync, None))
+    "request_sync" -> decode.success(#(ClientRequestSync, no_page_build))
     "event_batch" -> {
       // Decode array of events — each follows the "event" format
       let event_decoder = {
@@ -848,9 +872,10 @@ fn client_frame_decoder() -> decode.Decoder(ClientFrame) {
         ))
       }
       use events <- decode.field("events", decode.list(event_decoder))
-      decode.success(#(ClientEventBatch(events: events), None))
+      decode.success(#(ClientEventBatch(events: events), no_page_build))
     }
-    _unknown -> decode.failure(#(ClientHeartbeat, None), "ClientMessage type")
+    _unknown ->
+      decode.failure(#(ClientHeartbeat, no_page_build), "ClientMessage type")
   }
 }
 
@@ -1373,11 +1398,11 @@ fn handle_ws_text_decode(state: ConnectionState, text: String) -> Next {
     Ok(#(ClientJoin(path:, ..) as msg, build)) -> {
       use new_state <- admit_rate_limited(state, msg, 1)
       case check_build(new_state, build) {
-        Ok(Nil) -> {
-          use gated_state <- gate_live_page(new_state, JoinGate, path)
+        Ok(checked_state) -> {
+          use gated_state <- gate_live_page(checked_state, JoinGate, path)
           deliver(gated_state, msg)
         }
-        Error(stop) -> stop
+        Error(next) -> next
       }
     }
     Ok(#(ClientNavigate(path:, ..) as msg, _)) -> {
@@ -1515,94 +1540,179 @@ fn gate_live_page(
   }
 }
 
-/// Refuse a join whose page runs an older client build; see
-/// `check_join_build`.
+/// Check the builds a join's page reports before the join reaches the
+/// runtime. Reads no file: both are compared with what the server loaded
+/// (`ssr.client_bundle`, `ssr.dev_build`).
+///
+/// - A page rendered under another dev build (`check_join_dev_build`) is
+///   sent a `reload`, and the join is not forwarded.
+/// - A page on another client bundle closes with 4499 (`check_join_build`).
+/// - A join without a build id cannot be checked and is let through. It is
+///   warned about once per connection, so a client loading the unversioned
+///   `/brazier_client.js` is noticed without a warning on every rejoin;
+///   later ones on the connection are logged at debug.
 fn check_build(
   state: ConnectionState,
-  build: Option(String),
-) -> Result(Nil, Next) {
-  case check_join_build(ssr.client_assets_dir(), ctx(state), build) {
-    Ok(Nil) -> Ok(Nil)
-    Error(#(code, reason)) ->
-      Error(Stop(state, SendClose(code, reason), reason))
+  build: PageBuild,
+) -> Result(ConnectionState, Next) {
+  let conn = ctx(state)
+  case check_join_dev_build(ssr.dev_build(), conn, build.dev) {
+    Error(Nil) -> Error(send_or_stop(state, ServerReload))
+    Ok(Nil) ->
+      case build.bundle {
+        None -> Ok(note_join_without_build(state, conn))
+        Some(page_build) ->
+          case check_join_build(ssr.client_bundle(), conn, page_build) {
+            Ok(Nil) -> Ok(state)
+            Error(#(code, reason)) ->
+              Error(Stop(state, SendClose(code, reason), reason))
+          }
+      }
   }
 }
 
-/// Check the build id a `join` carries against the client bundle the
-/// server serves now: the one `brazier_client.manifest` in `assets_dir`
-/// names, as the server-rendered page does. The manifest is read on every
-/// join, never cached, because `brazier/dev` rebuilds the bundle into a
-/// running server.
+fn note_join_without_build(
+  state: ConnectionState,
+  conn: String,
+) -> ConnectionState {
+  case state.warned_no_build {
+    False -> {
+      log.warning(
+        "brazier.transport",
+        "Join from "
+          <> conn
+          <> " carries no build id: its page did not load the client from "
+          <> "/brazier_client_<hash>.js, so a page from an older build is not "
+          <> "detected (warned once per connection)",
+      )
+      ConnectionState(..state, warned_no_build: True)
+    }
+    True -> {
+      log.debug(
+        "brazier.transport",
+        "Join from " <> conn <> " carries no build id again; not checked",
+      )
+      state
+    }
+  }
+}
+
+/// Check the build id a `join` carries against `current`, the client
+/// bundle the server loaded (`ssr.client_bundle`), which is the one the
+/// server-rendered page names.
 ///
 /// - The page's bundle is the current one: `Ok(Nil)`.
 /// - It is another one (the app was rebuilt since the page loaded):
-///   `Error(#(4409, "stale build"))`. The client reloads behind its reload
+///   `Error(#(4499, "stale build"))`. The client reloads behind its reload
 ///   guard and gets the new bundle, so it never decodes a model with a
 ///   codec of another build.
-/// - The manifest cannot be read, or names no bundle that exists:
-///   `Error(#(1011, "internal error"))`, logged as an error. This is a
-///   broken deployment, so the join is not let through unchecked.
-/// - The join has no build id (its page loaded the client from the
-///   unversioned `/brazier_client.js`, or by some other URL): it cannot be
-///   checked. `Ok(Nil)`, logged as a warning on every such join.
+/// - The server has no bundle (`current` is an `Error`):
+///   `Error(#(1011, "internal error"))`, logged as an error. The join is
+///   not let through unchecked.
 ///
 /// `conn` names the connection in the log lines.
 /// Reference: Phoenix LiveView's `phx-track-static`. The client sends the
 /// URLs of the tracked assets its page loaded with the join, the server
 /// compares them with its current digests, and an outdated page is told to
 /// reload, with a counter in the client that stops a reload loop.
+@internal
 pub fn check_join_build(
-  assets_dir: String,
+  current: Result(String, String),
   conn: String,
-  build: Option(String),
+  page_build: String,
 ) -> Result(Nil, #(Int, String)) {
-  case build {
-    None -> {
-      log.warning(
+  case current {
+    Error(reason) -> {
+      log.error(
+        "brazier.transport",
+        "Cannot check the build of the join from "
+          <> conn
+          <> ", closing with 1011: "
+          <> reason,
+      )
+      Error(#(ws.close_internal_error, "internal error"))
+    }
+    Ok(bundle) ->
+      case bundle == "brazier_client_" <> page_build <> ".js" {
+        True -> {
+          log.debug(
+            "brazier.transport",
+            "Join from " <> conn <> " is on the current build " <> bundle,
+          )
+          Ok(Nil)
+        }
+        False -> {
+          log.info(
+            "brazier.transport",
+            "Join from "
+              <> conn
+              <> " is from build "
+              <> string.inspect(string.slice(page_build, 0, 64))
+              <> ", the server serves "
+              <> bundle
+              <> ": closing with "
+              <> int.to_string(ws.close_stale_build)
+              <> " so the page reloads",
+          )
+          Error(#(ws.close_stale_build, "stale build"))
+        }
+      }
+  }
+}
+
+/// Check the dev build a `join`'s page was rendered under against
+/// `current`, the server's (`ssr.dev_build`, set by `brazier/dev`).
+/// `Error(Nil)` when they differ: the page is from before the last
+/// rebuild, and is told to reload. This reaches a page that was between
+/// sockets when the rebuild's `reload` was broadcast, and that would
+/// otherwise run on (its client bundle may be unchanged) with the old
+/// server code's page.
+///
+/// Missing on either side is `Ok(Nil)`, logged at debug: outside dev mode
+/// the server has no dev build, and a page rendered before dev mode
+/// started, or by a server outside it, has none.
+@internal
+pub fn check_join_dev_build(
+  current: Option(String),
+  conn: String,
+  page_dev_build: Option(String),
+) -> Result(Nil, Nil) {
+  case current, page_dev_build {
+    Some(server), Some(page) if server == page -> Ok(Nil)
+    Some(server), Some(page) -> {
+      log.info(
         "brazier.transport",
         "Join from "
           <> conn
-          <> " carries no build id: its page did not load the client from "
-          <> "/brazier_client_<hash>.js, so a page from an older build is not detected",
+          <> " was rendered under dev build "
+          <> string.inspect(string.slice(page, 0, 64))
+          <> ", the server is on "
+          <> server
+          <> ": telling the page to reload",
+      )
+      Error(Nil)
+    }
+    Some(server), None -> {
+      log.debug(
+        "brazier.transport",
+        "Join from "
+          <> conn
+          <> " reports no dev build; the server is on "
+          <> server
+          <> ", so its page is not checked against the last rebuild",
       )
       Ok(Nil)
     }
-    Some(page_build) ->
-      case ssr.client_bundle_name(assets_dir) {
-        Error(reason) -> {
-          log.error(
-            "brazier.transport",
-            "Cannot check the build of the join from "
-              <> conn
-              <> ", closing with 1011: "
-              <> reason,
-          )
-          Error(#(ws.close_internal_error, "internal error"))
-        }
-        Ok(bundle) ->
-          case bundle == "brazier_client_" <> page_build <> ".js" {
-            True -> {
-              log.debug(
-                "brazier.transport",
-                "Join from " <> conn <> " is on the current build " <> bundle,
-              )
-              Ok(Nil)
-            }
-            False -> {
-              log.info(
-                "brazier.transport",
-                "Join from "
-                  <> conn
-                  <> " is from build "
-                  <> string.inspect(string.slice(page_build, 0, 64))
-                  <> ", the server serves "
-                  <> bundle
-                  <> ": closing with 4409 so the page reloads",
-              )
-              Error(#(ws.close_stale_build, "stale build"))
-            }
-          }
-      }
+    None, Some(_) -> {
+      log.debug(
+        "brazier.transport",
+        "Join from "
+          <> conn
+          <> " reports a dev build, but the server is not in dev mode",
+      )
+      Ok(Nil)
+    }
+    None, None -> Ok(Nil)
   }
 }
 
@@ -2394,6 +2504,7 @@ fn start_ws_connection(
           frames_out: 0,
           bytes_in: 0,
           bytes_out: 0,
+          warned_no_build: False,
         )
 
       case subscribe_dev_reload(state) {
@@ -3953,56 +4064,32 @@ fn serve_page_or_ssr(
   }
 }
 
-/// Default page when no SSR is configured. Fails when the client bundle
-/// has not been built: a page whose script cannot load is not served.
+/// Default page when no SSR is configured, with the script of the client
+/// bundle the server loaded at start (`ssr.client_bundle`) and, under
+/// `brazier/dev`, the dev build its join reports (`ssr.new_dev_build`).
+/// Fails when the bundle could not be loaded: a page whose script cannot
+/// load is not served.
 fn default_page_html() -> Result(String, String) {
-  case get_client_js_filename(ssr.client_assets_dir()) {
+  case ssr.client_bundle() {
     Error(reason) -> Error(reason)
-    Ok(filename) ->
+    Ok(filename) -> {
+      let dev_build_attribute = case ssr.dev_build() {
+        Some(id) ->
+          " data-brazier-dev-build=\"" <> render.escape_html(id) <> "\""
+        None -> ""
+      }
       Ok(
         "<!DOCTYPE html>"
         <> "<html><head><meta charset=\"utf-8\"><title>Brazier</title>"
         <> "</head><body>"
-        <> "<div id=\"brazier-app\"></div>"
+        <> "<div id=\"brazier-app\""
+        <> dev_build_attribute
+        <> "></div>"
         <> "<script src=\"/"
         <> filename
         <> "\"></script>"
         <> "</body></html>",
       )
-  }
-}
-
-/// The bundle file named by `brazier_client.manifest` in `assets_dir`. The
-/// name must be exact build output (`static.is_client_bundle_name`), so a
-/// damaged manifest can never point the server at another file.
-fn get_client_js_filename(assets_dir: String) -> Result(String, String) {
-  let manifest_path = assets_dir <> "/brazier_client.manifest"
-  case simplifile.read(manifest_path) {
-    Ok(contents) -> {
-      let name = string.trim(contents)
-      case static.is_client_bundle_name(name) {
-        True -> Ok(name)
-        False -> {
-          let reason =
-            "brazier_client.manifest at "
-            <> manifest_path
-            <> " names an invalid bundle "
-            <> string.inspect(name)
-            <> " — rebuild with `gleam run -m brazier/build`"
-          log.error("brazier.transport", reason)
-          Error(reason)
-        }
-      }
-    }
-    Error(err) -> {
-      let reason =
-        "No brazier_client.manifest at "
-        <> manifest_path
-        <> ": "
-        <> string.inspect(err)
-        <> " — the client JS was not built. Run `gleam run -m brazier/build` first."
-      log.error("brazier.transport", reason)
-      Error(reason)
     }
   }
 }
@@ -4051,10 +4138,11 @@ fn client_js_unavailable(reason: String) -> response.Response(ResponseBody) {
 fn serve_client_js(
   req: Request(Connection),
 ) -> response.Response(ResponseBody) {
-  let assets_dir = ssr.client_assets_dir()
-  case get_client_js_filename(assets_dir) {
+  case ssr.client_bundle() {
     Ok(name) ->
-      case serve_js_file(assets_dir <> "/" <> name, "no-cache", req) {
+      case
+        serve_js_file(ssr.client_assets_dir() <> "/" <> name, "no-cache", req)
+      {
         Ok(resp) -> resp
         // The manifest names a bundle that does not exist: broken build.
         Error(Nil) ->
@@ -4298,6 +4386,15 @@ fn prepare_listener(
       })
     None -> Ok(Nil)
   })
+  // The client bundle is read here, once: every page and every join's build
+  // check uses the loaded name and reads no file. `load_client_bundle` logs
+  // the failure.
+  use _bundle <- result.try(
+    ssr.load_client_bundle()
+    |> result.map_error(fn(reason) {
+      error.ConfigError(reason: "No client bundle: " <> reason)
+    }),
+  )
   // Built once: middleware and routing closures, and the parsed hosts and
   // origins, are shared by every connection instead of being rebuilt per
   // request.

@@ -88,7 +88,17 @@ fn reporting_config(
   })
 }
 
+/// Load the repository's client bundle, as the server does when it starts:
+/// `ssr.render_page` reads only the loaded bundle. A load that is unchanged
+/// writes nothing.
+fn load_bundle() -> Nil {
+  let assert Ok(_) = ssr.load_client_bundle()
+    as "the repository's priv/static must hold a built runtime bundle"
+  Nil
+}
+
 fn render(config: ssr.SsrConfig(TestModel, TestMsg)) -> ssr.RenderedPage {
+  load_bundle()
   ssr.render_page(config, request.new())
 }
 
@@ -96,6 +106,7 @@ fn render_path(
   config: ssr.SsrConfig(TestModel, TestMsg),
   path: String,
 ) -> ssr.RenderedPage {
+  load_bundle()
   ssr.render_page(config, request.new() |> request.set_path(path))
 }
 
@@ -197,7 +208,12 @@ fn with_assets_dir(
 /// A page whose client bundle cannot be named is a static 500: no script,
 /// no join cookie. Nothing falls back to Brazier's own bundle.
 fn assert_render_refused(dir: String) -> Nil {
-  let page = ssr.render_page_from(test_config(), request.new(), dir)
+  let page =
+    ssr.render_page_with_bundle(
+      test_config(),
+      request.new(),
+      ssr.client_bundle_name(dir),
+    )
   let assert 500 = page.status
   let assert False = page.join_cookie
   let assert False = str_contains(page.html, "<script")
@@ -220,9 +236,14 @@ pub fn render_page_with_invalid_bundle_name_is_500_test() {
   assert_render_refused(dir)
 }
 
-pub fn render_page_from_serves_the_named_bundle_test() {
+pub fn render_page_with_bundle_serves_the_named_bundle_test() {
   use dir <- with_assets_dir(option.Some(bundle <> "\n"), [bundle])
-  let page = ssr.render_page_from(test_config(), request.new(), dir)
+  let page =
+    ssr.render_page_with_bundle(
+      test_config(),
+      request.new(),
+      ssr.client_bundle_name(dir),
+    )
   let assert 200 = page.status
   let assert True = page.join_cookie
   let assert True = str_contains(page.html, bundle)
@@ -375,6 +396,7 @@ pub fn render_page_bad_percent_encoding_is_a_static_400_test() {
 }
 
 pub fn render_page_bad_query_encoding_is_a_static_400_test() {
+  load_bundle()
   let page =
     ssr.render_page(
       test_config(),
@@ -390,6 +412,7 @@ pub fn render_page_gives_init_a_dead_render_context_test() {
     request.new()
     |> request.set_path("/about")
     |> request.set_header("cookie", "theme=dark; brazier_session=session-a")
+  load_bundle()
   let page = ssr.render_page(reporting_config(calls), req)
   let assert 200 = page.status
   let assert Ok(ctx) = process.receive(calls, 0)
@@ -974,90 +997,6 @@ fn do_string_index_of(haystack: String, needle: String) -> Result(Int, Nil)
 
 @external(erlang, "brazier_test_ffi", "system_time_seconds")
 fn current_system_time_seconds() -> Int
-
-// --- Client bundle name cache ---
-
-const bundle_a = "brazier_client_0123456789abcdef.js"
-
-const bundle_b = "brazier_client_fedcba9876543210.js"
-
-/// A scratch assets dir holding a manifest that names bundle A, with the
-/// manifest's mtime at `mtime`.
-fn bundle_dir(mtime: Int) -> #(String, String) {
-  let dir = "/tmp/brazier_ssr_bundle_" <> int.to_string(unique_integer())
-  let assert Ok(Nil) = simplifile.create_directory_all(dir)
-    as "test directory must be creatable"
-  let manifest = dir <> "/brazier_client.manifest"
-  write_file(dir <> "/" <> bundle_a, "/* a */")
-  write_manifest(manifest, bundle_a, mtime)
-  #(dir, manifest)
-}
-
-fn write_manifest(manifest: String, name: String, mtime: Int) -> Nil {
-  write_file(manifest, name)
-  let assert Ok(Nil) = set_mtime(manifest, mtime)
-    as "the test sets the manifest's mtime"
-  Nil
-}
-
-fn write_file(path: String, contents: String) -> Nil {
-  let assert Ok(Nil) = simplifile.write(path, contents)
-    as "test file must be writable"
-  Nil
-}
-
-fn remove_dir(dir: String) -> Nil {
-  let assert Ok(Nil) = simplifile.delete(dir) as "test directory cleanup"
-  Nil
-}
-
-@external(erlang, "brazier_bundle_manifest_test_ffi", "set_mtime")
-fn set_mtime(path: String, posix: Int) -> Result(Nil, String)
-
-pub fn bundle_name_of_a_settled_manifest_is_cached_test() {
-  let #(dir, manifest) = bundle_dir(current_system_time_seconds() - 100)
-  let assert Ok(name) = ssr.client_bundle_name(dir)
-  assert name == bundle_a
-  let assert True = list.contains(ssr.cached_bundle_manifests(), manifest)
-    as "a manifest last changed before it was read is cached"
-  // A hit still checks the bundle: a deleted bundle is an error, not a
-  // name served from the cache.
-  let assert Ok(Nil) = simplifile.delete(dir <> "/" <> bundle_a)
-  let assert Error(reason) = ssr.client_bundle_name(dir)
-  let assert True =
-    string.contains(reason, bundle_a <> ", which does not exist")
-  remove_dir(dir)
-}
-
-pub fn bundle_name_cache_sees_a_rebuild_test() {
-  let now = current_system_time_seconds()
-  let #(dir, manifest) = bundle_dir(now - 100)
-  let assert Ok(_) = ssr.client_bundle_name(dir)
-  write_file(dir <> "/" <> bundle_b, "/* b */")
-  write_manifest(manifest, bundle_b, now - 50)
-  let assert Ok(name) = ssr.client_bundle_name(dir)
-  assert name == bundle_b
-  remove_dir(dir)
-}
-
-/// mtime has one-second resolution and every bundle name has the same
-/// length, so a manifest rewritten in the second it was read keeps its
-/// stat. Such a manifest is never served from the cache (git's racy-clean
-/// rule): here its mtime is never in the past, and a rewrite with the same
-/// stat is still seen.
-pub fn bundle_name_of_a_manifest_changed_this_second_is_not_cached_test() {
-  let racy = current_system_time_seconds() + 100
-  let #(dir, manifest) = bundle_dir(racy)
-  let assert Ok(name) = ssr.client_bundle_name(dir)
-  assert name == bundle_a
-  let assert False = list.contains(ssr.cached_bundle_manifests(), manifest)
-    as "a manifest modified in the second it was read is not cached"
-  write_file(dir <> "/" <> bundle_b, "/* b */")
-  write_manifest(manifest, bundle_b, racy)
-  let assert Ok(name) = ssr.client_bundle_name(dir)
-  assert name == bundle_b
-  remove_dir(dir)
-}
 
 pub fn bundle_name_of_a_missing_manifest_is_an_error_test() {
   let dir = "/tmp/brazier_ssr_bundle_" <> int.to_string(unique_integer())

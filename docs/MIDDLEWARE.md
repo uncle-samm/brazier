@@ -200,8 +200,9 @@ pub fn require_api_key(expected: String) -> Middleware {
 
 Read a body with `api.read_text(req, max_bytes)` (UTF-8 text) or
 `api.read_form(req, max_bytes)` (URL-encoded form fields). Both return an
-`Error` with the reason for a body over `max_bytes`, a body that is not valid
-UTF-8 or a form that does not decode. See
+`Error` with the reason for a missing or invalid `Content-Length`, a body
+over `max_bytes`, a body already read, a read that failed or timed out, a
+body that is not valid UTF-8 or a form that does not decode. See
 [GETTING_STARTED.md](GETTING_STARTED.md#api-routes).
 
 ## Passing Data to the Handler

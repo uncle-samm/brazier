@@ -57,11 +57,13 @@ pub const close_try_again_later = 1013
 /// Clients must not blindly reconnect on this code; they must re-authenticate.
 pub const close_auth_revoked = 4401
 
-/// 4409: application code — the page's client bundle is not the one the
+/// 4499: application code — the page's client bundle is not the one the
 /// server serves now (the app was rebuilt since the page loaded), so its
 /// model codec may not match the server's. The client reloads the page, as
-/// for every code from 4400 to 4499.
-pub const close_stale_build = 4409
+/// for every code from 4400 to 4499. It is `4000 + 499`, the one status
+/// `error.refuse` does not take (`error.reserved_status`), so an init
+/// refusal (`4000 + status`, 4409 for a 409) never shares it.
+pub const close_stale_build = 4499
 
 /// 4600: application code — route middleware refused the page this socket
 /// would mount. A browser cannot read the HTTP status of a refused upgrade,

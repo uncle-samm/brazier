@@ -742,6 +742,7 @@ fn is_pure_function_name(name: String) -> Bool {
   || string.starts_with(name, "get_")
   || string.starts_with(name, "patches_to_")
   || string.starts_with(name, "default_")
+  || string.starts_with(name, "describe_")
   || name == "diff"
   || name == "main"
   || name == "listen"

@@ -547,20 +547,20 @@ http_body_state(Socket) ->
         undefined -> {error, nil}
     end.
 
+%% {ok, Bytes} | {error, BodyReadError}, the error being the Erlang form of
+%% `transport/server.BodyReadError`: no_active_request, body_unavailable,
+%% {read_past_body, Requested, Remaining}, body_read_timeout,
+%% request_deadline_exceeded or {socket_failed, Reason}.
 http_body_read(Socket, Length) when is_integer(Length) ->
     Key = {brazier_http_body, Socket},
     case get(Key) of
         undefined ->
             brazier_log_ffi:error(<<"brazier.http">>, "read_body called outside an active HTTP request"),
-            {error, <<"read_body called outside an active HTTP request">>};
+            {error, no_active_request};
         #{failed := true} ->
-            {error, <<"request body unavailable after an earlier read failure">>};
-        _Ctx when Length < 0 ->
-            {error, <<"negative body length requested">>};
-        #{remaining := Remaining} when Length > Remaining ->
-            {error, iolist_to_binary(io_lib:format(
-                "requested ~p body bytes but only ~p remain of the declared Content-Length",
-                [Length, Remaining]))};
+            {error, body_unavailable};
+        #{remaining := Remaining} when Length < 0; Length > Remaining ->
+            {error, {read_past_body, Length, Remaining}};
         _Ctx when Length =:= 0 ->
             {ok, <<>>};
         Ctx = #{remaining := Remaining} ->
@@ -583,24 +583,29 @@ recv_body(Socket, Key, Ctx = #{remaining := Remaining, timeout := Timeout,
     case maybe_send_continue(Socket, Ctx) of
         {error, Reason} ->
             put(Key, Ctx#{failed := true}),
-            {error, format_reason(Reason)};
+            {error, {socket_failed, format_reason(Reason)}};
         {ok, Ctx1} ->
             Wait = min(Timeout, Deadline - now_ms()),
             case Wait =< 0 of
                 true ->
                     put(Key, Ctx1#{failed := true}),
-                    {error, <<"request_deadline_exceeded">>};
+                    {error, request_deadline_exceeded};
                 false ->
                     case gen_tcp:recv(Socket, Length - byte_size(Buffered), Wait) of
                         {ok, Data} ->
                             put(Key, Ctx1#{remaining := Remaining - Length}),
                             {ok, <<Buffered/binary, Data/binary>>};
+                        {error, timeout} when Wait < Timeout ->
+                            %% The wait was cut short by the request
+                            %% deadline, not the per-read timeout.
+                            put(Key, Ctx1#{failed := true}),
+                            {error, request_deadline_exceeded};
                         {error, timeout} ->
                             put(Key, Ctx1#{failed := true}),
-                            {error, <<"body_read_timeout">>};
+                            {error, body_read_timeout};
                         {error, Reason} ->
                             put(Key, Ctx1#{failed := true}),
-                            {error, format_reason(Reason)}
+                            {error, {socket_failed, format_reason(Reason)}}
                     end
             end
     end.

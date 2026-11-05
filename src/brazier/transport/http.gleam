@@ -480,10 +480,11 @@ pub fn finish_body(socket: server.Socket, outcome: BodyOutcome) -> BodyOutcome {
           )
           BodyConsumed
         }
-        Error(reason) -> {
+        Error(error) -> {
           log.warning(
             "brazier.http",
-            "Failed to discard unread request body: " <> reason,
+            "Failed to discard unread request body: "
+              <> server.describe_body_read_error(error),
           )
           BodyFailed
         }
@@ -509,11 +510,43 @@ pub fn abandon_body(socket: server.Socket, outcome: BodyOutcome) -> Nil {
   ffi_body_end(socket)
 }
 
+/// Why `read_body` returned no body.
+pub type ReadBodyError {
+  /// The request has no Content-Length header, so it has no body: the
+  /// listener does not accept chunked bodies.
+  MissingContentLength
+  /// The Content-Length header is not one decimal number.
+  InvalidContentLength
+  /// The declared Content-Length is over the `max_bytes` the caller allows.
+  /// Nothing was read.
+  BodyTooLarge(length: Int, limit: Int)
+  /// The body was already read, in full or in part. It can be read once.
+  BodyAlreadyConsumed
+  /// Reading failed: a timeout, a closed socket, an earlier failed read, or
+  /// a call outside an active request.
+  BodyReadFailed(error: server.BodyReadError)
+}
+
+/// A one-line description of a `ReadBodyError`, for logs and replies.
+pub fn describe_read_body_error(error: ReadBodyError) -> String {
+  case error {
+    MissingContentLength -> "Missing Content-Length header"
+    InvalidContentLength -> "Invalid Content-Length header"
+    BodyTooLarge(length:, limit:) ->
+      "Content-Length "
+      <> int.to_string(length)
+      <> " exceeds limit of "
+      <> int.to_string(limit)
+    BodyAlreadyConsumed -> "Request body already consumed"
+    BodyReadFailed(error:) -> server.describe_body_read_error(error)
+  }
+}
+
 /// Read the request body.
 ///
-/// Returns Error if Content-Length is missing, the body exceeds
-/// `max_bytes`, the body was already consumed, or reading fails or times
-/// out. The body can be read at most once.
+/// Returns an error if Content-Length is missing or invalid, the body
+/// exceeds `max_bytes`, the body was already consumed, or reading fails or
+/// times out. The body can be read at most once.
 ///
 /// Example:
 /// ```gleam
@@ -524,35 +557,37 @@ pub fn abandon_body(socket: server.Socket, outcome: BodyOutcome) -> Nil {
 ///       Error(Nil) -> send_error(400, "Invalid UTF-8")
 ///     }
 ///   }
-///   Error(reason) -> send_error(400, reason)
+///   Error(transport_http.BodyTooLarge(..) as error) ->
+///     send_error(413, transport_http.describe_read_body_error(error))
+///   Error(error) -> send_error(400, transport_http.describe_read_body_error(error))
 /// }
 /// ```
 pub fn read_body(
   req: Request(server.Connection),
   max_bytes: Int,
-) -> Result(BitArray, String) {
+) -> Result(BitArray, ReadBodyError) {
   let server.Connection(socket: socket) = req.body
   case request.get_header(req, "content-length") {
     Error(Nil) -> {
       log.debug("brazier.http", "read_body: request has no Content-Length")
-      Error("Missing Content-Length header")
+      Error(MissingContentLength)
     }
     Ok(length_str) ->
       case parse_content_length(length_str), ffi_body_state(socket) {
         Error(Nil), _ -> {
           log.warning("brazier.http", "read_body: invalid Content-Length")
-          Error("Invalid Content-Length header")
+          Error(InvalidContentLength)
         }
         _, Error(Nil) -> {
           log.error(
             "brazier.http",
             "read_body called outside an active HTTP request",
           )
-          Error("read_body called outside an active HTTP request")
+          Error(BodyReadFailed(server.NoActiveRequest))
         }
         Ok(_), Ok(#(_, True)) -> {
           log.warning("brazier.http", "read_body after an earlier read failure")
-          Error("Request body unavailable after an earlier read failure")
+          Error(BodyReadFailed(server.BodyUnavailable))
         }
         Ok(length), Ok(#(_, False)) if length > max_bytes -> {
           log.warning(
@@ -562,16 +597,11 @@ pub fn read_body(
               <> " exceeds limit of "
               <> int.to_string(max_bytes),
           )
-          Error(
-            "Content-Length "
-            <> int.to_string(length)
-            <> " exceeds limit of "
-            <> int.to_string(max_bytes),
-          )
+          Error(BodyTooLarge(length: length, limit: max_bytes))
         }
         Ok(length), Ok(#(remaining, False)) if remaining != length -> {
           log.warning("brazier.http", "read_body: body already consumed")
-          Error("Request body already consumed")
+          Error(BodyAlreadyConsumed)
         }
         Ok(0), Ok(#(_, False)) -> Ok(<<>>)
         Ok(length), Ok(#(_, False)) -> {
@@ -581,9 +611,13 @@ pub fn read_body(
           )
           case server.read_body(socket, length) {
             Ok(body) -> Ok(body)
-            Error(reason) -> {
-              log.warning("brazier.http", "Failed to read body: " <> reason)
-              Error(reason)
+            Error(error) -> {
+              log.warning(
+                "brazier.http",
+                "Failed to read body: "
+                  <> server.describe_body_read_error(error),
+              )
+              Error(BodyReadFailed(error))
             }
           }
         }
