@@ -776,7 +776,15 @@
 - [x] L589 (m118-tests; the pending modules are a phase B follow-up): no check for messages a test leaves in the mailbox. m118-tests (partly).
 - [ ] Perf, before the re-baseline: L637 SSR at 1000 rows takes about 8 ms; L638 client decode and patch at 1000 rows; L639 `presence.list` copies the whole room; L640 a DOM morph bench (CDP); L642 6 atoms leak per suite run; L643 `ws.100x200` runs only 5 rounds.
 
-- [x] Coordinator, 2026-11-05: merged phase A except m118-cluster, rebuilt the prebuilt runtime bundle (`priv/static`, it predated the shifted-array diff), and wrote the CHANGELOG entries.
+- [x] Coordinator, 2026-11-05: merged phase A except m118-cluster, rebuilt the prebuilt runtime bundle (`priv/static`, it predated the shifted-array diff), and wrote the CHANGELOG entries. Verified 3047dd1: build, format, lint and docs pass; 2090 tests pass twice; `make test-client` passes; CDP passes 633 of 633 on desktop and 642 of 642 on mobile.
+- [ ] Phase B running (started 2026-11-05, every worktree at 3047dd1):
+  - m118-streams-server: STREAMS.md steps 2–5, with the `streams` field on `patch` and `model_sync`;
+  - m118-streams-client: step 6;
+  - m118-logs: L452, L453, L608–609, and the 4401 TODO;
+  - m118-residue: the residue-pending modules, L190 and L414.
+  The two streams halves merge together before CDP runs, because each breaks the suite on its own.
+- Decision, 2026-11-05: 4401 stays shared by an `init` 401 and a revoked or expired session. Both mean "authentication is no longer valid; reload" to the client. The server tells them apart by a distinct cause in the close's log line and telemetry metadata. m118-logs builds it.
+- Decision, 2026-11-05: m118-streams-client checks the required `streams` field with synthetic frames only. Making the replay of recorded server frames (`sync_vectors.mjs`) strict waits for the merge with the server half, so neither branch carries a red test.
 - [ ] Follow-up: `crdt_test.gleam:597` (`append_cost_does_not_grow_with_the_values_under_the_key_test`) flaked once on m118-transport's branch (3427 vs 992 reductions). m118-cluster owns the CRDT; if it isn't fixed there, phase B.
 - [ ] Follow-up: `patch_bench` metrics need a baseline (the re-baseline item).
 
