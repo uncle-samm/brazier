@@ -2,7 +2,7 @@ name = "brazier"
 version = "0.1.0"
 description = "A full-stack Gleam web framework combining LiveView-style server rendering with type-safe routing and VDOM diffing on the BEAM."
 licences = ["MIT"]
-repository = { type = "github", user = "uncle-samm", repo = "beacon" }
+repository = { type = "github", user = "uncle-samm", repo = "brazier" }
 target = "erlang"
 # Hidden from the generated docs. `brazier/transport` and
 # `brazier/transport/server` stay public while `brazier.security_limits`,

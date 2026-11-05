@@ -16,9 +16,14 @@ cd my_app
 
 ### 2. Add Brazier as a dependency
 
-Brazier is not published on Hex (the `brazier` package there is another
-project). Clone the repository and depend on the checkout by path in
-`gleam.toml`, as the apps in `examples/` do:
+Add Brazier from Hex:
+
+```sh
+gleam add brazier
+```
+
+To work against an unreleased checkout instead, clone the repository and
+depend on it by path in `gleam.toml`, as the apps in `examples/` do:
 
 ```toml
 [dependencies]

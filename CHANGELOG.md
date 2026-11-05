@@ -4,16 +4,14 @@ All notable changes to Brazier (named Beacon until 2026-11-04) are recorded here
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/).
 
-**No version has been published.** Nothing has gone to Hex, and no release has
-been tagged. `gleam.toml` says `0.1.0`, the version the first release will
-take. An earlier copy of this file had `0.1.0` and `0.2.0` entries from
+`0.1.0` is the first version published to Hex. An earlier copy of this file had `0.1.0` and `0.2.0` entries from
 2026-03-15 and 2026-03-16. Neither was ever released, and their contents no
 longer describe the code. They have been removed, and the history before
 Milestone 117 is summarised at the end of this file.
 
 The package was renamed from `beacon` to `brazier` on 2026-11-04, before it
 was first published, because the `beacon` name is taken on Hex. The first
-`### Breaking` entry under `[Unreleased]` lists what changed. The entries
+`### Breaking` entry under `[0.1.0]` lists what changed. The entries
 below it were written before the rename and keep the old names.
 
 `scripts/publish.sh` refuses to publish unless the `gleam.toml` version has a
@@ -22,11 +20,13 @@ without contacting Hex.
 
 ## [Unreleased]
 
-Milestone 117, the full review remediation. The workstreams are listed in
+## [0.1.0] - 2026-11-05
+
+The first release. It holds Milestone 117, the full review remediation. The workstreams are listed in
 `docs/PROGRESS.md`. WS5 and WS6 changed postgleam, which is a separate package
 with its own changelog, so they are not listed here. Entries tagged `(M118
 ...)` come from Milestone 118 (streams, the shifted-array diff and the
-open follow-ups), which is in progress.
+open follow-ups), merged on 2026-11-05.
 
 ### Breaking
 

@@ -1,8 +1,9 @@
 # Brazier
 
 Brazier is an alpha full-stack Gleam framework for building MVU web apps on the
-BEAM. It is not published on Hex yet. It was named Beacon until 2026-11-04 and
-was renamed because another package holds that name on Hex; see
+BEAM, published on Hex as `brazier` (`gleam add brazier`). It was named Beacon
+until 2026-11-04 and was renamed because another package holds that name on
+Hex; see
 [CHANGELOG.md](CHANGELOG.md).
 
 How a page works:
