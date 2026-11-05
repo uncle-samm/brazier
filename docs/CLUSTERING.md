@@ -277,7 +277,7 @@ Discovery follows libcluster's Epmd and DNSPoll strategies.
 |---|---|
 | `Static(["app@node1.internal", ...])` | Connects to each node. Failed and lost connections are retried with backoff. This node may be in the list. |
 | `Dns(query, basename, poll_ms)` | Every `poll_ms`, resolves A and AAAA records for `query` and connects to `basename@<address>` for each new address. |
-| `NoDiscovery` | Connects to nothing. It reports and checks nodes that connect by other means. |
+| `NoDiscovery` | Connects to nothing and never reconnects. It reports and checks nodes that connect by other means. |
 
 Settings:
 
@@ -308,6 +308,48 @@ Settings:
   emits `[brazier, cluster, connect, failed]`.
 - **Membership telemetry.** `[brazier, cluster, node, up | down]` reports
   membership.
+
+### Netsplits
+
+A netsplit ends only when something connects the two sides again. Which
+discovery does that:
+
+| Discovery | After the network heals |
+|---|---|
+| `Static` | The lost node is retried with backoff (`connect_backoff`) until it connects. |
+| `Dns` | Each poll connects every answered address that is not connected. The next poll after the heal joins the sides. |
+| `NoDiscovery` | Nothing reconnects. The sides stay apart until your own code, or a new connection from outside, joins them. |
+
+`NoDiscovery` owns no connections, by design. libcluster's Epmd strategy is
+the same: it connects once, and reconnects only when its `timeout` option is
+set. Use `NoDiscovery` when something else forms the cluster, such as a
+release that runs `net_kernel:connect_node/1` itself, or a test. If nothing
+else does, use `Static` or `Dns`.
+
+OTP's `global` can also cut connections during a netsplit. Under the
+kernel default `prevent_overlapping_partitions=true`, when node `a` loses
+`b` but `c` still reaches both, `global` on `a` tells `c`, and `c` drops
+its connection to `b`. Every part is then fully connected: `a` and `c` on
+one side, `b` on the other (see
+[Why a rejected peer is not disconnected](#why-a-rejected-peer-is-not-disconnected)
+for the mechanism). Members that the network never separated can
+therefore go down. Brazier keeps the OTP default:
+
+- Brazier registers no `global` names, and takes `global` locks on its own
+  node only. Your application or a library may use them. With the setting off, `global` cannot keep its names consistent
+  across a partial partition (the OTP `global` docs).
+- The nodes it drops are only disconnected, so `Static` and `Dns` connect
+  them again once the network heals, and the peer check runs again on the
+  new connection. Each drop and each reconnect is logged and reported with
+  `[brazier, cluster, node, up | down]`.
+- `NoDiscovery` does not reconnect them, which is one more reason to
+  choose a discovery that connects.
+
+Turn the setting off (`-kernel prevent_overlapping_partitions false`) only
+when no code on the node uses `global` names and you need connections that
+survive a partial partition. Brazier's own netsplit tests do this, to keep
+each app node connected to a shared database node while the app nodes are
+split.
 
 ### The peer check
 
@@ -393,6 +435,31 @@ There is no fallback to every connected node. Without a running cluster
 manager, no remote node is a member, so these features stay on this node.
 Membership is per connection. A node loses it when it is rejected or goes
 down. It is checked again on its next hello, or when it reconnects.
+
+- **A membership belongs to one connection.** The manager records the
+  distribution connection each peer check passed on. `members()` counts a
+  node only while it is still connected over that connection, so a node
+  that went down and came back is not a member until its new connection
+  passes the check. This holds even in the moment before the manager has
+  handled the `nodedown`.
+- **Waits survive a manager restart.** Code inside Brazier that waits for a
+  node to pass the check, or to verify this node too, is recorded in a
+  table owned by the node's ETS table owner, not by the manager. A manager
+  that crashes and restarts loses none of them. The new manager drops the
+  waits of exited processes and of connections that went down while it was
+  away. Each wait is answered exactly once, and is dropped when its
+  connection goes down. Phoenix.Tracker, by contrast, loses what it
+  tracked when the tracker crashes. Brazier follows the OTP pattern of
+  keeping state with a process that does not crash.
+- **Both sides verify.** A node has verified a peer when the peer's hello
+  is accepted. The peer may not yet have verified this node, and until it
+  has it drops what this node sends. Session re-checks and replicated
+  store syncs therefore start only when both sides have verified each
+  other: this node has accepted the peer's hello, and the peer has
+  acknowledged this node's hello. A manager answers an acknowledgement
+  that verified its sender, once per verification, so two managers never
+  acknowledge each other in a loop. A new hello from a peer, such as after
+  its manager restarted, makes this node wait for a new acknowledgement.
 
 ## PubSub across nodes
 
@@ -484,8 +551,10 @@ is the one in [STATE_MANAGEMENT.md](STATE_MANAGEMENT.md#replicated-stores).
 4. A replica that starts asks every peer for its full state at once. This
    covers a node joining, a node rejoining after a crash, and a replica
    restarted by its supervisor. It also asks a node for its full state
-   when that node connects. Until the first sync arrives, a new replica
-   serves empty reads.
+   once that node and this node have verified each other (see
+   [Membership](#membership)): a request sent earlier would be dropped by
+   a peer that has not yet verified this node. Until the first sync
+   arrives, a new replica serves empty reads.
 
 Merges are idempotent and commutative, so a delta that arrives twice, late,
 or after a full state that already contained it changes nothing.
@@ -530,7 +599,8 @@ out of range, and `store.open` returns `Error(InvalidConfig(_))` for them.
 - **On every receiver**, a delta or full state larger than its limit, or
   one that would grow the replica past `max_entries`, is refused and
   logged at error level. The replica keeps its state. Its digest still
-  differs, so the next exchange retries and logs again until the
+  differs, so a later exchange retries, after a backoff (see
+  [Refused merges back off](#refused-merges-back-off)), until the
   configurations agree or the data shrinks.
 - **A malformed payload is refused before it is read.** Every field of a
   delta or full state from another member is checked first: each key and
@@ -547,13 +617,110 @@ Every node must open a store with the same configuration. A node that
 opens a name already open with another configuration, or in the other mode,
 gets `Error(InvalidConfig(_))`.
 
+### Refused merges back off
+
+A refused merge leaves the digests different, so without a delay every
+exchange would pull the same state, refuse it again, and move up to
+`max_sync_bytes` every `sync_interval_ms`. So each refusal from a peer
+delays the next state request to that peer:
+
+- After refusal `n` (counting from 0) the delay is taken at random from
+  `[D/2, D]`, where `D = min(cap, sync_interval_ms * 2^n)` and
+  `cap = max(sync_interval_ms, 60s)`. This is the same jittered window as
+  the cluster manager's reconnect backoff, so replicas that refuse the
+  same peer do not retry in lockstep.
+- Each refusal is logged at warning level with its count and the delay:
+  `refusal 3 in a row; its state is requested again in 3412ms at the
+  earliest`. Each retry is logged at info level.
+- A digest that differs while the delay runs is not acted on (debug log).
+- A merged full state from the peer, or a digest equal to this replica's,
+  ends the backoff, which is logged at info level.
+- The backoff holds at most one entry per member, and a peer's entry goes
+  when the peer disconnects. The request sent when a node and this node
+  have verified each other is not delayed: it happens once per
+  connection.
+
+### Knowing when a replica is in sync
+
+<!-- docs-check: wrap
+import brazier/store/replicated
+
+pub fn cart_synced() -> Result(Bool, String) {
+  {{block}}
+}
+-->
+```gleam
+case replicated.start(replicated.KeyValue, "cart", replicated.default_config()) {
+  Ok(#(server, _table)) ->
+    case replicated.synced(server) {
+      Ok(synced) -> Ok(synced)
+      Error(err) -> Error(replicated.describe_write_error(err))
+    }
+  Error(err) -> Error(replicated.describe_start_error(err))
+}
+```
+
+`replicated.start` returns the running replica when the store is already
+open with the same configuration. `replicated.synced` is `Ok(True)` when
+every peer replica last sent a digest equal to this replica's. Then every
+value written anywhere before those digests were sent is on this node.
+
+- **Peers** are the replicas of the store on members (see
+  [Membership](#membership)), as pg lists them. A node that has not opened
+  the store is not waited for.
+- **With no peer** it is `Ok(True)`. A single node, or a node cut off by a
+  netsplit, is in sync with itself.
+- **It turns `Ok(False)`** on a local write, a merge, or a new peer, and
+  turns back once the next digests agree, one `sync_interval_ms` later
+  when nothing else changes. A peer that has not sent a digest since it
+  joined counts as not in sync.
+- **It follows pg.** Just after a peer connects or its replica restarts,
+  pg may not list the new replica yet. Until it does, the replica does not
+  count it, and a digest from it is not counted either.
+- Changes of the in-sync state are logged at debug level.
+
+Use it to wait before serving reads that must include other nodes' writes,
+for example in a readiness check after a deploy. Like the rest of the
+store, it says nothing about writes still in flight when it was read.
+
+### Restarts and floors
+
+Every replica start is a new *incarnation* of its node, and every value it
+writes is tagged with that incarnation. Incarnations only grow on a VM:
+each one is the wall clock in microseconds, or one above the last
+incarnation of that store on this VM when the clock has not moved past it.
+
+Without more, each restart would add an entry to every replica's causal
+context that no replica could drop. So once a restarted replica is in sync
+with at least one peer, it raises its node's *floor* to its incarnation.
+The floor covers every value the node's earlier incarnations wrote, and
+their context entries are dropped everywhere. The raise is a delta with no
+values, broadcast like a write and logged at info level with the context
+size before and after. `replicated.context_size(server)` reports the
+context's size, which stays bounded however often replicas restart.
+
+The trade-off is narrow. A value of an earlier incarnation that only an
+unreachable replica held, such as one on the other side of a netsplit or
+on a node whose replica had not yet joined, or that was still in flight,
+is covered without having been seen. It is dropped wherever it later
+arrives. Its writer is gone and its delta was fire and forget, so that
+write was already at risk.
+
+**A stale incarnation restarts.** A replica that receives a floor of its
+own node above its own incarnation is outdated: a later incarnation of
+its node exists, for example because the node's clock went back across a
+full restart. Every value it wrote would be covered, so dropped,
+everywhere. It logs an error and stops, and its supervisor restarts it
+with an incarnation above that floor.
+
 ### Failures
 
 - **Netsplit.** Each side keeps accepting writes. When the nodes reconnect,
   the digest exchange pulls the missing state and both sides converge by
   the rules above.
 - **Replica crash.** The supervisor restarts the replica (at most 3
-  restarts in 5 seconds), and the new replica syncs from its peers. While
+  restarts in 5 seconds), and the new replica syncs from its peers, then
+  raises its node's floor (see [Restarts and floors](#restarts-and-floors)). While
   it restarts, reads crash the caller loudly and writes return
   `Unavailable`. If the supervisor gives up, the store stays down on that
   node until it is opened again.
@@ -579,9 +746,25 @@ gets `Error(InvalidConfig(_))`.
   `max_sync_bytes` for the smallest node.
 - A full sync sends the whole state, so a large store makes joins and
   repairs proportionally expensive. Deltas carry only the written entries.
-- The replica's causal context gains one entry for every incarnation of
-  every replica (each restart is a new one), and it is never compacted.
-  This is small, but it grows with restarts.
+- A floor drops a value of an earlier incarnation that no reachable replica
+  held when the floor was raised (see
+  [Restarts and floors](#restarts-and-floors)).
+- `replicated.synced` reflects digests and pg's view of the peers, not
+  delivery of each write (see
+  [Knowing when a replica is in sync](#knowing-when-a-replica-is-in-sync)).
+- The CRDT is ported from delta_crdt_ex's `AWLWWMap`, with these
+  differences (the `brazier/store/crdt` module doc has the detail):
+  - the causal context is exact, where delta_crdt_ex compresses it to one
+    counter per replica;
+  - values are ordered by a hybrid logical clock with a tie-break on the
+    dot, so every node reads the same value;
+  - floors bound the context across restarts, where delta_crdt_ex's grows
+    with every restart;
+  - a differing digest pulls the whole state, where delta_crdt_ex walks a
+    Merkle tree to the differing keys and keeps one sync in flight per
+    neighbour. Brazier does not track outstanding syncs: each differing
+    digest sends a new request, and the backoff above bounds repeats of a
+    refused one.
 - Replication runs between members only (see [Membership](#membership)).
   Membership does not authenticate a message's content: members trust each
   other completely (see [Security first](#security-first-what-distribution-means)).
@@ -620,9 +803,31 @@ Across the cluster:
   sends `{brazier_session_revoked, Id, Reason}` to every process bound to it
   (`bind_current_process`) on this node and on every member (see
   [Membership](#membership)).
-- **Netsplits.** A revocation cannot cross a netsplit. When a node passes
-  the peer check after it connects, every store re-checks the sessions its
-  local processes are bound to, and revokes those that are gone.
+- **Netsplits.** A revocation cannot cross a netsplit. When a connected
+  node and this node have verified each other, every store re-checks the
+  sessions its local processes are bound to, and revokes those that are
+  gone. The re-check waits for both sides: a revocation goes only to the
+  nodes its sender has verified, so a re-check after only this side had
+  passed the other could run before the other side's revocations reach
+  this node. A node is verified on both sides once its hello is accepted
+  here and it has acknowledged this node's hello. If a peer's cluster
+  manager restarts while the connection stays up, its new hello starts
+  the exchange again, and the re-check runs again.
+
+  One window remains. pg copies each node's bindings to the others on its
+  own schedule, apart from the peer check. A revocation sent after both
+  sides have verified each other, but before the sender's pg has learnt of
+  a binding on the other node, misses that binding, and no re-check
+  follows. A socket bound by `auth.protect_ws` or `auth.allow_guests_ws`
+  is still closed at its next auth re-check (`ws_auth_recheck_interval_ms`,
+  see [WebSocket sessions](SECURITY.md#websocket-sessions)).
+- **Bindings do not reveal session ids.** A bound process joins a pg group
+  in the session revocation scope, and pg shows its group names to every
+  connected node, member or not (`pg:which_groups/1`). The group is named
+  by a SHA-256 hash of the session store's namespace and the session id,
+  never the id. Each node keeps its own bindings and their ids in a local
+  table for the re-check, and drops the rows of exited processes on every
+  maintenance sweep and before each re-check.
 - **Clocks.** Lifetimes use `erlang:system_time(millisecond)` so nodes can
   compare timestamps. Clocks may differ by up to `clock_skew_tolerance_ms`
   (5,000), so a lifetime can end up to 5s early or late. A timestamp
