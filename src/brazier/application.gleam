@@ -43,6 +43,7 @@ import brazier/element.{type Element}
 import brazier/error
 import brazier/internal/context.{type Context}
 import brazier/internal/presence_watch
+import brazier/internal/stream_window
 import brazier/log
 import brazier/middleware
 import brazier/notification.{type Notification}
@@ -754,6 +755,7 @@ fn transport_config(
         Some(_) -> Some(config.encode_model)
         None -> None
       },
+      stream_limits: stream_window.default_limits(),
     )
   // Every page is rendered for its request: init reads the request's URL,
   // cookies and session through the Context.

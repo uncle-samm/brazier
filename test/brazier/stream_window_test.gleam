@@ -728,3 +728,36 @@ pub fn applied_streams_json_is_the_encoded_changes_test() {
   let assert Applied(streams_json:, changes: [Change(delta:, ..)], ..) = applied
   let assert True = streams_json == stream_window.encode_deltas([delta])
 }
+
+// --- Descriptions -----------------------------------------------------------
+
+pub fn describe_limit_uses_the_app_spelling_test() {
+  let assert "KeepLast(300)" = stream_window.describe_limit(last(300))
+  let assert "KeepFirst(1)" = stream_window.describe_limit(first(1))
+}
+
+pub fn describe_op_reason_names_the_sizes_test() {
+  let assert "the limit 2000 is outside 1 to 1000" =
+    stream_window.describe_op_reason(stream_window.LimitOutOfRange(2000, 1000))
+  let assert "the stream was first used with KeepLast(3), this op uses KeepFirst(3)" =
+    stream_window.describe_op_reason(stream_window.LimitMismatch(
+      last(3),
+      first(3),
+    ))
+  let assert "the key is empty" =
+    stream_window.describe_op_reason(stream_window.KeyEmpty)
+  let assert "the key is 300 bytes, over the limit of 256" =
+    stream_window.describe_op_reason(stream_window.KeyTooLarge(300, 256))
+  let assert "the item is 70000 bytes, over the limit of 65536" =
+    stream_window.describe_op_reason(stream_window.ItemTooLarge(70_000, 65_536))
+}
+
+pub fn describe_update_refusal_names_the_sizes_test() {
+  let assert "the update carries 1001 stream ops, over the limit of 1000" =
+    stream_window.describe_update_refusal(stream_window.TooManyOps(1001, 1000))
+  let assert "the update's stream entries are 2000000 bytes, over the frame limit of 1048576" =
+    stream_window.describe_update_refusal(stream_window.FrameTooLarge(
+      2_000_000,
+      1_048_576,
+    ))
+}

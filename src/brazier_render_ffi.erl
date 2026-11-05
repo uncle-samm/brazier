@@ -13,7 +13,7 @@
 %% that a combining mark follows.
 -module(brazier_render_ffi).
 
--export([is_markup_name/1, is_event_name/1, escape_html/1, escape_attr/1]).
+-export([is_markup_name/1, is_event_name/1, escape_html/1, escape_attr/1, identity/1]).
 
 -define(IS_ALNUM(C),
     ((C >= $a andalso C =< $z) orelse
@@ -82,3 +82,8 @@ attr(<<>>, Text, _Skip, _Len, []) ->
     Text;
 attr(<<>>, Text, Skip, Len, Acc) ->
     iolist_to_binary([Acc, binary_part(Text, Skip, Len)]).
+
+%% `Value` unchanged, typed as `Dynamic` on the Gleam side: a stream
+%% container's `item_ref`, compared and never called.
+-spec identity(term()) -> term().
+identity(Value) -> Value.

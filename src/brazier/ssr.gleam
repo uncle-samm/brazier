@@ -19,6 +19,8 @@ import brazier/internal/context
 import brazier/internal/http_status
 import brazier/internal/log_path
 import brazier/internal/render
+import brazier/internal/stream_ssr
+import brazier/internal/stream_window
 import brazier/internal/uri_check
 import brazier/log
 import brazier/session
@@ -68,6 +70,9 @@ pub type SsrConfig(state, msg) {
     /// carries the same JSON the client receives in model_sync, so it never
     /// holds more than the wire protocol does.
     recovery_encoder: Option(fn(state) -> String),
+    /// The stream bounds the runtime applies, so the dead render keeps the
+    /// same items the join will send (docs/design/STREAMS.md 7.6).
+    stream_limits: stream_window.Limits,
   )
 }
 
@@ -183,10 +188,15 @@ pub type RenderedPage {
 ///    `error.unavailable`); its reason is logged, never rendered. A crash
 ///    in `init` propagates, and the transport answers it with 500.
 /// 4. Apply the route message through `update` (effects dropped likewise).
-/// 5. Render `view` and wrap it in the HTML document with the script of the
-///    client bundle the server loaded when it started (`client_bundle`); no
-///    file is read. A bundle that could not be loaded is a 500 static error
-///    page.
+///    The stream ops of `init` and of the route message are taken out of
+///    their effects and applied, with the runtime's bounds, to windows that
+///    keep their items (docs/design/STREAMS.md 7.6).
+/// 5. Render `view`, each stream container holding its items, and wrap it
+///    in the HTML document with the script of the client bundle the server
+///    loaded when it started (`client_bundle`); no file is read. A bundle
+///    that could not be loaded is a 500 static error page. A stream item
+///    that does not decode, or does not render, crashes the dead render,
+///    which the transport answers with 500.
 pub fn render_page(
   config: SsrConfig(state, msg),
   req: Request(body),
@@ -238,16 +248,32 @@ pub fn render_page_with_bundle(
           case config.init(ctx) {
             Error(init_error) -> render_init_error(config, init_error, path)
             Ok(#(state, init_effects)) -> {
+              let #(windows, init_effects) =
+                stream_ssr.apply(
+                  stream_ssr.new(),
+                  init_effects,
+                  config.stream_limits,
+                  "init",
+                  path,
+                )
               drop_effects(init_effects, "init", path)
-              let state = case route_msg {
-                None -> state
+              let #(state, windows) = case route_msg {
+                None -> #(state, windows)
                 Some(msg) -> {
                   let #(routed, route_effects) = config.update(state, msg)
+                  let #(windows, route_effects) =
+                    stream_ssr.apply(
+                      windows,
+                      route_effects,
+                      config.stream_limits,
+                      "route update",
+                      path,
+                    )
                   drop_effects(route_effects, "route update", path)
-                  routed
+                  #(routed, windows)
                 }
               }
-              render_state(config, state, path, bundle)
+              render_state(config, state, windows, path, bundle)
             }
           }
         }
@@ -323,10 +349,18 @@ fn drop_effects(effects: Effect(msg), stage: String, path: String) -> Nil {
 fn render_state(
   config: SsrConfig(state, msg),
   state: state,
+  windows: stream_window.Windows,
   path: String,
   bundle: Result(String, String),
 ) -> RenderedPage {
-  let view_html = element.to_string(config.view(state))
+  let rendered =
+    stream_ssr.render(element.to_node(config.view(state)), windows, path)
+  // Invariant (docs/design/STREAMS.md 7.6): a stream item that does not
+  // decode or render crashes the dead render, so the transport serves the
+  // 500 page and an encoder and decoder that disagree fail on the first page
+  // load. `stream_ssr.render` has logged the reason at error.
+  let assert Ok(view_html) = rendered
+    as "brazier/ssr: a stream item does not render in the dead render"
   let model_json = case config.recovery_encoder {
     Some(encode) -> Some(encode(state))
     None -> None

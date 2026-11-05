@@ -44,10 +44,36 @@
 //// child module's ops reach its parent. `effect.keyed` and
 //// `effect.cancellable` do not key them: an op is applied when its update
 //// returns. `emitted` lists the ops an effect carries, for tests.
+////
+//// `render` puts the stream in the view: a container element whose
+//// children are the stream's items, each rendered by a named top-level
+//// function of the item (docs/design/STREAMS.md 5.3):
+////
+//// ```gleam
+//// import brazier/element.{type Element}
+//// import brazier/html
+//// import brazier/stream.{type Stream}
+////
+//// pub type Line {
+////   Line(id: String, text: String)
+//// }
+////
+//// pub fn view(log: Stream(Line)) -> Element(msg) {
+////   html.main([], [stream.render(log, "ol", [], render_line)])
+//// }
+////
+//// pub fn render_line(line: Line) -> Element(msg) {
+////   html.li([], [html.text(line.text)])
+//// }
+//// ```
 
+import brazier/attribute.{type Attribute}
 import brazier/effect.{type Effect}
+import brazier/element.{type Element}
+import brazier/internal/render
 import brazier/internal/stream_op
 import gleam/dict
+import gleam/dynamic.{type Dynamic}
 import gleam/dynamic/decode
 import gleam/json
 import gleam/list
@@ -207,6 +233,49 @@ pub fn reset(stream: Stream(item), items: List(item)) -> Effect(msg) {
       action: stream_op.Reset(unique_entries(stream, items)),
     ),
   ])
+}
+
+/// The stream's container: a `tag` element holding the stream's items, in
+/// order, each rendered by `item` with its root keyed by the stream's key
+/// (LiveView's `phx-update="stream"` container).
+///
+/// `item` must be a named top-level function, not an anonymous `fn` or a
+/// capture: an item is rendered when it is inserted or updated, never
+/// again, so it can depend on the item only. Its root must be one element,
+/// not text, `element.none()`, `unsafe_raw_html` or `element.keyed`. A view
+/// renders a stream at most once and never inside another stream's item;
+/// a second render of the same stream crashes the render. The build checks
+/// the rest (docs/design/STREAMS.md 5.3).
+///
+/// ```gleam
+/// stream.render(log(), "ol", [attribute.class("log")], render_line)
+/// ```
+pub fn render(
+  stream: Stream(item),
+  tag: String,
+  attributes: List(Attribute(msg)),
+  item: fn(item) -> Element(msg),
+) -> Element(msg) {
+  let assert True = render.is_valid_tag_name(tag)
+    as "brazier/stream.render: tag names are a-z A-Z 0-9 - _ : ."
+  let decoder = stream.decoder
+  element.from_node(render.Stream(
+    name: stream.name,
+    limit: to_op_limit(stream.limit),
+    tag: tag,
+    attributes: list.map(attributes, attribute.to_attr),
+    item: fn(value: Dynamic) {
+      case decode.run(value, decoder) {
+        Ok(decoded) -> Ok(element.to_node(item(decoded)))
+        Error(errors) ->
+          Error(
+            "the stream's decoder refused the item: "
+            <> string.join(list.map(errors, describe_decode_error), "; "),
+          )
+      }
+    },
+    item_ref: render.item_ref(item),
+  ))
 }
 
 /// The stream ops an effect carries, in the order they are applied: an

@@ -370,6 +370,59 @@ pub fn update_refusal_name(refusal: UpdateRefusal) -> String {
   }
 }
 
+/// A limit as the app wrote it: `KeepFirst(300)` or `KeepLast(300)`.
+pub fn describe_limit(limit: Limit) -> String {
+  case limit.keep {
+    First -> "KeepFirst("
+    Last -> "KeepLast("
+  }
+  <> int.to_string(limit.count)
+  <> ")"
+}
+
+/// Why an op was refused, for log lines and `error` frames.
+pub fn describe_op_reason(reason: OpReason) -> String {
+  case reason {
+    LimitOutOfRange(count, max) ->
+      "the limit "
+      <> int.to_string(count)
+      <> " is outside 1 to "
+      <> int.to_string(max)
+    LimitMismatch(window, op) ->
+      "the stream was first used with "
+      <> describe_limit(window)
+      <> ", this op uses "
+      <> describe_limit(op)
+    KeyEmpty -> "the key is empty"
+    KeyTooLarge(bytes, max) ->
+      "the key is "
+      <> int.to_string(bytes)
+      <> " bytes, over the limit of "
+      <> int.to_string(max)
+    ItemTooLarge(bytes, max) ->
+      "the item is "
+      <> int.to_string(bytes)
+      <> " bytes, over the limit of "
+      <> int.to_string(max)
+  }
+}
+
+/// Why a whole update was refused, for log lines and `error` frames.
+pub fn describe_update_refusal(refusal: UpdateRefusal) -> String {
+  case refusal {
+    TooManyOps(count, max) ->
+      "the update carries "
+      <> int.to_string(count)
+      <> " stream ops, over the limit of "
+      <> int.to_string(max)
+    FrameTooLarge(bytes, max) ->
+      "the update's stream entries are "
+      <> int.to_string(bytes)
+      <> " bytes, over the frame limit of "
+      <> int.to_string(max)
+  }
+}
+
 /// How many ops an update counts against `ops_max_per_update`: one per
 /// `Insert` and `Delete`, one per item of a `Reset` and at least one.
 pub fn op_count(ops: List(Op)) -> Int {

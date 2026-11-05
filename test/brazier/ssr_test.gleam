@@ -5,6 +5,7 @@ import brazier/element
 import brazier/error
 import brazier/html
 import brazier/internal/context.{type Context}
+import brazier/internal/stream_window
 import brazier/log_capture
 import brazier/monitored
 import brazier/session
@@ -59,6 +60,7 @@ fn test_config() -> ssr.SsrConfig(TestModel, TestMsg) {
     head_html: option.None,
     dev_mode: False,
     recovery_encoder: option.None,
+    stream_limits: stream_window.default_limits(),
   )
 }
 

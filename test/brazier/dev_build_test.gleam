@@ -8,6 +8,7 @@ import brazier/cluster/peer.{Timeout}
 import brazier/effect
 import brazier/error
 import brazier/html
+import brazier/internal/stream_window
 import brazier/log_capture
 import brazier/pubsub
 import brazier/raw_ws.{type RawSocket}
@@ -161,6 +162,7 @@ fn ssr_config() -> ssr.SsrConfig(Model, Nil) {
     head_html: None,
     dev_mode: True,
     recovery_encoder: None,
+    stream_limits: stream_window.default_limits(),
   )
 }
 
