@@ -738,7 +738,15 @@
 - [ ] m118-transport: `transport*`, `ssr`, `error.gleam`, `brazier_client/src` except `patch.mjs`, `test_all_cdp.py`. Join build-id warning once per connection; manifest read once in production; 4409 split from the init-409 close; dev reload not missed while reconnecting; `read_body` error type; outbound-pending hook counts debounced sends; server side of `rejected_middleware` (4000 + status); scroll to `#fragment` after live navigation.
 - [ ] m118-diff-shift: `brazier_patch_ffi.erl`, `brazier_client/src/brazier_client/patch.mjs` and their tests (the shift item below).
 - [ ] m118-tests: existing tests and test FFI outside the files above. Redirected 2026-11-05: its four original items were done in M117 by w5-test-hygiene (L574–589; the follow-up lines at L553–556 were stale). It takes w5-test-hygiene's leftovers instead: the 2 polls in `store_replica_validation_test`, `await_restart` spinning on `yield`, and a mailbox-residue check (child_module, router and presence_test only, for now).
-- [ ] Streams design (`docs/design/STREAMS.md`), posted to Modorra before the build.
+- [x] Streams design (`docs/design/STREAMS.md`, c61fea0, merged 2026-11-05), posted to Modorra (R1, questions Q1–Q6 open). The coordinator decided D1–D7 (below).
+- [ ] m118-streams-core (started 2026-11-05; new files only): design steps 1–2 without the effect and runtime wiring. These are `brazier/internal/stream_op`, the window and its delta, the shared vectors, and `brazier/stream` (declaration, op values, test helpers).
+- Decision, 2026-11-05, streams D1: the item codec is explicit `encode`/`decoder` on `stream.new`, as `presence.new` has it. A generated codec would need items erased to `Dynamic` and a name-keyed encoder table, which is more machinery for no gain to the first user.
+- Decision, 2026-11-05, streams D2: item render functions must be named, and the build refuses closures and captures. Items then never depend on the model, and a model change re-renders no item (LiveView's rule too).
+- Decision, 2026-11-05, streams D3: a stream fault on the client closes with 4000 `stream fault` and reconnects; init refills the stream. The reconnect backoff bounds a loop from an app codec bug, and telemetry and a client error log make it visible. The alternative, a stream left wrong until the next reconnect, is the silent degradation the rules forbid.
+- Decision, 2026-11-05, streams D4: the bounds are `SecurityLimits` fields with the proposed defaults: `stream_max_limit` 1000, `stream_item_max_bytes` 64 KB, `stream_ops_max_per_update` 1000, `stream_frame_max_bytes` 1 MB, `stream_key_max_bytes` 256. Every other per-session bound is a `SecurityLimits` field and documented in SECURITY.md, so these are too.
+- Decision, 2026-11-05, streams D5: `streams` is required on every `patch` and `model_sync`, as `ack_clock` is. 14 bytes buy one frame shape and no optional-field branch in either codec.
+- Decision, 2026-11-05, streams D6: the server keeps each stream's keys and computes the trims; the client checks the limit and treats going over as a stream fault. The server then knows exactly what the client holds, and both sides are bounded. This differs from LiveView on purpose.
+- Decision, 2026-11-05, streams D7: the server does not decode items again. The dead render and `stream.round_trip` in tests catch a codec mismatch, and a second decode would double the per-op codec cost.
 - [x] Follow-up audit (read-only), done 2026-11-05: 30 M117 follow-ups are still open; they are listed below. The rest were fixed in later workstreams or are recorded decisions.
 - [ ] m118-cluster (started 2026-11-05; owns `brazier_session_ffi.erl`, `session.gleam`, `brazier_cluster_manager.erl`, `brazier_cluster_ffi.erl`, `cluster.gleam`, the replicated store and CRDT, and `CLUSTERING.md`): L409–412, L515–516, L716–719 below.
 - [ ] m118-build (started 2026-11-05; owns `src/brazier/build/**`): L267 below.
@@ -770,7 +778,7 @@
 - [ ] LiveView-style streams (Modorra R1, answered 2026-11-04), following `stream`, `stream_insert`, `stream_delete` and `limit`:
   - keyed items sent as ops (insert, update, delete, reset), not kept in the synced model;
   - inserting an existing key updates it in place (Modorra's chunked turn output, keyed `agent_id:seq`);
-  - `limit` trims on the client; ops are bounded server-side, and an op over the frame limit fails loudly;
+  - `limit` trims are computed by the server and sent as deletes (decision D6); ops are bounded server-side, and an op over the frame limit fails loudly;
   - after a reconnect the stream starts empty, and the app's init refills it (Modorra refetches from its last seq over HTTP, so there is no replay buffer);
   - it is a wire addition, so it needs a CHANGELOG **Wire break:** entry;
   - write a design in `docs/design/` and post it to Modorra before building.
