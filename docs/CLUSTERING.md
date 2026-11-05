@@ -1208,6 +1208,19 @@ pub fn join_room(user_id: String) {
 - `track`, `update`, `untrack` and `untrack_all` act on the calling
   process. The tracker monitors it and removes its entries when it exits.
 - `list` and `get_by_key` read an ETS table and never wait on the tracker.
+  The table holds every meta already decoded, as Phoenix.Tracker keeps
+  meta terms: `track` and `update` decode the meta they check, and a
+  shard decodes a peer's meta once, when the entry arrives. A list does
+  no decoding, so its cost per entry stays flat as the room grows.
+- Build every handle from the config the tracker was started with. A
+  handle whose decoder is another function gets `MetaDecodeFailed` from
+  `list`, `get_by_key`, `track`, `update` and `decode_diff`, and nothing
+  it sends is stored, as the shard's values would not be of its type.
+  The check compares the decoder value, so a hot reload in development
+  that changes the module building the decoder makes the handles built
+  after it differ from the running tracker's until the tracker restarts.
+  Handles held from before the reload, such as the one
+  `brazier.presence` keeps, still match.
 - `presence.start(config)` runs a tracker without a supervisor, and
   `presence.stop` stops it. With `supervised`, get the handle from
   `presence.handle(config)`; until the tracker runs, calls return
@@ -1273,6 +1286,10 @@ Further constraints:
   the PubSub limit minus the diff topic prefix.
 - A meta that your decoder cannot read back is refused with
   `MetaDecodeFailed`.
+- A peer's meta that this node's decoder cannot read, or crashes on, is
+  logged when it arrives and kept as undecodable. Every read and diff
+  that would return it fails with `MetaDecodeFailed`; `get_by_key` of
+  the other keys still works, and the shard keeps running.
 
 ### Failures
 
