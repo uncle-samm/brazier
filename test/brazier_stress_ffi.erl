@@ -4,7 +4,7 @@
 %% the join must be answered, every event must be acknowledged by a patch
 %% carrying its clock, and the close handshake must echo 1000. Nothing
 %% sleeps: each step waits for the server's answer, bounded by a deadline.
--export([connect_and_join/4, connect_and_join/5, timed_events/4, close_handshake/2,
+-export([connect_and_join/5, fetch_page/3, timed_events/4, close_handshake/2,
          monotonic_us/0]).
 
 monotonic_us() ->
@@ -14,15 +14,10 @@ monotonic_us() ->
 %% {ok, {Conn, Acknowledged}} | {error, Reason}. Conn is opaque to Gleam and
 %% must be closed by the process that opened it (close_handshake/2).
 %%
-%% The join carries no build id: brazier/stress may drive a server in
-%% another VM, whose client bundle it cannot know, so the server warns once
-%% per connection that it cannot check the page's build.
-connect_and_join(Host, Port, Events, TimeoutMs) ->
-    connect_and_join(Host, Port, Events, none, TimeoutMs).
-
-%% As connect_and_join/4, but the join carries Build (`{some, Hash}`, the
-%% hash of the `brazier_client_<hash>.js` the server serves, as a page that
-%% loaded that script sends it) or none.
+%% The join carries Build: `{some, Hash}`, the hash of the
+%% `brazier_client_<hash>.js` the server serves, as a page that loaded that
+%% script sends it, or none, as a page that did not (the server then warns
+%% once per connection that it cannot check the page's build).
 connect_and_join(Host, Port, Events, Build, TimeoutMs) ->
     Deadline = erlang:monotonic_time(millisecond) + TimeoutMs,
     HostBin = ensure_binary(Host),
@@ -153,6 +148,75 @@ await_close(Socket, Buffer, Deadline) ->
         %% Frames already in flight before the server read the close.
         {ok, _Opcode, _Payload, Rest} -> await_close(Socket, Rest, Deadline);
         {error, Reason} -> {error, <<"close reply: ", Reason/binary>>}
+    end.
+
+%% GET / with `Connection: close`, as a browser loads the page whose script
+%% names the client bundle. {ok, {StatusLine, Body}} | {error, Reason}. The
+%% body is read to its Content-Length; an answer without one is refused by
+%% name (the listener sends one with every page).
+fetch_page(Host, Port, TimeoutMs) ->
+    Deadline = erlang:monotonic_time(millisecond) + TimeoutMs,
+    HostBin = ensure_binary(Host),
+    case gen_tcp:connect(binary_to_list(HostBin), Port,
+                         [binary, {active, false}, {packet, raw}], TimeoutMs) of
+        {ok, Socket} ->
+            Request = iolist_to_binary([
+                <<"GET / HTTP/1.1\r\n">>,
+                <<"Host: ">>, HostBin, <<"\r\n">>,
+                <<"Accept: text/html\r\n">>,
+                <<"Connection: close\r\n">>,
+                <<"\r\n">>
+            ]),
+            Result = case gen_tcp:send(Socket, Request) of
+                ok -> page_answer(Socket, Deadline);
+                {error, Reason} -> {error, <<"send: ", (format_reason(Reason))/binary>>}
+            end,
+            ok = gen_tcp:close(Socket),
+            Result;
+        {error, Reason} ->
+            {error, <<"connect: ", (format_reason(Reason))/binary>>}
+    end.
+
+page_answer(Socket, Deadline) ->
+    case recv_head(Socket, <<>>, Deadline) of
+        {ok, Head, Rest} ->
+            [StatusLine | Headers] = binary:split(Head, <<"\r\n">>, [global]),
+            case content_length(Headers) of
+                {ok, Length} ->
+                    case recv_body(Socket, Rest, Length, Deadline) of
+                        {ok, Body} -> {ok, {StatusLine, Body}};
+                        {error, Reason} -> {error, <<"body: ", Reason/binary>>}
+                    end;
+                {error, Reason} ->
+                    {error, <<StatusLine/binary, ": ", Reason/binary>>}
+            end;
+        {error, Reason} ->
+            {error, <<"head: ", Reason/binary>>}
+    end.
+
+content_length(Headers) ->
+    Lengths = [Value || Header <- Headers,
+                        [Name, Value] <- [binary:split(Header, <<":">>)],
+                        brazier_render_ffi:ascii_lowercase(Name) =:= <<"content-length">>],
+    case Lengths of
+        [Value] ->
+            case string:to_integer(string:trim(Value)) of
+                {Length, <<>>} when is_integer(Length), Length >= 0 -> {ok, Length};
+                _ -> {error, <<"invalid Content-Length ", Value/binary>>}
+            end;
+        [] -> {error, <<"no Content-Length">>};
+        _ -> {error, <<"more than one Content-Length">>}
+    end.
+
+recv_body(_Socket, Have, Length, _Deadline) when byte_size(Have) >= Length ->
+    case Have of
+        <<Body:Length/binary>> -> {ok, Body};
+        _ -> {error, <<"more bytes than its Content-Length">>}
+    end;
+recv_body(Socket, Have, Length, Deadline) ->
+    case recv_more(Socket, Deadline) of
+        {ok, Data} -> recv_body(Socket, <<Have/binary, Data/binary>>, Length, Deadline);
+        {error, _} = E -> E
     end.
 
 upgrade(Socket, Host, Deadline) ->

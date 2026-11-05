@@ -224,9 +224,14 @@
     It now joins with the hash of the bundle the listener loaded
     (`ssr.client_bundle`), as a page rendered by that server does, so the
     server checks the build on each join and logs nothing. The bench fails
-    by name if no bundle is loaded. `brazier/stress` still joins without a
-    build: it may drive a server in another VM, whose bundle it cannot
-    know.
+    by name if no bundle is loaded. `brazier/stress` joins the same way
+    (`StressConfig.build`): `stress.page_build` takes the bundle a listener
+    in its own VM loaded and fails by name if none is, and the CLI, which
+    drives a server in another VM, reads the bundle from the `<script>` of
+    the page that server serves at `/` (`stress.served_build`), as a
+    browser does. `test/brazier/stress_test.gleam` asserts that a run logs
+    no join without a build and that a join from another build is closed
+    with 4499.
 
 - **Issue:** the client manifest had two readers (`ssr` for the page and
   `transport.check_join_build` for the join), and the join read it from
