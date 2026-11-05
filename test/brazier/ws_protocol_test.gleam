@@ -534,23 +534,28 @@ pub fn state_frames_embed_model_and_ops_raw_on_the_socket_test() {
   let assert True = string.byte_size(model_json) > 65_535
   process.send(
     probe.runtime,
-    transport.SendModelSync(model_json:, version: 4, ack_clock: 3),
+    transport.SendModelSync(
+      model_json:,
+      version: 4,
+      ack_clock: 3,
+      streams_json: "[]",
+    ),
   )
   let assert True =
     recv_text(probe.socket)
     == "{\"type\":\"model_sync\",\"model\":"
     <> model_json
-    <> ",\"version\":4,\"ack_clock\":3}"
+    <> ",\"version\":4,\"ack_clock\":3,\"streams\":[]}"
   let ops_json = "[{\"op\":\"replace\",\"path\":\"/rows/0\",\"value\":\"x\"}]"
   process.send(
     probe.runtime,
-    transport.SendPatch(ops_json:, version: 5, ack_clock: 3),
+    transport.SendPatch(ops_json:, version: 5, ack_clock: 3, streams_json: "[]"),
   )
   let assert True =
     recv_text(probe.socket)
     == "{\"type\":\"patch\",\"ops\":"
     <> ops_json
-    <> ",\"version\":5,\"ack_clock\":3}"
+    <> ",\"version\":5,\"ack_clock\":3,\"streams\":[]}"
   raw_close(probe.socket)
 }
 
@@ -975,7 +980,10 @@ pub fn slow_reader_is_closed_by_send_timeout_test() {
   // buffers, so a send blocks and the send timeout fires.
   let big = string.repeat("x", 65_536)
   list.each(list.repeat(Nil, 1000), fn(_) {
-    process.send(runtime, transport.SendModelSync(big, 1, 0))
+    process.send(
+      runtime,
+      transport.SendModelSync(big, 1, 0, streams_json: "[]"),
+    )
   })
   let assert True = await_closed(server.observer, conn_id)
   await.expect_down(handler, "slow reader's WebSocket handler")

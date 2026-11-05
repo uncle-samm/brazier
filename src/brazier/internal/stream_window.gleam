@@ -52,10 +52,10 @@ import gleam/list
 import gleam/set.{type Set}
 import gleam/string
 
-/// The stream bounds (decision D4). They will be `SecurityLimits` fields
-/// (`stream_max_limit`, `stream_item_max_bytes`,
-/// `stream_ops_max_per_update`, `stream_frame_max_bytes`,
-/// `stream_key_max_bytes`); until then the caller passes them.
+/// The stream bounds (decision D4): the `SecurityLimits` fields
+/// `stream_max_limit`, `stream_item_max_bytes`,
+/// `stream_ops_max_per_update`, `stream_frame_max_bytes` and
+/// `stream_key_max_bytes`, as `transport.stream_limits` reads them.
 pub type Limits {
   Limits(
     /// The largest limit a stream may have.
@@ -224,6 +224,23 @@ pub fn limit(windows: Windows, name: String) -> Result(Limit, Nil) {
     Ok(window) -> Ok(window.limit)
     Error(Nil) -> Error(Nil)
   }
+}
+
+/// The number of keys in every window together.
+pub fn key_count(windows: Windows) -> Int {
+  dict.fold(windows.streams, 0, fn(total, _, window) { total + window.size })
+}
+
+/// The same streams with every window empty and no items kept: what a
+/// client that was sent nothing holds. Each stream keeps the limit it was
+/// first used with (design 7.5). The runtime uses it when the first
+/// join's stream entries could not be sent (design 7.4).
+pub fn emptied(windows: Windows) -> Windows {
+  let streams =
+    dict.map_values(windows.streams, fn(_, window) {
+      Window(..window, keys: [], size: 0, members: set.new(), items: NoItems)
+    })
+  Windows(streams: streams, keep_items: False)
 }
 
 /// Apply one update's ops, in order. `Error` when the update is over a

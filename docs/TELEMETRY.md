@@ -147,7 +147,9 @@ measurements: `system_time` and `monotonic_time` on start, `duration` and
 | `[brazier, ws, backpressure]` | `queue_len` | `reason`, `connection_id` | yes, `brazier/transport` |
 | `[brazier, ws, navigation_refused]` | `count` | `kind`, `status`, `connection_id` | yes, `brazier/transport` |
 | `[brazier, runtime, mount \| handle_event \| navigate]` S | none | `route`, `event`, `connection_id` | yes, `brazier/runtime` |
-| `[brazier, runtime, render]` S | `patch_bytes` (stop) | `route`, `event`, `connection_id` | yes, `brazier/runtime` |
+| `[brazier, runtime, render]` S | `patch_bytes`, `stream_bytes` (stop) | `route`, `event`, `connection_id` | yes, `brazier/runtime` |
+| `[brazier, stream, delta]` | `inserts`, `updates`, `deletes`, `trimmed`, `bytes` | `stream`, `reset`, `connection_id` | yes, `brazier/runtime` |
+| `[brazier, stream, refused]` | `count`, `bytes` | `stream`, `reason` | yes, `brazier/runtime` |
 | `[brazier, runtime, stop]` | `uptime` | `reason`; `kind`, `error` (crash, exit) | yes, `brazier/runtime` |
 | `[brazier, effect, run]` S | none | `effect`: `sync`, `keyed` or `background` | yes, `brazier/effect` |
 | `[brazier, effect, timer, rejected]` | none | `limit` | yes, `brazier/effect` |
@@ -247,7 +249,28 @@ Notes on individual events:
   connections; with none joined it is not emitted. `event` is the message
   that caused it, or `batch` for an event batch. `patch_bytes` is the size
   of the patch sent, the model's size for a full resync, and 0 when the
-  model did not change.
+  model did not change. `stream_bytes` is the size of the largest
+  `streams` array the broadcast sent to one connection, 0 when it sent no
+  stream entry.
+- `[brazier, stream, delta]` is emitted once per stream entry sent, per
+  connection (a join's entries included), in the runtime's process.
+  `inserts` counts the keys new to that connection's window or moved,
+  `updates` the keys updated in place, `deletes` the keys of the entry's
+  `deletes` array, `trimmed` the ones of them the limit removed (so a
+  trimmed key is in both), and `bytes` is the size of the encoded entry.
+  An item inserted and trimmed or deleted within one update is never sent
+  and not counted. `reset` is whether the entry empties the stream first.
+- `[brazier, stream, refused]` is emitted for the stream ops of one update
+  the runtime refused, once per stream and reason, with the refused ops'
+  `count`. `reason` is `unknown_stream` (a name the build did not
+  declare), `limit_mismatch` (another limit than the stream's first one),
+  `limit_out_of_range`, `key_empty`, `key_too_large`, `item_too_large`, or,
+  for a whole update, `too_many_ops` or `frame_too_large`. `bytes` is what
+  the reason measured: the refused items' size for `item_too_large`, the
+  keys' size for `key_too_large`, the entries' size for `frame_too_large`,
+  and 0 otherwise. The bounds are `SecurityLimits` fields (see
+  [SECURITY.md](SECURITY.md#stream-bounds)). Neither stream event carries
+  a key or an item: a key can identify a user (see Privacy).
 - `[brazier, runtime, stop]` is emitted by every runtime stop that runs
   code, with `uptime` in native time units. `reason` is `shutdown` for a
   `Shutdown`; `crash` for a crash in the runtime's message handler (the

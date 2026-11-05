@@ -177,30 +177,79 @@ error and ignores it.
 answer to `request_sync`, and whenever the server must replace the client's
 cached model JSON. `version` is the current revision (see Versioning).
 `model` is the client-visible model as a JSON value, embedded in the frame as
-it is (not a JSON string holding it).
+it is (not a JSON string holding it). `streams` is required (see
+**Streams** below).
 ```json
-{"type": "model_sync", "model": {"count": 1}, "version": 1, "ack_clock": 1}
+{"type": "model_sync", "model": {"count": 1}, "version": 1, "ack_clock": 1, "streams": []}
 ```
 
 **patch** -- Incremental server-computed RFC 6902 JSON Patch ops against the
 client-visible model JSON. `version` is the revision the patch produces.
-`ops` is the array of ops, embedded in the frame as it is.
+`ops` is the array of ops, embedded in the frame as it is. `streams` is
+required (see **Streams** below).
 ```json
-{"type": "patch", "ops": [{"op": "replace", "path": "/count", "value": 2}], "version": 2, "ack_clock": 2}
+{"type": "patch", "ops": [{"op": "replace", "path": "/count", "value": 2}], "version": 2, "ack_clock": 2, "streams": []}
 ```
 A patch with `"ops": []` is an **ack**: the server processed the
 connection's events and navigations up to `ack_clock` without changing the
 client-visible model. Its `version` is the current revision, not a new one.
 ```json
-{"type": "patch", "ops": [], "version": 2, "ack_clock": 3}
+{"type": "patch", "ops": [], "version": 2, "ack_clock": 3, "streams": []}
 ```
-The server writes `model` and `ops` into the frame without decoding or
-re-encoding them, as Phoenix's V2 serializer embeds a reply's payload, and a
-client parses each frame once. That is safe because the runtime builds both
-from its own encoder output: the model JSON is checked to be valid JSON
-before it is cached or sent, and the ops come from diffing two decoded
-models. Before this change both fields were JSON strings, which made the
-server escape every quote in the model and the client parse it twice.
+
+**Streams** -- Every `patch` and `model_sync` carries a required `streams`
+array, last in the frame: one entry per stream (`brazier/stream`, as
+LiveView's `stream/4`) whose items the frame changes for this connection,
+`[]` when it changes none. A frame without `streams`, or with one that is
+not an array, is a protocol error, never "no change". Each entry:
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `name` | string | The stream's declared name |
+| `keep` | `"first"` or `"last"` | The end the limit keeps |
+| `limit` | integer, 1 to 1000 | The limit |
+| `reset` | boolean | Empty the stream before the deletes and inserts |
+| `deletes` | array of keys | Keys to remove, those the limit trims included |
+| `inserts` | array of `{key, at, item}` | `at` is the item's index in the stream after this entry, in ascending order; `item` is the stream's encoded item, embedded as JSON |
+
+Stream ops ride the frame of the update that made them. When the model
+changed, that is the update's patch:
+```json
+{"type": "patch", "ops": [{"op": "replace", "path": "/count", "value": 3}], "version": 3, "ack_clock": 4,
+ "streams": [{"name": "log", "keep": "last", "limit": 3, "reset": false,
+              "deletes": ["a"],
+              "inserts": [{"key": "d", "at": 2, "item": {"id": "d", "text": "added"}}]}]}
+```
+When it did not, the entries go on an ack-shaped patch (`"ops": []` at the
+current revision, with that connection's own `ack_clock`) to every joined
+connection, not only the one whose event caused them. The items `init`
+filled before the first join arrive on that join's `model_sync` as
+`reset: true` entries; a later connection, a rejoin and a `model_sync`
+answering `request_sync` carry `"streams": []` (the server keeps keys,
+not items, once a connection joined, so it never sends items again). Each
+connection's entries are computed against what that connection was sent,
+so two connections can get different `at` indices for one insert.
+
+The server checks every entry before it sends it: a refused stream op (an
+undeclared stream, a limit, key or item over the `SecurityLimits` stream
+bounds, see [SECURITY.md](SECURITY.md#stream-bounds)) is not sent, and the
+joined connections get an `error` frame for it instead, before the frame
+of its update:
+```json
+{"type": "error", "reason": "Stream log: refused 1 op(s): the item is 70013 bytes, over the limit of 65536"}
+```
+The browser client's rules for applying an entry, and the `stream fault`
+close when one cannot be applied, are in
+[design/STREAMS.md](design/STREAMS.md#62-client-rules).
+The server writes `model`, `ops` and each stream `item` into the frame
+without decoding or re-encoding them, as Phoenix's V2 serializer embeds a
+reply's payload, and a client parses each frame once. That is safe because
+the runtime builds all three from its own encoder output: the model JSON is
+checked to be valid JSON before it is cached or sent, the ops come from
+diffing two decoded models, and each item is the stream's `encode` output
+through `gleam/json`. Before this change `model` and `ops` were JSON
+strings, which made the server escape every quote in the model and the
+client parse it twice.
 
 **heartbeat_ack** -- Acknowledges heartbeat.
 ```json

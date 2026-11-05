@@ -117,6 +117,7 @@ fn counter_config() -> runtime.RuntimeConfig(CounterModel, CounterMsg) {
     secret_key: "",
     presence: option.None,
     title: option.None,
+    streams: runtime.no_streams(),
   )
 }
 
@@ -195,6 +196,7 @@ fn route_config() -> runtime.RuntimeConfig(RouteModel, RouteMsg) {
     secret_key: "",
     presence: option.None,
     title: option.None,
+    streams: runtime.no_streams(),
   )
 }
 
@@ -229,6 +231,7 @@ pub fn start_applies_initial_route_before_first_sync_test() {
     model_json: "{\"page\":\"user7\",\"visits\":\"user7\",\"tab\":\"posts\"}",
     version: 0,
     ack_clock: 0,
+    streams_json: "[]",
   ) = first
 }
 
@@ -316,6 +319,7 @@ pub fn start_with_unknown_route_keeps_init_state_test() {
         model_json: "{\"page\":\"none\",\"visits\":\"\",\"tab\":\"\"}",
         version: 0,
         ack_clock: 0,
+        streams_json: "[]",
       ),
     )
 }
@@ -339,8 +343,12 @@ pub fn navigation_runs_on_change_for_known_route_test() {
     subject,
     runtime.ClientNavigated(conn_id: "r_nav", path: "/settings?tab=a", clock: 0),
   )
-  let assert Ok(transport.SendPatch(ops_json: ops, version: 1, ack_clock: 0)) =
-    process.receive(transport_subject, await.deadline_ms)
+  let assert Ok(transport.SendPatch(
+    ops_json: ops,
+    version: 1,
+    ack_clock: 0,
+    streams_json: "[]",
+  )) = process.receive(transport_subject, await.deadline_ms)
   let assert True = string.contains(ops, "settings")
   let assert True = string.contains(ops, "home,settings")
 }
@@ -778,7 +786,12 @@ pub fn runtime_handles_unknown_event_test() {
   let assert True =
     list.contains(
       msgs,
-      transport.SendPatch(ops_json: "[]", version: 0, ack_clock: 1),
+      transport.SendPatch(
+        ops_json: "[]",
+        version: 0,
+        ack_clock: 1,
+        streams_json: "[]",
+      ),
     )
 }
 
@@ -805,6 +818,7 @@ pub fn runtime_effect_dispatches_message_test() {
       secret_key: "",
       presence: option.None,
       title: option.None,
+      streams: runtime.no_streams(),
     )
 
   let assert Ok(subject) = runtime.start(config, test_context())
@@ -855,6 +869,7 @@ pub fn live_update_does_not_render_server_view_test() {
       secret_key: "",
       presence: option.None,
       title: option.None,
+      streams: runtime.no_streams(),
     )
   let assert Ok(subject) = runtime.start(config, test_context())
   let transport_subject = process.new_subject()
@@ -1278,8 +1293,12 @@ pub fn state_recovery_from_token_test() {
     )
   // The model sync carries the recovered state (3), not the init state (0).
   let #(_, first) = join_and_receive(subject, "recovery_conn", token)
-  let assert transport.SendModelSync(model_json: "3", version: 0, ack_clock: 0) =
-    first
+  let assert transport.SendModelSync(
+    model_json: "3",
+    version: 0,
+    ack_clock: 0,
+    streams_json: "[]",
+  ) = first
 }
 
 /// SEC-17: at join, `restore` gets the state `init` built, so server-only
@@ -1356,6 +1375,7 @@ pub fn model_sync_sent_after_event_test() {
       secret_key: "",
       presence: option.None,
       title: option.None,
+      streams: runtime.no_streams(),
     )
   let assert Ok(subject) = runtime.start(config, test_context())
   let transport_subject = process.new_subject()
@@ -1813,7 +1833,12 @@ pub fn patch_content_correct_after_many_increments_test() {
   let msgs = await.settle(subject, transport_subject)
   let expected =
     list.map(clocks, fn(i) {
-      transport.SendPatch(ops_json: count_patch(i), version: i, ack_clock: i)
+      transport.SendPatch(
+        ops_json: count_patch(i),
+        version: i,
+        ack_clock: i,
+        streams_json: "[]",
+      )
     })
   let assert True = msgs == expected
   list.each(msgs, fn(m) {
@@ -1869,6 +1894,7 @@ pub fn server_state_not_in_model_sync_test() {
       secret_key: "",
       presence: option.None,
       title: option.None,
+      streams: runtime.no_streams(),
     )
   let assert Ok(subject) = runtime.start(config, test_context())
   let transport_subject = process.new_subject()
@@ -1934,6 +1960,7 @@ pub fn server_state_background_effect_pushes_update_test() {
       secret_key: "",
       presence: option.None,
       title: option.None,
+      streams: runtime.no_streams(),
     )
   let assert Ok(subject) = runtime.start(config, test_context())
   let transport_subject = process.new_subject()
@@ -2010,6 +2037,7 @@ pub fn server_state_user_event_pushes_update_test() {
       secret_key: "",
       presence: option.None,
       title: option.None,
+      streams: runtime.no_streams(),
     )
   let assert Ok(subject) = runtime.start(config, test_context())
   let transport_subject = process.new_subject()
@@ -2119,8 +2147,18 @@ pub fn runtime_handles_malformed_event_data_test() {
   // The decoder ignores event data, so both events increment; the runtime
   // itself must not choke on the garbage payload.
   let assert [
-    transport.SendPatch(ops_json: first, version: 1, ack_clock: 1),
-    transport.SendPatch(ops_json: second, version: 2, ack_clock: 2),
+    transport.SendPatch(
+      ops_json: first,
+      version: 1,
+      ack_clock: 1,
+      streams_json: "[]",
+    ),
+    transport.SendPatch(
+      ops_json: second,
+      version: 2,
+      ack_clock: 2,
+      streams_json: "[]",
+    ),
   ] = await.settle(subject, transport_subject)
   let assert True = first == count_patch(1)
   let assert True = second == count_patch(2)
@@ -2163,7 +2201,12 @@ pub fn runtime_handles_rapid_events_test() {
   let msgs = await.settle(subject, transport_subject)
   let expected =
     list.map(clocks, fn(i) {
-      transport.SendPatch(ops_json: count_patch(i), version: i, ack_clock: i)
+      transport.SendPatch(
+        ops_json: count_patch(i),
+        version: i,
+        ack_clock: i,
+        streams_json: "[]",
+      )
     })
   let assert True = msgs == expected
 }
@@ -2291,6 +2334,7 @@ pub fn on_update_effect_is_invoked_test() {
       secret_key: "",
       presence: option.None,
       title: option.None,
+      streams: runtime.no_streams(),
     )
   let assert Ok(subject) = runtime.start(config, test_context())
   let transport_subject = process.new_subject()

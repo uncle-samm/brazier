@@ -244,6 +244,7 @@ fn nav_config() -> runtime.RuntimeConfig(Model, Msg) {
     secret_key: "",
     presence: option.None,
     title: option.None,
+    streams: runtime.no_streams(),
   )
 }
 
@@ -395,8 +396,12 @@ fn receive_navigation(
 fn expect_ack(
   transport_subject: process.Subject(transport.InternalMessage),
 ) -> Nil {
-  let assert Ok(transport.SendPatch(ops_json: "[]", version: 0, ack_clock: 1)) =
-    process.receive(transport_subject, 1000)
+  let assert Ok(transport.SendPatch(
+    ops_json: "[]",
+    version: 0,
+    ack_clock: 1,
+    streams_json: "[]",
+  )) = process.receive(transport_subject, 1000)
   Nil
 }
 

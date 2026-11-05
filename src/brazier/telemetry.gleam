@@ -141,6 +141,8 @@ pub fn catalogue() -> List(List(String)) {
     ["ws", "backpressure"],
     ["ws", "navigation_refused"],
     ["runtime", "stop"],
+    ["stream", "delta"],
+    ["stream", "refused"],
     ["effect", "timer", "rejected"],
     ["effect", "after", "rejected"],
     ["effect", "background", "rejected"],
@@ -313,16 +315,48 @@ pub fn runtime_span(
   run: fn() -> a,
 ) -> a
 
-/// `[brazier, runtime, render]` span. `run` returns the result and the
-/// size of the patch in bytes.
+/// `[brazier, runtime, render]` span. `run` returns the result, the size
+/// of the patch in bytes and the size of the largest `streams` array the
+/// broadcast sent, in bytes (0 when it sent no stream entry).
 @external(erlang, "brazier_telemetry_ffi", "runtime_render_span")
 @internal
 pub fn runtime_render_span(
   route: String,
   event: String,
   connection_id: String,
-  run: fn() -> #(a, Int),
+  run: fn() -> #(a, Int, Int),
 ) -> a
+
+/// `[brazier, stream, delta]`: one stream entry sent to one connection.
+/// `inserts` counts new and moved keys, `updates` keys updated in place,
+/// `trimmed` keys the limit removed, `bytes` the encoded entry. Keys and
+/// items are never in the metadata (docs/design/STREAMS.md 11).
+@external(erlang, "brazier_telemetry_ffi", "stream_delta")
+@internal
+pub fn stream_delta(
+  inserts: Int,
+  updates: Int,
+  deletes: Int,
+  trimmed: Int,
+  bytes: Int,
+  stream: String,
+  reset: Bool,
+  connection_id: String,
+) -> Nil
+
+/// `[brazier, stream, refused]`: `count` stream ops of one update were
+/// refused for `reason` (`unknown_stream`, `limit_out_of_range`,
+/// `limit_mismatch`, `key_empty`, `key_too_large`, `item_too_large`,
+/// `too_many_ops` or `frame_too_large`); `bytes` is the size the reason
+/// measured (the items, the keys or the frame), 0 when it measures none.
+@external(erlang, "brazier_telemetry_ffi", "stream_refused")
+@internal
+pub fn stream_refused(
+  count: Int,
+  bytes: Int,
+  stream: String,
+  reason: String,
+) -> Nil
 
 /// `[brazier, runtime, stop]` for a `Shutdown`.
 @external(erlang, "brazier_telemetry_ffi", "runtime_stop")

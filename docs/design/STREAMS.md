@@ -598,15 +598,25 @@ The client still enforces the limit: it checks that a store never holds
 more than `limit` items and faults if it does. It does not compute trims
 itself. One side computes them, so the two cannot disagree.
 
+Correction (step 5): the session's windows validate every op, and each
+joined connection also has windows of its own, of the keys its client was
+sent (`brazier/internal/stream_session`). A connection that joins after
+the first starts with no window and is sent no items (no replay), so the
+entries each connection is sent, and their `at` indices, are computed
+against its own windows. A connection's windows are dropped when it
+disconnects, and emptied when its join `model_sync` was not sent.
+
 ### 7.4 Bounds
 
-| Bound | Value | When it is exceeded |
+| Bound (`SecurityLimits` field) | Default | When it is exceeded |
 |-------|-------|---------------------|
-| `stream.max_limit` | 1000 | `stream.new` crashes |
-| `stream.max_key_bytes` | 256 | the op crashes in `update` |
-| `stream.item_max_bytes` | 65_536 | the op is refused |
-| `stream.ops_max_per_update` | 1000 ops, all streams together | every op of the update is refused |
-| `stream.frame_max_bytes` | 1_048_576 of stream entries per frame | every op of the update is refused |
+| `stream_max_limit` | 1000, and at most 1000 | the op is refused (`limit_out_of_range`) |
+| `stream_key_max_bytes` | 256; an empty key is refused too | the op is refused (`key_too_large`, `key_empty`) |
+| `stream_item_max_bytes` | 65_536 | the op is refused (`item_too_large`) |
+| `stream_ops_max_per_update` | 1000 ops, all streams together | every op of the update is refused (`too_many_ops`) |
+| `stream_frame_max_bytes` | 1_048_576 of stream entries per frame | every op of the update is refused (`frame_too_large`) |
+
+`stream.new` crashes only for a limit below 1 or a bad name.
 
 Work per update is O(ops × limit) for the windows, at most
 1000 × 1000 key comparisons, and the delta is at most `limit` deletes and
@@ -616,15 +626,19 @@ same numbers.
 A refused op is not applied to the window, so the window still equals what
 the client holds. The runtime logs an error naming the stream, the size and
 the limit, emits `[brazier, stream, refused]`, and sends
-`{"type": "error", "reason": "Stream item too large: ..."}` to the joined
-connections, as it does for a model over `model_size_max_bytes`
-(`model_too_large`). The model part of the update is sent as usual. A
-refused op at the first join (7.2) resets that window to empty, because the
-client then holds nothing.
+`{"type": "error", "reason": "Stream log: refused 1 op(s): the item is 70013 bytes, over the limit of 65536"}`
+to the joined connections, one per stream and reason, as it does for a
+model over `model_size_max_bytes` (`model_too_large`). An update refused
+whole sends one `error` beginning "Refused every stream op of the update".
+The model part of the update is sent as usual. When the first join's
+entries (7.2) are over `stream_frame_max_bytes`, every window is emptied,
+because the client then holds nothing.
 
-These are constants, like `model_size_max_bytes`, not `SecurityLimits`:
-they bound what the server sends, not what it accepts. Decision D4 asks
-about the numbers.
+Correction (step 5): these bounds are `SecurityLimits` fields
+(`transport.stream_limits` reads them), validated as the other fields are:
+each must be positive, and `stream_max_limit` at most 1000, the largest
+limit the wire and the client accept. An earlier draft made them
+constants; decision D4 set the defaults above.
 
 ### 7.5 Unknown streams and duplicate declarations
 
@@ -774,7 +788,7 @@ item types.
 | Event | Measurements | Metadata | Emitted |
 |-------|--------------|----------|---------|
 | `[brazier, stream, delta]` | `inserts`, `updates`, `deletes`, `trimmed`, `bytes` | `stream`, `reset`, `connection_id` | once per stream per frame sent, `brazier/runtime` |
-| `[brazier, stream, refused]` | `count`, `bytes` | `stream`, `reason`: `item_too_large`, `too_many_ops`, `frame_too_large`, `unknown_stream` or `limit_mismatch` | `brazier/runtime` |
+| `[brazier, stream, refused]` | `count`, `bytes` | `stream`, `reason`: `item_too_large`, `too_many_ops`, `frame_too_large`, `unknown_stream`, `limit_mismatch`, `limit_out_of_range`, `key_empty` or `key_too_large` | `brazier/runtime` |
 | `[brazier, runtime, render]` S | adds `stream_bytes` (stop) | unchanged | `brazier/runtime` |
 
 Keys and items are never in metadata: a key such as `agent_id:seq` can
@@ -794,8 +808,9 @@ rejoin with non-empty windows, error for every refusal. The browser logs a
 | Duplicate declaration: two `stream.new` with one name | build | Build error naming both places |
 | Same name used with two limits at run time | runtime | Refused, `limit_mismatch` |
 | A stream rendered twice in one view | render | SSR crashes the dead render (500); the browser's render throws, which takes the existing render-failure path |
-| Limit 0, negative or over 1000 | `stream.new` | Crash with a message |
-| Empty or over-long key | the op, in `update` | Crash with a message |
+| Limit 0 or negative | `stream.new` | Crash with a message |
+| Limit over `stream_max_limit` | runtime | That op refused, `limit_out_of_range` |
+| Empty or over-long key | runtime | That op refused, `key_empty` or `key_too_large` |
 | Item over `item_max_bytes` | runtime | That op refused, error log, `error` frame; the rest of the update is sent |
 | More ops than `ops_max_per_update`, or stream entries over `frame_max_bytes` | runtime | Every op of the update refused; the model part is sent |
 | Ops for a stream not in the current view | browser | Not an error: the store keeps them, bounded by the limit, and the container is filled by a full reconcile when it appears |

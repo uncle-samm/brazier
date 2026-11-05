@@ -120,8 +120,8 @@ pub type Emitted {
 /// Crashes, as `attribute.attribute` does for a bad name, when `name` is
 /// not 1 to 64 characters of `a-z`, `0-9` and `_` starting with a letter,
 /// or when the limit is below 1. The largest limit is a server bound
-/// (1000 by default): a stream over it has its ops refused and logged by
-/// the runtime.
+/// (`SecurityLimits.stream_max_limit`, 1000 by default): a stream over it
+/// has its ops refused and logged by the runtime.
 ///
 /// ```gleam
 /// stream.new(

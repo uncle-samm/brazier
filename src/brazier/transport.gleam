@@ -12,6 +12,7 @@ import brazier/error
 import brazier/internal/local_path
 import brazier/internal/log_path
 import brazier/internal/render
+import brazier/internal/stream_window
 import brazier/ip
 import brazier/log
 import brazier/middleware
@@ -123,14 +124,27 @@ pub type ServerMessage {
   /// Invariant: `model_json` is one complete, valid JSON value. It is
   /// embedded raw in the frame (`"model":{...}`), so invalid text would
   /// corrupt the whole frame. The runtime only sends text it decoded into a
-  /// `patch.Snapshot`.
-  ServerModelSync(model_json: String, version: Int, ack_clock: Int)
+  /// `patch.Snapshot`. `streams_json` is the frame's `streams` array
+  /// (docs/design/STREAMS.md 6.1), embedded raw the same way; the runtime
+  /// only sends `stream_window.encode_deltas` output or the literal `[]`.
+  ServerModelSync(
+    model_json: String,
+    version: Int,
+    ack_clock: Int,
+    streams_json: String,
+  )
   /// Incremental model patch — only changed fields.
   /// Client applies ops to its cached model JSON instead of replacing entirely.
   /// Invariant: `ops_json` is one valid JSON array of RFC 6902 operations,
   /// embedded raw in the frame (`"ops":[...]`). The runtime only sends the
-  /// output of `patch.diff_snapshots` or the literal `[]`.
-  ServerPatch(ops_json: String, version: Int, ack_clock: Int)
+  /// output of `patch.diff_snapshots` or the literal `[]`. `streams_json`
+  /// is as on `ServerModelSync`.
+  ServerPatch(
+    ops_json: String,
+    version: Int,
+    ack_clock: Int,
+    streams_json: String,
+  )
   /// Server-initiated navigation (redirect via pushState).
   ServerNavigate(path: String)
   /// Server-initiated navigation that replaces the current history entry
@@ -154,11 +168,22 @@ pub type InternalMessage {
   /// An error needs to be sent to the client.
   SendError(reason: String)
   /// Send authoritative Model state to the client. `model_json` must be
-  /// one valid JSON value; see `ServerModelSync`.
-  SendModelSync(model_json: String, version: Int, ack_clock: Int)
-  /// Send incremental model patch to the client. `ops_json` must be one
-  /// valid JSON array; see `ServerPatch`.
-  SendPatch(ops_json: String, version: Int, ack_clock: Int)
+  /// one valid JSON value and `streams_json` one valid JSON array; see
+  /// `ServerModelSync`.
+  SendModelSync(
+    model_json: String,
+    version: Int,
+    ack_clock: Int,
+    streams_json: String,
+  )
+  /// Send incremental model patch to the client. `ops_json` and
+  /// `streams_json` must each be one valid JSON array; see `ServerPatch`.
+  SendPatch(
+    ops_json: String,
+    version: Int,
+    ack_clock: Int,
+    streams_json: String,
+  )
   /// Send navigation redirect to the client (pushState).
   SendNavigate(path: String)
   /// Send navigation to the client that replaces the history entry.
@@ -288,11 +313,61 @@ pub type SecurityLimits {
     /// development; in production (`BRAZIER_ENV=production`) the listener
     /// refuses to start with an empty list. Default: [].
     allowed_hosts: List(String),
+    // Stream limits (docs/design/STREAMS.md 7.4). They bound what the
+    // runtime sends in a frame's `streams` array; a breach is refused with
+    // an error log, `[brazier, stream, refused]` and an `error` frame.
+    /// The largest limit a stream may be used with. An op with a larger one
+    /// is refused (`limit_out_of_range`). At most 1000, the largest limit
+    /// the wire and the client accept. Default: 1000.
+    stream_max_limit: Int,
+    /// The largest encoded stream item, in bytes. An op with a larger item
+    /// is refused (`item_too_large`). Default: 65536.
+    stream_item_max_bytes: Int,
+    /// The most stream ops one update may carry, all streams together; a
+    /// reset counts one per item. An update with more has every stream op
+    /// refused (`too_many_ops`); its model part is still sent. Default: 1000.
+    stream_ops_max_per_update: Int,
+    /// The largest `streams` array of one frame, in bytes. An update whose
+    /// entries are larger has every stream op refused (`frame_too_large`).
+    /// Default: 1048576 (1MB).
+    stream_frame_max_bytes: Int,
+    /// The longest stream key, in bytes. An op with a longer key is refused
+    /// (`key_too_large`). Default: 256.
+    stream_key_max_bytes: Int,
+  )
+}
+
+/// The largest stream limit the wire allows (docs/design/STREAMS.md 6.1):
+/// the client faults on a larger one.
+pub const stream_wire_max_limit = 1000
+
+/// The stream bounds of `limits`, for the runtime and the dead render.
+pub fn stream_limits(limits: SecurityLimits) -> stream_window.Limits {
+  log.debug(
+    "brazier.transport",
+    "Stream limits: max_limit="
+      <> int.to_string(limits.stream_max_limit)
+      <> " item_max_bytes="
+      <> int.to_string(limits.stream_item_max_bytes)
+      <> " ops_max_per_update="
+      <> int.to_string(limits.stream_ops_max_per_update)
+      <> " frame_max_bytes="
+      <> int.to_string(limits.stream_frame_max_bytes)
+      <> " key_max_bytes="
+      <> int.to_string(limits.stream_key_max_bytes),
+  )
+  stream_window.Limits(
+    max_limit: limits.stream_max_limit,
+    item_max_bytes: limits.stream_item_max_bytes,
+    ops_max_per_update: limits.stream_ops_max_per_update,
+    frame_max_bytes: limits.stream_frame_max_bytes,
+    key_max_bytes: limits.stream_key_max_bytes,
   )
 }
 
 /// Sensible default security limits.
 pub fn default_security_limits() -> SecurityLimits {
+  let stream_defaults = stream_window.default_limits()
   SecurityLimits(
     max_message_bytes: 65_536,
     max_events_per_second: 50,
@@ -323,6 +398,12 @@ pub fn default_security_limits() -> SecurityLimits {
     ws_max_rate_violations: 100,
     ws_allowed_origins: [],
     allowed_hosts: [],
+    // Stream limits: the defaults of decision D4.
+    stream_max_limit: stream_defaults.max_limit,
+    stream_item_max_bytes: stream_defaults.item_max_bytes,
+    stream_ops_max_per_update: stream_defaults.ops_max_per_update,
+    stream_frame_max_bytes: stream_defaults.frame_max_bytes,
+    stream_key_max_bytes: stream_defaults.key_max_bytes,
   )
 }
 
@@ -393,6 +474,12 @@ fn check_security_limits(
     #("keepalive_idle_timeout_ms", limits.keepalive_idle_timeout_ms),
     #("max_keepalive_requests", limits.max_keepalive_requests),
     #("send_timeout_ms", limits.send_timeout_ms),
+    // Stream limits
+    #("stream_max_limit", limits.stream_max_limit),
+    #("stream_item_max_bytes", limits.stream_item_max_bytes),
+    #("stream_ops_max_per_update", limits.stream_ops_max_per_update),
+    #("stream_frame_max_bytes", limits.stream_frame_max_bytes),
+    #("stream_key_max_bytes", limits.stream_key_max_bytes),
   ]
   let timers = [
     #("ws_ping_interval_ms", limits.ws_ping_interval_ms),
@@ -438,6 +525,15 @@ fn check_security_limits(
       }),
     )
     use _ <- result.try(validate_drain_timeout(limits.drain_timeout_ms))
+    use _ <- result.try(case limits.stream_max_limit <= stream_wire_max_limit {
+      True -> Ok(Nil)
+      False ->
+        Error(
+          "stream_max_limit must be <= "
+          <> int.to_string(stream_wire_max_limit)
+          <> " (the largest limit the client accepts)",
+        )
+    })
     // HTTP limits: a typo in the proxy list must never silently change who
     // is trusted.
     use trusted <- result.try(
@@ -712,11 +808,12 @@ pub fn encode_server_message(msg: ServerMessage) -> String {
 /// Encode a ServerMessage to the JSON text sent over the wire, as a string
 /// tree the socket writes without flattening it into one binary.
 ///
-/// The model of a `model_sync` and the ops of a `patch` are already JSON
-/// text, and they are embedded raw: `"model":{...}` and `"ops":[...]`,
-/// not re-encoded as JSON strings. That relies on the invariant documented
-/// on `ServerModelSync` and `ServerPatch`: the text is one valid JSON value.
-/// Field order is fixed (type, model or ops, version, ack_clock).
+/// The model of a `model_sync`, the ops of a `patch` and the `streams` of
+/// both are already JSON text, and they are embedded raw: `"model":{...}`,
+/// `"ops":[...]` and `"streams":[...]`, not re-encoded as JSON strings.
+/// That relies on the invariant documented on `ServerModelSync` and
+/// `ServerPatch`: the text is one valid JSON value. Field order is fixed
+/// (type, model or ops, version, ack_clock, streams).
 ///
 /// Reference: Phoenix.Socket.V2.JSONSerializer, whose `encode!` returns
 /// iodata with the already-encoded payload spliced in; LiveView sends its
@@ -734,19 +831,21 @@ pub fn encode_server_message_tree(msg: ServerMessage) -> StringTree {
         #("type", json.string("error")),
         #("reason", json.string(reason)),
       ])
-    ServerModelSync(model_json, version, ack_clock) ->
+    ServerModelSync(model_json, version, ack_clock, streams_json) ->
       json.object([
         #("type", json.string("model_sync")),
         #("model", json_raw(model_json)),
         #("version", json.int(version)),
         #("ack_clock", json.int(ack_clock)),
+        #("streams", json_raw(streams_json)),
       ])
-    ServerPatch(ops_json, version, ack_clock) ->
+    ServerPatch(ops_json, version, ack_clock, streams_json) ->
       json.object([
         #("type", json.string("patch")),
         #("ops", json_raw(ops_json)),
         #("version", json.int(version)),
         #("ack_clock", json.int(ack_clock)),
+        #("streams", json_raw(streams_json)),
       ])
     ServerNavigate(path) ->
       json.object([
@@ -2184,22 +2283,24 @@ fn handle_runtime_message(
       case message {
         SendMount(payload) -> send_or_stop(state, ServerMount(payload: payload))
         SendError(reason) -> send_or_stop(state, ServerError(reason: reason))
-        SendModelSync(model_json, version, ack_clock) ->
+        SendModelSync(model_json, version, ack_clock, streams_json) ->
           send_or_stop(
             state,
             ServerModelSync(
               model_json: model_json,
               version: version,
               ack_clock: ack_clock,
+              streams_json: streams_json,
             ),
           )
-        SendPatch(ops_json, version, ack_clock) ->
+        SendPatch(ops_json, version, ack_clock, streams_json) ->
           send_or_stop(
             state,
             ServerPatch(
               ops_json: ops_json,
               version: version,
               ack_clock: ack_clock,
+              streams_json: streams_json,
             ),
           )
         SendNavigate(path) -> send_or_stop(state, ServerNavigate(path: path))

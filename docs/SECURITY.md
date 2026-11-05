@@ -46,6 +46,12 @@ pub type SecurityLimits {
     ws_max_rate_violations: Int,      // 100
     ws_allowed_origins: List(String), // []
     allowed_hosts: List(String),      // []: localhost names in development; required in production
+    // Stream limits (see Stream Bounds)
+    stream_max_limit: Int,            // 1000, and at most 1000
+    stream_item_max_bytes: Int,       // 65536 per encoded item
+    stream_ops_max_per_update: Int,   // 1000 per update, all streams together
+    stream_frame_max_bytes: Int,      // 1048576 of stream entries per frame
+    stream_key_max_bytes: Int,        // 256 per key
   )
 }
 ```
@@ -526,6 +532,32 @@ The effect system caps what one runtime process can have running: 10 periodic ti
 ## Model Size Bounds
 
 The runtime tracks serialized model size. Models exceeding 1MB trigger a warning log. Models exceeding 5MB are rejected to prevent memory exhaustion.
+
+## Stream Bounds
+
+A stream (`brazier/stream`) sends items in the `streams` array of a frame,
+and the server keeps only each stream's keys, at most its limit, per
+connection (items only until the first join). Five `SecurityLimits` fields
+bound what an update may send; `transport.validate_security_limits`
+refuses a value that is not positive, and a `stream_max_limit` over 1000,
+the largest limit the wire and the browser client accept.
+
+| Field | Default | Over it |
+|-------|---------|---------|
+| `stream_max_limit` | 1000 | The op is refused (`limit_out_of_range`) |
+| `stream_key_max_bytes` | 256 | The op is refused (`key_too_large`); an empty key is refused too (`key_empty`) |
+| `stream_item_max_bytes` | 65536 | The op is refused (`item_too_large`) |
+| `stream_ops_max_per_update` | 1000 | Every stream op of the update is refused (`too_many_ops`) |
+| `stream_frame_max_bytes` | 1048576 | Every stream op of the update is refused (`frame_too_large`) |
+
+A refused op is not applied, so the server's windows still match what each
+client holds. The runtime logs it at error with the stream, the size and
+the bound, emits `[brazier, stream, refused]` (see
+[TELEMETRY.md](TELEMETRY.md#event-catalogue)), and sends an `error` frame
+to the joined connections; the rest of the update, and its model part, are
+sent. Work per update is at most `stream_ops_max_per_update` ×
+`stream_max_limit` key comparisons. See
+[design/STREAMS.md](design/STREAMS.md#74-bounds).
 
 ## WebSocket Authentication
 

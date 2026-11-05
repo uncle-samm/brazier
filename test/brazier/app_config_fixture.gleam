@@ -47,5 +47,6 @@ pub fn new(
     pubsub: pubsub.default_config(),
     cluster: option.None,
     presence: option.None,
+    stream_names: [],
   )
 }

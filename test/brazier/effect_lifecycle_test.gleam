@@ -358,6 +358,7 @@ fn lifecycle_config(
     secret_key: "",
     presence: None,
     title: None,
+    streams: runtime.no_streams(),
   )
 }
 
@@ -489,6 +490,7 @@ pub fn runtime_after_fires_in_the_runtime_process_test() {
       secret_key: "",
       presence: None,
       title: None,
+      streams: runtime.no_streams(),
     )
   let assert Ok(subject) = runtime.start(config, test_ctx.root())
   let assert Ok(runtime_pid) = process.subject_owner(subject)

@@ -77,6 +77,7 @@ fn start() -> Subject(runtime.RuntimeMessage(Msg)) {
       secret_key: "runtime-title-limit-test-secret-0123456789",
       presence: None,
       title: Some(title),
+      streams: runtime.no_streams(),
     )
   let assert Ok(rt) = runtime.start(config, test_ctx.root())
     as "the test runtime must start"

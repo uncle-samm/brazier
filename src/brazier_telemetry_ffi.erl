@@ -39,6 +39,8 @@
     ws_navigation_refused/3,
     runtime_span/5,
     runtime_render_span/4,
+    stream_delta/8,
+    stream_refused/4,
     runtime_stop/2,
     runtime_stop_failed/4,
     effect_run_span/2,
@@ -252,13 +254,26 @@ runtime_kind(mount) -> mount;
 runtime_kind(handle_event) -> handle_event;
 runtime_kind(navigate) -> navigate.
 
-%% [brazier, runtime, render] span. Run returns {Result, PatchBytes}.
+%% [brazier, runtime, render] span. Run returns
+%% {Result, PatchBytes, StreamBytes}.
 runtime_render_span(Route, Event, ConnectionId, Run) ->
     Meta = #{route => Route, event => Event, connection_id => ConnectionId},
     telemetry:span([?PREFIX, runtime, render], Meta, fun() ->
-        {Result, PatchBytes} = Run(),
-        {Result, #{patch_bytes => PatchBytes}, Meta}
+        {Result, PatchBytes, StreamBytes} = Run(),
+        {Result, #{patch_bytes => PatchBytes, stream_bytes => StreamBytes}, Meta}
     end).
+
+%% [brazier, stream, delta]
+stream_delta(Inserts, Updates, Deletes, Trimmed, Bytes, Stream, Reset, ConnectionId) ->
+    telemetry:execute([?PREFIX, stream, delta],
+                      #{inserts => Inserts, updates => Updates, deletes => Deletes,
+                        trimmed => Trimmed, bytes => Bytes},
+                      #{stream => Stream, reset => Reset, connection_id => ConnectionId}).
+
+%% [brazier, stream, refused]
+stream_refused(Count, Bytes, Stream, Reason) ->
+    telemetry:execute([?PREFIX, stream, refused], #{count => Count, bytes => Bytes},
+                      #{stream => Stream, reason => Reason}).
 
 %% [brazier, runtime, stop]
 runtime_stop(Uptime, Reason) ->

@@ -702,6 +702,49 @@ pub fn snapshot_of_windows_without_items_is_an_error_test() {
     stream_window.snapshot(seeded(last(3), ["a"]))
 }
 
+// --- Key count and emptied windows ------------------------------------------
+
+pub fn key_count_sums_every_window_test() {
+  let assert 0 = stream_window.key_count(stream_window.new(keep_items: False))
+  let windows =
+    apply(seeded(last(3), ["a", "b"]), [
+      Op(
+        name: "t",
+        limit: first(5),
+        action: stream_op.Insert("x", item("x"), Back),
+      ),
+    ]).windows
+  let assert 3 = stream_window.key_count(windows)
+}
+
+pub fn emptied_windows_keep_each_limit_and_no_item_test() {
+  let windows =
+    apply(stream_window.new(keep_items: True), [
+      insert(last(3), "a", Back),
+      insert(last(3), "b", Back),
+    ]).windows
+  let emptied = stream_window.emptied(windows)
+  let assert 0 = stream_window.key_count(emptied)
+  let assert Ok([]) = stream_window.keys(emptied, "s")
+  let assert Ok(limit) = stream_window.limit(emptied, "s")
+  let assert True = limit == last(3)
+  // No item is kept once emptied: nothing is sent again.
+  let assert Error(stream_window.ItemsNotKept) = stream_window.snapshot(emptied)
+  // The limit the stream was first used with still holds (design 7.5).
+  let assert Ok(stream_window.Applied(refused: [refusal], ..)) =
+    stream_window.apply_update(
+      emptied,
+      [insert(first(3), "c", Back)],
+      stream_window.default_limits(),
+    )
+  let assert stream_window.LimitMismatch(..) = refusal.reason
+  // An insert into the emptied window is placed as in a fresh one.
+  let applied = apply(emptied, [insert(last(3), "c", Back)])
+  let assert ["c"] = keys_of(applied.windows)
+  let assert [at_c] = one_delta(applied).inserts
+  let assert True = at_c == at("c", 0)
+}
+
 // --- Wire text --------------------------------------------------------------
 
 pub fn delta_wire_text_test() {

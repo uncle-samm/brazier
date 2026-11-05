@@ -72,6 +72,7 @@ fn config() -> runtime.RuntimeConfig(Model, Msg) {
     secret_key: "",
     presence: option.None,
     title: option.None,
+    streams: runtime.no_streams(),
   )
 }
 

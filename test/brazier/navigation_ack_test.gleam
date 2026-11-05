@@ -58,6 +58,7 @@ fn config() -> runtime.RuntimeConfig(Page, Msg) {
     secret_key: "",
     presence: option.None,
     title: option.None,
+    streams: runtime.no_streams(),
   )
 }
 
@@ -93,8 +94,12 @@ pub fn the_navigation_patch_acknowledges_its_clock_test() {
     rt,
     runtime.ClientNavigated(conn_id: "c", path: "/docs", clock: 7),
   )
-  let assert Ok(transport.SendPatch(ops_json: ops, version: 1, ack_clock: 7)) =
-    process.receive(conn, await.deadline_ms)
+  let assert Ok(transport.SendPatch(
+    ops_json: ops,
+    version: 1,
+    ack_clock: 7,
+    streams_json: "[]",
+  )) = process.receive(conn, await.deadline_ms)
     as "the navigation's patch acknowledges clock 7"
   let assert True = string.contains(ops, "docs") as ops
 }
@@ -102,8 +107,12 @@ pub fn the_navigation_patch_acknowledges_its_clock_test() {
 pub fn an_unchanged_navigation_is_acknowledged_test() {
   let #(rt, conn) = join()
   process.send(rt, runtime.ClientNavigated(conn_id: "c", path: "/", clock: 3))
-  let assert Ok(transport.SendPatch(ops_json: "[]", version: 0, ack_clock: 3)) =
-    process.receive(conn, await.deadline_ms)
+  let assert Ok(transport.SendPatch(
+    ops_json: "[]",
+    version: 0,
+    ack_clock: 3,
+    streams_json: "[]",
+  )) = process.receive(conn, await.deadline_ms)
     as "an unchanged model is answered with an ack at the current version"
 }
 

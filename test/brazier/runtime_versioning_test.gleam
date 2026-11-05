@@ -85,6 +85,7 @@ fn config() -> runtime.RuntimeConfig(Model, Msg) {
     secret_key: secret,
     presence: None,
     title: None,
+    streams: runtime.no_streams(),
   )
 }
 
@@ -184,8 +185,12 @@ pub fn event_before_join_is_rejected_and_not_applied_test() {
   let assert transport.SendError(reason: "event received before join") = next(s)
     as "an event before join was not refused with 'event received before join'"
   process.send(rt, runtime.ClientJoined(conn_id: "c", token: "", path: ""))
-  let assert transport.SendModelSync(model_json: json, version: 0, ack_clock: 0) =
-    next(s)
+  let assert transport.SendModelSync(
+    model_json: json,
+    version: 0,
+    ack_clock: 0,
+    streams_json: "[]",
+  ) = next(s)
     as "the join after a refused event did not get a model_sync at revision 0, ack 0"
   let assert True = string.contains(json, "\"count\":0")
     as "the event sent before join was applied to the model"
@@ -296,8 +301,12 @@ pub fn rejoin_is_full_resync_and_never_resets_state_test() {
       secret,
     )
   process.send(rt, runtime.ClientJoined(conn_id: "c", token: token, path: ""))
-  let assert transport.SendModelSync(model_json: json, version: 2, ack_clock: 2) =
-    next(s)
+  let assert transport.SendModelSync(
+    model_json: json,
+    version: 2,
+    ack_clock: 2,
+    streams_json: "[]",
+  ) = next(s)
     as "the rejoin was not a full model_sync at revision 2, ack 2"
   let assert True = string.contains(json, "\"count\":2")
     as "the rejoin's token replaced the live model (count is not 2)"
@@ -317,18 +326,30 @@ pub fn unchanged_event_sends_ack_only_patch_test() {
   let assert transport.SendModelSync(version: 0, ..) = next(s)
     as "the join got no model_sync at revision 0"
   event(rt, "c", "noop", 1)
-  let assert transport.SendPatch(ops_json: "[]", version: 0, ack_clock: 1) =
-    next(s)
+  let assert transport.SendPatch(
+    ops_json: "[]",
+    version: 0,
+    ack_clock: 1,
+    streams_json: "[]",
+  ) = next(s)
     as "the first noop was not an empty ack patch at revision 0, ack 1"
   event(rt, "c", "inc", 2)
-  let assert transport.SendPatch(ops_json: ops, version: 1, ack_clock: 2) =
-    next(s)
+  let assert transport.SendPatch(
+    ops_json: ops,
+    version: 1,
+    ack_clock: 2,
+    streams_json: "[]",
+  ) = next(s)
     as "the inc did not patch to revision 1, ack 2"
   let assert True = string.contains(ops, "/count")
     as "the inc's patch does not touch /count"
   event(rt, "c", "noop", 3)
-  let assert transport.SendPatch(ops_json: "[]", version: 1, ack_clock: 3) =
-    next(s)
+  let assert transport.SendPatch(
+    ops_json: "[]",
+    version: 1,
+    ack_clock: 3,
+    streams_json: "[]",
+  ) = next(s)
     as "the noop after the inc was not an empty ack patch at revision 1, ack 3"
 }
 
@@ -343,8 +364,12 @@ pub fn decode_failure_reports_error_then_acks_test() {
     as "an undecodable event did not report an error first"
   let assert True = string.contains(reason, "Unknown handler")
     as "the decode error does not name the unknown handler"
-  let assert transport.SendPatch(ops_json: "[]", version: 0, ack_clock: 4) =
-    next(s)
+  let assert transport.SendPatch(
+    ops_json: "[]",
+    version: 0,
+    ack_clock: 4,
+    streams_json: "[]",
+  ) = next(s)
     as "the undecodable event was not acked with an empty patch at revision 0, ack 4"
 }
 
@@ -373,11 +398,19 @@ pub fn revision_is_shared_and_acks_are_per_connection_test() {
     as "connection b's join got no model_sync at revision 0"
 
   event(rt, "a", "inc", 5)
-  let assert transport.SendPatch(ops_json: ops_a, version: 1, ack_clock: 5) =
-    next(a)
+  let assert transport.SendPatch(
+    ops_json: ops_a,
+    version: 1,
+    ack_clock: 5,
+    streams_json: "[]",
+  ) = next(a)
     as "a's inc did not patch a to revision 1 with a's ack 5"
-  let assert transport.SendPatch(ops_json: ops_b, version: 1, ack_clock: 0) =
-    next(b)
+  let assert transport.SendPatch(
+    ops_json: ops_b,
+    version: 1,
+    ack_clock: 0,
+    streams_json: "[]",
+  ) = next(b)
     as "a's inc did not patch b to revision 1 with b's own ack 0"
   let assert True = ops_a == ops_b
     as "a and b got different ops for the same revision"
@@ -390,8 +423,12 @@ pub fn revision_is_shared_and_acks_are_per_connection_test() {
 
   // An unchanged event is acknowledged to its sender only.
   event(rt, "b", "noop", 2)
-  let assert transport.SendPatch(ops_json: "[]", version: 2, ack_clock: 2) =
-    next(b)
+  let assert transport.SendPatch(
+    ops_json: "[]",
+    version: 2,
+    ack_clock: 2,
+    streams_json: "[]",
+  ) = next(b)
     as "b's noop was not an empty ack patch to b at revision 2, ack 2"
   let assert transport.SendModelSync(version: 2, ack_clock: 5, ..) =
     barrier(rt, "a", a)
@@ -418,8 +455,12 @@ pub fn navigation_bumps_revision_only_when_model_changes_test() {
   process.send(rt, runtime.ClientNavigated(conn_id: "a", path: "/a", clock: 1))
   let assert Ok("/a") = process.receive(proof, 1000)
     as "navigating to /a did not run the route handler"
-  let assert transport.SendPatch(ops_json: ops, version: 1, ack_clock: 1) =
-    next(a)
+  let assert transport.SendPatch(
+    ops_json: ops,
+    version: 1,
+    ack_clock: 1,
+    streams_json: "[]",
+  ) = next(a)
     as "the navigation to /a did not patch the navigator to revision 1, ack 1"
   let assert True = string.contains(ops, "/path")
     as "the navigation patch does not touch /path"
@@ -433,8 +474,12 @@ pub fn navigation_bumps_revision_only_when_model_changes_test() {
   process.send(rt, runtime.ClientNavigated(conn_id: "a", path: "/a", clock: 2))
   let assert Ok("/a") = process.receive(proof, 1000)
     as "navigating to /a again did not re-run the route handler"
-  let assert transport.SendPatch(ops_json: "[]", version: 1, ack_clock: 2) =
-    next(a)
+  let assert transport.SendPatch(
+    ops_json: "[]",
+    version: 1,
+    ack_clock: 2,
+    streams_json: "[]",
+  ) = next(a)
     as "the same-route navigation was not acked to a at revision 1, ack 2"
   let assert transport.SendModelSync(version: 1, ..) = barrier(rt, "a", a)
     as "the same-route navigation sent a a patch or moved the revision"
@@ -494,8 +539,12 @@ pub fn model_over_limit_fails_loudly_and_resyncs_after_shrinking_test() {
   let assert False = string.contains(reason, "encoder")
     as "the over-limit error was reported as an encoder failure"
   // The event is still acknowledged; the revision did not move.
-  let assert transport.SendPatch(ops_json: "[]", version: 0, ack_clock: 1) =
-    next(s)
+  let assert transport.SendPatch(
+    ops_json: "[]",
+    version: 0,
+    ack_clock: 1,
+    streams_json: "[]",
+  ) = next(s)
     as "the over-limit event was not acked with an empty patch at revision 0, ack 1"
 
   // A join while the model is too large gets the same distinct error.
@@ -514,8 +563,12 @@ pub fn model_over_limit_fails_loudly_and_resyncs_after_shrinking_test() {
   // Once the model shrinks, the stale cache is not diffed against: every
   // joined connection gets a full model_sync at a new revision.
   event(rt, "c", "small", 2)
-  let assert transport.SendModelSync(model_json: json, version: 1, ack_clock: 2) =
-    next(s)
+  let assert transport.SendModelSync(
+    model_json: json,
+    version: 1,
+    ack_clock: 2,
+    streams_json: "[]",
+  ) = next(s)
     as "shrinking the model did not resync c at revision 1, ack 2"
   let assert True = string.contains(json, "\"blob\":\"\"")
     as "the resync after shrinking does not carry the empty blob"
@@ -542,8 +595,12 @@ pub fn batch_with_failing_last_event_still_broadcasts_test() {
     as "a batch with a failing event reported no error"
   let assert True = string.starts_with(reason, "1 of 2 batched events rejected")
     as "the batch error does not say '1 of 2 batched events rejected'"
-  let assert transport.SendPatch(ops_json: ops, version: 1, ack_clock: 2) =
-    next(s)
+  let assert transport.SendPatch(
+    ops_json: ops,
+    version: 1,
+    ack_clock: 2,
+    streams_json: "[]",
+  ) = next(s)
     as "the batch's good event was not broadcast at revision 1, ack 2"
   let assert True = string.contains(ops, "/count")
     as "the batch patch does not touch /count"
@@ -562,8 +619,12 @@ pub fn unchanged_batch_sends_ack_only_patch_test() {
       #("click", "noop", "{}", "0", 3, []),
     ]),
   )
-  let assert transport.SendPatch(ops_json: "[]", version: 0, ack_clock: 3) =
-    next(s)
+  let assert transport.SendPatch(
+    ops_json: "[]",
+    version: 0,
+    ack_clock: 3,
+    streams_json: "[]",
+  ) = next(s)
     as "an all-noop batch was not one empty ack patch at revision 0, ack 3"
 }
 
@@ -603,8 +664,12 @@ pub fn disconnect_removes_connection_from_broadcasts_test() {
   process.send(rt, runtime.ClientDisconnected(conn_id: "b"))
   process.send(rt, runtime.EffectDispatched(message: Inc))
   let c = join(rt, "c", "")
-  let assert transport.SendModelSync(model_json: json, version: 1, ack_clock: 0) =
-    next(c)
+  let assert transport.SendModelSync(
+    model_json: json,
+    version: 1,
+    ack_clock: 0,
+    streams_json: "[]",
+  ) = next(c)
     as "the joiner after everyone left did not get revision 1, ack 0"
   let assert True = string.contains(json, "\"count\":2")
     as "the update made while nobody was joined is missing from the model"
@@ -845,8 +910,12 @@ pub fn invalid_model_json_fails_loudly_and_resyncs_after_fix_test() {
   let assert transport.SendError(reason: "Model encoder returned invalid JSON") =
     next(s)
     as "invalid encoder output was not reported to c as 'Model encoder returned invalid JSON'"
-  let assert transport.SendPatch(ops_json: "[]", version: 0, ack_clock: 1) =
-    next(s)
+  let assert transport.SendPatch(
+    ops_json: "[]",
+    version: 0,
+    ack_clock: 1,
+    streams_json: "[]",
+  ) = next(s)
     as "the event with invalid encoder output was not acked at revision 0, ack 1"
 
   // A join while the encoder is broken gets the same error, and so does
@@ -861,8 +930,12 @@ pub fn invalid_model_json_fails_loudly_and_resyncs_after_fix_test() {
 
   // Valid JSON again: every joined connection resyncs at a new revision.
   event(rt, "c", "inc", 2)
-  let assert transport.SendModelSync(model_json: json, version: 1, ack_clock: 2) =
-    next(s)
+  let assert transport.SendModelSync(
+    model_json: json,
+    version: 1,
+    ack_clock: 2,
+    streams_json: "[]",
+  ) = next(s)
     as "valid encoder output again did not resync c at revision 1, ack 2"
   let assert True = string.contains(json, "\"count\":2")
     as "the resync after the encoder recovered does not carry count 2"
@@ -911,17 +984,24 @@ fn scratch_path(name: String) -> String
 /// Wire JSON of a state message, exactly as the transport sends it.
 fn wire(message: transport.InternalMessage) -> String {
   case message {
-    transport.SendModelSync(model_json:, version:, ack_clock:) ->
+    transport.SendModelSync(
+      model_json:,
+      version:,
+      ack_clock:,
+      streams_json: "[]",
+    ) ->
       transport.encode_server_message(transport.ServerModelSync(
         model_json:,
         version:,
         ack_clock:,
+        streams_json: "[]",
       ))
-    transport.SendPatch(ops_json:, version:, ack_clock:) ->
+    transport.SendPatch(ops_json:, version:, ack_clock:, streams_json: "[]") ->
       transport.encode_server_message(transport.ServerPatch(
         ops_json:,
         version:,
         ack_clock:,
+        streams_json: "[]",
       ))
     other -> panic as { "not a state message: " <> string.inspect(other) }
   }
@@ -953,7 +1033,12 @@ fn record_session() -> #(List(String), String, Int) {
     as "a's change did not patch b to revision 1"
   event(rt, "a", "noop", 2)
   let f2 = next(a)
-  let assert transport.SendPatch(ops_json: "[]", version: 1, ack_clock: 2) = f2
+  let assert transport.SendPatch(
+    ops_json: "[]",
+    version: 1,
+    ack_clock: 2,
+    streams_json: "[]",
+  ) = f2
     as "frame 2 is not a's empty ack patch at revision 1, ack 2"
   event(rt, "b", "inc", 1)
   let f3 = next(a)
@@ -976,7 +1061,12 @@ fn record_session() -> #(List(String), String, Int) {
   let assert Ok("/a") = process.receive(proof, 1000)
     as "a's repeat navigation to /a did not re-run the route handler"
   let f4b = next(a)
-  let assert transport.SendPatch(ops_json: "[]", version: 3, ack_clock: 4) = f4b
+  let assert transport.SendPatch(
+    ops_json: "[]",
+    version: 3,
+    ack_clock: 4,
+    streams_json: "[]",
+  ) = f4b
     as "frame 4b is not the repeat navigation's empty ack at revision 3, ack 4"
 
   // A failing event: error (not a state frame), then an ack.
@@ -984,7 +1074,12 @@ fn record_session() -> #(List(String), String, Int) {
   let assert transport.SendError(..) = next(a)
     as "a's undecodable event reported no error"
   let f5 = next(a)
-  let assert transport.SendPatch(ops_json: "[]", version: 3, ack_clock: 5) = f5
+  let assert transport.SendPatch(
+    ops_json: "[]",
+    version: 3,
+    ack_clock: 5,
+    streams_json: "[]",
+  ) = f5
     as "frame 5 is not the failing event's empty ack at revision 3, ack 5"
 
   // Rejoin: full resync at the current revision.
