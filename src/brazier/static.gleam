@@ -170,7 +170,7 @@ fn serve_with_cache_control(
   case matches_prefix(config, path) {
     False -> Error(Nil)
     True -> {
-      let relative = string.drop_start(path, string.length(config.prefix))
+      let relative = bytes_from(path, string.byte_size(config.prefix))
       case resolve_relative(relative) {
         Error(NoFile) -> {
           log.debug(
@@ -216,12 +216,14 @@ type PathProblem {
 
 /// Split the part of the path after the prefix into decoded, safe segments.
 /// `relative` is "" or starts with "/" (guaranteed by `matches_prefix`).
+/// The path is split on `/` bytes, as the file system splits it (see
+/// `split_bytes`).
 fn resolve_relative(relative: String) -> Result(List(String), PathProblem) {
   use <- bool.guard(
     when: contains_traversal(relative),
     return: Error(Refused("traversal sequence")),
   )
-  case string.split(relative, "/") {
+  case split_bytes(relative, "/") {
     // "" is the prefix itself: no file.
     [""] -> Error(NoFile)
     ["", ..segments] ->
@@ -256,12 +258,11 @@ fn check_segment(segment: String) -> Result(Nil, PathProblem) {
     "" -> Error(Refused("empty path segment"))
     "." | ".." -> Error(Refused("relative path segment"))
     _ ->
+      // `starts_with` compares bytes; the separators are looked for as
+      // bytes too (see `contains_bytes`).
       case
         string.starts_with(segment, "."),
-        string.contains(segment, "/")
-        || string.contains(segment, "\\")
-        || string.contains(segment, ":")
-        || string.contains(segment, "\u{0000}")
+        contains_bytes(segment, ["/", "\\", ":", "\u{0000}"])
       {
         True, _ -> Error(Refused("hidden file"))
         _, True -> Error(Refused("separator or NUL inside a segment"))
@@ -669,15 +670,54 @@ fn ffi_load_asset(
 /// Check if a path contains directory traversal sequences.
 /// Catches: "..", backslash, null bytes, and encoded traversal (%2e, %2f, %5c).
 /// A percent-escape is ASCII, so the path is lowercased in ASCII only.
+///
+/// The path is searched as bytes, the way the file system reads it, not as
+/// grapheme clusters: `..` followed by a combining mark (U+0301) is one
+/// `.` and one `.́` to `string.contains`, but holds the bytes `..`, and
+/// `%2f` + U+0301 still decodes to a `/` byte.
 pub fn contains_traversal(path: String) -> Bool {
-  let lower = ascii.lowercase(path)
-  string.contains(path, "..")
-  || string.contains(path, "\\")
-  || string.contains(path, "\u{0000}")
-  || string.contains(lower, "%2e")
-  || string.contains(lower, "%2f")
-  || string.contains(lower, "%5c")
-  || string.contains(lower, "%00")
+  contains_bytes(path, ["..", "\\", "\u{0000}"])
+  || contains_bytes(ascii.lowercase(path), ["%2e", "%2f", "%5c", "%00"])
+}
+
+/// True when `text` holds any of `needles` as a byte sequence.
+/// `gleam/string.contains` matches grapheme clusters instead (OTP's
+/// `string:find/2`), so a combining mark after the needle's last character
+/// hides it.
+@external(erlang, "brazier_static_ffi", "contains_bytes")
+fn contains_bytes(text: String, needles: List(String)) -> Bool
+
+/// `text` split at every `separator` byte sequence, empty parts kept.
+/// `gleam/string.split` splits between grapheme clusters (OTP's
+/// `string:split/3`), so it does not split `/` + U+0301. `separator` is
+/// ASCII, so every part is valid UTF-8.
+@external(erlang, "brazier_static_ffi", "split_bytes")
+fn split_bytes(text: String, separator: String) -> List(String)
+
+/// `text` from byte `start` to its end. `start` is the byte size of a
+/// prefix `text` starts with, so it falls between two characters.
+fn bytes_from(text: String, start: Int) -> String {
+  let bits = <<text:utf8>>
+  // The caller checked that `text` starts with `start` bytes of its own.
+  let assert Ok(rest) =
+    bit_array.slice(bits, start, bit_array.byte_size(bits) - start)
+    as "a prefix's byte size is within the text that starts with it"
+  // A complete UTF-8 prefix ends between two characters of `text`.
+  let assert Ok(rest) = bit_array.to_string(rest)
+    as "the bytes after a UTF-8 prefix are UTF-8"
+  rest
+}
+
+/// The first `length` bytes of `text`. `length` ends right before an ASCII
+/// byte of `text`, so it falls between two characters.
+fn bytes_before(text: String, length: Int) -> String {
+  // The caller cut at an ASCII byte inside `text`.
+  let assert Ok(head) = bit_array.slice(<<text:utf8>>, 0, length)
+    as "the cut is within the text"
+  // An ASCII byte never continues a multi-byte UTF-8 sequence.
+  let assert Ok(head) = bit_array.to_string(head)
+    as "the bytes before an ASCII byte are UTF-8"
+  head
 }
 
 /// Determine MIME type from file extension.
@@ -711,14 +751,15 @@ pub fn mime_type(path: String) -> String {
 /// Extract the file extension of the last path segment, lowercased in ASCII,
 /// or "" when the name has no extension ("Makefile", ".env", "dir/"). The
 /// extensions `mime_type` knows are ASCII; a character outside ASCII is
-/// kept as it is, so such an extension is unknown (and keeps its length
-/// for `fingerprint`).
+/// kept as it is, so such an extension is unknown (and keeps its byte size
+/// for `fingerprint`). The name is split on `/` and `.` bytes (see
+/// `split_bytes`), so a combining mark after the `.` does not hide it.
 fn file_extension(path: String) -> String {
-  let name = case list.last(string.split(path, "/")) {
+  let name = case list.last(split_bytes(path, "/")) {
     Ok(segment) -> segment
     Error(Nil) -> path
   }
-  case string.split(name, ".") {
+  case split_bytes(name, ".") {
     // No dot, or a dotfile with no further extension.
     [_] | ["", _] -> ""
     parts ->
@@ -736,7 +777,10 @@ pub fn fingerprint(path: String, contents: BitArray) -> String {
   case file_extension(path) {
     "" -> path <> "-" <> hash
     ext -> {
-      let base = string.drop_end(path, string.length(ext) + 1)
+      // `ext` is the bytes after the last `.` (ASCII folding keeps the
+      // byte size), so the base is everything before that `.`.
+      let base =
+        bytes_before(path, string.byte_size(path) - string.byte_size(ext) - 1)
       base <> "-" <> hash <> "." <> ext
     }
   }
