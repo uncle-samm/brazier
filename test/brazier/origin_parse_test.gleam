@@ -372,7 +372,7 @@ fn old_parse_port(text: String) -> Result(Int, String) {
   }
 }
 
-@external(erlang, "brazier_render_ffi", "ascii_lowercase")
+@external(erlang, "brazier_ascii_ffi", "lowercase")
 fn old_ascii_lowercase(text: String) -> String
 
 /// The trim `brazier/transport` uses for Origin and Host, which is private

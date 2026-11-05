@@ -197,7 +197,7 @@ page_answer(Socket, Deadline) ->
 content_length(Headers) ->
     Lengths = [Value || Header <- Headers,
                         [Name, Value] <- [binary:split(Header, <<":">>)],
-                        brazier_render_ffi:ascii_lowercase(Name) =:= <<"content-length">>],
+                        brazier_ascii_ffi:lowercase(Name) =:= <<"content-length">>],
     case Lengths of
         [Value] ->
             case string:to_integer(string:trim(Value)) of

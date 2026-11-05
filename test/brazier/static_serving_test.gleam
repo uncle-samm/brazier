@@ -37,6 +37,16 @@ fn cleanup(dir: String) -> Nil {
   Nil
 }
 
+/// Deletes each file by name, without listing its directory. On macOS,
+/// OTP 28's `file:list_dir/1` never returns for a directory that holds a
+/// name starting with a combining mark, so `cleanup` (which lists) can only
+/// run once those files are gone.
+fn delete_files(paths: List(String)) -> Nil {
+  list.each(paths, fn(path) {
+    let assert Ok(Nil) = simplifile.delete_file(path) as "test file cleanup"
+  })
+}
+
 fn config_for(static_cfg: option.Option(static.StaticConfig)) {
   transport.TransportConfig(
     port: 0,
@@ -162,6 +172,125 @@ pub fn traversal_and_hidden_paths_are_refused_test() {
     let assert True = resp.status == 403
   })
   cleanup(dir)
+}
+
+// A combining mark (U+0301) joins the character before it into one grapheme
+// cluster: `.` + U+0301, `/` + U+0301, `\` + U+0301. The file system reads
+// bytes, so the path checks must too.
+
+pub fn combining_mark_does_not_hide_traversal_test() {
+  [
+    "..\u{0301}/",
+    "/static/..\u{0301}/etc/passwd",
+    "/\u{0301}..",
+    "/static/\u{0301}../etc/passwd",
+    "/a%2f\u{0301}b",
+    "/a%2F\u{0301}b",
+    "/a%2e\u{0301}",
+    "/a%5c\u{0301}b",
+    "/a%00\u{0301}b",
+    "/a\\\u{0301}b",
+  ]
+  |> list.each(fn(path) {
+    let assert True = static.contains_traversal(path)
+      as "a traversal sequence before a combining mark is still found"
+  })
+  let assert False = static.contains_traversal("/caf\u{0065}\u{0301}/a.txt")
+    as "a combining mark alone is not traversal"
+}
+
+pub fn combining_mark_does_not_smuggle_a_separator_test() {
+  let dir = temp_dir("combining_refused")
+  let assert Ok(Nil) = simplifile.create_directory_all(dir <> "/a")
+    as "test directory must be creatable"
+  // Files a smuggled separator would reach, so a refusal is not a miss.
+  write(dir <> "/a/\u{0301}b", "behind an encoded slash")
+  write(dir <> "/c:\u{0301}x", "behind a drive separator")
+  let cfg = static.StaticConfig(directory: dir, prefix: "/static", max_age: 0)
+  [
+    "/static/..\u{0301}/etc/passwd",
+    "/static/\u{0301}../etc/passwd",
+    "/static/a%2f\u{0301}b",
+    "/static/a%2F\u{0301}b",
+    "/static/a%5c\u{0301}b",
+    "/static/a\\\u{0301}b",
+    "/static/c:\u{0301}x",
+    "/static/c%3a\u{0301}x",
+  ]
+  |> list.each(fn(path) {
+    let assert Ok(resp) = static.serve(cfg, path)
+      as "a refused path must be answered"
+    let assert True = resp.status == 403
+      as "a separator before a combining mark is still refused"
+  })
+  delete_files([dir <> "/a/\u{0301}b"])
+  cleanup(dir)
+}
+
+pub fn names_with_combining_marks_are_served_test() {
+  let dir = temp_dir("combining_served")
+  let assert Ok(Nil) = simplifile.create_directory_all(dir <> "/a")
+    as "test directory must be creatable"
+  write(dir <> "/cafe\u{0301}.txt", "decomposed")
+  write(dir <> "/\u{0301}lead.txt", "leading mark")
+  write(dir <> "/x.\u{0301}txt", "mark after the dot")
+  write(dir <> "/a/\u{0301}b.txt", "mark after the slash")
+  let cfg = static.StaticConfig(directory: dir, prefix: "/static", max_age: 0)
+  [
+    #("/static/cafe\u{0301}.txt", "/cafe\u{0301}.txt"),
+    #("/static/cafe%CC%81.txt", "/cafe\u{0301}.txt"),
+    #("/static/\u{0301}lead.txt", "/\u{0301}lead.txt"),
+    #("/static/x.\u{0301}txt", "/x.\u{0301}txt"),
+    #("/static/a/\u{0301}b.txt", "/a/\u{0301}b.txt"),
+  ]
+  |> list.each(fn(case_) {
+    let #(path, file) = case_
+    let assert Ok(resp) = static.serve(cfg, path)
+      as "a name with a combining mark is a file"
+    let assert True = resp.status == 200 as "a legit name is served"
+    let assert server.File(path: served, ..) = resp.body
+      as "a static file is sent from disk"
+    let assert True = served == dir <> file
+      as "the file served is the one named"
+  })
+  delete_files([dir <> "/\u{0301}lead.txt", dir <> "/a/\u{0301}b.txt"])
+  cleanup(dir)
+}
+
+pub fn prefix_ending_in_a_prepend_character_is_cut_in_bytes_test() {
+  // U+0600 is a Prepend character: it joins the `/` after it into one
+  // grapheme cluster, so cutting the prefix off by graphemes ate the `/`.
+  let dir = temp_dir("prepend")
+  write(dir <> "/ok.txt", "ok")
+  let cfg =
+    static.StaticConfig(directory: dir, prefix: "/st\u{0600}", max_age: 0)
+  let assert Ok(Nil) = static.validate_config(cfg)
+    as "the prefix is a valid static prefix"
+  let assert Ok(resp) = static.serve(cfg, "/st\u{0600}/ok.txt")
+    as "the file below the prefix is found"
+  let assert True = resp.status == 200 as "the file below the prefix is served"
+  cleanup(dir)
+}
+
+pub fn fingerprint_and_mime_type_split_names_in_bytes_test() {
+  // The `.` before a combining mark is a `.` byte: the extension is what
+  // follows it, as the file system and the browser see the name.
+  let assert True =
+    static.fingerprint("app.\u{0301}js", <<"x":utf8>>)
+    == "app-" <> static_hash_16(<<"x":utf8>>) <> ".\u{0301}js"
+    as "the extension after a `.` + mark is kept after the hash"
+  let assert True =
+    static.fingerprint("cafe\u{0301}.js", <<"x":utf8>>)
+    == "cafe\u{0301}-" <> static_hash_16(<<"x":utf8>>) <> ".js"
+    as "a mark in the base is kept"
+  let assert "application/octet-stream" = static.mime_type("x.\u{0301}css")
+  let assert "text/css; charset=utf-8" = static.mime_type("d/\u{0301}x.css")
+}
+
+/// The 16 hex characters `fingerprint` puts in a name for `contents`.
+fn static_hash_16(contents: BitArray) -> String {
+  let name = static.fingerprint("LICENSE", contents)
+  string.drop_start(name, string.length("LICENSE-"))
 }
 
 pub fn invalid_percent_encoding_is_bad_request_test() {

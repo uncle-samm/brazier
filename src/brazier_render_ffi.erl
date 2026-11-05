@@ -48,24 +48,13 @@ event_bytes(<<C, Rest/binary>>) when ?IS_ALNUM(C) orelse C =:= $- orelse C =:= $
 event_bytes(_) ->
     false.
 
-%% `Name` with `A-Z` lowercased, every other byte unchanged. A name with no
-%% `A-Z` is returned as it is, without a copy. Unlike `string:lowercase/1`,
-%% which raises and catches an exception for every name that is already
-%% lowercase, this only scans bytes; it is the same for the ASCII names
-%% `is_markup_name/1` accepts.
+%% The ASCII folding moved to brazier_ascii_ffi:lowercase/1 (the one
+%% implementation, behind brazier/internal/ascii.lowercase); this export
+%% only forwards to it for brazier_transport_ffi:normalize_header_name/1,
+%% which still calls it here. Remove it once that caller names
+%% brazier_ascii_ffi (docs/TODO.md).
 -spec ascii_lowercase(binary()) -> binary().
-ascii_lowercase(Name) ->
-    case has_upper(Name) of
-        false -> Name;
-        true -> << <<(lower_byte(C))>> || <<C>> <= Name >>
-    end.
-
-has_upper(<<>>) -> false;
-has_upper(<<C, _/binary>>) when C >= $A, C =< $Z -> true;
-has_upper(<<_, Rest/binary>>) -> has_upper(Rest).
-
-lower_byte(C) when C >= $A, C =< $Z -> C + 32;
-lower_byte(C) -> C.
+ascii_lowercase(Name) -> brazier_ascii_ffi:lowercase(Name).
 
 %% Escape `&`, `<` and `>`.
 -spec escape_html(binary()) -> binary().

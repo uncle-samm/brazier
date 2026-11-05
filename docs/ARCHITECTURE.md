@@ -389,6 +389,17 @@ it and never one before it. The children, in start order:
 5. **The presence tracker**, when configured (`presence.supervised`).
 6. **The HTTP/WebSocket listener** (`transport.supervised`).
 
+The root (`brazier_app_sup`) restarts at most 2 times in 5 seconds and gives
+each child the id of its place in this order. Like the listener's own
+supervisor, it starts with no children and adds them with
+`supervisor:start_child`, one by one, as Ranch adds a listener to the running
+`ranch_sup`. A child that cannot start is then an error `start_supervised`
+returns (`"Supervision tree failed to start: cannot listen on port 4000:
+eaddrinuse (address already in use)"`), not an exit of the root's own start,
+which killed a caller that did not trap exits. The children already started
+are stopped, unlinked from the caller first, so the caller gets no exit
+signal.
+
 `application.start` (tests, embedding) starts the shared infrastructure
 unsupervised, and the table owner on demand runs until the node stops.
 
@@ -440,7 +451,7 @@ drain under one node-local `global:trans` lock, so an app is stopped once.
 | `patch` | JSON Patch diff and apply (Erlang FFI) |
 | `api` | Typed handlers for `brazier.api_routes` |
 | `middleware` | HTTP middleware pipeline ([MIDDLEWARE.md](MIDDLEWARE.md)) |
-| `static` | Static files with traversal prevention |
+| `static` | Static files with traversal prevention; the path checks read bytes, never grapheme clusters ([SECURITY.md](SECURITY.md#static-files)) |
 | `cookie`, `session`, `auth` | Cookies, server-side sessions, login/logout and session-bound WebSockets |
 | `form`, `upload` | Form helpers and CSRF; bounded multipart uploads with content sniffing |
 | `rate_limit`, `ip` | Fixed-window rate limiting; trusted-proxy client addresses |
@@ -454,7 +465,7 @@ drain under one node-local `global:trans` lock, so an app is stopped once.
 | `notification` | Typed PubSub payloads for `on_notification` |
 | `debug` | Runtime statistics |
 | `internal/wire_decode` | Fail-fast decoders the generated codecs read models and events with, on the server and in the browser, keeping `gleam/dynamic/decode` errors |
-| `internal/ascii` | ASCII-only case folding for protocol text (header names, tokens, schemes); Unicode folding would make the Kelvin sign equal `k` |
+| `internal/ascii` | ASCII-only case folding for protocol text (header names, tokens, schemes, attribute names, Gleam names in the build); Unicode folding would make the Kelvin sign equal `k`. The one ASCII folding on each target (`brazier_ascii_ffi.erl`, `.mjs`) |
 
 ### Tooling
 
@@ -462,7 +473,7 @@ drain under one node-local `global:trans` lock, so an app is stopped once.
 |---|---|
 | `build`, `build/*` | The build pipeline above |
 | `dev` | Build, run, rebuild and hot-reload on change (with `fswatch` or `inotifywait`, required), then tell every open page to reload |
-| `lint` | Glance-based linter for the engineering principles (`gleam run -m brazier/lint`) |
+| `lint` | Glance-based linter for the engineering principles (`gleam run -m brazier/lint`); among its rules, `unicode-case-folding` refuses `string.lowercase`, `uppercase` and `capitalise` in `src/` outside `case_folding_allowed` |
 
 ## Dependencies
 

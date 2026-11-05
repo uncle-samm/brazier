@@ -4,7 +4,8 @@
 %% peer nodes, so the tree owns PubSub and the session scope there.
 
 -export([children/1, restarted/3, crash/2, http_status/1,
-         snapshot/0, leftovers/1, whereis_name/1, receive_broadcast/2]).
+         snapshot/0, leftovers/1, whereis_name/1, receive_broadcast/2,
+         child_specs/1]).
 
 %% The root supervisor's children in start order (static_supervisor gives
 %% child N the id N). Crashes if a child is not running.
@@ -14,6 +15,19 @@ children(Sup) ->
          Pid when is_pid(Pid) -> Pid;
          Other -> erlang:error({child_not_running, Id, Other})
      end || {Id, Child, _Type, _Modules} <- Rows].
+
+%% The root supervisor's child specs in start order, each as
+%% "Id Restart Type Shutdown Significant" (supervisor:get_childspec/2).
+child_specs(Sup) ->
+    Ids = lists:sort([Id || {Id, _, _, _} <- supervisor:which_children(Sup)]),
+    [begin
+         {ok, #{restart := Restart, type := Type, shutdown := Shutdown,
+                significant := Significant}} = supervisor:get_childspec(Sup, Id),
+         format_text("~p ~p ~p ~p ~p", [Id, Restart, Type, Shutdown, Significant])
+     end || Id <- Ids].
+
+format_text(Format, Args) ->
+    iolist_to_binary(io_lib:format(Format, Args)).
 
 %% Crash unless child Index (0-based) runs with a pid other than Old. Call
 %% it once Sup has handled Old's exit signal (await.with_watch_exit on Sup,

@@ -33,9 +33,33 @@
 %%     so it outlives every request. When the table cannot be had, the
 %%     request fails with cache_unavailable: there is no silent fallback to
 %%     uncached hashing.
--export([file_digest/4, now_seconds/0, cache_size/0]).
+%%
+%% PATH BYTES. A request path names bytes on the file system, so the path
+%% checks in brazier/static.gleam compare bytes: contains_bytes/2 and
+%% split_bytes/2 below. gleam/string's contains and split go through
+%% string:find/2 and string:split/3, which match grapheme clusters: a
+%% combining mark after `.`, `/` or `\` joins it into one grapheme with the
+%% character before, so `..` + U+0301 does not contain `..` and `/` + U+0301
+%% is not split on `/`, though the file system sees both bytes.
+-export([file_digest/4, now_seconds/0, cache_size/0,
+         contains_bytes/2, split_bytes/2]).
 
 -include_lib("kernel/include/file.hrl").
+
+%% True when Haystack holds any of Needles as a byte sequence.
+-spec contains_bytes(binary(), [binary(), ...]) -> boolean().
+contains_bytes(Haystack, [_ | _] = Needles) when is_binary(Haystack) ->
+    binary:match(Haystack, Needles) =/= nomatch.
+
+%% Text split at every occurrence of the byte sequence Separator, empty
+%% parts kept (as gleam/string.split does). Separator is ASCII, and an ASCII
+%% byte never occurs inside a multi-byte UTF-8 sequence, so every part of
+%% valid UTF-8 is valid UTF-8.
+-spec split_bytes(binary(), binary()) -> [binary(), ...].
+split_bytes(Text, Separator) when is_binary(Text), byte_size(Separator) > 0 ->
+    %% The separator is ASCII, or a part could cut a character in two.
+    true = lists:all(fun(Byte) -> Byte < 128 end, binary_to_list(Separator)),
+    binary:split(Text, Separator, [global]).
 
 -define(CHUNK_BYTES, 65536).
 -define(TABLE, brazier_static_digests).

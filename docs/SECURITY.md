@@ -291,6 +291,21 @@ Before WebSocket upgrade, Brazier limits total header count, total request/heade
 
 HTTP responses are validated immediately before serialization. Header names must be RFC token names, and header values must not contain CR, LF, or NUL bytes. Unsafe response headers fail loudly instead of being written to the socket, preventing HTTP response splitting from API routes or middleware.
 
+## Static Files
+
+`brazier/static` follows Plug.Static. The prefix matches only on a `/`
+segment boundary. A path holding `..`, `\`, NUL, or an encoded `.`, `/`,
+`\` or NUL (`%2e`, `%2f`, `%5c`, `%00`, in either case) gets 403. So does
+any segment that decodes to `.`, `..` or the empty string, starts with `.`
+(a hidden file), or holds `/`, `\`, `:` or NUL.
+
+Every one of these checks reads the path as bytes, the way the file system
+does, and never as grapheme clusters. A combining mark such as U+0301 joins
+the `.`, `/` or `\` before it into one grapheme, so a grapheme search finds
+no `..` in `..` + U+0301 and no split point in `/` + U+0301, though the file
+system sees both. The prefix is cut off by its byte size for the same
+reason.
+
 ## HTML Attribute Validation
 
 Brazier escapes text (`&`, `<`, `>`) and attribute values (also `"`) during SSR and in the browser. The escapers work on bytes on Erlang and UTF-16 code units in JavaScript, never on graphemes, so every `"` is escaped even when a combining mark follows it and the two form one grapheme.
@@ -299,11 +314,11 @@ Brazier escapes text (`&`, `<`, `>`) and attribute values (also `"`) during SSR 
 
 - an inline event attribute such as `onclick`: use `brazier/event`;
 - `srcdoc`, whose value is a whole HTML document: use `attribute.unsafe_srcdoc` (see [Escape Hatches](#escape-hatches));
-- `attributeName` with a value containing `href`: an SVG `<animate>` or `<set>` targeting `href` or `xlink:href` would change a link after the URL policy checked it. DOMPurify refuses the same values. See [SVG.md](SVG.md#animation);
+- `attributeName` with a value containing `href`: an SVG `<animate>` or `<set>` targeting `href` or `xlink:href` would change a link after the URL policy checked it. DOMPurify refuses the same values. The value is lowercased in ASCII only before the check: SVG matches attribute names code point by code point, and no character outside ASCII lowercases to `h`, `r`, `e` or `f`, so Unicode folding would refuse nothing more. DOMPurify compares the value case-sensitively (GHSA-c6gr-qvv4-5v3f), so this check is the stricter one. See [SVG.md](SVG.md#animation);
 - a name starting with `data-brazier-`, which the client reads and the render sets (`data-brazier-key`, `-stream`, `-on-<event>` and the rest). A forged `data-brazier-on-click` would send a handler id the view never rendered, a forged `data-brazier-stream` would make the client patch an element that is not a stream's container. Four names in the prefix are app API and allowed: `data-brazier-hook`, `-hook-watch`, `-preserve-children` and `-external` (see [HTML_ELEMENTS.md](HTML_ELEMENTS.md#attributes-brazierattribute)). The build refuses a reserved name it can know before the view runs;
 - a name with characters outside `a-z A-Z 0-9 - _ : .`.
 
-Names match case-insensitively. Attribute names come from application code, so such a name is a bug in the view. Event handler IDs are rendered as escaped attribute values.
+Names match case-insensitively in ASCII (`brazier/internal/ascii`): Unicode folding would turn the Kelvin sign U+212A into `k`. Attribute names come from application code, so such a name is a bug in the view. Event handler IDs are rendered as escaped attribute values.
 
 ### URL Policy
 
