@@ -467,7 +467,7 @@ pub fn compile_logs_an_app_warning_at_the_apps_own_line_test() {
   client_project(dir, emitted, False)
   let #(result, logs) =
     log_capture.capture(fn() {
-      client_bundle.compile(dir, root <> "/app/src", ".", [emitted])
+      client_bundle.compile(dir, root <> "/app/src", ".", [emitted], [])
     })
   let assert Ok(Nil) = result
   // Each warning names the place the compiler names in the original, and
@@ -510,7 +510,7 @@ pub fn compile_refuses_a_warning_in_a_line_the_build_generated_test() {
   client_project(dir, emitted, False)
   let #(result, logs) =
     log_capture.capture(fn() {
-      client_bundle.compile(dir, "app_src", ".", [emitted])
+      client_bundle.compile(dir, "app_src", ".", [emitted], [])
     })
   let assert Error(reason) = result
   let assert Ok(source_file) = program.absolute_path("app_src/app/view.gleam")
@@ -555,7 +555,7 @@ pub fn compile_refuses_a_pruned_brazier_module_warning_at_its_own_line_test() {
   write(dir, "src/brazier_app_entry.gleam", "pub fn main() { 1 }\n")
   let #(result, logs) =
     log_capture.capture(fn() {
-      client_bundle.compile(dir, "app_src", root <> "/brazier", [emitted])
+      client_bundle.compile(dir, "app_src", root <> "/brazier", [emitted], [])
     })
   let assert Error(reason) = result
   let assert Ok(source_file) =
@@ -587,12 +587,47 @@ pub fn compile_refuses_a_pruned_brazier_module_warning_at_its_own_line_test() {
     })
 }
 
+pub fn compile_refuses_a_whole_copied_brazier_module_warning_at_its_own_line_test() {
+  let root = fresh_dir("compile_copied_brazier_warning")
+  // A Brazier module the client project copies whole, as it copies
+  // `brazier/element`, whose third line warns on JavaScript.
+  let source = "pub fn id(x) { x }\n\npub fn big() { 9007199254740993 }\n"
+  write(root <> "/brazier", "src/brazier/big.gleam", source)
+  let dir = root <> "/client"
+  write(dir, "gleam.toml", js_toml)
+  write(dir, "src/brazier/big.gleam", source)
+  write(dir, "src/brazier_app_entry.gleam", "pub fn main() { 1 }\n")
+  let #(result, logs) =
+    log_capture.capture(fn() {
+      client_bundle.compile(dir, "app_src", root <> "/brazier", [], [
+        "brazier/big",
+      ])
+    })
+  let assert Error(reason) = result
+  let assert Ok(source_file) =
+    program.absolute_path(root <> "/brazier/src/brazier/big.gleam")
+  let assert True = string.contains(reason, "This is a Brazier bug")
+  // Brazier's own source at the copy's line and column, the copy alongside.
+  let assert True =
+    string.contains(
+      reason,
+      "\n- Int is outside JavaScript's safe integer range at "
+        <> source_file
+        <> ":3:16 (the client project's copy: /",
+    )
+    && string.ends_with(
+      reason,
+      "/compile_copied_brazier_warning/client/src/brazier/big.gleam:3:16)",
+    )
+  let assert True = log_capture.has(logs, level: "error", containing: [reason])
+}
+
 pub fn compile_refuses_a_warning_in_a_file_brazier_writes_test() {
   let dir = fresh_dir("compile_brazier_warning")
   client_project(dir, emit_view(view_source), True)
   let #(result, logs) =
     log_capture.capture(fn() {
-      client_bundle.compile(dir, "app_src", ".", [emit_view(view_source)])
+      client_bundle.compile(dir, "app_src", ".", [emit_view(view_source)], [])
     })
   let assert Error(reason) = result
   let assert True = string.contains(reason, "`gleam build` in " <> dir)
@@ -622,7 +657,7 @@ pub fn place_maps_an_app_warning_to_the_apps_line_test() {
     client_bundle.Sliced(emit_view(view_source), "/p/app/view.gleam"),
   ]
   let at = fn(location) {
-    client_bundle.place(program.Warning("w", Some(location)), sliced)
+    client_bundle.place(program.Warning("w", Some(location)), sliced, [])
   }
   let assert client_bundle.InAppCode(
     "w at /p/app/view.gleam:11:7 (the client project's copy: /c/src/app/view.gleam:5:7)",
@@ -638,7 +673,7 @@ pub fn place_refuses_an_app_warning_it_cannot_place_test() {
     client_bundle.Sliced(emit_view(view_source), "/p/app/view.gleam"),
   ]
   let at = fn(location) {
-    client_bundle.place(program.Warning("w", Some(location)), sliced)
+    client_bundle.place(program.Warning("w", Some(location)), sliced, [])
   }
   // The @external line before `abs`, and the blank line after it, are the
   // build's.
@@ -665,7 +700,7 @@ pub fn place_refuses_warnings_outside_app_modules_test() {
     ),
   ]
   let place = fn(location) {
-    client_bundle.place(program.Warning("w", location), sliced)
+    client_bundle.place(program.Warning("w", location), sliced, [])
   }
   // A generated file.
   let assert client_bundle.InBrazierCode(
@@ -682,5 +717,31 @@ pub fn place_refuses_warnings_outside_app_modules_test() {
     client_bundle.place(
       program.Warning("w", Some("/c/src/app/view.gleam:5:7")),
       [],
+      [],
     )
+}
+
+pub fn place_names_a_whole_copied_brazier_module_at_its_source_test() {
+  let copied = [
+    client_bundle.Copied("brazier/element", "/b/src/brazier/element.gleam"),
+  ]
+  let place = fn(location) {
+    client_bundle.place(program.Warning("w", location), [], copied)
+  }
+  // A whole copy repeats its source byte for byte: the same line and column.
+  let assert client_bundle.InBrazierCode(
+    "w at /b/src/brazier/element.gleam:12:3 (the client project's copy: /c/src/brazier/element.gleam:12:3)",
+  ) = place(Some("/c/src/brazier/element.gleam:12:3"))
+  let assert client_bundle.InBrazierCode(
+    "w in /b/src/brazier/element.gleam (the client project's copy: /c/src/brazier/element.gleam, which gives no line and column)",
+  ) = place(Some("/c/src/brazier/element.gleam"))
+  // A module whose path only starts like the copy's, and a Brazier file
+  // that is not a copy (the `brazier/log` shim), name the file the
+  // compiler names.
+  let assert client_bundle.InBrazierCode(
+    "w at /c/src/brazier/element/keyed.gleam:1:1",
+  ) = place(Some("/c/src/brazier/element/keyed.gleam:1:1"))
+  let assert client_bundle.InBrazierCode("w at /c/src/brazier/log.gleam:2:1") =
+    place(Some("/c/src/brazier/log.gleam:2:1"))
+  let assert client_bundle.InBrazierCode("w") = place(None)
 }

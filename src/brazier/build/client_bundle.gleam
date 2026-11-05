@@ -87,7 +87,7 @@ pub fn build(
     "brazier.build.client_bundle",
     "Building client bundle for " <> app.path,
   )
-  use project_files <- result.try(project_files(
+  use ClientProject(files: project_files, copied:) <- result.try(project_files(
     src_dir,
     brazier_root,
     runtime_dir,
@@ -101,7 +101,13 @@ pub fn build(
     app_manifest(project),
     packages,
   ))
-  use Nil <- result.try(compile(dir, src_dir, brazier_root, analysis.client))
+  use Nil <- result.try(compile(
+    dir,
+    src_dir,
+    brazier_root,
+    analysis.client,
+    copied,
+  ))
   use Nil <- result.try(files.write(files.join(dir, "bundle_entry.mjs"), entry))
   use Nil <- result.try(program.esbuild_bundle(
     dir,
@@ -153,6 +159,11 @@ pub fn publish(static: String, contents: String) -> Result(Bundle, String) {
 /// in a slice is placed in its source file through the module's segments
 /// (`source_map`), with the copy's place alongside.
 ///
+/// `copied` are the Brazier modules copied whole from `brazier_root/src`
+/// (`brazier/element`, ...): a copy's lines and columns are its source's, so
+/// a warning in one is named at the same place in Brazier's source, with the
+/// copy's place alongside.
+///
 /// A warning in a definition copied from the app's code is the app's, as
 /// the server's `gleam build` of the same source is: it is logged at the
 /// place in the app's file and does not fail the build, so an unused
@@ -174,6 +185,7 @@ pub fn compile(
   src_dir: String,
   brazier_root: String,
   emitted: List(reach.Emitted),
+  copied: List(String),
 ) -> Result(Nil, String) {
   use warnings <- result.try(program.gleam_build_warnings(dir))
   use sliced <- result.try(
@@ -186,7 +198,13 @@ pub fn compile(
       |> result.map(fn(source_file) { Sliced(emitted: module, source_file:) })
     }),
   )
-  let placed = list.map(warnings, place(_, sliced))
+  use copied <- result.try(
+    list.try_map(copied, fn(path) {
+      program.absolute_path(files.join(brazier_root, module_file(path)))
+      |> result.map(fn(source_file) { Copied(path:, source_file:) })
+    }),
+  )
+  let placed = list.map(warnings, place(_, sliced, copied))
   list.each(placed, fn(placed) {
     case placed {
       InAppCode(description) ->
@@ -228,6 +246,13 @@ pub type Sliced {
   Sliced(emitted: reach.Emitted, source_file: String)
 }
 
+/// A Brazier module the client project holds a whole copy of: its module
+/// path (`brazier/element`) and the absolute path of the file it was copied
+/// from, `<brazier_root>/src/<path>.gleam`.
+pub type Copied {
+  Copied(path: String, source_file: String)
+}
+
 /// A warning of the client project's compile, placed.
 pub type Placed {
   /// In a definition copied from the app's code, described at its place in
@@ -237,13 +262,24 @@ pub type Placed {
   InBrazierCode(description: String)
 }
 
-/// Place `warning` given the client project's `sliced` modules (see
-/// `compile`). A warning in a slice is described at the place in its source
-/// file, followed by the copy's place; one that maps to no place there is
-/// described at the copy's place, saying why. Never at a guessed line.
-pub fn place(warning: program.Warning, sliced: List(Sliced)) -> Placed {
-  case sliced_of(warning, sliced) {
-    Error(Nil) -> InBrazierCode(program.describe_warning(warning))
+/// Place `warning` given the client project's `sliced` modules and its
+/// whole `copied` Brazier modules (see `compile`). A warning in a slice is
+/// described at the place in its source file, followed by the copy's place;
+/// one that maps to no place there is described at the copy's place, saying
+/// why. A warning in a whole copy is described at the same place in its
+/// source file, followed by the copy's place. Never at a guessed line.
+pub fn place(
+  warning: program.Warning,
+  sliced: List(Sliced),
+  copied: List(Copied),
+) -> Placed {
+  case copy_of(warning, sliced, fn(module) { module.emitted.path }) {
+    Error(Nil) ->
+      case copy_of(warning, copied, fn(module) { module.path }) {
+        Ok(#(module, copy)) ->
+          InBrazierCode(describe_in_copy(warning.headline, copy, module))
+        Error(Nil) -> InBrazierCode(program.describe_warning(warning))
+      }
     Ok(#(module, copy)) ->
       case
         describe_in_slice(warning.headline, copy, module),
@@ -256,20 +292,48 @@ pub fn place(warning: program.Warning, sliced: List(Sliced)) -> Placed {
   }
 }
 
-/// The sliced module whose copy `warning` points into, and the warning's
-/// location there. The compiler prints absolute paths; matching the end,
-/// `/src/<module>.gleam`, does not depend on how the project's directory is
-/// spelled.
-fn sliced_of(
+/// The one of `modules` (each named by its module path, `path_of`) whose
+/// copy `warning` points into, and the warning's location there. The
+/// compiler prints absolute paths; matching the end, `/src/<module>.gleam`,
+/// does not depend on how the project's directory is spelled.
+fn copy_of(
   warning: program.Warning,
-  sliced: List(Sliced),
-) -> Result(#(Sliced, String), Nil) {
+  modules: List(module),
+  path_of: fn(module) -> String,
+) -> Result(#(module, String), Nil) {
   use location <- result.try(option.to_result(warning.location, Nil))
   use file <- result.try(option.to_result(program.warning_file(warning), Nil))
-  list.find(sliced, fn(module) {
-    string.ends_with(file, "/" <> module_file(module.emitted.path))
+  list.find(modules, fn(module) {
+    string.ends_with(file, "/" <> module_file(path_of(module)))
   })
   |> result.map(fn(module) { #(module, location) })
+}
+
+/// A warning `headline` at `copy` (the compiler's `file:line:column` in
+/// `module`'s whole copy), at the same place in its source file, which the
+/// copy repeats byte for byte, followed by the copy's place. A location with
+/// no line and column names the source file alone.
+fn describe_in_copy(headline: String, copy: String, module: Copied) -> String {
+  case program.location_line_column(copy) {
+    option.Some(#(line, column)) ->
+      headline
+      <> " at "
+      <> module.source_file
+      <> ":"
+      <> int.to_string(line)
+      <> ":"
+      <> int.to_string(column)
+      <> " (the client project's copy: "
+      <> copy
+      <> ")"
+    option.None ->
+      headline
+      <> " in "
+      <> module.source_file
+      <> " (the client project's copy: "
+      <> copy
+      <> ", which gives no line and column)"
+  }
 }
 
 /// A warning `headline` at `copy` (the compiler's `file:line:column` in
@@ -327,12 +391,18 @@ import * as App from './build/dev/javascript/brazier_client_app/brazier_app_entr
 start(App);
 "
 
+/// The client project's files, and the module paths of the Brazier modules
+/// among them copied whole from Brazier's sources (see `compile`).
+type ClientProject {
+  ClientProject(files: List(ProjectFile), copied: List(String))
+}
+
 fn project_files(
   src_dir: String,
   brazier_root: String,
   runtime_dir: String,
   analysis: Analysis,
-) -> Result(List(ProjectFile), String) {
+) -> Result(ClientProject, String) {
   use entry_module <- result.try(client_entry.generate(analysis))
   // An emitted Brazier module (`brazier/stream`) loads its FFI files from
   // Brazier's sources, a user module from the app's.
@@ -387,7 +457,12 @@ fn project_files(
       <> string.inspect(list.length(framework_ffi))
       <> " framework FFI files",
   )
-  Ok(project_files)
+  // The shim and the generated entry are written by Brazier, not copied:
+  // a warning there names the file the compiler names.
+  Ok(ClientProject(
+    files: project_files,
+    copied: list.map(framework, fn(source) { source.0 }),
+  ))
 }
 
 /// The JavaScript FFI files that the `@external(javascript, ...)` attributes
