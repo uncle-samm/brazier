@@ -37,7 +37,7 @@ jobs:
             echo "::error::The HEXPM_READ_API_KEY secret is not set. The CI image build needs it (see ci.yml)." >&2
             exit 1
           fi
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: refs/tags/${{ github.event.release.tag_name }}
           persist-credentials: false

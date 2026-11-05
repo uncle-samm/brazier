@@ -103,7 +103,7 @@ signed token, so open tabs lose their session.
 
 ## Requirements
 
-- Gleam 1.19.2 and Erlang/OTP 28.
+- Gleam 1.19.2 and Erlang/OTP 29.
 - `node` and `npx`: the build bundles the client with a pinned esbuild through
   `npx`, and `gleam test` needs both (client round-trip tests run in `node`,
   and the build fixture tests bundle with esbuild). A missing tool fails

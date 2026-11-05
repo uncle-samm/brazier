@@ -17,7 +17,7 @@ jobs:
     name: Build CI image
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Build CI image
         env:
           HEXPM_READ_API_KEY: ${{ secrets.HEXPM_READ_API_KEY }}
@@ -29,7 +29,7 @@ jobs:
           docker build --secret id=hexpm_read_api_key,env=HEXPM_READ_API_KEY -f Dockerfile.ci -t brazier-ci .
       - name: Save CI image
         run: docker save brazier-ci | gzip -1 > brazier-ci.tar.gz
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: brazier-ci-image
           path: brazier-ci.tar.gz
