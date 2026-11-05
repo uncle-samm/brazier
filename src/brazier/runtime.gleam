@@ -1827,9 +1827,10 @@ fn route_for_path(
 /// patch, `on_change` always runs for a known route.
 ///
 /// Returns whether the client was already answered: by the broadcast of a
-/// changed model, or by the `hard_navigate` or `error` of a refusal. When
-/// it was not (`on_change` left the model as it was), the caller sends an
-/// ack, so every navigation the runtime handles gets an answer.
+/// changed model, or by the `hard_navigate` of a refusal. When it was not
+/// (`on_change` left the model as it was, or the refusal was an `error`
+/// frame, which carries no clock), the caller sends an ack, so every
+/// navigation the runtime handles settles its clock on the client.
 fn handle_navigation(
   state: RuntimeState(model, msg),
   conn_id: transport.ConnectionId,
@@ -1846,16 +1847,14 @@ fn handle_navigation(
       let state = RuntimeState(..state, current_route_msg: Some(msg))
       run_update_for(state, msg, Some(conn_id), Some(telemetry.Navigate))
     }
-    Error(problem) -> #(
+    Error(problem) ->
       telemetry.runtime_span(
         telemetry.Navigate,
         transport.page_route,
         unknown_event,
         conn_id,
         fn() { refuse_navigation(state, conn_id, path, problem) },
-      ),
-      True,
-    )
+      )
   }
 }
 
@@ -1867,13 +1866,16 @@ type NavigationProblem {
 }
 
 /// Answer a navigation that does not run `on_change`: a hard navigation
-/// (the dead render answers it), or an error for a non-local path.
+/// (the dead render answers it), or an error for a non-local path. The
+/// `Bool` is whether that answered the navigation: an `error` frame does
+/// not carry the navigation's clock, so after one the caller sends the
+/// empty-patch ack that settles it (as for an event that changed nothing).
 fn refuse_navigation(
   state: RuntimeState(model, msg),
   conn_id: transport.ConnectionId,
   path: String,
   problem: NavigationProblem,
-) -> RuntimeState(model, msg) {
+) -> #(RuntimeState(model, msg), Bool) {
   case problem {
     NoRouter -> {
       log.warning(
@@ -1898,13 +1900,15 @@ fn refuse_navigation(
               <> "): "
               <> log_path(path),
           )
-          send_to_conn_id(
-            state,
-            conn_id,
-            transport.SendError(
-              reason: "navigation path must be a same-origin path",
-            ),
-          )
+          let state =
+            send_to_conn_id(
+              state,
+              conn_id,
+              transport.SendError(
+                reason: "navigation path must be a same-origin path",
+              ),
+            )
+          #(state, False)
         }
         BadEncoding(reason) -> {
           log.warning(
@@ -1937,15 +1941,19 @@ fn refuse_navigation(
 /// Send a hard navigation to `path`: the browser loads it. Only a
 /// same-origin path is ever sent (`internal/local_path`); every caller has
 /// already checked it, so another path is a bug in the runtime, which is
-/// logged as an error and answered with an error, never sent.
+/// logged as an error and answered with an error, never sent. The `Bool`
+/// is whether the navigation was answered (see `refuse_navigation`): the
+/// hard navigation answers it, the error does not.
 fn hard_navigate(
   state: RuntimeState(model, msg),
   conn_id: transport.ConnectionId,
   path: String,
-) -> RuntimeState(model, msg) {
+) -> #(RuntimeState(model, msg), Bool) {
   case local_path.check(path) {
-    Ok(Nil) ->
-      send_to_conn_id(state, conn_id, transport.SendHardNavigate(path: path))
+    Ok(Nil) -> #(
+      send_to_conn_id(state, conn_id, transport.SendHardNavigate(path: path)),
+      True,
+    )
     Error(reason) -> {
       log.error(
         "brazier.runtime",
@@ -1956,10 +1964,13 @@ fn hard_navigate(
           <> ": not a same-origin path, "
           <> reason,
       )
-      send_to_conn_id(
-        state,
-        conn_id,
-        transport.SendError(reason: "Invalid page path"),
+      #(
+        send_to_conn_id(
+          state,
+          conn_id,
+          transport.SendError(reason: "Invalid page path"),
+        ),
+        False,
       )
     }
   }

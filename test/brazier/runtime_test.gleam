@@ -446,6 +446,9 @@ pub fn navigation_to_non_local_path_is_refused_test() {
       let assert Ok(transport.SendError(reason: reason)) =
         process.receive(transport_subject, await.deadline_ms)
       let assert True = string.contains(reason, "same-origin path")
+      // The refusal is acked, so the client settles the navigation's clock.
+      let assert Ok(transport.SendPatch(ops_json: "[]", ..)) =
+        process.receive(transport_subject, await.deadline_ms)
     },
   )
   // The model was not touched.
