@@ -17,8 +17,11 @@
 /// 8. Every `let assert` in `src/` has a non-empty `as "..."` message
 ///    (`let-assert-message`, see `check_let_assert_messages`)
 /// 9. Every file must be readable and parse; failures are violations
+/// 10. No Unicode case folding (`string.lowercase`, `string.uppercase`,
+///     `string.capitalise`) in `src/` outside `case_folding_allowed`
+///     (`unicode-case-folding`, see `check_case_folding`)
 ///
-/// The AST rules (1, 2, 4 and 8) visit every statement and expression of a
+/// The AST rules (1, 2, 4, 8 and 10) visit every statement and expression of a
 /// function body at any depth (see `body_nodes`): code inside `use`
 /// callbacks, `assert`s, case guards, record updates, captures, bit arrays
 /// and `as` messages is checked like any other.
@@ -337,6 +340,8 @@ pub fn lint_source(file_path: String, source: String) -> List(Violation) {
         check_deprecated_route_api(file_path, source)
       let assert_message_violations =
         check_let_assert_messages(file_path, source, module)
+      let case_folding_violations =
+        check_case_folding(file_path, source, module, case_folding_allowed)
       list.flatten([
         todo_violations,
         logging_violations,
@@ -344,21 +349,214 @@ pub fn lint_source(file_path: String, source: String) -> List(Violation) {
         deprecated_route_violations,
         discard_violations,
         assert_message_violations,
+        case_folding_violations,
       ])
     }
-    Error(err) -> {
-      let message = source_location.describe_parse_error(file_path, source, err)
-      log.error("brazier.lint", "Cannot parse " <> message)
-      [
-        Violation(
-          file: file_path,
-          location: "file",
-          rule: "parse-error",
-          message: "Cannot parse: " <> message,
-        ),
-      ]
+    Error(err) -> [parse_error_violation(file_path, source, err)]
+  }
+}
+
+/// Run only the `unicode-case-folding` rule over `source`, with `allowed`
+/// in place of `case_folding_allowed`. `lint_source` runs it with
+/// `case_folding_allowed`; this entry point lets a test exercise an
+/// allow-list the source tree does not need.
+pub fn lint_case_folding(
+  file_path: String,
+  source: String,
+  allowed: List(CaseFoldingAllowance),
+) -> List(Violation) {
+  case glance.module(source) {
+    Ok(module) -> check_case_folding(file_path, source, module, allowed)
+    Error(err) -> [parse_error_violation(file_path, source, err)]
+  }
+}
+
+fn parse_error_violation(
+  file_path: String,
+  source: String,
+  err: glance.Error,
+) -> Violation {
+  let message = source_location.describe_parse_error(file_path, source, err)
+  log.error("brazier.lint", "Cannot parse " <> message)
+  Violation(
+    file: file_path,
+    location: "file",
+    rule: "parse-error",
+    message: "Cannot parse: " <> message,
+  )
+}
+
+/// A `src/` module allowed to fold text in Unicode, and the reason its text
+/// is Unicode by design rather than ASCII by grammar.
+pub type CaseFoldingAllowance {
+  CaseFoldingAllowance(path: String, reason: String)
+}
+
+/// The modules in `src/` allowed `string.lowercase`, `string.uppercase` and
+/// `string.capitalise`, each with its reason.
+///
+/// Those functions fold in Unicode: the Kelvin sign U+212A lowercases to
+/// `k`, U+0130 to `i` plus a combining dot, `ß` uppercases to `SS`. Almost
+/// all text the framework folds is ASCII by grammar: HTTP field names and
+/// tokens (RFC 9110 §5.1, §5.6.2), URL schemes (WHATWG URL), HTML and SVG
+/// attribute names, media types, file extensions and Gleam names (glexer's
+/// `[A-Z][A-Za-z0-9]*`). Unicode folding of such text lets a non-ASCII
+/// lookalike pass a check that compares against an ASCII name, so it is
+/// folded with `brazier/internal/ascii` instead.
+///
+/// The list is empty: no module in `src/` folds text that is Unicode by
+/// design. A module that does (say, a search that matches user text
+/// without case) is added here with the reason, which the rule requires to
+/// be non-empty.
+pub const case_folding_allowed: List(CaseFoldingAllowance) = []
+
+/// The `gleam/string` functions that fold case in Unicode.
+const unicode_case_functions = ["lowercase", "uppercase", "capitalise"]
+
+/// Flag every use of a Unicode case function from `gleam/string` in a `src/`
+/// module not in `allowed`: a qualified reference (`string.lowercase`,
+/// called, piped or passed as a value, in a function body or a constant)
+/// and an unqualified import (`import gleam/string.{lowercase}`). `examples/`
+/// is application code, where Unicode folding of user text is the app's
+/// choice, so the rule covers `src/` only.
+///
+/// The linter works on the untyped AST: a local variable named like the
+/// `gleam/string` import with a field named like a case function would be
+/// flagged too. No such code exists; renaming it would be the fix.
+fn check_case_folding(
+  file_path: String,
+  source: String,
+  module: glance.Module,
+  allowed: List(CaseFoldingAllowance),
+) -> List(Violation) {
+  case
+    string.starts_with(file_path, "src/"),
+    list.find(allowed, fn(allowance) { allowance.path == file_path })
+  {
+    False, _ -> []
+    True, Ok(allowance) ->
+      case string.trim(allowance.reason) {
+        "" -> [
+          Violation(
+            file: file_path,
+            location: "file",
+            rule: "unicode-case-folding",
+            message: "The case-folding allowance for "
+              <> file_path
+              <> " gives no reason. State why its text is Unicode by design.",
+          ),
+        ]
+        _ -> []
+      }
+    True, Error(Nil) -> {
+      let string_imports =
+        list.filter(module.imports, fn(def) {
+          def.definition.module == "gleam/string"
+        })
+      let import_violations =
+        list.flat_map(string_imports, fn(def) {
+          unqualified_case_imports(file_path, source, def.definition)
+        })
+      let qualifiers = list.flat_map(string_imports, import_qualifier)
+      let function_violations =
+        list.flat_map(module.functions, fn(def) {
+          let func = def.definition
+          body_nodes(func.body)
+          |> list.flat_map(fn(node) {
+            case_folding_violation(
+              file_path,
+              source,
+              qualifiers,
+              "function `" <> func.name <> "`",
+              node,
+            )
+          })
+        })
+      let constant_violations =
+        list.flat_map(module.constants, fn(def) {
+          let constant = def.definition
+          nodes_under(ExpressionNode(constant.value))
+          |> list.flat_map(fn(node) {
+            case_folding_violation(
+              file_path,
+              source,
+              qualifiers,
+              "constant `" <> constant.name <> "`",
+              node,
+            )
+          })
+        })
+      list.flatten([import_violations, function_violations, constant_violations])
     }
   }
+}
+
+/// The name `import gleam/string` binds for qualified access: `string`, or
+/// its `as` alias. `as _` binds none.
+fn import_qualifier(def: glance.Definition(glance.Import)) -> List(String) {
+  case def.definition.alias {
+    option.None -> ["string"]
+    option.Some(glance.Named(alias)) -> [alias]
+    option.Some(glance.Discarded(_)) -> []
+  }
+}
+
+fn unqualified_case_imports(
+  file_path: String,
+  source: String,
+  import_: glance.Import,
+) -> List(Violation) {
+  import_.unqualified_values
+  |> list.filter(fn(value) { list.contains(unicode_case_functions, value.name) })
+  |> list.map(fn(value) {
+    Violation(
+      file: file_path,
+      location: source_location.format_span(source, import_.location),
+      rule: "unicode-case-folding",
+      message: case_folding_message("the import of `" <> value.name <> "`"),
+    )
+  })
+}
+
+fn case_folding_violation(
+  file_path: String,
+  source: String,
+  qualifiers: List(String),
+  owner: String,
+  node: Node,
+) -> List(Violation) {
+  case node {
+    ExpressionNode(glance.FieldAccess(
+      container: glance.Variable(name: qualifier, ..),
+      label:,
+      location:,
+    )) ->
+      case
+        list.contains(qualifiers, qualifier),
+        list.contains(unicode_case_functions, label)
+      {
+        True, True -> [
+          Violation(
+            file: file_path,
+            location: source_location.format_span(source, location),
+            rule: "unicode-case-folding",
+            message: case_folding_message(
+              "`" <> qualifier <> "." <> label <> "` in " <> owner,
+            ),
+          ),
+        ]
+        _, _ -> []
+      }
+    ExpressionNode(..) | StatementNode(..) -> []
+  }
+}
+
+fn case_folding_message(what: String) -> String {
+  what
+  <> " folds case in Unicode (the Kelvin sign U+212A lowercases to `k`). "
+  <> "Fold text that is ASCII by grammar with `brazier/internal/ascii`, or "
+  <> "add the module to `case_folding_allowed` with the reason its text is "
+  <> "Unicode."
 }
 
 /// The comment that opts a single `let _ =` out of the discard rule.

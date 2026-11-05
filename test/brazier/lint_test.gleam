@@ -578,6 +578,173 @@ pub fn names_directory_that_does_not_exist_is_a_violation_test() {
   assert v.rule == "unreadable-path"
 }
 
+// --- unicode-case-folding ---
+
+fn rules(violations: List(lint.Violation)) -> List(String) {
+  list.map(violations, fn(v) { v.rule })
+}
+
+pub fn string_lowercase_call_in_src_is_violation_test() {
+  let source =
+    "import gleam/string
+pub fn name(text: String) -> String {
+  string.lowercase(text)
+}
+"
+  let assert [v] = lint.lint_source("src/brazier/other.gleam", source)
+    as "the one Unicode lowercase is the one violation"
+  assert v.rule == "unicode-case-folding"
+  assert v.location == "3:3"
+  assert str_contains(v.message, "`string.lowercase` in function `name`")
+  assert str_contains(v.message, "brazier/internal/ascii")
+}
+
+pub fn every_unicode_case_function_is_flagged_as_a_value_test() {
+  // A pipe, a reference passed as a value, a capture's function and a case
+  // guard: each is a use, called or not.
+  let source =
+    "import gleam/list
+import gleam/string
+pub fn names(texts: List(String), text: String) -> List(String) {
+  let first = text |> string.uppercase
+  let rest = list.map(texts, string.capitalise)
+  case text {
+    t if t == string.lowercase(t) -> [first, ..rest]
+    _ -> list.map(rest, string.lowercase(_))
+  }
+}
+"
+  let violations = lint.lint_source("src/brazier/other.gleam", source)
+  assert rules(violations)
+    == [
+      "unicode-case-folding", "unicode-case-folding", "unicode-case-folding",
+      "unicode-case-folding",
+    ]
+  assert list.map(violations, fn(v) { v.location })
+    == ["4:23", "5:30", "7:15", "8:25"]
+}
+
+pub fn aliased_string_import_is_followed_test() {
+  let source =
+    "import gleam/string as text
+pub fn name(value: String) -> String {
+  text.lowercase(value)
+}
+"
+  let assert [v] = lint.lint_source("src/brazier/other.gleam", source)
+    as "the alias names gleam/string"
+  assert v.rule == "unicode-case-folding"
+  assert str_contains(v.message, "`text.lowercase`")
+}
+
+pub fn unqualified_import_is_violation_test() {
+  let source =
+    "import gleam/string.{lowercase as lower, trim}
+pub fn name(value: String) -> String {
+  lower(trim(value))
+}
+"
+  let assert [v] = lint.lint_source("src/brazier/other.gleam", source)
+    as "the import of lowercase is the violation; trim is not"
+  assert v.rule == "unicode-case-folding"
+  assert v.location == "1:1"
+  assert str_contains(v.message, "the import of `lowercase`")
+}
+
+pub fn case_folding_in_a_constant_is_violation_test() {
+  let source =
+    "import gleam/string
+pub const fold = string.lowercase
+"
+  let assert [v] = lint.lint_source("src/brazier/other.gleam", source)
+    as "a constant holding the function is a use"
+  assert str_contains(v.message, "in constant `fold`")
+}
+
+pub fn other_modules_lowercase_is_not_flagged_test() {
+  // `ascii.lowercase` and a local `string` that is not the gleam/string
+  // import (here `as _` binds no qualifier) are not Unicode case folding.
+  let source =
+    "import brazier/internal/ascii
+import gleam/string.{trim} as _
+pub fn name(value: String) -> String {
+  ascii.lowercase(trim(value))
+}
+"
+  let assert [] = lint.lint_source("src/brazier/other.gleam", source)
+    as "ASCII folding is the fix, not a violation"
+}
+
+pub fn case_folding_outside_src_is_not_checked_test() {
+  let source =
+    "import gleam/string
+pub fn search(query: String) -> String {
+  string.lowercase(query)
+}
+"
+  // Tests (an oracle may fold in Unicode) and examples (application code)
+  // are not checked.
+  let assert [] = lint.lint_source("test/brazier/other_test.gleam", source)
+    as "tests may fold in Unicode"
+  let assert [] = lint.lint_source("examples/search/src/search.gleam", source)
+    as "examples are application code"
+}
+
+pub fn allowed_module_with_a_reason_may_fold_in_unicode_test() {
+  let source =
+    "import gleam/string
+pub fn search(query: String) -> String {
+  string.lowercase(query)
+}
+"
+  let allowed = [
+    lint.CaseFoldingAllowance(
+      path: "src/brazier/search.gleam",
+      reason: "matches user text without case; the text is Unicode",
+    ),
+  ]
+  let assert [] =
+    lint.lint_case_folding("src/brazier/search.gleam", source, allowed)
+    as "an allowed module is not flagged"
+  // The allowance names one module, not its neighbours.
+  let assert [v] =
+    lint.lint_case_folding("src/brazier/other.gleam", source, allowed)
+    as "a module not on the list is flagged"
+  assert v.rule == "unicode-case-folding"
+}
+
+pub fn allowance_without_a_reason_is_violation_test() {
+  let source =
+    "import gleam/string
+pub fn search(query: String) -> String {
+  string.lowercase(query)
+}
+"
+  let allowed = [
+    lint.CaseFoldingAllowance(path: "src/brazier/search.gleam", reason: "  "),
+  ]
+  let assert [v] =
+    lint.lint_case_folding("src/brazier/search.gleam", source, allowed)
+    as "an allowance must say why its text is Unicode"
+  assert v.rule == "unicode-case-folding"
+  assert v.location == "file"
+  assert str_contains(v.message, "gives no reason")
+}
+
+pub fn case_folding_allow_list_is_empty_test() {
+  // Every case folding in src/ folds text that is ASCII by grammar. An
+  // entry added here must come with its reason (the rule checks it); this
+  // test makes adding one a deliberate change.
+  assert lint.case_folding_allowed == []
+}
+
+pub fn lint_case_folding_reports_a_parse_error_test() {
+  let assert [v] =
+    lint.lint_case_folding("src/brazier/other.gleam", "pub fn (", [])
+    as "unparseable source is a violation"
+  assert v.rule == "parse-error"
+}
+
 // --- Helper ---
 
 fn str_contains(haystack: String, needle: String) -> Bool {
