@@ -52,12 +52,15 @@ pub fn with_watch_pg_scope_unwatches_when_the_body_crashes_test() {
   let assert Error(#("error", _)) =
     rescue(fn() {
       use watch <- await.with_watch_pg_scope(scope)
-      process.send(watches, watch)
+      process.send(watches, #(watch, pg_scope_watched(watch)))
       panic as "test body crashed on purpose"
     })
     as "the body's crash is re-raised"
-  let assert Ok(watch) = process.receive(watches, 0)
+  let assert Ok(#(watch, watched_in_body)) = process.receive(watches, 0)
     as "the body ran with a watch"
+  // The probe sees a monitor that is in place, so its False below means
+  // the monitor is gone.
+  assert watched_in_body as "the probe saw the watch while the body ran"
   assert !pg_scope_watched(watch)
     as "the scope monitor was removed although the body crashed"
 }

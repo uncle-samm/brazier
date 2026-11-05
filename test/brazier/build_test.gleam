@@ -4,6 +4,8 @@ import brazier/build
 import brazier/build/discovery
 import brazier/build/program
 import brazier/build/sources
+import brazier/cluster/peer.{Timeout}
+import gleam/erlang/atom
 import gleam/list
 import gleam/option.{None, Some}
 import gleam/string
@@ -132,6 +134,25 @@ pub fn program_run_passes_unicode_arguments_unchanged_test() {
     program.run(".", "printf", ["%s", "zoë \" </script> 日本"])
   let assert "zoë \" </script> 日本" = output
 }
+
+/// A VM whose locale is not UTF-8 (a bare container) encodes file names
+/// and port arguments as latin1. The arguments still reach the program as
+/// the same UTF-8 text: they are passed as bytes, not encoded again.
+pub fn program_run_passes_unicode_arguments_under_latin1_test_() -> peer.Timeout {
+  use <- Timeout(60)
+  use peers <- peer.with_cluster_args(1, "brazier_build_latin1", ["+fnl"])
+  let assert [node] = peers as "the cluster starts one peer"
+  assert peer.on(node, native_name_encoding) == atom.create("latin1")
+    as "the peer runs in latin1 file name mode"
+  let output =
+    peer.on(node, fn() {
+      program.run(".", "printf", ["%s", "zoë \" </script> 日本"])
+    })
+  assert output == Ok("zoë \" </script> 日本")
+}
+
+@external(erlang, "file", "native_name_encoding")
+fn native_name_encoding() -> atom.Atom
 
 pub fn program_run_nonzero_exit_is_an_error_test() {
   let assert Error(reason) = program.run(".", "sh", ["-c", "echo boom; exit 3"])

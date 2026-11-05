@@ -3,13 +3,13 @@
 
 %% Run a program without invoking a shell. This prevents build-time command
 %% injection through project paths or path dependencies.
-%% Paths and arguments are UTF-8 binaries. They are converted to character
-%% lists, not byte lists, so a non-ASCII path or argument reaches the program
-%% as the same UTF-8 text instead of each byte re-encoded as a character.
-run_program(Cwd0, Program0, Args0) ->
-    Cwd = unicode:characters_to_list(Cwd0),
+%% The working directory and arguments are UTF-8 binaries, and open_port is
+%% given them as binaries: those reach the program byte for byte. A character
+%% list is encoded with the VM's file name encoding instead, which is latin1
+%% when the locale is not UTF-8 (a bare container), and there open_port
+%% raises badarg for any character past U+00FF.
+run_program(Cwd, Program0, Args) ->
     Program = unicode:characters_to_list(Program0),
-    Args = [unicode:characters_to_list(Arg) || Arg <- Args0],
     case os:find_executable(Program) of
         false ->
             {error, unicode:characters_to_binary(["Executable not found: ", Program])};

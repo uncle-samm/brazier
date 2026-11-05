@@ -13,14 +13,22 @@ stop_pg_scope(ScopeName) ->
     ok = gen_server:stop(binary_to_existing_atom(ScopeName)),
     nil.
 
-%% Whether the watch's scope monitor is still in place. pg:demonitor/2
-%% removes it if it is (ok) and reports false if not, so the watch must not
-%% be used afterwards.
+%% Whether the watch's scope monitor is still in place: the caller joins a
+%% group of its own in the scope and leaves it. pg notifies every scope
+%% monitor while it handles the join, before it replies, so a monitor still
+%% in place has put its join notice in the caller's mailbox when
+%% pg:join/3 returns. The probe's notices are flushed. pg:demonitor/2 cannot
+%% tell: since OTP 29 it returns ok for a reference it does not know.
 pg_scope_watched({Scope, Ref}) ->
-    case pg:demonitor(Scope, Ref) of
-        ok -> true;
-        false -> false
-    end.
+    Group = {brazier_await_probe, make_ref()},
+    ok = pg:join(Scope, Group, self()),
+    ok = pg:leave(Scope, Group, self()),
+    Watched = receive
+                  {Ref, join, Group, _Pids} -> true
+              after 0 -> false
+              end,
+    flush_pg_notices(Ref),
+    Watched.
 
 %% A mailbox barrier on an OTP process (a gleam_otp actor, gen_server or any
 %% sys-compliant process). sys:get_state/2 is answered in mailbox order, so

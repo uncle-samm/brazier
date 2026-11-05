@@ -546,7 +546,12 @@ two jobs. Building it downloads the dependencies of the root and every
 example, about 400 Hex API requests, so the build needs the repository secret
 `HEXPM_READ_API_KEY`: a read-only Hex key (unauthenticated, GitHub runners
 share the limit of 100 requests a minute per IP). The image job fails if the
-secret is missing. A local `docker build` may leave it out. The two jobs:
+secret is missing. A local `docker build` may leave it out, but past about
+100 requests in a minute Hex refuses it. The image runs the tests as the
+unprivileged user `brazier`, as the production image runs the app: as root,
+a file whose permissions forbid reading it is still read, so the tests of
+permission errors would fail. The image's Erlang is the Gleam image's (OTP
+29), newer than the 28.4 that `mise.toml` pins for local runs. The two jobs:
 
 - **Gleam build, test, lint.** These steps run in order and stop at the
   first failure:

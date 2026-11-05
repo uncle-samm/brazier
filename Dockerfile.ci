@@ -40,10 +40,22 @@ RUN if command -v apt-get >/dev/null 2>&1; then \
       exit 1; \
     fi
 
-COPY requirements-dev.txt ./
+# The tests run as an unprivileged user, as the production image does. Root
+# reads a file whose permissions forbid reading it, so as root the tests of
+# permission errors (an unreadable static file is a 500) cannot fail the way
+# they must.
+RUN if command -v useradd >/dev/null 2>&1; then \
+      useradd --create-home --shell /bin/sh brazier; \
+    else \
+      adduser -D -s /bin/sh brazier; \
+    fi && \
+    chown brazier:brazier /app
+USER brazier
+
+COPY --chown=brazier:brazier requirements-dev.txt ./
 RUN python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
 
-COPY . .
+COPY --chown=brazier:brazier . .
 
 ENV CHROME_BIN=/usr/bin/chromium
 ENV CHROME_EXTRA_ARGS="--no-sandbox --disable-dev-shm-usage"
