@@ -330,19 +330,19 @@ pub fn default_security_limits() -> SecurityLimits {
 const max_timer_ms = 4_294_967_295
 
 /// A drain timeout is a receive timeout: 0 (kill at once) up to the largest
-/// timer.
+/// timer. A refusal is returned, not logged: each caller logs it once with
+/// its own context ("Invalid security limits: ...", or the application's
+/// "BRAZIER_SHUTDOWN_TIMEOUT: ..."), so one refusal makes one log line.
 pub fn validate_drain_timeout(ms: Int) -> Result(Nil, String) {
   case ms >= 0 && ms <= max_timer_ms {
     True -> Ok(Nil)
-    False -> {
-      let reason =
+    False ->
+      Error(
         "drain_timeout_ms must be in 0.."
         <> int.to_string(max_timer_ms)
         <> "ms, got "
-        <> int.to_string(ms)
-      log.warning("brazier.transport", "Refusing drain timeout: " <> reason)
-      Error(reason)
-    }
+        <> int.to_string(ms),
+      )
   }
 }
 
@@ -2657,7 +2657,8 @@ pub opaque type AllowedOrigins {
 }
 
 /// Parse `ws_allowed_origins` entries; each must be a bare
-/// `scheme://host[:port]` origin (http or https, no path).
+/// `scheme://host[:port]` origin (http or https, no path). A refusal is
+/// returned for the caller to log once ("Invalid security limits: ...").
 pub fn parse_allowed_origins(
   entries: List(String),
 ) -> Result(AllowedOrigins, String) {
@@ -2689,13 +2690,7 @@ pub fn parse_allowed_origins(
       )
       Ok(AllowedOrigins(origins: origins))
     }
-    Error(reason) -> {
-      log.warning(
-        "brazier.transport",
-        "Refusing ws_allowed_origins: " <> reason,
-      )
-      Error(reason)
-    }
+    Error(reason) -> Error(reason)
   }
 }
 
@@ -2720,7 +2715,8 @@ pub const development_allowed_hosts = [".localhost", "127.0.0.1", "[::1]"]
 
 /// Parse `allowed_hosts`. An empty list is refused in production (the
 /// error names the setting) and means `development_allowed_hosts`
-/// otherwise.
+/// otherwise. A refusal is returned for the caller to log once ("Invalid
+/// security limits: ...").
 @internal
 pub fn parse_allowed_hosts(
   entries: List(String),
@@ -2763,10 +2759,7 @@ pub fn parse_allowed_hosts(
       }
       Ok(AllowedHosts(patterns: patterns))
     }
-    Error(reason) -> {
-      log.warning("brazier.transport", "Refusing allowed_hosts: " <> reason)
-      Error(reason)
-    }
+    Error(reason) -> Error(reason)
   }
 }
 
