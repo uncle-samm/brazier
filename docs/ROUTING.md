@@ -184,9 +184,11 @@ of one page send nothing either. A link to another page's fragment
 server is sent only the path. Once the new page is rendered, the client
 scrolls to the element whose id is the fragment (else to the `<a>` with that
 `name`), or to the top of the page with a console warning when the page has
-neither; `router.push("/docs#install")` does the same. These are LiveView's
-rules (`DOM.isNewPageClick`, and `Browser.pushState` scrolling after the
-patch reply). Back and forward keep the browser's scroll restoration. The
+neither; `router.push("/docs#install")` does the same. A navigation to a URL
+without a fragment scrolls to the top once its page is rendered. These are
+LiveView's rules (`DOM.isNewPageClick`, and `Browser.pushState` scrolling
+after the reply of a live navigation). Back and forward keep the browser's
+scroll restoration. The
 wire side, a `clock` on `navigate` that the server acknowledges, is in
 [WIRE_PROTOCOL.md](WIRE_PROTOCOL.md#client-messages-browser-to-server) and
 [Event Clocking](WIRE_PROTOCOL.md#event-clocking).
@@ -320,16 +322,9 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
 }
 
 pub fn view(model: Model) -> Element(Msg) {
-  element.keyed(route_key(model.route), case model.route {
+  case model.route {
     HomePage -> home.view(model.home) |> element.map(Home)
     AboutPage -> about_page()
-  })
-}
-
-fn route_key(route: Route) -> String {
-  case route {
-    HomePage -> "/"
-    AboutPage -> "/about"
   }
 }
 
@@ -339,11 +334,18 @@ fn about_page() -> Element(msg) {
 }
 ```
 
-Key the page by its route with `element.keyed`. The browser updates the DOM
-by morphing the old tree into the new one, and without a key it reuses one
-page's nodes for the next page by position, carrying over focus and input
-state and moving reused nodes (which the browser reports as layout shift).
-A different key makes a route change replace the page's nodes.
+A render on the same page morphs the old DOM into the new one, so focus,
+typed values and scroll positions stay. The first render after a client
+navigation (a link, `router.push`, `router.replace`, back or forward) is
+different: the client replaces the children of the app root with the new
+page, as a LiveView live navigation replaces the view's root. No node,
+focus, typed value or hook of one page carries over to the next, even where
+the two pages share markup, and the view needs no key for it.
+
+After that render the client scrolls as the browser does for a page load: to
+the element the URL's `#fragment` names, or to the top when the URL has no
+fragment (or names no element). Back and forward keep the browser's own
+scroll restoration.
 
 The examples show the pattern at three sizes:
 

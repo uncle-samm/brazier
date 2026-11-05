@@ -1873,12 +1873,16 @@ scenario("a live navigation to another page's #fragment scrolls once that page r
   patch(s, 5, [{ op: "replace", path: "/page", value: "e" }], 4);
   assert.deepEqual(scrolls.at(-1), "#café");
 
-  // A navigation without a fragment schedules nothing.
+  // A navigation without a fragment scrolls to the top once its page
+  // renders, as LiveView's pushState does for a live navigation.
   const before = scrolls.length;
   fire(el("#to-plain"), "click");
+  assert.equal(scrolls.length, before, "nothing scrolls before the page exists");
   patch(s, 6, [{ op: "replace", path: "/page", value: "f" }], 5);
-  assert.equal(scrolls.length, before, "a page without a fragment keeps the client's scroll");
-  assert.equal(logsMatching("warn", "no element for the fragment").length, 1);
+  assert.deepEqual(scrolls.slice(before), ["top"], "a page without a fragment starts at the top");
+  patch(s, 7, [{ op: "add", path: "/n3", value: 1 }], 5);
+  assert.deepEqual(scrolls.slice(before), ["top"], "and only once");
+  assert.equal(logsMatching("warn", "no element for the fragment").length, 1, "the top is not a missing fragment");
 });
 
 scenario("a fragment scroll waits for a held navigation, yields to newer URLs, and follows router.push", async () => {
@@ -1939,8 +1943,12 @@ scenario("a fragment navigation lost with the socket scrolls on the join; a queu
   const s1 = sockets[1];
   assert.ok(s1.url.endsWith("/ws?path=" + encodeURIComponent("/b")), "the join is for the navigation's page");
   s1.open();
+  const replaced = () => logsMatching("log", "Navigation rendered a new page").length;
+  const oldSec = el("#to-sec");
   sync(s1, 0, { page: "b" }, 0);
   assert.deepEqual(scrolls, ["#sec"], "the join's model_sync renders the page, so it scrolls");
+  assert.equal(replaced(), 1, "and replaces the page");
+  assert.notEqual(el("#to-sec"), oldSec, "no node of the old page is kept");
 
   // Unhappy path: a navigate still queued when the socket drops keeps its
   // clock; the join's model_sync does not stand in for its answer.
@@ -1949,11 +1957,128 @@ scenario("a fragment navigation lost with the socket scrolls on the join; a queu
   advance(reconnectDelay());
   const s2 = sockets[2];
   s2.open();
-  sync(s2, 0, { page: "b" }, 0);
+  const beforeJoin = el("#to-sec");
+  sync(s2, 0, { page: "c" }, 0);
   assert.deepEqual(scrolls, ["#sec"], "the join does not answer a navigate it has not seen");
+  assert.equal(replaced(), 2, "the join is for the new URL, so it replaces the page");
+  assert.notEqual(el("#to-sec"), beforeJoin);
   assert.deepEqual(lastNavigate(s2), { type: "navigate", path: "/c", clock: 2 }, "the queued navigate is sent once synced");
+  const afterJoin = el("#to-sec");
   patch(s2, 0, [], 2);
   assert.deepEqual(scrolls, ["#sec", "#[name=old]"]);
+  patch(s2, 1, [{ op: "add", path: "/n", value: 1 }], 2);
+  assert.equal(replaced(), 2, "a later frame of the page morphs");
+  assert.equal(el("#to-sec"), afterJoin);
+});
+
+// --- page replace on a live navigation (L83) ---
+// The first render of the server's answer to a navigate replaces the app
+// root's children instead of morphing them, as LiveView's live navigation
+// replaces the view's root: no element, focus, typed value or hook of the
+// old page carries over to the new one, even where the two pages share
+// markup. Renders on the same page still morph.
+scenario("a live navigation replaces the page's nodes; a render on the same page morphs them", async () => {
+  const view = (model) => ({
+    html:
+      '<a id="to-b" href="/b">b</a><a id="to-c" href="/c">c</a>' +
+      `<div id="h" data-brazier-hook="probe" data-p="${model.page}"></div>` +
+      `<input id="q" name="q"><p id="t">${model.page}:${model.count}</p>` +
+      (model.page === "d" ? '<input id="af" autofocus>' : ""),
+    handlers: [],
+  });
+  await loadRuntime({ path: "/a", view });
+  const s = sockets[0];
+  s.open();
+  const calls = [];
+  window.brazierClient.registerHook("probe", probeHook(calls));
+  const replaced = () => logsMatching("log", "Navigation rendered a new page").length;
+  sync(s, 0, { page: "a", count: 0 });
+  assert.deepEqual(calls.splice(0), ["mount h"]);
+  const a = { t: el("#t"), q: el("#q"), h: el("#h") };
+  patch(s, 1, [{ op: "replace", path: "/count", value: 1 }], 0);
+  assert.equal(el("#t"), a.t, "a model change on the page morphs");
+  assert.equal(el("#t").textContent, "a:1");
+  assert.deepEqual(calls.splice(0), [], "and touches no hook");
+
+  // A link: frames before the navigate's ack still morph the old page.
+  a.q.focus();
+  fire(el("#to-b"), "click");
+  assert.equal(lastNavigate(s).clock, 1);
+  patch(s, 2, [{ op: "replace", path: "/count", value: 2 }], 0);
+  assert.equal(el("#t"), a.t, "a frame from before the navigation morphs");
+  assert.equal(document.activeElement, a.q, "and keeps focus");
+  assert.equal(replaced(), 0);
+  patch(s, 3, [{ op: "replace", path: "/page", value: "b" }], 1);
+  assert.equal(replaced(), 1, "the navigation's frame replaces the page");
+  for (const id of ["t", "q", "h"]) assert.notEqual(el("#" + id), a[id], id + " is a new element");
+  assert.equal(a.t.parentNode, null, "the old page's nodes are gone");
+  assert.notEqual(document.activeElement, a.q, "the old page's focus does not carry over");
+  assert.deepEqual(calls.splice(0), ["unmount h", "mount h"], "the old page's hook unmounts and the new one mounts");
+  assert.equal(el("#t").textContent, "b:2");
+  const b = { t: el("#t"), h: el("#h") };
+  patch(s, 4, [{ op: "replace", path: "/count", value: 3 }], 1);
+  assert.equal(el("#t"), b.t, "a later frame of the new page morphs it");
+  assert.deepEqual(calls.splice(0), []);
+
+  // A navigation the server answers with an ack (the model stays) leaves
+  // the page on screen: it is already that page, and a later frame morphs.
+  fire(el("#to-c"), "click");
+  patch(s, 4, [], 2);
+  patch(s, 5, [{ op: "replace", path: "/count", value: 4 }], 2);
+  assert.equal(replaced(), 1, "an acknowledged navigation without a change is settled");
+  assert.equal(el("#t"), b.t);
+
+  // router.push: the new page's autofocus element takes focus.
+  s.deliver({ type: "navigate", path: "/d" });
+  assert.equal(lastNavigate(s).clock, 3);
+  patch(s, 6, [{ op: "replace", path: "/page", value: "d" }], 3);
+  assert.equal(replaced(), 2);
+  assert.equal(document.activeElement, el("#af"), "the new page's autofocus element is focused");
+  assert.deepEqual(calls.splice(0), ["unmount h", "mount h"]);
+
+  // Back: the page is replaced, and nothing scrolls (the browser restores).
+  const scrolled = scrolls.length;
+  popTo("/c");
+  assert.equal(lastNavigate(s).clock, 4);
+  const d = el("#t");
+  patch(s, 7, [{ op: "replace", path: "/page", value: "c" }], 4);
+  assert.equal(replaced(), 3, "a popstate navigation replaces the page too");
+  assert.notEqual(el("#t"), d);
+  assert.equal(scrolls.length, scrolled, "a popstate navigation does not scroll");
+});
+
+scenario("a navigation's page refills a stream container from its store and remounts item hooks", async () => {
+  await loadRuntime({ path: "/a", ...streamsApp() });
+  const s = sockets[0];
+  s.open();
+  const calls = [];
+  window.brazierClient.registerHook("Item", {
+    mount: (node) => calls.push("mount " + node.getAttribute("data-brazier-key")),
+    update: (node) => calls.push("update " + node.getAttribute("data-brazier-key")),
+    unmount: (node) => calls.push("unmount " + node.getAttribute("data-brazier-key")),
+  });
+  const hooked = (t) => item(t, { hook: "Item" });
+  sync(s, 0, { count: 0 }, 0, [entry({ inserts: [ins("ka", 0, hooked("A")), ins("kb", 1, hooked("B"))] })]);
+  assert.deepEqual(calls.splice(0), ["mount ka", "mount kb"]);
+  const container = streamEl();
+  const nodes = [streamNode("ka"), streamNode("kb")];
+  // An item patch before the navigation's answer goes to the old container.
+  s.deliver({ type: "navigate", path: "/b" });
+  patch(s, 0, [], 0, [entry({ inserts: [ins("kc", 2, hooked("C"))] })]);
+  assert.equal(streamEl(), container);
+  assert.deepEqual(streamKeys(), ["ka", "kb", "kc"]);
+  assert.deepEqual(calls.splice(0), ["mount kc"]);
+  patch(s, 1, [{ op: "replace", path: "/count", value: 1 }], 1);
+  assert.notEqual(streamEl(), container, "the new page has a new container");
+  assert.deepEqual(streamKeys(), ["ka", "kb", "kc"], "filled from the store");
+  for (const node of nodes) assert.notEqual(streamNode(node.getAttribute("data-brazier-key")), node);
+  assert.deepEqual(calls.splice(0).sort(), ["mount ka", "mount kb", "mount kc", "unmount ka", "unmount kb", "unmount kc"]);
+  assert.equal(logsMatching("log", "Stream s rendered into a new container").length, 1);
+  // The new container takes the next item patch.
+  patch(s, 1, [], 1, [entry({ deletes: ["ka"], inserts: [ins("kd", 2, hooked("D"))] })]);
+  assert.deepEqual(streamKeys(), ["kb", "kc", "kd"]);
+  assert.deepEqual(calls.splice(0), ["unmount ka", "mount kd"]);
+  assert.equal(errorsMatching("").length, 0);
 });
 
 // --- refused upgrades ---

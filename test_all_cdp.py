@@ -1815,6 +1815,69 @@ def expect_path_and_text(path, fragment, msg):
         msg,
     )
 
+# Page identity across renders (L83). Every element under #brazier-app gets
+# a JS property no markup can set, the root and the window get a marker, and
+# the elements are kept in a list, so a later check can tell a reused node
+# from a new one and a live navigation from a page load.
+def mark_page_nodes(label):
+    marker = json.dumps(f"page-{time.time_ns()}")
+    marked = evl(
+        "(function(){"
+        'var root = document.getElementById("brazier-app");'
+        'var nodes = Array.from(root.querySelectorAll("*"));'
+        "nodes.forEach(function(n){ n.__cdpOldPage = true; });"
+        f"window.__cdpMarkedNodes = nodes; root.__cdpRootMarker = {marker}; window.__cdpPageMarker = {marker};"
+        "return nodes.length;})()"
+    )
+    check(isinstance(marked, int) and marked > 0, f"{label}: page nodes marked ({marked})")
+    return json.loads(marker)
+
+OLD_PAGE_NODES_JS = (
+    'Array.from(document.getElementById("brazier-app").querySelectorAll("*"))'
+    ".filter(function(n){ return n.__cdpOldPage === true; }).length"
+)
+DETACHED_MARKED_NODES_JS = "window.__cdpMarkedNodes.filter(function(n){ return !n.isConnected; }).length"
+
+def check_same_root_and_document(label, marker):
+    check(
+        str(evl('document.getElementById("brazier-app").__cdpRootMarker || ""')) == marker,
+        f"{label}: the app root element is the same",
+    )
+    check(str(evl("window.__cdpPageMarker || ''")) == marker, f"{label}: no page load")
+
+def check_page_morphs_in_place(label, act, rendered_js):
+    """A model change on the same page morphs it: every element of the page
+    is still in the document afterwards."""
+    marker = mark_page_nodes(label)
+    clear_cdp_events()
+    act()
+    expect_js(rendered_js, f"{label}: the change renders")
+    check(count_js(DETACHED_MARKED_NODES_JS) == 0, f"{label}: no element of the page is replaced ({evl(DETACHED_MARKED_NODES_JS)} detached)")
+    check_same_root_and_document(label, marker)
+
+def check_page_replaced_on_live_navigation(label, link_sel, path, page_js):
+    """The first render of a live navigation's page replaces the root's
+    children: no element of the old page is reused, the focused element of
+    the old page does not keep focus, and the root element stays. The link
+    is focused before the click, as a keyboard user's would be. `page_js`
+    is true only once the new page is rendered."""
+    marker = mark_page_nodes(label)
+    focused = evl(f"(function(){{var a = document.querySelector({json.dumps(link_sel)}); if (!a) return 'none'; a.focus(); return document.activeElement === a ? 'focused' : 'not focused';}})()")
+    check(focused == "focused", f"{label}: the link on the old page has focus ({focused})")
+    clear_cdp_events()
+    click(link_sel)
+    rendered = wait_for_js(f"location.pathname === {json.dumps(path)} && ({page_js})")
+    check(rendered, f"{label}: the new page renders at {path} ({evl('location.pathname')})")
+    old = count_js(OLD_PAGE_NODES_JS)
+    check(old == 0, f"{label}: no element of the old page is reused ({old} kept)")
+    check(
+        evl("!(document.activeElement && document.activeElement.__cdpOldPage)") is True,
+        f"{label}: focus does not stay on an element of the old page",
+    )
+    check_same_root_and_document(label, marker)
+    sent = [p.get("path") for p in websocket_json_payloads("Sent") if p.get("type") == "navigate"]
+    check(sent == [path], f"{label}: one navigate for {path} ({sent})")
+
 print("-- 19: Routed Workspace --")
 if start_example("routed_workspace", module="main"):
     navigate("/")
@@ -1866,8 +1929,14 @@ if start_example("routed_workspace", module="main"):
     expect_text("compact: true", "Local compact toggle changes")
     check_local_ws_quiet("Routed workspace compact")
 
-    clear_cdp_events()
-    click('a[href="/settings"]')
+    # The pipeline page's form, typed into above, is not morphed into the
+    # settings page's: the page is replaced.
+    check_page_replaced_on_live_navigation(
+        "Routed workspace navigation to settings",
+        'a[href="/settings"]',
+        "/settings",
+        '!!document.querySelector("[data-testid=draft-name]")',
+    )
     expect_path_and_text("/settings", "Settings", "Client navigation: settings URL and view")
     expect_text("Ada / owner / v1", "Settings renders saved profile")
 
@@ -1968,6 +2037,59 @@ def check_fragment_scroll_after_live_navigation(path, fragment_text, other_path,
     )
     check(removed == "removed", f"Fragment scroll: test link and padding removed ({removed})")
 
+ROUTED_ABOUT_JS = '(document.getElementById("brazier-app")?.textContent || "").includes("does not scan the filesystem")'
+
+SCROLL_STATE_JS = (
+    "JSON.stringify({path: location.pathname, hash: location.hash, "
+    "scrollY: Math.round(window.scrollY), height: document.documentElement.scrollHeight, "
+    "marker: window.__brazierCdpScrollNav || null})"
+)
+
+def check_scroll_top_after_live_navigation(link_sel, path, page_js, back_path, back_page_js):
+    """A live navigation to a URL without a fragment scrolls to the top once
+    the new page is rendered (L606), as a page load does and as LiveView's
+    pushState does; history.pushState alone keeps the scroll, and the body
+    is padded so every page is tall enough to keep it. Back to the previous
+    entry keeps the browser's scroll restoration: the client does not scroll
+    after rendering that page. The current URL is back_path, the page the
+    link is on."""
+    marker = json.dumps(f"scroll-{time.time_ns()}")
+    setup = evl(
+        "(function(){"
+        'var style = document.createElement("style"); style.id = "cdp-scroll-pad";'
+        'style.textContent = "body{padding-bottom:4000px}";'
+        "document.head.appendChild(style);"
+        f"window.__brazierCdpScrollNav = {marker}; window.scrollTo(0, 1500);"
+        'return "ready";})()'
+    )
+    check(setup == "ready", f"Scroll to top: padding installed ({setup})")
+    check(str(evl("location.pathname")) == back_path, f"Scroll to top: starts at {back_path} ({evl('location.pathname')})")
+    check(wait_for_js("Math.round(window.scrollY) === 1500"), f"Scroll to top: scrolled down first ({evl(SCROLL_STATE_JS)})")
+
+    clear_cdp_events()
+    click(link_sel)
+    topped = wait_for_js(
+        f"location.pathname === {json.dumps(path)} && location.hash === \"\" && ({page_js}) && window.scrollY === 0"
+    )
+    check(topped, f"Scroll to top: live navigation to {path} scrolls to the top once the page renders ({evl(SCROLL_STATE_JS)})")
+    check(str(evl("window.__brazierCdpScrollNav")) == json.loads(marker), "Scroll to top: no page load")
+
+    clear_cdp_events()
+    went = evl('history.back(); "ok"')
+    check(went == "ok", f"Scroll to top: history.back() evaluated ({went})")
+    # The browser restores the entry's scroll before popstate; the page
+    # renders when the navigate is answered, and the client must not scroll
+    # then, so the check waits for that page and reads the scroll after it.
+    restored = wait_for_js(
+        f"location.pathname === {json.dumps(back_path)} && ({back_page_js}) && Math.round(window.scrollY) === 1500"
+    )
+    check(restored, f"Scroll to top: back to {back_path} keeps the browser's scroll restoration ({evl(SCROLL_STATE_JS)})")
+    expect(lambda: websocket_type_count("Sent", "navigate") == 1, "Scroll to top: back sends one navigate")
+    check(str(evl("window.__brazierCdpScrollNav")) == json.loads(marker), "Scroll to top: still no page load")
+
+    removed = evl('(function(){document.getElementById("cdp-scroll-pad").remove(); window.scrollTo(0, 0); return "removed";})()')
+    check(removed == "removed", f"Scroll to top: padding removed ({removed})")
+
 print("-- 20: Explicit Routing --")
 if start_example("routed", module="main"):
     install_dom_monitor()
@@ -1983,8 +2105,17 @@ if start_example("routed", module="main"):
     check_model_ws_update("Routed model event", events=1)
     check(websocket_payload_count("Sent", '"type":"event_batch"') == 0, "Model event does not send event_batch")
 
-    clear_cdp_events()
-    click('a[href="/about"]')
+    check_page_morphs_in_place(
+        "Routed model event on the same page",
+        lambda: click_by_text("+"),
+        f"({ROUTED_COUNT_JS}) === \"2\"",
+    )
+    check_page_replaced_on_live_navigation(
+        "Routed navigation to about",
+        'a[href="/about"]',
+        "/about",
+        ROUTED_ABOUT_JS,
+    )
     expect_path_and_text("/about", "About", "Client navigation: about URL and view")
     check("does not scan the filesystem" in str(text()), "Client navigation: no filesystem route scan copy")
 
@@ -2014,6 +2145,10 @@ if start_example("routed", module="main"):
     # After the conformance check: the padding it installs is not the app's
     # layout.
     check_fragment_scroll_after_live_navigation("/about", "About", "/settings", "Settings")
+    check_scroll_top_after_live_navigation(
+        'a[href="/about"]', "/about", ROUTED_ABOUT_JS,
+        "/settings", '!!document.querySelector("[data-testid=name-input]")',
+    )
     check(errors() == "0", f"Zero errors ({error_list()})")
 
     # The browser logs the 404 document load itself as a console error, so

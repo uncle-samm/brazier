@@ -139,16 +139,21 @@ integer is malformed.
 {"type": "navigate", "path": "/about", "clock": 7}
 ```
 That ack is how the browser client finds the frame that shows the new page.
-After a link click or a server `navigate` to a URL with a fragment
-(`/docs#install`), it scrolls once the first applied frame with `ack_clock` ≥
-the navigate's clock is rendered: to the element whose id is the fragment,
-else to the `<a>` with that `name` (the fragment as written, then
-percent-decoded), and to the top of the page, with a console warning, when
-there is neither. This is LiveView's `Browser.pushState` after a patch reply
-(`getHashTargetEl`, `scrollIntoView`, else `window.scroll(0, 0)`). Back and
-forward keep the browser's scroll restoration and schedule no scroll. A
-navigate written to a socket that dropped before its ack is answered by the
-next connection's join `model_sync`, whose page is the current URL's.
+The first applied frame with `ack_clock` ≥ the navigate's clock that renders
+replaces the children of the app root instead of morphing them, so no node
+of the old page is reused (LiveView replaces the view's root on a live
+navigation); an ack that leaves the model unchanged keeps the page on
+screen. After a link click or a server `navigate`, the client scrolls once
+that frame is applied: for a URL with a fragment (`/docs#install`), to the
+element whose id is the fragment, else to the `<a>` with that `name` (the
+fragment as written, then percent-decoded), and to the top of the page, with
+a console warning, when there is neither; for a URL without a fragment, to
+the top. This is LiveView's `Browser.pushState` after the reply of a live
+navigation (`getHashTargetEl`, `scrollIntoView`, else `window.scroll(0, 0)`).
+Back and forward replace the page too, but keep the browser's scroll
+restoration and schedule no scroll. A navigate written to a socket that
+dropped before its ack is answered by the next connection's join
+`model_sync`, whose page is the current URL's.
 The middleware runs on a `GET` of the target page first, as it does at the
 upgrade. A page it refuses is not navigated to: the server sends
 `hard_navigate` to the path, so the browser loads it over HTTP and gets the
