@@ -1227,6 +1227,11 @@ fn handle_owner_down(
               <> describe_down_reason(reason)
               <> "); forgetting it",
           )
+          telemetry.runtime_connection_forgotten(
+            telemetry.ConnectionDown,
+            0,
+            conn_id,
+          )
           forget_connection(state, conn_id)
         }
         Error(Nil) -> {
@@ -3297,6 +3302,11 @@ fn send_to_connection(
         "brazier.runtime",
         "Connection " <> conn_id <> " is gone (" <> why <> "); forgetting it",
       )
+      telemetry.runtime_connection_forgotten(
+        telemetry.ConnectionDown,
+        0,
+        conn_id,
+      )
       forget_connection(state, conn_id)
     }
     Ok(queue_len) ->
@@ -3317,6 +3327,11 @@ fn send_to_connection(
             transport.CloseForBackpressure(
               reason: "Connection is too far behind; reconnect to resync",
             ),
+          )
+          telemetry.runtime_connection_forgotten(
+            telemetry.ConnectionSlow,
+            queue_len,
+            conn_id,
           )
           forget_connection(state, conn_id)
         }

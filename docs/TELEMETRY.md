@@ -151,6 +151,7 @@ measurements: `system_time` and `monotonic_time` on start, `duration` and
 | `[brazier, stream, delta]` | `inserts`, `updates`, `deletes`, `trimmed`, `bytes` | `stream`, `reset`, `connection_id` | yes, `brazier/runtime` |
 | `[brazier, stream, refused]` | `count`, `bytes` | `stream`, `reason` | yes, `brazier/runtime` |
 | `[brazier, runtime, stop]` | `uptime` | `reason`; `kind`, `error` (crash, exit) | yes, `brazier/runtime` |
+| `[brazier, runtime, connection, forgotten]` | `count`, `queue_len` | `reason`: `slow` or `down`, `connection_id` | yes, `brazier/runtime` |
 | `[brazier, effect, run]` S | none | `effect`: `sync`, `keyed` or `background` | yes, `brazier/effect` |
 | `[brazier, effect, timer, rejected]` | none | `limit` | yes, `brazier/effect` |
 | `[brazier, effect, after, rejected]` | none | `limit` | yes, `brazier/effect` |
@@ -289,6 +290,20 @@ Notes on individual events:
   either way it then leaves with the original reason, so its links and the
   VM's crash report see what they did before. A normal exit of a linked
   process does not stop it. Only an untrappable `kill` emits nothing.
+- `[brazier, runtime, connection, forgotten]` is emitted when the runtime
+  drops a connection it was not told had disconnected, once per
+  connection (see
+  [ERROR_HANDLING.md](ERROR_HANDLING.md#transport-errors)).
+  `reason` is `slow` when a send found the handler's mailbox over 1000
+  messages: the runtime told it to close, which the transport answers
+  with an `error` frame, close 1013 and a `[brazier, ws, backpressure]`
+  with reason `runtime`. `queue_len` is that mailbox length. `reason` is
+  `down` when the handler had exited: a send found no process, or the
+  runtime handled the DOWN of the monitor it holds on the handler. Its
+  `queue_len` is 0. A handler that exits after its disconnect is queued
+  but before the runtime reads it can be found `down` by a send first.
+  A `ClientDisconnected` and a registration again under the same id also
+  forget a connection, but the runtime was told, so neither emits it.
 - `[brazier, http, connection, *]`: `duration` is the time from accept to
   handoff (accepted, rejected) or the connection's lifetime (closed).
   `reason` for a rejection names the limit that refused it, or is

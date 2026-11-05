@@ -20,8 +20,10 @@ import brazier/cluster/log_capture as node_log
 import brazier/effect
 import brazier/error
 import brazier/internal/stream_window
+import brazier/monitored
 import brazier/runtime
 import brazier/stream
+import brazier/telemetry
 import brazier/test_ctx
 import brazier/transport.{type InternalMessage}
 import gleam/dynamic/decode
@@ -232,6 +234,132 @@ pub fn old_owner_going_down_after_a_reregistration_is_ignored_test() {
     as string.inspect(received)
 }
 
+// --- Telemetry of a forgotten connection ---------------------------------------
+
+/// A slow connection emits one `[brazier, runtime, connection, forgotten]`
+/// with reason `slow` and its mailbox length, however many broadcasts find
+/// it after; the healthy connection emits none.
+pub fn slow_connection_emits_one_forgotten_event_test() {
+  let rt = start(config())
+  let fast_id = unique("fast")
+  let slow_id = unique("slow")
+  let fast = process.new_subject()
+  let #(slow, slow_pid) = subject_in_live_process()
+  let events = {
+    use events <- monitored.listening([forgotten_event])
+    connect(rt, fast_id, fast)
+    connect(rt, slow_id, slow)
+    let _ = await.settle(rt, fast)
+    fill(slow, 1001)
+    click(rt, fast_id, 1)
+    click(rt, fast_id, 2)
+    click(rt, fast_id, 3)
+    let received = await.settle(rt, fast)
+    assert patches(received) == 3
+    forgotten(events, [fast_id, slow_id])
+  }
+  let assert [Forgotten(reason: "slow", count: 1, queue_len:, connection_id:)] =
+    events
+    as string.inspect(events)
+  assert connection_id == slow_id
+  // The join's model sync is in its mailbox behind the 1001 queued frames.
+  assert queue_len > 1001 as int.to_string(queue_len)
+  stop(rt)
+  process.kill(slow_pid)
+}
+
+/// A handler killed without a `ClientDisconnected` emits one event with
+/// reason `down` when the runtime handles its DOWN.
+pub fn killed_handler_emits_one_down_event_test() {
+  let rt = start(config())
+  let assert Ok(rt_pid) = process.subject_owner(rt)
+  let fast_id = unique("fast")
+  let doomed_id = unique("doomed")
+  let fast = process.new_subject()
+  let #(doomed, doomed_pid) = subject_in_live_process()
+  connect(rt, fast_id, fast)
+  connect(rt, doomed_id, doomed)
+  let _ = await.settle(rt, fast)
+  let events = {
+    use events <- monitored.listening([forgotten_event])
+    let trace = trace_receive(rt_pid)
+    process.kill(doomed_pid)
+    let assert Ok(Nil) =
+      await_down_received(rt_pid, doomed_pid, await.deadline_ms)
+      as "the runtime must receive the DOWN of the killed handler"
+    stop_trace(trace, rt_pid)
+    click(rt, fast_id, 1)
+    let received = await.settle(rt, fast)
+    assert patches(received) == 1
+    forgotten(events, [fast_id, doomed_id])
+  }
+  assert events
+    == [
+      Forgotten(
+        reason: "down",
+        count: 1,
+        queue_len: 0,
+        connection_id: doomed_id,
+      ),
+    ]
+    as string.inspect(events)
+  stop(rt)
+}
+
+/// A handler that exited before it registered emits one event with reason
+/// `down`, whether a send or the monitor's DOWN (noproc) found it first.
+pub fn dead_handler_emits_one_down_event_test() {
+  let rt = start(config())
+  let fast_id = unique("fast")
+  let gone_id = unique("gone")
+  let fast = process.new_subject()
+  let gone = subject_in_dead_process()
+  let events = {
+    use events <- monitored.listening([forgotten_event])
+    connect(rt, fast_id, fast)
+    connect(rt, gone_id, gone)
+    let _ = await.settle(rt, fast)
+    click(rt, fast_id, 1)
+    click(rt, fast_id, 2)
+    let received = await.settle(rt, fast)
+    assert patches(received) == 2
+    forgotten(events, [fast_id, gone_id])
+  }
+  assert events
+    == [
+      Forgotten(reason: "down", count: 1, queue_len: 0, connection_id: gone_id),
+    ]
+    as string.inspect(events)
+  stop(rt)
+}
+
+/// A connection the transport reports disconnected, and one registered
+/// again under its id, are forgotten because the runtime was told, so
+/// neither emits the event.
+pub fn told_forgets_emit_no_forgotten_event_test() {
+  let rt = start(config())
+  let left_id = unique("left")
+  let again_id = unique("again")
+  let left = process.new_subject()
+  let old = process.new_subject()
+  let new = process.new_subject()
+  let events = {
+    use events <- monitored.listening([forgotten_event])
+    connect(rt, left_id, left)
+    connect(rt, again_id, old)
+    let _ = await.settle(rt, left)
+    let _ = await.drain(old)
+    process.send(rt, runtime.ClientDisconnected(conn_id: left_id))
+    connect(rt, again_id, new)
+    let assert [transport.SendModelSync(..)] = await.settle(rt, new)
+    forgotten(events, [left_id, again_id])
+  }
+  assert events == [] as string.inspect(events)
+  assert await.drain(left) == []
+  assert await.drain(old) == []
+  stop(rt)
+}
+
 // --- Stream windows of a forgotten connection ----------------------------------
 
 /// A slow connection's stream windows are dropped when it is forgotten: the
@@ -282,6 +410,44 @@ pub fn forgotten_connection_drops_its_stream_windows_test() {
 }
 
 // --- Helpers -------------------------------------------------------------------
+
+const forgotten_event = ["brazier", "runtime", "connection", "forgotten"]
+
+type Forgotten {
+  Forgotten(reason: String, count: Int, queue_len: Int, connection_id: String)
+}
+
+/// The forgotten events received so far for any of `connection_ids`
+/// (other tests' runtimes may emit their own), oldest first.
+fn forgotten(
+  events: Subject(telemetry.Event),
+  connection_ids: List(String),
+) -> List(Forgotten) {
+  await.drain(events)
+  |> list.map(fn(event) {
+    assert event.name == forgotten_event
+    let assert Ok(reason) = telemetry.string(event, "reason")
+      as "a forgotten event carries its reason"
+    let assert Ok(count) = telemetry.int(event, "count")
+      as "a forgotten event carries count"
+    let assert Ok(queue_len) = telemetry.int(event, "queue_len")
+      as "a forgotten event carries queue_len"
+    let assert Ok(connection_id) = telemetry.string(event, "connection_id")
+      as "a forgotten event names its connection"
+    Forgotten(reason:, count:, queue_len:, connection_id:)
+  })
+  |> list.filter(fn(event) {
+    list.contains(connection_ids, event.connection_id)
+  })
+}
+
+/// Shut the runtime down and return once it has exited.
+fn stop(rt: Subject(runtime.RuntimeMessage(Msg))) -> Nil {
+  let assert Ok(pid) = process.subject_owner(rt)
+    as "the runtime's subject has an owner"
+  process.send(rt, runtime.Shutdown)
+  await.expect_down(pid, "the runtime after Shutdown")
+}
 
 fn patches(received: List(InternalMessage)) -> Int {
   list.count(received, fn(message) {

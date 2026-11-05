@@ -348,6 +348,9 @@ fn documented() -> List(Documented) {
       [],
     ),
     Plain(["runtime", "stop"], ["uptime"], ["reason"]),
+    Plain(["runtime", "connection", "forgotten"], ["count", "queue_len"], [
+      "reason", "connection_id",
+    ]),
     Plain(
       ["stream", "delta"],
       ["inserts", "updates", "deletes", "trimmed", "bytes"],
@@ -473,6 +476,8 @@ fn emit_everything() -> Nil {
   telemetry.stream_delta(1, 2, 3, 4, 100, "log", False, "c1")
   telemetry.stream_refused(1, 70_000, "log", "item_too_large")
   telemetry.runtime_stop(1000, "normal")
+  telemetry.runtime_connection_forgotten(telemetry.ConnectionSlow, 1001, "c1")
+  telemetry.runtime_connection_forgotten(telemetry.ConnectionDown, 0, "c1")
   let effect = fn(run) { telemetry.effect_run_span("http", run) }
   let assert 5 = effect(fn() { 5 }) as "effect returns 5"
   crash(fn() { effect(fn() { panic as "effect crashed" }) })
