@@ -5,6 +5,7 @@ import brazier/build/project_toml.{
 }
 import gleam/dict
 import gleam/list
+import gleam/option.{None, Some}
 import gleam/string
 
 const manifest =
@@ -96,11 +97,14 @@ pub fn parse_manifest_reads_every_source_kind_test() {
     == Ok(LockedPackage(
       name: "gleam_json",
       version: "3.1.0",
+      build_tools: ["gleam"],
       requirements: ["gleam_stdlib"],
-      source: HexSource,
+      otp_app: Some("gleam_json"),
+      source: HexSource("AB"),
     ))
   let assert Ok(brazier) = dict.get(packages, "brazier")
   assert brazier.source == LocalSource("../..")
+  assert brazier.otp_app == None
   let assert Ok(git) = dict.get(packages, "from_git")
   assert git.source == GitSource("https://example.com/x.git", "abc")
 }
@@ -120,7 +124,7 @@ pub fn parse_manifest_packages_not_array_test() {
 pub fn parse_manifest_entry_missing_version_names_index_test() {
   let text =
     "packages = [
-  { name = \"ok\", version = \"1.0.0\", requirements = [], source = \"hex\" },
+  { name = \"ok\", version = \"1.0.0\", build_tools = [\"gleam\"], requirements = [], source = \"hex\", outer_checksum = \"AB\" },
   { name = \"bad\", requirements = [], source = \"hex\" },
 ]
 "
@@ -132,7 +136,7 @@ pub fn parse_manifest_entry_missing_version_names_index_test() {
 pub fn parse_manifest_unknown_source_test() {
   let text =
     "packages = [
-  { name = \"x\", version = \"1.0.0\", requirements = [], source = \"ftp\" },
+  { name = \"x\", version = \"1.0.0\", build_tools = [\"gleam\"], requirements = [], source = \"ftp\" },
 ]
 "
   let assert Error(reason) = project_toml.parse_manifest("m.toml", text)
@@ -142,7 +146,7 @@ pub fn parse_manifest_unknown_source_test() {
 pub fn parse_manifest_non_string_requirement_test() {
   let text =
     "packages = [
-  { name = \"x\", version = \"1.0.0\", requirements = [1], source = \"hex\" },
+  { name = \"x\", version = \"1.0.0\", build_tools = [\"gleam\"], requirements = [1], source = \"hex\" },
 ]
 "
   let assert Error(reason) = project_toml.parse_manifest("m.toml", text)
@@ -166,57 +170,163 @@ pub fn locked_closure_missing_package_is_error_test() {
   assert string.contains(reason, "not locked in manifest.toml")
 }
 
+fn hex_package(name: String, version: String) -> project_toml.LockedPackage {
+  LockedPackage(
+    name:,
+    version:,
+    build_tools: ["gleam"],
+    requirements: [],
+    otp_app: Some(name),
+    source: HexSource("CHECKSUM"),
+  )
+}
+
 pub fn pinned_dependency_line_hex_is_exact_test() {
-  let package =
-    LockedPackage(
-      name: "gleam_json",
-      version: "3.1.0",
-      requirements: [],
-      source: HexSource,
-    )
-  assert project_toml.pinned_dependency_line(package, fn(p) { Ok(p) })
+  assert project_toml.pinned_dependency_line(hex_package("gleam_json", "3.1.0"))
     == Ok("gleam_json = \"== 3.1.0\"")
 }
 
-pub fn pinned_dependency_line_local_uses_resolved_path_test() {
+pub fn pinned_dependency_line_local_uses_the_path_as_given_test() {
   let package =
     LockedPackage(
-      name: "brazier",
-      version: "0.1.0",
-      requirements: [],
-      source: LocalSource("../.."),
+      ..hex_package("brazier", "0.1.0"),
+      source: LocalSource("../../.."),
     )
-  assert project_toml.pinned_dependency_line(package, fn(p) { Ok("/abs/" <> p) })
-    == Ok("brazier = { path = \"/abs/../..\" }")
-}
-
-/// A path that cannot be resolved fails the line with the resolver's
-/// reason, instead of pinning an unresolved path.
-pub fn pinned_dependency_line_local_resolve_error_is_returned_test() {
-  let package =
-    LockedPackage(
-      name: "brazier",
-      version: "0.1.0",
-      requirements: [],
-      source: LocalSource("../.."),
-    )
-  assert project_toml.pinned_dependency_line(package, fn(_) {
-      Error("cannot read the current directory")
-    })
-    == Error("cannot read the current directory")
+  assert project_toml.pinned_dependency_line(package)
+    == Ok("brazier = { path = \"../../..\" }")
 }
 
 pub fn pinned_dependency_line_git_is_rejected_test() {
   let package =
     LockedPackage(
-      name: "lib",
-      version: "1.0.0",
-      requirements: [],
+      ..hex_package("lib", "1.0.0"),
       source: GitSource("https://example.com/lib.git", "abc"),
     )
-  let assert Error(reason) =
-    project_toml.pinned_dependency_line(package, fn(p) { Ok(p) })
+  let assert Error(reason) = project_toml.pinned_dependency_line(package)
   assert string.contains(reason, "comes from git")
+}
+
+/// A Hex entry without `outer_checksum` cannot be locked: Gleam would refuse
+/// the client manifest, and nothing could check the tarball.
+pub fn parse_manifest_hex_without_checksum_is_error_test() {
+  let text =
+    "packages = [
+  { name = \"x\", version = \"1.0.0\", build_tools = [\"gleam\"], requirements = [], source = \"hex\" },
+]
+"
+  let assert Error(reason) =
+    project_toml.parse_manifest("app/manifest.toml", text)
+  assert string.contains(reason, "app/manifest.toml: packages[0]")
+  assert string.contains(reason, "missing key `outer_checksum`")
+  assert string.contains(reason, "gleam deps download")
+}
+
+pub fn parse_manifest_missing_build_tools_is_error_test() {
+  let text =
+    "packages = [
+  { name = \"x\", version = \"1.0.0\", requirements = [], source = \"hex\", outer_checksum = \"AB\" },
+]
+"
+  let assert Error(reason) = project_toml.parse_manifest("m.toml", text)
+  assert string.contains(reason, "missing key `build_tools`")
+}
+
+/// A requirement with no entry of its own is a broken lock, reported as one
+/// and naming the package that requires it.
+pub fn locked_closure_requirement_without_entry_is_inconsistent_test() {
+  let text =
+    "packages = [
+  { name = \"a\", version = \"1.0.0\", build_tools = [\"gleam\"], requirements = [\"gone\"], source = \"hex\", outer_checksum = \"AB\" },
+]
+"
+  let assert Ok(packages) = project_toml.parse_manifest("m.toml", text)
+  let assert Error(reason) = project_toml.locked_closure(packages, ["a"])
+  assert string.contains(reason, "manifest.toml is inconsistent")
+  assert string.contains(reason, "`a` requires `gone`")
+}
+
+/// The client manifest locks exactly the app's entries: the same versions,
+/// checksums, build tools, requirements and OTP app names, and its
+/// `[requirements]` state the same pins as the client's `gleam.toml`.
+pub fn client_manifest_pins_the_app_entries_test() {
+  let assert Ok(app) = project_toml.parse_manifest("manifest.toml", manifest)
+  let assert Ok(closure) = project_toml.locked_closure(app, ["gleam_json"])
+  let assert Ok(text) =
+    project_toml.client_manifest("app/manifest.toml", closure)
+  let assert Ok(client) = project_toml.parse_manifest("client.toml", text)
+  assert sorted(dict.to_list(client))
+    == list.map(closure, fn(p) { #(p.name, p) })
+  assert string.contains(
+    text,
+    "Generated by the Brazier build from app/manifest.toml",
+  )
+  assert string.ends_with(
+    text,
+    "[requirements]
+gleam_json = { version = \"== 3.1.0\" }
+gleam_stdlib = { version = \"== 1.0.0\" }
+",
+  )
+  assert string.contains(
+    text,
+    "  { name = \"gleam_json\", version = \"3.1.0\", build_tools = [\"gleam\"], requirements = [\"gleam_stdlib\"], otp_app = \"gleam_json\", source = \"hex\", outer_checksum = \"AB\" },\n",
+  )
+}
+
+/// A local package keeps its entry with the path the caller gives, in the
+/// entry and in `[requirements]`, and has no `otp_app`, as Gleam writes it.
+pub fn client_manifest_local_package_test() {
+  let local =
+    LockedPackage(
+      name: "lib",
+      version: "0.2.0",
+      build_tools: ["gleam"],
+      requirements: [],
+      otp_app: None,
+      source: LocalSource("../../lib"),
+    )
+  let assert Ok(text) = project_toml.client_manifest("m.toml", [local])
+  assert string.contains(
+    text,
+    "  { name = \"lib\", version = \"0.2.0\", build_tools = [\"gleam\"], requirements = [], source = \"local\", path = \"../../lib\" },\n",
+  )
+  assert string.contains(text, "lib = { path = \"../../lib\" }\n")
+  let assert Ok(client) = project_toml.parse_manifest("client.toml", text)
+  assert dict.get(client, "lib") == Ok(local)
+}
+
+pub fn client_manifest_git_package_is_rejected_test() {
+  let package =
+    LockedPackage(
+      ..hex_package("lib", "1.0.0"),
+      source: GitSource("https://example.com/lib.git", "abc"),
+    )
+  let assert Error(reason) = project_toml.client_manifest("m.toml", [package])
+  assert string.contains(reason, "comes from git")
+}
+
+pub fn parse_downloaded_reads_versions_test() {
+  let text =
+    "[packages]\ngleam_json = \"3.1.0\"\ngleam_stdlib = \"1.0.5\"\n\n[git]\n"
+  let assert Ok(downloaded) =
+    project_toml.parse_downloaded("build/packages/packages.toml", text)
+  assert sorted(dict.to_list(downloaded))
+    == [#("gleam_json", "3.1.0"), #("gleam_stdlib", "1.0.5")]
+}
+
+pub fn parse_downloaded_without_packages_table_is_error_test() {
+  let assert Error(reason) = project_toml.parse_downloaded("p.toml", "[git]\n")
+  assert reason == "p.toml: missing key `packages`"
+}
+
+pub fn parse_downloaded_non_string_version_is_error_test() {
+  let assert Error(reason) =
+    project_toml.parse_downloaded("p.toml", "[packages]\nx = 1\n")
+  assert reason == "p.toml: packages.x must be a version string"
+}
+
+fn sorted(entries: List(#(String, a))) -> List(#(String, a)) {
+  list.sort(entries, fn(a, b) { string.compare(a.0, b.0) })
 }
 
 pub fn toml_string_escapes_quotes_and_control_characters_test() {

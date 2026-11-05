@@ -70,9 +70,37 @@ pub fn fixture_app_builds_and_round_trips_test_() -> Timeout {
     let assert Ok(output) =
       program.run(fixture, "gleam", ["run", "-m", "fixture_roundtrip"])
     let assert True = string.contains(output, "ROUNDTRIP OK")
+    client_project_builds_offline()
     Nil
   })
 }
+
+/// The client project is locked to the app's manifest, so building it again
+/// needs no Hex: with every proxy pointing at a closed port, `gleam build`
+/// there still succeeds. Without the client manifest the same offline build
+/// must try to resolve versions and fail, which shows the proxies do cut Hex
+/// off and that the manifest is what keeps the build off the network.
+fn client_project_builds_offline() -> Nil {
+  let client = fixture <> "/" <> client_bundle.client_dir
+  let lock = client <> "/manifest.toml"
+  let assert Ok(_output) = run_offline(client, "gleam", ["build"])
+  let assert Ok(locked) = files.read(lock)
+  let assert Ok(Nil) = files.delete_if_exists(lock)
+  let unlocked = run_offline(client, "gleam", ["build"])
+  let assert Ok(Nil) = files.write(lock, locked)
+  let assert Error(reason) = unlocked
+  let assert True = string.contains(reason, "Resolving versions")
+  Nil
+}
+
+/// `program.run` with the HTTP(S) proxies pointing at a closed localhost
+/// port, so the program cannot reach Hex.
+@external(erlang, "brazier_build_test_ffi", "run_offline")
+fn run_offline(
+  cwd: String,
+  program: String,
+  args: List(String),
+) -> Result(String, String)
 
 fn write_fixture() -> Nil {
   // The fixture depends on exactly what the counter example does, from the

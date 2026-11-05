@@ -17,10 +17,20 @@ not count), generates the server codec `src/brazier_codec.gleam`, runs
 `priv/static/brazier_client_<hash>.js` with `priv/static/brazier_client.manifest`
 naming it. It needs `node` and `npx` (esbuild is pinned and fetched by `npx`).
 
+The client code compiles in a generated project,
+`build/brazier_client_app`, whose `manifest.toml` is copied from the app's:
+the same package versions and checksums, nothing resolved from Hex. The
+packages come from Gleam's package cache, which the app's own
+`gleam deps download` filled, so parallel builds do not hit the Hex rate
+limit and two builds of one app compile the same client. Commit the app's
+`manifest.toml`; the build needs it and `build/packages` to agree with it.
+
 The build exits with status 1 on any failure: no app module or more than one,
 an unparsable source file (the error names the file, line and column), a Model
 or Msg field type the codec cannot encode (the error names the type and the
-field), a codec that does not compile, or a failed client bundle. A failed
+field), a codec that does not compile, a missing app `manifest.toml` or one
+that disagrees with the downloaded packages (the error names the package and
+says to run `gleam deps download`), or a failed client bundle. A failed
 step leaves no half-written artifact behind.
 
 Production never builds. `brazier.start` refuses to start when the manifest or
