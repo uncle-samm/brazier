@@ -64,6 +64,13 @@ closes with 1008. A message over `max_message_bytes` (default 64 KB)
 closes the connection with 1009 ("message too big"), checked from the frame
 header before the payload is buffered. See [SECURITY.md](SECURITY.md).
 
+A connection whose client cannot keep up (more than `ws_max_outbound_queue`
+messages waiting, default 1000) closes with 1013 and emits one
+`[brazier, ws, backpressure]` event. That close, and a connection handler
+that crashes or is killed, ends only that connection: the others on the
+listener keep sending and receiving (`backpressure_isolation_test`). See
+[Backpressure](WIRE_PROTOCOL.md#backpressure).
+
 ## Rate Limiting
 
 Each connection may send `max_events_per_second` events per one-second
