@@ -226,7 +226,11 @@ Notes on individual events:
   `tcp_error` or `send_failed` without a close frame; or `init_refused`
   (including a join token that fails its check, 4400) and
   `startup_failure` when the runtime did not start. Dev mode's `reload`
-  emits no event of its own.
+  emits no event of its own. The server's close log line carries the same
+  label (`with <code> (reason <label>)`), so a log and the event name one
+  cause. Close code 4401 has three: `init_refused` (an `init` refusing
+  with 401), `session_revoked` and `authentication_expired` (a failed
+  `ws_auth` re-check); count by `reason`, not by `close_code`.
 - `[brazier, ws, rate_limited]` fires for every refused message. `kind` is
   `event_rate`, `batch_size` or `heartbeat_rate`, and `violations` is the
   connection's count in the current rate window; reaching

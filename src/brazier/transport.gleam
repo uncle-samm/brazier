@@ -2266,9 +2266,19 @@ fn stop_connection(
   action: CloseAction,
   reason: String,
 ) -> Nil {
+  // The label is the one `[brazier, ws, close]` reports, so the log line
+  // and the event name the same cause (4401 is shared by three).
+  let #(close_code, close_label) = close_summary(action)
   log.info(
     "brazier.transport",
-    "Closing WebSocket " <> ctx(state) <> ": " <> reason,
+    "Closing WebSocket "
+      <> ctx(state)
+      <> " with "
+      <> int.to_string(close_code)
+      <> " (reason "
+      <> close_label
+      <> "): "
+      <> reason,
   )
   let frame = case action {
     SendClose(code: code, reason: close_reason) ->
@@ -2295,7 +2305,6 @@ fn stop_connection(
     None -> state
   }
   server.close(state.socket)
-  let #(close_code, close_label) = close_summary(action)
   telemetry.ws_close(
     erlang_monotonic_time() - state.opened_at,
     state.frames_in,
@@ -2541,7 +2550,9 @@ fn start_ws_connection(
         <> admission.peer_ip
         <> ") with "
         <> int.to_string(close_code)
-        <> " after the runtime did not start: "
+        <> " (reason "
+        <> close_label
+        <> ") after the runtime did not start: "
         <> startup_error_to_string(startup_error)
       // The cause (a crash with its stacktrace, a refusal at the level its
       // status calls for) was logged once where it happened, with this

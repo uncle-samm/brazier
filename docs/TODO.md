@@ -14,18 +14,31 @@
   - **Resolution:** how it was fixed (fill in when resolved)
 -->
 
-Found while splitting the stale-build close code (Milestone 118, 2026-11-05).
+## Resolved Issues
+
+<!-- Move resolved issues here with full resolution details -->
 
 - **Issue:** an `init` refusing with 401 closes with 4401, the code of a
   revoked session or expired authentication, so the two are told apart only
   by the close reason and the server log. The client action is the same (a
   reload behind the guard), so nothing misbehaves; a monitor that counts
   revocations by close code also counts 401 refusals.
-  - **Files:** `src/brazier/error.gleam`, `src/brazier/transport/ws.gleam`
-
-## Resolved Issues
-
-<!-- Move resolved issues here with full resolution details -->
+  - **Files:** `src/brazier/transport.gleam`, `docs/WIRE_PROTOCOL.md`,
+    `docs/TELEMETRY.md`
+  - **Resolution:** (Milestone 118, m118-logs) Decision: 4401 stays shared.
+    The client does the same thing for all three causes, and a code per
+    cause would only move the distinction into a table the client does not
+    need. The server tells them apart: the `[brazier, ws, close]` event
+    already carried `init_refused`, `session_revoked` or
+    `authentication_expired` as its `reason`, but the log lines did not
+    (the connection close line said only `auth re-check failed` or
+    `session revoked`, the startup close line only the code). Every close
+    line now reads `with <code> (reason <label>)`, the label taken from the
+    one function that also labels the event (`close_summary`, and
+    `startup_close` for a runtime that did not start), so the two cannot
+    drift. `close_cause_4401_test` covers each cause over a real listener,
+    asserting the close frame, the event's code and label and the one log
+    line.
 
 - **Issue:** `brazier_application_ffi:receive_wait_event` takes any
   `{'EXIT', _, normal}` as a shutdown request, so a linked helper that exits
