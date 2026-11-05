@@ -101,7 +101,7 @@ pub fn build(
     app_manifest(project),
     packages,
   ))
-  use Nil <- result.try(compile(dir, src_dir, app_modules(analysis)))
+  use Nil <- result.try(compile(dir, src_dir, brazier_root, analysis.client))
   use Nil <- result.try(files.write(files.join(dir, "bundle_entry.mjs"), entry))
   use Nil <- result.try(program.esbuild_bundle(
     dir,
@@ -145,149 +145,179 @@ pub fn publish(static: String, contents: String) -> Result(Bundle, String) {
 
 /// Compile the client project at `dir` with `gleam build`.
 ///
-/// `app_modules` are the emitted app modules, holding the app's own reached
-/// definitions sliced unchanged from its sources in `src_dir`. A warning in
-/// one of them is the app's, as the server's `gleam build` of the same
-/// source is: it is logged and does not fail the build, so an unused
-/// variable in a view does not stop a bundle that Gleam itself would build.
-/// The compiler names the copy in the client project, whose line numbers
-/// are not the source's, so the log names the place in the app's own file,
-/// mapped through the module's segments (`source_map`). A place the build
-/// generated (a regenerated import, an `@external` line) has no place in
-/// the app's file, and the log says so, naming the copy.
+/// `emitted` are the sliced modules: the app's modules, holding their
+/// reached definitions copied unchanged from the app's sources in `src_dir`,
+/// and the pruned Brazier modules (`brazier/stream`), copied the same way
+/// from Brazier's sources in `brazier_root/src`. The compiler names a place
+/// in a slice by the copy's line, which is not the source's, so each warning
+/// in a slice is placed in its source file through the module's segments
+/// (`source_map`), with the copy's place alongside.
 ///
-/// Every other file is one Brazier writes: the copied and sliced Brazier
-/// modules, the `brazier/log` shim, the generated entry and `gleam.toml`.
-/// These must compile on JavaScript without a warning, so a warning in one,
-/// or a warning naming no file, fails the build, naming each file and
-/// warning. `--warnings-as-errors` is not used because it would refuse the
-/// app's own warnings too.
+/// A warning in a definition copied from the app's code is the app's, as
+/// the server's `gleam build` of the same source is: it is logged at the
+/// place in the app's file and does not fail the build, so an unused
+/// variable in a view does not stop a bundle that Gleam itself would build.
+///
+/// Everything else is code Brazier writes, which must compile on JavaScript
+/// without a warning, so a warning there fails the build, naming each place
+/// and warning: a warning in a whole file Brazier writes (a copied Brazier
+/// module, the `brazier/log` shim, the generated entry, `gleam.toml`), one
+/// naming no file, one in a pruned Brazier module, and one in a line the
+/// build generated in an app module's copy (its regenerated imports or an
+/// `@external` attribute), since only a Brazier bug can put a warning
+/// there. A warning in an app module's copy that gives no line and column
+/// cannot be placed in the app's code, so it fails the build as one naming
+/// no file does. `--warnings-as-errors` is not used because it would refuse
+/// the app's own warnings too.
 pub fn compile(
   dir: String,
   src_dir: String,
-  app_modules: List(reach.Emitted),
+  brazier_root: String,
+  emitted: List(reach.Emitted),
 ) -> Result(Nil, String) {
   use warnings <- result.try(program.gleam_build_warnings(dir))
-  let user_modules = list.map(app_modules, fn(emitted) { emitted.path })
-  use Nil <- result.try(
-    list.try_each(warnings, fn(warning) {
-      case app_module_of(warning, app_modules) {
-        Ok(#(emitted, copy)) -> {
-          use file <- result.map(
-            program.absolute_path(files.join(src_dir, emitted.path <> ".gleam")),
-          )
-          log.warning(
-            "brazier.build.client_bundle",
-            "`gleam build` of the client project in "
-              <> dir
-              <> " warned in the app's code: "
-              <> describe_app_warning(warning.headline, copy, emitted, file),
-          )
-        }
-        Error(Nil) -> Ok(Nil)
+  use sliced <- result.try(
+    list.try_map(emitted, fn(module) {
+      let root = case reach.is_framework_module(module.path) {
+        True -> files.join(brazier_root, "src")
+        False -> src_dir
       }
+      program.absolute_path(files.join(root, module.path <> ".gleam"))
+      |> result.map(fn(source_file) { Sliced(emitted: module, source_file:) })
     }),
   )
-  case brazier_warnings(warnings, user_modules) {
+  let placed = list.map(warnings, place(_, sliced))
+  list.each(placed, fn(placed) {
+    case placed {
+      InAppCode(description) ->
+        log.warning(
+          "brazier.build.client_bundle",
+          "`gleam build` of the client project in "
+            <> dir
+            <> " warned in the app's code: "
+            <> description,
+        )
+      InBrazierCode(_) -> Nil
+    }
+  })
+  case
+    list.filter_map(placed, fn(placed) {
+      case placed {
+        InBrazierCode(description) -> Ok(description)
+        InAppCode(_) -> Error(Nil)
+      }
+    })
+  {
     [] -> Ok(Nil)
     refused -> {
       let reason =
         "`gleam build` in "
         <> dir
-        <> " warned in files Brazier writes, which must compile without warnings. This is a Brazier bug; the bundle was not written:\n"
-        <> string.join(
-          list.map(refused, fn(w) { "- " <> program.describe_warning(w) }),
-          "\n",
-        )
+        <> " warned in code Brazier writes (its own files, and the lines it generates in the app's modules), which must compile without warnings. This is a Brazier bug; the bundle was not written:\n"
+        <> string.join(list.map(refused, fn(d) { "- " <> d }), "\n")
       log.error("brazier.build.client_bundle", reason)
       Error(reason)
     }
   }
 }
 
-/// The warnings that do not point into one of `user_modules` (module
-/// paths): those whose file does not end with `/src/<module>.gleam`, and
-/// those naming no file. The compiler prints absolute paths; matching the
-/// end does not depend on how the project's directory is spelled.
-pub fn brazier_warnings(
-  warnings: List(program.Warning),
-  user_modules: List(String),
-) -> List(program.Warning) {
-  list.filter(warnings, fn(warning) {
-    case program.warning_file(warning) {
-      option.Some(file) ->
-        !list.any(user_modules, fn(module) {
-          string.ends_with(file, "/" <> module_file(module))
-        })
-      option.None -> True
-    }
-  })
+/// A module of the client project sliced out of a source file: an emitted
+/// app module, or a pruned Brazier module, and the absolute path of the file
+/// it was sliced from.
+pub type Sliced {
+  Sliced(emitted: reach.Emitted, source_file: String)
 }
 
-/// The app module whose copy `warning` points into, by the same rule as
-/// `brazier_warnings`, and the warning's location there.
-fn app_module_of(
-  warning: program.Warning,
-  app_modules: List(reach.Emitted),
-) -> Result(#(reach.Emitted, String), Nil) {
-  use location <- result.try(option.to_result(warning.location, Nil))
-  use file <- result.try(option.to_result(program.warning_file(warning), Nil))
-  list.find(app_modules, fn(emitted) {
-    string.ends_with(file, "/" <> module_file(emitted.path))
-  })
-  |> result.map(fn(emitted) { #(emitted, location) })
+/// A warning of the client project's compile, placed.
+pub type Placed {
+  /// In a definition copied from the app's code, described at its place in
+  /// the app's file: logged, and the build goes on.
+  InAppCode(description: String)
+  /// In code Brazier writes: the build fails.
+  InBrazierCode(description: String)
 }
 
-/// An app module's warning `headline`, at `copy` (the compiler's
-/// `file:line:column` in `emitted`'s copy), described at the place in the
-/// app's file `source_file` that it maps to, followed by the copy's
-/// location. When it maps to no place, the copy's location and why: the
-/// position is in a line the build generated, or the compiler gave no line
-/// and column. Never a guessed line.
-pub fn describe_app_warning(
-  headline: String,
-  copy: String,
-  emitted: reach.Emitted,
-  source_file: String,
-) -> String {
-  case program.location_line_column(copy) {
-    option.Some(#(line, column)) ->
-      case source_map.locate(emitted.segments, line, column) {
-        source_map.InSource(line:, column:) ->
-          headline
-          <> " at "
-          <> source_file
-          <> ":"
-          <> int.to_string(line)
-          <> ":"
-          <> int.to_string(column)
-          <> " (the client project's copy: "
-          <> copy
-          <> ")"
-        source_map.Generated ->
-          headline
-          <> " at "
-          <> copy
-          <> ", in a line the build generated for "
-          <> emitted.path
-          <> " (its imports or an @external attribute), not in your source "
-          <> source_file
+/// Place `warning` given the client project's `sliced` modules (see
+/// `compile`). A warning in a slice is described at the place in its source
+/// file, followed by the copy's place; one that maps to no place there is
+/// described at the copy's place, saying why. Never at a guessed line.
+pub fn place(warning: program.Warning, sliced: List(Sliced)) -> Placed {
+  case sliced_of(warning, sliced) {
+    Error(Nil) -> InBrazierCode(program.describe_warning(warning))
+    Ok(#(module, copy)) ->
+      case
+        describe_in_slice(warning.headline, copy, module),
+        reach.is_framework_module(module.emitted.path)
+      {
+        Ok(description), False -> InAppCode(description)
+        Ok(description), True -> InBrazierCode(description)
+        Error(description), _ -> InBrazierCode(description)
       }
-    option.None ->
-      headline
-      <> " at "
-      <> copy
-      <> ", which gives no line and column, so it cannot be mapped to a place in your source "
-      <> source_file
   }
 }
 
-/// The emitted app modules in the client project: those that are not
-/// Brazier's.
-fn app_modules(analysis: Analysis) -> List(reach.Emitted) {
-  list.filter(analysis.client, fn(emitted) {
-    !reach.is_framework_module(emitted.path)
+/// The sliced module whose copy `warning` points into, and the warning's
+/// location there. The compiler prints absolute paths; matching the end,
+/// `/src/<module>.gleam`, does not depend on how the project's directory is
+/// spelled.
+fn sliced_of(
+  warning: program.Warning,
+  sliced: List(Sliced),
+) -> Result(#(Sliced, String), Nil) {
+  use location <- result.try(option.to_result(warning.location, Nil))
+  use file <- result.try(option.to_result(program.warning_file(warning), Nil))
+  list.find(sliced, fn(module) {
+    string.ends_with(file, "/" <> module_file(module.emitted.path))
   })
+  |> result.map(fn(module) { #(module, location) })
+}
+
+/// A warning `headline` at `copy` (the compiler's `file:line:column` in
+/// `module`'s copy): `Ok` at the place in the source file it maps to,
+/// followed by the copy's place, or `Error` at the copy's place when it maps
+/// to no place there, saying why: the position is in a line the build
+/// generated, or the compiler gave no line and column.
+fn describe_in_slice(
+  headline: String,
+  copy: String,
+  module: Sliced,
+) -> Result(String, String) {
+  case program.location_line_column(copy) {
+    option.Some(#(line, column)) ->
+      case source_map.locate(module.emitted.segments, line, column) {
+        source_map.InSource(line:, column:) ->
+          Ok(
+            headline
+            <> " at "
+            <> module.source_file
+            <> ":"
+            <> int.to_string(line)
+            <> ":"
+            <> int.to_string(column)
+            <> " (the client project's copy: "
+            <> copy
+            <> ")",
+          )
+        source_map.Generated ->
+          Error(
+            headline
+            <> " at "
+            <> copy
+            <> ", in a line the build generated for "
+            <> module.emitted.path
+            <> " (its imports or an @external attribute), not in its source "
+            <> module.source_file,
+          )
+      }
+    option.None ->
+      Error(
+        headline
+        <> " at "
+        <> copy
+        <> ", which gives no line and column, so it cannot be placed in its source "
+        <> module.source_file,
+      )
+  }
 }
 
 /// The esbuild entry: starts the runtime with the generated entry module.

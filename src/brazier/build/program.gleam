@@ -108,9 +108,10 @@ pub fn gleam_build(cwd: String) -> Result(List(Warning), String) {
 }
 
 /// Run `gleam build` in `cwd` and return its warnings without logging them.
-/// The caller must log or refuse every one: `client_bundle.compile` logs an
-/// app module's warning at the place in the app's own file, which this
-/// module cannot know, and refuses the rest.
+/// The caller must log or refuse every one: `client_bundle.compile` places
+/// a warning in a sliced module in the file it was sliced from, which this
+/// module cannot know, logs the ones in the app's own code and refuses the
+/// rest.
 pub fn gleam_build_warnings(cwd: String) -> Result(List(Warning), String) {
   case run(cwd, "gleam", ["build"]) {
     Ok(output) -> {

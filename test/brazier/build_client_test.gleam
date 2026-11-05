@@ -1,7 +1,8 @@
 /// Tests for the client-side build pieces: the generated `brazier/log` shim,
 /// app module discovery, bundle publishing, the framework FFI files the
-/// client project gets, the warnings its compile refuses, and the app's own
-/// warnings, logged at their places in the app's files.
+/// client project gets, the warnings its compile refuses, placed in the
+/// sources Brazier sliced them from, and the app's own warnings, logged at
+/// their places in the app's files.
 import brazier/build/client_bundle
 import brazier/build/client_shim
 import brazier/build/discovery
@@ -466,7 +467,7 @@ pub fn compile_logs_an_app_warning_at_the_apps_own_line_test() {
   client_project(dir, emitted, False)
   let #(result, logs) =
     log_capture.capture(fn() {
-      client_bundle.compile(dir, root <> "/app/src", [emitted])
+      client_bundle.compile(dir, root <> "/app/src", ".", [emitted])
     })
   let assert Ok(Nil) = result
   // Each warning names the place the compiler names in the original, and
@@ -493,7 +494,7 @@ pub fn compile_logs_an_app_warning_at_the_apps_own_line_test() {
     })
 }
 
-pub fn compile_says_a_warning_in_generated_lines_is_not_in_the_source_test() {
+pub fn compile_refuses_a_warning_in_a_line_the_build_generated_test() {
   let dir = fresh_dir("compile_generated_warning")
   let emitted = emit_view(view_source)
   // As a Brazier bug in the regenerated imports would: an import the copied
@@ -509,55 +510,81 @@ pub fn compile_says_a_warning_in_generated_lines_is_not_in_the_source_test() {
   client_project(dir, emitted, False)
   let #(result, logs) =
     log_capture.capture(fn() {
-      client_bundle.compile(dir, "app_src", [emitted])
+      client_bundle.compile(dir, "app_src", ".", [emitted])
     })
-  let assert Ok(Nil) = result
+  let assert Error(reason) = result
   let assert Ok(source_file) = program.absolute_path("app_src/app/view.gleam")
+  let assert True = string.contains(reason, "`gleam build` in " <> dir)
+  let assert True = string.contains(reason, "This is a Brazier bug")
+  // The copy's path, line and column, the warning, and that the build
+  // generated the line. It is the only one refused, so the reason ends with
+  // it.
   let assert True =
-    log_capture.has(logs, level: "warning", containing: [
-      "warned in the app's code: Unused imported module at /",
-      "/compile_generated_warning/src/app/view.gleam:1:1, in a line the build generated for app/view (its imports or an @external attribute), not in your source "
+    string.contains(reason, "\n- Unused imported module at /")
+    && string.ends_with(
+      reason,
+      "/compile_generated_warning/src/app/view.gleam:1:1, in a line the build generated for app/view (its imports or an @external attribute), not in its source "
         <> source_file,
-    ])
+    )
   // No line of the source is guessed for it.
-  let assert False =
-    list.any(logs, fn(event) {
-      string.contains(event.message, "Unused imported module")
-      && string.contains(event.message, source_file <> ":")
-    })
-  // The definitions below it still map.
+  let assert False = string.contains(reason, source_file <> ":")
+  let assert True = log_capture.has(logs, level: "error", containing: [reason])
+  // The app's own warnings below it are still its own: mapped and logged,
+  // not refused.
+  let assert False = string.contains(reason, "Unused variable")
   let assert True =
     log_capture.has(logs, level: "warning", containing: [
-      "Unused variable at " <> source_file <> ":11:7 (",
+      "warned in the app's code: Unused variable at "
+        <> source_file
+        <> ":11:7 (",
       "/compile_generated_warning/src/app/view.gleam:7:7)",
     ])
 }
 
-pub fn describe_app_warning_without_line_and_column_maps_nothing_test() {
-  let emitted = emit_view(view_source)
-  let assert "Unused variable at /c/src/app/view.gleam, which gives no line and column, so it cannot be mapped to a place in your source /p/src/app/view.gleam" =
-    client_bundle.describe_app_warning(
-      "Unused variable",
-      "/c/src/app/view.gleam",
-      emitted,
-      "/p/src/app/view.gleam",
+pub fn compile_refuses_a_pruned_brazier_module_warning_at_its_own_line_test() {
+  let root = fresh_dir("compile_pruned_brazier_warning")
+  // The view module's slice standing in for a pruned Brazier module whose
+  // reached definitions warn: the copy at `src/brazier/stream.gleam` of
+  // `<brazier_root>/src/brazier/stream.gleam`.
+  let emitted =
+    reach.Emitted(..emit_view(view_source), path: reach.stream_module)
+  let dir = root <> "/client"
+  write(dir, "gleam.toml", js_toml)
+  write(dir, "src/brazier/stream.gleam", emitted.source)
+  write(dir, "src/brazier/view_ffi.mjs", view_ffi)
+  write(dir, "src/brazier_app_entry.gleam", "pub fn main() { 1 }\n")
+  let #(result, logs) =
+    log_capture.capture(fn() {
+      client_bundle.compile(dir, "app_src", root <> "/brazier", [emitted])
+    })
+  let assert Error(reason) = result
+  let assert Ok(source_file) =
+    program.absolute_path(root <> "/brazier/src/brazier/stream.gleam")
+  // Both warnings name Brazier's own source at the lines the compiler gives
+  // for the original (see `compile_logs_an_app_warning_at_the_apps_own_line_test`),
+  // with the copy's place alongside.
+  let assert True =
+    string.contains(
+      reason,
+      "- Unused variable at "
+        <> source_file
+        <> ":11:7 (the client project's copy: /",
     )
-  // The blank line between two copied definitions is the build's.
-  let assert "Unused variable at /c/src/app/view.gleam:3:1, in a line the build generated for app/view (its imports or an @external attribute), not in your source /p/src/app/view.gleam" =
-    client_bundle.describe_app_warning(
-      "Unused variable",
-      "/c/src/app/view.gleam:3:1",
-      emitted,
-      "/p/src/app/view.gleam",
+    && string.contains(reason, "/client/src/brazier/stream.gleam:5:7)")
+  let assert True =
+    string.contains(
+      reason,
+      "- Int is outside JavaScript's safe integer range at "
+        <> source_file
+        <> ":15:44 (the client project's copy: /",
     )
-  // The @external line before `abs` is too.
-  let assert "Deprecated at /c/src/app/view.gleam:1:2, in a line the build generated for app/view (its imports or an @external attribute), not in your source /p/src/app/view.gleam" =
-    client_bundle.describe_app_warning(
-      "Deprecated",
-      "/c/src/app/view.gleam:1:2",
-      emitted,
-      "/p/src/app/view.gleam",
-    )
+    && string.contains(reason, "/client/src/brazier/stream.gleam:9:19)")
+  let assert True = log_capture.has(logs, level: "error", containing: [reason])
+  // None of it is logged as the app's.
+  let assert False =
+    list.any(logs, fn(event) {
+      string.contains(event.message, "warned in the app's code")
+    })
 }
 
 pub fn compile_refuses_a_warning_in_a_file_brazier_writes_test() {
@@ -565,7 +592,7 @@ pub fn compile_refuses_a_warning_in_a_file_brazier_writes_test() {
   client_project(dir, emit_view(view_source), True)
   let #(result, logs) =
     log_capture.capture(fn() {
-      client_bundle.compile(dir, "app_src", [emit_view(view_source)])
+      client_bundle.compile(dir, "app_src", ".", [emit_view(view_source)])
     })
   let assert Error(reason) = result
   let assert True = string.contains(reason, "`gleam build` in " <> dir)
@@ -590,22 +617,70 @@ pub fn compile_refuses_a_warning_in_a_file_brazier_writes_test() {
     ])
 }
 
-pub fn brazier_warnings_keeps_only_warnings_outside_app_modules_test() {
-  let warning = fn(location) { program.Warning("w", location) }
-  let app = warning(Some("/p/build/brazier_client_app/src/app/view.gleam:1:10"))
-  let entry =
-    warning(Some("/p/build/brazier_client_app/src/brazier_app_entry.gleam:3:1"))
-  // A Brazier module whose file name matches an app module's.
-  let brazier_view =
-    warning(Some("/p/build/brazier_client_app/src/brazier/view.gleam:2:1"))
+pub fn place_maps_an_app_warning_to_the_apps_line_test() {
+  let sliced = [
+    client_bundle.Sliced(emit_view(view_source), "/p/app/view.gleam"),
+  ]
+  let at = fn(location) {
+    client_bundle.place(program.Warning("w", Some(location)), sliced)
+  }
+  let assert client_bundle.InAppCode(
+    "w at /p/app/view.gleam:11:7 (the client project's copy: /c/src/app/view.gleam:5:7)",
+  ) = at("/c/src/app/view.gleam:5:7")
+  // On the first line of `big`, the column shifts by where it starts.
+  let assert client_bundle.InAppCode(
+    "w at /p/app/view.gleam:15:44 (the client project's copy: /c/src/app/view.gleam:9:19)",
+  ) = at("/c/src/app/view.gleam:9:19")
+}
+
+pub fn place_refuses_an_app_warning_it_cannot_place_test() {
+  let sliced = [
+    client_bundle.Sliced(emit_view(view_source), "/p/app/view.gleam"),
+  ]
+  let at = fn(location) {
+    client_bundle.place(program.Warning("w", Some(location)), sliced)
+  }
+  // The @external line before `abs`, and the blank line after it, are the
+  // build's.
+  let assert client_bundle.InBrazierCode(
+    "w at /c/src/app/view.gleam:1:2, in a line the build generated for app/view (its imports or an @external attribute), not in its source /p/app/view.gleam",
+  ) = at("/c/src/app/view.gleam:1:2")
+  let assert client_bundle.InBrazierCode(
+    "w at /c/src/app/view.gleam:3:1, in a line the build generated for app/view (its imports or an @external attribute), not in its source /p/app/view.gleam",
+  ) = at("/c/src/app/view.gleam:3:1")
+  // Past the last definition.
+  let assert client_bundle.InBrazierCode(_) = at("/c/src/app/view.gleam:10:1")
+  // A location without a line and column cannot be placed in the app's code.
+  let assert client_bundle.InBrazierCode(
+    "w at /c/src/app/view.gleam, which gives no line and column, so it cannot be placed in its source /p/app/view.gleam",
+  ) = at("/c/src/app/view.gleam")
+}
+
+pub fn place_refuses_warnings_outside_app_modules_test() {
+  let sliced = [
+    client_bundle.Sliced(emit_view(view_source), "/p/app/view.gleam"),
+    client_bundle.Sliced(
+      reach.Emitted(..emit_view(view_source), path: "view"),
+      "/p/view.gleam",
+    ),
+  ]
+  let place = fn(location) {
+    client_bundle.place(program.Warning("w", location), sliced)
+  }
+  // A generated file.
+  let assert client_bundle.InBrazierCode(
+    "w at /p/build/brazier_client_app/src/brazier_app_entry.gleam:3:1",
+  ) = place(Some("/p/build/brazier_client_app/src/brazier_app_entry.gleam:3:1"))
+  // A Brazier module whose file name ends like an app module's.
+  let assert client_bundle.InBrazierCode(
+    "w at /p/build/brazier_client_app/src/brazier/view.gleam:2:1",
+  ) = place(Some("/p/build/brazier_client_app/src/brazier/view.gleam:2:1"))
   // A warning naming no file cannot be the app's.
-  let unlocated = warning(None)
-  let assert [] = client_bundle.brazier_warnings([app], ["app/view"])
-  let assert True =
-    client_bundle.brazier_warnings([app, entry, brazier_view, unlocated], [
-      "app/view", "view",
-    ])
-    == [entry, brazier_view, unlocated]
-  // With no app modules, every warning is Brazier's.
-  let assert [_] = client_bundle.brazier_warnings([app], [])
+  let assert client_bundle.InBrazierCode("w") = place(None)
+  // With no sliced modules, every warning is Brazier's.
+  let assert client_bundle.InBrazierCode(_) =
+    client_bundle.place(
+      program.Warning("w", Some("/c/src/app/view.gleam:5:7")),
+      [],
+    )
 }

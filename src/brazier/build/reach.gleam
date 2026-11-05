@@ -17,8 +17,10 @@
 /// and regenerates the imports from what those definitions use, so a
 /// server-only import, function, constant or type never reaches the client
 /// project. Each emitted module records a `source_map.Segment` per copied
-/// definition, so a compiler warning at a line of the copy can be reported
-/// at the line of the user's file it came from.
+/// definition, so a compiler warning at a line of the copy is reported at
+/// the line of the file it was sliced from (the app's, or Brazier's for
+/// `brazier/stream`). A warning in a line emission writes (an import, an
+/// `@external` attribute) can only be a Brazier bug, and fails the build.
 import brazier/build/field_type
 import brazier/build/source_location
 import brazier/build/source_map.{type Segment}
