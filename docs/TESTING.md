@@ -396,11 +396,14 @@ each shard has its own ports:
 ```sh
 BRAZIER_CDP_VIEWPORTS=desktop BRAZIER_CDP_SHARD=1/4 make browser-all-shard
 make browser-all-docker-shards
-BRAZIER_CDP_TOTAL_SHARDS=23 BRAZIER_CDP_VIEWPORTS=desktop BRAZIER_CDP_PARALLEL=5 make browser-all-docker-shards
+BRAZIER_CDP_VIEWPORTS=desktop BRAZIER_CDP_PARALLEL=5 make browser-all-docker-shards
 ```
 
 Docker runner knobs:
 
+- `BRAZIER_CDP_TOTAL_SHARDS` sets the shard total. By default it is the
+  number of examples the harness in the image selects, one example per
+  shard; a total above that count is refused.
 - `BRAZIER_CDP_SHARDS="1,6,11"` runs a selected shard list from the
   configured total (for multi-VM runners).
 - `BRAZIER_CDP_PREBUILD_EXAMPLES=1` bakes `gleam build` output for the root
@@ -425,15 +428,17 @@ For Boxd-style VM fan-out:
 
    ```sh
    BRAZIER_CDP_DOCKER_IMAGE=brazier-cdp:boxd BRAZIER_CDP_PREBUILD_EXAMPLES=1 \
-     BRAZIER_CDP_TOTAL_SHARDS=23 BRAZIER_CDP_SHARDS=1 BRAZIER_CDP_PARALLEL=1 \
+     BRAZIER_CDP_SHARDS=1 BRAZIER_CDP_PARALLEL=1 \
      sh scripts/run_cdp_shards_docker.sh
    ```
 
-2. Fork the VM and run non-overlapping shard lists on each fork:
+2. Fork the VM and run non-overlapping shard lists on each fork. Every fork
+   reads the shard total from the same image, so they agree on it; with 25
+   examples, five forks take `1,6,11,16,21` through `5,10,15,20,25`:
 
    ```sh
    BRAZIER_CDP_DOCKER_IMAGE=brazier-cdp:boxd BRAZIER_CDP_SKIP_DOCKER_BUILD=1 \
-     BRAZIER_CDP_TOTAL_SHARDS=23 BRAZIER_CDP_SHARDS="1,6,11,16,21" \
+     BRAZIER_CDP_SHARDS="1,6,11,16,21" \
      BRAZIER_CDP_PARALLEL=2 sh scripts/run_cdp_shards_docker.sh
    ```
 

@@ -1,10 +1,18 @@
 #!/usr/bin/env sh
+# Run the full browser (CDP) matrix as one Docker container per shard.
+#
+# The shard total defaults to the number of examples the harness selects (its
+# ALL_EXAMPLES; this runner passes no filter and no --canonical), read from
+# the harness inside the image the shards run, so each shard runs one example
+# and every fork of one image agrees on the total. BRAZIER_CDP_TOTAL_SHARDS
+# overrides it, but never above that count: a shard past it would run no
+# example and pass without testing anything.
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 . "$ROOT/scripts/refuse_renamed_env.sh"
 IMAGE="${BRAZIER_CDP_DOCKER_IMAGE:-brazier-cdp:local}"
-TOTAL="${BRAZIER_CDP_TOTAL_SHARDS:-23}"
+REQUESTED_TOTAL="${BRAZIER_CDP_TOTAL_SHARDS:-}"
 VIEWPORTS="${BRAZIER_CDP_VIEWPORTS:-desktop}"
 LOG_DIR="${BRAZIER_CDP_DOCKER_LOG_DIR:-$ROOT/.tmp/cdp-shards}"
 REQUESTED_SHARDS="${BRAZIER_CDP_SHARDS:-}"
@@ -40,68 +48,73 @@ default_parallel() {
   echo "$half"
 }
 
-case "$TOTAL" in
-  ''|*[!0-9]*)
-    echo "BRAZIER_CDP_TOTAL_SHARDS must be an integer" >&2
-    exit 1
-    ;;
-esac
-
-if [ "$TOTAL" -lt 1 ]; then
-  echo "BRAZIER_CDP_TOTAL_SHARDS must be >= 1" >&2
-  exit 1
-fi
-
-if [ -n "$REQUESTED_SHARDS" ]; then
-  SHARD_LIST="$(printf '%s\n' "$REQUESTED_SHARDS" | tr ',' ' ')"
-else
-  SHARD_LIST="$(seq 1 "$TOTAL")"
-fi
-
-SHARD_COUNT=0
-for shard in $SHARD_LIST; do
-  case "$shard" in
+# Exits unless $2 is an integer >= 1, naming the setting $1.
+require_positive_integer() {
+  case "$2" in
     ''|*[!0-9]*)
-      echo "BRAZIER_CDP_SHARDS entries must be integers" >&2
+      echo "$1 must be an integer" >&2
       exit 1
       ;;
   esac
-
-  if [ "$shard" -lt 1 ] || [ "$shard" -gt "$TOTAL" ]; then
-    echo "BRAZIER_CDP_SHARDS entry $shard is outside 1..$TOTAL" >&2
+  if [ "$2" -lt 1 ]; then
+    echo "$1 must be >= 1" >&2
     exit 1
   fi
+}
 
-  SHARD_COUNT=$((SHARD_COUNT + 1))
-done
+# Prints how many examples the harness in $IMAGE selects: the length of its
+# ALL_EXAMPLES list, read with Python's parser, so the harness itself does not
+# run. Exits non-zero, saying why, when the list is not one literal list of
+# distinct names.
+count_examples() {
+  docker run --rm "$IMAGE" python3 -c '
+import ast, sys
+path = "test_all_cdp.py"
+with open(path, encoding="utf-8") as source:
+    tree = ast.parse(source.read(), path)
+lists = [
+    ast.literal_eval(node.value)
+    for node in tree.body
+    if isinstance(node, ast.Assign)
+    and [target.id for target in node.targets if isinstance(target, ast.Name)] == ["ALL_EXAMPLES"]
+]
+if len(lists) != 1:
+    sys.exit("%s assigns ALL_EXAMPLES %d times; expected once" % (path, len(lists)))
+names = lists[0]
+if not isinstance(names, list) or not names or not all(isinstance(name, str) for name in names):
+    sys.exit("%s: ALL_EXAMPLES must be a non-empty list of example names" % path)
+if len(set(names)) != len(names):
+    sys.exit("%s: ALL_EXAMPLES names an example more than once" % path)
+print(len(names))
+'
+}
 
-if [ "$SHARD_COUNT" -lt 1 ]; then
-  echo "at least one shard is required" >&2
-  exit 1
+# Everything that does not need the example count is checked before the image
+# is built, so a typo fails at once rather than after the build.
+if [ -n "$REQUESTED_TOTAL" ]; then
+  require_positive_integer BRAZIER_CDP_TOTAL_SHARDS "$REQUESTED_TOTAL"
 fi
 
-# Assign in two steps: a plain assignment from $(...) carries the
-# substitution's exit status, so set -e stops here if default_parallel fails.
-if [ -n "${BRAZIER_CDP_PARALLEL:-}" ]; then
-  PARALLEL="$BRAZIER_CDP_PARALLEL"
-else
-  PARALLEL="$(default_parallel)"
-fi
-
-case "$PARALLEL" in
-  ''|*[!0-9]*)
-    echo "BRAZIER_CDP_PARALLEL must be an integer" >&2
+if [ -n "$REQUESTED_SHARDS" ]; then
+  REQUESTED_SHARD_LIST="$(printf '%s\n' "$REQUESTED_SHARDS" | tr ',' ' ')"
+  requested_count=0
+  for shard in $REQUESTED_SHARD_LIST; do
+    case "$shard" in
+      ''|*[!0-9]*)
+        echo "BRAZIER_CDP_SHARDS entries must be integers" >&2
+        exit 1
+        ;;
+    esac
+    requested_count=$((requested_count + 1))
+  done
+  if [ "$requested_count" -lt 1 ]; then
+    echo "at least one shard is required" >&2
     exit 1
-    ;;
-esac
-
-if [ "$PARALLEL" -lt 1 ]; then
-  echo "BRAZIER_CDP_PARALLEL must be >= 1" >&2
-  exit 1
+  fi
 fi
 
-if [ "$PARALLEL" -gt "$SHARD_COUNT" ]; then
-  PARALLEL="$SHARD_COUNT"
+if [ -n "${BRAZIER_CDP_PARALLEL:-}" ]; then
+  require_positive_integer BRAZIER_CDP_PARALLEL "$BRAZIER_CDP_PARALLEL"
 fi
 
 if ! command -v docker >/dev/null 2>&1; then
@@ -153,6 +166,51 @@ else
     -f "$ROOT/Dockerfile.ci" \
     -t "$IMAGE" \
     "$ROOT"
+fi
+
+# Assign in two steps: a plain assignment from $(...) carries the
+# substitution's exit status, so set -e stops here if count_examples fails.
+EXAMPLE_COUNT="$(count_examples)"
+require_positive_integer "the example count read from $IMAGE" "$EXAMPLE_COUNT"
+
+if [ -n "$REQUESTED_TOTAL" ]; then
+  if [ "$REQUESTED_TOTAL" -gt "$EXAMPLE_COUNT" ]; then
+    echo "BRAZIER_CDP_TOTAL_SHARDS=$REQUESTED_TOTAL is more than the $EXAMPLE_COUNT examples the harness in $IMAGE selects; a shard past $EXAMPLE_COUNT would run no example" >&2
+    exit 1
+  fi
+  TOTAL="$REQUESTED_TOTAL"
+else
+  TOTAL="$EXAMPLE_COUNT"
+fi
+echo "The harness in $IMAGE selects $EXAMPLE_COUNT examples; sharding them $TOTAL ways"
+
+if [ -n "$REQUESTED_SHARDS" ]; then
+  SHARD_LIST="$REQUESTED_SHARD_LIST"
+  for shard in $SHARD_LIST; do
+    if [ "$shard" -lt 1 ] || [ "$shard" -gt "$TOTAL" ]; then
+      echo "BRAZIER_CDP_SHARDS entry $shard is outside 1..$TOTAL" >&2
+      exit 1
+    fi
+  done
+else
+  SHARD_LIST="$(seq 1 "$TOTAL")"
+fi
+
+SHARD_COUNT=0
+for shard in $SHARD_LIST; do
+  SHARD_COUNT=$((SHARD_COUNT + 1))
+done
+
+# Assign in two steps, as above, so set -e stops here if default_parallel
+# fails.
+if [ -n "${BRAZIER_CDP_PARALLEL:-}" ]; then
+  PARALLEL="$BRAZIER_CDP_PARALLEL"
+else
+  PARALLEL="$(default_parallel)"
+fi
+
+if [ "$PARALLEL" -gt "$SHARD_COUNT" ]; then
+  PARALLEL="$SHARD_COUNT"
 fi
 
 echo "Running $SHARD_COUNT selected CDP shard container(s) of $TOTAL total, parallel=$PARALLEL, viewport(s)=$VIEWPORTS"
