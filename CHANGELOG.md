@@ -51,6 +51,13 @@ open follow-ups), which is in progress.
   body read cut short by the request deadline is `RequestDeadlineExceeded`,
   and the error descriptions name `body_read_timeout_ms` and
   `request_timeout_ms`.
+- (M118 streams) **Wire break:** `patch` and `model_sync` carry a required
+  `streams` array, empty when no stream changed. A server from before this
+  sends no `streams`, which this client treats as a stream fault; a client
+  from before it ignores the field and never shows stream items. The
+  stale-build close (4499) reloads pages across the change.
+- (M118 streams) `transport.SendPatch` and `transport.SendModelSync` gain a
+  `streams_json` field, and `ssr.SsrConfig` a `stream_limits` field.
 - (M118 cluster) **Wire break (between nodes):** the replicated-store CRDT
   context is `{context, Clock, Cloud, Floors}`, so replicas on mixed versions
   refuse each other's payloads as malformed. Session revocation pg groups
@@ -261,8 +268,28 @@ open follow-ups), which is in progress.
   `stream_window` keeps each stream's keys and computes exact per-update
   deltas, trims included, and refuses every stream bound with a typed
   error. Shared delta and fault vectors are in
-  `test/fixtures/stream_vectors.json`. Streams are not yet wired into
-  effects, the view or the wire (`docs/design/STREAMS.md`).
+  `test/fixtures/stream_vectors.json` (`docs/design/STREAMS.md`).
+- (M118 streams) Streams run end to end. Stream ops are effects, rendered
+  by a stream container node whose items have item-relative handler ids
+  (`i0`, `i0.2`), and the dead render fills them. Each connection keeps
+  its own windows, so its indices are its own, and ops applied before any
+  connection joins reach the first join as resets. An op on an undeclared
+  stream, an oversized item, an over-max limit or a bad key is refused
+  with an `error` frame and a log line, grouped per stream and reason. The
+  build checks stream declarations and item render functions (named, no
+  closures) and generates `stream_names()`.
+- (M118 streams) The browser runtime applies the `streams` field of every
+  frame: it keeps each rendered container in step item by item, keeps
+  nodes across updates and moves (`moveBefore`), and keeps debounce and
+  throttle per item. A stream fault logs a `console.error`, closes with
+  4000 `stream fault` and reconnects; the join refills the streams.
+- (M118 streams) `SecurityLimits.stream_max_limit` (1000, at most 1000),
+  `stream_item_max_bytes` (65,536), `stream_ops_max_per_update` (1000),
+  `stream_frame_max_bytes` (1,048,576) and `stream_key_max_bytes` (256),
+  all validated.
+- (M118 streams) Telemetry events `[brazier, stream, delta]` and
+  `[brazier, stream, refused]`, and a `stream_bytes` measurement on the
+  render span's stop.
 - (M118 cluster) `replicated.synced/1` is true when every peer's last
   digest equals this replica's (and when there are no peers), and
   `replicated.context_size/1` reports the causal context's size.
@@ -673,6 +700,8 @@ open follow-ups), which is in progress.
   the test process was counted as the append's reductions. The cost is
   now measured in a fresh process with room for the work, and a trace
   session asserts no collection ran during it.
+- (M118 streams) The client's `syncHooks` threw its invariant when one
+  frame inserted a key and then deleted it.
 - (M118 logs) A static file name longer than the file system allows is a
   404 logged at debug (as in Plug.Static), not a 500 with an error log.
 - (M118 logs) A malformed forwarding hop is logged once per WebSocket

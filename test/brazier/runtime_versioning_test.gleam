@@ -1195,12 +1195,16 @@ pub fn client_replay_of_server_frames_matches_final_sync_test() {
 /// `simple` prediction, the focused-input lock, autofocus, server navigation
 /// and its same-origin refusals, ack_clock and event clock validation, hook
 /// mount/update/unmount tracking, the parsed-markup cache, the join's build
-/// id and dev build, 4499 behind the reload guard, the outbound test hook, refusal of a model or ops sent as JSON text, and the dev
-/// `reload` message) driven by a fake socket, clock and DOM. The harness
-/// exits non-zero on any failed scenario.
+/// id and dev build, 4499 behind the reload guard, the outbound test hook,
+/// refusal of a model or ops sent as JSON text, the dev `reload` message, and
+/// streams: every stream fault closing with 4000, deltas under every model
+/// verdict, item node identity, item hooks, item handler ids, containers that
+/// appear or change item function, and the reconnect that refills the
+/// stores) driven by a fake socket, clock and DOM. The harness exits non-zero
+/// on any failed scenario.
 pub fn client_runtime_behaviour_harness_test() {
   let assert Ok(output) = run_node("brazier_client/test/ffi_harness.mjs", "")
     as "the client FFI harness failed; run node brazier_client/test/ffi_harness.mjs"
-  let assert True = string.contains(output, "ffi harness ok: 62 scenarios")
-    as "the client FFI harness did not run all 62 scenarios"
+  let assert True = string.contains(output, "ffi harness ok: 77 scenarios")
+    as "the client FFI harness did not run all 77 scenarios"
 }

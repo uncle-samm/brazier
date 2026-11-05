@@ -3,7 +3,9 @@
 // Usage: node brazier_client/test/sync_vectors.mjs [server_messages.json]
 //
 // Always runs the unit checks of the pure policy in
-// brazier_client/src/brazier_client/patch.mjs (unhappy paths first).
+// brazier_client/src/brazier_client/patch.mjs (unhappy paths first), and
+// synthetic checks that a frame's required `streams` field decodes
+// (brazier_client/src/brazier_client/stream.mjs).
 //
 // With a messages file (produced by test/brazier/runtime_versioning_test.gleam)
 //   { "messages": [<server frame JSON string>, ...], "final_model": <json string>,
@@ -38,6 +40,7 @@ import {
   MAX_RELOADS,
   RELOAD_WINDOW_MS,
 } from "../src/brazier_client/patch.mjs";
+import { decodeStreams } from "../src/brazier_client/stream.mjs";
 
 let checks = 0;
 function check(name, fn) {
@@ -328,6 +331,38 @@ check("PacedQueue removeWhere and setBudget", () => {
   assert.equal(q.length, 1);
 });
 
+// --- The required streams field (docs/design/STREAMS.md 6.1, D5) ---
+// Every patch and model_sync carries `streams`, an array (empty when no
+// stream changed). The runtime has no default for a missing field: it is a
+// stream fault, decoded as `malformed`.
+function assertFrameStreams(msg, where) {
+  const decoded = decodeStreams(msg.streams);
+  assert.ok(decoded.ok, `${where}: streams: ${decoded.ok ? "" : decoded.fault.detail}`);
+  return decoded.entries;
+}
+check("a patch or model_sync without a streams field is malformed", () => {
+  for (const msg of [
+    { type: "patch", version: 1, ops: [], ack_clock: 0 },
+    { type: "model_sync", version: 0, model: {}, ack_clock: 0 },
+  ]) {
+    assert.throws(() => assertFrameStreams(msg, msg.type), /the frame has no streams field/);
+    const decoded = decodeStreams(msg.streams);
+    assert.equal(decoded.fault.reason, "malformed");
+  }
+});
+check("streams that is null, an object or JSON text is malformed", () => {
+  for (const streams of [null, {}, "[]"]) {
+    assert.throws(() => assertFrameStreams({ type: "patch", streams }, "patch"), /streams is not an array/);
+  }
+});
+check("an empty streams array changes no stream", () => {
+  assert.deepEqual(assertFrameStreams({ type: "patch", version: 1, ops: [], ack_clock: 0, streams: [] }, "patch"), []);
+});
+check("a streams entry with a missing field is malformed", () => {
+  const streams = [{ name: "s", keep: "last", limit: 3, reset: false, deletes: [] }];
+  assert.throws(() => assertFrameStreams({ type: "model_sync", streams }, "model_sync"), /inserts is not an array/);
+});
+
 // --- Server frame replay ---
 const file = process.argv[2];
 let replayed = 0;
@@ -341,12 +376,14 @@ if (file) {
     const msg = JSON.parse(raw);
     const where = `frame ${index} ${raw.substring(0, 160)}`;
     if (msg.type === "model_sync") {
+      assertFrameStreams(msg, where);
       assert.equal(classifyModelSync(state, msg.version), "apply", where);
       // The server embeds the model raw ("model":{...}), never as a string.
       assert.ok(msg.model !== null && typeof msg.model === "object", `${where}: model must be a raw JSON object`);
       model = msg.model;
       state = { version: msg.version, synced: true };
     } else if (msg.type === "patch") {
+      assertFrameStreams(msg, where);
       // The server embeds the ops raw ("ops":[...]), never as a string.
       assert.ok(Array.isArray(msg.ops), `${where}: ops must be a raw JSON array`);
       const ops = msg.ops;

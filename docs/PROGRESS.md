@@ -803,6 +803,29 @@
     - still pending: runtime, runtime_telemetry, runtime_versioning and session_security;
     - follow-up: `await.until_telemetry` can leave residue (an event emitted before it detaches), and session_security, runtime_versioning and http_fuzz still use it.
   The two streams halves merge together before CDP runs, because each breaks the suite on its own.
+  - m118-streams-server: STREAMS.md steps 2–5 (68f6e38, 3772a5c, 73ee693, 42416b3). Done (merged 2026-11-05 with m118-streams-client):
+    - stream ops are effects, rendered by a stream container node with item-relative handler ids; the dead render fills streams;
+    - the build checks stream declarations and generates `stream_names()`;
+    - `patch` and `model_sync` carry the required `streams` field (decision D5);
+    - `stream_session` keeps windows per session and per connection, so each connection gets its own indices; ops applied before any join reach the first join as resets;
+    - the five D4 bounds are `SecurityLimits` fields, validated; `stream_max_limit` must be at most 1000, the most the client accepts;
+    - the telemetry events `[brazier, stream, delta]` and `[brazier, stream, refused]`, and `stream_bytes` on the render stop;
+    - departures from STREAMS.md are marked "Correction (step 5)" there: an over-max limit, an empty key and an over-long key are refused at runtime (three new refused reasons), not crashes; one error frame per (stream, reason).
+  - m118-streams-client: step 6 (5bfb32c, c24e92a, 2db7e46, 2f3017b). Done (merged 2026-11-05): the store decoder and applier run the shared vectors; stores render into containers and keep nodes across updates and moves; item handler ids are relative to the item; a stream fault closes with 4000 `stream fault` (decision D3).
+  - At the merge the coordinator made the `sync_vectors.mjs` replay strict (every recorded server `patch` and `model_sync` must carry a valid `streams`), added `stream_limits` to `log_forging_paths_test`'s `SsrConfig` (that test arrived with m118-logs) and resolved one `ws_protocol_test` conflict. The rebuilt runtime bundle is unchanged (`brazier_client_f2ce9d5d8f498075.js`).
+  - Verified on the merged tree: build (zero warnings), format, lint and docs pass; 2270 tests pass 3 runs in a row; `make test-client` passes (ffi harness 77 scenarios, stream vectors 42 checks).
+  - Follow-ups from streams-server, not fixed yet:
+    - [ ] SSR does not refuse an op on an unknown stream.
+    - [ ] A `data-brazier-stream` attribute on an element that is not a stream container is not refused.
+    - [ ] The JS-target build shows "Unused value" warnings.
+    - [ ] Item render functions from dependency modules are accepted without the named-function check.
+    - [ ] The `check_framework` message's allowlist text omits `brazier/stream`.
+    - [ ] `stream_item_type` gives `None` for an annotation it cannot resolve; it must fail loudly.
+    - [ ] A route change on a join after the first is not sent to the joiner; check against STREAMS.md (nothing is replayed by design).
+    - [ ] The connection-level `FrameTooLarge` path has no test.
+    - [ ] Stream errors during init are only logged, since no connection exists yet; decide whether the first join must carry them.
+    - [ ] `http_fuzz_test` flaked with MailboxResidue on its branch (it still uses `await.until_telemetry`; see the residue follow-up above).
+  - Open from streams-client: a gleam test should run `stream_vectors.mjs` (today only `make test-client` does).
 - Decision, 2026-11-05: 4401 stays shared by an `init` 401 and a revoked or expired session. Both mean "authentication is no longer valid; reload" to the client. The server tells them apart by a distinct cause in the close's log line and telemetry metadata. m118-logs builds it.
 - Decision, 2026-11-05: m118-logs reproduced L453. Both problems are in the runtime's send paths:
   - `message_queue_len` returns an invented 1000000000 for a dead pid, so a dead connection is reported as slow on every broadcast;

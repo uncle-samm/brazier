@@ -12,6 +12,7 @@ import brazier/cluster/log_capture as node_log
 import brazier/effect
 import brazier/error
 import brazier/html
+import brazier/internal/stream_window
 import brazier/ip
 import brazier/log_capture
 import brazier/ssr
@@ -468,6 +469,7 @@ fn ssr_config(
     head_html: None,
     dev_mode: False,
     recovery_encoder: None,
+    stream_limits: stream_window.default_limits(),
   )
 }
 
