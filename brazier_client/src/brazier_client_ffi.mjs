@@ -2518,14 +2518,20 @@ function morphNode(o, n) {
   if (isFormControl) syncFormControlState(o, n);
 }
 
+// An element's key: data-brazier-key, or else its id attribute. The id is
+// read as an attribute, never as the `id` property: on a form, a control
+// named "id" shadows that property (form.id is then the control, an object,
+// which no other element's key equals), so the form would match nothing and
+// be built again on every render, with its controls.
 function nodeKey(node) {
   if (!node || node.nodeType !== 1) return null;
-  return node.getAttribute("data-brazier-key") || node.id || null;
+  return node.getAttribute("data-brazier-key") || node.getAttribute("id") || null;
 }
 
 function describeNode(node) {
   if (!node || node.nodeType !== 1) return "";
-  const id = node.id ? "#" + node.id : "";
+  const idAttr = node.getAttribute("id");
+  const id = idAttr ? "#" + idAttr : "";
   const key = node.getAttribute("data-brazier-key");
   const keyed = key ? `[data-brazier-key="${key}"]` : "";
   return node.tagName.toLowerCase() + id + keyed;

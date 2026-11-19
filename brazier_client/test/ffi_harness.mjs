@@ -217,6 +217,9 @@ function matcher(selector) {
     (value === undefined || el.getAttribute(m[2]) === value);
 }
 
+// The elements a form exposes as named properties (HTML's "listed" elements).
+const FORM_LISTED_TAGS = new Set(["BUTTON", "FIELDSET", "INPUT", "OBJECT", "OUTPUT", "SELECT", "TEXTAREA"]);
+
 class FakeElement extends FakeNode {
   constructor(tagName, nodeType = 1) {
     super(nodeType);
@@ -227,7 +230,15 @@ class FakeElement extends FakeNode {
   get firstChild() {
     return this.childNodes[0] || null;
   }
+  // As in a browser, a form's control named "id" (or with that id) shadows
+  // the form's own `id` property: form.id is then the control.
   get id() {
+    if (this.tagName === "FORM") {
+      const named = this.querySelectorAll("*").find(
+        (c) => FORM_LISTED_TAGS.has(c.tagName) && (c.getAttribute("name") === "id" || c.getAttribute("id") === "id"),
+      );
+      if (named) return named;
+    }
     return this.getAttribute("id") || "";
   }
   getAttribute(name) {
@@ -2591,6 +2602,50 @@ scenario("keyed children keep their elements across any reorder, focus and typed
   assert.deepEqual([focused.selectionStart, focused.selectionEnd], [1, 2], "and its selection");
   assert.equal(focused.value, "typed", "an unacknowledged value survives the move");
   assert.equal(el("#i4").value, "vi4", "the other inputs follow the markup");
+});
+
+// --- a form with a control named "id" ---
+// form.id is that control, not the form's id (see the fake DOM's `id`), so
+// the morph must read the id attribute.
+const namedIdView = (model) => ({
+  html:
+    `<p>${model.n}</p>` +
+    `<form class="new"><input name="id" value="${model.name}" data-brazier-on-input="in"><button type="submit">Start</button></form>` +
+    "<div>" +
+    model.forms.map((id) => `<form id="${id}"><input name="id" value="${id}" data-brazier-on-input="in"></form>`).join("") +
+    "</div>",
+  handlers: [{ name: "input", id: "in", decode: (e) => ok({ typed: e.target.value }) }],
+});
+
+scenario("a form with a control named id keeps its element across renders, and its id attribute is its key", async () => {
+  await loadRuntime({ view: namedIdView });
+  const s = sockets[0];
+  s.open();
+  sync(s, 0, { n: 0, name: "", forms: ["a", "b", "c"] });
+  const form = el("form");
+  const input = el('[name="id"]');
+  assert.equal(form.id, input, "the fake DOM shadows form.id as a browser does");
+  const keyed = () => [...root.childNodes[2].childNodes];
+  const byId = new Map(keyed().map((node) => [node.getAttribute("id"), node]));
+  input.focus();
+  input.setSelectionRange(2, 2);
+  // An unkeyed form: a render that changes something else keeps the form,
+  // its focused control and the caret.
+  sync(s, 1, { n: 1, name: "", forms: ["a", "b", "c"] });
+  assert.equal(root.childNodes[0].textContent, "1");
+  assert.equal(el("form"), form, "the form is the same element");
+  assert.equal(el('[name="id"]'), input, "and so is its control");
+  assert.equal(document.activeElement, input, "which keeps focus");
+  assert.deepEqual([input.selectionStart, input.selectionEnd], [2, 2], "and its caret");
+  // Forms keyed by their id attribute keep their elements across a reorder.
+  sync(s, 2, { n: 1, name: "", forms: ["c", "a", "b"] });
+  assert.deepEqual(keyed().map((node) => node.getAttribute("id")), ["c", "a", "b"]);
+  for (const node of keyed()) assert.equal(node, byId.get(node.getAttribute("id")), "a reorder keeps form#" + node.getAttribute("id"));
+  // A repeated id is reported by the attribute's value, not as the control.
+  sync(s, 3, { n: 1, name: "", forms: ["c", "a", "c"] });
+  assert.equal(errorsMatching('Duplicate key "c" among siblings (form#c)').length, 1);
+  assert.equal(keyed()[0], byId.get("c"), "the first form#c keeps its element");
+  assert.notEqual(keyed()[2], byId.get("c"), "the second is a new element");
 });
 
 // --- random morph equivalence ---
