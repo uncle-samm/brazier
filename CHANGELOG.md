@@ -23,6 +23,16 @@ which publishes to Hex after the `hex` environment is approved.
 
 ## [Unreleased]
 
+### Fixed
+
+- A form with a control named `id` (`<input name="id">`) keeps its element
+  across renders. The client's morph read an element's key from the `id`
+  property, and on such a form that property is the control, not the form's
+  id. The form then matched no element of the next render and was built
+  again on every render, with every control in it. The morph now reads the
+  `id` attribute. A form with both an `id` attribute and a control named
+  `id` is keyed by the attribute, as any other element is.
+
 ## [0.1.2] - 2026-11-06
 
 0.1.1 was tagged and released on GitHub but never reached Hex (see Fixed).

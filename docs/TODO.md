@@ -14,6 +14,23 @@
   - **Resolution:** how it was fixed (fill in when resolved)
 -->
 
+- **Issue:** a form control named after a DOM property the client's morph
+  reads shadows that property on its form. `HTMLFormElement` exposes its
+  controls by name ahead of its own properties, methods included, so on a
+  form holding `<input name="attributes">`, `form.attributes` is the
+  control. The morph reads `attributes`, `tagName`, `nodeType`,
+  `firstChild`, `nextSibling`, `parentNode`, `childNodes`, `contains` and
+  the attribute methods (`getAttribute`, `hasAttribute`, `setAttribute`,
+  `removeAttribute`) on every element, forms included. `id`, the common
+  name, is fixed: the morph reads it as an attribute.
+  - **Context:** found while fixing `nodeKey` for Modorra's new-thread
+    form (`<input name="id">`), 2026-11-18.
+  - **Files:** `brazier_client/src/brazier_client_ffi.mjs` (`morphChildren`,
+    `morphNode`, `morphAttributes`, `sameNode`)
+  - **Attempted:** nothing yet. Reading through the prototypes
+    (`Element.prototype`, `Node.prototype`) would not be shadowed; the
+    harness's fake DOM has no such prototypes, so it would need them too.
+
 - **Issue:** the listener's `eacces` path is tested only where the OS
   refuses a privileged port. macOS lets any user bind port 1 on the
   wildcard address, so `a_privileged_port_matches_what_the_os_says_test`

@@ -1263,6 +1263,6 @@ pub fn client_replay_of_server_frames_matches_final_sync_test() {
 pub fn client_runtime_behaviour_harness_test() {
   let assert Ok(output) = run_node("brazier_client/test/ffi_harness.mjs", "")
     as "the client FFI harness failed; run node brazier_client/test/ffi_harness.mjs"
-  let assert True = string.contains(output, "ffi harness ok: 88 scenarios")
-    as "the client FFI harness did not run all 88 scenarios"
+  let assert True = string.contains(output, "ffi harness ok: 89 scenarios")
+    as "the client FFI harness did not run all 89 scenarios"
 }
