@@ -23,6 +23,26 @@ which publishes to Hex after the `hex` environment is approved.
 
 ## [Unreleased]
 
+### Added
+
+- `brazier/web_push`: notifications on phones and computers sent by the
+  app's own server, with no third party that can read them (RFC 8030, RFC
+  8291 and RFC 8188, RFC 8292). VAPID keys (`generate_keys`, kept with
+  `encode_private_key` and `decode_private_key`), the encrypted and signed
+  request for one subscription (`request`) and what the push service's
+  answer means (`outcome`: `Delivered`, `Gone`, `TryAgain` with
+  `Retry-After`, `Refused`). A subscription's endpoint must be on a list of
+  push services (`default_services`: Google's, Mozilla's, Apple's,
+  Microsoft's, over https), so a page cannot point the server elsewhere. The
+  payload encryption matches RFC 8291's worked example byte for byte.
+- `brazier/web_push/device`: the subscribe, unsubscribe and check buttons,
+  with a device script (`/brazier-web-push.js`, `web_push.head_html`) that
+  registers a service worker (`/brazier-web-push-sw.js`), subscribes, and
+  reports this browser's state as JSON for `web_push.parse_report`,
+  including an iPhone or iPad outside a Home Screen web app.
+  `web_push.routes` serves both scripts for `brazier.api_routes`. See
+  `docs/WEB_PUSH.md`.
+
 ### Fixed
 
 - A form with a control named `id` (`<input name="id">`) keeps its element

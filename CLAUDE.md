@@ -22,6 +22,7 @@ Codex reads `AGENTS.md` for project-local guidance. There is no repo-editable Co
 | `docs/MIDDLEWARE.md` | HTTP middleware pipeline, scoping, built-ins |
 | `docs/STATE_MANAGEMENT.md` | Stores, PubSub, dynamic subscriptions, sessions |
 | `docs/STREAMS.md` | Streams: keyed lists the server sends once and does not keep, limits, hooks in items |
+| `docs/WEB_PUSH.md` | Web Push: notifications from your own server, keys, the subscribe buttons, sending, iPhone |
 | `docs/COMPONENTS.md` | Composable MVU units |
 | `docs/CLUSTERING.md` | Multi-node clustering, PubSub and presence across nodes, distribution security |
 | `docs/TELEMETRY.md` | Telemetry events and metrics |
