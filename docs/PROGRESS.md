@@ -10,7 +10,7 @@
 
 ## Current Status
 
-**Active Milestone:** 118 — merged into main 2026-11-05; only the night re-baseline is open
+**Active Milestone:** 119 — Web Push (branch `claude/project-thread-pc81pv`); 118 merged into main 2026-11-05, only its night re-baseline is open
 **Last Completed:** 117 — Full Review Remediation (merged into main 2026-11-05)
 **Build Status:** GREEN (zero errors, zero warnings) on Gleam 1.19.2
 **Test Status:** GREEN (2496 tests passed, 0 failures; CDP 1033/1033 desktop, 1044/1044 mobile)
@@ -1006,6 +1006,21 @@
 - Decision, 2026-11-05: `effect.push_hook` (LiveView `push_event`) is parked. Modorra's only use case, streamed turn output, is covered by streams, and the terminal and diffs have their own channels.
 - [x] (m118-diff-shift) Array diff detects a shift. Today a sliding window (drop from the front and append in one update) matches no prefix or suffix, so the diff pairs elements by index and replaces the whole array on every event. Detect a small shift k (old[k..] == new[..n-k]), so the diff becomes k `remove` ops plus an `append`. Check Myers / LiveView streams first. The Erlang and JS diffs must stay op-for-op identical (equivalence harness).
 
+
+### Milestone 119: Web Push 🚧
+> Notifications from the app's own server, for Modorra in place of ntfy:
+> `brazier/web_push` and `brazier/web_push/device`. Standards only (RFC
+> 8030, 8291/8188, 8292), OTP `crypto`, no new dependency.
+
+- [x] Keys: P-256 pairs from OTP, a private key at or past the curve's order refused (OTP takes it), kept as base64url text; VAPID with a checked subject
+- [x] Payload encryption (`aes128gcm`, one record, at most 3993 bytes of JSON), checked against RFC 8291's worked example byte for byte and decrypted by an independent implementation in the test FFI
+- [x] VAPID JWT (ES256, DER signature to raw R||S), verified in the tests with the public key
+- [x] Subscriptions checked against a list of push services (https, exact hosts or one-label wildcards), `parse_report` for the device script's JSON, `outcome` for the push service's answer (`Retry-After` read)
+- [x] Device script and service worker (`priv/web_push`), served by `web_push.routes`; `brazier/web_push/device` added to the analyzer's client modules
+- [x] Tests: `test/brazier/web_push_test.gleam` (17)
+- [x] Docs: `docs/WEB_PUSH.md` (samples compiled), ARCHITECTURE, CHANGELOG
+- [ ] A browser check of the device script in an example app (CDP), after Modorra's browser check of it (apps/ui/test/browser/check.mjs, with a stand-in push service)
+- [ ] Release it on Hex, so Modorra pins a version instead of the commit
 
 ### Earlier milestones (1–116)
 Archived verbatim in [docs/archive/PROGRESS.md](archive/PROGRESS.md).

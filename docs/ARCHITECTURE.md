@@ -463,6 +463,7 @@ drain under one node-local `global:trans` lock, so an app is stopped once.
 | `config` | `port`, `secret_key`, `is_production` from the environment |
 | `error`, `error_page`, `log` | Error types, error pages, structured logging |
 | `notification` | Typed PubSub payloads for `on_notification` |
+| `web_push`, `web_push/device` | Web Push from the app's own server: VAPID keys, payload encryption, the request for one subscription and what its answer means, and the routes for the device script and service worker (`priv/web_push`); `web_push/device` holds the subscribe buttons' attributes, and runs in the browser too ([WEB_PUSH.md](WEB_PUSH.md)) |
 | `debug` | Runtime statistics |
 | `internal/wire_decode` | Fail-fast decoders the generated codecs read models and events with, on the server and in the browser, keeping `gleam/dynamic/decode` errors |
 | `internal/ascii` | ASCII-only case folding for protocol text (header names, tokens, schemes, attribute names, Gleam names in the build); Unicode folding would make the Kelvin sign equal `k`. The one ASCII folding on each target (`brazier_ascii_ffi.erl`, `.mjs`) |
@@ -524,3 +525,4 @@ test_all_cdp.py           # Browser tests over the examples (see TESTING.md)
 | PubSub, presence | Phoenix.PubSub, Phoenix.Tracker | `pubsub`, `presence` |
 | Codegen from source analysis | Squirrel | `build` |
 | Model JSON patches | RFC 6902, RFC 6901 | `patch`, `patch.mjs` |
+| Web Push | RFC 8030, RFC 8291, RFC 8188, RFC 8292 | `web_push` |

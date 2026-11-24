@@ -39,7 +39,7 @@ import gleam/string
 pub const client_modules = [
   "brazier/attribute", "brazier/element", "brazier/event", "brazier/html",
   "brazier/local", "brazier/log", "brazier/notification",
-  "brazier/presence/sync", "brazier/svg",
+  "brazier/presence/sync", "brazier/svg", "brazier/web_push/device",
 ]
 
 const element_module = "brazier/element"
